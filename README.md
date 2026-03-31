@@ -13,9 +13,9 @@ Tributary provides a unified interface for managing and streaming music from mul
 |---------|--------|
 | GTK4 / libadwaita UI (Rhythmbox-style `GtkColumnView`) | ✅ Phase 2 |
 | Browser filtering (Genre → Artist → Album) | ✅ Phase 2 |
-| Local library with FS `date_modified` scanning | 🚧 Phase 3 |
-| Real-time filesystem watching (`notify`) | 🚧 Phase 3 |
-| SQLite persistence (`SeaORM`) | 🚧 Phase 3 |
+| Local library with FS `date_modified` scanning | ✅ Phase 3 |
+| Real-time filesystem watching (`notify`) | ✅ Phase 3 |
+| SQLite persistence (`SeaORM`) | ✅ Phase 3 |
 | GStreamer audio playback | 📋 Phase 4 |
 | MPRIS / SMTC / macOS Now Playing integration | 📋 Phase 4 |
 | Subsonic / Navidrome backend | 📋 Phase 5 |
@@ -158,6 +158,18 @@ src/
 │   ├── models.rs       # Track, Album, Artist, SearchResults, etc.
 │   ├── backend.rs      # MediaBackend async trait
 │   └── error.rs        # BackendError (thiserror)
+├── db/
+│   ├── mod.rs          # Database layer root
+│   ├── connection.rs   # SQLite init, XDG paths, migration runner
+│   ├── entities/
+│   │   └── track.rs    # SeaORM entity for tracks table
+│   └── migration/
+│       └── m20250101_000001_create_tables.rs
+├── local/
+│   ├── mod.rs          # Local backend root
+│   ├── backend.rs      # MediaBackend impl (LocalBackend)
+│   ├── engine.rs       # Async scan + notify FS watcher
+│   └── tag_parser.rs   # lofty audio tag extraction
 ├── platform/
 │   └── mod.rs          # OS media controls abstraction (MPRIS/SMTC/macOS)
 ├── ui/
@@ -180,8 +192,8 @@ data/                    # .desktop & AppStream metainfo
 
 1. **Phase 1:** ✅ Project skeleton, core traits, GTK4 window scaffold, CI/CD
 2. **Phase 2:** ✅ Full Rhythmbox-style UI with `GtkColumnView`, browser filtering, multi-pane layout
-3. **Phase 3 (current):** Local backend — SQLite (`SeaORM`), `lofty` tag parsing, `notify` FS watching, async engine
-4. **Phase 4:** GStreamer audio playback, MPRIS/SMTC/macOS Now Playing integration
+3. **Phase 3:** ✅ Local backend — SQLite (`SeaORM`), `lofty` tag parsing, `notify` FS watching, async engine
+4. **Phase 4 (current):** GStreamer audio playback, MPRIS/SMTC/macOS Now Playing integration
 5. **Phase 5:** Remote backends (Subsonic, Jellyfin, DAAP)
 
 ---
