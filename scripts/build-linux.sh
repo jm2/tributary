@@ -27,8 +27,10 @@ check_pkg() {
   Arch:          sudo pacman -S $4"
 }
 
-check_pkg "gtk4"        "libgtk-4-dev"     "gtk4-devel"       "gtk4"
-check_pkg "libadwaita-1" "libadwaita-1-dev" "libadwaita-devel" "libadwaita"
+check_pkg "gtk4"           "libgtk-4-dev"          "gtk4-devel"          "gtk4"
+check_pkg "libadwaita-1"  "libadwaita-1-dev"      "libadwaita-devel"    "libadwaita"
+check_pkg "gstreamer-1.0" "libgstreamer1.0-dev"   "gstreamer1-devel"    "gstreamer"
+check_pkg "dbus-1"        "libdbus-1-dev"         "dbus-devel"          "dbus"
 
 info "All system dependencies satisfied."
 

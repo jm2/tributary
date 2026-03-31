@@ -75,6 +75,11 @@ impl Player {
     /// });
     /// ```
     pub fn new() -> anyhow::Result<(Self, async_channel::Receiver<PlayerEvent>)> {
+        // On Windows, point GStreamer at bundled plugins next to the executable
+        // before init() scans the plugin registry.
+        #[cfg(target_os = "windows")]
+        Self::set_bundled_plugin_path();
+
         gst::init()?;
         info!("GStreamer {}", gst::version_string());
 
@@ -288,6 +293,30 @@ impl Player {
 
             glib::ControlFlow::Continue
         });
+    }
+
+    // ── Internal: Windows plugin path ───────────────────────────────
+
+    /// On Windows, set `GST_PLUGIN_PATH` to the bundled `lib/gstreamer-1.0`
+    /// directory next to the executable, so GStreamer can find codec plugins
+    /// in a self-contained deployment.
+    ///
+    /// Does nothing if the variable is already set (user override) or if
+    /// the bundled directory does not exist (dev/MSYS2 environment).
+    #[cfg(target_os = "windows")]
+    fn set_bundled_plugin_path() {
+        if std::env::var_os("GST_PLUGIN_PATH").is_some() {
+            return; // Respect explicit user override.
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let plugin_dir = dir.join("lib").join("gstreamer-1.0");
+                if plugin_dir.is_dir() {
+                    std::env::set_var("GST_PLUGIN_PATH", &plugin_dir);
+                    debug!(path = %plugin_dir.display(), "Set GST_PLUGIN_PATH for bundled plugins");
+                }
+            }
+        }
     }
 }
 

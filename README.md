@@ -86,7 +86,7 @@ The binary is at `target/release/tributary`.
 Requires [Homebrew](https://brew.sh):
 
 ```bash
-brew install gtk4 libadwaita pkg-config
+brew install gtk4 libadwaita pkg-config gstreamer gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav
 cargo build --release
 ```
 
@@ -108,6 +108,10 @@ Requires [MSYS2](https://www.msys2.org) with the UCRT64 environment:
 # In an MSYS2 UCRT64 shell:
 pacman -S mingw-w64-ucrt-x86_64-gtk4 \
           mingw-w64-ucrt-x86_64-libadwaita \
+          mingw-w64-ucrt-x86_64-gstreamer \
+          mingw-w64-ucrt-x86_64-gst-plugins-good \
+          mingw-w64-ucrt-x86_64-gst-plugins-bad \
+          mingw-w64-ucrt-x86_64-gst-libav \
           mingw-w64-ucrt-x86_64-pkg-config \
           mingw-w64-ucrt-x86_64-toolchain
 ```

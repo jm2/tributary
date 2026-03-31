@@ -55,7 +55,7 @@ if (-not $NoCargoBuild -and -not (Get-Command cargo -ErrorAction SilentlyContinu
 # ── PKG_CONFIG setup ─────────────────────────────────────────────────────────
 $pkgConfigPath = Join-Path $MsysPath "lib\pkgconfig"
 if (-not (Test-Path $pkgConfigPath)) {
-    Write-Err "GTK4 pkgconfig not found at $pkgConfigPath.`nIn MSYS2 shell, run:`n  pacman -S $PkgPrefix-gtk4 $PkgPrefix-libadwaita $PkgPrefix-pkg-config $PkgPrefix-toolchain"
+    Write-Err "GTK4 pkgconfig not found at $pkgConfigPath.`nIn MSYS2 shell, run:`n  pacman -S $PkgPrefix-gtk4 $PkgPrefix-libadwaita $PkgPrefix-gstreamer $PkgPrefix-gst-plugins-good $PkgPrefix-gst-plugins-bad $PkgPrefix-gst-libav $PkgPrefix-pkg-config $PkgPrefix-toolchain"
 }
 
 $env:PKG_CONFIG_PATH   = $pkgConfigPath
@@ -120,6 +120,39 @@ Write-Info "Resolving DLLs with ldd..."
             }
         }
     }
+
+# ── GStreamer Plugins (runtime-loaded, invisible to ldd) ─────────────────────
+Write-Info "Copying GStreamer plugins..."
+
+$gstPluginSrc  = Join-Path $MsysPath "lib\gstreamer-1.0"
+$gstPluginDest = Join-Path $DIST     "lib\gstreamer-1.0"
+if (Test-Path $gstPluginSrc) {
+    New-Item -ItemType Directory -Force $gstPluginDest | Out-Null
+    Copy-Item "$gstPluginSrc\*.dll" $gstPluginDest
+    $pluginCount = (Get-ChildItem "$gstPluginDest\*.dll").Count
+    Write-Info "GStreamer plugins copied ($pluginCount plugins)."
+
+    # Resolve transitive DLL dependencies from plugin DLLs
+    Write-Info "Resolving additional DLLs from GStreamer plugins..."
+    Get-ChildItem "$gstPluginDest\*.dll" | ForEach-Object {
+        & $ldd $_.FullName 2>$null |
+            Select-String "/$MsysEnv/bin/" |
+            ForEach-Object {
+                $parts = $_.Line -split "\s+"
+                $libPath = $parts | Where-Object { $_ -like "*$MsysEnv/bin*" } | Select-Object -First 1
+                if ($libPath -and (Test-Path $libPath)) {
+                    $dest = Join-Path $DIST (Split-Path $libPath -Leaf)
+                    if (-not (Test-Path $dest)) {
+                        Copy-Item $libPath $dest
+                        Write-Host "  copied: $(Split-Path $libPath -Leaf)"
+                    }
+                }
+            }
+    }
+} else {
+    Write-Warn "GStreamer plugins not found at $gstPluginSrc — audio playback will not work."
+    Write-Warn "Install in MSYS2: pacman -S $PkgPrefix-gst-plugins-good $PkgPrefix-gst-plugins-bad $PkgPrefix-gst-libav"
+}
 
 # ── GTK Resources ────────────────────────────────────────────────────────────
 Write-Info "Copying GTK icons and schemas..."

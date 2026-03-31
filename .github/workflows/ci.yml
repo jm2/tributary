@@ -28,7 +28,9 @@ jobs:
       - name: Install system dependencies (Fedora)
         run: |
           dnf install -y gcc gtk4-devel libadwaita-devel \
+            dbus-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel \
+            gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-libav \
             pkgconf-pkg-config git curl
 
       - uses: actions/checkout@v4
@@ -78,7 +80,9 @@ jobs:
       - name: Install system dependencies (Homebrew)
         run: |
           brew update
-          brew install gtk4 libadwaita pkg-config create-dmg gstreamer adwaita-icon-theme
+          brew install gtk4 libadwaita pkg-config create-dmg \
+            gstreamer gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav \
+            adwaita-icon-theme
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -152,6 +156,10 @@ jobs:
           install: >-
             ${{ matrix.pkg_prefix }}-gtk4
             ${{ matrix.pkg_prefix }}-libadwaita
+            ${{ matrix.pkg_prefix }}-gstreamer
+            ${{ matrix.pkg_prefix }}-gst-plugins-good
+            ${{ matrix.pkg_prefix }}-gst-plugins-bad
+            ${{ matrix.pkg_prefix }}-gst-libav
             ${{ matrix.pkg_prefix }}-pkg-config
             ${{ matrix.pkg_prefix }}-toolchain
 

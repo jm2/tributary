@@ -25,7 +25,7 @@ info "Checking build dependencies..."
 command -v cargo &>/dev/null || error "cargo not found. Install Rust: https://rustup.rs"
 command -v brew  &>/dev/null || error "Homebrew not found. Install: https://brew.sh"
 
-for formula in gtk4 libadwaita pkg-config gstreamer adwaita-icon-theme; do
+for formula in gtk4 libadwaita pkg-config gstreamer gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav adwaita-icon-theme; do
   brew list "$formula" &>/dev/null || {
     warn "$formula not installed. Installing via Homebrew..."
     brew install "$formula"
