@@ -6,8 +6,27 @@
 use adw::prelude::*;
 use gtk::Align;
 
-/// Build the full header bar and return the `adw::HeaderBar`.
-pub fn build_header_bar() -> adw::HeaderBar {
+/// Interactive widgets exposed for the integration bridge to drive.
+#[allow(dead_code)]
+pub struct HeaderBarWidgets {
+    pub header: adw::HeaderBar,
+    pub play_button: gtk::Button,
+    pub prev_button: gtk::Button,
+    pub next_button: gtk::Button,
+    pub repeat_button: gtk::ToggleButton,
+    pub shuffle_button: gtk::ToggleButton,
+    pub title_label: gtk::Label,
+    pub artist_label: gtk::Label,
+    pub progress: gtk::Scale,
+    pub progress_adj: gtk::Adjustment,
+    pub position_label: gtk::Label,
+    pub duration_label: gtk::Label,
+    pub volume_scale: gtk::Scale,
+    pub volume_adj: gtk::Adjustment,
+}
+
+/// Build the full header bar and return all interactive widgets.
+pub fn build_header_bar() -> HeaderBarWidgets {
     // ── Left: Playback Controls ──────────────────────────────────────
     let btn_prev = gtk::Button::builder()
         .icon_name("media-skip-backward-symbolic")
@@ -86,26 +105,53 @@ pub fn build_header_bar() -> adw::HeaderBar {
     now_playing.append(&text_box);
 
     // ── Right: Progress + Volume + Menu ──────────────────────────────
+    let position_label = gtk::Label::builder()
+        .label("0:00")
+        .css_classes(["dim-label", "caption", "numeric"])
+        .width_chars(5)
+        .halign(Align::End)
+        .valign(Align::Center)
+        .build();
+
+    let progress_adj = gtk::Adjustment::new(0.0, 0.0, 1.0, 1000.0, 10000.0, 0.0);
     let progress = gtk::Scale::builder()
         .orientation(gtk::Orientation::Horizontal)
         .draw_value(false)
         .hexpand(false)
         .width_request(200)
         .valign(Align::Center)
-        .adjustment(&gtk::Adjustment::new(0.0, 0.0, 100.0, 1.0, 10.0, 0.0))
+        .adjustment(&progress_adj)
         .build();
     progress.add_css_class("progress-scrubber");
+
+    let duration_label = gtk::Label::builder()
+        .label("0:00")
+        .css_classes(["dim-label", "caption", "numeric"])
+        .width_chars(5)
+        .halign(Align::Start)
+        .valign(Align::Center)
+        .build();
+
+    let progress_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .valign(Align::Center)
+        .build();
+    progress_box.append(&position_label);
+    progress_box.append(&progress);
+    progress_box.append(&duration_label);
 
     // Volume: use a Scale + speaker icon since VolumeButton is deprecated in GTK 4.10+
     let volume_icon = gtk::Image::builder()
         .icon_name("audio-volume-high-symbolic")
         .build();
+    let volume_adj = gtk::Adjustment::new(1.0, 0.0, 1.0, 0.05, 0.1, 0.0);
     let volume_scale = gtk::Scale::builder()
         .orientation(gtk::Orientation::Horizontal)
         .draw_value(false)
         .width_request(80)
         .valign(Align::Center)
-        .adjustment(&gtk::Adjustment::new(0.7, 0.0, 1.0, 0.05, 0.1, 0.0))
+        .adjustment(&volume_adj)
         .build();
 
     let volume_box = gtk::Box::builder()
@@ -135,7 +181,7 @@ pub fn build_header_bar() -> adw::HeaderBar {
         .spacing(4)
         .valign(Align::Center)
         .build();
-    right_box.append(&progress);
+    right_box.append(&progress_box);
     right_box.append(&volume_box);
 
     // ── Assemble ─────────────────────────────────────────────────────
@@ -145,5 +191,20 @@ pub fn build_header_bar() -> adw::HeaderBar {
     header.pack_end(&menu_btn);
     header.pack_end(&right_box);
 
-    header
+    HeaderBarWidgets {
+        header,
+        play_button: btn_play,
+        prev_button: btn_prev,
+        next_button: btn_next,
+        repeat_button: btn_repeat,
+        shuffle_button: btn_shuffle,
+        title_label,
+        artist_label,
+        progress,
+        progress_adj,
+        position_label,
+        duration_label,
+        volume_scale,
+        volume_adj,
+    }
 }

@@ -25,6 +25,8 @@ mod imp {
         pub sample_rate_hz: Cell<u32>,
         pub play_count: Cell<u32>,
         pub format: RefCell<String>,
+        /// Playable URI (`file:///…` or stream URL).
+        pub uri: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -58,6 +60,7 @@ impl TrackObject {
         sample_rate_hz: u32,
         play_count: u32,
         format: &str,
+        uri: &str,
     ) -> Self {
         let obj: Self = glib::Object::builder().build();
         let imp = obj.imp();
@@ -73,6 +76,7 @@ impl TrackObject {
         imp.sample_rate_hz.set(sample_rate_hz);
         imp.play_count.set(play_count);
         imp.format.replace(format.to_string());
+        imp.uri.replace(uri.to_string());
         obj
     }
 
@@ -111,6 +115,9 @@ impl TrackObject {
     }
     pub fn format(&self) -> String {
         self.imp().format.borrow().clone()
+    }
+    pub fn uri(&self) -> String {
+        self.imp().uri.borrow().clone()
     }
 
     pub fn duration_display(&self) -> String {

@@ -7,7 +7,9 @@
 
 #[allow(dead_code)]
 mod architecture;
+mod audio;
 mod db;
+mod desktop_integration;
 #[allow(dead_code)]
 mod local;
 #[allow(dead_code)]

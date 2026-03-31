@@ -56,6 +56,12 @@ async-channel = "2"
 # XDG / platform directories
 dirs = "6"
 
+# Audio playback (GStreamer pipeline)
+gstreamer = "0.25"
+
+# Desktop media controls (MPRIS / SMTC / Now Playing)
+souvlaki = "0.8"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

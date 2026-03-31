@@ -11,7 +11,9 @@ use super::objects::TrackObject;
 ///
 /// Returns `(outer_box, track_store, status_label)` so the caller can
 /// update the store when browser filters change and refresh the status.
-pub fn build_tracklist(initial_tracks: &[TrackObject]) -> (gtk::Box, gio::ListStore, gtk::Label) {
+pub fn build_tracklist(
+    initial_tracks: &[TrackObject],
+) -> (gtk::Box, gio::ListStore, gtk::Label, gtk::ColumnView) {
     let store = gio::ListStore::new::<TrackObject>();
     for t in initial_tracks {
         store.append(t);
@@ -96,7 +98,7 @@ pub fn build_tracklist(initial_tracks: &[TrackObject]) -> (gtk::Box, gio::ListSt
     outer.append(&scrolled);
     outer.append(&status_label);
 
-    (outer, store, status_label)
+    (outer, store, status_label, column_view)
 }
 
 /// Recompute and set the status label text from the current tracks.

@@ -16,8 +16,10 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Local library with FS `date_modified` scanning | ✅ Phase 3 |
 | Real-time filesystem watching (`notify`) | ✅ Phase 3 |
 | SQLite persistence (`SeaORM`) | ✅ Phase 3 |
-| GStreamer audio playback | 📋 Phase 4 |
-| MPRIS / SMTC / macOS Now Playing integration | 📋 Phase 4 |
+| GStreamer audio playback (`playbin3`) | ✅ Phase 4 |
+| MPRIS / SMTC / macOS Now Playing integration (`souvlaki`) | ✅ Phase 4 |
+| Playback controls (play/pause, next/prev, seek, volume) | ✅ Phase 4 |
+| Auto-advance with repeat-all support | ✅ Phase 4 |
 | Subsonic / Navidrome backend | 📋 Phase 5 |
 | Jellyfin / Plex backend | 📋 Phase 5 |
 | DAAP / mDNS backend | 📋 Phase 5 |
@@ -57,17 +59,17 @@ All backends implement a single `MediaBackend` async trait, so the UI layer neve
 
 **Debian / Ubuntu:**
 ```bash
-sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config build-essential
+sudo apt install libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev libdbus-1-dev pkg-config build-essential
 ```
 
 **Fedora:**
 ```bash
-sudo dnf install gtk4-devel libadwaita-devel pkg-config gcc
+sudo dnf install gtk4-devel libadwaita-devel gstreamer1-devel dbus-devel pkgconf-pkg-config gcc
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S gtk4 libadwaita pkgconf base-devel
+sudo pacman -S gtk4 libadwaita gstreamer dbus pkgconf base-devel
 ```
 
 Then build:
@@ -158,6 +160,8 @@ src/
 │   ├── models.rs       # Track, Album, Artist, SearchResults, etc.
 │   ├── backend.rs      # MediaBackend async trait
 │   └── error.rs        # BackendError (thiserror)
+├── audio/
+│   └── mod.rs          # GStreamer Player (playbin3, bus watch, position timer)
 ├── db/
 │   ├── mod.rs          # Database layer root
 │   ├── connection.rs   # SQLite init, XDG paths, migration runner
@@ -165,16 +169,19 @@ src/
 │   │   └── track.rs    # SeaORM entity for tracks table
 │   └── migration/
 │       └── m20250101_000001_create_tables.rs
+├── desktop_integration/
+│   └── mod.rs          # OS media controls via souvlaki (MPRIS/SMTC/Now Playing)
 ├── local/
 │   ├── mod.rs          # Local backend root
 │   ├── backend.rs      # MediaBackend impl (LocalBackend)
 │   ├── engine.rs       # Async scan + notify FS watcher
 │   └── tag_parser.rs   # lofty audio tag extraction
 ├── platform/
-│   └── mod.rs          # OS media controls abstraction (MPRIS/SMTC/macOS)
+│   └── mod.rs          # OS media controls abstraction (stubs, Phase 1)
 ├── ui/
 │   ├── mod.rs          # UI module root
-│   └── window.rs       # Main application window
+│   ├── window.rs       # Main window + integration bridge
+│   └── header_bar.rs   # Playback controls, now-playing, progress, volume
 └── main.rs             # Application entry point
 
 scripts/
@@ -193,7 +200,7 @@ data/                    # .desktop & AppStream metainfo
 1. **Phase 1:** ✅ Project skeleton, core traits, GTK4 window scaffold, CI/CD
 2. **Phase 2:** ✅ Full Rhythmbox-style UI with `GtkColumnView`, browser filtering, multi-pane layout
 3. **Phase 3:** ✅ Local backend — SQLite (`SeaORM`), `lofty` tag parsing, `notify` FS watching, async engine
-4. **Phase 4 (current):** GStreamer audio playback, MPRIS/SMTC/macOS Now Playing integration
+4. **Phase 4:** ✅ GStreamer audio playback (`playbin3`), MPRIS/SMTC/macOS Now Playing (`souvlaki`), full transport controls
 5. **Phase 5:** Remote backends (Subsonic, Jellyfin, DAAP)
 
 ---
