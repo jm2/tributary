@@ -62,6 +62,10 @@ gstreamer = "0.25"
 # Desktop media controls (MPRIS / SMTC / Now Playing)
 souvlaki = "0.8"
 
+# Windows-only: GDK4 Win32 backend (HWND extraction for souvlaki SMTC)
+[target.'cfg(target_os = "windows")'.dependencies]
+gdk4-win32 = "0.11"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

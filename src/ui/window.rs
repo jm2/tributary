@@ -193,6 +193,12 @@ pub fn build_window(
     // Phase 4: Audio Player + Desktop Integration
     // ═══════════════════════════════════════════════════════════════════
 
+    // Present the window EARLY so that the native OS surface is
+    // allocated.  On Windows, souvlaki needs the HWND which only
+    // exists after the window has been realized and mapped.
+    window.present();
+    info!("Main window presented");
+
     // ── Create GStreamer player ──────────────────────────────────────
     let (player, player_rx) = match crate::audio::Player::new() {
         Ok(pair) => pair,
@@ -206,16 +212,17 @@ pub fn build_window(
                 browser_widget,
                 scan_spinner,
             );
-            window.present();
-            info!("Main window presented (playback disabled)");
             return;
         }
     };
     let player = Rc::new(RefCell::new(player));
 
+    // ── Extract native window handle (HWND on Windows) ──────────────
+    let hwnd = extract_hwnd(&window);
+
     // ── Create OS media controls ────────────────────────────────────
     let media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>> =
-        match crate::desktop_integration::MediaController::new() {
+        match crate::desktop_integration::MediaController::new(hwnd) {
             Ok((ctrl, media_rx)) => {
                 let player = player.clone();
                 glib::MainContext::default().spawn_local(async move {
@@ -475,14 +482,35 @@ pub fn build_window(
         browser_widget,
         scan_spinner,
     );
-
-    window.present();
-    info!("Main window presented");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════
+
+/// Extract the native window handle for `souvlaki`.
+///
+/// On **Windows** this returns the `HWND` from the GDK Win32 surface.
+/// The window **must** have been presented (realized + mapped) first,
+/// otherwise there is no native surface to query.
+///
+/// On Linux and macOS this returns `None` — souvlaki uses D-Bus / Now
+/// Playing respectively and does not need a window handle.
+#[cfg(target_os = "windows")]
+fn extract_hwnd(window: &adw::ApplicationWindow) -> Option<*mut std::ffi::c_void> {
+    use gtk::prelude::NativeExt;
+
+    let surface = window.surface()?;
+    let win32_surface = surface.downcast_ref::<gdk4_win32::Win32Surface>()?;
+    let hwnd = win32_surface.handle();
+    // handle() returns an isize (HWND) — cast to the raw pointer souvlaki expects.
+    Some(hwnd as *mut std::ffi::c_void)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn extract_hwnd(_window: &adw::ApplicationWindow) -> Option<*mut std::ffi::c_void> {
+    None
+}
 
 /// Try to play the track at `position` in the given store.
 ///

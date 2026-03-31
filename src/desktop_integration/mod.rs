@@ -46,7 +46,9 @@ impl MediaController {
     /// for incoming [`MediaAction`]s.
     ///
     /// On Linux this creates an MPRIS D-Bus service named `tributary`.
-    /// On Windows, pass the window HWND via [`PlatformConfig`] (TODO).
+    /// On Windows, `hwnd` **must** be `Some(ptr)` pointing to the
+    /// application's main window — SMTC will panic without it.
+    /// On macOS, `hwnd` is ignored.
     ///
     /// The caller must consume the receiver on the GTK main thread via:
     /// ```ignore
@@ -56,11 +58,13 @@ impl MediaController {
     ///     }
     /// });
     /// ```
-    pub fn new() -> anyhow::Result<(Self, async_channel::Receiver<MediaAction>)> {
+    pub fn new(
+        hwnd: Option<*mut std::ffi::c_void>,
+    ) -> anyhow::Result<(Self, async_channel::Receiver<MediaAction>)> {
         let config = PlatformConfig {
             dbus_name: "tributary",
             display_name: "Tributary",
-            hwnd: None, // Windows: requires real HWND for SMTC
+            hwnd,
         };
 
         let mut controls = MediaControls::new(config)
