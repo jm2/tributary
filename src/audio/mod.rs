@@ -117,6 +117,8 @@ impl Player {
         info!(uri, "Loading track");
         let _ = self.playbin.set_state(gst::State::Null);
         self.playbin.set_property("uri", uri);
+        // Re-apply volume — the NULL transition resets it to 1.0.
+        self.playbin.set_property("volume", self.volume);
         let _ = self.playbin.set_state(gst::State::Playing);
     }
 
