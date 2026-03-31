@@ -599,7 +599,11 @@ pub fn build_sources() -> Vec<SourceObject> {
 pub fn build_tracks() -> Vec<TrackObject> {
     TRACKS
         .iter()
-        .map(|t| TrackObject::new(t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9, t.10, t.11, ""))
+        .map(|t| {
+            TrackObject::new(
+                t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9, t.10, t.11, "",
+            )
+        })
         .collect()
 }
 

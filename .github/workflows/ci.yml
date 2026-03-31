@@ -78,7 +78,7 @@ jobs:
       - name: Install system dependencies (Homebrew)
         run: |
           brew update
-          brew install gtk4 libadwaita pkg-config create-dmg
+          brew install gtk4 libadwaita pkg-config create-dmg gstreamer
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

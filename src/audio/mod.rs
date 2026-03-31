@@ -18,8 +18,8 @@
 
 use std::time::Duration;
 
-use gstreamer as gst;
 use gst::prelude::*;
+use gstreamer as gst;
 use gtk::glib;
 use tracing::{debug, error, info, warn};
 
@@ -31,10 +31,7 @@ pub enum PlayerEvent {
     /// The pipeline transitioned to a new coarse state.
     StateChanged(PlayerState),
     /// Periodic position tick (values in milliseconds).
-    PositionChanged {
-        position_ms: u64,
-        duration_ms: u64,
-    },
+    PositionChanged { position_ms: u64, duration_ms: u64 },
     /// The current stream reached its natural end.
     TrackEnded,
     /// A pipeline error occurred.
@@ -233,9 +230,7 @@ impl Player {
                 MessageView::StateChanged(sc) => {
                     // Only react to the playbin's own transitions,
                     // not those of child elements (decoders, sinks, …).
-                    let is_playbin = msg
-                        .src()
-                        .is_some_and(|src| src.name() == playbin_name);
+                    let is_playbin = msg.src().is_some_and(|src| src.name() == playbin_name);
 
                     if is_playbin {
                         let new_state = match sc.current() {
@@ -268,10 +263,7 @@ impl Player {
     /// playing and sends [`PlayerEvent::PositionChanged`].
     ///
     /// The timer self-cancels when the playbin is dropped (weak ref).
-    fn start_position_timer(
-        playbin: &gst::Element,
-        event_tx: &async_channel::Sender<PlayerEvent>,
-    ) {
+    fn start_position_timer(playbin: &gst::Element, event_tx: &async_channel::Sender<PlayerEvent>) {
         let playbin_weak = playbin.downgrade();
         let tx = event_tx.clone();
 
