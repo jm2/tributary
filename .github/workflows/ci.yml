@@ -180,7 +180,7 @@ jobs:
       - name: Bundle DLLs and create zip
         run: |
           MSYS_ROOT=$(cygpath -w /)
-          pwsh -File scripts/build-windows.ps1 -Msys2Root "$MSYS_ROOT"
+          pwsh -File scripts/build-windows.ps1 -Msys2Root "$MSYS_ROOT" -NoCargoBuild
         env:
           RUST_TARGET: ${{ matrix.rust_target }}
           MSYS_ENV: ${{ matrix.msys_env }}
