@@ -55,6 +55,12 @@ $env:PKG_CONFIG_PATH   = $pkgConfigPath
 $env:PKG_CONFIG_ALLOW_CROSS = "1"
 $env:PATH = "$MsysPath\bin;" + $env:PATH
 
+# Force Cargo to use MSYS2 tools instead of Rustup's incomplete bundled toolchain.
+$env:DLLTOOL = Join-Path $MsysPath "bin\dlltool.exe"
+$env:CC      = Join-Path $MsysPath "bin\gcc.exe"
+$env:CXX     = Join-Path $MsysPath "bin\g++.exe"
+$env:AR      = Join-Path $MsysPath "bin\ar.exe"
+
 Write-Info "PKG_CONFIG_PATH set to $pkgConfigPath"
 Write-Info "All dependency checks passed."
 
