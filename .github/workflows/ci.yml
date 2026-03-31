@@ -26,7 +26,6 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - name: Install system dependencies (Fedora)
-        # Git and curl are required for actions/checkout and rustup inside the container
         run: |
           dnf install -y gcc gtk4-devel libadwaita-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel \
@@ -71,11 +70,8 @@ jobs:
 
   # ── macOS (.app + .dmg) ───────────────────────────────────────────────────
   build-macos:
-    name: macOS (aarch64 + x86_64)
+    name: macOS (aarch64)
     runs-on: macos-15
-    strategy:
-      matrix:
-        arch: [aarch64, x86_64]
     steps:
       - uses: actions/checkout@v4
 
@@ -88,7 +84,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Add macOS target
-        run: rustup target add ${{ matrix.arch }}-apple-darwin
+        run: rustup target add aarch64-apple-darwin
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -98,27 +94,27 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: macos-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: macos-${{ matrix.arch }}-cargo-
+          key: macos-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-aarch64-cargo-
 
       - name: Build (release)
         run: |
           BREW_PREFIX="$(brew --prefix)"
           export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig"
-          cargo build --release --target ${{ matrix.arch }}-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
 
       - name: Create .app bundle and .dmg
         run: |
           mkdir -p dist
-          cp target/${{ matrix.arch }}-apple-darwin/release/tributary dist/
+          cp target/aarch64-apple-darwin/release/tributary dist/
           bash scripts/build-macos.sh --dmg
         env:
-          BINARY_PATH: target/${{ matrix.arch }}-apple-darwin/release/tributary
+          BINARY_PATH: target/aarch64-apple-darwin/release/tributary
 
       - name: Upload .dmg
         uses: actions/upload-artifact@v4
         with:
-          name: tributary-macos-${{ matrix.arch }}
+          name: tributary-macos-aarch64
           path: dist/Tributary.dmg
           if-no-files-found: error
 
@@ -177,6 +173,7 @@ jobs:
 
       - name: Build (release)
         run: |
+          export PKG_CONFIG_ALLOW_CROSS="1"
           export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
           cargo build --release --target ${{ matrix.rust_target }}
 
@@ -203,6 +200,10 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Python dependencies
+        # Uses --break-system-packages to bypass PEP 668 protections inside the CI container
+        run: pip3 install tomlkit aiohttp --break-system-packages || pip3 install tomlkit aiohttp
 
       - name: Download flatpak-cargo-generator
         run: |
