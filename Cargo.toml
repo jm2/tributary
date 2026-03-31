@@ -39,6 +39,23 @@ chrono = { version = "0.4", features = ["serde"] }
 # UUIDs
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Local backend — database (SQLite via SeaORM)
+sea-orm = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
+sea-orm-migration = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+
+# Local backend — audio tag parsing
+lofty = "0.22"
+
+# Local backend — filesystem watching
+notify = "8"
+walkdir = "2"
+
+# Thread bridging (GTK ↔ tokio)
+async-channel = "2"
+
+# XDG / platform directories
+dirs = "6"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

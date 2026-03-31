@@ -1,26 +1,14 @@
-//! Main application window — assembles all UI components.
-//!
-//! Layout:
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                      HeaderBar (full)                          │
-//! ├──────────┬──────────────────────────────────────────────────────┤
-//! │          │  ╔══════════╦══════════╦══════════╗                  │
-//! │ Sidebar  │  ║  Genre   ║  Artist  ║  Album   ║  ← Browser     │
-//! │          │  ╚══════════╩══════════╩══════════╝                  │
-//! │ (sources)│  ┌────────────────────────────────────────────────┐  │
-//! │          │  │  #  Title  Time  Artist  Album  Genre  Year…  │  │
-//! │          │  │  1  ...    3:42  ...     ...    ...    2019    │  │
-//! │          │  └────────────────────────────────────────────────┘  │
-//! │          │  40 songs, 3.2 hours                                 │
-//! └──────────┴──────────────────────────────────────────────────────┘
-//! ```
+//! Main application window — assembles all UI components and bridges
+//! the background library engine to the GTK main thread.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::glib;
 use tracing::info;
+
+use crate::local::engine::{LibraryEngine, LibraryEvent};
 
 use super::browser;
 use super::dummy_data;
@@ -40,126 +28,109 @@ const SIDEBAR_POS: i32 = 200;
 const BROWSER_POS: i32 = 220;
 
 /// Build and present the main Tributary window.
-pub fn build_window(app: &adw::Application) {
-    info!("Building main window (Phase 2 — full UI shell)");
+pub fn build_window(
+    app: &adw::Application,
+    rt_handle: tokio::runtime::Handle,
+    engine_tx: async_channel::Sender<LibraryEvent>,
+    engine_rx: async_channel::Receiver<LibraryEvent>,
+) {
+    info!("Building main window (Phase 3 — live local backend)");
 
     // ── Load custom CSS ──────────────────────────────────────────────
     load_css();
 
-    // ── Generate dummy data ──────────────────────────────────────────
+    // ── Generate dummy data (shown until FullSync arrives) ────────────
     let sources = dummy_data::build_sources();
     let all_tracks = dummy_data::build_tracks();
 
-    // ── Header Bar ───────────────────────────────────────────────────
+    // ── Header Bar with scan spinner ─────────────────────────────────
     let header = header_bar::build_header_bar();
+
+    // Add a spinner to the header bar for scan progress
+    let scan_spinner = gtk::Spinner::builder()
+        .spinning(true)
+        .tooltip_text("Scanning library…")
+        .build();
+    header.pack_end(&scan_spinner);
 
     // ── Sidebar ──────────────────────────────────────────────────────
     let sidebar_widget = sidebar::build_sidebar(&sources);
 
-    // ── Tracklist (we need the store and label handles for filtering) ─
+    // ── Tracklist ────────────────────────────────────────────────────
     let (tracklist_widget, track_store, status_label) =
         tracklist::build_tracklist(&all_tracks);
 
-    // Keep a copy of all tracks for filtering
     let all_tracks = Rc::new(all_tracks);
 
     // ── Browser (with filtering callback) ────────────────────────────
     let track_store_for_filter = track_store.clone();
     let status_label_for_filter = status_label.clone();
-    let all_tracks_for_filter = all_tracks.clone();
+    let _all_tracks_for_filter = all_tracks.clone();
 
-    // Track the currently filtered set for status updates
-    let _filtered_tracks: Rc<RefCell<Vec<TrackObject>>> =
-        Rc::new(RefCell::new(Vec::new()));
-    let ft = _filtered_tracks.clone();
+    let master_tracks: Rc<RefCell<Vec<TrackObject>>> =
+        Rc::new(RefCell::new((*all_tracks).clone()));
+    let master_for_filter = master_tracks.clone();
 
     let on_filter = Box::new(move |genre: Option<String>, artist: Option<String>, album: Option<String>| {
-        info!(?genre, ?artist, ?album, "Filter changed — updating tracklist");
-
-        // Filter the master list
-        let matching: Vec<&TrackObject> = all_tracks_for_filter
+        let master = master_for_filter.borrow();
+        let matching: Vec<&TrackObject> = master
             .iter()
             .filter(|t| {
                 if let Some(ref g) = genre {
-                    if &t.genre() != g {
-                        return false;
-                    }
+                    if &t.genre() != g { return false; }
                 }
                 if let Some(ref a) = artist {
-                    if &t.artist() != a {
-                        return false;
-                    }
+                    if &t.artist() != a { return false; }
                 }
                 if let Some(ref al) = album {
-                    if &t.album() != al {
-                        return false;
-                    }
+                    if &t.album() != al { return false; }
                 }
                 true
             })
             .collect();
 
-        // Rebuild the store
         track_store_for_filter.remove_all();
         let mut snapshot = Vec::new();
         for t in &matching {
             let new_t = TrackObject::new(
-                t.track_number(),
-                &t.title(),
-                t.duration_secs(),
-                &t.artist(),
-                &t.album(),
-                &t.genre(),
-                t.year(),
-                &t.date_modified(),
-                t.bitrate_kbps(),
-                t.sample_rate_hz(),
-                t.play_count(),
-                &t.format(),
+                t.track_number(), &t.title(), t.duration_secs(),
+                &t.artist(), &t.album(), &t.genre(), t.year(),
+                &t.date_modified(), t.bitrate_kbps(), t.sample_rate_hz(),
+                t.play_count(), &t.format(),
             );
             track_store_for_filter.append(&new_t);
             snapshot.push(new_t);
         }
-
-        // Update status
         tracklist::update_status(&status_label_for_filter, &snapshot);
-        *ft.borrow_mut() = snapshot;
     });
 
     let browser_widget = browser::build_browser(&all_tracks, on_filter);
 
-    // ── Right content: Browser (top) + Tracklist (bottom) ────────────
+    // ── Right content ────────────────────────────────────────────────
     let right_paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Vertical)
         .position(BROWSER_POS)
         .wide_handle(true)
-        .vexpand(true)
-        .hexpand(true)
+        .vexpand(true).hexpand(true)
         .start_child(&browser_widget)
         .end_child(&tracklist_widget)
-        .shrink_start_child(false)
-        .shrink_end_child(false)
+        .shrink_start_child(false).shrink_end_child(false)
         .build();
 
-    // ── Main: Sidebar (left) + Right content ─────────────────────────
     let main_paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
         .position(SIDEBAR_POS)
         .wide_handle(true)
-        .vexpand(true)
-        .hexpand(true)
+        .vexpand(true).hexpand(true)
         .start_child(&sidebar_widget)
         .end_child(&right_paned)
-        .shrink_start_child(false)
-        .shrink_end_child(false)
+        .shrink_start_child(false).shrink_end_child(false)
         .build();
 
-    // ── Outer layout: Header + main body ─────────────────────────────
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&header);
     content.append(&main_paned);
 
-    // ── Window ───────────────────────────────────────────────────────
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Tributary")
@@ -168,8 +139,110 @@ pub fn build_window(app: &adw::Application) {
         .content(&content)
         .build();
 
+    // ── Start the library engine on tokio ────────────────────────────
+    let music_dir = dirs::home_dir()
+        .expect("Could not determine home directory")
+        .join("Music");
+
+    let engine_tx_clone = engine_tx.clone();
+    rt_handle.spawn(async move {
+        match crate::db::connection::init_db().await {
+            Ok(db) => {
+                let engine = LibraryEngine::new(db, music_dir, engine_tx_clone);
+                engine.run().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to initialise database");
+                let _ = engine_tx_clone
+                    .send(LibraryEvent::Error(format!("Database error: {e}")))
+                    .await;
+            }
+        }
+    });
+
+    // ── Receive LibraryEvents on GTK main thread ─────────────────────
+    let track_store_for_events = track_store.clone();
+    let status_label_for_events = status_label.clone();
+    let master_tracks_for_events = master_tracks.clone();
+    let spinner = scan_spinner.clone();
+
+    glib::MainContext::default().spawn_local(async move {
+        while let Ok(event) = engine_rx.recv().await {
+            match event {
+                LibraryEvent::FullSync(tracks) => {
+                    info!(count = tracks.len(), "Received full library sync");
+
+                    // Replace everything
+                    track_store_for_events.remove_all();
+                    let mut new_master = Vec::new();
+
+                    for t in &tracks {
+                        let obj = arch_track_to_object(t);
+                        track_store_for_events.append(&obj);
+                        new_master.push(obj);
+                    }
+
+                    tracklist::update_status(&status_label_for_events, &new_master);
+                    *master_tracks_for_events.borrow_mut() = new_master;
+                }
+
+                LibraryEvent::TrackUpserted(track) => {
+                    // For now, just log — FullSync handles the bulk.
+                    // Real-time upsert into the GtkListStore will be done
+                    // after FullSync has been received.
+                    info!(
+                        title = %track.title,
+                        artist = %track.artist_name,
+                        "Track upserted"
+                    );
+                }
+
+                LibraryEvent::TrackRemoved(path) => {
+                    info!(path = %path, "Track removed");
+                    // FullSync will reconcile the state; for now just log.
+                }
+
+                LibraryEvent::ScanProgress(done, total) => {
+                    info!(done, total, "Scan progress");
+                }
+
+                LibraryEvent::ScanComplete => {
+                    info!("Library scan complete");
+                    spinner.set_spinning(false);
+                    spinner.set_visible(false);
+                }
+
+                LibraryEvent::Error(msg) => {
+                    tracing::error!(error = %msg, "Library engine error");
+                    spinner.set_spinning(false);
+                    spinner.set_visible(false);
+                }
+            }
+        }
+    });
+
     window.present();
     info!("Main window presented");
+}
+
+/// Convert an architecture `Track` to a UI `TrackObject`.
+fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObject {
+    TrackObject::new(
+        t.track_number.unwrap_or(0),
+        &t.title,
+        t.duration_secs.unwrap_or(0),
+        &t.artist_name,
+        &t.album_title,
+        t.genre.as_deref().unwrap_or(""),
+        t.year.unwrap_or(0),
+        &t.date_modified
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_default(),
+        t.bitrate_kbps.unwrap_or(0),
+        t.sample_rate_hz.unwrap_or(0),
+        t.play_count.unwrap_or(0),
+        t.format.as_deref().unwrap_or(""),
+    )
 }
 
 /// Load the custom CSS from the embedded stylesheet.

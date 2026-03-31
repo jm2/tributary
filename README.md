@@ -14,11 +14,13 @@ Tributary provides a unified interface for managing and streaming music from mul
 | GTK4 / libadwaita UI (Rhythmbox-style `GtkColumnView`) | ✅ Phase 2 |
 | Browser filtering (Genre → Artist → Album) | ✅ Phase 2 |
 | Local library with FS `date_modified` scanning | 🚧 Phase 3 |
-| GStreamer audio playback | 🚧 Phase 3 |
-| Subsonic / Navidrome backend | 📋 Phase 4 |
-| Jellyfin / Plex backend | 📋 Phase 4 |
-| DAAP / mDNS backend | 📋 Phase 4 |
+| Real-time filesystem watching (`notify`) | 🚧 Phase 3 |
+| SQLite persistence (`SeaORM`) | 🚧 Phase 3 |
+| GStreamer audio playback | 📋 Phase 4 |
 | MPRIS / SMTC / macOS Now Playing integration | 📋 Phase 4 |
+| Subsonic / Navidrome backend | 📋 Phase 5 |
+| Jellyfin / Plex backend | 📋 Phase 5 |
+| DAAP / mDNS backend | 📋 Phase 5 |
 | Cross-platform: Linux, macOS, Windows | ✅ CI scaffolded |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
@@ -176,10 +178,11 @@ data/                    # .desktop & AppStream metainfo
 
 ## Development Phases
 
-1. **Phase 1 (current):** Project skeleton, core traits, GTK4 window scaffold, CI/CD
-2. **Phase 2:** Full Rhythmbox-style UI with `GtkColumnView`, browser panes, album art grid
-3. **Phase 3:** Local backend (SQLite + `lofty` tag reader + FS scanner), GStreamer playback
-4. **Phase 4:** Remote backends (Subsonic, Jellyfin, DAAP), MPRIS/SMTC integration
+1. **Phase 1:** ✅ Project skeleton, core traits, GTK4 window scaffold, CI/CD
+2. **Phase 2:** ✅ Full Rhythmbox-style UI with `GtkColumnView`, browser filtering, multi-pane layout
+3. **Phase 3 (current):** Local backend — SQLite (`SeaORM`), `lofty` tag parsing, `notify` FS watching, async engine
+4. **Phase 4:** GStreamer audio playback, MPRIS/SMTC/macOS Now Playing integration
+5. **Phase 5:** Remote backends (Subsonic, Jellyfin, DAAP)
 
 ---
 
