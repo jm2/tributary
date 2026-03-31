@@ -1,0 +1,45 @@
+[package]
+name = "tributary"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A high-performance, Rhythmbox-style media manager with unified local and remote backends"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/jm2/tributary"
+authors = ["Tributary Contributors"]
+
+[dependencies]
+# GTK4 / Libadwaita UI
+gtk = { version = "0.11", package = "gtk4", features = ["v4_16"] }
+adw = { version = "0.9", package = "libadwaita", features = ["v1_6"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging / Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async trait support
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+
+# URL handling
+url = { version = "2", features = ["serde"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUIDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

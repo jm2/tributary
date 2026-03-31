@@ -1,0 +1,45 @@
+app-id: io.github.tributary.Tributary
+runtime: org.gnome.Platform
+runtime-version: "47"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: tributary
+finish-args:
+  # Wayland + X11 fallback
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # Audio output
+  - --socket=pulseaudio
+  # Network (for remote backends: Subsonic, Jellyfin, DAAP)
+  - --share=network
+  # Read access to home dir for local music library
+  - --filesystem=home:ro
+  # D-Bus for MPRIS media keys
+  - --own-name=org.mpris.MediaPlayer2.tributary
+  - --talk-name=org.freedesktop.DBus
+  # System theme / icon access
+  - --filesystem=xdg-data/themes:ro
+  - --filesystem=xdg-data/icons:ro
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/tributary/cargo
+    CARGO_NET_OFFLINE: "true"
+
+modules:
+  - name: tributary
+    buildsystem: simple
+    build-commands:
+      - cargo build --offline --release
+      - install -Dm0755 target/release/tributary /app/bin/tributary
+      - install -Dm0644 data/io.github.tributary.Tributary.desktop
+          /app/share/applications/io.github.tributary.Tributary.desktop
+      - install -Dm0644 data/io.github.tributary.Tributary.metainfo.xml
+          /app/share/metainfo/io.github.tributary.Tributary.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..
+      - cargo-sources.json

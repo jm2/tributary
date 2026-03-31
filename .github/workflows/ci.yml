@@ -1,0 +1,196 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Linux (native binary + test) ──────────────────────────────────────────
+  build-linux:
+    name: Linux (x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev \
+            pkg-config build-essential \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy (lint)
+        run: cargo clippy -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tributary-linux-x86_64
+          path: target/release/tributary
+          if-no-files-found: error
+
+  # ── macOS (.app + .dmg) ───────────────────────────────────────────────────
+  build-macos:
+    name: macOS (arm64 + x86_64)
+    runs-on: macos-15
+    strategy:
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Homebrew)
+        run: |
+          brew update
+          brew install gtk4 libadwaita pkg-config create-dmg
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add macOS target
+        run: rustup target add ${{ matrix.arch }}-apple-darwin
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-${{ matrix.arch }}-cargo-
+
+      - name: Build (release)
+        run: |
+          BREW_PREFIX="$(brew --prefix)"
+          export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig"
+          cargo build --release --target ${{ matrix.arch }}-apple-darwin
+
+      - name: Create .app bundle and .dmg
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.arch }}-apple-darwin/release/tributary dist/
+          bash scripts/build-macos.sh --dmg
+        env:
+          BINARY_PATH: target/${{ matrix.arch }}-apple-darwin/release/tributary
+
+      - name: Upload .dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: tributary-macos-${{ matrix.arch }}
+          path: dist/Tributary.dmg
+          if-no-files-found: error
+
+  # ── Windows (.zip DLL bundle) ─────────────────────────────────────────────
+  build-windows:
+    name: Windows (x86_64)
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+            mingw-w64-ucrt-x86_64-pkg-config
+            mingw-w64-ucrt-x86_64-toolchain
+
+      - name: Install Rust (GNU target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-cargo-
+
+      - name: Build (release)
+        run: |
+          export PKG_CONFIG_PATH="/ucrt64/lib/pkgconfig"
+          cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Bundle DLLs and create zip
+        shell: pwsh
+        run: .\scripts\build-windows.ps1 -Msys2Root "C:\msys64"
+
+      - name: Upload Windows zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: tributary-windows-x86_64
+          path: dist/tributary-windows.zip
+          if-no-files-found: error
+
+  # ── Flatpak ───────────────────────────────────────────────────────────────
+  build-flatpak:
+    name: Flatpak (Linux)
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate cargo-sources.json
+        run: |
+          python3 build-aux/flatpak/flatpak-cargo-generator.py \
+            Cargo.lock -o cargo-sources.json
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: tributary.flatpak
+          manifest-path: build-aux/flatpak/io.github.tributary.Tributary.yml
+          cache-key: flatpak-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Upload Flatpak bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: tributary-flatpak
+          path: tributary.flatpak
+          if-no-files-found: error

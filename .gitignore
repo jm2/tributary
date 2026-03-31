@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution builds
+/dist/
+*.dmg
+*.flatpak
+*.zip
+
+# Flatpak build artifacts
+.flatpak-builder/
+build-dir/
+repo/
+cargo-sources.json

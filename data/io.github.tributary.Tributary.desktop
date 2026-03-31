@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Tributary
+GenericName=Music Manager
+Comment=A high-performance, multi-source music manager
+Exec=tributary
+Icon=io.github.tributary.Tributary
+Terminal=false
+Categories=Audio;Music;Player;GNOME;GTK;
+Keywords=Music;Audio;Player;Library;FLAC;MP3;Subsonic;Jellyfin;
+StartupWMClass=tributary
+StartupNotify=true

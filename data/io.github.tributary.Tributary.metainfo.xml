@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.tributary.Tributary</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Tributary</name>
+  <summary>A high-performance, multi-source music manager</summary>
+
+  <description>
+    <p>
+      Tributary is a modern, Rhythmbox-style music manager built in Rust with
+      GTK4 and libadwaita. It provides a unified interface for managing and
+      streaming music from multiple sources:
+    </p>
+    <ul>
+      <li>Local library with fast filesystem scanning</li>
+      <li>Subsonic / Navidrome servers</li>
+      <li>Jellyfin and Plex media servers</li>
+      <li>DAAP / iTunes library sharing over mDNS</li>
+    </ul>
+    <p>
+      All backends share a common data model, ensuring a consistent experience
+      regardless of where your music lives.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.tributary.Tributary.desktop</launchable>
+
+  <url type="homepage">https://github.com/jm2/tributary</url>
+  <url type="bugtracker">https://github.com/jm2/tributary/issues</url>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.1.0" date="2026-03-30">
+      <description>
+        <p>Initial release — project skeleton and architecture.</p>
+      </description>
+    </release>
+  </releases>
+
+  <requires>
+    <display_length compare="ge">800</display_length>
+  </requires>
+
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+</component>
