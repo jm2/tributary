@@ -1,0 +1,3 @@
+// Windows resource file — embeds the app icon into the executable.
+// Compiled by the winres crate via build.rs.
+1 ICON "data/tributary.ico"

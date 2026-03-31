@@ -66,6 +66,9 @@ souvlaki = "0.8"
 [target.'cfg(target_os = "windows")'.dependencies]
 gdk4-win32 = "0.11"
 
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

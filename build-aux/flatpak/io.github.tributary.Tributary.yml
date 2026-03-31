@@ -39,6 +39,11 @@ modules:
           /app/share/applications/io.github.tributary.Tributary.desktop
       - install -Dm0644 data/io.github.tributary.Tributary.metainfo.xml
           /app/share/metainfo/io.github.tributary.Tributary.metainfo.xml
+      - for size in 16 24 32 48 64 128 256 512; do
+          install -Dm0644
+            "data/icons/hicolor/${size}x${size}/apps/io.github.tributary.Tributary.png"
+            "/app/share/icons/hicolor/${size}x${size}/apps/io.github.tributary.Tributary.png";
+        done
     sources:
       - type: dir
         path: ../..

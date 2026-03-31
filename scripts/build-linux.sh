@@ -39,6 +39,13 @@ info "Building Tributary (release)..."
 cargo build --release
 info "Binary: $(pwd)/target/release/tributary"
 
+# ── Install Icons (if running with --install or as root) ─────────────────────
+ICON_PREFIX="${DESTDIR:-/usr/local}/share/icons/hicolor"
+if [[ -d "data/icons/hicolor" ]]; then
+  info "To install icons system-wide, run:"
+  info "  sudo cp -r data/icons/hicolor/* /usr/local/share/icons/hicolor/"
+fi
+
 # ── Flatpak Bundle (optional) ────────────────────────────────────────────────
 if $FLATPAK; then
   command -v flatpak-builder &>/dev/null || error "flatpak-builder not found. Install: sudo apt install flatpak-builder"

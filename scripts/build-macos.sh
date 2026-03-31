@@ -66,6 +66,17 @@ cp -R "${BREW_PREFIX}/share/icons/Adwaita" "${APP_BUNDLE}/Contents/Resources/sha
 cp -R "${BREW_PREFIX}/share/glib-2.0/schemas" "${APP_BUNDLE}/Contents/Resources/share/glib-2.0/" 2>/dev/null || true
 glib-compile-schemas "${APP_BUNDLE}/Contents/Resources/share/glib-2.0/schemas" 2>/dev/null || true
 
+# Generate .icns from the iconset PNGs
+ICONSET_SRC="data/tributary.iconset"
+if [[ -d "$ICONSET_SRC" ]] && command -v iconutil &>/dev/null; then
+  iconutil -c icns -o "${APP_BUNDLE}/Contents/Resources/tributary.icns" "$ICONSET_SRC"
+  info "App icon created via iconutil."
+elif [[ -f "data/tributary.icns" ]]; then
+  cp "data/tributary.icns" "${APP_BUNDLE}/Contents/Resources/tributary.icns"
+else
+  warn "No app icon found — .app will use default icon."
+fi
+
 # Write Info.plist
 cat > "${APP_BUNDLE}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -78,6 +89,7 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key>         <string>${APP_NAME}</string>
   <key>CFBundleVersion</key>      <string>0.1.0</string>
   <key>CFBundlePackageType</key>  <string>APPL</string>
+  <key>CFBundleIconFile</key>     <string>tributary</string>
   <key>NSHighResolutionCapable</key> <true/>
   <key>LSMinimumSystemVersion</key>  <string>13.0</string>
 </dict>

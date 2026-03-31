@@ -1,3 +1,5 @@
+<img src="data/tributary.png" width="96" align="left" alt="Tributary icon">
+
 # Tributary
 
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
