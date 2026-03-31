@@ -164,9 +164,14 @@ pub fn build_header_bar() -> HeaderBarWidgets {
 
     // Modern GNOME primary menu (Ptyxis-style)
     let menu = gtk::gio::Menu::new();
-    menu.append(Some("_Preferences"), Some("app.preferences"));
-    menu.append(Some("_Keyboard Shortcuts"), Some("app.shortcuts"));
-    menu.append(Some("_About Tributary"), Some("app.about"));
+    let section1 = gtk::gio::Menu::new();
+    section1.append(Some("_Preferences"), Some("app.preferences"));
+    section1.append(Some("_Keyboard Shortcuts"), Some("app.shortcuts"));
+    section1.append(Some("_About Tributary"), Some("app.about"));
+    menu.append_section(None, &section1);
+    let section2 = gtk::gio::Menu::new();
+    section2.append(Some("_Quit"), Some("app.quit"));
+    menu.append_section(None, &section2);
 
     let menu_btn = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")

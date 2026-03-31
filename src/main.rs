@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::thread;
 
 use adw::prelude::*;
+use gtk::gio;
 use tracing::info;
 
 /// Reverse-DNS application identifier.
@@ -60,6 +61,14 @@ fn main() {
 
     // ── GTK Application ──────────────────────────────────────────────
     let app = adw::Application::builder().application_id(APP_ID).build();
+
+    // ── Application actions ─────────────────────────────────────────
+    let quit_action = gio::ActionEntry::builder("quit")
+        .activate(|app: &adw::Application, _, _| app.quit())
+        .build();
+    app.add_action_entries([quit_action]);
+    // <primary> = Cmd on macOS, Ctrl on Linux/Windows.
+    app.set_accels_for_action("app.quit", &["<primary>q"]);
 
     app.connect_activate(move |app| {
         ui::window::build_window(app, rt_handle.clone(), engine_tx.clone(), engine_rx.clone());

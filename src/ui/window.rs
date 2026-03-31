@@ -503,8 +503,9 @@ fn extract_hwnd(window: &adw::ApplicationWindow) -> Option<*mut std::ffi::c_void
     let surface = window.surface()?;
     let win32_surface = surface.downcast_ref::<gdk4_win32::Win32Surface>()?;
     let hwnd = win32_surface.handle();
-    // handle() returns an isize (HWND) — cast to the raw pointer souvlaki expects.
-    Some(hwnd as *mut std::ffi::c_void)
+    // handle() returns windows::Win32::Foundation::HWND(isize) —
+    // unwrap the newtype and cast to the raw pointer souvlaki expects.
+    Some(hwnd.0 as *mut std::ffi::c_void)
 }
 
 #[cfg(not(target_os = "windows"))]
