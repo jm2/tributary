@@ -25,7 +25,7 @@ info "Checking build dependencies..."
 command -v cargo &>/dev/null || error "cargo not found. Install Rust: https://rustup.rs"
 command -v brew  &>/dev/null || error "Homebrew not found. Install: https://brew.sh"
 
-for formula in gtk4 libadwaita pkg-config gstreamer; do
+for formula in gtk4 libadwaita pkg-config gstreamer adwaita-icon-theme; do
   brew list "$formula" &>/dev/null || {
     warn "$formula not installed. Installing via Homebrew..."
     brew install "$formula"
@@ -58,6 +58,13 @@ mkdir -p "${APP_BUNDLE}/Contents/Frameworks"
 
 # Copy binary
 cp "$BINARY" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
+
+# Copy GTK icons and schemas (silently fails if missing to avoid breaking the build)
+BREW_PREFIX="$(brew --prefix)"
+cp -R "${BREW_PREFIX}/share/icons/hicolor" "${APP_BUNDLE}/Contents/Resources/share/icons/" 2>/dev/null || true
+cp -R "${BREW_PREFIX}/share/icons/Adwaita" "${APP_BUNDLE}/Contents/Resources/share/icons/" 2>/dev/null || true
+cp -R "${BREW_PREFIX}/share/glib-2.0/schemas" "${APP_BUNDLE}/Contents/Resources/share/glib-2.0/" 2>/dev/null || true
+glib-compile-schemas "${APP_BUNDLE}/Contents/Resources/share/glib-2.0/schemas" 2>/dev/null || true
 
 # Write Info.plist
 cat > "${APP_BUNDLE}/Contents/Info.plist" <<PLIST
