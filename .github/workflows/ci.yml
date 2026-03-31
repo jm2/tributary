@@ -178,8 +178,9 @@ jobs:
           cargo build --release --target ${{ matrix.rust_target }}
 
       - name: Bundle DLLs and create zip
-        shell: pwsh
-        run: .\scripts\build-windows.ps1 -Msys2Root "C:\msys64"
+        run: |
+          MSYS_ROOT=$(cygpath -w /)
+          pwsh -File scripts/build-windows.ps1 -Msys2Root "$MSYS_ROOT"
         env:
           RUST_TARGET: ${{ matrix.rust_target }}
           MSYS_ENV: ${{ matrix.msys_env }}
@@ -202,7 +203,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Python dependencies
-        # Uses --break-system-packages to bypass PEP 668 protections inside the CI container
         run: pip3 install tomlkit aiohttp --break-system-packages || pip3 install tomlkit aiohttp
 
       - name: Download flatpak-cargo-generator
@@ -213,7 +213,7 @@ jobs:
       - name: Generate cargo-sources.json
         run: |
           python3 build-aux/flatpak/flatpak-cargo-generator.py \
-            Cargo.lock -o cargo-sources.json
+            Cargo.lock -o build-aux/flatpak/cargo-sources.json
 
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
