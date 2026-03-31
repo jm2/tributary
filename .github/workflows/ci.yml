@@ -13,18 +13,26 @@ env:
 jobs:
   # ── Linux (native binary + test) ──────────────────────────────────────────
   build-linux:
-    name: Linux (x86_64)
-    runs-on: ubuntu-24.04
+    name: Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: fedora:41
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system dependencies
+      - name: Install system dependencies (Fedora)
+        # Git and curl are required for actions/checkout and rustup inside the container
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-4-dev libadwaita-1-dev \
-            pkg-config build-essential \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+          dnf install -y gcc gtk4-devel libadwaita-devel \
+            gstreamer1-devel gstreamer1-plugins-base-devel \
+            pkgconf-pkg-config git curl
+
+      - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -39,8 +47,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: linux-cargo-
+          key: linux-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-${{ matrix.arch }}-cargo-
 
       - name: Check formatting
         run: cargo fmt --check
@@ -57,7 +65,7 @@ jobs:
       - name: Upload Linux binary
         uses: actions/upload-artifact@v4
         with:
-          name: tributary-linux-x86_64
+          name: tributary-linux-${{ matrix.arch }}
           path: target/release/tributary
           if-no-files-found: error
 
