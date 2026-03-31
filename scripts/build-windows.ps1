@@ -31,6 +31,13 @@ function Write-Err   { Write-Host "[tributary] $args" -ForegroundColor Red; exit
 $RustTarget = if ($env:RUST_TARGET) { $env:RUST_TARGET } else { "x86_64-pc-windows-gnu" }
 $MsysEnv    = if ($env:MSYS_ENV) { $env:MSYS_ENV } else { "ucrt64" }
 
+# Map the environment to the correct MSYS2 package prefix for error messages
+$PkgPrefix = switch ($MsysEnv) {
+    "ucrt64"     { "mingw-w64-ucrt-x86_64" }
+    "clangarm64" { "mingw-w64-clang-aarch64" }
+    default      { "mingw-w64-$MsysEnv" }
+}
+
 $MsysPath = Join-Path $Msys2Root $MsysEnv
 $DIST     = "dist\tributary-windows"
 
@@ -48,7 +55,7 @@ if (-not $NoCargoBuild -and -not (Get-Command cargo -ErrorAction SilentlyContinu
 # ── PKG_CONFIG setup ─────────────────────────────────────────────────────────
 $pkgConfigPath = Join-Path $MsysPath "lib\pkgconfig"
 if (-not (Test-Path $pkgConfigPath)) {
-    Write-Err "GTK4 pkgconfig not found at $pkgConfigPath.`nIn MSYS2 shell, run:`n  pacman -S mingw-w64-$MsysEnv-gtk4 mingw-w64-$MsysEnv-libadwaita"
+    Write-Err "GTK4 pkgconfig not found at $pkgConfigPath.`nIn MSYS2 shell, run:`n  pacman -S $PkgPrefix-gtk4 $PkgPrefix-libadwaita $PkgPrefix-pkg-config $PkgPrefix-toolchain"
 }
 
 $env:PKG_CONFIG_PATH   = $pkgConfigPath
