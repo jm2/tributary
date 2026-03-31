@@ -11,7 +11,8 @@ Tributary provides a unified interface for managing and streaming music from mul
 
 | Feature | Status |
 |---------|--------|
-| GTK4 / libadwaita UI (Rhythmbox-style `GtkColumnView`) | 🚧 Phase 2 |
+| GTK4 / libadwaita UI (Rhythmbox-style `GtkColumnView`) | ✅ Phase 2 |
+| Browser filtering (Genre → Artist → Album) | ✅ Phase 2 |
 | Local library with FS `date_modified` scanning | 🚧 Phase 3 |
 | GStreamer audio playback | 🚧 Phase 3 |
 | Subsonic / Navidrome backend | 📋 Phase 4 |
@@ -185,5 +186,3 @@ data/                    # .desktop & AppStream metainfo
 ## License
 
 Tributary is licensed under the [GNU General Public License v3.0 or later](LICENSE).
-
-This ensures compatibility with the broader GNOME ecosystem and guarantees that the software remains free and open.

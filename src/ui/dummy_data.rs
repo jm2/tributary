@@ -1,0 +1,141 @@
+#![allow(dead_code)]
+//! Hardcoded in-memory dummy data for UI development.
+//!
+//! Generates realistic-looking sources, browser items, and tracks so
+//! every pane has content to display and filtering can be tested.
+
+use super::objects::{BrowserItem, SourceObject, TrackObject};
+
+/// All dummy track data as a flat Vec of tuples for easy iteration.
+/// (track#, title, dur_secs, artist, album, genre, year, date_modified,
+///  bitrate, sample_rate, play_count, format)
+type TrackTuple = (
+    u32, &'static str, u64, &'static str, &'static str, &'static str,
+    i32, &'static str, u32, u32, u32, &'static str,
+);
+
+const TRACKS: &[TrackTuple] = &[
+    // ── Rock ────────────────────────────────────────────────────────
+    (1,  "Bohemian Rhapsody",     354, "Queen",          "A Night at the Opera",   "Rock", 1975, "2024-11-15", 320, 44100, 87,  "FLAC"),
+    (2,  "Don't Stop Me Now",     209, "Queen",          "A Night at the Opera",   "Rock", 1978, "2024-11-15", 320, 44100, 62,  "FLAC"),
+    (3,  "Somebody to Love",      296, "Queen",          "A Night at the Opera",   "Rock", 1976, "2024-11-15", 320, 44100, 34,  "FLAC"),
+    (4,  "Paranoid Android",      383, "Radiohead",      "OK Computer",            "Rock", 1997, "2025-01-20", 256, 44100, 41,  "FLAC"),
+    (5,  "Karma Police",          264, "Radiohead",      "OK Computer",            "Rock", 1997, "2025-01-20", 256, 44100, 55,  "FLAC"),
+    (6,  "Exit Music (For a Film)", 251, "Radiohead",    "OK Computer",            "Rock", 1997, "2025-01-20", 256, 44100, 29,  "FLAC"),
+    (7,  "Lucky",                 261, "Radiohead",      "OK Computer",            "Rock", 1997, "2025-01-20", 256, 44100, 18,  "FLAC"),
+    // ── Jazz ────────────────────────────────────────────────────────
+    (1,  "So What",               545, "Miles Davis",    "Kind of Blue",           "Jazz", 1959, "2024-06-01", 320, 96000, 120, "FLAC"),
+    (2,  "Freddie Freeloader",    587, "Miles Davis",    "Kind of Blue",           "Jazz", 1959, "2024-06-01", 320, 96000, 98,  "FLAC"),
+    (3,  "Blue in Green",         327, "Miles Davis",    "Kind of Blue",           "Jazz", 1959, "2024-06-01", 320, 96000, 74,  "FLAC"),
+    (4,  "All Blues",             695, "Miles Davis",    "Kind of Blue",           "Jazz", 1959, "2024-06-01", 320, 96000, 51,  "FLAC"),
+    (1,  "Take Five",             324, "Dave Brubeck",   "Time Out",               "Jazz", 1959, "2024-08-12", 256, 44100, 63,  "MP3"),
+    (2,  "Blue Rondo à la Turk",  404, "Dave Brubeck",   "Time Out",               "Jazz", 1959, "2024-08-12", 256, 44100, 22,  "MP3"),
+    // ── Electronic ──────────────────────────────────────────────────
+    (1,  "minipops 67",           297, "Aphex Twin",     "Syro",                   "Electronic", 2014, "2025-02-10", 320, 48000, 33, "FLAC"),
+    (2,  "XMAS_EVET10",          363, "Aphex Twin",     "Syro",                   "Electronic", 2014, "2025-02-10", 320, 48000, 19, "FLAC"),
+    (3,  "produk 29",             380, "Aphex Twin",     "Syro",                   "Electronic", 2014, "2025-02-10", 320, 48000, 27, "FLAC"),
+    (1,  "Midnight City",         244, "M83",            "Hurry Up, We're Dreaming", "Electronic", 2011, "2025-03-01", 320, 44100, 45, "AAC"),
+    (2,  "Outro",                 339, "M83",            "Hurry Up, We're Dreaming", "Electronic", 2011, "2025-03-01", 320, 44100, 38, "AAC"),
+    (3,  "Wait",                  296, "M83",            "Hurry Up, We're Dreaming", "Electronic", 2011, "2025-03-01", 256, 44100, 12, "AAC"),
+    // ── Classical ───────────────────────────────────────────────────
+    (1,  "Clair de Lune",         301, "Debussy",        "Suite bergamasque",      "Classical", 1905, "2024-03-22", 320, 96000, 91, "FLAC"),
+    (2,  "Rêverie",               262, "Debussy",        "Rêveries",               "Classical", 1890, "2024-03-22", 320, 96000, 44, "FLAC"),
+    (3,  "Arabesques No. 1",      254, "Debussy",        "Deux arabesques",        "Classical", 1891, "2024-03-22", 320, 96000, 37, "FLAC"),
+    // ── Hip-Hop ─────────────────────────────────────────────────────
+    (1,  "Alright",               219, "Kendrick Lamar", "To Pimp a Butterfly",    "Hip-Hop", 2015, "2025-01-05", 320, 44100, 58, "MP3"),
+    (2,  "King Kunta",            234, "Kendrick Lamar", "To Pimp a Butterfly",    "Hip-Hop", 2015, "2025-01-05", 320, 44100, 42, "MP3"),
+    (3,  "These Walls",           304, "Kendrick Lamar", "To Pimp a Butterfly",    "Hip-Hop", 2015, "2025-01-05", 256, 44100, 31, "MP3"),
+    (4,  "Wesley's Theory",       283, "Kendrick Lamar", "To Pimp a Butterfly",    "Hip-Hop", 2015, "2025-01-05", 256, 44100, 25, "MP3"),
+    (5,  "The Blacker the Berry", 331, "Kendrick Lamar", "To Pimp a Butterfly",    "Hip-Hop", 2015, "2025-01-05", 320, 44100, 39, "MP3"),
+    // ── Folk ────────────────────────────────────────────────────────
+    (1,  "Skinny Love",           214, "Bon Iver",       "For Emma, Forever Ago",  "Folk", 2007, "2024-12-18", 256, 44100, 67, "FLAC"),
+    (2,  "Flume",                 216, "Bon Iver",       "For Emma, Forever Ago",  "Folk", 2007, "2024-12-18", 256, 44100, 48, "FLAC"),
+    (3,  "Re: Stacks",            378, "Bon Iver",       "For Emma, Forever Ago",  "Folk", 2007, "2024-12-18", 256, 44100, 35, "FLAC"),
+    (1,  "Holocene",              338, "Bon Iver",       "Bon Iver",               "Folk", 2011, "2024-12-18", 320, 44100, 53, "FLAC"),
+    (2,  "Perth",                 264, "Bon Iver",       "Bon Iver",               "Folk", 2011, "2024-12-18", 320, 44100, 29, "FLAC"),
+    (3,  "Towers",                317, "Bon Iver",       "Bon Iver",               "Folk", 2011, "2024-12-18", 320, 44100, 22, "FLAC"),
+    // ── More Rock (for volume) ──────────────────────────────────────
+    (1,  "A-Punk",                137, "Vampire Weekend", "Vampire Weekend",       "Rock", 2008, "2025-02-28", 256, 44100, 70, "MP3"),
+    (2,  "Oxford Comma",          197, "Vampire Weekend", "Vampire Weekend",       "Rock", 2008, "2025-02-28", 256, 44100, 55, "MP3"),
+    (3,  "Cape Cod Kwassa Kwassa", 233, "Vampire Weekend", "Vampire Weekend",      "Rock", 2008, "2025-02-28", 256, 44100, 31, "MP3"),
+    (1,  "Everlong",              250, "Foo Fighters",   "The Colour and the Shape", "Rock", 1997, "2025-03-10", 320, 44100, 82, "FLAC"),
+    (2,  "My Hero",               260, "Foo Fighters",   "The Colour and the Shape", "Rock", 1997, "2025-03-10", 320, 44100, 64, "FLAC"),
+    (3,  "Monkey Wrench",         231, "Foo Fighters",   "The Colour and the Shape", "Rock", 1997, "2025-03-10", 320, 44100, 47, "FLAC"),
+];
+
+/// Build the sidebar source list.
+pub fn build_sources() -> Vec<SourceObject> {
+    vec![
+        SourceObject::header("Local"),
+        SourceObject::source("Local Filesystem",    "local",    "drive-harddisk-symbolic"),
+        SourceObject::header("Subsonic"),
+        SourceObject::source("Navidrome (Home)",     "subsonic", "network-server-symbolic"),
+        SourceObject::source("Gonic (Office)",       "subsonic", "network-server-symbolic"),
+        SourceObject::header("Jellyfin / Plex"),
+        SourceObject::source("Plex Media Server",    "plex",     "network-server-symbolic"),
+        SourceObject::header("DAAP"),
+        SourceObject::source("Living Room Mac",      "daap",     "network-workgroup-symbolic"),
+    ]
+}
+
+/// Build all `TrackObject` instances from dummy data.
+pub fn build_tracks() -> Vec<TrackObject> {
+    TRACKS
+        .iter()
+        .map(|t| {
+            TrackObject::new(
+                t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9, t.10, t.11,
+            )
+        })
+        .collect()
+}
+
+/// Extract unique genres from the track data with counts.
+pub fn build_genres(tracks: &[TrackObject]) -> Vec<BrowserItem> {
+    let mut map = std::collections::BTreeMap::<String, u32>::new();
+    for t in tracks {
+        *map.entry(t.genre()).or_insert(0) += 1;
+    }
+    let total: u32 = map.values().sum();
+    let mut items = vec![BrowserItem::new("All", total)];
+    for (genre, count) in &map {
+        items.push(BrowserItem::new(genre, *count));
+    }
+    items
+}
+
+/// Extract unique artists from the track data with counts.
+pub fn build_artists(tracks: &[TrackObject]) -> Vec<BrowserItem> {
+    let mut map = std::collections::BTreeMap::<String, u32>::new();
+    for t in tracks {
+        *map.entry(t.artist()).or_insert(0) += 1;
+    }
+    let total: u32 = map.values().sum();
+    let mut items = vec![BrowserItem::new("All", total)];
+    for (artist, count) in &map {
+        items.push(BrowserItem::new(artist, *count));
+    }
+    items
+}
+
+/// Extract unique albums from the track data with counts.
+pub fn build_albums(tracks: &[TrackObject]) -> Vec<BrowserItem> {
+    let mut map = std::collections::BTreeMap::<String, u32>::new();
+    for t in tracks {
+        *map.entry(t.album()).or_insert(0) += 1;
+    }
+    let total: u32 = map.values().sum();
+    let mut items = vec![BrowserItem::new("All", total)];
+    for (album, count) in &map {
+        items.push(BrowserItem::new(album, *count));
+    }
+    items
+}
+
+/// Compute a status bar summary string.
+pub fn status_summary(tracks: &[TrackObject]) -> String {
+    let count = tracks.len();
+    let total_secs: u64 = tracks.iter().map(|t| t.duration_secs()).sum();
+    let hours = total_secs as f64 / 3600.0;
+    format!("{count} songs, {hours:.1} hours")
+}

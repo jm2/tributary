@@ -72,6 +72,9 @@ pub struct Track {
 
     /// File format / codec (e.g., "FLAC", "MP3", "AAC").
     pub format: Option<String>,
+
+    /// Number of times this track has been played.
+    pub play_count: Option<u32>,
 }
 
 /// An album — a logical grouping of tracks.

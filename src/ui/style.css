@@ -1,0 +1,48 @@
+/* Tributary — Custom CSS overrides for the GTK4/libadwaita theme */
+
+/* Dense row spacing for the tracklist column view */
+.data-table .cell {
+    padding-top: 1px;
+    padding-bottom: 1px;
+}
+
+/* Status bar at bottom of tracklist */
+.statusbar-box {
+    background-color: alpha(@window_bg_color, 0.95);
+    border-top: 1px solid alpha(@borders, 0.3);
+}
+
+/* Sidebar header labels */
+.navigation-sidebar .heading {
+    font-weight: 700;
+    font-size: 0.85em;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+/* Browser pane column headers */
+.browser-header {
+    font-weight: 600;
+    font-size: 0.9em;
+    padding: 4px 8px;
+    border-bottom: 1px solid alpha(@borders, 0.3);
+    background-color: alpha(@headerbar_bg_color, 0.5);
+}
+
+/* Album art placeholder in header bar */
+.album-art-placeholder {
+    border-radius: 4px;
+    background-color: alpha(@window_fg_color, 0.08);
+    padding: 4px;
+}
+
+/* Progress scrubber — thinner track */
+.progress-scrubber trough {
+    min-height: 4px;
+}
+
+/* Subtle separator between browser panes */
+.browser-separator {
+    background-color: alpha(@borders, 0.3);
+    min-width: 1px;
+}
