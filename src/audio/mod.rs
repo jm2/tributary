@@ -305,17 +305,49 @@ impl Player {
     /// the bundled directory does not exist (dev/MSYS2 environment).
     #[cfg(target_os = "windows")]
     fn set_bundled_plugin_path() {
-        if std::env::var_os("GST_PLUGIN_PATH").is_some() {
-            return; // Respect explicit user override.
+        use std::env;
+
+        if env::var_os("GST_PLUGIN_PATH").is_some() {
+            info!("GST_PLUGIN_PATH already set — skipping bundled plugin detection");
+            return;
         }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let plugin_dir = dir.join("lib").join("gstreamer-1.0");
-                if plugin_dir.is_dir() {
-                    std::env::set_var("GST_PLUGIN_PATH", &plugin_dir);
-                    debug!(path = %plugin_dir.display(), "Set GST_PLUGIN_PATH for bundled plugins");
-                }
+
+        let exe = match env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Could not determine exe path: {e}");
+                return;
             }
+        };
+        let Some(dir) = exe.parent() else { return };
+        let plugin_dir = dir.join("lib").join("gstreamer-1.0");
+
+        if plugin_dir.is_dir() {
+            let count = std::fs::read_dir(&plugin_dir)
+                .map(|rd| {
+                    rd.filter(|e| {
+                        e.as_ref()
+                            .is_ok_and(|e| e.path().extension().is_some_and(|ext| ext == "dll"))
+                    })
+                    .count()
+                })
+                .unwrap_or(0);
+
+            env::set_var("GST_PLUGIN_PATH", &plugin_dir);
+            // Force a fresh registry scan so stale system paths don't win.
+            let registry = dir.join("gst-registry.bin");
+            env::set_var("GST_REGISTRY", &registry);
+
+            info!(
+                path = %plugin_dir.display(),
+                plugins = count,
+                "Bundled GStreamer plugins detected"
+            );
+        } else {
+            info!(
+                path = %plugin_dir.display(),
+                "No bundled GStreamer plugin directory found — using system plugins"
+            );
         }
     }
 }

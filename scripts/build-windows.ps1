@@ -55,10 +55,10 @@ if (-not $NoCargoBuild -and -not (Get-Command cargo -ErrorAction SilentlyContinu
 # ── PKG_CONFIG setup ─────────────────────────────────────────────────────────
 $pkgConfigPath = Join-Path $MsysPath "lib\pkgconfig"
 if (-not (Test-Path $pkgConfigPath)) {
-    Write-Err "GTK4 pkgconfig not found at $pkgConfigPath.`nIn MSYS2 shell, run:`n  pacman -S $PkgPrefix-gtk4 $PkgPrefix-libadwaita $PkgPrefix-gstreamer $PkgPrefix-gst-plugins-good $PkgPrefix-gst-plugins-bad $PkgPrefix-gst-libav $PkgPrefix-pkg-config $PkgPrefix-toolchain"
+    Write-Err "pkgconfig directory not found at $pkgConfigPath.`nIn MSYS2 shell, run:`n  pacman -S $PkgPrefix-pkg-config $PkgPrefix-toolchain"
 }
 
-$env:PKG_CONFIG_PATH   = $pkgConfigPath
+$env:PKG_CONFIG_PATH        = $pkgConfigPath
 $env:PKG_CONFIG_ALLOW_CROSS = "1"
 $env:PATH = "$MsysPath\bin;" + $env:PATH
 
@@ -69,6 +69,53 @@ $env:CXX     = Join-Path $MsysPath "bin\g++.exe"
 $env:AR      = Join-Path $MsysPath "bin\ar.exe"
 
 Write-Info "PKG_CONFIG_PATH set to $pkgConfigPath"
+
+# ── Per-package dependency checks (mirrors build-linux.sh) ───────────────────
+$pkgConfig = Join-Path $MsysPath "bin\pkg-config.exe"
+
+# Compile-time libraries (hard fail)
+$requiredPkgs = @(
+    @{ pc = "gtk4";           pkg = "gtk4" },
+    @{ pc = "libadwaita-1";   pkg = "libadwaita" },
+    @{ pc = "gstreamer-1.0";  pkg = "gstreamer" }
+)
+
+$missing = @()
+foreach ($dep in $requiredPkgs) {
+    $rc = & $pkgConfig --exists $dep.pc 2>$null; $ok = $LASTEXITCODE -eq 0
+    if ($ok) {
+        Write-Host "  [ok] $($dep.pc)"
+    } else {
+        Write-Host "  [MISSING] $($dep.pc)" -ForegroundColor Red
+        $missing += "$PkgPrefix-$($dep.pkg)"
+    }
+}
+if ($missing.Count -gt 0) {
+    Write-Err "Missing compile-time packages. In MSYS2 shell, run:`n  pacman -S $($missing -join ' ')"
+}
+
+# Runtime GStreamer plugins (warn only — not needed to compile)
+$gstPluginDir = Join-Path $MsysPath "lib\gstreamer-1.0"
+$pluginWarnings = @()
+foreach ($plugin in @("gst-plugins-good", "gst-plugins-bad", "gst-libav")) {
+    # Each package installs DLLs with a recognisable prefix into the plugin dir
+    $pattern = switch ($plugin) {
+        "gst-plugins-good" { "libgstaudioparsers.dll" }
+        "gst-plugins-bad"  { "libgstfdkaac.dll" }
+        "gst-libav"        { "libgstlibav.dll" }
+    }
+    $probe = Join-Path $gstPluginDir $pattern
+    if (Test-Path $probe) {
+        Write-Host "  [ok] $plugin"
+    } else {
+        Write-Host "  [MISSING] $plugin (audio codecs)" -ForegroundColor Yellow
+        $pluginWarnings += "$PkgPrefix-$plugin"
+    }
+}
+if ($pluginWarnings.Count -gt 0) {
+    Write-Warn "Missing GStreamer codec plugins — playback of some formats will fail.`n  pacman -S $($pluginWarnings -join ' ')"
+}
+
 Write-Info "All dependency checks passed."
 
 # ── Rust Build ───────────────────────────────────────────────────────────────
