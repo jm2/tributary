@@ -11,9 +11,7 @@ use super::objects::TrackObject;
 ///
 /// Returns `(outer_box, track_store, status_label)` so the caller can
 /// update the store when browser filters change and refresh the status.
-pub fn build_tracklist(
-    initial_tracks: &[TrackObject],
-) -> (gtk::Box, gio::ListStore, gtk::Label) {
+pub fn build_tracklist(initial_tracks: &[TrackObject]) -> (gtk::Box, gio::ListStore, gtk::Label) {
     let store = gio::ListStore::new::<TrackObject>();
     for t in initial_tracks {
         store.append(t);
@@ -31,18 +29,46 @@ pub fn build_tracklist(
         .build();
 
     // ── Define columns ───────────────────────────────────────────────
-    add_column(&column_view, "#",           50,  true,  |t: &TrackObject| t.track_number().to_string());
-    add_column(&column_view, "Title",       250, false, |t: &TrackObject| t.title());
-    add_column(&column_view, "Time",        60,  true,  |t: &TrackObject| t.duration_display());
-    add_column(&column_view, "Artist",      180, false, |t: &TrackObject| t.artist());
-    add_column(&column_view, "Album",       200, false, |t: &TrackObject| t.album());
-    add_column(&column_view, "Genre",       100, false, |t: &TrackObject| t.genre());
-    add_column(&column_view, "Year",        60,  true,  |t: &TrackObject| t.year_display());
-    add_column(&column_view, "Date Modified", 110, false, |t: &TrackObject| t.date_modified());
-    add_column(&column_view, "Bitrate",     80,  true,  |t: &TrackObject| t.bitrate_display());
-    add_column(&column_view, "Sample Rate", 80,  true,  |t: &TrackObject| t.sample_rate_display());
-    add_column(&column_view, "Plays",       60,  true,  |t: &TrackObject| t.play_count_display());
-    add_column(&column_view, "Format",      60,  false, |t: &TrackObject| t.format());
+    add_column(&column_view, "#", 50, true, |t: &TrackObject| {
+        t.track_number().to_string()
+    });
+    add_column(&column_view, "Title", 250, false, |t: &TrackObject| {
+        t.title()
+    });
+    add_column(&column_view, "Time", 60, true, |t: &TrackObject| {
+        t.duration_display()
+    });
+    add_column(&column_view, "Artist", 180, false, |t: &TrackObject| {
+        t.artist()
+    });
+    add_column(&column_view, "Album", 200, false, |t: &TrackObject| {
+        t.album()
+    });
+    add_column(&column_view, "Genre", 100, false, |t: &TrackObject| {
+        t.genre()
+    });
+    add_column(&column_view, "Year", 60, true, |t: &TrackObject| {
+        t.year_display()
+    });
+    add_column(
+        &column_view,
+        "Date Modified",
+        110,
+        false,
+        |t: &TrackObject| t.date_modified(),
+    );
+    add_column(&column_view, "Bitrate", 80, true, |t: &TrackObject| {
+        t.bitrate_display()
+    });
+    add_column(&column_view, "Sample Rate", 80, true, |t: &TrackObject| {
+        t.sample_rate_display()
+    });
+    add_column(&column_view, "Plays", 60, true, |t: &TrackObject| {
+        t.play_count_display()
+    });
+    add_column(&column_view, "Format", 60, false, |t: &TrackObject| {
+        t.format()
+    });
 
     // ── Scrolled container ───────────────────────────────────────────
     let scrolled = gtk::ScrolledWindow::builder()
@@ -103,11 +129,13 @@ fn add_column<F>(
 
     let ra = right_align;
     factory.connect_setup(move |_, list_item| {
-        let list_item = list_item
-            .downcast_ref::<gtk::ListItem>()
-            .expect("ListItem");
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
         let label = gtk::Label::builder()
-            .halign(if ra { gtk::Align::End } else { gtk::Align::Start })
+            .halign(if ra {
+                gtk::Align::End
+            } else {
+                gtk::Align::Start
+            })
             .margin_start(6)
             .margin_end(6)
             .margin_top(2)
@@ -119,9 +147,7 @@ fn add_column<F>(
     });
 
     factory.connect_bind(move |_, list_item| {
-        let list_item = list_item
-            .downcast_ref::<gtk::ListItem>()
-            .expect("ListItem");
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
         let track = list_item
             .item()
             .and_downcast::<TrackObject>()

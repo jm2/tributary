@@ -57,9 +57,7 @@ fn main() {
     let (engine_tx, engine_rx) = async_channel::unbounded();
 
     // ── GTK Application ──────────────────────────────────────────────
-    let app = adw::Application::builder()
-        .application_id(APP_ID)
-        .build();
+    let app = adw::Application::builder().application_id(APP_ID).build();
 
     app.connect_activate(move |app| {
         ui::window::build_window(app, rt_handle.clone(), engine_tx.clone(), engine_rx.clone());

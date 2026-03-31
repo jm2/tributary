@@ -46,7 +46,9 @@ pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
     let tagged_file = lofty::read_from_path(path)
         .with_context(|| format!("Failed to read tags from {}", path.display()))?;
 
-    let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag());
+    let tag = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag());
     let props = tagged_file.properties();
 
     // Extract tag fields
@@ -88,9 +90,7 @@ pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("Failed to read metadata for {}", path.display()))?;
 
-    let date_modified = metadata
-        .modified()
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let date_modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let date_modified: DateTime<Utc> = date_modified.into();
 
     let file_size_bytes = Some(metadata.len());

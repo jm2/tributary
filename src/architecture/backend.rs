@@ -64,11 +64,7 @@ pub trait MediaBackend: Send + Sync {
     // -------------------------------------------------------------------
 
     /// Retrieve all albums, optionally sorted.
-    async fn list_albums(
-        &self,
-        sort: SortField,
-        order: SortOrder,
-    ) -> BackendResult<Vec<Album>>;
+    async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>>;
 
     /// Retrieve all artists.
     async fn list_artists(&self) -> BackendResult<Vec<Artist>>;

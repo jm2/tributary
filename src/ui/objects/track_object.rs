@@ -76,18 +76,42 @@ impl TrackObject {
         obj
     }
 
-    pub fn track_number(&self) -> u32 { self.imp().track_number.get() }
-    pub fn title(&self) -> String { self.imp().title.borrow().clone() }
-    pub fn duration_secs(&self) -> u64 { self.imp().duration_secs.get() }
-    pub fn artist(&self) -> String { self.imp().artist.borrow().clone() }
-    pub fn album(&self) -> String { self.imp().album.borrow().clone() }
-    pub fn genre(&self) -> String { self.imp().genre.borrow().clone() }
-    pub fn year(&self) -> i32 { self.imp().year.get() }
-    pub fn date_modified(&self) -> String { self.imp().date_modified.borrow().clone() }
-    pub fn bitrate_kbps(&self) -> u32 { self.imp().bitrate_kbps.get() }
-    pub fn sample_rate_hz(&self) -> u32 { self.imp().sample_rate_hz.get() }
-    pub fn play_count(&self) -> u32 { self.imp().play_count.get() }
-    pub fn format(&self) -> String { self.imp().format.borrow().clone() }
+    pub fn track_number(&self) -> u32 {
+        self.imp().track_number.get()
+    }
+    pub fn title(&self) -> String {
+        self.imp().title.borrow().clone()
+    }
+    pub fn duration_secs(&self) -> u64 {
+        self.imp().duration_secs.get()
+    }
+    pub fn artist(&self) -> String {
+        self.imp().artist.borrow().clone()
+    }
+    pub fn album(&self) -> String {
+        self.imp().album.borrow().clone()
+    }
+    pub fn genre(&self) -> String {
+        self.imp().genre.borrow().clone()
+    }
+    pub fn year(&self) -> i32 {
+        self.imp().year.get()
+    }
+    pub fn date_modified(&self) -> String {
+        self.imp().date_modified.borrow().clone()
+    }
+    pub fn bitrate_kbps(&self) -> u32 {
+        self.imp().bitrate_kbps.get()
+    }
+    pub fn sample_rate_hz(&self) -> u32 {
+        self.imp().sample_rate_hz.get()
+    }
+    pub fn play_count(&self) -> u32 {
+        self.imp().play_count.get()
+    }
+    pub fn format(&self) -> String {
+        self.imp().format.borrow().clone()
+    }
 
     pub fn duration_display(&self) -> String {
         let secs = self.duration_secs();
@@ -96,21 +120,37 @@ impl TrackObject {
 
     pub fn year_display(&self) -> String {
         let y = self.year();
-        if y > 0 { y.to_string() } else { String::new() }
+        if y > 0 {
+            y.to_string()
+        } else {
+            String::new()
+        }
     }
 
     pub fn bitrate_display(&self) -> String {
         let b = self.bitrate_kbps();
-        if b > 0 { format!("{b} kbps") } else { String::new() }
+        if b > 0 {
+            format!("{b} kbps")
+        } else {
+            String::new()
+        }
     }
 
     pub fn sample_rate_display(&self) -> String {
         let sr = self.sample_rate_hz();
-        if sr > 0 { format!("{:.1} kHz", sr as f64 / 1000.0) } else { String::new() }
+        if sr > 0 {
+            format!("{:.1} kHz", sr as f64 / 1000.0)
+        } else {
+            String::new()
+        }
     }
 
     pub fn play_count_display(&self) -> String {
         let pc = self.play_count();
-        if pc > 0 { pc.to_string() } else { String::new() }
+        if pc > 0 {
+            pc.to_string()
+        } else {
+            String::new()
+        }
     }
 }

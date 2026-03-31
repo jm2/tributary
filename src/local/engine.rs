@@ -10,17 +10,15 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-};
+use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use super::tag_parser::{self, ParsedTrack};
 use crate::architecture::models::Track;
 use crate::db::entities::track;
-use super::tag_parser::{self, ParsedTrack};
 
 // ---------------------------------------------------------------------------
 // LibraryEvent — messages sent to GTK main thread
@@ -140,19 +138,17 @@ async fn initial_scan(
                 tokio::task::spawn_blocking(move || tag_parser::parse_audio_file(&p)).await;
 
             match parse_result {
-                Ok(Ok(parsed)) => {
-                    match upsert_track(db, &parsed, existing.as_ref()).await {
-                        Ok(track_model) => {
-                            let arch_track = db_model_to_track(&track_model);
-                            let _ = tx
-                                .send(LibraryEvent::TrackUpserted(Box::new(arch_track)))
-                                .await;
-                        }
-                        Err(e) => {
-                            warn!(path = %path_str, error = %e, "Failed to upsert track");
-                        }
+                Ok(Ok(parsed)) => match upsert_track(db, &parsed, existing.as_ref()).await {
+                    Ok(track_model) => {
+                        let arch_track = db_model_to_track(&track_model);
+                        let _ = tx
+                            .send(LibraryEvent::TrackUpserted(Box::new(arch_track)))
+                            .await;
                     }
-                }
+                    Err(e) => {
+                        warn!(path = %path_str, error = %e, "Failed to upsert track");
+                    }
+                },
                 Ok(Err(e)) => {
                     warn!(path = %path_str, error = %e, "Skipping unparseable file");
                 }
@@ -174,7 +170,9 @@ async fn initial_scan(
         if !on_disk_paths.contains(&row.file_path) {
             info!(path = %row.file_path, "Removing stale track from database");
             track::Entity::delete_by_id(&row.id).exec(db).await?;
-            let _ = tx.send(LibraryEvent::TrackRemoved(row.file_path.clone())).await;
+            let _ = tx
+                .send(LibraryEvent::TrackRemoved(row.file_path.clone()))
+                .await;
         }
     }
 
@@ -208,8 +206,7 @@ async fn watch_directory(
         move |res| {
             let _ = notify_tx.blocking_send(res);
         },
-        notify::Config::default()
-            .with_poll_interval(Duration::from_secs(2)),
+        notify::Config::default().with_poll_interval(Duration::from_secs(2)),
     )?;
 
     watcher.watch(music_dir.as_ref(), RecursiveMode::Recursive)?;
@@ -252,7 +249,8 @@ async fn handle_fs_event(
 
                 if path.exists() {
                     let p = path.clone();
-                    match tokio::task::spawn_blocking(move || tag_parser::parse_audio_file(&p)).await
+                    match tokio::task::spawn_blocking(move || tag_parser::parse_audio_file(&p))
+                        .await
                     {
                         Ok(Ok(parsed)) => {
                             let path_str = parsed.file_path.clone();

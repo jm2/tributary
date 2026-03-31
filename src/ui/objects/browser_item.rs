@@ -35,8 +35,12 @@ impl BrowserItem {
         obj
     }
 
-    pub fn label(&self) -> String { self.imp().label.borrow().clone() }
-    pub fn count(&self) -> u32 { self.imp().count.get() }
+    pub fn label(&self) -> String {
+        self.imp().label.borrow().clone()
+    }
+    pub fn count(&self) -> u32 {
+        self.imp().count.get()
+    }
 
     pub fn display(&self) -> String {
         format!("{} ({})", self.label(), self.count())

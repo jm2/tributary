@@ -15,10 +15,30 @@ impl MigrationTrait for Migration {
                     .table(Tracks::Table)
                     .if_not_exists()
                     .col(ColumnDef::new(Tracks::Id).string().not_null().primary_key())
-                    .col(ColumnDef::new(Tracks::FilePath).string().not_null().unique_key())
-                    .col(ColumnDef::new(Tracks::Title).string().not_null().default(""))
-                    .col(ColumnDef::new(Tracks::ArtistName).string().not_null().default(""))
-                    .col(ColumnDef::new(Tracks::AlbumTitle).string().not_null().default(""))
+                    .col(
+                        ColumnDef::new(Tracks::FilePath)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(
+                        ColumnDef::new(Tracks::Title)
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .col(
+                        ColumnDef::new(Tracks::ArtistName)
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .col(
+                        ColumnDef::new(Tracks::AlbumTitle)
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
                     .col(ColumnDef::new(Tracks::Genre).string().null())
                     .col(ColumnDef::new(Tracks::Year).integer().null())
                     .col(ColumnDef::new(Tracks::TrackNumber).integer().null())
@@ -27,7 +47,12 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(Tracks::BitrateKbps).integer().null())
                     .col(ColumnDef::new(Tracks::SampleRateHz).integer().null())
                     .col(ColumnDef::new(Tracks::Format).string().null())
-                    .col(ColumnDef::new(Tracks::PlayCount).integer().not_null().default(0))
+                    .col(
+                        ColumnDef::new(Tracks::PlayCount)
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
                     .col(ColumnDef::new(Tracks::DateAdded).string().not_null())
                     .col(ColumnDef::new(Tracks::DateModified).string().not_null())
                     .col(ColumnDef::new(Tracks::FileSizeBytes).big_integer().null())

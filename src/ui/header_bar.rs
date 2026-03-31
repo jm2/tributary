@@ -139,9 +139,7 @@ pub fn build_header_bar() -> adw::HeaderBar {
     right_box.append(&volume_box);
 
     // ── Assemble ─────────────────────────────────────────────────────
-    let header = adw::HeaderBar::builder()
-        .title_widget(&now_playing)
-        .build();
+    let header = adw::HeaderBar::builder().title_widget(&now_playing).build();
 
     header.pack_start(&playback_box);
     header.pack_end(&menu_btn);

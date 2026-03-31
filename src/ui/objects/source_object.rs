@@ -46,8 +46,16 @@ impl SourceObject {
         obj
     }
 
-    pub fn name(&self) -> String { self.imp().name.borrow().clone() }
-    pub fn backend_type(&self) -> String { self.imp().backend_type.borrow().clone() }
-    pub fn icon_name(&self) -> String { self.imp().icon_name.borrow().clone() }
-    pub fn is_header(&self) -> bool { self.imp().is_header.get() }
+    pub fn name(&self) -> String {
+        self.imp().name.borrow().clone()
+    }
+    pub fn backend_type(&self) -> String {
+        self.imp().backend_type.borrow().clone()
+    }
+    pub fn icon_name(&self) -> String {
+        self.imp().icon_name.borrow().clone()
+    }
+    pub fn is_header(&self) -> bool {
+        self.imp().is_header.get()
+    }
 }

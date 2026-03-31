@@ -22,10 +22,7 @@ pub type FilterCallback = Box<dyn Fn(Option<String>, Option<String>, Option<Stri
 /// item counts when filters change).
 ///
 /// Returns `(gtk::Box containing the browser, filter_callback_handle)`.
-pub fn build_browser(
-    all_tracks: &[TrackObject],
-    on_filter_changed: FilterCallback,
-) -> gtk::Box {
+pub fn build_browser(all_tracks: &[TrackObject], on_filter_changed: FilterCallback) -> gtk::Box {
     // Shared filter state
     let selected_genre: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let selected_artist: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -166,9 +163,7 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
     let factory = gtk::SignalListItemFactory::new();
 
     factory.connect_setup(|_, list_item| {
-        let list_item = list_item
-            .downcast_ref::<gtk::ListItem>()
-            .expect("ListItem");
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
         let label = gtk::Label::builder()
             .halign(gtk::Align::Start)
             .margin_start(8)
@@ -181,9 +176,7 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
     });
 
     factory.connect_bind(|_, list_item| {
-        let list_item = list_item
-            .downcast_ref::<gtk::ListItem>()
-            .expect("ListItem");
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
         let item = list_item
             .item()
             .and_downcast::<BrowserItem>()
@@ -244,11 +237,7 @@ fn get_selected_label(sel: &gtk::SingleSelection) -> Option<String> {
         .map(|item| item.label())
 }
 
-fn populate_genres(
-    store: &gio::ListStore,
-    tracks: &[TrackSnapshot],
-    _filter: &Option<String>,
-) {
+fn populate_genres(store: &gio::ListStore, tracks: &[TrackSnapshot], _filter: &Option<String>) {
     store.remove_all();
     let mut map = std::collections::BTreeMap::<String, u32>::new();
     for t in tracks {
@@ -362,4 +351,3 @@ fn get_store_from_pane(pane: &gtk::Box) -> Option<gio::ListStore> {
         .model()
         .and_then(|m| m.downcast::<gio::ListStore>().ok())
 }
-

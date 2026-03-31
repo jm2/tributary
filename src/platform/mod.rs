@@ -105,8 +105,7 @@ impl MediaControlsBackend for StubMediaControls {
 /// receiver for incoming OS media-key events.
 ///
 /// In Phase 1 all backends are stubs; the channel will never yield events.
-pub fn init_system_media_controls(
-) -> anyhow::Result<(
+pub fn init_system_media_controls() -> anyhow::Result<(
     Box<dyn MediaControlsBackend>,
     tokio::sync::mpsc::Receiver<OsMediaEvent>,
 )> {
@@ -117,12 +116,10 @@ pub fn init_system_media_controls(
     let _tx = tx;
 
     #[cfg(target_os = "linux")]
-    let backend: Box<dyn MediaControlsBackend> =
-        Box::new(StubMediaControls::new("linux/mpris"));
+    let backend: Box<dyn MediaControlsBackend> = Box::new(StubMediaControls::new("linux/mpris"));
 
     #[cfg(target_os = "windows")]
-    let backend: Box<dyn MediaControlsBackend> =
-        Box::new(StubMediaControls::new("windows/smtc"));
+    let backend: Box<dyn MediaControlsBackend> = Box::new(StubMediaControls::new("windows/smtc"));
 
     #[cfg(target_os = "macos")]
     let backend: Box<dyn MediaControlsBackend> =
@@ -130,8 +127,7 @@ pub fn init_system_media_controls(
 
     // Fallback for other/unsupported platforms (e.g., FreeBSD).
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    let backend: Box<dyn MediaControlsBackend> =
-        Box::new(StubMediaControls::new("unknown"));
+    let backend: Box<dyn MediaControlsBackend> = Box::new(StubMediaControls::new("unknown"));
 
     Ok((backend, rx))
 }

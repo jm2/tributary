@@ -63,11 +63,11 @@ jobs:
 
   # ── macOS (.app + .dmg) ───────────────────────────────────────────────────
   build-macos:
-    name: macOS (arm64 + x86_64)
+    name: macOS (aarch64 + x86_64)
     runs-on: macos-15
     strategy:
       matrix:
-        arch: [arm64, x86_64]
+        arch: [aarch64, x86_64]
     steps:
       - uses: actions/checkout@v4
 
@@ -116,29 +116,45 @@ jobs:
 
   # ── Windows (.zip DLL bundle) ─────────────────────────────────────────────
   build-windows:
-    name: Windows (x86_64)
-    runs-on: windows-2025
+    name: Windows (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2025
+            msystem: UCRT64
+            pkg_prefix: mingw-w64-ucrt-x86_64
+            rust_target: x86_64-pc-windows-gnu
+            msys_env: ucrt64
+          - arch: aarch64
+            runner: windows-11-arm
+            msystem: CLANGARM64
+            pkg_prefix: mingw-w64-clang-aarch64
+            rust_target: aarch64-pc-windows-gnullvm
+            msys_env: clangarm64
     defaults:
       run:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up MSYS2 (UCRT64)
+      - name: Set up MSYS2 (${{ matrix.msystem }})
         uses: msys2/setup-msys2@v2
         with:
-          msystem: UCRT64
+          msystem: ${{ matrix.msystem }}
+          path-type: inherit
           update: true
           install: >-
-            mingw-w64-ucrt-x86_64-gtk4
-            mingw-w64-ucrt-x86_64-libadwaita
-            mingw-w64-ucrt-x86_64-pkg-config
-            mingw-w64-ucrt-x86_64-toolchain
+            ${{ matrix.pkg_prefix }}-gtk4
+            ${{ matrix.pkg_prefix }}-libadwaita
+            ${{ matrix.pkg_prefix }}-pkg-config
+            ${{ matrix.pkg_prefix }}-toolchain
 
-      - name: Install Rust (GNU target)
+      - name: Install Rust (${{ matrix.rust_target }})
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu
+          targets: ${{ matrix.rust_target }}
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -148,22 +164,25 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: windows-cargo-
+          key: windows-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-${{ matrix.arch }}-cargo-
 
       - name: Build (release)
         run: |
-          export PKG_CONFIG_PATH="/ucrt64/lib/pkgconfig"
-          cargo build --release --target x86_64-pc-windows-gnu
+          export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
+          cargo build --release --target ${{ matrix.rust_target }}
 
       - name: Bundle DLLs and create zip
         shell: pwsh
         run: .\scripts\build-windows.ps1 -Msys2Root "C:\msys64"
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          MSYS_ENV: ${{ matrix.msys_env }}
 
       - name: Upload Windows zip
         uses: actions/upload-artifact@v4
         with:
-          name: tributary-windows-x86_64
+          name: tributary-windows-${{ matrix.arch }}
           path: dist/tributary-windows.zip
           if-no-files-found: error
 
@@ -176,6 +195,11 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download flatpak-cargo-generator
+        run: |
+          mkdir -p build-aux/flatpak
+          curl -o build-aux/flatpak/flatpak-cargo-generator.py https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
 
       - name: Generate cargo-sources.json
         run: |

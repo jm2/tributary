@@ -1,9 +1,7 @@
 //! `LocalBackend` — `MediaBackend` implementation for the local SQLite library.
 
 use async_trait::async_trait;
-use sea_orm::{
-    ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
-};
+use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter};
 use url::Url;
 use uuid::Uuid;
 
@@ -73,11 +71,7 @@ impl MediaBackend for LocalBackend {
         })
     }
 
-    async fn list_albums(
-        &self,
-        sort: SortField,
-        order: SortOrder,
-    ) -> BackendResult<Vec<Album>> {
+    async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
         // Derive albums from track data using GROUP BY equivalent
         let all_tracks = track::Entity::find()
             .all(&self.db)
@@ -86,17 +80,19 @@ impl MediaBackend for LocalBackend {
 
         let mut album_map = std::collections::BTreeMap::<String, Album>::new();
         for row in &all_tracks {
-            let entry = album_map.entry(row.album_title.clone()).or_insert_with(|| Album {
-                id: Uuid::new_v4(),
-                title: row.album_title.clone(),
-                artist_name: row.artist_name.clone(),
-                artist_id: None,
-                year: row.year,
-                genre: row.genre.clone(),
-                cover_art_url: None,
-                track_count: 0,
-                total_duration_secs: Some(0),
-            });
+            let entry = album_map
+                .entry(row.album_title.clone())
+                .or_insert_with(|| Album {
+                    id: Uuid::new_v4(),
+                    title: row.album_title.clone(),
+                    artist_name: row.artist_name.clone(),
+                    artist_id: None,
+                    year: row.year,
+                    genre: row.genre.clone(),
+                    cover_art_url: None,
+                    track_count: 0,
+                    total_duration_secs: Some(0),
+                });
             entry.track_count += 1;
             if let Some(dur) = row.duration_secs {
                 *entry.total_duration_secs.as_mut().unwrap() += dur as u64;

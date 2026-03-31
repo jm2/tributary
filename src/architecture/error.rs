@@ -24,10 +24,7 @@ pub enum BackendError {
 
     /// A requested entity was not found.
     #[error("{entity_type} not found: {id}")]
-    NotFound {
-        entity_type: String,
-        id: Uuid,
-    },
+    NotFound { entity_type: String, id: Uuid },
 
     /// The operation is not supported by this backend.
     ///

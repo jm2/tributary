@@ -55,50 +55,64 @@ pub fn build_window(
 
     // ── Tracklist (starts empty — populated by FullSync) ──────────────
     let empty_tracks: Vec<TrackObject> = Vec::new();
-    let (tracklist_widget, track_store, status_label) =
-        tracklist::build_tracklist(&empty_tracks);
+    let (tracklist_widget, track_store, status_label) = tracklist::build_tracklist(&empty_tracks);
 
     // ── Master track list (shared, mutable) ──────────────────────────
-    let master_tracks: Rc<RefCell<Vec<TrackObject>>> =
-        Rc::new(RefCell::new(Vec::new()));
+    let master_tracks: Rc<RefCell<Vec<TrackObject>>> = Rc::new(RefCell::new(Vec::new()));
 
     // ── Browser (starts empty, updated by FullSync) ──────────────────
     let track_store_for_filter = track_store.clone();
     let status_label_for_filter = status_label.clone();
     let master_for_filter = master_tracks.clone();
 
-    let on_filter = Box::new(move |genre: Option<String>, artist: Option<String>, album: Option<String>| {
-        let master = master_for_filter.borrow();
-        let matching: Vec<&TrackObject> = master
-            .iter()
-            .filter(|t| {
-                if let Some(ref g) = genre {
-                    if &t.genre() != g { return false; }
-                }
-                if let Some(ref a) = artist {
-                    if &t.artist() != a { return false; }
-                }
-                if let Some(ref al) = album {
-                    if &t.album() != al { return false; }
-                }
-                true
-            })
-            .collect();
+    let on_filter = Box::new(
+        move |genre: Option<String>, artist: Option<String>, album: Option<String>| {
+            let master = master_for_filter.borrow();
+            let matching: Vec<&TrackObject> = master
+                .iter()
+                .filter(|t| {
+                    if let Some(ref g) = genre {
+                        if &t.genre() != g {
+                            return false;
+                        }
+                    }
+                    if let Some(ref a) = artist {
+                        if &t.artist() != a {
+                            return false;
+                        }
+                    }
+                    if let Some(ref al) = album {
+                        if &t.album() != al {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect();
 
-        track_store_for_filter.remove_all();
-        let mut snapshot = Vec::new();
-        for t in &matching {
-            let new_t = TrackObject::new(
-                t.track_number(), &t.title(), t.duration_secs(),
-                &t.artist(), &t.album(), &t.genre(), t.year(),
-                &t.date_modified(), t.bitrate_kbps(), t.sample_rate_hz(),
-                t.play_count(), &t.format(),
-            );
-            track_store_for_filter.append(&new_t);
-            snapshot.push(new_t);
-        }
-        tracklist::update_status(&status_label_for_filter, &snapshot);
-    });
+            track_store_for_filter.remove_all();
+            let mut snapshot = Vec::new();
+            for t in &matching {
+                let new_t = TrackObject::new(
+                    t.track_number(),
+                    &t.title(),
+                    t.duration_secs(),
+                    &t.artist(),
+                    &t.album(),
+                    &t.genre(),
+                    t.year(),
+                    &t.date_modified(),
+                    t.bitrate_kbps(),
+                    t.sample_rate_hz(),
+                    t.play_count(),
+                    &t.format(),
+                );
+                track_store_for_filter.append(&new_t);
+                snapshot.push(new_t);
+            }
+            tracklist::update_status(&status_label_for_filter, &snapshot);
+        },
+    );
 
     let browser_widget = browser::build_browser(&empty_tracks, on_filter);
 
@@ -107,20 +121,24 @@ pub fn build_window(
         .orientation(gtk::Orientation::Vertical)
         .position(BROWSER_POS)
         .wide_handle(true)
-        .vexpand(true).hexpand(true)
+        .vexpand(true)
+        .hexpand(true)
         .start_child(&browser_widget)
         .end_child(&tracklist_widget)
-        .shrink_start_child(false).shrink_end_child(false)
+        .shrink_start_child(false)
+        .shrink_end_child(false)
         .build();
 
     let main_paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
         .position(SIDEBAR_POS)
         .wide_handle(true)
-        .vexpand(true).hexpand(true)
+        .vexpand(true)
+        .hexpand(true)
         .start_child(&sidebar_widget)
         .end_child(&right_paned)
-        .shrink_start_child(false).shrink_end_child(false)
+        .shrink_start_child(false)
+        .shrink_end_child(false)
         .build();
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -172,7 +190,8 @@ pub fn build_window(
                     info!(count = tracks.len(), "Received full library sync");
 
                     // Convert to TrackObjects
-                    let objects: Vec<TrackObject> = tracks.iter().map(arch_track_to_object).collect();
+                    let objects: Vec<TrackObject> =
+                        tracks.iter().map(arch_track_to_object).collect();
 
                     // Update tracklist store
                     track_store_for_events.remove_all();
