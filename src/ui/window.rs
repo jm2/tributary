@@ -11,7 +11,6 @@ use tracing::info;
 use crate::local::engine::{LibraryEngine, LibraryEvent};
 
 use super::browser;
-use super::dummy_data;
 use super::header_bar;
 use super::objects::TrackObject;
 use super::sidebar;
@@ -39,14 +38,12 @@ pub fn build_window(
     // ── Load custom CSS ──────────────────────────────────────────────
     load_css();
 
-    // ── Generate dummy data (shown until FullSync arrives) ────────────
-    let sources = dummy_data::build_sources();
-    let all_tracks = dummy_data::build_tracks();
+    // ── Sidebar sources (static for now) ─────────────────────────────
+    let sources = super::dummy_data::build_sources();
 
     // ── Header Bar with scan spinner ─────────────────────────────────
     let header = header_bar::build_header_bar();
 
-    // Add a spinner to the header bar for scan progress
     let scan_spinner = gtk::Spinner::builder()
         .spinning(true)
         .tooltip_text("Scanning library…")
@@ -56,19 +53,18 @@ pub fn build_window(
     // ── Sidebar ──────────────────────────────────────────────────────
     let sidebar_widget = sidebar::build_sidebar(&sources);
 
-    // ── Tracklist ────────────────────────────────────────────────────
+    // ── Tracklist (starts empty — populated by FullSync) ──────────────
+    let empty_tracks: Vec<TrackObject> = Vec::new();
     let (tracklist_widget, track_store, status_label) =
-        tracklist::build_tracklist(&all_tracks);
+        tracklist::build_tracklist(&empty_tracks);
 
-    let all_tracks = Rc::new(all_tracks);
+    // ── Master track list (shared, mutable) ──────────────────────────
+    let master_tracks: Rc<RefCell<Vec<TrackObject>>> =
+        Rc::new(RefCell::new(Vec::new()));
 
-    // ── Browser (with filtering callback) ────────────────────────────
+    // ── Browser (starts empty, updated by FullSync) ──────────────────
     let track_store_for_filter = track_store.clone();
     let status_label_for_filter = status_label.clone();
-    let _all_tracks_for_filter = all_tracks.clone();
-
-    let master_tracks: Rc<RefCell<Vec<TrackObject>>> =
-        Rc::new(RefCell::new((*all_tracks).clone()));
     let master_for_filter = master_tracks.clone();
 
     let on_filter = Box::new(move |genre: Option<String>, artist: Option<String>, album: Option<String>| {
@@ -104,7 +100,7 @@ pub fn build_window(
         tracklist::update_status(&status_label_for_filter, &snapshot);
     });
 
-    let browser_widget = browser::build_browser(&all_tracks, on_filter);
+    let browser_widget = browser::build_browser(&empty_tracks, on_filter);
 
     // ── Right content ────────────────────────────────────────────────
     let right_paned = gtk::Paned::builder()
@@ -166,30 +162,35 @@ pub fn build_window(
     let master_tracks_for_events = master_tracks.clone();
     let spinner = scan_spinner.clone();
 
+    // Keep references to browser stores so we can rebuild them on FullSync
+    let browser_ref = browser_widget.clone();
+
     glib::MainContext::default().spawn_local(async move {
         while let Ok(event) = engine_rx.recv().await {
             match event {
                 LibraryEvent::FullSync(tracks) => {
                     info!(count = tracks.len(), "Received full library sync");
 
-                    // Replace everything
-                    track_store_for_events.remove_all();
-                    let mut new_master = Vec::new();
+                    // Convert to TrackObjects
+                    let objects: Vec<TrackObject> = tracks.iter().map(arch_track_to_object).collect();
 
-                    for t in &tracks {
-                        let obj = arch_track_to_object(t);
-                        track_store_for_events.append(&obj);
-                        new_master.push(obj);
+                    // Update tracklist store
+                    track_store_for_events.remove_all();
+                    for obj in &objects {
+                        track_store_for_events.append(obj);
                     }
 
-                    tracklist::update_status(&status_label_for_events, &new_master);
-                    *master_tracks_for_events.borrow_mut() = new_master;
+                    // Update status bar
+                    tracklist::update_status(&status_label_for_events, &objects);
+
+                    // Rebuild browser panes with real data
+                    browser::rebuild_browser_data(&browser_ref, &objects);
+
+                    // Update master tracks
+                    *master_tracks_for_events.borrow_mut() = objects;
                 }
 
                 LibraryEvent::TrackUpserted(track) => {
-                    // For now, just log — FullSync handles the bulk.
-                    // Real-time upsert into the GtkListStore will be done
-                    // after FullSync has been received.
                     info!(
                         title = %track.title,
                         artist = %track.artist_name,
@@ -199,11 +200,12 @@ pub fn build_window(
 
                 LibraryEvent::TrackRemoved(path) => {
                     info!(path = %path, "Track removed");
-                    // FullSync will reconcile the state; for now just log.
                 }
 
                 LibraryEvent::ScanProgress(done, total) => {
-                    info!(done, total, "Scan progress");
+                    if done % 500 == 0 || done == total {
+                        info!(done, total, "Scan progress");
+                    }
                 }
 
                 LibraryEvent::ScanComplete => {

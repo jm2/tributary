@@ -310,3 +310,56 @@ fn populate_albums(
         store.append(&BrowserItem::new(album, *count));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Public API for rebuilding browser from FullSync
+// ---------------------------------------------------------------------------
+
+/// Rebuild all three browser pane stores from a new set of tracks.
+///
+/// Called from `window.rs` when a `FullSync` event arrives. Extracts the
+/// three `gio::ListStore` instances from the browser widget tree and
+/// repopulates them.
+pub fn rebuild_browser_data(browser_box: &gtk::Box, tracks: &[TrackObject]) {
+    let snapshots: Vec<TrackSnapshot> = tracks
+        .iter()
+        .map(|t| TrackSnapshot {
+            genre: t.genre(),
+            artist: t.artist(),
+            album: t.album(),
+        })
+        .collect();
+
+    // The browser_box has 3 children (genre_pane, artist_pane, album_pane)
+    let mut child = browser_box.first_child();
+    let mut panes = Vec::new();
+    while let Some(widget) = child {
+        if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
+            panes.push(pane.clone());
+        }
+        child = widget.next_sibling();
+    }
+
+    if panes.len() >= 3 {
+        if let Some(genre_store) = get_store_from_pane(&panes[0]) {
+            populate_genres(&genre_store, &snapshots, &None);
+        }
+        if let Some(artist_store) = get_store_from_pane(&panes[1]) {
+            populate_artists(&artist_store, &snapshots, &None);
+        }
+        if let Some(album_store) = get_store_from_pane(&panes[2]) {
+            populate_albums(&album_store, &snapshots, &None, &None);
+        }
+    }
+}
+
+/// Extract the `gio::ListStore` from a browser pane's widget tree.
+fn get_store_from_pane(pane: &gtk::Box) -> Option<gio::ListStore> {
+    let scrolled = pane.last_child()?.downcast::<gtk::ScrolledWindow>().ok()?;
+    let list_view = scrolled.child()?.downcast::<gtk::ListView>().ok()?;
+    let selection = list_view.model()?.downcast::<gtk::SingleSelection>().ok()?;
+    selection
+        .model()
+        .and_then(|m| m.downcast::<gio::ListStore>().ok())
+}
+

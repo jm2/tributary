@@ -136,12 +136,30 @@ async fn initial_scan(
 
         if needs_update {
             let p = path.clone();
-            let parsed = tokio::task::spawn_blocking(move || tag_parser::parse_audio_file(&p))
-                .await??;
+            let parse_result =
+                tokio::task::spawn_blocking(move || tag_parser::parse_audio_file(&p)).await;
 
-            let track_model = upsert_track(db, &parsed, existing.as_ref()).await?;
-            let arch_track = db_model_to_track(&track_model);
-            let _ = tx.send(LibraryEvent::TrackUpserted(Box::new(arch_track))).await;
+            match parse_result {
+                Ok(Ok(parsed)) => {
+                    match upsert_track(db, &parsed, existing.as_ref()).await {
+                        Ok(track_model) => {
+                            let arch_track = db_model_to_track(&track_model);
+                            let _ = tx
+                                .send(LibraryEvent::TrackUpserted(Box::new(arch_track)))
+                                .await;
+                        }
+                        Err(e) => {
+                            warn!(path = %path_str, error = %e, "Failed to upsert track");
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!(path = %path_str, error = %e, "Skipping unparseable file");
+                }
+                Err(e) => {
+                    warn!(path = %path_str, error = %e, "spawn_blocking failed");
+                }
+            }
         }
 
         scanned += 1;
