@@ -42,6 +42,7 @@ pub enum PlayerEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerState {
     Stopped,
+    Buffering,
     Playing,
     Paused,
 }
@@ -113,6 +114,9 @@ impl Player {
     // ── Playback controls ───────────────────────────────────────────
 
     /// Load a URI (e.g. `file:///path/to/song.flac`) and start playback.
+    ///
+    /// Immediately emits [`PlayerState::Buffering`] so the UI can show a
+    /// spinner while the pipeline transitions to `Playing`.
     pub fn load_uri(&self, uri: &str) {
         info!(uri, "Loading track");
         let _ = self.playbin.set_state(gst::State::Null);
@@ -120,6 +124,13 @@ impl Player {
         // Re-apply volume — the NULL transition resets it to 1.0.
         self.playbin
             .set_property("volume", slider_to_pipeline(self.volume));
+
+        // Signal buffering immediately — the bus watch will send
+        // `Playing` once the pipeline actually reaches that state.
+        let _ = self
+            .event_tx
+            .try_send(PlayerEvent::StateChanged(PlayerState::Buffering));
+
         let _ = self.playbin.set_state(gst::State::Playing);
     }
 
@@ -260,7 +271,17 @@ impl Player {
                     }
                 }
 
-                // TODO(Phase 4): Buffering, latency, tag, duration-changed
+                MessageView::Buffering(buffering) => {
+                    let percent = buffering.percent();
+                    debug!(percent, "Buffering");
+                    if percent < 100 {
+                        let _ = tx.try_send(PlayerEvent::StateChanged(PlayerState::Buffering));
+                    }
+                    // When buffering reaches 100%, GStreamer will emit a
+                    // StateChanged → Playing message, so we don't need to
+                    // send Playing here.
+                }
+
                 _ => {}
             }
 

@@ -46,3 +46,9 @@
     background-color: alpha(@borders, 0.3);
     min-width: 1px;
 }
+
+/* Buffering spinner inside the circular play button */
+.suggested-action.circular spinner {
+    min-width: 16px;
+    min-height: 16px;
+}

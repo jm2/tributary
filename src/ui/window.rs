@@ -667,15 +667,34 @@ pub fn build_window(
         let sm = sort_model.clone();
         let current_pos = current_pos.clone();
 
+        // Pre-build a spinner widget for the buffering state.
+        let buffering_spinner = gtk::Spinner::builder()
+            .spinning(true)
+            .width_request(16)
+            .height_request(16)
+            .build();
+
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = player_rx.recv().await {
                 match event {
                     PlayerEvent::StateChanged(state) => {
-                        let icon = match state {
-                            PlayerState::Playing => "media-playback-pause-symbolic",
-                            _ => "media-playback-start-symbolic",
-                        };
-                        play_btn.set_icon_name(icon);
+                        match state {
+                            PlayerState::Buffering => {
+                                // Replace the button icon with a spinner.
+                                play_btn.set_child(Some(&buffering_spinner));
+                                play_btn.set_icon_name("");
+                            }
+                            PlayerState::Playing => {
+                                // Restore icon: show pause.
+                                play_btn.set_child(Option::<&gtk::Widget>::None);
+                                play_btn.set_icon_name("media-playback-pause-symbolic");
+                            }
+                            _ => {
+                                // Stopped or Paused: show play.
+                                play_btn.set_child(Option::<&gtk::Widget>::None);
+                                play_btn.set_icon_name("media-playback-start-symbolic");
+                            }
+                        }
 
                         if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
                             ctrl.update_playback(state == PlayerState::Playing);
@@ -753,6 +772,10 @@ pub fn build_window(
 
                     PlayerEvent::Error(msg) => {
                         tracing::error!(error = %msg, "Player error");
+                        // On error, restore the play icon (stop the spinner
+                        // if we were buffering).
+                        play_btn.set_child(Option::<&gtk::Widget>::None);
+                        play_btn.set_icon_name("media-playback-start-symbolic");
                     }
                 }
             }
