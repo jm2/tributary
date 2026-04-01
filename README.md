@@ -1,4 +1,4 @@
-<img src="data/tributary.png" width="96" align="left" alt="Tributary icon">
+<img src="data/tributary.png" width="96" alt="Tributary icon">
 
 # Tributary
 
