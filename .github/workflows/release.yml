@@ -1,0 +1,368 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Linux Flatpak (x86_64 + aarch64) ─────────────────────────────────────
+  flatpak:
+    name: Flatpak (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python dependencies
+        run: pip3 install tomlkit aiohttp --break-system-packages || pip3 install tomlkit aiohttp
+
+      - name: Download flatpak-cargo-generator
+        run: |
+          mkdir -p build-aux/flatpak
+          curl -o build-aux/flatpak/flatpak-cargo-generator.py \
+            https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+
+      - name: Generate cargo-sources.json
+        run: |
+          python3 build-aux/flatpak/flatpak-cargo-generator.py \
+            Cargo.lock -o build-aux/flatpak/cargo-sources.json
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: tributary-linux-${{ matrix.arch }}.flatpak
+          manifest-path: build-aux/flatpak/io.github.tributary.Tributary.yml
+          cache-key: flatpak-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Upload Flatpak to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tributary-linux-${{ matrix.arch }}.flatpak
+
+  # ── macOS (.dmg) ──────────────────────────────────────────────────────────
+  macos:
+    name: macOS (aarch64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Homebrew)
+        run: |
+          brew update
+          brew install gtk4 libadwaita pkg-config create-dmg \
+            gstreamer gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav \
+            adwaita-icon-theme
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: release-macos-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-macos-aarch64-cargo-
+
+      - name: Build and create .dmg
+        run: bash scripts/build-macos.sh --dmg
+
+      - name: Rename DMG for release
+        run: mv dist/Tributary.dmg dist/tributary-macos-aarch64.dmg
+
+      - name: Upload DMG to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/tributary-macos-aarch64.dmg
+
+  # ── Windows (.zip + Inno Setup .exe) ──────────────────────────────────────
+  windows:
+    name: Windows (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2025
+            msystem: UCRT64
+            pkg_prefix: mingw-w64-ucrt-x86_64
+            rust_target: x86_64-pc-windows-gnu
+            msys_env: ucrt64
+            inno_arch: x64
+          - arch: aarch64
+            runner: windows-11-arm
+            msystem: CLANGARM64
+            pkg_prefix: mingw-w64-clang-aarch64
+            rust_target: aarch64-pc-windows-gnullvm
+            msys_env: clangarm64
+            inno_arch: arm64
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (${{ matrix.msystem }})
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          path-type: inherit
+          update: true
+          install: >-
+            ${{ matrix.pkg_prefix }}-gtk4
+            ${{ matrix.pkg_prefix }}-libadwaita
+            ${{ matrix.pkg_prefix }}-gstreamer
+            ${{ matrix.pkg_prefix }}-gst-plugins-good
+            ${{ matrix.pkg_prefix }}-gst-plugins-bad
+            ${{ matrix.pkg_prefix }}-gst-libav
+            ${{ matrix.pkg_prefix }}-pkg-config
+            ${{ matrix.pkg_prefix }}-toolchain
+
+      - name: Install Rust (${{ matrix.rust_target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: release-windows-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-windows-${{ matrix.arch }}-cargo-
+
+      - name: Build (release)
+        run: |
+          export PKG_CONFIG_ALLOW_CROSS="1"
+          export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
+          cargo build --release --target ${{ matrix.rust_target }}
+
+      - name: Bundle DLLs and create zip
+        run: |
+          MSYS_ROOT=$(cygpath -w /)
+          pwsh -File scripts/build-windows.ps1 -Msys2Root "$MSYS_ROOT" -NoCargoBuild
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          MSYS_ENV: ${{ matrix.msys_env }}
+
+      - name: Rename zip for release
+        shell: pwsh
+        run: |
+          Move-Item dist/tributary-windows.zip dist/tributary-windows-${{ matrix.arch }}.zip
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          # Add Inno Setup to PATH for this job
+          echo "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          scripts/build-windows.ps1 -Msys2Root "C:\msys64" -NoCargoBuild -SkipBundle -InnoSetup
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          MSYS_ENV: ${{ matrix.msys_env }}
+          INNO_ARCH: ${{ matrix.inno_arch }}
+
+      - name: Rename installer for release
+        shell: pwsh
+        run: |
+          Move-Item dist/tributary-setup.exe dist/tributary-windows-${{ matrix.arch }}-setup.exe
+
+      - name: Upload Windows artifacts to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/tributary-windows-${{ matrix.arch }}.zip
+            dist/tributary-windows-${{ matrix.arch }}-setup.exe
+
+  # ── Linux Native Installers (deb, rpm, arch pkg) ─────────────────────────
+  linux-deb:
+    name: Debian Package (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: debian:bookworm
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            deb_arch: amd64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            deb_arch: arm64
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential curl git pkg-config \
+            libgtk-4-dev libadwaita-1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libdbus-1-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: release-deb-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-deb-${{ matrix.arch }}-cargo-
+
+      - name: Build .deb package
+        run: cargo deb
+
+      - name: Rename .deb for release
+        run: |
+          DEB_FILE=$(ls target/debian/*.deb | head -1)
+          mv "$DEB_FILE" "target/debian/tributary-${{ matrix.deb_arch }}.deb"
+
+      - name: Upload .deb to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/debian/tributary-${{ matrix.deb_arch }}.deb
+
+  linux-rpm:
+    name: RPM Package (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: fedora:41
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            rpm_arch: x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            rpm_arch: aarch64
+    steps:
+      - name: Install system dependencies
+        run: |
+          dnf install -y gcc gtk4-devel libadwaita-devel \
+            dbus-devel \
+            gstreamer1-devel gstreamer1-plugins-base-devel \
+            pkgconf-pkg-config git curl
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: release-rpm-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-rpm-${{ matrix.arch }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Generate .rpm package
+        run: cargo generate-rpm
+
+      - name: Rename .rpm for release
+        run: |
+          RPM_FILE=$(ls target/generate-rpm/*.rpm | head -1)
+          mv "$RPM_FILE" "target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm"
+
+      - name: Upload .rpm to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
+
+  linux-arch:
+    name: Arch Linux Package (x86_64)
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install system dependencies
+        run: |
+          pacman -Syu --noconfirm git gtk4 libadwaita gstreamer \
+            gst-plugins-good gst-plugins-bad gst-libav dbus rustup
+
+      - name: Setup Rust
+        run: rustup default stable
+
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-arch-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-arch-x86_64-cargo-
+
+      - name: Build Arch package
+        run: |
+          # makepkg refuses to run as root, so create a build user
+          useradd -m builder
+          cp -r . /home/builder/tributary
+          chown -R builder:builder /home/builder/tributary
+
+          # Copy PKGBUILD and build
+          cd /home/builder/tributary
+          cp build-aux/arch/PKGBUILD .
+          # Set the version from the release tag
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" PKGBUILD
+
+          su builder -c "makepkg -sf --noconfirm --skipchecksums"
+
+      - name: Collect package
+        run: |
+          PKG_FILE=$(ls /home/builder/tributary/*.pkg.tar.zst | head -1)
+          mkdir -p dist
+          cp "$PKG_FILE" dist/tributary-x86_64.pkg.tar.zst
+
+      - name: Upload Arch package to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/tributary-x86_64.pkg.tar.zst

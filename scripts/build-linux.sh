@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 # scripts/build-linux.sh
 # Tributary — Linux release build helper
-# Usage: ./scripts/build-linux.sh [--flatpak]
+# Usage: ./scripts/build-linux.sh [--flatpak] [--deb] [--rpm] [--arch-pkg]
 set -euo pipefail
 
 FLATPAK=false
+DEB=false
+RPM=false
+ARCH_PKG=false
+
 for arg in "$@"; do
-  [[ "$arg" == "--flatpak" ]] && FLATPAK=true
+  case "$arg" in
+    --flatpak)   FLATPAK=true ;;
+    --deb)       DEB=true ;;
+    --rpm)       RPM=true ;;
+    --arch-pkg)  ARCH_PKG=true ;;
+  esac
 done
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -59,6 +68,66 @@ if $FLATPAK; then
   flatpak-builder --force-clean --repo=repo build-dir "$MANIFEST"
   flatpak build-bundle repo tributary.flatpak io.github.tributary.Tributary
   info "Flatpak bundle: $(pwd)/tributary.flatpak"
+fi
+
+# ── Debian Package (optional) ────────────────────────────────────────────────
+if $DEB; then
+  command -v cargo-deb &>/dev/null || {
+    info "Installing cargo-deb..."
+    cargo install cargo-deb
+  }
+
+  info "Building .deb package..."
+  cargo deb
+  DEB_FILE=$(ls target/debian/*.deb 2>/dev/null | head -1)
+  if [[ -n "$DEB_FILE" ]]; then
+    info "Debian package: $(pwd)/$DEB_FILE"
+  else
+    error "cargo-deb did not produce a .deb file"
+  fi
+fi
+
+# ── RPM Package (optional) ───────────────────────────────────────────────────
+if $RPM; then
+  command -v cargo-generate-rpm &>/dev/null || {
+    info "Installing cargo-generate-rpm..."
+    cargo install cargo-generate-rpm
+  }
+
+  info "Building .rpm package..."
+  cargo generate-rpm
+  RPM_FILE=$(ls target/generate-rpm/*.rpm 2>/dev/null | head -1)
+  if [[ -n "$RPM_FILE" ]]; then
+    info "RPM package: $(pwd)/$RPM_FILE"
+  else
+    error "cargo-generate-rpm did not produce an .rpm file"
+  fi
+fi
+
+# ── Arch Linux Package (optional) ────────────────────────────────────────────
+if $ARCH_PKG; then
+  command -v makepkg &>/dev/null || error "makepkg not found. This option requires Arch Linux (or an Arch-based distro)."
+
+  info "Building Arch Linux package..."
+  # Copy PKGBUILD to project root (makepkg expects it in cwd)
+  cp build-aux/arch/PKGBUILD .
+
+  # Extract version from Cargo.toml and patch PKGBUILD
+  CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+  sed -i "s/^pkgver=.*/pkgver=${CARGO_VERSION}/" PKGBUILD
+
+  makepkg -sf --noconfirm --skipchecksums
+  PKG_FILE=$(ls *.pkg.tar.zst 2>/dev/null | head -1)
+  if [[ -n "$PKG_FILE" ]]; then
+    mkdir -p dist
+    mv "$PKG_FILE" dist/
+    info "Arch package: $(pwd)/dist/$PKG_FILE"
+  else
+    error "makepkg did not produce a .pkg.tar.zst file"
+  fi
+
+  # Clean up PKGBUILD from project root
+  rm -f PKGBUILD
 fi
 
 info "Done."

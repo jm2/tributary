@@ -14,11 +14,16 @@
 
 .PARAMETER NoCargoBuild
     If specified, skips the cargo build step (useful for CI).
+
+.PARAMETER InnoSetup
+    If specified, builds an Inno Setup installer (.exe) from the bundled dist folder.
+    Requires Inno Setup 6 to be installed (iscc.exe in PATH or standard install location).
 #>
 param(
     [string]$Msys2Root = "C:\msys64",
     [switch]$SkipBundle,
-    [switch]$NoCargoBuild
+    [switch]$NoCargoBuild,
+    [switch]$InnoSetup
 )
 
 Set-StrictMode -Version Latest
@@ -40,6 +45,47 @@ $PkgPrefix = switch ($MsysEnv) {
 
 $MsysPath = Join-Path $Msys2Root $MsysEnv
 $DIST     = "dist\tributary-windows"
+
+# ── Inno Setup only mode ─────────────────────────────────────────────────────
+# When -InnoSetup is passed with -SkipBundle, skip straight to installer creation
+if ($InnoSetup -and $SkipBundle) {
+    Write-Info "Building Inno Setup installer..."
+
+    # Determine architecture for Inno Setup
+    $InnoArch = if ($env:INNO_ARCH) { $env:INNO_ARCH } else { "x64" }
+
+    # Extract version from Cargo.toml
+    $CargoVersion = (Select-String -Path "Cargo.toml" -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+
+    # Find iscc.exe
+    $iscc = $null
+    $isccPaths = @(
+        "iscc.exe",
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        "C:\Program Files\Inno Setup 6\ISCC.exe"
+    )
+    foreach ($p in $isccPaths) {
+        if (Get-Command $p -ErrorAction SilentlyContinue) { $iscc = $p; break }
+        if (Test-Path $p) { $iscc = $p; break }
+    }
+    if (-not $iscc) {
+        Write-Err "Inno Setup compiler (iscc.exe) not found. Install Inno Setup 6 from https://jrsoftware.org/isinfo.php"
+    }
+
+    $issFile = "build-aux\inno\tributary.iss"
+    $sourceDir = (Resolve-Path $DIST).Path
+    $outputDir = (Resolve-Path "dist").Path
+
+    Write-Info "Running Inno Setup compiler..."
+    & $iscc /DAppVersion="$CargoVersion" /DSourceDir="$sourceDir" /DOutputDir="$outputDir" /DTargetArch="$InnoArch" $issFile
+    if ($LASTEXITCODE -ne 0) { Write-Err "Inno Setup compilation failed." }
+
+    Write-Info "Installer created: $outputDir\tributary-setup.exe"
+    Write-Info "Done."
+    exit 0
+}
 
 # ── Dependency Checks ────────────────────────────────────────────────────────
 Write-Info "Checking build dependencies..."
@@ -209,5 +255,43 @@ $zipPath = "dist\tributary-windows.zip"
 Remove-Item $zipPath -ErrorAction SilentlyContinue
 Compress-Archive -Path $DIST -DestinationPath $zipPath
 Write-Info "Archive created: $((Get-Item $zipPath).FullName)"
+
+# ── Inno Setup Installer (optional) ─────────────────────────────────────────
+if ($InnoSetup) {
+    Write-Info "Building Inno Setup installer..."
+
+    # Determine architecture for Inno Setup
+    $InnoArch = if ($env:INNO_ARCH) { $env:INNO_ARCH } else { "x64" }
+
+    # Extract version from Cargo.toml
+    $CargoVersion = (Select-String -Path "Cargo.toml" -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+
+    # Find iscc.exe
+    $iscc = $null
+    $isccPaths = @(
+        "iscc.exe",
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        "C:\Program Files\Inno Setup 6\ISCC.exe"
+    )
+    foreach ($p in $isccPaths) {
+        if (Get-Command $p -ErrorAction SilentlyContinue) { $iscc = $p; break }
+        if (Test-Path $p) { $iscc = $p; break }
+    }
+    if (-not $iscc) {
+        Write-Err "Inno Setup compiler (iscc.exe) not found. Install Inno Setup 6 from https://jrsoftware.org/isinfo.php"
+    }
+
+    $issFile = "build-aux\inno\tributary.iss"
+    $sourceDir = (Resolve-Path $DIST).Path
+    $outputDir = (Resolve-Path "dist").Path
+
+    Write-Info "Running Inno Setup compiler..."
+    & $iscc /DAppVersion="$CargoVersion" /DSourceDir="$sourceDir" /DOutputDir="$outputDir" /DTargetArch="$InnoArch" $issFile
+    if ($LASTEXITCODE -ne 0) { Write-Err "Inno Setup compilation failed." }
+
+    Write-Info "Installer created: $outputDir\tributary-setup.exe"
+}
 
 Write-Info "Done."
