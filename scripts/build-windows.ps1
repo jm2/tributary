@@ -151,14 +151,17 @@ Copy-Item $exePath $DIST
 $ldd = Join-Path $MsysPath "bin\ldd.exe"
 if (-not (Test-Path $ldd)) { $ldd = "ldd" }
 
+# Regex to match the MSYS environment bin folder using EITHER forward or back slashes
+$pathRegex = "[/\\]$MsysEnv[/\\]bin[/\\]"
+
 Write-Info "Resolving DLLs with ldd..."
 
 & $ldd $exePath 2>$null |
-    Select-String "/$MsysEnv/bin/" |
+    Select-String $pathRegex |
     ForEach-Object {
         $parts = $_.Line -split "\s+"
         # ldd output: libname => /path/to/lib (0xaddr)
-        $libPath = $parts | Where-Object { $_ -like "*$MsysEnv/bin*" } | Select-Object -First 1
+        $libPath = $parts | Where-Object { $_ -match $pathRegex } | Select-Object -First 1
         if ($libPath -and (Test-Path $libPath)) {
             $dest = Join-Path $DIST (Split-Path $libPath -Leaf)
             if (-not (Test-Path $dest)) {
@@ -183,10 +186,10 @@ if (Test-Path $gstPluginSrc) {
     Write-Info "Resolving additional DLLs from GStreamer plugins..."
     Get-ChildItem "$gstPluginDest\*.dll" | ForEach-Object {
         & $ldd $_.FullName 2>$null |
-            Select-String "/$MsysEnv/bin/" |
+            Select-String $pathRegex |
             ForEach-Object {
                 $parts = $_.Line -split "\s+"
-                $libPath = $parts | Where-Object { $_ -like "*$MsysEnv/bin*" } | Select-Object -First 1
+                $libPath = $parts | Where-Object { $_ -match $pathRegex } | Select-Object -First 1
                 if ($libPath -and (Test-Path $libPath)) {
                     $dest = Join-Path $DIST (Split-Path $libPath -Leaf)
                     if (-not (Test-Path $dest)) {
