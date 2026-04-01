@@ -879,6 +879,7 @@ pub fn build_window(
     {
         let player = player.clone();
         let media_ctrl = media_ctrl.clone();
+        let album_art = hb.album_art.clone();
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
         let sort_model = sort_model.clone();
@@ -901,6 +902,7 @@ pub fn build_window(
                     &PlaybackContext {
                         model: sort_model.clone(),
                         player: player.clone(),
+                        album_art: album_art.clone(),
                         title_label: title_label.clone(),
                         artist_label: artist_label.clone(),
                         media_ctrl: media_ctrl.clone(),
@@ -954,6 +956,7 @@ pub fn build_window(
     {
         let player = player.clone();
         let media_ctrl = media_ctrl.clone();
+        let album_art = hb.album_art.clone();
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
         let sm = sort_model.clone();
@@ -965,6 +968,7 @@ pub fn build_window(
                 &PlaybackContext {
                     model: sm.clone(),
                     player: player.clone(),
+                    album_art: album_art.clone(),
                     title_label: title_label.clone(),
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
@@ -978,6 +982,7 @@ pub fn build_window(
     {
         let player = player.clone();
         let media_ctrl = media_ctrl.clone();
+        let album_art = hb.album_art.clone();
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
         let sm = sort_model.clone();
@@ -990,6 +995,7 @@ pub fn build_window(
                 &PlaybackContext {
                     model: sm.clone(),
                     player: player.clone(),
+                    album_art: album_art.clone(),
                     title_label: title_label.clone(),
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
@@ -1005,6 +1011,7 @@ pub fn build_window(
     {
         let player = player.clone();
         let media_ctrl = media_ctrl.clone();
+        let album_art = hb.album_art.clone();
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
         let sm = sort_model.clone();
@@ -1027,6 +1034,7 @@ pub fn build_window(
                     &PlaybackContext {
                         model: sm.clone(),
                         player: player.clone(),
+                        album_art: album_art.clone(),
                         title_label: title_label.clone(),
                         artist_label: artist_label.clone(),
                         media_ctrl: media_ctrl.clone(),
@@ -1042,6 +1050,7 @@ pub fn build_window(
     // ── Receive PlayerEvents on GTK main thread ─────────────────────
     {
         let play_btn = hb.play_button.clone();
+        let album_art = hb.album_art.clone();
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
         let progress_adj = hb.progress_adj.clone();
@@ -1113,6 +1122,7 @@ pub fn build_window(
                                     &PlaybackContext {
                                         model: sm.clone(),
                                         player: player.clone(),
+                                        album_art: album_art.clone(),
                                         title_label: title_label.clone(),
                                         artist_label: artist_label.clone(),
                                         media_ctrl: media_ctrl.clone(),
@@ -1128,6 +1138,7 @@ pub fn build_window(
                             &PlaybackContext {
                                 model: sm.clone(),
                                 player: player.clone(),
+                                album_art: album_art.clone(),
                                 title_label: title_label.clone(),
                                 artist_label: artist_label.clone(),
                                 media_ctrl: media_ctrl.clone(),
@@ -1142,6 +1153,7 @@ pub fn build_window(
                             play_btn.set_icon_name("media-playback-start-symbolic");
                             title_label.set_label("Not Playing");
                             artist_label.set_label("");
+                            album_art.set_icon_name(Some("audio-x-generic-symbolic"));
                             current_pos.set(None);
 
                             seeking.set(true);
@@ -1236,6 +1248,7 @@ fn display_tracks(
 struct PlaybackContext {
     model: gtk::SortListModel,
     player: Rc<RefCell<crate::audio::Player>>,
+    album_art: gtk::Image,
     title_label: gtk::Label,
     artist_label: gtk::Label,
     media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>>,
@@ -1267,11 +1280,54 @@ fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         .set_label(&format!("{} \u{2014} {}", track.artist(), track.album()));
     ctx.current_pos.set(Some(position));
 
+    // ── Update album art from embedded tags (in-memory) ─────────
+    update_album_art(&ctx.album_art, &uri);
+
     if let Some(ref mut ctrl) = *ctx.media_ctrl.borrow_mut() {
         ctrl.update_metadata(&track.title(), &track.artist(), &track.album());
     }
 
     true
+}
+
+/// Extract embedded album art from a track's file and display it on the
+/// header bar image widget.  Falls back to the generic placeholder icon
+/// if no art is found or the URI is not a local file.
+fn update_album_art(image: &gtk::Image, uri: &str) {
+    // Only attempt extraction for local file:// URIs.
+    let path = match url::Url::parse(uri) {
+        Ok(u) if u.scheme() == "file" => match u.to_file_path() {
+            Ok(p) => p,
+            Err(_) => {
+                image.set_icon_name(Some("audio-x-generic-symbolic"));
+                return;
+            }
+        },
+        _ => {
+            image.set_icon_name(Some("audio-x-generic-symbolic"));
+            return;
+        }
+    };
+
+    // Read tags and extract the first embedded picture.
+    let texture = (|| -> Option<gtk::gdk::Texture> {
+        use lofty::file::TaggedFileExt;
+
+        let tagged_file = lofty::read_from_path(&path).ok()?;
+        let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag())?;
+        let picture = tag.pictures().first()?;
+        let bytes = glib::Bytes::from(picture.data());
+        gtk::gdk::Texture::from_bytes(&bytes).ok()
+    })();
+
+    match texture {
+        Some(tex) => {
+            image.set_paintable(Some(&tex));
+        }
+        None => {
+            image.set_icon_name(Some("audio-x-generic-symbolic"));
+        }
+    }
 }
 
 /// Advance to the next track, respecting shuffle and repeat-all.
