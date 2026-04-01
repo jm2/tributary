@@ -1314,7 +1314,9 @@ fn update_album_art(image: &gtk::Image, uri: &str) {
         use lofty::file::TaggedFileExt;
 
         let tagged_file = lofty::read_from_path(&path).ok()?;
-        let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag())?;
+        let tag = tagged_file
+            .primary_tag()
+            .or_else(|| tagged_file.first_tag())?;
         let picture = tag.pictures().first()?;
         let bytes = glib::Bytes::from(picture.data());
         gtk::gdk::Texture::from_bytes(&bytes).ok()
