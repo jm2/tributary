@@ -1078,8 +1078,11 @@ pub fn build_window(
                         match state {
                             PlayerState::Buffering => {
                                 // Replace the button icon with a spinner.
+                                // NOTE: Do NOT call set_icon_name() here — in GTK4
+                                // it replaces the button's child with a new Image,
+                                // which would immediately destroy the spinner we
+                                // just set.
                                 play_btn.set_child(Some(&buffering_spinner));
-                                play_btn.set_icon_name("");
                             }
                             PlayerState::Playing => {
                                 // Restore icon: show pause.

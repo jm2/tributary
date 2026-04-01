@@ -36,6 +36,14 @@ use tracing::info;
 const APP_ID: &str = "io.github.tributary.Tributary";
 
 fn main() {
+    // ── macOS .app bundle environment setup ──────────────────────────
+    // When launched from a .app bundle (e.g. Finder / Launchpad), the
+    // working directory is unpredictable and LSEnvironment relative
+    // paths don't resolve correctly.  Detect the bundle at runtime and
+    // set absolute paths so GTK/Adwaita can find icons, schemas, etc.
+    #[cfg(target_os = "macos")]
+    setup_macos_bundle_env();
+
     // ── Tracing ──────────────────────────────────────────────────────
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -89,4 +97,98 @@ fn main() {
     // Run the GTK main loop.  This blocks until the last window closes.
     let exit_code = app.run();
     std::process::exit(exit_code.into());
+}
+
+// ── macOS .app bundle environment ───────────────────────────────────────
+
+/// Detect whether we are running inside a `.app` bundle and, if so,
+/// set the environment variables that GTK4, libadwaita, GDK-Pixbuf,
+/// and GStreamer need to find their bundled resources.
+///
+/// The `.app` layout is:
+/// ```text
+/// Tributary.app/
+///   Contents/
+///     MacOS/Tributary          ← executable
+///     Resources/
+///       share/icons/…          ← icon themes (hicolor, Adwaita)
+///       share/glib-2.0/schemas ← compiled GSettings schemas
+///       lib/gdk-pixbuf-2.0/…   ← pixbuf loaders
+///       lib/gstreamer-1.0/…    ← GStreamer plugins
+/// ```
+///
+/// `LSEnvironment` in `Info.plist` uses relative paths which only work
+/// when the working directory happens to be `Contents/MacOS`.  macOS
+/// does **not** guarantee that — Finder typically sets it to `/`.
+/// This function computes absolute paths from `current_exe()`.
+#[cfg(target_os = "macos")]
+fn setup_macos_bundle_env() {
+    use std::env;
+    use std::path::PathBuf;
+
+    let exe = match env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    // Canonicalise symlinks so we get the real path inside the bundle.
+    let exe = exe.canonicalize().unwrap_or(exe);
+
+    // Check we're inside a .app bundle:
+    //   …/Tributary.app/Contents/MacOS/Tributary
+    let macos_dir = match exe.parent() {
+        Some(d) => d,
+        None => return,
+    };
+    let contents_dir = match macos_dir.parent() {
+        Some(d) => d,
+        None => return,
+    };
+
+    // Verify the directory structure looks like a .app bundle.
+    if !macos_dir.ends_with("Contents/MacOS") {
+        return; // Not running from a .app bundle — nothing to do.
+    }
+
+    let resources_dir = contents_dir.join("Resources");
+    if !resources_dir.is_dir() {
+        return; // No Resources directory — probably a dev build.
+    }
+
+    // Helper: only set a var if it isn't already overridden by the user.
+    let set_if_unset = |key: &str, value: PathBuf| {
+        if env::var_os(key).is_none() && value.exists() {
+            env::set_var(key, &value);
+        }
+    };
+
+    // XDG_DATA_DIRS — GTK and Adwaita look here for icon themes.
+    let share_dir = resources_dir.join("share");
+    set_if_unset("XDG_DATA_DIRS", share_dir.clone());
+
+    // GSETTINGS_SCHEMA_DIR — compiled GSettings schemas.
+    let schemas_dir = share_dir.join("glib-2.0").join("schemas");
+    set_if_unset("GSETTINGS_SCHEMA_DIR", schemas_dir);
+
+    // GDK_PIXBUF_MODULE_FILE — pixbuf loader cache.
+    let pixbuf_cache = resources_dir
+        .join("lib")
+        .join("gdk-pixbuf-2.0")
+        .join("2.10.0")
+        .join("loaders.cache");
+    set_if_unset("GDK_PIXBUF_MODULE_FILE", pixbuf_cache);
+
+    // GST_PLUGIN_PATH — bundled GStreamer plugins.
+    let gst_plugins = resources_dir.join("lib").join("gstreamer-1.0");
+    set_if_unset("GST_PLUGIN_PATH", gst_plugins.clone());
+
+    // Prevent GStreamer from also scanning system plugin paths which
+    // may contain incompatible versions.
+    if env::var_os("GST_PLUGIN_SYSTEM_PATH").is_none() && gst_plugins.is_dir() {
+        env::set_var("GST_PLUGIN_SYSTEM_PATH", "");
+    }
+
+    // GTK_PATH — helps GTK find the bundled IM modules / print backends.
+    let gtk_path = resources_dir.join("lib").join("gtk-4.0");
+    set_if_unset("GTK_PATH", gtk_path);
 }
