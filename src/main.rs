@@ -10,10 +10,12 @@ mod architecture;
 mod audio;
 mod db;
 mod desktop_integration;
+mod discovery;
 #[allow(dead_code)]
 mod local;
 #[allow(dead_code)]
 mod platform;
+mod subsonic;
 mod ui;
 
 use std::sync::Arc;

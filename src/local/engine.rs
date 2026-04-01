@@ -29,6 +29,11 @@ use crate::db::entities::track;
 pub enum LibraryEvent {
     /// Complete library snapshot after initial scan.
     FullSync(Vec<Track>),
+    /// Tracks from a remote backend, keyed by source (e.g. server URL).
+    RemoteSync {
+        source_key: String,
+        tracks: Vec<Track>,
+    },
     /// A single track was added or updated.
     TrackUpserted(Box<Track>),
     /// A track was removed (by file_path).

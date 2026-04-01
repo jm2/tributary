@@ -585,13 +585,9 @@ pub fn build_sources() -> Vec<SourceObject> {
     vec![
         SourceObject::header("Local"),
         SourceObject::source("Local Filesystem", "local", "drive-harddisk-symbolic"),
-        SourceObject::header("Subsonic"),
-        SourceObject::source("Navidrome (Home)", "subsonic", "network-server-symbolic"),
-        SourceObject::source("Gonic (Office)", "subsonic", "network-server-symbolic"),
-        SourceObject::header("Jellyfin / Plex"),
-        SourceObject::source("Plex Media Server", "plex", "network-server-symbolic"),
-        SourceObject::header("DAAP"),
-        SourceObject::source("Living Room Mac", "daap", "network-workgroup-symbolic"),
+        // Remote servers are populated dynamically by mDNS discovery
+        // and env-var configuration — see window.rs.
+        SourceObject::header("Network"),
     ]
 }
 

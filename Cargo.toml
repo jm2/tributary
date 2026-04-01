@@ -37,7 +37,7 @@ url = { version = "2", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # UUIDs
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # Local backend — database (SQLite via SeaORM)
 sea-orm = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
@@ -58,6 +58,13 @@ dirs = "6"
 
 # Shuffle randomness (zero-dependency PRNG)
 fastrand = "2"
+
+# Subsonic API client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+md-5 = "0.10"
+
+# mDNS service discovery (Subsonic/DAAP auto-detect)
+mdns-sd = "0.12"
 
 # Audio playback (GStreamer pipeline)
 gstreamer = "0.25"

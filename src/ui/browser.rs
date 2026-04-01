@@ -21,6 +21,7 @@ pub type FilterCallback = Box<dyn Fn(Option<String>, Option<String>, Option<Stri
 
 /// Opaque handle to the browser's internal track snapshot.
 /// Passed back to [`rebuild_browser_data`] when the library changes.
+#[derive(Clone)]
 pub struct BrowserState {
     tracks: Rc<RefCell<Vec<TrackSnapshot>>>,
 }

@@ -3,6 +3,7 @@
 //! media controls to the GTK main thread.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -16,7 +17,7 @@ use crate::ui::header_bar::RepeatMode;
 
 use super::browser;
 use super::header_bar;
-use super::objects::TrackObject;
+use super::objects::{SourceObject, TrackObject};
 use super::sidebar;
 use super::tracklist;
 
@@ -46,8 +47,21 @@ pub fn build_window(
     // ── Load custom CSS ──────────────────────────────────────────────
     load_css();
 
-    // ── Sidebar sources (static for now) ─────────────────────────────
+    // ── Sidebar sources ────────────────────────────────────────────────
     let sources = super::dummy_data::build_sources();
+
+    // If env vars are set, add a pre-configured Subsonic entry.
+    let mut sources = sources;
+    if let (Ok(url), Ok(_user), Ok(_pass)) = (
+        std::env::var("SUBSONIC_URL"),
+        std::env::var("SUBSONIC_USER"),
+        std::env::var("SUBSONIC_PASS"),
+    ) {
+        // Mark as connected (env vars provide credentials).
+        let src = SourceObject::source("Subsonic (env)", "subsonic", "network-server-symbolic");
+        sources.push(src);
+        info!(url = %url, "Subsonic server configured via env vars");
+    }
 
     // ── Header Bar with all interactive widgets ──────────────────────
     let hb = header_bar::build_header_bar();
@@ -75,7 +89,7 @@ pub fn build_window(
     }
 
     // ── Sidebar ──────────────────────────────────────────────────────
-    let sidebar_widget = sidebar::build_sidebar(&sources);
+    let (sidebar_widget, sidebar_store, sidebar_selection) = sidebar::build_sidebar(&sources);
 
     // ── Tracklist (starts empty — populated by FullSync) ──────────────
     let empty_tracks: Vec<TrackObject> = Vec::new();
@@ -86,6 +100,12 @@ pub fn build_window(
     let master_tracks: Rc<RefCell<Vec<TrackObject>>> = Rc::new(RefCell::new(Vec::new()));
     let current_pos: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
     let seeking = Rc::new(Cell::new(false));
+
+    // ── Per-source track storage ────────────────────────────────────
+    // Key: "local" for local filesystem, or server URL for remote.
+    let source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let active_source_key: Rc<RefCell<String>> = Rc::new(RefCell::new("local".to_string()));
 
     // ── Browser (starts empty, updated by FullSync) ──────────────────
     let track_store_for_filter = track_store.clone();
@@ -206,6 +226,198 @@ pub fn build_window(
         }
     });
 
+    // ── Start Subsonic backend if configured via env vars ──────────
+    if let (Ok(url), Ok(user), Ok(pass)) = (
+        std::env::var("SUBSONIC_URL"),
+        std::env::var("SUBSONIC_USER"),
+        std::env::var("SUBSONIC_PASS"),
+    ) {
+        let tx = engine_tx.clone();
+        rt_handle.spawn(async move {
+            info!(server = %url, "Connecting to Subsonic server...");
+            match crate::subsonic::SubsonicBackend::connect("Subsonic", &url, &user, &pass).await {
+                Ok(backend) => {
+                    let tracks: Vec<crate::architecture::models::Track> =
+                        backend.all_tracks().await;
+                    info!(count = tracks.len(), "Subsonic library fetched");
+                    let _ = tx
+                        .send(LibraryEvent::RemoteSync {
+                            source_key: url.clone(),
+                            tracks,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Subsonic connection failed");
+                    let _ = tx.send(LibraryEvent::Error(format!("Subsonic: {e}"))).await;
+                }
+            }
+        });
+    }
+
+    // ── mDNS zero-config discovery ─────────────────────────────────
+    {
+        let discovery_rx = crate::discovery::start_discovery();
+        let store = sidebar_store.clone();
+
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(server) = discovery_rx.recv().await {
+                // Dedup: check if this URL is already in the sidebar.
+                let already_exists = (0..store.n_items()).any(|i| {
+                    store
+                        .item(i)
+                        .and_downcast_ref::<SourceObject>()
+                        .is_some_and(|s| s.server_url() == server.url)
+                });
+                if already_exists {
+                    continue;
+                }
+
+                info!(
+                    name = %server.name,
+                    url = %server.url,
+                    "Adding discovered server to sidebar"
+                );
+                let src = SourceObject::discovered(&server.name, "subsonic", &server.url);
+                store.append(&src);
+            }
+        });
+    }
+
+    // ── Sidebar selection: source switching + auth dialog ───────────
+    let sidebar_store_for_events = sidebar_store.clone();
+    let sidebar_sel_for_events = sidebar_selection.clone();
+    {
+        let sel = sidebar_selection.clone();
+        let engine_tx = engine_tx.clone();
+        let rt_handle = rt_handle.clone();
+        let win = window.clone();
+        let track_store = track_store.clone();
+        let master_tracks = master_tracks.clone();
+        let source_tracks = source_tracks.clone();
+        let active_source_key = active_source_key.clone();
+        let browser_widget = browser_widget.clone();
+        let browser_state = browser_state.clone();
+        let status_label = status_label.clone();
+        let column_view = column_view.clone();
+        let current_pos = current_pos.clone();
+
+        sel.connect_selection_changed(move |sel, _, _| {
+            let Some(item) = sel.selected_item() else {
+                return;
+            };
+            let Some(src) = item.downcast_ref::<SourceObject>() else {
+                return;
+            };
+            if src.is_header() {
+                return;
+            }
+
+            // Determine the source key.
+            let url = src.server_url();
+            let key = if url.is_empty() {
+                "local".to_string()
+            } else {
+                url.clone()
+            };
+
+            // ── Connected source: switch view ───────────────────────
+            if src.connected() {
+                *active_source_key.borrow_mut() = key.clone();
+                let st = source_tracks.borrow();
+                let tracks = st.get(&key).cloned().unwrap_or_default();
+                display_tracks(
+                    &tracks,
+                    &track_store,
+                    &master_tracks,
+                    &browser_widget,
+                    &browser_state,
+                    &status_label,
+                    &column_view,
+                );
+                current_pos.set(None);
+                return;
+            }
+
+            // ── Discovered (unauthenticated): show auth dialog ──────
+            let server_name = src.name();
+            let server_url = src.server_url();
+            let engine_tx = engine_tx.clone();
+            let rt_handle = rt_handle.clone();
+            let win = win.clone();
+            let sidebar_store = sidebar_store.clone();
+            let selected_pos = sel.selected();
+
+            let name_for_closure = server_name.clone();
+            let url_for_closure = server_url.clone();
+
+            show_auth_dialog(&win, &server_name, &server_url, move |user, pass| {
+                let engine_tx = engine_tx.clone();
+                let server_url = url_for_closure.clone();
+                let server_name = name_for_closure.clone();
+
+                // Mark as connecting → spinner in sidebar.
+                if let Some(src) = sidebar_store
+                    .item(selected_pos)
+                    .and_downcast_ref::<SourceObject>()
+                {
+                    src.set_connecting(true);
+                    let src = src.clone();
+                    sidebar_store.remove(selected_pos);
+                    sidebar_store.insert(selected_pos, &src);
+                }
+                // One-shot to signal failure back to the main thread so we
+                // can clear the spinner (GObjects are not Send).
+                let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
+                let sidebar_store_for_fail = sidebar_store.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    if fail_rx.recv().await.is_ok() {
+                        if let Some(src) = sidebar_store_for_fail
+                            .item(selected_pos)
+                            .and_downcast_ref::<SourceObject>()
+                        {
+                            src.set_connecting(false);
+                            let src = src.clone();
+                            sidebar_store_for_fail.remove(selected_pos);
+                            sidebar_store_for_fail.insert(selected_pos, &src);
+                        }
+                    }
+                });
+
+                rt_handle.spawn(async move {
+                    info!(server = %server_url, "Authenticating with Subsonic...");
+                    match crate::subsonic::SubsonicBackend::connect(
+                        &server_name,
+                        &server_url,
+                        &user,
+                        &pass,
+                    )
+                    .await
+                    {
+                        Ok(backend) => {
+                            let tracks: Vec<crate::architecture::models::Track> =
+                                backend.all_tracks().await;
+                            info!(count = tracks.len(), "Subsonic library fetched");
+                            let _ = engine_tx
+                                .send(LibraryEvent::RemoteSync {
+                                    source_key: server_url,
+                                    tracks,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Subsonic auth failed");
+                            let _ = engine_tx
+                                .send(LibraryEvent::Error(format!("Subsonic auth failed: {e}")))
+                                .await;
+                            let _ = fail_tx.send(()).await;
+                        }
+                    }
+                });
+            });
+        });
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // Phase 4: Audio Player + Desktop Integration
     // ═══════════════════════════════════════════════════════════════════
@@ -226,9 +438,13 @@ pub fn build_window(
                 track_store,
                 status_label,
                 master_tracks,
+                source_tracks,
+                active_source_key,
                 &browser_widget,
                 browser_state,
                 &column_view,
+                sidebar_store_for_events,
+                sidebar_sel_for_events,
                 scan_spinner,
             );
             return;
@@ -537,9 +753,13 @@ pub fn build_window(
         track_store,
         status_label,
         master_tracks,
+        source_tracks,
+        active_source_key,
         &browser_widget,
         browser_state,
         &column_view,
+        sidebar_store_for_events,
+        sidebar_sel_for_events,
         scan_spinner,
     );
 }
@@ -569,6 +789,27 @@ fn extract_hwnd(_window: &adw::ApplicationWindow) -> Option<*mut std::ffi::c_voi
 /// Uses the `SortListModel` so positions match the visible sorted order.
 /// Updates the now-playing labels, the OS media overlay metadata, and
 /// the `current_pos` tracker.  Returns `true` on success.
+/// Replace the visible tracklist, browser, and master track list with a
+/// new set of tracks (e.g., when switching sidebar sources).
+fn display_tracks(
+    objects: &[TrackObject],
+    track_store: &gtk::gio::ListStore,
+    master_tracks: &RefCell<Vec<TrackObject>>,
+    browser_widget: &gtk::Box,
+    browser_state: &browser::BrowserState,
+    status_label: &gtk::Label,
+    column_view: &gtk::ColumnView,
+) {
+    track_store.remove_all();
+    for obj in objects {
+        track_store.append(obj);
+    }
+    tracklist::update_status(status_label, objects);
+    browser::rebuild_browser_data(browser_widget, browser_state, objects);
+    *master_tracks.borrow_mut() = objects.to_vec();
+    column_view.scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
+}
+
 fn play_track_at(
     position: u32,
     model: &gtk::SortListModel,
@@ -704,14 +945,19 @@ fn format_ms(ms: u64) -> String {
 }
 
 /// Spawn the library event receiver loop on the GTK main thread.
+#[allow(clippy::too_many_arguments)]
 fn setup_library_events(
     engine_rx: async_channel::Receiver<LibraryEvent>,
     track_store: gtk::gio::ListStore,
     status_label: gtk::Label,
     master_tracks: Rc<RefCell<Vec<TrackObject>>>,
+    source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    active_source_key: Rc<RefCell<String>>,
     browser_widget: &gtk::Box,
     browser_state: browser::BrowserState,
     column_view: &gtk::ColumnView,
+    sidebar_store: gtk::gio::ListStore,
+    sidebar_selection: gtk::SingleSelection,
     scan_spinner: gtk::Spinner,
 ) {
     let browser_widget = browser_widget.clone();
@@ -726,18 +972,71 @@ fn setup_library_events(
                     let objects: Vec<TrackObject> =
                         tracks.iter().map(arch_track_to_object).collect();
 
-                    track_store.remove_all();
-                    for obj in &objects {
-                        track_store.append(obj);
+                    // Store per-source.
+                    source_tracks
+                        .borrow_mut()
+                        .insert("local".to_string(), objects.clone());
+
+                    // Display only if local is the active source.
+                    if *active_source_key.borrow() == "local" {
+                        display_tracks(
+                            &objects,
+                            &track_store,
+                            &master_tracks,
+                            &browser_widget,
+                            &browser_state,
+                            &status_label,
+                            &column_view,
+                        );
+                    }
+                }
+
+                LibraryEvent::RemoteSync { source_key, tracks } => {
+                    info!(
+                        source = %source_key,
+                        count = tracks.len(),
+                        "Received remote library sync"
+                    );
+
+                    let objects: Vec<TrackObject> =
+                        tracks.iter().map(arch_track_to_object).collect();
+
+                    // Store per-source.
+                    source_tracks
+                        .borrow_mut()
+                        .insert(source_key.clone(), objects.clone());
+
+                    // Update the sidebar item: mark connected, force rebind.
+                    for i in 0..sidebar_store.n_items() {
+                        if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>()
+                        {
+                            if src.server_url() == source_key && !src.connected() {
+                                src.set_connected(true);
+                                src.set_connecting(false);
+                                // Remove + re-insert to force ListView rebind.
+                                let src = src.clone();
+                                sidebar_store.remove(i);
+                                sidebar_store.insert(i, &src);
+                                // Auto-select this source.
+                                sidebar_selection.set_selected(i);
+                                break;
+                            }
+                        }
                     }
 
-                    tracklist::update_status(&status_label, &objects);
-                    browser::rebuild_browser_data(&browser_widget, &browser_state, &objects);
-
-                    *master_tracks.borrow_mut() = objects;
-
-                    // Scroll to the top of the (possibly sorted) list.
-                    column_view.scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
+                    // Display if this source is now active (set by
+                    // the selection_changed handler triggered above).
+                    if *active_source_key.borrow() == source_key {
+                        display_tracks(
+                            &objects,
+                            &track_store,
+                            &master_tracks,
+                            &browser_widget,
+                            &browser_state,
+                            &status_label,
+                            &column_view,
+                        );
+                    }
                 }
 
                 LibraryEvent::TrackUpserted(track) => {
@@ -909,4 +1208,65 @@ fn restore_sort_state(column_view: &gtk::ColumnView) {
             }
         }
     }
+}
+
+// ── Auth dialog for discovered servers ──────────────────────────────
+
+/// Present an `adw::AlertDialog` asking for Subsonic credentials.
+///
+/// `on_connect` is called with `(username, password)` if the user
+/// clicks Connect.  Cancel / Escape simply dismisses the dialog.
+fn show_auth_dialog(
+    window: &adw::ApplicationWindow,
+    server_name: &str,
+    server_url: &str,
+    on_connect: impl Fn(String, String) + 'static,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(&format!("Connect to {server_name}"))
+        .body(server_url)
+        .close_response("cancel")
+        .default_response("connect")
+        .build();
+
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("connect", "Connect");
+    dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
+
+    // ── Credential entry fields ─────────────────────────────────────
+    let user_entry = gtk::Entry::builder()
+        .placeholder_text("Username")
+        .activates_default(true)
+        .build();
+
+    let pass_entry = gtk::PasswordEntry::builder()
+        .placeholder_text("Password")
+        .show_peek_icon(true)
+        .activates_default(true)
+        .build();
+
+    let vbox = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(8)
+        .build();
+    vbox.append(&user_entry);
+    vbox.append(&pass_entry);
+
+    dialog.set_extra_child(Some(&vbox));
+
+    let user_entry_clone = user_entry.clone();
+    let pass_entry_clone = pass_entry.clone();
+
+    dialog.connect_response(None, move |_dialog, response| {
+        if response == "connect" {
+            let user = user_entry_clone.text().to_string();
+            let pass = pass_entry_clone.text().to_string();
+            if !user.is_empty() && !pass.is_empty() {
+                on_connect(user, pass);
+            }
+        }
+    });
+
+    dialog.present(Some(window));
 }
