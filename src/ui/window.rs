@@ -50,17 +50,32 @@ pub fn build_window(
     // ── Sidebar sources ────────────────────────────────────────────────
     let sources = super::dummy_data::build_sources();
 
-    // If env vars are set, add a pre-configured Subsonic entry.
+    // If env vars are set, add pre-configured remote server entries.
     let mut sources = sources;
     if let (Ok(url), Ok(_user), Ok(_pass)) = (
         std::env::var("SUBSONIC_URL"),
         std::env::var("SUBSONIC_USER"),
         std::env::var("SUBSONIC_PASS"),
     ) {
-        // Mark as connected (env vars provide credentials).
         let src = SourceObject::source("Subsonic (env)", "subsonic", "network-server-symbolic");
         sources.push(src);
         info!(url = %url, "Subsonic server configured via env vars");
+    }
+
+    if let (Ok(url), Ok(_key), Ok(_uid)) = (
+        std::env::var("JELLYFIN_URL"),
+        std::env::var("JELLYFIN_API_KEY"),
+        std::env::var("JELLYFIN_USER_ID"),
+    ) {
+        let src = SourceObject::source("Jellyfin (env)", "jellyfin", "network-server-symbolic");
+        sources.push(src);
+        info!(url = %url, "Jellyfin server configured via env vars");
+    }
+
+    if let (Ok(url), Ok(_token)) = (std::env::var("PLEX_URL"), std::env::var("PLEX_TOKEN")) {
+        let src = SourceObject::source("Plex (env)", "plex", "network-server-symbolic");
+        sources.push(src);
+        info!(url = %url, "Plex server configured via env vars");
     }
 
     // ── Header Bar with all interactive widgets ──────────────────────
@@ -255,6 +270,62 @@ pub fn build_window(
         });
     }
 
+    // ── Start Jellyfin backend if configured via env vars ──────────
+    if let (Ok(url), Ok(api_key), Ok(user_id)) = (
+        std::env::var("JELLYFIN_URL"),
+        std::env::var("JELLYFIN_API_KEY"),
+        std::env::var("JELLYFIN_USER_ID"),
+    ) {
+        let tx = engine_tx.clone();
+        rt_handle.spawn(async move {
+            info!(server = %url, "Connecting to Jellyfin server...");
+            match crate::jellyfin::JellyfinBackend::connect("Jellyfin", &url, &api_key, &user_id)
+                .await
+            {
+                Ok(backend) => {
+                    let tracks: Vec<crate::architecture::models::Track> =
+                        backend.all_tracks().await;
+                    info!(count = tracks.len(), "Jellyfin library fetched");
+                    let _ = tx
+                        .send(LibraryEvent::RemoteSync {
+                            source_key: url.clone(),
+                            tracks,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Jellyfin connection failed");
+                    let _ = tx.send(LibraryEvent::Error(format!("Jellyfin: {e}"))).await;
+                }
+            }
+        });
+    }
+
+    // ── Start Plex backend if configured via env vars ──────────────
+    if let (Ok(url), Ok(token)) = (std::env::var("PLEX_URL"), std::env::var("PLEX_TOKEN")) {
+        let tx = engine_tx.clone();
+        rt_handle.spawn(async move {
+            info!(server = %url, "Connecting to Plex server...");
+            match crate::plex::PlexBackend::connect("Plex", &url, &token).await {
+                Ok(backend) => {
+                    let tracks: Vec<crate::architecture::models::Track> =
+                        backend.all_tracks().await;
+                    info!(count = tracks.len(), "Plex library fetched");
+                    let _ = tx
+                        .send(LibraryEvent::RemoteSync {
+                            source_key: url.clone(),
+                            tracks,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Plex connection failed");
+                    let _ = tx.send(LibraryEvent::Error(format!("Plex: {e}"))).await;
+                }
+            }
+        });
+    }
+
     // ── mDNS zero-config discovery ─────────────────────────────────
     {
         let discovery_rx = crate::discovery::start_discovery();
@@ -278,7 +349,7 @@ pub fn build_window(
                     url = %server.url,
                     "Adding discovered server to sidebar"
                 );
-                let src = SourceObject::discovered(&server.name, "subsonic", &server.url);
+                let src = SourceObject::discovered(&server.name, &server.service_type, &server.url);
                 store.append(&src);
             }
         });
@@ -348,6 +419,7 @@ pub fn build_window(
             let sidebar_store = sidebar_store.clone();
             let selected_pos = sel.selected();
 
+            let backend_type = src.backend_type();
             let name_for_closure = server_name.clone();
             let url_for_closure = server_url.clone();
 
@@ -355,6 +427,7 @@ pub fn build_window(
                 let engine_tx = engine_tx.clone();
                 let server_url = url_for_closure.clone();
                 let server_name = name_for_closure.clone();
+                let backend_type = backend_type.clone();
 
                 // Mark as connecting → spinner in sidebar.
                 if let Some(src) = sidebar_store
@@ -385,19 +458,80 @@ pub fn build_window(
                 });
 
                 rt_handle.spawn(async move {
-                    info!(server = %server_url, "Authenticating with Subsonic...");
-                    match crate::subsonic::SubsonicBackend::connect(
-                        &server_name,
-                        &server_url,
-                        &user,
-                        &pass,
-                    )
-                    .await
-                    {
-                        Ok(backend) => {
-                            let tracks: Vec<crate::architecture::models::Track> =
-                                backend.all_tracks().await;
-                            info!(count = tracks.len(), "Subsonic library fetched");
+                    let result: Result<
+                        Vec<crate::architecture::models::Track>,
+                        crate::architecture::error::BackendError,
+                    > = match backend_type.as_str() {
+                        "jellyfin" => {
+                            info!(server = %server_url, "Authenticating with Jellyfin...");
+                            match crate::jellyfin::client::JellyfinClient::authenticate(
+                                &server_url,
+                                &user,
+                                &pass,
+                            )
+                            .await
+                            {
+                                Ok(client) => {
+                                    match crate::jellyfin::JellyfinBackend::from_client(
+                                        &server_name,
+                                        client,
+                                    )
+                                    .await
+                                    {
+                                        Ok(backend) => Ok(backend.all_tracks().await),
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        "plex" => {
+                            info!(server = %server_url, "Authenticating with Plex...");
+                            match crate::plex::client::PlexClient::authenticate(
+                                &server_url,
+                                &user,
+                                &pass,
+                            )
+                            .await
+                            {
+                                Ok(client) => {
+                                    match crate::plex::PlexBackend::from_client(
+                                        &server_name,
+                                        client,
+                                    )
+                                    .await
+                                    {
+                                        Ok(backend) => Ok(backend.all_tracks().await),
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        _ => {
+                            // Default: Subsonic
+                            info!(server = %server_url, "Authenticating with Subsonic...");
+                            match crate::subsonic::SubsonicBackend::connect(
+                                &server_name,
+                                &server_url,
+                                &user,
+                                &pass,
+                            )
+                            .await
+                            {
+                                Ok(backend) => Ok(backend.all_tracks().await),
+                                Err(e) => Err(e),
+                            }
+                        }
+                    };
+
+                    match result {
+                        Ok(tracks) => {
+                            info!(
+                                backend = %backend_type,
+                                count = tracks.len(),
+                                "Remote library fetched"
+                            );
                             let _ = engine_tx
                                 .send(LibraryEvent::RemoteSync {
                                     source_key: server_url,
@@ -406,9 +540,15 @@ pub fn build_window(
                                 .await;
                         }
                         Err(e) => {
-                            tracing::error!(error = %e, "Subsonic auth failed");
+                            tracing::error!(
+                                backend = %backend_type,
+                                error = %e,
+                                "Authentication failed"
+                            );
                             let _ = engine_tx
-                                .send(LibraryEvent::Error(format!("Subsonic auth failed: {e}")))
+                                .send(LibraryEvent::Error(format!(
+                                    "{backend_type} auth failed: {e}"
+                                )))
                                 .await;
                             let _ = fail_tx.send(()).await;
                         }

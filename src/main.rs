@@ -13,9 +13,13 @@ mod db;
 mod desktop_integration;
 mod discovery;
 #[allow(dead_code)]
+mod jellyfin;
+#[allow(dead_code)]
 mod local;
 #[allow(dead_code)]
 mod platform;
+#[allow(dead_code)]
+mod plex;
 mod subsonic;
 mod ui;
 

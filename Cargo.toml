@@ -59,8 +59,14 @@ dirs = "6"
 # Shuffle randomness (zero-dependency PRNG)
 fastrand = "2"
 
-# Subsonic API client
+# Subsonic / Jellyfin / Plex API client
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# URL percent-encoding (Plex auth form body)
+urlencoding = "2"
+
+# JSON value type (Jellyfin ImageTags parsing)
+serde_json = "1"
 md-5 = "0.10"
 
 # mDNS service discovery (Subsonic/DAAP auto-detect)
