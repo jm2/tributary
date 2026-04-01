@@ -155,20 +155,23 @@ fn setup_macos_bundle_env() {
         return; // No Resources directory — probably a dev build.
     }
 
-    // Helper: only set a var if it isn't already overridden by the user.
-    let set_if_unset = |key: &str, value: PathBuf| {
-        if env::var_os(key).is_none() && value.exists() {
+    // Helper: always set the var when inside a .app bundle.
+    // We unconditionally override because LSEnvironment (if present in
+    // Info.plist) may have set these to broken relative paths.  The
+    // absolute paths we compute here are authoritative.
+    let set_bundle_var = |key: &str, value: PathBuf| {
+        if value.exists() {
             env::set_var(key, &value);
         }
     };
 
     // XDG_DATA_DIRS — GTK and Adwaita look here for icon themes.
     let share_dir = resources_dir.join("share");
-    set_if_unset("XDG_DATA_DIRS", share_dir.clone());
+    set_bundle_var("XDG_DATA_DIRS", share_dir.clone());
 
     // GSETTINGS_SCHEMA_DIR — compiled GSettings schemas.
     let schemas_dir = share_dir.join("glib-2.0").join("schemas");
-    set_if_unset("GSETTINGS_SCHEMA_DIR", schemas_dir);
+    set_bundle_var("GSETTINGS_SCHEMA_DIR", schemas_dir);
 
     // GDK_PIXBUF_MODULE_FILE — pixbuf loader cache.
     let pixbuf_cache = resources_dir
@@ -176,19 +179,22 @@ fn setup_macos_bundle_env() {
         .join("gdk-pixbuf-2.0")
         .join("2.10.0")
         .join("loaders.cache");
-    set_if_unset("GDK_PIXBUF_MODULE_FILE", pixbuf_cache);
+    set_bundle_var("GDK_PIXBUF_MODULE_FILE", pixbuf_cache);
 
     // GST_PLUGIN_PATH — bundled GStreamer plugins.
     let gst_plugins = resources_dir.join("lib").join("gstreamer-1.0");
-    set_if_unset("GST_PLUGIN_PATH", gst_plugins.clone());
+    set_bundle_var("GST_PLUGIN_PATH", gst_plugins.clone());
 
     // Prevent GStreamer from also scanning system plugin paths which
     // may contain incompatible versions.
-    if env::var_os("GST_PLUGIN_SYSTEM_PATH").is_none() && gst_plugins.is_dir() {
+    if gst_plugins.is_dir() {
         env::set_var("GST_PLUGIN_SYSTEM_PATH", "");
+        // Force a fresh registry scan so stale system paths don't win.
+        let registry = macos_dir.join("gst-registry.bin");
+        env::set_var("GST_REGISTRY", &registry);
     }
 
     // GTK_PATH — helps GTK find the bundled IM modules / print backends.
     let gtk_path = resources_dir.join("lib").join("gtk-4.0");
-    set_if_unset("GTK_PATH", gtk_path);
+    set_bundle_var("GTK_PATH", gtk_path);
 }

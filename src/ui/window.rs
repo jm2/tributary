@@ -5,6 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::glib;
@@ -1071,18 +1072,41 @@ pub fn build_window(
             .height_request(16)
             .build();
 
+        // Debounce: only show the spinner if buffering persists for
+        // longer than this threshold.  For local files the pipeline
+        // typically reaches Playing in < 20 ms, so the spinner would
+        // just blink distractingly without the delay.
+        const BUFFERING_DELAY_MS: u32 = 100;
+        // Generation counter — incremented on every state change so
+        // a stale timeout callback can detect it was superseded.
+        let buffering_gen: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = player_rx.recv().await {
                 match event {
                     PlayerEvent::StateChanged(state) => {
+                        // Bump generation on every state change to
+                        // invalidate any pending buffering timer.
+                        let gen = buffering_gen.get().wrapping_add(1);
+                        buffering_gen.set(gen);
+
                         match state {
                             PlayerState::Buffering => {
-                                // Replace the button icon with a spinner.
-                                // NOTE: Do NOT call set_icon_name() here — in GTK4
-                                // it replaces the button's child with a new Image,
-                                // which would immediately destroy the spinner we
-                                // just set.
-                                play_btn.set_child(Some(&buffering_spinner));
+                                // Schedule the spinner after a short
+                                // delay — if Playing arrives first the
+                                // generation will have changed and the
+                                // callback becomes a no-op.
+                                let btn = play_btn.clone();
+                                let spinner = buffering_spinner.clone();
+                                let gen_rc = buffering_gen.clone();
+                                glib::timeout_add_local_once(
+                                    Duration::from_millis(BUFFERING_DELAY_MS as u64),
+                                    move || {
+                                        if gen_rc.get() == gen {
+                                            btn.set_child(Some(&spinner));
+                                        }
+                                    },
+                                );
                             }
                             PlayerState::Playing => {
                                 // Restore icon: show pause.
@@ -1313,16 +1337,55 @@ fn update_album_art(image: &gtk::Image, uri: &str) {
     };
 
     // Read tags and extract the first embedded picture.
+    //
+    // Strategy:
+    //  1. Try the unified `Tag::pictures()` API (works for ID3, Vorbis, etc.)
+    //  2. For MP4/M4A files (iTunes Store purchases), the cover art is stored
+    //     in the `covr` atom.  lofty exposes this through `Mpeg4Ilst` which
+    //     may not surface via `pictures()` in all versions.  Fall back to
+    //     reading the raw MP4 atom data directly.
     let texture = (|| -> Option<gtk::gdk::Texture> {
         use lofty::file::TaggedFileExt;
 
         let tagged_file = lofty::read_from_path(&path).ok()?;
-        let tag = tagged_file
-            .primary_tag()
-            .or_else(|| tagged_file.first_tag())?;
-        let picture = tag.pictures().first()?;
-        let bytes = glib::Bytes::from(picture.data());
-        gtk::gdk::Texture::from_bytes(&bytes).ok()
+
+        // ── Attempt 1: unified pictures() API ───────────────────────
+        for tag in tagged_file.tags() {
+            if let Some(picture) = tag.pictures().first() {
+                let bytes = glib::Bytes::from(picture.data());
+                if let Ok(tex) = gtk::gdk::Texture::from_bytes(&bytes) {
+                    return Some(tex);
+                }
+            }
+        }
+
+        // ── Attempt 2: MP4-specific — read covr atom via mp4ameta ───
+        // lofty's Mpeg4Ilst tag should already be covered above, but
+        // as a belt-and-suspenders fallback for iTunes M4A files we
+        // also try the lower-level mp4ameta crate if available, or
+        // simply re-read with lofty's probe forcing the MP4 parser.
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if matches!(
+            ext.to_lowercase().as_str(),
+            "m4a" | "m4b" | "m4p" | "mp4" | "aac"
+        ) {
+            // Try reading with explicit MP4 file type hint.
+            use lofty::file::FileType;
+            use lofty::probe::Probe;
+
+            let probe = Probe::open(&path).ok()?.set_file_type(FileType::Mp4);
+            let tagged = probe.read().ok()?;
+            for tag in tagged.tags() {
+                if let Some(picture) = tag.pictures().first() {
+                    let bytes = glib::Bytes::from(picture.data());
+                    if let Ok(tex) = gtk::gdk::Texture::from_bytes(&bytes) {
+                        return Some(tex);
+                    }
+                }
+            }
+        }
+
+        None
     })();
 
     match texture {

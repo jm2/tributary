@@ -109,6 +109,10 @@ else
 fi
 
 # Write Info.plist
+# NOTE: LSEnvironment is intentionally omitted.  Its relative paths
+# only work when the working directory is Contents/MacOS, which macOS
+# does NOT guarantee when launching from Finder / Launchpad.  The
+# binary's setup_macos_bundle_env() sets absolute paths at runtime.
 cat > "${APP_BUNDLE}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -123,19 +127,6 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key>     <string>tributary</string>
   <key>NSHighResolutionCapable</key> <true/>
   <key>LSMinimumSystemVersion</key>  <string>13.0</string>
-  <key>LSEnvironment</key>
-  <dict>
-    <key>GST_PLUGIN_PATH</key>
-    <string>../Resources/lib/gstreamer-1.0</string>
-    <key>GST_PLUGIN_SYSTEM_PATH</key>
-    <string></string>
-    <key>GDK_PIXBUF_MODULE_FILE</key>
-    <string>../Resources/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache</string>
-    <key>XDG_DATA_DIRS</key>
-    <string>../Resources/share</string>
-    <key>GSETTINGS_SCHEMA_DIR</key>
-    <string>../Resources/share/glib-2.0/schemas</string>
-  </dict>
 </dict>
 </plist>
 PLIST
