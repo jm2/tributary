@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread;
 
 use adw::prelude::*;
-use gtk::gio;
+use gtk::{gio, glib};
 use tracing::info;
 
 /// Reverse-DNS application identifier.
@@ -60,6 +60,8 @@ fn main() {
     let (engine_tx, engine_rx) = async_channel::unbounded();
 
     // ── GTK Application ──────────────────────────────────────────────
+    glib::set_application_name("Tributary");
+
     let app = adw::Application::builder().application_id(APP_ID).build();
 
     // ── Application actions ─────────────────────────────────────────

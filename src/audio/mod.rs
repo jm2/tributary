@@ -92,7 +92,7 @@ impl Player {
             })
             .map_err(|e| anyhow::anyhow!("Failed to create playbin element: {e}"))?;
 
-        let volume = 1.0_f64;
+        let volume = load_saved_volume().unwrap_or(1.0);
         playbin.set_property("volume", volume);
 
         let (event_tx, event_rx) = async_channel::unbounded();
@@ -169,6 +169,7 @@ impl Player {
     pub fn set_volume(&mut self, level: f64) {
         self.volume = level.clamp(0.0, 1.0);
         self.playbin.set_property("volume", self.volume);
+        save_volume(self.volume);
         debug!(volume = self.volume, "Volume set");
     }
 
@@ -358,5 +359,25 @@ impl Drop for Player {
     fn drop(&mut self) {
         info!("Shutting down GStreamer pipeline");
         let _ = self.playbin.set_state(gst::State::Null);
+    }
+}
+
+// ── Volume persistence ──────────────────────────────────────────────────
+
+/// Path to the volume state file: `<data_dir>/tributary/volume`
+fn volume_path() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| d.join("tributary").join("volume"))
+}
+
+fn load_saved_volume() -> Option<f64> {
+    let path = volume_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: f64 = text.trim().parse().ok()?;
+    if (0.0..=1.0).contains(&v) { Some(v) } else { None }
+}
+
+fn save_volume(level: f64) {
+    if let Some(path) = volume_path() {
+        let _ = std::fs::write(path, format!("{level:.3}"));
     }
 }

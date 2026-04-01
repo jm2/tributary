@@ -217,6 +217,9 @@ pub fn build_window(
     };
     let player = Rc::new(RefCell::new(player));
 
+    // Sync the volume slider to the player's persisted volume.
+    hb.volume_adj.set_value(player.borrow().volume());
+
     // ── Extract native window handle (HWND on Windows) ──────────────
     let hwnd = extract_hwnd(&window);
 
