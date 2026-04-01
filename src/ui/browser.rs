@@ -1,9 +1,12 @@
 //! Browser — 3-pane genre / artist / album browser with filtering.
 //!
-//! Selecting an item in any pane filters the items in the downstream
+//! Selecting an item in any pane filters the items in the sibling
 //! panes and updates the tracklist via a callback.
+//!
+//! Cross-filtering is bidirectional: selecting an artist narrows the
+//! genre and album lists; selecting an album narrows genre and artist.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::gio;
@@ -35,6 +38,11 @@ pub fn build_browser(
     let selected_artist: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let selected_album: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
+    // Re-entrancy guard: when one handler repopulates a sibling store,
+    // the sibling's selection_changed fires.  The guard prevents that
+    // from cascading into further repopulation.
+    let updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
     // Stores for each pane
     let genre_store = gio::ListStore::new::<BrowserItem>();
     let artist_store = gio::ListStore::new::<BrowserItem>();
@@ -46,8 +54,8 @@ pub fn build_browser(
     ));
 
     // Initial population
-    populate_genres(&genre_store, &tracks.borrow(), &None);
-    populate_artists(&artist_store, &tracks.borrow(), &None);
+    populate_genres(&genre_store, &tracks.borrow(), &None, &None);
+    populate_artists(&artist_store, &tracks.borrow(), &None, &None);
     populate_albums(&album_store, &tracks.borrow(), &None, &None);
 
     // Wrap callback in Rc for sharing across closures
@@ -59,6 +67,8 @@ pub fn build_browser(
     let album_pane = build_pane("Album", &album_store);
 
     // ── Genre selection ──────────────────────────────────────────────
+    // User picks a genre → repopulate artist + album (downstream).
+    // Do NOT repopulate the genre store itself.
     {
         let sel = get_selection(&genre_pane);
         let sg = selected_genre.clone();
@@ -68,54 +78,96 @@ pub fn build_browser(
         let album_store = album_store.clone();
         let tracks = tracks.clone();
         let cb = on_filter_changed.clone();
+        let updating = updating.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
+            if updating.get() {
+                return;
+            }
             let genre = get_selected_label(sel);
             info!(?genre, "Browser: genre changed");
             *sg.borrow_mut() = genre.clone();
             *sa.borrow_mut() = None;
             *sl.borrow_mut() = None;
-            populate_artists(&artist_store, &tracks.borrow(), &genre);
-            populate_albums(&album_store, &tracks.borrow(), &genre, &None);
+
+            updating.set(true);
+            let borrowed = tracks.borrow();
+            populate_artists(&artist_store, &borrowed, &genre, &None);
+            populate_albums(&album_store, &borrowed, &genre, &None);
+            updating.set(false);
+
             cb(genre, None, None);
         });
     }
 
     // ── Artist selection ─────────────────────────────────────────────
+    // User picks an artist → cross-filter genres, repopulate albums.
     {
         let sel = get_selection(&artist_pane);
         let sg = selected_genre.clone();
         let sa = selected_artist.clone();
         let sl = selected_album.clone();
+        let genre_store = genre_store.clone();
+        let genre_pane = genre_pane.clone();
         let album_store = album_store.clone();
         let tracks = tracks.clone();
         let cb = on_filter_changed.clone();
+        let updating = updating.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
+            if updating.get() {
+                return;
+            }
             let artist = get_selected_label(sel);
             info!(?artist, "Browser: artist changed");
             *sa.borrow_mut() = artist.clone();
             *sl.borrow_mut() = None;
             let genre = sg.borrow().clone();
-            populate_albums(&album_store, &tracks.borrow(), &genre, &artist);
+
+            updating.set(true);
+            let borrowed = tracks.borrow();
+            populate_genres(&genre_store, &borrowed, &artist, &None);
+            restore_selection(&genre_pane, &genre);
+            populate_albums(&album_store, &borrowed, &genre, &artist);
+            updating.set(false);
+
             cb(genre, artist, None);
         });
     }
 
     // ── Album selection ──────────────────────────────────────────────
+    // User picks an album → cross-filter genres and artists.
     {
         let sel = get_selection(&album_pane);
         let sg = selected_genre.clone();
         let sa = selected_artist.clone();
         let sl = selected_album;
+        let genre_store = genre_store.clone();
+        let genre_pane = genre_pane.clone();
+        let artist_store = artist_store.clone();
+        let artist_pane = artist_pane.clone();
+        let tracks = tracks.clone();
         let cb = on_filter_changed;
+        let updating = updating.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
+            if updating.get() {
+                return;
+            }
             let album = get_selected_label(sel);
             info!(?album, "Browser: album changed");
             *sl.borrow_mut() = album.clone();
             let genre = sg.borrow().clone();
             let artist = sa.borrow().clone();
+
+            updating.set(true);
+            let borrowed = tracks.borrow();
+            populate_genres(&genre_store, &borrowed, &artist, &album);
+            restore_selection(&genre_pane, &genre);
+            populate_artists(&artist_store, &borrowed, &genre, &album);
+            restore_selection(&artist_pane, &artist);
+            updating.set(false);
+
             cb(genre, artist, album);
         });
     }
@@ -246,10 +298,50 @@ fn get_selected_label(sel: &gtk::SingleSelection) -> Option<String> {
         .map(|item| item.label())
 }
 
-fn populate_genres(store: &gio::ListStore, tracks: &[TrackSnapshot], _filter: &Option<String>) {
+/// After repopulating a sibling pane's store, restore the previous
+/// selection so the highlight doesn't jump to "All".
+fn restore_selection(pane: &gtk::Box, label: &Option<String>) {
+    let sel = get_selection(pane);
+    if let Some(target) = label {
+        let model = sel.model().unwrap();
+        for i in 0..model.n_items() {
+            if let Some(item) = model.item(i) {
+                if let Some(bi) = item.downcast_ref::<BrowserItem>() {
+                    if bi.label() == *target {
+                        sel.set_selected(i);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    // Label not found (or None) → select "All"
+    sel.set_selected(0);
+}
+
+// ---------------------------------------------------------------------------
+// Populate functions
+// ---------------------------------------------------------------------------
+
+fn populate_genres(
+    store: &gio::ListStore,
+    tracks: &[TrackSnapshot],
+    artist_filter: &Option<String>,
+    album_filter: &Option<String>,
+) {
     store.remove_all();
     let mut map = std::collections::BTreeMap::<String, u32>::new();
     for t in tracks {
+        if let Some(a) = artist_filter {
+            if &t.artist != a {
+                continue;
+            }
+        }
+        if let Some(al) = album_filter {
+            if &t.album != al {
+                continue;
+            }
+        }
         *map.entry(t.genre.clone()).or_insert(0) += 1;
     }
     let total: u32 = map.values().sum();
@@ -263,12 +355,18 @@ fn populate_artists(
     store: &gio::ListStore,
     tracks: &[TrackSnapshot],
     genre_filter: &Option<String>,
+    album_filter: &Option<String>,
 ) {
     store.remove_all();
     let mut map = std::collections::BTreeMap::<String, u32>::new();
     for t in tracks {
         if let Some(g) = genre_filter {
             if &t.genre != g {
+                continue;
+            }
+        }
+        if let Some(al) = album_filter {
+            if &t.album != al {
                 continue;
             }
         }
@@ -337,10 +435,10 @@ pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks
 
     if panes.len() >= 3 {
         if let Some(genre_store) = get_store_from_pane(&panes[0]) {
-            populate_genres(&genre_store, &borrowed, &None);
+            populate_genres(&genre_store, &borrowed, &None, &None);
         }
         if let Some(artist_store) = get_store_from_pane(&panes[1]) {
-            populate_artists(&artist_store, &borrowed, &None);
+            populate_artists(&artist_store, &borrowed, &None, &None);
         }
         if let Some(album_store) = get_store_from_pane(&panes[2]) {
             populate_albums(&album_store, &borrowed, &None, &None);

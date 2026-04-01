@@ -24,7 +24,7 @@ pub struct HeaderBarWidgets {
     pub play_button: gtk::Button,
     pub prev_button: gtk::Button,
     pub next_button: gtk::Button,
-    pub repeat_button: gtk::Button,
+    pub repeat_button: gtk::ToggleButton,
     pub repeat_mode: Rc<Cell<RepeatMode>>,
     pub shuffle_button: gtk::ToggleButton,
     pub title_label: gtk::Label,
@@ -57,34 +57,34 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         .build();
 
     let repeat_mode: Rc<Cell<RepeatMode>> = Rc::new(Cell::new(RepeatMode::Off));
-    let btn_repeat = gtk::Button::builder()
+    let btn_repeat = gtk::ToggleButton::builder()
         .icon_name("media-playlist-repeat-symbolic")
         .tooltip_text("Repeat: Off")
         .build();
 
     // Cycle Off → All → One on each click.
+    // We use a ToggleButton for the highlight but manage `active` manually.
     {
         let mode = repeat_mode.clone();
         let btn = btn_repeat.clone();
         btn_repeat.connect_clicked(move |_| {
+            // The toggle already flipped `active` before this handler runs.
+            // Determine the next mode from the PREVIOUS mode, not from
+            // the toggle state, so we cycle correctly through 3 states.
             let next = match mode.get() {
                 RepeatMode::Off => RepeatMode::All,
                 RepeatMode::All => RepeatMode::One,
                 RepeatMode::One => RepeatMode::Off,
             };
             mode.set(next);
-            let (icon, tooltip, css) = match next {
+            let (icon, tooltip, active) = match next {
                 RepeatMode::Off => ("media-playlist-repeat-symbolic", "Repeat: Off", false),
                 RepeatMode::All => ("media-playlist-repeat-symbolic", "Repeat: All", true),
                 RepeatMode::One => ("media-playlist-repeat-song-symbolic", "Repeat: One", true),
             };
             btn.set_icon_name(icon);
             btn.set_tooltip_text(Some(tooltip));
-            if css {
-                btn.add_css_class("suggested-action");
-            } else {
-                btn.remove_css_class("suggested-action");
-            }
+            btn.set_active(active);
         });
     }
 

@@ -58,6 +58,22 @@ pub fn build_window(
         .build();
     hb.header.pack_end(&scan_spinner);
 
+    // ── Restore persisted playback modes ─────────────────────────────
+    {
+        let saved_repeat = load_repeat_mode();
+        hb.repeat_mode.set(saved_repeat);
+        let (icon, tooltip, active) = match saved_repeat {
+            RepeatMode::Off => ("media-playlist-repeat-symbolic", "Repeat: Off", false),
+            RepeatMode::All => ("media-playlist-repeat-symbolic", "Repeat: All", true),
+            RepeatMode::One => ("media-playlist-repeat-song-symbolic", "Repeat: One", true),
+        };
+        hb.repeat_button.set_icon_name(icon);
+        hb.repeat_button.set_tooltip_text(Some(tooltip));
+        hb.repeat_button.set_active(active);
+
+        hb.shuffle_button.set_active(load_shuffle());
+    }
+
     // ── Sidebar ──────────────────────────────────────────────────────
     let sidebar_widget = sidebar::build_sidebar(&sources);
 
@@ -212,6 +228,7 @@ pub fn build_window(
                 master_tracks,
                 &browser_widget,
                 browser_state,
+                &column_view,
                 scan_spinner,
             );
             return;
@@ -288,6 +305,17 @@ pub fn build_window(
         });
     }
 
+    // ── Persist repeat/shuffle on change ────────────────────────────
+    {
+        let mode = hb.repeat_mode.clone();
+        hb.repeat_button.connect_clicked(move |_| {
+            save_repeat_mode(mode.get());
+        });
+    }
+    hb.shuffle_button.connect_toggled(move |btn| {
+        save_shuffle(btn.is_active());
+    });
+
     // ── Wire volume scale ───────────────────────────────────────────
     {
         let player = player.clone();
@@ -304,6 +332,15 @@ pub fn build_window(
             if !seeking.get() {
                 player.borrow().seek_to(adj.value() as u64);
             }
+        });
+    }
+
+    // ── Persist and restore column sort ────────────────────────────
+    restore_sort_state(&column_view);
+    if let Some(sorter) = column_view.sorter() {
+        let cv = column_view.clone();
+        sorter.connect_changed(move |_, _| {
+            save_sort_state(&cv);
         });
     }
 
@@ -502,6 +539,7 @@ pub fn build_window(
         master_tracks,
         &browser_widget,
         browser_state,
+        &column_view,
         scan_spinner,
     );
 }
@@ -673,9 +711,11 @@ fn setup_library_events(
     master_tracks: Rc<RefCell<Vec<TrackObject>>>,
     browser_widget: &gtk::Box,
     browser_state: browser::BrowserState,
+    column_view: &gtk::ColumnView,
     scan_spinner: gtk::Spinner,
 ) {
     let browser_widget = browser_widget.clone();
+    let column_view = column_view.clone();
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(event) = engine_rx.recv().await {
@@ -695,6 +735,9 @@ fn setup_library_events(
                     browser::rebuild_browser_data(&browser_widget, &browser_state, &objects);
 
                     *master_tracks.borrow_mut() = objects;
+
+                    // Scroll to the top of the (possibly sorted) list.
+                    column_view.scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
                 }
 
                 LibraryEvent::TrackUpserted(track) => {
@@ -774,4 +817,96 @@ fn load_css() {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+}
+
+// ── Playback mode persistence ───────────────────────────────────────
+
+fn settings_path(name: &str) -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| d.join("tributary").join(name))
+}
+
+fn load_repeat_mode() -> RepeatMode {
+    settings_path("repeat")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| match s.trim() {
+            "all" => RepeatMode::All,
+            "one" => RepeatMode::One,
+            _ => RepeatMode::Off,
+        })
+        .unwrap_or(RepeatMode::Off)
+}
+
+fn save_repeat_mode(mode: RepeatMode) {
+    if let Some(path) = settings_path("repeat") {
+        let s = match mode {
+            RepeatMode::Off => "off",
+            RepeatMode::All => "all",
+            RepeatMode::One => "one",
+        };
+        let _ = std::fs::write(path, s);
+    }
+}
+
+fn load_shuffle() -> bool {
+    settings_path("shuffle")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim() == "true")
+        .unwrap_or(false)
+}
+
+fn save_shuffle(active: bool) {
+    if let Some(path) = settings_path("shuffle") {
+        let _ = std::fs::write(path, if active { "true" } else { "false" });
+    }
+}
+
+fn save_sort_state(column_view: &gtk::ColumnView) {
+    let Some(sorter) = column_view.sorter() else {
+        return;
+    };
+    let Some(cv_sorter) = sorter.downcast_ref::<gtk::ColumnViewSorter>() else {
+        return;
+    };
+
+    match cv_sorter.primary_sort_column() {
+        Some(column) => {
+            let title = column.title().map(|t| t.to_string()).unwrap_or_default();
+            let dir = match cv_sorter.primary_sort_order() {
+                gtk::SortType::Descending => "desc",
+                _ => "asc",
+            };
+            if let Some(path) = settings_path("sort") {
+                let _ = std::fs::write(path, format!("{title}\n{dir}"));
+            }
+        }
+        None => {
+            // No active sort — remove saved state.
+            if let Some(path) = settings_path("sort") {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+fn restore_sort_state(column_view: &gtk::ColumnView) {
+    let Some(text) = settings_path("sort").and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return;
+    };
+    let mut lines = text.lines();
+    let Some(title) = lines.next() else { return };
+    let order = match lines.next() {
+        Some("desc") => gtk::SortType::Descending,
+        _ => gtk::SortType::Ascending,
+    };
+
+    let columns = column_view.columns();
+    for i in 0..columns.n_items() {
+        if let Some(col) = columns.item(i) {
+            let col = col.downcast_ref::<gtk::ColumnViewColumn>().unwrap();
+            if col.title().is_some_and(|t| t == title) {
+                column_view.sort_by_column(Some(col), order);
+                return;
+            }
+        }
+    }
 }

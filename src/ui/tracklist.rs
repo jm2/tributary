@@ -3,7 +3,9 @@
 //! 12 resizable, sortable columns backed by `gio::ListStore<TrackObject>`
 //! wrapped in a `gtk::SortListModel` for click-to-sort column headers.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::rc::Rc;
 
 use gtk::gio;
 use gtk::prelude::*;
@@ -144,6 +146,50 @@ pub fn build_tracklist(
     // Connect the ColumnView's composite sorter to the SortListModel
     // so that clicking headers actually re-orders the rows.
     sort_model.set_sorter(column_view.sorter().as_ref());
+
+    // ── Three-state sort: asc → desc → none ─────────────────────────
+    // GTK4 only cycles asc↔desc. We intercept to add a third "none"
+    // state: if the user clicks a column that is already descending,
+    // clear the sort entirely to restore the original insertion order.
+    if let Some(sorter) = column_view.sorter() {
+        let cv = column_view.clone();
+        let sm = sort_model.clone();
+        // Track (column_title, was_descending) from the previous state.
+        let prev: Rc<RefCell<Option<(String, bool)>>> = Rc::new(RefCell::new(None));
+
+        sorter.connect_changed(move |_, _| {
+            let Some(cv_sorter) = cv.sorter() else { return };
+            let Some(cv_sorter) = cv_sorter.downcast_ref::<gtk::ColumnViewSorter>() else {
+                return;
+            };
+            let Some(col) = cv_sorter.primary_sort_column() else {
+                // Already cleared.
+                *prev.borrow_mut() = None;
+                return;
+            };
+            let title = col.title().map(|t| t.to_string()).unwrap_or_default();
+            let is_desc = cv_sorter.primary_sort_order() == gtk::SortType::Descending;
+
+            let mut prev = prev.borrow_mut();
+            if let Some((ref prev_title, prev_desc)) = *prev {
+                if *prev_title == title && prev_desc && !is_desc {
+                    // Column flipped from desc back to asc — that means
+                    // the user clicked it a third time.  Clear sorting.
+                    // Use idle_add_local_once to avoid re-entrant sorter mutation.
+                    let cv2 = cv.clone();
+                    let sm2 = sm.clone();
+                    gtk::glib::idle_add_local_once(move || {
+                        cv2.sort_by_column(
+                            None::<&gtk::ColumnViewColumn>,
+                            gtk::SortType::Ascending,
+                        );
+                        sm2.set_sorter(cv2.sorter().as_ref());
+                    });
+                }
+            }
+            *prev = Some((title, is_desc));
+        });
+    }
 
     // ── Scrolled container ───────────────────────────────────────────
     let scrolled = gtk::ScrolledWindow::builder()
