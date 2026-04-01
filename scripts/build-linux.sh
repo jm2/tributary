@@ -41,6 +41,10 @@ check_pkg "libadwaita-1"  "libadwaita-1-dev"      "libadwaita-devel"    "libadwa
 check_pkg "gstreamer-1.0" "libgstreamer1.0-dev"   "gstreamer1-devel"    "gstreamer"
 check_pkg "dbus-1"        "libdbus-1-dev"         "dbus-devel"          "dbus"
 
+# Note: gst-plugins-good, gst-plugins-bad, gst-plugins-ugly, and gst-libav
+# are runtime dependencies (not detectable via pkg-config).
+# They are declared in the .deb, .rpm, and PKGBUILD package metadata.
+
 info "All system dependencies satisfied."
 
 # ── Rust Build ───────────────────────────────────────────────────────────────

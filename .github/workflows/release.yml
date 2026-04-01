@@ -3,6 +3,12 @@ name: Release
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0). Leave empty for HEAD."
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -17,7 +23,7 @@ jobs:
     name: Flatpak (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-49
       options: --privileged
     strategy:
       matrix:
@@ -50,9 +56,17 @@ jobs:
           cache-key: flatpak-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Upload Flatpak to release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: tributary-linux-${{ matrix.arch }}.flatpak
+
+      - name: Upload Flatpak as artifact (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tributary-linux-${{ matrix.arch }}-flatpak
+          path: tributary-linux-${{ matrix.arch }}.flatpak
 
   # ── macOS (.dmg) ──────────────────────────────────────────────────────────
   macos:
@@ -91,9 +105,17 @@ jobs:
         run: mv dist/Tributary.dmg dist/tributary-macos-aarch64.dmg
 
       - name: Upload DMG to release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: dist/tributary-macos-aarch64.dmg
+
+      - name: Upload DMG as artifact (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tributary-macos-aarch64-dmg
+          path: dist/tributary-macos-aarch64.dmg
 
   # ── Windows (.zip + Inno Setup .exe) ──────────────────────────────────────
   windows:
@@ -134,6 +156,7 @@ jobs:
             ${{ matrix.pkg_prefix }}-gstreamer
             ${{ matrix.pkg_prefix }}-gst-plugins-good
             ${{ matrix.pkg_prefix }}-gst-plugins-bad
+            ${{ matrix.pkg_prefix }}-gst-plugins-ugly
             ${{ matrix.pkg_prefix }}-gst-libav
             ${{ matrix.pkg_prefix }}-pkg-config
             ${{ matrix.pkg_prefix }}-toolchain
@@ -180,10 +203,16 @@ jobs:
           # Add Inno Setup to PATH for this job
           echo "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+      - name: Resolve MSYS2 root for Inno Setup
+        id: msys2-root
+        shell: msys2 {0}
+        run: |
+          echo "path=$(cygpath -w /)" >> "$GITHUB_OUTPUT"
+
       - name: Build Inno Setup installer
         shell: pwsh
         run: |
-          scripts/build-windows.ps1 -Msys2Root "C:\msys64" -NoCargoBuild -SkipBundle -InnoSetup
+          scripts/build-windows.ps1 -Msys2Root "${{ steps.msys2-root.outputs.path }}" -NoCargoBuild -SkipBundle -InnoSetup
         env:
           RUST_TARGET: ${{ matrix.rust_target }}
           MSYS_ENV: ${{ matrix.msys_env }}
@@ -195,9 +224,19 @@ jobs:
           Move-Item dist/tributary-setup.exe dist/tributary-windows-${{ matrix.arch }}-setup.exe
 
       - name: Upload Windows artifacts to release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            dist/tributary-windows-${{ matrix.arch }}.zip
+            dist/tributary-windows-${{ matrix.arch }}-setup.exe
+
+      - name: Upload Windows artifacts (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tributary-windows-${{ matrix.arch }}
+          path: |
             dist/tributary-windows-${{ matrix.arch }}.zip
             dist/tributary-windows-${{ matrix.arch }}-setup.exe
 
@@ -253,9 +292,17 @@ jobs:
           mv "$DEB_FILE" "target/debian/tributary-${{ matrix.deb_arch }}.deb"
 
       - name: Upload .deb to release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: target/debian/tributary-${{ matrix.deb_arch }}.deb
+
+      - name: Upload .deb as artifact (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tributary-${{ matrix.deb_arch }}-deb
+          path: target/debian/tributary-${{ matrix.deb_arch }}.deb
 
   linux-rpm:
     name: RPM Package (${{ matrix.arch }})
@@ -310,9 +357,17 @@ jobs:
           mv "$RPM_FILE" "target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm"
 
       - name: Upload .rpm to release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
+
+      - name: Upload .rpm as artifact (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tributary-${{ matrix.rpm_arch }}-rpm
+          path: target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
 
   linux-arch:
     name: Arch Linux Package (x86_64)
@@ -323,7 +378,7 @@ jobs:
       - name: Install system dependencies
         run: |
           pacman -Syu --noconfirm git gtk4 libadwaita gstreamer \
-            gst-plugins-good gst-plugins-bad gst-libav dbus rustup
+            gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav dbus rustup
 
       - name: Setup Rust
         run: rustup default stable
@@ -363,6 +418,14 @@ jobs:
           cp "$PKG_FILE" dist/tributary-x86_64.pkg.tar.zst
 
       - name: Upload Arch package to release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: dist/tributary-x86_64.pkg.tar.zst
+
+      - name: Upload Arch package as artifact (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tributary-x86_64-arch
+          path: dist/tributary-x86_64.pkg.tar.zst

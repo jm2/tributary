@@ -21,7 +21,7 @@ pub struct DiscoveredServer {
     pub name: String,
     /// Full HTTP(S) URL to the server root.
     pub url: String,
-    /// The backend type: `"subsonic"`, `"jellyfin"`, or `"plex"`.
+    /// The backend type: `"subsonic"`, `"jellyfin"`, `"plex"`, or `"daap"`.
     pub service_type: String,
 }
 

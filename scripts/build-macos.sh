@@ -19,6 +19,10 @@ BUNDLE_ID="io.github.tributary.Tributary"
 BINARY="target/release/tributary"
 APP_BUNDLE="dist/${APP_NAME}.app"
 
+# Extract version from Cargo.toml
+CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+info "Version: ${CARGO_VERSION}"
+
 # ── Dependency Checks ────────────────────────────────────────────────────────
 info "Checking build dependencies..."
 
@@ -59,20 +63,47 @@ mkdir -p "${APP_BUNDLE}/Contents/Frameworks"
 # Copy binary
 cp "$BINARY" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
 
-# Copy GTK icons and schemas (silently fails if missing to avoid breaking the build)
-BREW_PREFIX="$(brew --prefix)"
-cp -R "${BREW_PREFIX}/share/icons/hicolor" "${APP_BUNDLE}/Contents/Resources/share/icons/" 2>/dev/null || true
-cp -R "${BREW_PREFIX}/share/icons/Adwaita" "${APP_BUNDLE}/Contents/Resources/share/icons/" 2>/dev/null || true
-cp -R "${BREW_PREFIX}/share/glib-2.0/schemas" "${APP_BUNDLE}/Contents/Resources/share/glib-2.0/" 2>/dev/null || true
-glib-compile-schemas "${APP_BUNDLE}/Contents/Resources/share/glib-2.0/schemas" 2>/dev/null || true
+# ── Bundle GTK/Adwaita resources ─────────────────────────────────────────────
+RESOURCES_DIR="${APP_BUNDLE}/Contents/Resources"
+
+# Icons
+mkdir -p "${RESOURCES_DIR}/share/icons"
+cp -R "${BREW_PREFIX}/share/icons/hicolor" "${RESOURCES_DIR}/share/icons/" 2>/dev/null || true
+cp -R "${BREW_PREFIX}/share/icons/Adwaita" "${RESOURCES_DIR}/share/icons/" 2>/dev/null || true
+
+# GLib schemas
+mkdir -p "${RESOURCES_DIR}/share/glib-2.0/schemas"
+cp -R "${BREW_PREFIX}/share/glib-2.0/schemas" "${RESOURCES_DIR}/share/glib-2.0/" 2>/dev/null || true
+glib-compile-schemas "${RESOURCES_DIR}/share/glib-2.0/schemas" 2>/dev/null || true
+
+# GDK pixbuf loaders
+PIXBUF_LOADER_DIR="${BREW_PREFIX}/lib/gdk-pixbuf-2.0"
+if [[ -d "$PIXBUF_LOADER_DIR" ]]; then
+  mkdir -p "${RESOURCES_DIR}/lib"
+  cp -R "$PIXBUF_LOADER_DIR" "${RESOURCES_DIR}/lib/" 2>/dev/null || true
+fi
+
+# ── Bundle GStreamer plugins ─────────────────────────────────────────────────
+GST_PLUGIN_SRC="${BREW_PREFIX}/lib/gstreamer-1.0"
+GST_PLUGIN_DEST="${RESOURCES_DIR}/lib/gstreamer-1.0"
+if [[ -d "$GST_PLUGIN_SRC" ]]; then
+  info "Bundling GStreamer plugins..."
+  mkdir -p "$GST_PLUGIN_DEST"
+  # Copy all plugin dylibs
+  cp "${GST_PLUGIN_SRC}"/*.dylib "$GST_PLUGIN_DEST/" 2>/dev/null || true
+  GST_PLUGIN_COUNT=$(ls -1 "$GST_PLUGIN_DEST"/*.dylib 2>/dev/null | wc -l | tr -d ' ')
+  info "Bundled ${GST_PLUGIN_COUNT} GStreamer plugins."
+else
+  warn "GStreamer plugin directory not found at ${GST_PLUGIN_SRC}"
+fi
 
 # Generate .icns from the iconset PNGs
 ICONSET_SRC="data/tributary.iconset"
 if [[ -d "$ICONSET_SRC" ]] && command -v iconutil &>/dev/null; then
-  iconutil -c icns -o "${APP_BUNDLE}/Contents/Resources/tributary.icns" "$ICONSET_SRC"
+  iconutil -c icns -o "${RESOURCES_DIR}/tributary.icns" "$ICONSET_SRC"
   info "App icon created via iconutil."
 elif [[ -f "data/tributary.icns" ]]; then
-  cp "data/tributary.icns" "${APP_BUNDLE}/Contents/Resources/tributary.icns"
+  cp "data/tributary.icns" "${RESOURCES_DIR}/tributary.icns"
 else
   warn "No app icon found — .app will use default icon."
 fi
@@ -87,54 +118,146 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key>    <string>${APP_NAME}</string>
   <key>CFBundleIdentifier</key>   <string>${BUNDLE_ID}</string>
   <key>CFBundleName</key>         <string>${APP_NAME}</string>
-  <key>CFBundleVersion</key>      <string>0.1.0</string>
+  <key>CFBundleVersion</key>      <string>${CARGO_VERSION}</string>
   <key>CFBundlePackageType</key>  <string>APPL</string>
   <key>CFBundleIconFile</key>     <string>tributary</string>
   <key>NSHighResolutionCapable</key> <true/>
   <key>LSMinimumSystemVersion</key>  <string>13.0</string>
+  <key>LSEnvironment</key>
+  <dict>
+    <key>GST_PLUGIN_PATH</key>
+    <string>../Resources/lib/gstreamer-1.0</string>
+    <key>GST_PLUGIN_SYSTEM_PATH</key>
+    <string></string>
+    <key>GDK_PIXBUF_MODULE_FILE</key>
+    <string>../Resources/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache</string>
+    <key>XDG_DATA_DIRS</key>
+    <string>../Resources/share</string>
+    <key>GSETTINGS_SCHEMA_DIR</key>
+    <string>../Resources/share/glib-2.0/schemas</string>
+  </dict>
 </dict>
 </plist>
 PLIST
 
-# Copy GTK shared libraries and fix up rpaths
-info "Bundling dylibs and fixing rpaths (this may take a moment)..."
+# ── Copy and fix dylibs (recursive) ─────────────────────────────────────────
+info "Bundling dylibs and fixing rpaths (recursive — this may take a moment)..."
 FRAMEWORKS_DIR="${APP_BUNDLE}/Contents/Frameworks"
 BIN="${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
 
-# Collect unique dylibs reported by otool, excluding system frameworks
-copy_and_fix_dylib() {
+# Copy a single dylib into Frameworks/ if not already there.
+copy_dylib() {
   local src="$1"
   local basename
   basename="$(basename "$src")"
   local dest="${FRAMEWORKS_DIR}/${basename}"
-  [[ -f "$dest" ]] && return
+  [[ -f "$dest" ]] && return 1  # already copied
   cp "$src" "$dest"
+  chmod u+w "$dest"
   # Fix the install name of the copied library
   install_name_tool -id "@executable_path/../Frameworks/${basename}" "$dest" 2>/dev/null || true
+  return 0  # newly copied
 }
 
-fix_binary_rpaths() {
+# Rewrite Homebrew absolute paths in a binary/dylib to @executable_path-relative.
+# Returns the list of newly-copied dylibs (for recursive processing).
+fix_rpaths() {
   local bin="$1"
-  # Replace absolute Homebrew paths with @executable_path-relative ones
-  otool -L "$bin" 2>/dev/null \
-    | awk '/\/opt\/homebrew|\/usr\/local/{print $1}' \
-    | while read -r libpath; do
-        local basename
-        basename="$(basename "$libpath")"
-        copy_and_fix_dylib "$libpath"
-        install_name_tool -change "$libpath" \
-          "@executable_path/../Frameworks/${basename}" "$bin" 2>/dev/null || true
-      done
+  local new_libs=()
+  while IFS= read -r libpath; do
+    local basename
+    basename="$(basename "$libpath")"
+    if copy_dylib "$libpath"; then
+      new_libs+=("${FRAMEWORKS_DIR}/${basename}")
+    fi
+    install_name_tool -change "$libpath" \
+      "@executable_path/../Frameworks/${basename}" "$bin" 2>/dev/null || true
+  done < <(otool -L "$bin" 2>/dev/null \
+    | awk '/\/opt\/homebrew|\/usr\/local/{print $1}')
+  # Return new libs via global variable (bash doesn't have return arrays)
+  NEWLY_COPIED=("${new_libs[@]+"${new_libs[@]}"}")
 }
 
-fix_binary_rpaths "$BIN"
+# Fix the main binary first.
+fix_rpaths "$BIN"
+QUEUE=("${NEWLY_COPIED[@]+"${NEWLY_COPIED[@]}"}")
+
+# Recursively fix all newly-copied dylibs until no new ones are discovered.
+PASS=1
+while [[ ${#QUEUE[@]} -gt 0 ]]; do
+  info "  Dylib pass ${PASS}: processing ${#QUEUE[@]} libraries..."
+  NEXT_QUEUE=()
+  for lib in "${QUEUE[@]}"; do
+    fix_rpaths "$lib"
+    NEXT_QUEUE+=("${NEWLY_COPIED[@]+"${NEWLY_COPIED[@]}"}")
+  done
+  QUEUE=("${NEXT_QUEUE[@]+"${NEXT_QUEUE[@]}"}")
+  PASS=$((PASS + 1))
+  # Safety valve: prevent infinite loops
+  if [[ $PASS -gt 20 ]]; then
+    warn "Dylib recursion exceeded 20 passes — stopping."
+    break
+  fi
+done
+
+TOTAL_DYLIBS=$(ls -1 "${FRAMEWORKS_DIR}"/*.dylib 2>/dev/null | wc -l | tr -d ' ')
+info "Bundled ${TOTAL_DYLIBS} dylibs into Frameworks/."
+
+# Also fix rpaths in GStreamer plugin dylibs
+if [[ -d "$GST_PLUGIN_DEST" ]]; then
+  info "Fixing rpaths in GStreamer plugins..."
+  for plugin in "${GST_PLUGIN_DEST}"/*.dylib; do
+    [[ -f "$plugin" ]] || continue
+    chmod u+w "$plugin"
+    while IFS= read -r libpath; do
+      local_basename="$(basename "$libpath")"
+      # Copy the dependency into Frameworks/ if needed
+      copy_dylib "$libpath" || true
+      # Rewrite the path — GStreamer plugins are in Resources/lib/gstreamer-1.0/
+      # so relative path to Frameworks/ is ../../../Frameworks/
+      install_name_tool -change "$libpath" \
+        "@executable_path/../Frameworks/${local_basename}" "$plugin" 2>/dev/null || true
+    done < <(otool -L "$plugin" 2>/dev/null \
+      | awk '/\/opt\/homebrew|\/usr\/local/{print $1}')
+  done
+fi
+
+# ── Ad-hoc Code Signing ─────────────────────────────────────────────────────
+# macOS 13+ kills unsigned binaries launched from .app bundles (SIGKILL / exit 9).
+# After install_name_tool modifies binaries, any existing signature is invalidated.
+# We must re-sign everything with at least an ad-hoc signature.
+info "Ad-hoc code signing the bundle..."
+
+# Sign all dylibs in Frameworks/ first
+find "${FRAMEWORKS_DIR}" -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
+
+# Sign GStreamer plugin dylibs
+if [[ -d "$GST_PLUGIN_DEST" ]]; then
+  find "$GST_PLUGIN_DEST" -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
+fi
+
+# Sign the main binary last
+codesign --force --sign - "$BIN" 2>/dev/null || true
+
+# Sign the overall .app bundle
+codesign --force --deep --sign - "$APP_BUNDLE" 2>/dev/null || true
 
 info ".app bundle created: $(pwd)/${APP_BUNDLE}"
+
+# ── Verify the bundle ────────────────────────────────────────────────────────
+if codesign --verify --verbose "$APP_BUNDLE" 2>/dev/null; then
+  info "Code signature verified OK."
+else
+  warn "Code signature verification failed — the app may not launch from Finder."
+  warn "Try: codesign --force --deep --sign - '${APP_BUNDLE}'"
+fi
 
 # ── DMG ──────────────────────────────────────────────────────────────────────
 if $MAKE_DMG; then
   info "Creating .dmg disk image..."
   mkdir -p dist
+  # Remove any existing DMG (create-dmg fails if it exists)
+  rm -f "dist/${APP_NAME}.dmg"
   create-dmg \
     --volname "${APP_NAME}" \
     --window-pos 200 120 \
