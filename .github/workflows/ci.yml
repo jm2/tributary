@@ -86,6 +86,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Add macOS target
         run: rustup target add aarch64-apple-darwin
@@ -100,6 +102,12 @@ jobs:
             target
           key: macos-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: macos-aarch64-cargo-
+
+      - name: Clippy (lint)
+        run: |
+          BREW_PREFIX="$(brew --prefix)"
+          export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig"
+          cargo clippy --target aarch64-apple-darwin -- -D warnings
 
       - name: Build (release)
         run: |
@@ -167,6 +175,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_target }}
+          components: clippy, rustfmt
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -178,6 +187,12 @@ jobs:
             target
           key: windows-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: windows-${{ matrix.arch }}-cargo-
+
+      - name: Clippy (lint)
+        run: |
+          export PKG_CONFIG_ALLOW_CROSS="1"
+          export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
+          cargo clippy --target ${{ matrix.rust_target }} -- -D warnings
 
       - name: Build (release)
         run: |
