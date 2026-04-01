@@ -373,7 +373,11 @@ fn load_saved_volume() -> Option<f64> {
     let path = volume_path()?;
     let text = std::fs::read_to_string(path).ok()?;
     let v: f64 = text.trim().parse().ok()?;
-    if (0.0..=1.0).contains(&v) { Some(v) } else { None }
+    if (0.0..=1.0).contains(&v) {
+        Some(v)
+    } else {
+        None
+    }
 }
 
 fn save_volume(level: f64) {
