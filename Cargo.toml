@@ -56,6 +56,9 @@ async-channel = "2"
 # XDG / platform directories
 dirs = "6"
 
+# Shuffle randomness (zero-dependency PRNG)
+fastrand = "2"
+
 # Audio playback (GStreamer pipeline)
 gstreamer = "0.25"
 

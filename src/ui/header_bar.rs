@@ -3,8 +3,19 @@
 //! Follows modern GNOME app patterns (Ptyxis-style): a primary `MenuButton`
 //! with a `gio::Menu` popover on the right, rather than a legacy hamburger.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use adw::prelude::*;
 use gtk::Align;
+
+/// Repeat button cycles through these modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepeatMode {
+    Off,
+    All,
+    One,
+}
 
 /// Interactive widgets exposed for the integration bridge to drive.
 #[allow(dead_code)]
@@ -13,7 +24,8 @@ pub struct HeaderBarWidgets {
     pub play_button: gtk::Button,
     pub prev_button: gtk::Button,
     pub next_button: gtk::Button,
-    pub repeat_button: gtk::ToggleButton,
+    pub repeat_button: gtk::Button,
+    pub repeat_mode: Rc<Cell<RepeatMode>>,
     pub shuffle_button: gtk::ToggleButton,
     pub title_label: gtk::Label,
     pub artist_label: gtk::Label,
@@ -44,10 +56,37 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         .tooltip_text("Next")
         .build();
 
-    let btn_repeat = gtk::ToggleButton::builder()
+    let repeat_mode: Rc<Cell<RepeatMode>> = Rc::new(Cell::new(RepeatMode::Off));
+    let btn_repeat = gtk::Button::builder()
         .icon_name("media-playlist-repeat-symbolic")
-        .tooltip_text("Repeat")
+        .tooltip_text("Repeat: Off")
         .build();
+
+    // Cycle Off → All → One on each click.
+    {
+        let mode = repeat_mode.clone();
+        let btn = btn_repeat.clone();
+        btn_repeat.connect_clicked(move |_| {
+            let next = match mode.get() {
+                RepeatMode::Off => RepeatMode::All,
+                RepeatMode::All => RepeatMode::One,
+                RepeatMode::One => RepeatMode::Off,
+            };
+            mode.set(next);
+            let (icon, tooltip, css) = match next {
+                RepeatMode::Off => ("media-playlist-repeat-symbolic", "Repeat: Off", false),
+                RepeatMode::All => ("media-playlist-repeat-symbolic", "Repeat: All", true),
+                RepeatMode::One => ("media-playlist-repeat-song-symbolic", "Repeat: One", true),
+            };
+            btn.set_icon_name(icon);
+            btn.set_tooltip_text(Some(tooltip));
+            if css {
+                btn.add_css_class("suggested-action");
+            } else {
+                btn.remove_css_class("suggested-action");
+            }
+        });
+    }
 
     let btn_shuffle = gtk::ToggleButton::builder()
         .icon_name("media-playlist-shuffle-symbolic")
@@ -202,6 +241,7 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         prev_button: btn_prev,
         next_button: btn_next,
         repeat_button: btn_repeat,
+        repeat_mode,
         shuffle_button: btn_shuffle,
         title_label,
         artist_label,

@@ -12,6 +12,7 @@ use tracing::{info, warn};
 use crate::audio::{PlayerEvent, PlayerState};
 use crate::desktop_integration::MediaAction;
 use crate::local::engine::{LibraryEngine, LibraryEvent};
+use crate::ui::header_bar::RepeatMode;
 
 use super::browser;
 use super::header_bar;
@@ -62,7 +63,7 @@ pub fn build_window(
 
     // ── Tracklist (starts empty — populated by FullSync) ──────────────
     let empty_tracks: Vec<TrackObject> = Vec::new();
-    let (tracklist_widget, track_store, status_label, column_view) =
+    let (tracklist_widget, track_store, status_label, column_view, sort_model) =
         tracklist::build_tracklist(&empty_tracks);
 
     // ── Shared playback state ────────────────────────────────────────
@@ -129,7 +130,7 @@ pub fn build_window(
         },
     );
 
-    let browser_widget = browser::build_browser(&empty_tracks, on_filter);
+    let (browser_widget, browser_state) = browser::build_browser(&empty_tracks, on_filter);
 
     // ── Right content ────────────────────────────────────────────────
     let right_paned = gtk::Paned::builder()
@@ -209,7 +210,8 @@ pub fn build_window(
                 track_store,
                 status_label,
                 master_tracks,
-                browser_widget,
+                &browser_widget,
+                browser_state,
                 scan_spinner,
             );
             return;
@@ -252,10 +254,37 @@ pub fn build_window(
         };
 
     // ── Wire play/pause button ──────────────────────────────────────
+    // If nothing is playing, start from track 0 (or random if shuffle).
     {
         let player = player.clone();
+        let media_ctrl = media_ctrl.clone();
+        let title_label = hb.title_label.clone();
+        let artist_label = hb.artist_label.clone();
+        let sort_model = sort_model.clone();
+        let current_pos = current_pos.clone();
+        let shuffle = hb.shuffle_button.clone();
+
         hb.play_button.connect_clicked(move |_| {
-            player.borrow().toggle_play_pause();
+            if current_pos.get().is_some() {
+                // Already have a track loaded — just toggle.
+                player.borrow().toggle_play_pause();
+            } else if sort_model.n_items() > 0 {
+                // Nothing playing — start from the list.
+                let pos = if shuffle.is_active() {
+                    fastrand::u32(..sort_model.n_items())
+                } else {
+                    0
+                };
+                play_track_at(
+                    pos,
+                    &sort_model,
+                    &player.borrow(),
+                    &title_label,
+                    &artist_label,
+                    &media_ctrl,
+                    &current_pos,
+                );
+            }
         });
     }
 
@@ -284,13 +313,13 @@ pub fn build_window(
         let media_ctrl = media_ctrl.clone();
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
-        let store = track_store.clone();
+        let sm = sort_model.clone();
         let current_pos = current_pos.clone();
 
         column_view.connect_activate(move |_view, position| {
             play_track_at(
                 position,
-                &store,
+                &sm,
                 &player.borrow(),
                 &title_label,
                 &artist_label,
@@ -306,34 +335,22 @@ pub fn build_window(
         let media_ctrl = media_ctrl.clone();
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
-        let store = track_store.clone();
+        let sm = sort_model.clone();
         let current_pos = current_pos.clone();
-        let repeat_btn = hb.repeat_button.clone();
+        let repeat_mode = hb.repeat_mode.clone();
+        let shuffle = hb.shuffle_button.clone();
 
         hb.next_button.connect_clicked(move |_| {
-            let Some(pos) = current_pos.get() else { return };
-            let next = pos + 1;
-            if next < store.n_items() {
-                play_track_at(
-                    next,
-                    &store,
-                    &player.borrow(),
-                    &title_label,
-                    &artist_label,
-                    &media_ctrl,
-                    &current_pos,
-                );
-            } else if repeat_btn.is_active() && store.n_items() > 0 {
-                play_track_at(
-                    0,
-                    &store,
-                    &player.borrow(),
-                    &title_label,
-                    &artist_label,
-                    &media_ctrl,
-                    &current_pos,
-                );
-            }
+            advance_track(
+                &sm,
+                &player.borrow(),
+                &title_label,
+                &artist_label,
+                &media_ctrl,
+                &current_pos,
+                repeat_mode.get(),
+                shuffle.is_active(),
+            );
         });
     }
 
@@ -343,7 +360,7 @@ pub fn build_window(
         let media_ctrl = media_ctrl.clone();
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
-        let store = track_store.clone();
+        let sm = sort_model.clone();
         let current_pos = current_pos.clone();
 
         hb.prev_button.connect_clicked(move |_| {
@@ -360,7 +377,7 @@ pub fn build_window(
             if pos > 0 {
                 play_track_at(
                     pos - 1,
-                    &store,
+                    &sm,
                     &player.borrow(),
                     &title_label,
                     &artist_label,
@@ -381,11 +398,12 @@ pub fn build_window(
         let progress_adj = hb.progress_adj.clone();
         let position_label = hb.position_label.clone();
         let duration_label = hb.duration_label.clone();
-        let repeat_btn = hb.repeat_button.clone();
+        let repeat_mode = hb.repeat_mode.clone();
+        let shuffle = hb.shuffle_button.clone();
         let seeking = seeking.clone();
         let media_ctrl = media_ctrl.clone();
         let player = player.clone();
-        let store = track_store.clone();
+        let sm = sort_model.clone();
         let current_pos = current_pos.clone();
 
         glib::MainContext::default().spawn_local(async move {
@@ -417,35 +435,35 @@ pub fn build_window(
                     }
 
                     PlayerEvent::TrackEnded => {
-                        // Auto-advance to next track, or wrap if repeat.
-                        let advanced = if let Some(pos) = current_pos.get() {
-                            let next = pos + 1;
-                            if next < store.n_items() {
+                        let mode = repeat_mode.get();
+
+                        // Repeat-one: replay the same track.
+                        if mode == RepeatMode::One {
+                            if let Some(pos) = current_pos.get() {
                                 play_track_at(
-                                    next,
-                                    &store,
+                                    pos,
+                                    &sm,
                                     &player.borrow(),
                                     &title_label,
                                     &artist_label,
                                     &media_ctrl,
                                     &current_pos,
-                                )
-                            } else if repeat_btn.is_active() && store.n_items() > 0 {
-                                play_track_at(
-                                    0,
-                                    &store,
-                                    &player.borrow(),
-                                    &title_label,
-                                    &artist_label,
-                                    &media_ctrl,
-                                    &current_pos,
-                                )
-                            } else {
-                                false
+                                );
+                                continue;
                             }
-                        } else {
-                            false
-                        };
+                        }
+
+                        // Auto-advance (shuffle-aware).
+                        let advanced = advance_track(
+                            &sm,
+                            &player.borrow(),
+                            &title_label,
+                            &artist_label,
+                            &media_ctrl,
+                            &current_pos,
+                            mode,
+                            shuffle.is_active(),
+                        );
 
                         if !advanced {
                             // End of playlist — reset to idle.
@@ -482,7 +500,8 @@ pub fn build_window(
         track_store,
         status_label,
         master_tracks,
-        browser_widget,
+        &browser_widget,
+        browser_state,
         scan_spinner,
     );
 }
@@ -492,13 +511,6 @@ pub fn build_window(
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Extract the native window handle for `souvlaki`.
-///
-/// On **Windows** this returns the `HWND` from the GDK Win32 surface.
-/// The window **must** have been presented (realized + mapped) first,
-/// otherwise there is no native surface to query.
-///
-/// On Linux and macOS this returns `None` — souvlaki uses D-Bus / Now
-/// Playing respectively and does not need a window handle.
 #[cfg(target_os = "windows")]
 fn extract_hwnd(window: &adw::ApplicationWindow) -> Option<*mut std::ffi::c_void> {
     use gtk::prelude::NativeExt;
@@ -506,8 +518,6 @@ fn extract_hwnd(window: &adw::ApplicationWindow) -> Option<*mut std::ffi::c_void
     let surface = window.surface()?;
     let win32_surface = surface.downcast_ref::<gdk4_win32::Win32Surface>()?;
     let hwnd = win32_surface.handle();
-    // handle() returns windows::Win32::Foundation::HWND(isize) —
-    // unwrap the newtype and cast to the raw pointer souvlaki expects.
     Some(hwnd.0 as *mut std::ffi::c_void)
 }
 
@@ -516,20 +526,21 @@ fn extract_hwnd(_window: &adw::ApplicationWindow) -> Option<*mut std::ffi::c_voi
     None
 }
 
-/// Try to play the track at `position` in the given store.
+/// Try to play the track at `position` in the given model.
 ///
+/// Uses the `SortListModel` so positions match the visible sorted order.
 /// Updates the now-playing labels, the OS media overlay metadata, and
 /// the `current_pos` tracker.  Returns `true` on success.
 fn play_track_at(
     position: u32,
-    store: &gtk::gio::ListStore,
+    model: &gtk::SortListModel,
     player: &crate::audio::Player,
     title_label: &gtk::Label,
     artist_label: &gtk::Label,
     media_ctrl: &RefCell<Option<crate::desktop_integration::MediaController>>,
     current_pos: &Cell<Option<u32>>,
 ) -> bool {
-    let Some(item) = store.item(position) else {
+    let Some(item) = model.item(position) else {
         return false;
     };
     let Some(track) = item.downcast_ref::<TrackObject>() else {
@@ -559,6 +570,88 @@ fn play_track_at(
     true
 }
 
+/// Advance to the next track, respecting shuffle and repeat-all.
+///
+/// Returns `true` if a new track was loaded, `false` if we've reached
+/// the end (caller should reset to idle).
+fn advance_track(
+    model: &gtk::SortListModel,
+    player: &crate::audio::Player,
+    title_label: &gtk::Label,
+    artist_label: &gtk::Label,
+    media_ctrl: &RefCell<Option<crate::desktop_integration::MediaController>>,
+    current_pos: &Cell<Option<u32>>,
+    repeat_mode: RepeatMode,
+    shuffle: bool,
+) -> bool {
+    let n = model.n_items();
+    if n == 0 {
+        return false;
+    }
+
+    if shuffle {
+        // Pick a random track, avoiding the current one if possible.
+        let pos = if n > 1 {
+            let cur = current_pos.get().unwrap_or(u32::MAX);
+            loop {
+                let r = fastrand::u32(..n);
+                if r != cur {
+                    break r;
+                }
+            }
+        } else {
+            0
+        };
+        return play_track_at(
+            pos,
+            model,
+            player,
+            title_label,
+            artist_label,
+            media_ctrl,
+            current_pos,
+        );
+    }
+
+    // Sequential advance.
+    let Some(pos) = current_pos.get() else {
+        return play_track_at(
+            0,
+            model,
+            player,
+            title_label,
+            artist_label,
+            media_ctrl,
+            current_pos,
+        );
+    };
+
+    let next = pos + 1;
+    if next < n {
+        play_track_at(
+            next,
+            model,
+            player,
+            title_label,
+            artist_label,
+            media_ctrl,
+            current_pos,
+        )
+    } else if repeat_mode == RepeatMode::All && n > 0 {
+        play_track_at(
+            0,
+            model,
+            player,
+            title_label,
+            artist_label,
+            media_ctrl,
+            current_pos,
+        )
+    } else {
+        false
+    }
+}
+
 /// Format milliseconds as `m:ss` (or `h:mm:ss` for ≥ 1 hour).
 fn format_ms(ms: u64) -> String {
     let total_secs = ms / 1000;
@@ -578,9 +671,12 @@ fn setup_library_events(
     track_store: gtk::gio::ListStore,
     status_label: gtk::Label,
     master_tracks: Rc<RefCell<Vec<TrackObject>>>,
-    browser_widget: gtk::Box,
+    browser_widget: &gtk::Box,
+    browser_state: browser::BrowserState,
     scan_spinner: gtk::Spinner,
 ) {
+    let browser_widget = browser_widget.clone();
+
     glib::MainContext::default().spawn_local(async move {
         while let Ok(event) = engine_rx.recv().await {
             match event {
@@ -596,7 +692,7 @@ fn setup_library_events(
                     }
 
                     tracklist::update_status(&status_label, &objects);
-                    browser::rebuild_browser_data(&browser_widget, &objects);
+                    browser::rebuild_browser_data(&browser_widget, &browser_state, &objects);
 
                     *master_tracks.borrow_mut() = objects;
                 }

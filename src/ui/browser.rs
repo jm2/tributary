@@ -16,13 +16,20 @@ use tracing::info;
 /// Receives (selected_genre, selected_artist, selected_album) — `None` = "All".
 pub type FilterCallback = Box<dyn Fn(Option<String>, Option<String>, Option<String>)>;
 
+/// Opaque handle to the browser's internal track snapshot.
+/// Passed back to [`rebuild_browser_data`] when the library changes.
+pub struct BrowserState {
+    tracks: Rc<RefCell<Vec<TrackSnapshot>>>,
+}
+
 /// Build the 3-pane browser.
 ///
-/// `all_tracks` is the full unfiltered track list (used to recompute browser
-/// item counts when filters change).
-///
-/// Returns `(gtk::Box containing the browser, filter_callback_handle)`.
-pub fn build_browser(all_tracks: &[TrackObject], on_filter_changed: FilterCallback) -> gtk::Box {
+/// Returns `(gtk::Box, BrowserState)`.  The caller must keep the
+/// `BrowserState` and pass it to [`rebuild_browser_data`] on FullSync.
+pub fn build_browser(
+    all_tracks: &[TrackObject],
+    on_filter_changed: FilterCallback,
+) -> (gtk::Box, BrowserState) {
     // Shared filter state
     let selected_genre: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let selected_artist: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -33,22 +40,15 @@ pub fn build_browser(all_tracks: &[TrackObject], on_filter_changed: FilterCallba
     let artist_store = gio::ListStore::new::<BrowserItem>();
     let album_store = gio::ListStore::new::<BrowserItem>();
 
-    // Clone tracks into a shared Vec for re-computation
-    let tracks: Rc<Vec<TrackSnapshot>> = Rc::new(
-        all_tracks
-            .iter()
-            .map(|t| TrackSnapshot {
-                genre: t.genre(),
-                artist: t.artist(),
-                album: t.album(),
-            })
-            .collect(),
-    );
+    // Shared mutable track snapshot — updated by rebuild_browser_data.
+    let tracks: Rc<RefCell<Vec<TrackSnapshot>>> = Rc::new(RefCell::new(
+        all_tracks.iter().map(TrackSnapshot::from_object).collect(),
+    ));
 
     // Initial population
-    populate_genres(&genre_store, &tracks, &None);
-    populate_artists(&artist_store, &tracks, &None);
-    populate_albums(&album_store, &tracks, &None, &None);
+    populate_genres(&genre_store, &tracks.borrow(), &None);
+    populate_artists(&artist_store, &tracks.borrow(), &None);
+    populate_albums(&album_store, &tracks.borrow(), &None, &None);
 
     // Wrap callback in Rc for sharing across closures
     let on_filter_changed = Rc::new(on_filter_changed);
@@ -73,11 +73,10 @@ pub fn build_browser(all_tracks: &[TrackObject], on_filter_changed: FilterCallba
             let genre = get_selected_label(sel);
             info!(?genre, "Browser: genre changed");
             *sg.borrow_mut() = genre.clone();
-            // Reset downstream
             *sa.borrow_mut() = None;
             *sl.borrow_mut() = None;
-            populate_artists(&artist_store, &tracks, &genre);
-            populate_albums(&album_store, &tracks, &genre, &None);
+            populate_artists(&artist_store, &tracks.borrow(), &genre);
+            populate_albums(&album_store, &tracks.borrow(), &genre, &None);
             cb(genre, None, None);
         });
     }
@@ -98,7 +97,7 @@ pub fn build_browser(all_tracks: &[TrackObject], on_filter_changed: FilterCallba
             *sa.borrow_mut() = artist.clone();
             *sl.borrow_mut() = None;
             let genre = sg.borrow().clone();
-            populate_albums(&album_store, &tracks, &genre, &artist);
+            populate_albums(&album_store, &tracks.borrow(), &genre, &artist);
             cb(genre, artist, None);
         });
     }
@@ -132,7 +131,8 @@ pub fn build_browser(all_tracks: &[TrackObject], on_filter_changed: FilterCallba
     browser_box.append(&artist_pane);
     browser_box.append(&album_pane);
 
-    browser_box
+    let state = BrowserState { tracks };
+    (browser_box, state)
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +145,16 @@ struct TrackSnapshot {
     genre: String,
     artist: String,
     album: String,
+}
+
+impl TrackSnapshot {
+    fn from_object(t: &TrackObject) -> Self {
+        Self {
+            genre: t.genre(),
+            artist: t.artist(),
+            album: t.album(),
+        }
+    }
 }
 
 fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
@@ -211,7 +221,6 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
 
 /// Extract the `SingleSelection` from a browser pane box.
 fn get_selection(pane: &gtk::Box) -> gtk::SingleSelection {
-    // pane → label, scrolled_window → list_view → model (SingleSelection)
     let scrolled = pane
         .last_child()
         .and_downcast::<gtk::ScrolledWindow>()
@@ -306,18 +315,15 @@ fn populate_albums(
 
 /// Rebuild all three browser pane stores from a new set of tracks.
 ///
-/// Called from `window.rs` when a `FullSync` event arrives. Extracts the
-/// three `gio::ListStore` instances from the browser widget tree and
-/// repopulates them.
-pub fn rebuild_browser_data(browser_box: &gtk::Box, tracks: &[TrackObject]) {
-    let snapshots: Vec<TrackSnapshot> = tracks
-        .iter()
-        .map(|t| TrackSnapshot {
-            genre: t.genre(),
-            artist: t.artist(),
-            album: t.album(),
-        })
-        .collect();
+/// Updates the shared `BrowserState` snapshot so that subsequent
+/// selection changes use fresh data, then repopulates all three stores
+/// with filters reset to "All".
+pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks: &[TrackObject]) {
+    // Update the shared snapshot that selection handlers reference.
+    let snapshots: Vec<TrackSnapshot> = tracks.iter().map(TrackSnapshot::from_object).collect();
+    *state.tracks.borrow_mut() = snapshots;
+
+    let borrowed = state.tracks.borrow();
 
     // The browser_box has 3 children (genre_pane, artist_pane, album_pane)
     let mut child = browser_box.first_child();
@@ -331,13 +337,13 @@ pub fn rebuild_browser_data(browser_box: &gtk::Box, tracks: &[TrackObject]) {
 
     if panes.len() >= 3 {
         if let Some(genre_store) = get_store_from_pane(&panes[0]) {
-            populate_genres(&genre_store, &snapshots, &None);
+            populate_genres(&genre_store, &borrowed, &None);
         }
         if let Some(artist_store) = get_store_from_pane(&panes[1]) {
-            populate_artists(&artist_store, &snapshots, &None);
+            populate_artists(&artist_store, &borrowed, &None);
         }
         if let Some(album_store) = get_store_from_pane(&panes[2]) {
-            populate_albums(&album_store, &snapshots, &None, &None);
+            populate_albums(&album_store, &borrowed, &None, &None);
         }
     }
 }

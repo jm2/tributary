@@ -93,7 +93,7 @@ impl Player {
             .map_err(|e| anyhow::anyhow!("Failed to create playbin element: {e}"))?;
 
         let volume = load_saved_volume().unwrap_or(1.0);
-        playbin.set_property("volume", volume);
+        playbin.set_property("volume", slider_to_pipeline(volume));
 
         let (event_tx, event_rx) = async_channel::unbounded();
 
@@ -118,7 +118,8 @@ impl Player {
         let _ = self.playbin.set_state(gst::State::Null);
         self.playbin.set_property("uri", uri);
         // Re-apply volume — the NULL transition resets it to 1.0.
-        self.playbin.set_property("volume", self.volume);
+        self.playbin
+            .set_property("volume", slider_to_pipeline(self.volume));
         let _ = self.playbin.set_state(gst::State::Playing);
     }
 
@@ -166,9 +167,12 @@ impl Player {
     // ── Volume ──────────────────────────────────────────────────────
 
     /// Set pipeline volume (clamped to 0.0 – 1.0, linear).
+    /// Set volume from a linear slider position (0.0 – 1.0).
+    /// Internally applies a cubic curve for perceptually linear loudness.
     pub fn set_volume(&mut self, level: f64) {
         self.volume = level.clamp(0.0, 1.0);
-        self.playbin.set_property("volume", self.volume);
+        self.playbin
+            .set_property("volume", slider_to_pipeline(self.volume));
         save_volume(self.volume);
         debug!(volume = self.volume, "Volume set");
     }
@@ -360,6 +364,16 @@ impl Drop for Player {
         info!("Shutting down GStreamer pipeline");
         let _ = self.playbin.set_state(gst::State::Null);
     }
+}
+
+// ── Volume curve ────────────────────────────────────────────────────────
+
+/// Convert a linear slider position (0.0–1.0) to a GStreamer pipeline
+/// volume using a cubic curve.  This makes the quiet half of the slider
+/// far more usable — without it, most of the perceptible range is
+/// crammed into the top 20% of travel.
+fn slider_to_pipeline(slider: f64) -> f64 {
+    slider * slider * slider
 }
 
 // ── Volume persistence ──────────────────────────────────────────────────
