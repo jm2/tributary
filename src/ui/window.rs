@@ -852,7 +852,8 @@ fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
 
     ctx.player.borrow().load_uri(&uri);
     ctx.title_label.set_label(&track.title());
-    ctx.artist_label.set_label(&format!("{} \u{2014} {}", track.artist(), track.album()));
+    ctx.artist_label
+        .set_label(&format!("{} \u{2014} {}", track.artist(), track.album()));
     ctx.current_pos.set(Some(position));
 
     if let Some(ref mut ctrl) = *ctx.media_ctrl.borrow_mut() {

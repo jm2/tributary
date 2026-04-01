@@ -22,7 +22,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | MPRIS / SMTC / macOS Now Playing integration (`souvlaki`) | ✅ Phase 4 |
 | Playback controls (play/pause, next/prev, seek, volume) | ✅ Phase 4 |
 | Auto-advance with repeat-all support | ✅ Phase 4 |
-| Subsonic / Navidrome backend | 📋 Phase 5 |
+| Subsonic / Navidrome backend | 🚧 Phase 5 |
 | Jellyfin / Plex backend | 📋 Phase 5 |
 | DAAP / mDNS backend | 📋 Phase 5 |
 | Cross-platform: Linux, macOS, Windows | ✅ CI scaffolded |
