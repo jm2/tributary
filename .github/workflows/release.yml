@@ -78,9 +78,6 @@ jobs:
           - arch: aarch64
             runner: macos-15
             rust_target: aarch64-apple-darwin
-          - arch: x86_64
-            runner: macos-13
-            rust_target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
