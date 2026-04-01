@@ -72,8 +72,17 @@ jobs:
 
   # ── macOS (.app + .dmg) ───────────────────────────────────────────────────
   build-macos:
-    name: macOS (aarch64)
-    runs-on: macos-15
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: macos-15
+            rust_target: aarch64-apple-darwin
+          - arch: x86_64
+            runner: macos-13
+            rust_target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
@@ -87,10 +96,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          targets: ${{ matrix.rust_target }}
           components: clippy, rustfmt
-
-      - name: Add macOS target
-        run: rustup target add aarch64-apple-darwin
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -100,32 +107,32 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: macos-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: macos-aarch64-cargo-
+          key: macos-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-${{ matrix.arch }}-cargo-
 
       - name: Clippy (lint)
         run: |
           BREW_PREFIX="$(brew --prefix)"
           export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig"
-          cargo clippy --target aarch64-apple-darwin -- -D warnings
+          cargo clippy --target ${{ matrix.rust_target }} -- -D warnings
 
       - name: Build (release)
         run: |
           BREW_PREFIX="$(brew --prefix)"
           export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig"
-          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target ${{ matrix.rust_target }}
 
       - name: Create .app bundle and .dmg
         run: |
-          # Copy the cross-compiled binary to the default location expected by build-macos.sh
+          # Copy the target-specific binary to the default location expected by build-macos.sh
           mkdir -p target/release
-          cp target/aarch64-apple-darwin/release/tributary target/release/tributary
+          cp target/${{ matrix.rust_target }}/release/tributary target/release/tributary
           bash scripts/build-macos.sh --dmg
 
       - name: Upload .dmg
         uses: actions/upload-artifact@v4
         with:
-          name: tributary-macos-aarch64
+          name: tributary-macos-${{ matrix.arch }}
           path: dist/Tributary.dmg
           if-no-files-found: error
 

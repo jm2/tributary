@@ -70,8 +70,17 @@ jobs:
 
   # ── macOS (.dmg) ──────────────────────────────────────────────────────────
   macos:
-    name: macOS (aarch64)
-    runs-on: macos-15
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: macos-15
+            rust_target: aarch64-apple-darwin
+          - arch: x86_64
+            runner: macos-13
+            rust_target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
@@ -85,7 +94,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.rust_target }}
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -95,27 +104,27 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: release-macos-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: release-macos-aarch64-cargo-
+          key: release-macos-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-macos-${{ matrix.arch }}-cargo-
 
       - name: Build and create .dmg
         run: bash scripts/build-macos.sh --dmg
 
       - name: Rename DMG for release
-        run: mv dist/Tributary.dmg dist/tributary-macos-aarch64.dmg
+        run: mv dist/Tributary.dmg dist/tributary-macos-${{ matrix.arch }}.dmg
 
       - name: Upload DMG to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/tributary-macos-aarch64.dmg
+          files: dist/tributary-macos-${{ matrix.arch }}.dmg
 
       - name: Upload DMG as artifact (workflow_dispatch)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: tributary-macos-aarch64-dmg
-          path: dist/tributary-macos-aarch64.dmg
+          name: tributary-macos-${{ matrix.arch }}-dmg
+          path: dist/tributary-macos-${{ matrix.arch }}.dmg
 
   # ── Windows (.zip + Inno Setup .exe) ──────────────────────────────────────
   windows:
