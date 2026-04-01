@@ -420,9 +420,8 @@ pub fn build_window(
                         if let Ok(Some(requires_pw)) = probe_rx.recv().await {
                             // Find the source in the store and update it.
                             for i in 0..store_for_probe.n_items() {
-                                if let Some(src) = store_for_probe
-                                    .item(i)
-                                    .and_downcast_ref::<SourceObject>()
+                                if let Some(src) =
+                                    store_for_probe.item(i).and_downcast_ref::<SourceObject>()
                                 {
                                     if src.server_url() == probe_server_url && !src.connected() {
                                         src.set_requires_password(requires_pw);
@@ -624,13 +623,7 @@ pub fn build_window(
                 let server_name = name_for_closure.clone();
                 rt_handle.spawn(async move {
                     info!(server = %server_url, "Connecting to passwordless DAAP server...");
-                    match crate::daap::DaapBackend::connect(
-                        &server_name,
-                        &server_url,
-                        None,
-                    )
-                    .await
-                    {
+                    match crate::daap::DaapBackend::connect(&server_name, &server_url, None).await {
                         Ok(backend) => {
                             let tracks = backend.all_tracks().await;
                             info!(count = tracks.len(), "DAAP library fetched (no password)");
@@ -1632,10 +1625,7 @@ fn ensure_category_header_vec(sources: &mut Vec<SourceObject>, backend_type: &st
 /// `ListStore`. Returns the index at which a new source should be inserted
 /// (right after the last item in that category, or right after the header
 /// if the category is empty).
-fn ensure_category_header_store(
-    store: &gtk::gio::ListStore,
-    backend_type: &str,
-) -> u32 {
+fn ensure_category_header_store(store: &gtk::gio::ListStore, backend_type: &str) -> u32 {
     let category = category_for_backend(backend_type);
     let cat_order = CATEGORY_ORDER
         .iter()
@@ -1650,9 +1640,7 @@ fn ensure_category_header_store(
                 // (next header or end of list).
                 let mut insert_pos = i + 1;
                 while insert_pos < store.n_items() {
-                    if let Some(next) =
-                        store.item(insert_pos).and_downcast_ref::<SourceObject>()
-                    {
+                    if let Some(next) = store.item(insert_pos).and_downcast_ref::<SourceObject>() {
                         if next.is_header() {
                             break;
                         }
