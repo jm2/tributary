@@ -4,6 +4,7 @@
 //! subsystem, spawns a tokio background runtime for async I/O,
 //! creates the GTK4/libadwaita application, and hands off to the
 //! UI builder on activation.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[allow(dead_code)]
 mod architecture;
