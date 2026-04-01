@@ -63,6 +63,7 @@ fn main() {
     let (engine_tx, engine_rx) = async_channel::unbounded();
 
     // ── GTK Application ──────────────────────────────────────────────
+    glib::set_prgname(Some("Tributary"));
     glib::set_application_name("Tributary");
 
     let app = adw::Application::builder().application_id(APP_ID).build();

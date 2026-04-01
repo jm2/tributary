@@ -788,7 +788,7 @@ fn extract_hwnd(window: &adw::ApplicationWindow) -> Option<*mut std::ffi::c_void
     let surface = window.surface()?;
     let win32_surface = surface.downcast_ref::<gdk4_win32::Win32Surface>()?;
     let hwnd = win32_surface.handle();
-    Some(hwnd.0 as *mut std::ffi::c_void)
+    Some(hwnd.0)
 }
 
 #[cfg(not(target_os = "windows"))]
