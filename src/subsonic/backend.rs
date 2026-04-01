@@ -283,7 +283,7 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
                     album_entry_to_album(
                         a,
                         deterministic_uuid(&a.id),
-                        a.artist_id.as_deref().map(|id| deterministic_uuid(id)),
+                        a.artist_id.as_deref().map(deterministic_uuid),
                         a.cover_art
                             .as_deref()
                             .map(|id| self.client.cover_art_url(id)),
@@ -298,8 +298,8 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
                     song_to_track(
                         s,
                         uuid,
-                        s.artist_id.as_deref().map(|id| deterministic_uuid(id)),
-                        s.album_id.as_deref().map(|id| deterministic_uuid(id)),
+                        s.artist_id.as_deref().map(deterministic_uuid),
+                        s.album_id.as_deref().map(deterministic_uuid),
                         self.client.stream_url(&s.id),
                         s.cover_art
                             .as_deref()

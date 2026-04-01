@@ -510,12 +510,14 @@ pub fn build_window(
                 };
                 play_track_at(
                     pos,
-                    &sort_model,
-                    &player.borrow(),
-                    &title_label,
-                    &artist_label,
-                    &media_ctrl,
-                    &current_pos,
+                    &PlaybackContext {
+                        model: sort_model.clone(),
+                        player: player.clone(),
+                        title_label: title_label.clone(),
+                        artist_label: artist_label.clone(),
+                        media_ctrl: media_ctrl.clone(),
+                        current_pos: current_pos.clone(),
+                    },
                 );
             }
         });
@@ -572,12 +574,14 @@ pub fn build_window(
         column_view.connect_activate(move |_view, position| {
             play_track_at(
                 position,
-                &sm,
-                &player.borrow(),
-                &title_label,
-                &artist_label,
-                &media_ctrl,
-                &current_pos,
+                &PlaybackContext {
+                    model: sm.clone(),
+                    player: player.clone(),
+                    title_label: title_label.clone(),
+                    artist_label: artist_label.clone(),
+                    media_ctrl: media_ctrl.clone(),
+                    current_pos: current_pos.clone(),
+                },
             );
         });
     }
@@ -595,12 +599,14 @@ pub fn build_window(
 
         hb.next_button.connect_clicked(move |_| {
             advance_track(
-                &sm,
-                &player.borrow(),
-                &title_label,
-                &artist_label,
-                &media_ctrl,
-                &current_pos,
+                &PlaybackContext {
+                    model: sm.clone(),
+                    player: player.clone(),
+                    title_label: title_label.clone(),
+                    artist_label: artist_label.clone(),
+                    media_ctrl: media_ctrl.clone(),
+                    current_pos: current_pos.clone(),
+                },
                 repeat_mode.get(),
                 shuffle.is_active(),
             );
@@ -630,12 +636,14 @@ pub fn build_window(
             if pos > 0 {
                 play_track_at(
                     pos - 1,
-                    &sm,
-                    &player.borrow(),
-                    &title_label,
-                    &artist_label,
-                    &media_ctrl,
-                    &current_pos,
+                    &PlaybackContext {
+                        model: sm.clone(),
+                        player: player.clone(),
+                        title_label: title_label.clone(),
+                        artist_label: artist_label.clone(),
+                        media_ctrl: media_ctrl.clone(),
+                        current_pos: current_pos.clone(),
+                    },
                 );
             } else {
                 player.borrow().seek_to(0);
@@ -695,12 +703,14 @@ pub fn build_window(
                             if let Some(pos) = current_pos.get() {
                                 play_track_at(
                                     pos,
-                                    &sm,
-                                    &player.borrow(),
-                                    &title_label,
-                                    &artist_label,
-                                    &media_ctrl,
-                                    &current_pos,
+                                    &PlaybackContext {
+                                        model: sm.clone(),
+                                        player: player.clone(),
+                                        title_label: title_label.clone(),
+                                        artist_label: artist_label.clone(),
+                                        media_ctrl: media_ctrl.clone(),
+                                        current_pos: current_pos.clone(),
+                                    },
                                 );
                                 continue;
                             }
@@ -708,12 +718,14 @@ pub fn build_window(
 
                         // Auto-advance (shuffle-aware).
                         let advanced = advance_track(
-                            &sm,
-                            &player.borrow(),
-                            &title_label,
-                            &artist_label,
-                            &media_ctrl,
-                            &current_pos,
+                            &PlaybackContext {
+                                model: sm.clone(),
+                                player: player.clone(),
+                                title_label: title_label.clone(),
+                                artist_label: artist_label.clone(),
+                                media_ctrl: media_ctrl.clone(),
+                                current_pos: current_pos.clone(),
+                            },
                             mode,
                             shuffle.is_active(),
                         );
@@ -810,16 +822,17 @@ fn display_tracks(
     column_view.scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
 }
 
-fn play_track_at(
-    position: u32,
-    model: &gtk::SortListModel,
-    player: &crate::audio::Player,
-    title_label: &gtk::Label,
-    artist_label: &gtk::Label,
-    media_ctrl: &RefCell<Option<crate::desktop_integration::MediaController>>,
-    current_pos: &Cell<Option<u32>>,
-) -> bool {
-    let Some(item) = model.item(position) else {
+struct PlaybackContext {
+    model: gtk::SortListModel,
+    player: Rc<RefCell<crate::audio::Player>>,
+    title_label: gtk::Label,
+    artist_label: gtk::Label,
+    media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>>,
+    current_pos: Rc<Cell<Option<u32>>>,
+}
+
+fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
+    let Some(item) = ctx.model.item(position) else {
         return false;
     };
     let Some(track) = item.downcast_ref::<TrackObject>() else {
@@ -837,12 +850,12 @@ fn play_track_at(
         "Playing track"
     );
 
-    player.load_uri(&uri);
-    title_label.set_label(&track.title());
-    artist_label.set_label(&format!("{} \u{2014} {}", track.artist(), track.album()));
-    current_pos.set(Some(position));
+    ctx.player.borrow().load_uri(&uri);
+    ctx.title_label.set_label(&track.title());
+    ctx.artist_label.set_label(&format!("{} \u{2014} {}", track.artist(), track.album()));
+    ctx.current_pos.set(Some(position));
 
-    if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+    if let Some(ref mut ctrl) = *ctx.media_ctrl.borrow_mut() {
         ctrl.update_metadata(&track.title(), &track.artist(), &track.album());
     }
 
@@ -853,17 +866,8 @@ fn play_track_at(
 ///
 /// Returns `true` if a new track was loaded, `false` if we've reached
 /// the end (caller should reset to idle).
-fn advance_track(
-    model: &gtk::SortListModel,
-    player: &crate::audio::Player,
-    title_label: &gtk::Label,
-    artist_label: &gtk::Label,
-    media_ctrl: &RefCell<Option<crate::desktop_integration::MediaController>>,
-    current_pos: &Cell<Option<u32>>,
-    repeat_mode: RepeatMode,
-    shuffle: bool,
-) -> bool {
-    let n = model.n_items();
+fn advance_track(ctx: &PlaybackContext, repeat_mode: RepeatMode, shuffle: bool) -> bool {
+    let n = ctx.model.n_items();
     if n == 0 {
         return false;
     }
@@ -871,7 +875,7 @@ fn advance_track(
     if shuffle {
         // Pick a random track, avoiding the current one if possible.
         let pos = if n > 1 {
-            let cur = current_pos.get().unwrap_or(u32::MAX);
+            let cur = ctx.current_pos.get().unwrap_or(u32::MAX);
             loop {
                 let r = fastrand::u32(..n);
                 if r != cur {
@@ -881,51 +885,19 @@ fn advance_track(
         } else {
             0
         };
-        return play_track_at(
-            pos,
-            model,
-            player,
-            title_label,
-            artist_label,
-            media_ctrl,
-            current_pos,
-        );
+        return play_track_at(pos, ctx);
     }
 
     // Sequential advance.
-    let Some(pos) = current_pos.get() else {
-        return play_track_at(
-            0,
-            model,
-            player,
-            title_label,
-            artist_label,
-            media_ctrl,
-            current_pos,
-        );
+    let Some(pos) = ctx.current_pos.get() else {
+        return play_track_at(0, ctx);
     };
 
     let next = pos + 1;
     if next < n {
-        play_track_at(
-            next,
-            model,
-            player,
-            title_label,
-            artist_label,
-            media_ctrl,
-            current_pos,
-        )
+        play_track_at(next, ctx)
     } else if repeat_mode == RepeatMode::All && n > 0 {
-        play_track_at(
-            0,
-            model,
-            player,
-            title_label,
-            artist_label,
-            media_ctrl,
-            current_pos,
-        )
+        play_track_at(0, ctx)
     } else {
         false
     }
@@ -1223,7 +1195,7 @@ fn show_auth_dialog(
     on_connect: impl Fn(String, String) + 'static,
 ) {
     let dialog = adw::AlertDialog::builder()
-        .heading(&format!("Connect to {server_name}"))
+        .heading(format!("Connect to {server_name}"))
         .body(server_url)
         .close_response("cancel")
         .default_response("connect")
