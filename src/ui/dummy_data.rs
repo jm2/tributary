@@ -581,13 +581,14 @@ const TRACKS: &[TrackTuple] = &[
 ];
 
 /// Build the sidebar source list.
+///
+/// Only the "Local" section is created statically. Remote category
+/// headers (Subsonic, Jellyfin / Plex, DAAP) are added dynamically
+/// when servers are discovered or configured — see `window.rs`.
 pub fn build_sources() -> Vec<SourceObject> {
     vec![
         SourceObject::header("Local"),
         SourceObject::source("Local Filesystem", "local", "drive-harddisk-symbolic"),
-        // Remote servers are populated dynamically by mDNS discovery
-        // and env-var configuration — see window.rs.
-        SourceObject::header("Network"),
     ]
 }
 

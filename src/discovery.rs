@@ -23,6 +23,10 @@ pub struct DiscoveredServer {
     pub url: String,
     /// The backend type: `"subsonic"`, `"jellyfin"`, `"plex"`, or `"daap"`.
     pub service_type: String,
+    /// Whether this server requires a password.
+    /// `Some(true)` = password required, `Some(false)` = open,
+    /// `None` = unknown (probe not yet completed or not applicable).
+    pub requires_password: Option<bool>,
 }
 
 /// mDNS service types we browse for.
@@ -209,6 +213,7 @@ fn process_mdns_event(
                 name,
                 url,
                 service_type: service_type.to_string(),
+                requires_password: None,
             })
         }
         mdns_sd::ServiceEvent::SearchStarted(svc) => {
@@ -271,6 +276,7 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveredServer>) {
                         name: discovery.name,
                         url: discovery.address,
                         service_type: "jellyfin".to_string(),
+                        requires_password: None,
                     };
 
                     if tx.try_send(server).is_err() {

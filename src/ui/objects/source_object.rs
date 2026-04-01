@@ -28,6 +28,9 @@ mod imp {
         pub connecting: Cell<bool>,
         /// DAAP logout URL for session cleanup on disconnect.
         pub logout_url: RefCell<String>,
+        /// Whether this server requires a password to connect.
+        /// `true` = password required (default), `false` = open/passwordless.
+        pub requires_password: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -74,6 +77,7 @@ impl SourceObject {
         obj.imp().server_url.replace(server_url.to_string());
         obj.imp().is_header.set(false);
         obj.imp().connected.set(false);
+        obj.imp().requires_password.set(true); // assume locked until probed
         obj
     }
 
@@ -122,5 +126,13 @@ impl SourceObject {
 
     pub fn set_logout_url(&self, url: &str) {
         self.imp().logout_url.replace(url.to_string());
+    }
+
+    pub fn requires_password(&self) -> bool {
+        self.imp().requires_password.get()
+    }
+
+    pub fn set_requires_password(&self, val: bool) {
+        self.imp().requires_password.set(val);
     }
 }

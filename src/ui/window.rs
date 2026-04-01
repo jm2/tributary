@@ -50,13 +50,15 @@ pub fn build_window(
     // ── Sidebar sources ────────────────────────────────────────────────
     let sources = super::dummy_data::build_sources();
 
-    // If env vars are set, add pre-configured remote server entries.
+    // If env vars are set, add pre-configured remote server entries
+    // under their respective category headers.
     let mut sources = sources;
     if let (Ok(url), Ok(_user), Ok(_pass)) = (
         std::env::var("SUBSONIC_URL"),
         std::env::var("SUBSONIC_USER"),
         std::env::var("SUBSONIC_PASS"),
     ) {
+        ensure_category_header_vec(&mut sources, "subsonic");
         let src = SourceObject::source("Subsonic (env)", "subsonic", "network-server-symbolic");
         sources.push(src);
         info!(url = %url, "Subsonic server configured via env vars");
@@ -67,18 +69,21 @@ pub fn build_window(
         std::env::var("JELLYFIN_API_KEY"),
         std::env::var("JELLYFIN_USER_ID"),
     ) {
+        ensure_category_header_vec(&mut sources, "jellyfin");
         let src = SourceObject::source("Jellyfin (env)", "jellyfin", "network-server-symbolic");
         sources.push(src);
         info!(url = %url, "Jellyfin server configured via env vars");
     }
 
     if let (Ok(url), Ok(_token)) = (std::env::var("PLEX_URL"), std::env::var("PLEX_TOKEN")) {
+        ensure_category_header_vec(&mut sources, "plex");
         let src = SourceObject::source("Plex (env)", "plex", "network-server-symbolic");
         sources.push(src);
         info!(url = %url, "Plex server configured via env vars");
     }
 
     if let Ok(url) = std::env::var("DAAP_URL") {
+        ensure_category_header_vec(&mut sources, "daap");
         let src = SourceObject::source("DAAP (env)", "daap", "network-server-symbolic");
         sources.push(src);
         info!(url = %url, "DAAP server configured via env vars");
@@ -363,6 +368,7 @@ pub fn build_window(
     {
         let discovery_rx = crate::discovery::start_discovery();
         let store = sidebar_store.clone();
+        let rt_handle_for_discovery = rt_handle.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(server) = discovery_rx.recv().await {
@@ -380,10 +386,57 @@ pub fn build_window(
                 info!(
                     name = %server.name,
                     url = %server.url,
+                    backend = %server.service_type,
                     "Adding discovered server to sidebar"
                 );
+
+                // Insert under the correct category header.
+                let insert_pos = ensure_category_header_store(&store, &server.service_type);
                 let src = SourceObject::discovered(&server.name, &server.service_type, &server.url);
-                store.append(&src);
+
+                // Apply requires_password if already known from discovery.
+                if let Some(rp) = server.requires_password {
+                    src.set_requires_password(rp);
+                }
+
+                store.insert(insert_pos, &src);
+
+                // For DAAP servers, probe whether a password is required
+                // in the background and update the sidebar item.
+                if server.service_type == "daap" && server.requires_password.is_none() {
+                    let probe_url = server.url.clone();
+                    let store_for_probe = store.clone();
+                    let (probe_tx, probe_rx) = async_channel::bounded::<Option<bool>>(1);
+
+                    rt_handle_for_discovery.spawn(async move {
+                        let result =
+                            crate::daap::client::DaapClient::probe_requires_password(&probe_url)
+                                .await;
+                        let _ = probe_tx.send(result).await;
+                    });
+
+                    let probe_server_url = server.url.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        if let Ok(Some(requires_pw)) = probe_rx.recv().await {
+                            // Find the source in the store and update it.
+                            for i in 0..store_for_probe.n_items() {
+                                if let Some(src) = store_for_probe
+                                    .item(i)
+                                    .and_downcast_ref::<SourceObject>()
+                                {
+                                    if src.server_url() == probe_server_url && !src.connected() {
+                                        src.set_requires_password(requires_pw);
+                                        // Force rebind by remove + re-insert.
+                                        let src = src.clone();
+                                        store_for_probe.remove(i);
+                                        store_for_probe.insert(i, &src);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
             }
         });
     }
@@ -425,11 +478,19 @@ pub fn build_window(
                 // 1. Remove from source_tracks map.
                 source_tracks.borrow_mut().remove(&source_key);
 
-                // 2. Remove from sidebar ListStore.
+                // 2. Reset the sidebar item back to discovered (unconnected)
+                //    state instead of removing it entirely.
                 for i in 0..sidebar_store.n_items() {
                     if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
                         if src.server_url() == source_key {
+                            src.set_connected(false);
+                            src.set_connecting(false);
+                            src.set_logout_url("");
+                            src.set_icon_name("network-server-symbolic");
+                            // Force rebind by remove + re-insert.
+                            let src = src.clone();
                             sidebar_store.remove(i);
+                            sidebar_store.insert(i, &src);
                             break;
                         }
                     }
@@ -514,7 +575,7 @@ pub fn build_window(
                 return;
             }
 
-            // ── Discovered (unauthenticated): show auth dialog ──────
+            // ── Discovered (unauthenticated) ────────────────────────
             let server_name = src.name();
             let server_url = src.server_url();
             let engine_tx = engine_tx.clone();
@@ -526,6 +587,71 @@ pub fn build_window(
             let backend_type = src.backend_type();
             let name_for_closure = server_name.clone();
             let url_for_closure = server_url.clone();
+            let requires_password = src.requires_password();
+
+            // For passwordless DAAP servers, bypass the dialog entirely
+            // and connect directly.
+            if backend_type == "daap" && !requires_password {
+                // Mark as connecting → spinner in sidebar.
+                if let Some(src) = sidebar_store
+                    .item(selected_pos)
+                    .and_downcast_ref::<SourceObject>()
+                {
+                    src.set_connecting(true);
+                    let src = src.clone();
+                    sidebar_store.remove(selected_pos);
+                    sidebar_store.insert(selected_pos, &src);
+                }
+
+                let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
+                let sidebar_store_for_fail = sidebar_store.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    if fail_rx.recv().await.is_ok() {
+                        if let Some(src) = sidebar_store_for_fail
+                            .item(selected_pos)
+                            .and_downcast_ref::<SourceObject>()
+                        {
+                            src.set_connecting(false);
+                            let src = src.clone();
+                            sidebar_store_for_fail.remove(selected_pos);
+                            sidebar_store_for_fail.insert(selected_pos, &src);
+                        }
+                    }
+                });
+
+                let engine_tx = engine_tx.clone();
+                let server_url = url_for_closure.clone();
+                let server_name = name_for_closure.clone();
+                rt_handle.spawn(async move {
+                    info!(server = %server_url, "Connecting to passwordless DAAP server...");
+                    match crate::daap::DaapBackend::connect(
+                        &server_name,
+                        &server_url,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(backend) => {
+                            let tracks = backend.all_tracks().await;
+                            info!(count = tracks.len(), "DAAP library fetched (no password)");
+                            let _ = engine_tx
+                                .send(LibraryEvent::RemoteSync {
+                                    source_key: server_url,
+                                    tracks,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "DAAP connection failed");
+                            let _ = engine_tx
+                                .send(LibraryEvent::Error(format!("DAAP auth failed: {e}")))
+                                .await;
+                            let _ = fail_tx.send(()).await;
+                        }
+                    }
+                });
+                return;
+            }
 
             let password_only = backend_type == "daap";
             show_auth_dialog(
@@ -1469,6 +1595,119 @@ fn restore_sort_state(column_view: &gtk::ColumnView) {
             let col = col.downcast_ref::<gtk::ColumnViewColumn>().unwrap();
             if col.title().is_some_and(|t| t == title) {
                 column_view.sort_by_column(Some(col), order);
+                return;
+            }
+        }
+    }
+}
+
+// ── Sidebar category management ─────────────────────────────────────
+
+/// The fixed ordering of sidebar category headers.
+const CATEGORY_ORDER: &[&str] = &["Local", "Subsonic", "Jellyfin / Plex", "DAAP"];
+
+/// Map a backend type string to its sidebar category header name.
+fn category_for_backend(backend_type: &str) -> &'static str {
+    match backend_type {
+        "subsonic" => "Subsonic",
+        "jellyfin" | "plex" => "Jellyfin / Plex",
+        "daap" => "DAAP",
+        _ => "Subsonic", // fallback
+    }
+}
+
+/// Ensure the category header for `backend_type` exists in a `Vec<SourceObject>`
+/// (used during initial source list construction before the ListStore is built).
+fn ensure_category_header_vec(sources: &mut Vec<SourceObject>, backend_type: &str) {
+    let category = category_for_backend(backend_type);
+    let already_exists = sources
+        .iter()
+        .any(|s| s.is_header() && s.name() == category);
+    if !already_exists {
+        sources.push(SourceObject::header(category));
+    }
+}
+
+/// Ensure the category header for `backend_type` exists in the sidebar
+/// `ListStore`. Returns the index at which a new source should be inserted
+/// (right after the last item in that category, or right after the header
+/// if the category is empty).
+fn ensure_category_header_store(
+    store: &gtk::gio::ListStore,
+    backend_type: &str,
+) -> u32 {
+    let category = category_for_backend(backend_type);
+    let cat_order = CATEGORY_ORDER
+        .iter()
+        .position(|&c| c == category)
+        .unwrap_or(CATEGORY_ORDER.len());
+
+    // Check if the header already exists.
+    for i in 0..store.n_items() {
+        if let Some(src) = store.item(i).and_downcast_ref::<SourceObject>() {
+            if src.is_header() && src.name() == category {
+                // Header exists — find the end of this category
+                // (next header or end of list).
+                let mut insert_pos = i + 1;
+                while insert_pos < store.n_items() {
+                    if let Some(next) =
+                        store.item(insert_pos).and_downcast_ref::<SourceObject>()
+                    {
+                        if next.is_header() {
+                            break;
+                        }
+                    }
+                    insert_pos += 1;
+                }
+                return insert_pos;
+            }
+        }
+    }
+
+    // Header doesn't exist — find the correct insertion point based on
+    // CATEGORY_ORDER. Insert before the first header that comes after
+    // this category in the ordering.
+    let mut insert_at = store.n_items(); // default: end of list
+    for i in 0..store.n_items() {
+        if let Some(src) = store.item(i).and_downcast_ref::<SourceObject>() {
+            if src.is_header() {
+                let other_order = CATEGORY_ORDER
+                    .iter()
+                    .position(|&c| c == src.name().as_str())
+                    .unwrap_or(CATEGORY_ORDER.len());
+                if other_order > cat_order {
+                    insert_at = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Insert the header.
+    let header = SourceObject::header(category);
+    store.insert(insert_at, &header);
+    insert_at + 1 // return position right after the new header
+}
+
+/// Remove a category header from the store if it has no remaining
+/// non-header children (i.e., the category is now empty).
+#[allow(dead_code)]
+fn remove_empty_category_header(store: &gtk::gio::ListStore, category: &str) {
+    for i in 0..store.n_items() {
+        if let Some(src) = store.item(i).and_downcast_ref::<SourceObject>() {
+            if src.is_header() && src.name() == category {
+                // Check if the next item is another header or end of list.
+                let next_is_header_or_end = if i + 1 >= store.n_items() {
+                    true
+                } else {
+                    store
+                        .item(i + 1)
+                        .and_downcast_ref::<SourceObject>()
+                        .is_some_and(|s| s.is_header())
+                };
+                if next_is_header_or_end {
+                    store.remove(i);
+                }
                 return;
             }
         }

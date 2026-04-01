@@ -137,12 +137,19 @@ pub fn build_sidebar(
                     eject_btn.set_visible(false);
                     label.add_css_class("dim-label");
                 } else if !obj.connected() && !obj.server_url().is_empty() {
-                    // Discovered but not yet authenticated — lock icon.
+                    // Discovered but not yet authenticated.
                     icon.set_visible(true);
-                    icon.set_icon_name(Some("system-lock-screen-symbolic"));
+                    if obj.requires_password() {
+                        // Password-protected — show lock icon.
+                        icon.set_icon_name(Some("system-lock-screen-symbolic"));
+                        label.add_css_class("dim-label");
+                    } else {
+                        // Open / passwordless — show normal server icon.
+                        icon.set_icon_name(Some("network-server-symbolic"));
+                        label.remove_css_class("dim-label");
+                    }
                     spinner.set_visible(false);
                     eject_btn.set_visible(false);
-                    label.add_css_class("dim-label");
                 } else {
                     // Connected or local source — normal icon.
                     icon.set_visible(true);

@@ -350,6 +350,32 @@ impl DaapClient {
         }
     }
 
+    /// Probe a DAAP server's `/server-info` to check whether it requires
+    /// a password.
+    ///
+    /// Returns `Some(false)` for open shares (msau == 0 or absent),
+    /// `Some(true)` for password-protected shares, or `None` on error.
+    pub async fn probe_requires_password(server_url: &str) -> Option<bool> {
+        let http = build_http_client().ok()?;
+        let url = format!("{}/server-info", server_url.trim_end_matches('/'));
+        let resp = http.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let bytes = resp.bytes().await.ok()?;
+        let nodes = dmap::parse_dmap(&bytes).ok()?;
+        let children = match dmap::find_node(&nodes, b"msrv") {
+            Some(node) => match &node.data {
+                dmap::DmapValue::Container(c) => c.as_slice(),
+                _ => return None,
+            },
+            None => return None,
+        };
+        // msau: 0 = no auth, 1 = basic, 2 = digest
+        let auth_method = dmap::find_u8(children, b"msau").unwrap_or(0);
+        Some(auth_method != 0)
+    }
+
     // ── Accessors ───────────────────────────────────────────────────
 
     /// The base URL of the DAAP server.

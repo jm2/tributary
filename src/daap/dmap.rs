@@ -92,6 +92,7 @@ fn tag_type(tag: &[u8; 4]) -> DmapType {
         b"assr" => DmapType::U32, // song sample rate
         b"mstt" => DmapType::U32, // status code
         b"mimc" => DmapType::U32, // item count
+        b"msau" => DmapType::U8,  // authentication method (0 = none)
 
         // U16 integers
         b"astn" => DmapType::U16, // song track number
@@ -238,6 +239,14 @@ pub fn find_u32(nodes: &[DmapNode], tag: &[u8; 4]) -> Option<u32> {
         DmapValue::U32(v) => Some(*v),
         DmapValue::U16(v) => Some(u32::from(*v)),
         DmapValue::U8(v) => Some(u32::from(*v)),
+        _ => None,
+    })
+}
+
+/// Extract a `u8` value from the first node matching the tag.
+pub fn find_u8(nodes: &[DmapNode], tag: &[u8; 4]) -> Option<u8> {
+    find_node(nodes, tag).and_then(|n| match &n.data {
+        DmapValue::U8(v) => Some(*v),
         _ => None,
     })
 }
