@@ -78,6 +78,12 @@ pub fn build_window(
         info!(url = %url, "Plex server configured via env vars");
     }
 
+    if let Ok(url) = std::env::var("DAAP_URL") {
+        let src = SourceObject::source("DAAP (env)", "daap", "network-server-symbolic");
+        sources.push(src);
+        info!(url = %url, "DAAP server configured via env vars");
+    }
+
     // ── Header Bar with all interactive widgets ──────────────────────
     let hb = header_bar::build_header_bar();
 
@@ -104,7 +110,8 @@ pub fn build_window(
     }
 
     // ── Sidebar ──────────────────────────────────────────────────────
-    let (sidebar_widget, sidebar_store, sidebar_selection) = sidebar::build_sidebar(&sources);
+    let (sidebar_widget, sidebar_store, sidebar_selection, disconnect_rx) =
+        sidebar::build_sidebar(&sources);
 
     // ── Tracklist (starts empty — populated by FullSync) ──────────────
     let empty_tracks: Vec<TrackObject> = Vec::new();
@@ -326,6 +333,32 @@ pub fn build_window(
         });
     }
 
+    // ── Start DAAP backend if configured via env vars ──────────────
+    if let Ok(url) = std::env::var("DAAP_URL") {
+        let password = std::env::var("DAAP_PASSWORD").ok();
+        let tx = engine_tx.clone();
+        rt_handle.spawn(async move {
+            info!(server = %url, "Connecting to DAAP server...");
+            match crate::daap::DaapBackend::connect("DAAP", &url, password.as_deref()).await {
+                Ok(backend) => {
+                    let tracks: Vec<crate::architecture::models::Track> =
+                        backend.all_tracks().await;
+                    info!(count = tracks.len(), "DAAP library fetched");
+                    let _ = tx
+                        .send(LibraryEvent::RemoteSync {
+                            source_key: url.clone(),
+                            tracks,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "DAAP connection failed");
+                    let _ = tx.send(LibraryEvent::Error(format!("DAAP: {e}"))).await;
+                }
+            }
+        });
+    }
+
     // ── mDNS zero-config discovery ─────────────────────────────────
     {
         let discovery_rx = crate::discovery::start_discovery();
@@ -351,6 +384,77 @@ pub fn build_window(
                 );
                 let src = SourceObject::discovered(&server.name, &server.service_type, &server.url);
                 store.append(&src);
+            }
+        });
+    }
+
+    // ── DAAP disconnect (eject) handler ─────────────────────────────
+    {
+        let sidebar_store = sidebar_store.clone();
+        let sidebar_selection = sidebar_selection.clone();
+        let source_tracks = source_tracks.clone();
+        let active_source_key = active_source_key.clone();
+        let track_store = track_store.clone();
+        let master_tracks = master_tracks.clone();
+        let browser_widget = browser_widget.clone();
+        let browser_state = browser_state.clone();
+        let status_label = status_label.clone();
+        let column_view = column_view.clone();
+        let rt_handle = rt_handle.clone();
+
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(source_key) = disconnect_rx.recv().await {
+                info!(source = %source_key, "DAAP disconnect requested");
+
+                // Best-effort logout: find the logout URL on the SourceObject.
+                for i in 0..sidebar_store.n_items() {
+                    if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
+                        if src.server_url() == source_key {
+                            let logout_url = src.logout_url();
+                            if !logout_url.is_empty() {
+                                let rt = rt_handle.clone();
+                                rt.spawn(async move {
+                                    let _ = reqwest::get(&logout_url).await;
+                                });
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // 1. Remove from source_tracks map.
+                source_tracks.borrow_mut().remove(&source_key);
+
+                // 2. Remove from sidebar ListStore.
+                for i in 0..sidebar_store.n_items() {
+                    if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
+                        if src.server_url() == source_key {
+                            sidebar_store.remove(i);
+                            break;
+                        }
+                    }
+                }
+
+                // 3. If this was the active source, switch to "local".
+                if *active_source_key.borrow() == source_key {
+                    *active_source_key.borrow_mut() = "local".to_string();
+
+                    // Select the local source in the sidebar (index 1, after header).
+                    sidebar_selection.set_selected(1);
+
+                    // Display local tracks.
+                    let st = source_tracks.borrow();
+                    let local_tracks = st.get("local").cloned().unwrap_or_default();
+                    display_tracks(
+                        &local_tracks,
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
+                }
             }
         });
     }
@@ -423,138 +527,163 @@ pub fn build_window(
             let name_for_closure = server_name.clone();
             let url_for_closure = server_url.clone();
 
-            show_auth_dialog(&win, &server_name, &server_url, move |user, pass| {
-                let engine_tx = engine_tx.clone();
-                let server_url = url_for_closure.clone();
-                let server_name = name_for_closure.clone();
-                let backend_type = backend_type.clone();
+            let password_only = backend_type == "daap";
+            show_auth_dialog(
+                &win,
+                &server_name,
+                &server_url,
+                password_only,
+                move |user, pass| {
+                    let engine_tx = engine_tx.clone();
+                    let server_url = url_for_closure.clone();
+                    let server_name = name_for_closure.clone();
+                    let backend_type = backend_type.clone();
 
-                // Mark as connecting → spinner in sidebar.
-                if let Some(src) = sidebar_store
-                    .item(selected_pos)
-                    .and_downcast_ref::<SourceObject>()
-                {
-                    src.set_connecting(true);
-                    let src = src.clone();
-                    sidebar_store.remove(selected_pos);
-                    sidebar_store.insert(selected_pos, &src);
-                }
-                // One-shot to signal failure back to the main thread so we
-                // can clear the spinner (GObjects are not Send).
-                let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
-                let sidebar_store_for_fail = sidebar_store.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    if fail_rx.recv().await.is_ok() {
-                        if let Some(src) = sidebar_store_for_fail
-                            .item(selected_pos)
-                            .and_downcast_ref::<SourceObject>()
-                        {
-                            src.set_connecting(false);
-                            let src = src.clone();
-                            sidebar_store_for_fail.remove(selected_pos);
-                            sidebar_store_for_fail.insert(selected_pos, &src);
-                        }
+                    // Mark as connecting → spinner in sidebar.
+                    if let Some(src) = sidebar_store
+                        .item(selected_pos)
+                        .and_downcast_ref::<SourceObject>()
+                    {
+                        src.set_connecting(true);
+                        let src = src.clone();
+                        sidebar_store.remove(selected_pos);
+                        sidebar_store.insert(selected_pos, &src);
                     }
-                });
+                    // One-shot to signal failure back to the main thread so we
+                    // can clear the spinner (GObjects are not Send).
+                    let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
+                    let sidebar_store_for_fail = sidebar_store.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        if fail_rx.recv().await.is_ok() {
+                            if let Some(src) = sidebar_store_for_fail
+                                .item(selected_pos)
+                                .and_downcast_ref::<SourceObject>()
+                            {
+                                src.set_connecting(false);
+                                let src = src.clone();
+                                sidebar_store_for_fail.remove(selected_pos);
+                                sidebar_store_for_fail.insert(selected_pos, &src);
+                            }
+                        }
+                    });
 
-                rt_handle.spawn(async move {
-                    let result: Result<
-                        Vec<crate::architecture::models::Track>,
-                        crate::architecture::error::BackendError,
-                    > = match backend_type.as_str() {
-                        "jellyfin" => {
-                            info!(server = %server_url, "Authenticating with Jellyfin...");
-                            match crate::jellyfin::client::JellyfinClient::authenticate(
-                                &server_url,
-                                &user,
-                                &pass,
-                            )
-                            .await
-                            {
-                                Ok(client) => {
-                                    match crate::jellyfin::JellyfinBackend::from_client(
-                                        &server_name,
-                                        client,
-                                    )
-                                    .await
-                                    {
-                                        Ok(backend) => Ok(backend.all_tracks().await),
-                                        Err(e) => Err(e),
+                    rt_handle.spawn(async move {
+                        let result: Result<
+                            Vec<crate::architecture::models::Track>,
+                            crate::architecture::error::BackendError,
+                        > = match backend_type.as_str() {
+                            "jellyfin" => {
+                                info!(server = %server_url, "Authenticating with Jellyfin...");
+                                match crate::jellyfin::client::JellyfinClient::authenticate(
+                                    &server_url,
+                                    &user,
+                                    &pass,
+                                )
+                                .await
+                                {
+                                    Ok(client) => {
+                                        match crate::jellyfin::JellyfinBackend::from_client(
+                                            &server_name,
+                                            client,
+                                        )
+                                        .await
+                                        {
+                                            Ok(backend) => Ok(backend.all_tracks().await),
+                                            Err(e) => Err(e),
+                                        }
                                     }
+                                    Err(e) => Err(e),
                                 }
-                                Err(e) => Err(e),
                             }
-                        }
-                        "plex" => {
-                            info!(server = %server_url, "Authenticating with Plex...");
-                            match crate::plex::client::PlexClient::authenticate(
-                                &server_url,
-                                &user,
-                                &pass,
-                            )
-                            .await
-                            {
-                                Ok(client) => {
-                                    match crate::plex::PlexBackend::from_client(
-                                        &server_name,
-                                        client,
-                                    )
-                                    .await
-                                    {
-                                        Ok(backend) => Ok(backend.all_tracks().await),
-                                        Err(e) => Err(e),
+                            "plex" => {
+                                info!(server = %server_url, "Authenticating with Plex...");
+                                match crate::plex::client::PlexClient::authenticate(
+                                    &server_url,
+                                    &user,
+                                    &pass,
+                                )
+                                .await
+                                {
+                                    Ok(client) => {
+                                        match crate::plex::PlexBackend::from_client(
+                                            &server_name,
+                                            client,
+                                        )
+                                        .await
+                                        {
+                                            Ok(backend) => Ok(backend.all_tracks().await),
+                                            Err(e) => Err(e),
+                                        }
                                     }
+                                    Err(e) => Err(e),
                                 }
-                                Err(e) => Err(e),
                             }
-                        }
-                        _ => {
-                            // Default: Subsonic
-                            info!(server = %server_url, "Authenticating with Subsonic...");
-                            match crate::subsonic::SubsonicBackend::connect(
-                                &server_name,
-                                &server_url,
-                                &user,
-                                &pass,
-                            )
-                            .await
-                            {
-                                Ok(backend) => Ok(backend.all_tracks().await),
-                                Err(e) => Err(e),
+                            "daap" => {
+                                info!(server = %server_url, "Connecting to DAAP server...");
+                                let password = if pass.is_empty() {
+                                    None
+                                } else {
+                                    Some(pass.as_str())
+                                };
+                                match crate::daap::DaapBackend::connect(
+                                    &server_name,
+                                    &server_url,
+                                    password,
+                                )
+                                .await
+                                {
+                                    Ok(backend) => Ok(backend.all_tracks().await),
+                                    Err(e) => Err(e),
+                                }
                             }
-                        }
-                    };
+                            _ => {
+                                // Default: Subsonic
+                                info!(server = %server_url, "Authenticating with Subsonic...");
+                                match crate::subsonic::SubsonicBackend::connect(
+                                    &server_name,
+                                    &server_url,
+                                    &user,
+                                    &pass,
+                                )
+                                .await
+                                {
+                                    Ok(backend) => Ok(backend.all_tracks().await),
+                                    Err(e) => Err(e),
+                                }
+                            }
+                        };
 
-                    match result {
-                        Ok(tracks) => {
-                            info!(
-                                backend = %backend_type,
-                                count = tracks.len(),
-                                "Remote library fetched"
-                            );
-                            let _ = engine_tx
-                                .send(LibraryEvent::RemoteSync {
-                                    source_key: server_url,
-                                    tracks,
-                                })
-                                .await;
+                        match result {
+                            Ok(tracks) => {
+                                info!(
+                                    backend = %backend_type,
+                                    count = tracks.len(),
+                                    "Remote library fetched"
+                                );
+                                let _ = engine_tx
+                                    .send(LibraryEvent::RemoteSync {
+                                        source_key: server_url,
+                                        tracks,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    backend = %backend_type,
+                                    error = %e,
+                                    "Authentication failed"
+                                );
+                                let _ = engine_tx
+                                    .send(LibraryEvent::Error(format!(
+                                        "{backend_type} auth failed: {e}"
+                                    )))
+                                    .await;
+                                let _ = fail_tx.send(()).await;
+                            }
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                backend = %backend_type,
-                                error = %e,
-                                "Authentication failed"
-                            );
-                            let _ = engine_tx
-                                .send(LibraryEvent::Error(format!(
-                                    "{backend_type} auth failed: {e}"
-                                )))
-                                .await;
-                            let _ = fail_tx.send(()).await;
-                        }
-                    }
-                });
-            });
+                    });
+                },
+            );
         });
     }
 
@@ -1348,7 +1477,10 @@ fn restore_sort_state(column_view: &gtk::ColumnView) {
 
 // ── Auth dialog for discovered servers ──────────────────────────────
 
-/// Present an `adw::AlertDialog` asking for Subsonic credentials.
+/// Present an `adw::AlertDialog` asking for credentials.
+///
+/// When `password_only` is `true` (DAAP), only a password field is shown
+/// and empty passwords are allowed (open shares).
 ///
 /// `on_connect` is called with `(username, password)` if the user
 /// clicks Connect.  Cancel / Escape simply dismisses the dialog.
@@ -1356,11 +1488,18 @@ fn show_auth_dialog(
     window: &adw::ApplicationWindow,
     server_name: &str,
     server_url: &str,
+    password_only: bool,
     on_connect: impl Fn(String, String) + 'static,
 ) {
+    let body = if password_only {
+        format!("{server_url}\nEnter the share password (leave blank if none)")
+    } else {
+        server_url.to_string()
+    };
+
     let dialog = adw::AlertDialog::builder()
         .heading(format!("Connect to {server_name}"))
-        .body(server_url)
+        .body(&body)
         .close_response("cancel")
         .default_response("connect")
         .build();
@@ -1373,6 +1512,7 @@ fn show_auth_dialog(
     let user_entry = gtk::Entry::builder()
         .placeholder_text("Username")
         .activates_default(true)
+        .visible(!password_only)
         .build();
 
     let pass_entry = gtk::PasswordEntry::builder()
@@ -1396,10 +1536,16 @@ fn show_auth_dialog(
 
     dialog.connect_response(None, move |_dialog, response| {
         if response == "connect" {
-            let user = user_entry_clone.text().to_string();
-            let pass = pass_entry_clone.text().to_string();
-            if !user.is_empty() && !pass.is_empty() {
-                on_connect(user, pass);
+            if password_only {
+                // DAAP: password only, allow empty (open shares).
+                let pass = pass_entry_clone.text().to_string();
+                on_connect(String::new(), pass);
+            } else {
+                let user = user_entry_clone.text().to_string();
+                let pass = pass_entry_clone.text().to_string();
+                if !user.is_empty() && !pass.is_empty() {
+                    on_connect(user, pass);
+                }
             }
         }
     });

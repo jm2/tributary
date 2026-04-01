@@ -1,7 +1,8 @@
-//! Zero-config network discovery for Subsonic, Jellyfin, and Plex servers.
+//! Zero-config network discovery for Subsonic, Jellyfin, Plex, and DAAP servers.
 //!
 //! - **Subsonic:** mDNS browse for `_subsonic._tcp.local.`
 //! - **Plex:** mDNS browse for `_plexmediasvr._tcp.local.`
+//! - **DAAP:** mDNS browse for `_daap._tcp.local.`
 //! - **Jellyfin:** UDP broadcast `"Who is JellyfinServer?"` to `255.255.255.255:7359`
 //!
 //! All discovered servers are streamed to the GTK main thread via a
@@ -27,6 +28,7 @@ pub struct DiscoveredServer {
 /// mDNS service types we browse for.
 const SUBSONIC_SERVICE: &str = "_subsonic._tcp.local.";
 const PLEX_SERVICE: &str = "_plexmediasvr._tcp.local.";
+const DAAP_SERVICE: &str = "_daap._tcp.local.";
 
 /// Jellyfin UDP discovery port.
 const JELLYFIN_DISCOVERY_PORT: u16 = 7359;
@@ -88,12 +90,20 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveredServer>) {
         }
     };
 
-    if subsonic_rx.is_none() && plex_rx.is_none() {
+    let daap_rx = match daemon.browse(DAAP_SERVICE) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            warn!("mDNS browse failed for {DAAP_SERVICE}: {e}");
+            None
+        }
+    };
+
+    if subsonic_rx.is_none() && plex_rx.is_none() && daap_rx.is_none() {
         warn!("No mDNS services could be browsed");
         return;
     }
 
-    info!("mDNS discovery started for Subsonic + Plex");
+    info!("mDNS discovery started for Subsonic + Plex + DAAP");
 
     let mut seen = HashSet::new();
 
@@ -119,6 +129,17 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveredServer>) {
             while let Ok(event) = rx.try_recv() {
                 got_event = true;
                 if let Some(server) = process_mdns_event(event, "plex", &mut seen) {
+                    if tx.try_send(server).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        if let Some(ref rx) = daap_rx {
+            while let Ok(event) = rx.try_recv() {
+                got_event = true;
+                if let Some(server) = process_mdns_event(event, "daap", &mut seen) {
                     if tx.try_send(server).is_err() {
                         return;
                     }

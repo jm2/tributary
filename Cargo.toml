@@ -72,6 +72,9 @@ md-5 = "0.10"
 # mDNS service discovery (Subsonic/DAAP auto-detect)
 mdns-sd = "0.12"
 
+# DAAP/DMAP binary protocol parsing
+nom = "8"
+
 # Audio playback (GStreamer pipeline)
 gstreamer = "0.25"
 

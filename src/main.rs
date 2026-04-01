@@ -9,6 +9,8 @@
 #[allow(dead_code)]
 mod architecture;
 mod audio;
+#[allow(dead_code)]
+mod daap;
 mod db;
 mod desktop_integration;
 mod discovery;
