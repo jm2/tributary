@@ -70,7 +70,7 @@ $env:AR      = Join-Path $MsysPath "bin\ar.exe"
 
 Write-Info "PKG_CONFIG_PATH set to $pkgConfigPath"
 
-# ── Per-package dependency checks (mirrors build-linux.sh) ───────────────────
+# ── Per-package dependency checks ────────────────────────────────────────────
 $pkgConfig = Join-Path $MsysPath "bin\pkg-config.exe"
 
 # Compile-time libraries (hard fail)
@@ -94,11 +94,10 @@ if ($missing.Count -gt 0) {
     Write-Err "Missing compile-time packages. In MSYS2 shell, run:`n  pacman -S $($missing -join ' ')"
 }
 
-# Runtime GStreamer plugins (warn only — not needed to compile)
+# Runtime GStreamer plugins (warn only)
 $gstPluginDir = Join-Path $MsysPath "lib\gstreamer-1.0"
 $pluginWarnings = @()
 foreach ($plugin in @("gst-plugins-good", "gst-plugins-bad", "gst-libav")) {
-    # Each package installs DLLs with a recognisable prefix into the plugin dir
     $pattern = switch ($plugin) {
         "gst-plugins-good" { "libgstaudioparsers.dll" }
         "gst-plugins-bad"  { "libgstfdkaac.dll" }
@@ -113,7 +112,7 @@ foreach ($plugin in @("gst-plugins-good", "gst-plugins-bad", "gst-libav")) {
     }
 }
 if ($pluginWarnings.Count -gt 0) {
-    Write-Warn "Missing GStreamer codec plugins — playback of some formats will fail.`n  pacman -S $($pluginWarnings -join ' ')"
+    Write-Warn "Missing GStreamer codec plugins.`n  pacman -S $($pluginWarnings -join ' ')"
 }
 
 Write-Info "All dependency checks passed."
@@ -143,99 +142,65 @@ Write-Info "Bundling GTK4 DLLs and resources into $DIST ..."
 
 Remove-Item -Recurse -Force $DIST -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $DIST | Out-Null
+New-Item -ItemType Directory -Force "$DIST\lib" | Out-Null
 
-# Copy the binary
+# Copy the executable.
 Copy-Item $exePath $DIST
 
-# Resolve DLL dependencies with ldd (available in MSYS2)
-$ldd = Join-Path $MsysPath "bin\ldd.exe"
+# Copy dynamic plugin folders.
+Write-Info "Copying GTK plugins and GStreamer codecs..."
+$loadersSrc = Join-Path $MsysPath "lib\gdk-pixbuf-2.0"
+if (Test-Path $loadersSrc) { Copy-Item -Recurse -Force $loadersSrc "$DIST\lib" | Out-Null }
+
+$gstPluginSrc = Join-Path $MsysPath "lib\gstreamer-1.0"
+if (Test-Path $gstPluginSrc) { Copy-Item -Recurse -Force $gstPluginSrc "$DIST\lib" | Out-Null }
+
+# Resolve all transitive dependencies for the EXE and Plugins.
+# Use the explicit MSYS2 path for ldd to ensure it exists in PowerShell.
+$ldd = Join-Path $Msys2Root "usr\bin\ldd.exe"
 if (-not (Test-Path $ldd)) { $ldd = "ldd" }
 
-# Regex to match the MSYS environment bin folder using EITHER forward or back slashes
-$pathRegex = "[/\\]$MsysEnv[/\\]bin[/\\]"
+Write-Info "Resolving required DLLs for executable and plugins..."
 
-Write-Info "Resolving DLLs with ldd..."
+# Gather the exe and every single plugin dll we just copied.
+$binariesToScan = @(Join-Path $DIST (Split-Path $exePath -Leaf))
+$binariesToScan += Get-ChildItem -Path "$DIST\lib" -Recurse -Filter *.dll | Select-Object -ExpandProperty FullName
 
-& $ldd $exePath 2>$null |
-    Select-String $pathRegex |
-    ForEach-Object {
-        $parts = $_.Line -split "\s+"
-        # ldd output: libname => /path/to/lib (0xaddr)
-        $libPath = $parts | Where-Object { $_ -match $pathRegex } | Select-Object -First 1
-        if ($libPath -and (Test-Path $libPath)) {
-            $dest = Join-Path $DIST (Split-Path $libPath -Leaf)
-            if (-not (Test-Path $dest)) {
-                Copy-Item $libPath $dest
-                Write-Host "  copied: $(Split-Path $libPath -Leaf)"
+foreach ($bin in $binariesToScan) {
+    & $ldd $bin 2>$null | ForEach-Object {
+        # Extract JUST the DLL filename from the left side of the `=>` operator.
+        if ($_ -match "^\s*(.+?\.dll)\s+=>") {
+            $dllName = $matches[1].Trim()
+            $srcPath = Join-Path $MsysPath "bin\$dllName"
+            
+            # If it exists in the MSYS2 bin folder, copy it to the root next to the exe.
+            if (Test-Path $srcPath) {
+                $destPath = Join-Path $DIST $dllName
+                if (-not (Test-Path $destPath)) {
+                    Copy-Item $srcPath $destPath
+                    Write-Host "  copied: $dllName"
+                }
             }
         }
     }
-
-# ── GStreamer Plugins (runtime-loaded, invisible to ldd) ─────────────────────
-Write-Info "Copying GStreamer plugins..."
-
-$gstPluginSrc  = Join-Path $MsysPath "lib\gstreamer-1.0"
-$gstPluginDest = Join-Path $DIST     "lib\gstreamer-1.0"
-if (Test-Path $gstPluginSrc) {
-    New-Item -ItemType Directory -Force $gstPluginDest | Out-Null
-    Copy-Item "$gstPluginSrc\*.dll" $gstPluginDest
-    $pluginCount = (Get-ChildItem "$gstPluginDest\*.dll").Count
-    Write-Info "GStreamer plugins copied ($pluginCount plugins)."
-
-    # Resolve transitive DLL dependencies from plugin DLLs
-    Write-Info "Resolving additional DLLs from GStreamer plugins..."
-    Get-ChildItem "$gstPluginDest\*.dll" | ForEach-Object {
-        & $ldd $_.FullName 2>$null |
-            Select-String $pathRegex |
-            ForEach-Object {
-                $parts = $_.Line -split "\s+"
-                $libPath = $parts | Where-Object { $_ -match $pathRegex } | Select-Object -First 1
-                if ($libPath -and (Test-Path $libPath)) {
-                    $dest = Join-Path $DIST (Split-Path $libPath -Leaf)
-                    if (-not (Test-Path $dest)) {
-                        Copy-Item $libPath $dest
-                        Write-Host "  copied: $(Split-Path $libPath -Leaf)"
-                    }
-                }
-            }
-    }
-} else {
-    Write-Warn "GStreamer plugins not found at $gstPluginSrc — audio playback will not work."
-    Write-Warn "Install in MSYS2: pacman -S $PkgPrefix-gst-plugins-good $PkgPrefix-gst-plugins-bad $PkgPrefix-gst-libav"
 }
 
 # ── GTK Resources ────────────────────────────────────────────────────────────
 Write-Info "Copying GTK icons and schemas..."
 
-# Icon themes (required for symbolic icons used in the UI)
 foreach ($theme in @("hicolor", "Adwaita")) {
     $src  = Join-Path $MsysPath "share\icons\$theme"
     $dest = Join-Path $DIST   "share\icons\$theme"
-    if (Test-Path $src) {
-        Copy-Item -Recurse -Force $src (Split-Path $dest) | Out-Null
-    }
+    if (Test-Path $src) { Copy-Item -Recurse -Force $src (Split-Path $dest) | Out-Null }
 }
 
-# GLib schemas
 $schemasSrc  = Join-Path $MsysPath "share\glib-2.0\schemas"
 $schemasDest = Join-Path $DIST   "share\glib-2.0\schemas"
 if (Test-Path $schemasSrc) {
     New-Item -ItemType Directory -Force $schemasDest | Out-Null
     Copy-Item "$schemasSrc\*.xml" $schemasDest -ErrorAction SilentlyContinue
-    # Compile schemas
     $compiler = Join-Path $MsysPath "bin\glib-compile-schemas.exe"
-    if (Test-Path $compiler) {
-        & $compiler $schemasDest
-        Write-Info "Schemas compiled."
-    }
-}
-
-# GdkPixbuf loaders (required for image rendering)
-$loadersSrc  = Join-Path $MsysPath "lib\gdk-pixbuf-2.0"
-$loadersDest = Join-Path $DIST   "lib\gdk-pixbuf-2.0"
-if (Test-Path $loadersSrc) {
-    Copy-Item -Recurse -Force $loadersSrc (Split-Path $loadersDest) | Out-Null
-    Write-Info "GdkPixbuf loaders copied."
+    if (Test-Path $compiler) { & $compiler $schemasDest }
 }
 
 # ── Zip Archive ──────────────────────────────────────────────────────────────
