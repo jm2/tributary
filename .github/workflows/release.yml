@@ -22,9 +22,6 @@ jobs:
   flatpak:
     name: Flatpak (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-49
-      options: --privileged
     strategy:
       matrix:
         include:
@@ -34,6 +31,12 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+
+      # Install Flatpak natively on the runner instead of using an x86_64 container.
+      - name: Install Flatpak & Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder elfutils python3-pip
 
       - name: Install Python dependencies
         run: pip3 install tomlkit aiohttp --break-system-packages || pip3 install tomlkit aiohttp
@@ -54,6 +57,7 @@ jobs:
           bundle: tributary-linux-${{ matrix.arch }}.flatpak
           manifest-path: build-aux/flatpak/io.github.tributary.Tributary.yml
           cache-key: flatpak-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          arch: ${{ matrix.arch }}
 
       - name: Upload Flatpak to release
         if: github.event_name == 'release'
@@ -206,7 +210,6 @@ jobs:
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
-          # Add Inno Setup to PATH for this job
           echo "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Resolve MSYS2 root for Inno Setup
@@ -251,7 +254,7 @@ jobs:
     name: Debian Package (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     container:
-      image: debian:bookworm
+      image: debian:sid
     strategy:
       matrix:
         include:
@@ -384,10 +387,7 @@ jobs:
       - name: Install system dependencies
         run: |
           pacman -Syu --noconfirm git gtk4 libadwaita gstreamer \
-            gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav dbus rustup
-
-      - name: Setup Rust
-        run: rustup default stable
+            gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav dbus rust
 
       - uses: actions/checkout@v4
 
