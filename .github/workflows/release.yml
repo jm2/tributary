@@ -415,7 +415,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           sed -i "s/^pkgver=.*/pkgver=${VERSION}/" PKGBUILD
 
-          su builder -c "makepkg -sf --noconfirm --skipchecksums"
+          su builder -c "BUILDDIR=/tmp/makepkg makepkg -sf --noconfirm --skipchecksums"
 
       - name: Collect package
         run: |
