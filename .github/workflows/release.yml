@@ -411,10 +411,15 @@ jobs:
 
       - name: Build Arch package
         run: |
-          # makepkg refuses to run as root, so create a build user
+          # Strip GCC LTO flags from Arch's build environment to prevent LLD linker collisions.
+          sed -i 's/-flto=auto//g' /etc/makepkg.conf
+          sed -i 's/ lto/ !lto/g' /etc/makepkg.conf
+
+          # makepkg refuses to run as root, so create a build user.
           useradd -m builder
           cp -r . /home/builder/tributary
           chown -R builder:builder /home/builder/tributary
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
           # Copy PKGBUILD and build
           cd /home/builder/tributary
