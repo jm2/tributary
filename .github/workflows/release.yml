@@ -306,12 +306,7 @@ jobs:
           restore-keys: release-deb-${{ matrix.arch }}-cargo-
 
       - name: Build .deb package
-        run: cargo deb
-
-      - name: Rename .deb for release
-        run: |
-          DEB_FILE=$(ls target/debian/*.deb | head -1)
-          mv "$DEB_FILE" "target/debian/tributary-${{ matrix.deb_arch }}.deb"
+        run: cargo deb -o target/debian/tributary-${{ matrix.deb_arch }}.deb
 
       - name: Upload .deb to release
         if: github.event_name == 'release'
@@ -399,7 +394,7 @@ jobs:
     steps:
       - name: Install system dependencies
         run: |
-          pacman -Syu --noconfirm git gtk4 libadwaita gstreamer \
+          pacman -Syu --noconfirm git gtk4 libadwaita gstreamer sqlite \
             gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav dbus rust
 
       - uses: actions/checkout@v4
