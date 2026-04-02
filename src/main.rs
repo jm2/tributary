@@ -194,6 +194,15 @@ fn setup_macos_bundle_env() {
         env::set_var("GST_REGISTRY", &registry);
     }
 
+    // GST_PLUGIN_SCANNER — bundled helper binary that scans plugins.
+    // Without this, GStreamer uses the system's gst-plugin-scanner which
+    // loads the system libgstreamer, causing duplicate ObjC class conflicts
+    // (GstCocoaApplicationDelegate) and crashes.
+    let gst_scanner = macos_dir.join("gst-plugin-scanner");
+    if gst_scanner.is_file() {
+        env::set_var("GST_PLUGIN_SCANNER", &gst_scanner);
+    }
+
     // GTK_PATH — helps GTK find the bundled IM modules / print backends.
     let gtk_path = resources_dir.join("lib").join("gtk-4.0");
     set_bundle_var("GTK_PATH", gtk_path);
