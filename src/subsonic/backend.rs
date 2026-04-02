@@ -21,6 +21,7 @@ use super::api::{AlbumEntry, ArtistEntry, SongEntry};
 use super::client::SubsonicClient;
 
 /// In-memory library cache populated from the Subsonic API.
+#[allow(dead_code)]
 struct LibraryCache {
     tracks: Vec<Track>,
     albums: Vec<Album>,
@@ -48,6 +49,7 @@ impl LibraryCache {
 ///
 /// Create one with [`SubsonicBackend::connect`], which authenticates and
 /// fetches the full library into memory.
+#[allow(dead_code)]
 pub struct SubsonicBackend {
     display_name: String,
     client: SubsonicClient,
