@@ -101,14 +101,36 @@ fi
 # GStreamer uses an external helper binary to scan plugins.  If we don't
 # bundle it, GStreamer falls back to the system copy which loads the system
 # libgstreamer, causing duplicate Objective-C class conflicts and crashes.
-GST_SCANNER_SRC="${BREW_PREFIX}/libexec/gstreamer-1.0/gst-plugin-scanner"
+#
+# Homebrew may place the scanner in different locations depending on the
+# GStreamer version and whether it's a monorepo or split-package build.
 GST_SCANNER_DEST="${APP_BUNDLE}/Contents/MacOS/gst-plugin-scanner"
-if [[ -f "$GST_SCANNER_SRC" ]]; then
-  info "Bundling gst-plugin-scanner..."
+GST_SCANNER_SRC=""
+for candidate in \
+  "${BREW_PREFIX}/libexec/gstreamer-1.0/gst-plugin-scanner" \
+  "${BREW_PREFIX}/Cellar/gstreamer"/*/libexec/gstreamer-1.0/gst-plugin-scanner \
+  "${BREW_PREFIX}/opt/gstreamer/libexec/gstreamer-1.0/gst-plugin-scanner" \
+  ; do
+  # candidate may be a glob — iterate resolved paths
+  for resolved in $candidate; do
+    if [[ -f "$resolved" ]]; then
+      GST_SCANNER_SRC="$resolved"
+      break 2
+    fi
+  done
+done
+
+if [[ -n "$GST_SCANNER_SRC" ]]; then
+  info "Bundling gst-plugin-scanner from ${GST_SCANNER_SRC}..."
   cp "$GST_SCANNER_SRC" "$GST_SCANNER_DEST"
   chmod u+w "$GST_SCANNER_DEST"
 else
-  warn "gst-plugin-scanner not found at ${GST_SCANNER_SRC}"
+  warn "gst-plugin-scanner not found in any known Homebrew location!"
+  warn "GStreamer playback may fail when launched from the .app bundle."
+  # List what we searched for debugging
+  warn "Searched: ${BREW_PREFIX}/libexec/gstreamer-1.0/"
+  warn "Searched: ${BREW_PREFIX}/Cellar/gstreamer/*/libexec/gstreamer-1.0/"
+  warn "Searched: ${BREW_PREFIX}/opt/gstreamer/libexec/gstreamer-1.0/"
 fi
 
 # Generate .icns from the iconset PNGs
