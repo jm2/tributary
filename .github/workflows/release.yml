@@ -37,6 +37,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder elfutils python3-pip
+          sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
       - name: Install Python dependencies
         run: pip3 install tomlkit aiohttp --break-system-packages || pip3 install tomlkit aiohttp
