@@ -45,7 +45,6 @@ info "All system dependencies satisfied."
 # ── Rust Build ───────────────────────────────────────────────────────────────
 info "Building Tributary (release)..."
 
-# Homebrew on Apple Silicon uses /opt/homebrew; Intel uses /usr/local
 BREW_PREFIX="$(brew --prefix)"
 export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
@@ -60,16 +59,53 @@ mkdir -p "${APP_BUNDLE}/Contents/MacOS"
 mkdir -p "${APP_BUNDLE}/Contents/Resources"
 mkdir -p "${APP_BUNDLE}/Contents/Frameworks"
 
-# Copy binary
-cp "$BINARY" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
+# Copy binary as Tributary-bin and create the bash wrapper
+BIN_DEST="${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
+cp "$BINARY" "${BIN_DEST}-bin"
+
+# Force DYLD_LIBRARY_PATH
+cat > "${BIN_DEST}" << 'EOF'
+#!/bin/bash
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+BUNDLE_ROOT="$(dirname "$DIR")"
+
+# Blind the app to Homebrew by stripping it from PATH
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+# Force macOS to prioritize our bundled dylibs above everything else
+export DYLD_LIBRARY_PATH="$BUNDLE_ROOT/Frameworks"
+
+# Force GTK to look inside the bundle for icons and schemas
+export XDG_DATA_DIRS="$BUNDLE_ROOT/Resources/share"
+export GTK_DATA_PREFIX="$BUNDLE_ROOT/Resources"
+export GDK_PIXBUF_MODULE_FILE="$BUNDLE_ROOT/Resources/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+
+# Force GStreamer to only use bundled plugins and scanners
+export GST_PLUGIN_SYSTEM_PATH=""
+export GST_PLUGIN_PATH="$BUNDLE_ROOT/Resources/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER="$DIR/gst-plugin-scanner"
+export GST_REGISTRY_UPDATE=no
+
+# Launch the actual Rust binary
+exec "$DIR/Tributary-bin" "$@"
+EOF
+
+chmod +x "${BIN_DEST}"
 
 # ── Bundle GTK/Adwaita resources ─────────────────────────────────────────────
 RESOURCES_DIR="${APP_BUNDLE}/Contents/Resources"
 
 # Icons
 mkdir -p "${RESOURCES_DIR}/share/icons"
-cp -R "${BREW_PREFIX}/share/icons/hicolor" "${RESOURCES_DIR}/share/icons/" 2>/dev/null || true
-cp -R "${BREW_PREFIX}/share/icons/Adwaita" "${RESOURCES_DIR}/share/icons/" 2>/dev/null || true
+cp -RL "${BREW_PREFIX}/share/icons/hicolor" "${RESOURCES_DIR}/share/icons/" 2>/dev/null || true
+cp -RL "${BREW_PREFIX}/share/icons/Adwaita" "${RESOURCES_DIR}/share/icons/" 2>/dev/null || true
+
+# Compile GTK Icon Caches (Fixes the missing SVG errors)
+info "Compiling icon caches..."
+command -v gtk4-update-icon-cache &>/dev/null && {
+  gtk4-update-icon-cache -f -t "${RESOURCES_DIR}/share/icons/hicolor" 2>/dev/null || true
+  gtk4-update-icon-cache -f -t "${RESOURCES_DIR}/share/icons/Adwaita" 2>/dev/null || true
+}
 
 # GLib schemas
 mkdir -p "${RESOURCES_DIR}/share/glib-2.0/schemas"
@@ -89,7 +125,6 @@ GST_PLUGIN_DEST="${RESOURCES_DIR}/lib/gstreamer-1.0"
 if [[ -d "$GST_PLUGIN_SRC" ]]; then
   info "Bundling GStreamer plugins..."
   mkdir -p "$GST_PLUGIN_DEST"
-  # Copy all plugin dylibs
   cp "${GST_PLUGIN_SRC}"/*.dylib "$GST_PLUGIN_DEST/" 2>/dev/null || true
   GST_PLUGIN_COUNT=$(ls -1 "$GST_PLUGIN_DEST"/*.dylib 2>/dev/null | wc -l | tr -d ' ')
   info "Bundled ${GST_PLUGIN_COUNT} GStreamer plugins."
@@ -98,12 +133,6 @@ else
 fi
 
 # ── Bundle gst-plugin-scanner ────────────────────────────────────────────────
-# GStreamer uses an external helper binary to scan plugins.  If we don't
-# bundle it, GStreamer falls back to the system copy which loads the system
-# libgstreamer, causing duplicate Objective-C class conflicts and crashes.
-#
-# Homebrew may place the scanner in different locations depending on the
-# GStreamer version and whether it's a monorepo or split-package build.
 GST_SCANNER_DEST="${APP_BUNDLE}/Contents/MacOS/gst-plugin-scanner"
 GST_SCANNER_SRC=""
 for candidate in \
@@ -111,7 +140,6 @@ for candidate in \
   "${BREW_PREFIX}/Cellar/gstreamer"/*/libexec/gstreamer-1.0/gst-plugin-scanner \
   "${BREW_PREFIX}/opt/gstreamer/libexec/gstreamer-1.0/gst-plugin-scanner" \
   ; do
-  # candidate may be a glob — iterate resolved paths
   for resolved in $candidate; do
     if [[ -f "$resolved" ]]; then
       GST_SCANNER_SRC="$resolved"
@@ -170,7 +198,10 @@ PLIST
 # ── Copy and fix dylibs (recursive) ─────────────────────────────────────────
 info "Bundling dylibs and fixing rpaths (recursive — this may take a moment)..."
 FRAMEWORKS_DIR="${APP_BUNDLE}/Contents/Frameworks"
-BIN="${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
+
+# We must point `otool` at the actual Rust binary (-bin), 
+# not the bash wrapper we just created.
+BIN="${APP_BUNDLE}/Contents/MacOS/${APP_NAME}-bin"
 
 # Copy a single dylib into Frameworks/ if not already there.
 copy_dylib() {
@@ -178,38 +209,47 @@ copy_dylib() {
   local basename
   basename="$(basename "$src")"
   local dest="${FRAMEWORKS_DIR}/${basename}"
-  [[ -f "$dest" ]] && return 1  # already copied
+  [[ -f "$dest" ]] && return 1
   cp "$src" "$dest"
   chmod u+w "$dest"
-  # Fix the install name of the copied library
   install_name_tool -id "@executable_path/../Frameworks/${basename}" "$dest" 2>/dev/null || true
-  return 0  # newly copied
+  return 0
 }
 
-# Rewrite Homebrew absolute paths in a binary/dylib to @executable_path-relative.
-# Returns the list of newly-copied dylibs (for recursive processing).
+# The Aggressive @rpath Fix
 fix_rpaths() {
   local bin="$1"
   local new_libs=()
   while IFS= read -r libpath; do
     local basename
     basename="$(basename "$libpath")"
-    if copy_dylib "$libpath"; then
-      new_libs+=("${FRAMEWORKS_DIR}/${basename}")
+    
+    # Resolve actual Homebrew path if it's a relative @rpath or @loader_path
+    local src_path="$libpath"
+    if [[ "$libpath" == @rpath/* ]] || [[ "$libpath" == @loader_path/* ]]; then
+      src_path="${BREW_PREFIX}/lib/${basename}"
     fi
+    
+    if [[ -f "$src_path" ]]; then
+      if copy_dylib "$src_path"; then
+        new_libs+=("${FRAMEWORKS_DIR}/${basename}")
+      fi
+    fi
+    
     install_name_tool -change "$libpath" \
       "@executable_path/../Frameworks/${basename}" "$bin" 2>/dev/null || true
+      
+  # The updated regex catches /opt/homebrew, /usr/local, AND @rpath/@loader_path
   done < <(otool -L "$bin" 2>/dev/null \
-    | awk '/\/opt\/homebrew|\/usr\/local/{print $1}')
-  # Return new libs via global variable (bash doesn't have return arrays)
+    | awk '/\/opt\/homebrew|\/usr\/local|@rpath\/|@loader_path\// {print $1}')
+    
   NEWLY_COPIED=("${new_libs[@]+"${new_libs[@]}"}")
 }
 
-# Fix the main binary first.
+# Fix the main binary
 fix_rpaths "$BIN"
 QUEUE=("${NEWLY_COPIED[@]+"${NEWLY_COPIED[@]}"}")
 
-# Recursively fix all newly-copied dylibs until no new ones are discovered.
 PASS=1
 while [[ ${#QUEUE[@]} -gt 0 ]]; do
   info "  Dylib pass ${PASS}: processing ${#QUEUE[@]} libraries..."
@@ -230,100 +270,46 @@ done
 TOTAL_DYLIBS=$(ls -1 "${FRAMEWORKS_DIR}"/*.dylib 2>/dev/null | wc -l | tr -d ' ')
 info "Bundled ${TOTAL_DYLIBS} dylibs into Frameworks/."
 
-# Also fix rpaths in GStreamer plugin dylibs
+# Fix GStreamer plugins
 if [[ -d "$GST_PLUGIN_DEST" ]]; then
   info "Fixing rpaths in GStreamer plugins..."
   for plugin in "${GST_PLUGIN_DEST}"/*.dylib; do
     [[ -f "$plugin" ]] || continue
     chmod u+w "$plugin"
-    # Fix absolute Homebrew paths (e.g. /opt/homebrew/lib/libfoo.dylib)
-    while IFS= read -r libpath; do
-      local_basename="$(basename "$libpath")"
-      # Copy the dependency into Frameworks/ if needed
-      copy_dylib "$libpath" || true
-      install_name_tool -change "$libpath" \
-        "@executable_path/../Frameworks/${local_basename}" "$plugin" 2>/dev/null || true
-    done < <(otool -L "$plugin" 2>/dev/null \
-      | awk '/\/opt\/homebrew|\/usr\/local/{print $1}')
-
-    # Fix @rpath references (e.g. @rpath/libgstaudio-1.0.0.dylib)
-    # These are used by GStreamer plugins to reference GStreamer's own
-    # libraries.  The bundled copies live in Frameworks/.
-    while IFS= read -r libpath; do
-      local_basename="$(basename "$libpath")"
-      # Try to find and copy the actual library from Homebrew
-      local_src="${BREW_PREFIX}/lib/${local_basename}"
-      if [[ -f "$local_src" ]]; then
-        copy_dylib "$local_src" || true
-      fi
-      install_name_tool -change "$libpath" \
-        "@executable_path/../Frameworks/${local_basename}" "$plugin" 2>/dev/null || true
-    done < <(otool -L "$plugin" 2>/dev/null \
-      | awk '/@rpath\//{print $1}')
+    install_name_tool -add_rpath "@loader_path/../../../Frameworks" "$plugin" 2>/dev/null || true
+    fix_rpaths "$plugin"
   done
 fi
 
 # Fix rpaths in the bundled gst-plugin-scanner
 if [[ -f "$GST_SCANNER_DEST" ]]; then
   info "Fixing rpaths in gst-plugin-scanner..."
-  while IFS= read -r libpath; do
-    local_basename="$(basename "$libpath")"
-    copy_dylib "$libpath" || true
-    install_name_tool -change "$libpath" \
-      "@executable_path/../Frameworks/${local_basename}" "$GST_SCANNER_DEST" 2>/dev/null || true
-  done < <(otool -L "$GST_SCANNER_DEST" 2>/dev/null \
-    | awk '/\/opt\/homebrew|\/usr\/local/{print $1}')
+  fix_rpaths "$GST_SCANNER_DEST"
 fi
 
-# ── Fix rpaths in pixbuf loaders ─────────────────────────────────────────────
+# Fix rpaths in pixbuf loaders
 PIXBUF_LOADERS_DEST="${RESOURCES_DIR}/lib/gdk-pixbuf-2.0/2.10.0/loaders"
 if [[ -d "$PIXBUF_LOADERS_DEST" ]]; then
   info "Fixing rpaths in pixbuf loaders..."
   for loader in "${PIXBUF_LOADERS_DEST}"/*.so; do
     [[ -f "$loader" ]] || continue
     chmod u+w "$loader"
-    while IFS= read -r libpath; do
-      local_basename="$(basename "$libpath")"
-      copy_dylib "$libpath" || true
-      install_name_tool -change "$libpath" \
-        "@executable_path/../Frameworks/${local_basename}" "$loader" 2>/dev/null || true
-    done < <(otool -L "$loader" 2>/dev/null \
-      | awk '/\/opt\/homebrew|\/usr\/local/{print $1}')
+    fix_rpaths "$loader"
   done
 fi
 
-# ── Update pixbuf loaders.cache with bundle-relative paths ───────────────────
+# Update pixbuf loaders.cache
 PIXBUF_CACHE="${RESOURCES_DIR}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
 if [[ -f "$PIXBUF_CACHE" ]]; then
   info "Patching pixbuf loaders.cache for bundle paths..."
-  # Replace absolute Homebrew paths with a placeholder that the runtime
-  # will resolve.  The cache just needs the loader filenames to be findable
-  # relative to the module directory.
   sed -i '' "s|${BREW_PREFIX}/lib/gdk-pixbuf-2.0/2.10.0/loaders/|${RESOURCES_DIR}/lib/gdk-pixbuf-2.0/2.10.0/loaders/|g" "$PIXBUF_CACHE" 2>/dev/null || true
 fi
 
-# ── Verify Adwaita icons ─────────────────────────────────────────────────────
+# Verify Adwaita icons
 ADWAITA_SCALABLE="${RESOURCES_DIR}/share/icons/Adwaita/scalable"
 if [[ -d "$ADWAITA_SCALABLE" ]]; then
   ADWAITA_SVG_COUNT=$(find "$ADWAITA_SCALABLE" -name '*.svg' 2>/dev/null | wc -l | tr -d ' ')
   info "Adwaita scalable icons: ${ADWAITA_SVG_COUNT} SVGs found."
-  if [[ "$ADWAITA_SVG_COUNT" -eq 0 ]]; then
-    warn "No Adwaita SVG icons found! Icons will be missing at runtime."
-    warn "Ensure 'brew install adwaita-icon-theme' includes scalable SVGs."
-  fi
-else
-  warn "Adwaita scalable icon directory not found at ${ADWAITA_SCALABLE}"
-  warn "Checking for symbolic icons in other locations..."
-  # Some Homebrew versions put icons under a versioned Adwaita path
-  for candidate in "${BREW_PREFIX}/share/icons/Adwaita" \
-                    "${BREW_PREFIX}/opt/adwaita-icon-theme/share/icons/Adwaita"; do
-    if [[ -d "${candidate}/scalable" ]]; then
-      info "Found Adwaita icons at ${candidate}, copying..."
-      rm -rf "${RESOURCES_DIR}/share/icons/Adwaita"
-      cp -R "$candidate" "${RESOURCES_DIR}/share/icons/"
-      break
-    fi
-  done
 fi
 
 # ── Ad-hoc Code Signing ─────────────────────────────────────────────────────
@@ -332,45 +318,26 @@ fi
 # We must re-sign everything with at least an ad-hoc signature.
 info "Ad-hoc code signing the bundle..."
 
-# Sign all dylibs in Frameworks/ first
 find "${FRAMEWORKS_DIR}" -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
+[[ -d "$GST_PLUGIN_DEST" ]] && find "$GST_PLUGIN_DEST" -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
+[[ -d "$PIXBUF_LOADERS_DEST" ]] && find "$PIXBUF_LOADERS_DEST" -name '*.so' -exec codesign --force --sign - {} \; 2>/dev/null || true
+[[ -f "$GST_SCANNER_DEST" ]] && codesign --force --sign - "$GST_SCANNER_DEST" 2>/dev/null || true
 
-# Sign GStreamer plugin dylibs
-if [[ -d "$GST_PLUGIN_DEST" ]]; then
-  find "$GST_PLUGIN_DEST" -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
-fi
-
-# Sign pixbuf loaders
-if [[ -d "$PIXBUF_LOADERS_DEST" ]]; then
-  find "$PIXBUF_LOADERS_DEST" -name '*.so' -exec codesign --force --sign - {} \; 2>/dev/null || true
-fi
-
-# Sign gst-plugin-scanner
-if [[ -f "$GST_SCANNER_DEST" ]]; then
-  codesign --force --sign - "$GST_SCANNER_DEST" 2>/dev/null || true
-fi
-
-# Sign the main binary last
 codesign --force --sign - "$BIN" 2>/dev/null || true
-
-# Sign the overall .app bundle
 codesign --force --deep --sign - "$APP_BUNDLE" 2>/dev/null || true
 
 info ".app bundle created: $(pwd)/${APP_BUNDLE}"
 
-# ── Verify the bundle ────────────────────────────────────────────────────────
 if codesign --verify --verbose "$APP_BUNDLE" 2>/dev/null; then
   info "Code signature verified OK."
 else
-  warn "Code signature verification failed — the app may not launch from Finder."
-  warn "Try: codesign --force --deep --sign - '${APP_BUNDLE}'"
+  warn "Code signature verification failed."
 fi
 
 # ── DMG ──────────────────────────────────────────────────────────────────────
 if $MAKE_DMG; then
   info "Creating .dmg disk image..."
   mkdir -p dist
-  # Remove any existing DMG (create-dmg fails if it exists)
   rm -f "dist/${APP_NAME}.dmg"
   create-dmg \
     --volname "${APP_NAME}" \
