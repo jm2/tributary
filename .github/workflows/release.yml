@@ -37,6 +37,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder elfutils python3-pip
+          
+          # Fix Polkit permission errors for headless bare-metal Flatpak
+          sudo mkdir -p /etc/polkit-1/rules.d
+          sudo tee /etc/polkit-1/rules.d/99-flatpak.rules << 'EOF'
+          polkit.addRule(function(action, subject) {
+              if (action.id.startsWith("org.freedesktop.Flatpak.") && subject.user === "runner") {
+                  return polkit.Result.YES;
+              }
+          });
+          EOF
+          
+          # Add the Flathub repository
           sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
       - name: Install Python dependencies
