@@ -1,6 +1,6 @@
 Name:           tributary
 Version:        v0.1.0
-Release:        1.20260403103619142464.main.2.g5f3e5c5%{?dist}
+Release:        1%{?dist}
 Summary:        A high-performance media manager with unified local and remote backends
 
 License:        GPL-3.0-or-later
@@ -34,7 +34,7 @@ for GNOME. It features unified backends for local music and remote services
 like Subsonic, Jellyfin, and Plex.
 
 %prep
-%autosetup -p1 -n tributary-%{version}
+%autosetup -p1 -n %{name}-%{version}
 
 %build
 cargo build --offline --release
@@ -68,9 +68,5 @@ appstream-util validate-relax --nonet %{buildroot}%{_metainfodir}/*.metainfo.xml
 %{_datadir}/icons/hicolor/*/apps/io.github.tributary.Tributary.png
 
 %changelog
-* Fri Apr 03 2026 John-Michael Mulesa <jmulesa@gmail.com> - v0.1.0-1.20260403103619142464.main.2.g5f3e5c5
-- feat: add full RPM packaging support and Packit configuration for Fedora COPR builds (John-Michael Mulesa)
-- chore: disable LTO in PKGBUILD and remove redundant makepkg configuration overrides (John-Michael Mulesa)
-
-* Fri Apr 03 2026 Tributary Contributors <tributary@example.com> - 0.1.0-1
-- Initial Fedora package
+* Fri Apr 03 2026 John-Michael Mulesa <jmulesa@gmail.com> - v0.1.0-1
+- Initial Fedora package.
