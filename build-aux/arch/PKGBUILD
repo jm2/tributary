@@ -6,6 +6,7 @@ pkgdesc="A high-performance, Rhythmbox-style media manager with unified local an
 arch=('x86_64')
 url="https://github.com/jm2/tributary"
 license=('GPL-3.0-or-later')
+options=('!lto')
 depends=(
   'gtk4'
   'libadwaita'
