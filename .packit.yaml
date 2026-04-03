@@ -11,13 +11,13 @@ files_to_sync:
 upstream_package_name: tributary
 downstream_package_name: tributary
 upstream_project_url: https://github.com/jm2/tributary
+enable_net: true
 
 jobs:
   - job: copr_build
     trigger: release
     owner: jmsqrd
     project: tributary
-    enable_net: true
     targets:
       - fedora-44-x86_64
       - fedora-44-aarch64
