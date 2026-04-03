@@ -12,23 +12,12 @@ upstream_package_name: tributary
 downstream_package_name: tributary
 upstream_project_url: https://github.com/jm2/tributary
 
-srpm_build_deps:
-  - cargo
-
-actions:
-  post-upstream-clone:
-    - "cargo vendor vendor"
-    - "mkdir -p .cargo"
-    - "bash -c 'cargo vendor vendor > .cargo/config.toml'"
-  create-archive:
-    - "bash -c 'tar -czf ../tributary-${PACKIT_PROJECT_VERSION}.tar.gz --exclude-vcs --transform \"s|^\\.|tributary-${PACKIT_PROJECT_VERSION}|\" . && mv ../tributary-${PACKIT_PROJECT_VERSION}.tar.gz .'"
-    - "bash -c 'ls -1 tributary-*.tar.gz'"
-
 jobs:
   - job: copr_build
     trigger: release
     owner: jmsqrd
     project: tributary
+    enable_net: true
     targets:
       - fedora-44-x86_64
       - fedora-44-aarch64

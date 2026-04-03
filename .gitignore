@@ -22,10 +22,6 @@ Thumbs.db
 *.deb
 *.tar.gz
 
-# Vendor
-/vendor/
-/.cargo/
-
 # Flatpak build artifacts
 .flatpak-builder/
 build-dir/

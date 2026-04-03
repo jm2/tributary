@@ -5,7 +5,7 @@ Summary:        A high-performance media manager with unified local and remote b
 
 License:        GPL-3.0-or-later
 URL:            https://github.com/jm2/tributary
-Source0:        https://github.com/jm2/tributary/archive/%{version}.tar.gz#/%{name}-%{version}.tar.gz
+Source0:        https://github.com/jm2/tributary/archive/refs/tags/v%{version}.tar.gz
 
 BuildRequires:  rust
 BuildRequires:  cargo
@@ -37,7 +37,7 @@ like Subsonic, Jellyfin, and Plex.
 %autosetup -p1 -n %{name}-%{version}
 
 %build
-cargo build --offline --release
+cargo build --release
 
 %install
 # Install binary
