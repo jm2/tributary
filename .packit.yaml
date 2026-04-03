@@ -1,0 +1,22 @@
+# See the documentation for more information:
+# https://packit.dev/docs/configuration/
+
+specfile_path: build-aux/rpm/tributary.spec
+
+# Use the source-git mode for syncing
+files_to_sync:
+  - build-aux/rpm/tributary.spec
+  - .packit.yaml
+
+upstream_package_name: tributary
+downstream_package_name: tributary
+upstream_project_url: https://github.com/jm2/tributary
+
+jobs:
+  - job: copr_build
+    trigger: release
+    owner: jmsqrd
+    project: tributary
+    targets:
+      - fedora-44-x86_64
+      - fedora-44-aarch64
