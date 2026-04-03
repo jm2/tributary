@@ -21,7 +21,7 @@ actions:
     - "mkdir -p .cargo"
     - "bash -c 'cargo vendor vendor > .cargo/config.toml'"
   create-archive:
-    - "tar -czf tributary-${PACKIT_PROJECT_VERSION}.tar.gz --exclude-vcs --exclude=tributary-*.tar.gz --transform \"s|^\\.|tributary-${PACKIT_PROJECT_VERSION}|\" ."
+    - "bash -c 'tar -czf ../tributary-${PACKIT_PROJECT_VERSION}.tar.gz --exclude-vcs --transform \"s|^\\.|tributary-${PACKIT_PROJECT_VERSION}|\" . && mv ../tributary-${PACKIT_PROJECT_VERSION}.tar.gz .'"
     - "bash -c 'ls -1 tributary-*.tar.gz'"
 
 jobs:
