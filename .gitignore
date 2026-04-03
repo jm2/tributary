@@ -18,6 +18,9 @@ Thumbs.db
 *.dmg
 *.flatpak
 *.zip
+*.rpm
+*.deb
+*.tar.gz
 
 # Flatpak build artifacts
 .flatpak-builder/

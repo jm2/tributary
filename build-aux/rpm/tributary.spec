@@ -1,15 +1,18 @@
 Name:           tributary
-Version:        0.1.0
-Release:        1%{?dist}
+Version:        v0.1.0
+Release:        1.20260403103619142464.main.2.g5f3e5c5%{?dist}
 Summary:        A high-performance media manager with unified local and remote backends
 
 License:        GPL-3.0-or-later
 URL:            https://github.com/jm2/tributary
-Source0:        https://github.com/jm2/tributary/archive/refs/tags/v%{version}.tar.gz
+Source0:        https://github.com/jm2/tributary/archive/%{version}.tar.gz#/%{name}-%{version}.tar.gz
 
 BuildRequires:  rust
 BuildRequires:  cargo
 BuildRequires:  gcc
+BuildRequires:  pkgconf-pkg-config
+BuildRequires:  libadwaita-devel
+BuildRequires:  gtk4-devel
 BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pkgconfig(libadwaita-1)
 BuildRequires:  pkgconfig(gstreamer-1.0)
@@ -31,10 +34,10 @@ for GNOME. It features unified backends for local music and remote services
 like Subsonic, Jellyfin, and Plex.
 
 %prep
-%autosetup -p1
+%autosetup -p1 -n tributary-%{version}
 
 %build
-cargo build --release
+cargo build --offline --release
 
 %install
 # Install binary
@@ -65,5 +68,9 @@ appstream-util validate-relax --nonet %{buildroot}%{_metainfodir}/*.metainfo.xml
 %{_datadir}/icons/hicolor/*/apps/io.github.tributary.Tributary.png
 
 %changelog
+* Fri Apr 03 2026 John-Michael Mulesa <jmulesa@gmail.com> - v0.1.0-1.20260403103619142464.main.2.g5f3e5c5
+- feat: add full RPM packaging support and Packit configuration for Fedora COPR builds (John-Michael Mulesa)
+- chore: disable LTO in PKGBUILD and remove redundant makepkg configuration overrides (John-Michael Mulesa)
+
 * Fri Apr 03 2026 Tributary Contributors <tributary@example.com> - 0.1.0-1
 - Initial Fedora package
