@@ -1,7 +1,7 @@
 //! Preferences window — unified settings for browser views, column
 //! visibility, and library location.
 //!
-//! Uses `adw::PreferencesWindow` with a single page containing three
+//! Uses `adw::PreferencesDialog` with a single page containing three
 //! groups: Browser Views, Visible Columns, and Library Location.
 
 use adw::prelude::*;
@@ -110,12 +110,8 @@ pub fn show_preferences(
     browser_box: &gtk::Box,
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
 ) {
-    let prefs_window = adw::PreferencesWindow::builder()
+    let prefs_window = adw::PreferencesDialog::builder()
         .title("Preferences")
-        .transient_for(parent)
-        .modal(true)
-        .default_width(500)
-        .default_height(600)
         .build();
 
     let page = adw::PreferencesPage::new();
@@ -312,7 +308,7 @@ pub fn show_preferences(
     prefs_window.add(&page);
     drop(cfg); // release borrow before presenting
 
-    prefs_window.present();
+    prefs_window.present(Some(parent));
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -321,10 +317,7 @@ pub fn show_preferences(
 pub fn apply_column_visibility(column_view: &gtk::ColumnView, visible: &[String]) {
     let columns = column_view.columns();
     for i in 0..columns.n_items() {
-        if let Some(col) = columns
-            .item(i)
-            .and_downcast_ref::<gtk::ColumnViewColumn>()
-        {
+        if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
             if let Some(title) = col.title() {
                 col.set_visible(visible.iter().any(|v| v == title.as_str()));
             }

@@ -137,6 +137,7 @@ fn main() {
                 .website("https://github.com/jm2/tributary")
                 .issue_url("https://github.com/jm2/tributary/issues")
                 .copyright("© 2026 John-Michael Mulesa")
+                .license_type(gtk::License::Gpl30)
                 .license(license_text)
                 .build();
 
@@ -151,7 +152,7 @@ fn main() {
             // Forward to the window-level action that has access to
             // the ColumnView and browser widgets.
             if let Some(win) = app.active_window() {
-                win.activate_action("show-preferences", None);
+                let _ = win.activate_action("show-preferences", None);
             }
         })
         .build();

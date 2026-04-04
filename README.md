@@ -191,6 +191,30 @@ DAAP_URL=http://192.168.1.50:3689 DAAP_PASSWORD=secret ./target/release/tributar
 
 ---
 
+## Development
+
+### Git Hooks
+
+Tributary includes a pre-commit hook that runs `cargo fmt --check` to prevent formatting errors from being committed. To enable it after cloning:
+
+```bash
+git config core.hooksPath hooks
+```
+
+### Windows Helper Scripts
+
+On Windows, the build script can also be used for quick formatting and type-checking from PowerShell:
+
+```powershell
+# Format code:
+.\scripts\build-windows.ps1 -Fmt
+
+# Type-check without a full build:
+.\scripts\build-windows.ps1 -Check
+```
+
+---
+
 ## Project Structure
 
 ```

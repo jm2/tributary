@@ -1250,12 +1250,11 @@ pub fn build_window(
         let cv = column_view.clone();
         let bw = browser_widget.clone();
         let cfg = app_config.clone();
-        let prefs_action = gtk::gio::ActionEntry::builder("show-preferences")
-            .activate(move |_: &adw::ApplicationWindow, _, _| {
-                preferences::show_preferences(&win, &cv, &bw, &cfg);
-            })
-            .build();
-        window.add_action_entries([prefs_action]);
+        let prefs_action = gtk::gio::SimpleAction::new("show-preferences", None);
+        prefs_action.connect_activate(move |_, _| {
+            preferences::show_preferences(&win, &cv, &bw, &cfg);
+        });
+        window.add_action(&prefs_action);
     }
 
     // ── Receive LibraryEvents on GTK main thread ─────────────────────
