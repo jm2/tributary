@@ -1,0 +1,36 @@
+#!/bin/sh
+#
+# Git pre-commit hook for Tributary.
+#
+# Runs `cargo fmt --check` and aborts the commit if formatting issues
+# are found.  To enable this hook after cloning:
+#
+#   git config core.hooksPath hooks
+#
+# To format your code before committing:
+#
+#   cargo fmt
+#   # or on Windows via PowerShell:
+#   .\scripts\build-windows.ps1 -Fmt
+#
+
+set -e
+
+echo "[pre-commit] Checking code formatting..."
+
+if ! cargo fmt --check 2>/dev/null; then
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║  Commit blocked: code formatting issues detected.        ║"
+    echo "║                                                          ║"
+    echo "║  Run one of the following to fix:                        ║"
+    echo "║    cargo fmt                                             ║"
+    echo "║    ./scripts/build-windows.ps1 -Fmt   (Windows)          ║"
+    echo "║                                                          ║"
+    echo "║  Then stage the changes and try again.                   ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+    exit 1
+fi
+
+echo "[pre-commit] Formatting OK."

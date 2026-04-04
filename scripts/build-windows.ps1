@@ -18,12 +18,22 @@
 .PARAMETER InnoSetup
     If specified, builds an Inno Setup installer (.exe) from the bundled dist folder.
     Requires Inno Setup 6 to be installed (iscc.exe in PATH or standard install location).
+
+.PARAMETER Check
+    If specified, sets up the MSYS2 build environment and runs `cargo check` only.
+    Useful for quick compilation checking from PowerShell without a full build.
+
+.PARAMETER Fmt
+    If specified, sets up the MSYS2 build environment and runs `cargo fmt` only.
+    Useful for formatting code from PowerShell without a full build.
 #>
 param(
     [string]$Msys2Root = "C:\msys64",
     [switch]$SkipBundle,
     [switch]$NoCargoBuild,
-    [switch]$InnoSetup
+    [switch]$InnoSetup,
+    [switch]$Check,
+    [switch]$Fmt
 )
 
 Set-StrictMode -Version Latest
@@ -115,6 +125,23 @@ $env:CXX     = Join-Path $MsysPath "bin\g++.exe"
 $env:AR      = Join-Path $MsysPath "bin\ar.exe"
 
 Write-Info "PKG_CONFIG_PATH set to $pkgConfigPath"
+
+# ── Quick-exit modes: --Check and --Fmt ──────────────────────────────────────
+if ($Fmt) {
+    Write-Info "Running cargo fmt..."
+    cargo fmt
+    if ($LASTEXITCODE -ne 0) { Write-Err "cargo fmt failed." }
+    Write-Info "Formatting complete."
+    exit 0
+}
+
+if ($Check) {
+    Write-Info "Running cargo check for $RustTarget..."
+    cargo check --target $RustTarget
+    if ($LASTEXITCODE -ne 0) { Write-Err "cargo check failed." }
+    Write-Info "Check passed."
+    exit 0
+}
 
 # ── Per-package dependency checks ────────────────────────────────────────────
 $pkgConfig = Join-Path $MsysPath "bin\pkg-config.exe"
