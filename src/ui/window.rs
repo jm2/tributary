@@ -375,72 +375,148 @@ pub fn build_window(
         let discovery_rx = crate::discovery::start_discovery();
         let store = sidebar_store.clone();
         let rt_handle_for_discovery = rt_handle.clone();
+        let source_tracks_for_discovery = source_tracks.clone();
+        let active_source_key_for_discovery = active_source_key.clone();
+        let sidebar_selection_for_discovery = sidebar_selection.clone();
+        let track_store_for_discovery = track_store.clone();
+        let master_tracks_for_discovery = master_tracks.clone();
+        let browser_widget_for_discovery = browser_widget.clone();
+        let browser_state_for_discovery = browser_state.clone();
+        let status_label_for_discovery = status_label.clone();
+        let column_view_for_discovery = column_view.clone();
 
         glib::MainContext::default().spawn_local(async move {
-            while let Ok(server) = discovery_rx.recv().await {
-                // Dedup: check if this URL is already in the sidebar.
-                let already_exists = (0..store.n_items()).any(|i| {
-                    store
-                        .item(i)
-                        .and_downcast_ref::<SourceObject>()
-                        .is_some_and(|s| s.server_url() == server.url)
-                });
-                if already_exists {
-                    continue;
-                }
+            while let Ok(event) = discovery_rx.recv().await {
+                match event {
+                    crate::discovery::DiscoveryEvent::Found(server) => {
+                        // Dedup: check if this URL is already in the sidebar.
+                        let already_exists = (0..store.n_items()).any(|i| {
+                            store
+                                .item(i)
+                                .and_downcast_ref::<SourceObject>()
+                                .is_some_and(|s| s.server_url() == server.url)
+                        });
+                        if already_exists {
+                            continue;
+                        }
 
-                info!(
-                    name = %server.name,
-                    url = %server.url,
-                    backend = %server.service_type,
-                    "Adding discovered server to sidebar"
-                );
+                        info!(
+                            name = %server.name,
+                            url = %server.url,
+                            backend = %server.service_type,
+                            "Adding discovered server to sidebar"
+                        );
 
-                // Insert under the correct category header.
-                let insert_pos = ensure_category_header_store(&store, &server.service_type);
-                let src = SourceObject::discovered(&server.name, &server.service_type, &server.url);
+                        // Insert under the correct category header.
+                        let insert_pos = ensure_category_header_store(&store, &server.service_type);
+                        let src = SourceObject::discovered(
+                            &server.name,
+                            &server.service_type,
+                            &server.url,
+                        );
 
-                // Apply requires_password if already known from discovery.
-                if let Some(rp) = server.requires_password {
-                    src.set_requires_password(rp);
-                }
+                        // Apply requires_password if already known from discovery.
+                        if let Some(rp) = server.requires_password {
+                            src.set_requires_password(rp);
+                        }
 
-                store.insert(insert_pos, &src);
+                        store.insert(insert_pos, &src);
 
-                // For DAAP servers, probe whether a password is required
-                // in the background and update the sidebar item.
-                if server.service_type == "daap" && server.requires_password.is_none() {
-                    let probe_url = server.url.clone();
-                    let store_for_probe = store.clone();
-                    let (probe_tx, probe_rx) = async_channel::bounded::<Option<bool>>(1);
+                        // For DAAP servers, probe whether a password is required
+                        // in the background and update the sidebar item.
+                        if server.service_type == "daap" && server.requires_password.is_none() {
+                            let probe_url = server.url.clone();
+                            let store_for_probe = store.clone();
+                            let (probe_tx, probe_rx) = async_channel::bounded::<Option<bool>>(1);
 
-                    rt_handle_for_discovery.spawn(async move {
-                        let result =
-                            crate::daap::client::DaapClient::probe_requires_password(&probe_url)
-                                .await;
-                        let _ = probe_tx.send(result).await;
-                    });
+                            rt_handle_for_discovery.spawn(async move {
+                                let result =
+                                    crate::daap::client::DaapClient::probe_requires_password(
+                                        &probe_url,
+                                    )
+                                    .await;
+                                let _ = probe_tx.send(result).await;
+                            });
 
-                    let probe_server_url = server.url.clone();
-                    glib::MainContext::default().spawn_local(async move {
-                        if let Ok(Some(requires_pw)) = probe_rx.recv().await {
-                            // Find the source in the store and update it.
-                            for i in 0..store_for_probe.n_items() {
-                                if let Some(src) =
-                                    store_for_probe.item(i).and_downcast_ref::<SourceObject>()
-                                {
-                                    if src.server_url() == probe_server_url && !src.connected() {
-                                        src.set_requires_password(requires_pw);
-                                        // Force rebind by remove + re-insert.
-                                        let src = src.clone();
-                                        store_for_probe.remove(i);
-                                        store_for_probe.insert(i, &src);
-                                        break;
+                            let probe_server_url = server.url.clone();
+                            glib::MainContext::default().spawn_local(async move {
+                                if let Ok(Some(requires_pw)) = probe_rx.recv().await {
+                                    // Find the source in the store and update it.
+                                    for i in 0..store_for_probe.n_items() {
+                                        if let Some(src) = store_for_probe
+                                            .item(i)
+                                            .and_downcast_ref::<SourceObject>()
+                                        {
+                                            if src.server_url() == probe_server_url
+                                                && !src.connected()
+                                            {
+                                                src.set_requires_password(requires_pw);
+                                                // Force rebind by remove + re-insert.
+                                                let src = src.clone();
+                                                store_for_probe.remove(i);
+                                                store_for_probe.insert(i, &src);
+                                                break;
+                                            }
+                                        }
                                     }
+                                }
+                            });
+                        }
+                    }
+
+                    crate::discovery::DiscoveryEvent::Lost { url, service_type } => {
+                        info!(
+                            url = %url,
+                            backend = %service_type,
+                            "Removing lost server from sidebar"
+                        );
+
+                        // Find the sidebar entry for this URL.
+                        for i in 0..store.n_items() {
+                            if let Some(src) = store.item(i).and_downcast_ref::<SourceObject>() {
+                                if src.server_url() == url {
+                                    // If connected and still the active source,
+                                    // switch to local before removing.
+                                    let was_active =
+                                        *active_source_key_for_discovery.borrow() == url;
+
+                                    if src.connected() {
+                                        // Remove from source_tracks map.
+                                        source_tracks_for_discovery.borrow_mut().remove(&url);
+                                    }
+
+                                    // Remove the sidebar entry.
+                                    store.remove(i);
+
+                                    // Clean up empty category header.
+                                    let category = category_for_backend(&service_type);
+                                    remove_empty_category_header(&store, category);
+
+                                    // If this was the active source, switch to local.
+                                    if was_active {
+                                        *active_source_key_for_discovery.borrow_mut() =
+                                            "local".to_string();
+                                        sidebar_selection_for_discovery.set_selected(1);
+
+                                        let st = source_tracks_for_discovery.borrow();
+                                        let local_tracks =
+                                            st.get("local").cloned().unwrap_or_default();
+                                        display_tracks(
+                                            &local_tracks,
+                                            &track_store_for_discovery,
+                                            &master_tracks_for_discovery,
+                                            &browser_widget_for_discovery,
+                                            &browser_state_for_discovery,
+                                            &status_label_for_discovery,
+                                            &column_view_for_discovery,
+                                        );
+                                    }
+
+                                    break;
                                 }
                             }
                         }
-                    });
+                    }
                 }
             }
         });
@@ -1903,7 +1979,6 @@ fn ensure_category_header_store(store: &gtk::gio::ListStore, backend_type: &str)
 
 /// Remove a category header from the store if it has no remaining
 /// non-header children (i.e., the category is now empty).
-#[allow(dead_code)]
 fn remove_empty_category_header(store: &gtk::gio::ListStore, category: &str) {
     for i in 0..store.n_items() {
         if let Some(src) = store.item(i).and_downcast_ref::<SourceObject>() {
