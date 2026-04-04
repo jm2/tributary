@@ -152,6 +152,10 @@ pub struct PlexTrack {
     /// View count (play count).
     #[serde(rename = "viewCount", default)]
     pub view_count: Option<u32>,
+
+    /// Last updated timestamp (Unix seconds).
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: Option<i64>,
 }
 
 /// Media container info for a track.

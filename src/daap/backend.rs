@@ -121,6 +121,13 @@ impl DaapBackend {
             let bitrate = dmap::find_u16(nodes, b"asbr");
             let sample_rate = dmap::find_u32(nodes, b"assr");
 
+            // DAAP date modified: seconds since 2001-01-01 00:00:00 UTC.
+            // Convert to DateTime<Utc> by adding the DAAP epoch offset
+            // (978307200 = seconds between Unix epoch and 2001-01-01).
+            let date_modified = dmap::find_u32(nodes, b"asdm").and_then(|daap_secs| {
+                chrono::DateTime::from_timestamp(i64::from(daap_secs) + 978_307_200, 0)
+            });
+
             let track_uuid = deterministic_uuid(daap_id);
             let artist_uuid = deterministic_uuid_from_name(&artist_name);
             let album_uuid = deterministic_uuid_from_name(&album_title);
@@ -145,7 +152,7 @@ impl DaapBackend {
                 stream_url: Some(stream_url),
                 cover_art_url: None,
                 date_added: None,
-                date_modified: None,
+                date_modified,
                 bitrate_kbps: bitrate.map(u32::from),
                 sample_rate_hz: sample_rate,
                 format: Some(format),

@@ -162,7 +162,7 @@ impl JellyfinBackend {
                     &items_endpoint,
                     &lib.id,
                     "Audio",
-                    "MediaSources,Genres,UserData",
+                    "MediaSources,Genres,UserData,DateCreated",
                 )
                 .await?;
 
@@ -565,7 +565,11 @@ fn jellyfin_item_to_track(
         stream_url: Some(stream_url),
         cover_art_url,
         date_added: None,
-        date_modified: None,
+        date_modified: item.date_created.as_deref().and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        }),
         bitrate_kbps,
         sample_rate_hz,
         format: item.container.clone(),

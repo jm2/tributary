@@ -36,6 +36,35 @@ use tracing::info;
 const APP_ID: &str = "io.github.tributary.Tributary";
 
 fn main() {
+    // ── Windows: attach to parent console ────────────────────────────
+    // The `windows_subsystem = "windows"` attribute prevents a console
+    // window from popping up when double-clicking the exe.  However,
+    // when launched from a terminal (PowerShell, cmd), we want log
+    // output to appear there.  `AttachConsole(ATTACH_PARENT_PROCESS)`
+    // re-attaches to the launching terminal if one exists; it silently
+    // fails when launched from Explorer (no parent console).
+    #[cfg(target_os = "windows")]
+    {
+        extern "system" {
+            fn AttachConsole(dw_process_id: u32) -> i32;
+        }
+        const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+
+        // GTK4 on Windows defaults to the Cairo software renderer which
+        // makes libadwaita animations (dialog slide-in, fade, blur)
+        // extremely laggy.  Request the Vulkan renderer instead — GTK4
+        // will automatically fall back through ngl → gl → cairo if
+        // Vulkan is unavailable.  Only override if the user hasn't
+        // already set GSK_RENDERER (so power users can still force a
+        // specific renderer).
+        if std::env::var_os("GSK_RENDERER").is_none() {
+            std::env::set_var("GSK_RENDERER", "vulkan");
+        }
+    }
+
     // ── macOS .app bundle environment setup ──────────────────────────
     // When launched from a .app bundle (e.g. Finder / Launchpad), the
     // working directory is unpredictable and LSEnvironment relative
@@ -87,35 +116,19 @@ fn main() {
         .activate(|app: &adw::Application, _, _| app.quit())
         .build();
 
-    // Register the app icon from the bundled PNG so it appears in the
-    // About dialog and window decorations even when the system icon
-    // theme doesn't include it.
-    {
-        let display = gtk::gdk::Display::default().expect("Could not get default display");
-        let icon_theme = gtk::IconTheme::for_display(&display);
-        // Add the project's data/ directory (contains tributary.png) as
-        // a search path.  At runtime the exe is in target/…/tributary,
-        // so we resolve relative to the source tree or installed prefix.
-        if let Ok(exe) = std::env::current_exe() {
-            // Development: <repo>/target/release/tributary → <repo>/data
-            if let Some(repo) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
-                let data_dir = repo.join("data");
-                if data_dir.is_dir() {
-                    icon_theme.add_search_path(&data_dir);
-                }
-            }
-            // Installed / bundled: exe next to data/ or share/icons
-            if let Some(dir) = exe.parent() {
-                let data_dir = dir.join("data");
-                if data_dir.is_dir() {
-                    icon_theme.add_search_path(&data_dir);
-                }
-            }
-        }
-    }
+    // Register the app icon search path inside connect_activate,
+    // after GTK has initialised the display.  We store the exe path
+    // now so the closure can use it later.
+    let exe_path = std::env::current_exe().ok();
 
     let about_action = gio::ActionEntry::builder("about")
         .activate(|app: &adw::Application, _, _| {
+            // Build the license text with copyright header + full GPL v3.
+            let license_text = format!(
+                "Copyright © 2026 John-Michael Mulesa\n\n{}",
+                include_str!("../LICENSE")
+            );
+
             let about = adw::AboutDialog::builder()
                 .application_name("Tributary")
                 .application_icon("tributary")
@@ -124,7 +137,7 @@ fn main() {
                 .website("https://github.com/jm2/tributary")
                 .issue_url("https://github.com/jm2/tributary/issues")
                 .copyright("© 2026 John-Michael Mulesa")
-                .license_type(gtk::License::Gpl30)
+                .license(license_text)
                 .build();
 
             if let Some(win) = app.active_window() {
@@ -145,6 +158,31 @@ fn main() {
     app.set_accels_for_action("app.quit", &["<primary>q"]);
 
     app.connect_activate(move |app| {
+        // Register the app icon search path now that GTK has a display.
+        if let Some(ref exe) = exe_path {
+            if let Some(display) = gtk::gdk::Display::default() {
+                let icon_theme = gtk::IconTheme::for_display(&display);
+                // Development: <repo>/target/release/tributary → <repo>/data
+                if let Some(repo) = exe
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                {
+                    let data_dir = repo.join("data");
+                    if data_dir.is_dir() {
+                        icon_theme.add_search_path(&data_dir);
+                    }
+                }
+                // Installed / bundled: exe next to data/
+                if let Some(dir) = exe.parent() {
+                    let data_dir = dir.join("data");
+                    if data_dir.is_dir() {
+                        icon_theme.add_search_path(&data_dir);
+                    }
+                }
+            }
+        }
+
         ui::window::build_window(app, rt_handle.clone(), engine_tx.clone(), engine_rx.clone());
     });
 

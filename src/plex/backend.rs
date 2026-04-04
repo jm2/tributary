@@ -469,7 +469,9 @@ fn plex_track_to_track(
         stream_url,
         cover_art_url,
         date_added: None,
-        date_modified: None,
+        date_modified: plex
+            .updated_at
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
         bitrate_kbps,
         sample_rate_hz: None, // Not available in Plex track metadata.
         format,

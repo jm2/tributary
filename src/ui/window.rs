@@ -1744,7 +1744,7 @@ fn restore_sort_state(column_view: &gtk::ColumnView) {
 // ── Sidebar category management ─────────────────────────────────────
 
 /// The fixed ordering of sidebar category headers.
-const CATEGORY_ORDER: &[&str] = &["Local", "Subsonic", "Jellyfin", "Plex", "DAAP"];
+const CATEGORY_ORDER: &[&str] = &["Local", "DAAP", "Subsonic", "Jellyfin", "Plex"];
 
 /// Map a backend type string to its sidebar category header name.
 fn category_for_backend(backend_type: &str) -> &'static str {

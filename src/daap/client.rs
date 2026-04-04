@@ -34,7 +34,8 @@ const DMAP_CONTENT_TYPE: &str = "application/x-dmap-tagged";
 /// The `meta` query parameter requesting the fields Tributary needs.
 const TRACK_META: &str = "dmap.itemid,dmap.itemname,daap.songartist,daap.songalbum,\
 daap.songtime,daap.songtracknumber,daap.songdiscnumber,daap.songgenre,\
-daap.songyear,daap.songformat,daap.songbitrate,daap.songsamplerate";
+daap.songyear,daap.songformat,daap.songbitrate,daap.songsamplerate,\
+daap.songdatemodified";
 
 /// Holds DAAP session state and a reusable `reqwest::Client`.
 pub struct DaapClient {

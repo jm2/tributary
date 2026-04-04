@@ -156,6 +156,10 @@ pub struct JellyfinItem {
     #[serde(rename = "ImageTags", default)]
     pub image_tags: Option<serde_json::Value>,
 
+    /// Date the item was created on the server (ISO 8601).
+    #[serde(rename = "DateCreated", default)]
+    pub date_created: Option<String>,
+
     // ── Artist fields ───────────────────────────────────────────────
     /// Number of albums (for artist items).
     #[serde(rename = "AlbumCount", default)]
