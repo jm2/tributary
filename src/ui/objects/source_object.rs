@@ -31,6 +31,10 @@ mod imp {
         /// Whether this server requires a password to connect.
         /// `true` = password required (default), `false` = open/passwordless.
         pub requires_password: Cell<bool>,
+        /// Whether this server was manually added by the user (persisted in
+        /// `servers.json`). Manually-added servers are never auto-removed by
+        /// discovery refresh and show a trash/delete button in the sidebar.
+        pub manually_added: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -134,5 +138,24 @@ impl SourceObject {
 
     pub fn set_requires_password(&self, val: bool) {
         self.imp().requires_password.set(val);
+    }
+
+    pub fn manually_added(&self) -> bool {
+        self.imp().manually_added.get()
+    }
+
+    pub fn set_manually_added(&self, val: bool) {
+        self.imp().manually_added.set(val);
+    }
+
+    /// Create a manually-added (unauthenticated) remote server row.
+    ///
+    /// Similar to `discovered()` but sets `manually_added = true` so the
+    /// server is never auto-removed by discovery refresh and shows a
+    /// trash/delete button in the sidebar.
+    pub fn manual(name: &str, backend_type: &str, server_url: &str) -> Self {
+        let obj = Self::discovered(name, backend_type, server_url);
+        obj.imp().manually_added.set(true);
+        obj
     }
 }

@@ -55,10 +55,24 @@ pub fn build_window(
 
     // ── Sidebar sources ────────────────────────────────────────────────
     let sources = super::dummy_data::build_sources();
+    let mut sources = sources;
+
+    // Load manually-added servers from servers.json.
+    let saved_servers = load_saved_servers();
+    for entry in &saved_servers {
+        ensure_category_header_vec(&mut sources, &entry.server_type);
+        let src = SourceObject::manual(&entry.name, &entry.server_type, &entry.url);
+        sources.push(src);
+        info!(
+            name = %entry.name,
+            url = %entry.url,
+            backend = %entry.server_type,
+            "Loaded saved server from servers.json"
+        );
+    }
 
     // If env vars are set, add pre-configured remote server entries
     // under their respective category headers.
-    let mut sources = sources;
     if let (Ok(url), Ok(_user), Ok(_pass)) = (
         std::env::var("SUBSONIC_URL"),
         std::env::var("SUBSONIC_USER"),
@@ -121,7 +135,7 @@ pub fn build_window(
     }
 
     // ── Sidebar ──────────────────────────────────────────────────────
-    let (sidebar_widget, sidebar_store, sidebar_selection, disconnect_rx) =
+    let (sidebar_widget, sidebar_store, sidebar_selection, disconnect_rx, delete_rx, add_button) =
         sidebar::build_sidebar(&sources);
 
     // ── Tracklist (starts empty — populated by FullSync) ──────────────
@@ -475,6 +489,10 @@ pub fn build_window(
                         for i in 0..store.n_items() {
                             if let Some(src) = store.item(i).and_downcast_ref::<SourceObject>() {
                                 if src.server_url() == url {
+                                    // Never auto-remove manually-added servers.
+                                    if src.manually_added() {
+                                        break;
+                                    }
                                     // If connected and still the active source,
                                     // switch to local before removing.
                                     let was_active =
@@ -517,6 +535,74 @@ pub fn build_window(
                             }
                         }
                     }
+                }
+            }
+        });
+    }
+
+    // ── Wire "+" add-server button ──────────────────────────────────
+    {
+        let win = window.clone();
+        let store = sidebar_store.clone();
+        let engine_tx = engine_tx.clone();
+        let rt_handle = rt_handle.clone();
+        add_button.connect_clicked(move |_| {
+            show_add_server_dialog(&win, &store, &engine_tx, &rt_handle);
+        });
+    }
+
+    // ── Manual server delete (trash) handler ────────────────────────
+    {
+        let sidebar_store = sidebar_store.clone();
+        let sidebar_selection = sidebar_selection.clone();
+        let source_tracks = source_tracks.clone();
+        let active_source_key = active_source_key.clone();
+        let track_store = track_store.clone();
+        let master_tracks = master_tracks.clone();
+        let browser_widget = browser_widget.clone();
+        let browser_state = browser_state.clone();
+        let status_label = status_label.clone();
+        let column_view = column_view.clone();
+
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(source_key) = delete_rx.recv().await {
+                info!(source = %source_key, "Manual server delete requested");
+
+                // Remove from servers.json.
+                remove_saved_server(&source_key);
+
+                // Remove from source_tracks map.
+                source_tracks.borrow_mut().remove(&source_key);
+
+                // Remove from sidebar.
+                for i in 0..sidebar_store.n_items() {
+                    if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
+                        if src.server_url() == source_key {
+                            let backend = src.backend_type();
+                            sidebar_store.remove(i);
+                            let category = category_for_backend(&backend);
+                            remove_empty_category_header(&sidebar_store, category);
+                            break;
+                        }
+                    }
+                }
+
+                // If this was the active source, switch to "local".
+                if *active_source_key.borrow() == source_key {
+                    *active_source_key.borrow_mut() = "local".to_string();
+                    sidebar_selection.set_selected(1);
+
+                    let st = source_tracks.borrow();
+                    let local_tracks = st.get("local").cloned().unwrap_or_default();
+                    display_tracks(
+                        &local_tracks,
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
                 }
             }
         });
@@ -2074,6 +2160,291 @@ fn show_auth_dialog(
                 }
             }
         }
+    });
+
+    dialog.present(Some(window));
+}
+
+// ── Manual server persistence (servers.json) ────────────────────────
+
+use serde::{Deserialize, Serialize};
+
+/// A saved server entry in `servers.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedServer {
+    /// Backend type: `"subsonic"`, `"jellyfin"`, or `"plex"`.
+    #[serde(rename = "type")]
+    server_type: String,
+    /// Human-readable display name.
+    name: String,
+    /// Server URL.
+    url: String,
+}
+
+/// Path to `servers.json`: `<data_dir>/tributary/servers.json`.
+fn servers_json_path() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| d.join("tributary").join("servers.json"))
+}
+
+/// Load saved servers from `servers.json`, returning an empty vec on error.
+fn load_saved_servers() -> Vec<SavedServer> {
+    servers_json_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Save the list of servers to `servers.json`.
+fn save_servers(servers: &[SavedServer]) {
+    if let Some(path) = servers_json_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(servers) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+/// Add a server to `servers.json` (dedup by URL).
+fn add_saved_server(server_type: &str, name: &str, url: &str) {
+    let mut servers = load_saved_servers();
+    if !servers.iter().any(|s| s.url == url) {
+        servers.push(SavedServer {
+            server_type: server_type.to_string(),
+            name: name.to_string(),
+            url: url.to_string(),
+        });
+        save_servers(&servers);
+        info!(url = %url, "Server added to servers.json");
+    }
+}
+
+/// Remove a server from `servers.json` by URL.
+fn remove_saved_server(url: &str) {
+    let mut servers = load_saved_servers();
+    let before = servers.len();
+    servers.retain(|s| s.url != url);
+    if servers.len() != before {
+        save_servers(&servers);
+        info!(url = %url, "Server removed from servers.json");
+    }
+}
+
+/// Present the "Add Server" dialog.
+///
+/// Server type dropdown: Subsonic, Jellyfin, Plex (no DAAP).
+/// Fields: URL, Username, Password.
+/// On "Connect": adds to sidebar + servers.json, then triggers auth.
+fn show_add_server_dialog(
+    window: &adw::ApplicationWindow,
+    sidebar_store: &gtk::gio::ListStore,
+    engine_tx: &async_channel::Sender<LibraryEvent>,
+    rt_handle: &tokio::runtime::Handle,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Add Server")
+        .body("Enter the server details to connect.")
+        .close_response("cancel")
+        .default_response("connect")
+        .build();
+
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("connect", "Connect");
+    dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
+
+    // ── Server type dropdown ─────────────────────────────────────────
+    let type_model = gtk::StringList::new(&["Subsonic", "Jellyfin", "Plex"]);
+    let type_dropdown = gtk::DropDown::builder()
+        .model(&type_model)
+        .selected(0)
+        .build();
+
+    let url_entry = gtk::Entry::builder()
+        .placeholder_text("https://music.example.com")
+        .activates_default(true)
+        .build();
+
+    let user_entry = gtk::Entry::builder()
+        .placeholder_text("Username")
+        .activates_default(true)
+        .build();
+
+    let pass_entry = gtk::PasswordEntry::builder()
+        .placeholder_text("Password")
+        .show_peek_icon(true)
+        .activates_default(true)
+        .build();
+
+    let vbox = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(8)
+        .build();
+    vbox.append(&type_dropdown);
+    vbox.append(&url_entry);
+    vbox.append(&user_entry);
+    vbox.append(&pass_entry);
+
+    dialog.set_extra_child(Some(&vbox));
+
+    let store = sidebar_store.clone();
+    let engine_tx = engine_tx.clone();
+    let rt_handle = rt_handle.clone();
+
+    let url_entry_c = url_entry.clone();
+    let user_entry_c = user_entry.clone();
+    let pass_entry_c = pass_entry.clone();
+    let type_dropdown_c = type_dropdown.clone();
+
+    dialog.connect_response(None, move |_dialog, response| {
+        if response != "connect" {
+            return;
+        }
+
+        let url = url_entry_c.text().to_string().trim().to_string();
+        let user = user_entry_c.text().to_string();
+        let pass = pass_entry_c.text().to_string();
+
+        if url.is_empty() || user.is_empty() || pass.is_empty() {
+            return;
+        }
+
+        let backend_type = match type_dropdown_c.selected() {
+            1 => "jellyfin",
+            2 => "plex",
+            _ => "subsonic",
+        };
+
+        // Derive a display name from the URL host.
+        let display_name = url::Url::parse(&url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_else(|| url.clone());
+
+        // Persist to servers.json (type, name, url — no credentials).
+        add_saved_server(backend_type, &display_name, &url);
+
+        // Add to sidebar as a manual server.
+        let insert_pos = ensure_category_header_store(&store, backend_type);
+        let src = SourceObject::manual(&display_name, backend_type, &url);
+        src.set_connecting(true);
+        store.insert(insert_pos, &src);
+
+        // One-shot to clear spinner on failure.
+        let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
+        let store_for_fail = store.clone();
+        let url_for_fail = url.clone();
+        glib::MainContext::default().spawn_local(async move {
+            if fail_rx.recv().await.is_ok() {
+                for i in 0..store_for_fail.n_items() {
+                    if let Some(src) = store_for_fail.item(i).and_downcast_ref::<SourceObject>() {
+                        if src.server_url() == url_for_fail {
+                            src.set_connecting(false);
+                            let src = src.clone();
+                            store_for_fail.remove(i);
+                            store_for_fail.insert(i, &src);
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Spawn auth + fetch on tokio.
+        let engine_tx = engine_tx.clone();
+        let server_url = url.clone();
+        let server_name = display_name.clone();
+        let backend_type = backend_type.to_string();
+
+        rt_handle.spawn(async move {
+            let result: Result<
+                Vec<crate::architecture::models::Track>,
+                crate::architecture::error::BackendError,
+            > = match backend_type.as_str() {
+                "jellyfin" => {
+                    info!(server = %server_url, "Authenticating with Jellyfin (manual)...");
+                    match crate::jellyfin::client::JellyfinClient::authenticate(
+                        &server_url,
+                        &user,
+                        &pass,
+                    )
+                    .await
+                    {
+                        Ok(client) => {
+                            match crate::jellyfin::JellyfinBackend::from_client(
+                                &server_name,
+                                client,
+                            )
+                            .await
+                            {
+                                Ok(backend) => Ok(backend.all_tracks().await),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                "plex" => {
+                    info!(server = %server_url, "Authenticating with Plex (manual)...");
+                    match crate::plex::client::PlexClient::authenticate(&server_url, &user, &pass)
+                        .await
+                    {
+                        Ok(client) => {
+                            match crate::plex::PlexBackend::from_client(&server_name, client).await
+                            {
+                                Ok(backend) => Ok(backend.all_tracks().await),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                _ => {
+                    info!(server = %server_url, "Authenticating with Subsonic (manual)...");
+                    match crate::subsonic::SubsonicBackend::connect(
+                        &server_name,
+                        &server_url,
+                        &user,
+                        &pass,
+                    )
+                    .await
+                    {
+                        Ok(backend) => Ok(backend.all_tracks().await),
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+
+            match result {
+                Ok(tracks) => {
+                    info!(
+                        backend = %backend_type,
+                        count = tracks.len(),
+                        "Manual server library fetched"
+                    );
+                    let _ = engine_tx
+                        .send(LibraryEvent::RemoteSync {
+                            source_key: server_url,
+                            tracks,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        backend = %backend_type,
+                        error = %e,
+                        "Manual server auth failed"
+                    );
+                    let _ = engine_tx
+                        .send(LibraryEvent::Error(format!(
+                            "{backend_type} auth failed: {e}"
+                        )))
+                        .await;
+                    let _ = fail_tx.send(()).await;
+                }
+            }
+        });
     });
 
     dialog.present(Some(window));

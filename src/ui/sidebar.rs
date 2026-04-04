@@ -4,6 +4,7 @@
 //! mutated at runtime (e.g., to add mDNS-discovered servers).
 //!
 //! DAAP sources get a monochrome eject button for disconnecting.
+//! Manually-added servers get a trash button for removal.
 
 use gtk::gio;
 use gtk::prelude::*;
@@ -13,16 +14,22 @@ use tracing::info;
 
 /// Build the source sidebar.
 ///
-/// Returns `(ScrolledWindow, ListStore, SingleSelection, disconnect_rx)`.
-/// The `disconnect_rx` emits the `server_url` of a DAAP source when the
-/// user clicks its eject button.
+/// Returns `(sidebar_box, ListStore, SingleSelection, disconnect_rx, delete_rx, add_button)`.
+///
+/// * `disconnect_rx` emits the `server_url` of a DAAP source when the
+///   user clicks its eject button.
+/// * `delete_rx` emits the `server_url` of a manually-added source when
+///   the user clicks its trash button.
+/// * `add_button` is the `+` button for adding manual servers (wired in `window.rs`).
 pub fn build_sidebar(
     initial_sources: &[SourceObject],
 ) -> (
-    gtk::ScrolledWindow,
+    gtk::Box,
     gio::ListStore,
     gtk::SingleSelection,
     async_channel::Receiver<String>,
+    async_channel::Receiver<String>,
+    gtk::Button,
 ) {
     let store = gio::ListStore::new::<SourceObject>();
     for src in initial_sources {
@@ -37,6 +44,8 @@ pub fn build_sidebar(
 
     // Channel for DAAP disconnect (eject) requests.
     let (disconnect_tx, disconnect_rx) = async_channel::unbounded::<String>();
+    // Channel for manual server delete (trash) requests.
+    let (delete_tx, delete_rx) = async_channel::unbounded::<String>();
 
     let factory = gtk::SignalListItemFactory::new();
 
@@ -65,22 +74,22 @@ pub fn build_sidebar(
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
-        let eject_btn = gtk::Button::builder()
-            .icon_name("media-eject-symbolic")
+        // Action button: eject (DAAP) or trash (manual) — reused widget.
+        let action_btn = gtk::Button::builder()
             .css_classes(["flat", "circular"])
-            .tooltip_text("Disconnect")
             .visible(false)
             .build();
 
         row_box.append(&icon);
         row_box.append(&spinner);
         row_box.append(&label);
-        row_box.append(&eject_btn);
+        row_box.append(&action_btn);
         list_item.set_child(Some(&row_box));
     });
 
     {
         let disconnect_tx = disconnect_tx.clone();
+        let delete_tx = delete_tx.clone();
         factory.connect_bind(move |_, list_item| {
             let list_item = list_item
                 .downcast_ref::<gtk::ListItem>()
@@ -106,7 +115,7 @@ pub fn build_sidebar(
                 .next_sibling()
                 .and_downcast::<gtk::Label>()
                 .expect("Label expected");
-            let eject_btn = label
+            let action_btn = label
                 .next_sibling()
                 .and_downcast::<gtk::Button>()
                 .expect("Button expected");
@@ -114,7 +123,7 @@ pub fn build_sidebar(
             if obj.is_header() {
                 icon.set_visible(false);
                 spinner.set_visible(false);
-                eject_btn.set_visible(false);
+                action_btn.set_visible(false);
                 label.set_text(&obj.name());
                 label.add_css_class("heading");
                 label.add_css_class("dim-label");
@@ -134,10 +143,10 @@ pub fn build_sidebar(
                     // Auth in progress — show spinner instead of icon.
                     icon.set_visible(false);
                     spinner.set_visible(true);
-                    eject_btn.set_visible(false);
+                    action_btn.set_visible(false);
                     label.add_css_class("dim-label");
                 } else if !obj.connected() && !obj.server_url().is_empty() {
-                    // Discovered but not yet authenticated.
+                    // Discovered/manual but not yet authenticated.
                     icon.set_visible(true);
                     if obj.requires_password() {
                         // Password-protected — show lock icon.
@@ -149,7 +158,20 @@ pub fn build_sidebar(
                         label.remove_css_class("dim-label");
                     }
                     spinner.set_visible(false);
-                    eject_btn.set_visible(false);
+
+                    // Show trash button for manually-added (disconnected) servers.
+                    if obj.manually_added() {
+                        action_btn.set_icon_name("user-trash-symbolic");
+                        action_btn.set_tooltip_text(Some("Remove server"));
+                        action_btn.set_visible(true);
+                        let tx = delete_tx.clone();
+                        let source_key = obj.server_url();
+                        action_btn.connect_clicked(move |_| {
+                            let _ = tx.try_send(source_key.clone());
+                        });
+                    } else {
+                        action_btn.set_visible(false);
+                    }
                 } else {
                     // Connected or local source — normal icon.
                     icon.set_visible(true);
@@ -157,23 +179,35 @@ pub fn build_sidebar(
                     spinner.set_visible(false);
                     label.remove_css_class("dim-label");
 
-                    // Show eject button only for connected DAAP sources.
                     if obj.backend_type() == "daap" && obj.connected() {
-                        eject_btn.set_visible(true);
+                        // Show eject button for connected DAAP sources.
+                        action_btn.set_icon_name("media-eject-symbolic");
+                        action_btn.set_tooltip_text(Some("Disconnect"));
+                        action_btn.set_visible(true);
                         let tx = disconnect_tx.clone();
                         let source_key = obj.server_url();
-                        eject_btn.connect_clicked(move |_| {
+                        action_btn.connect_clicked(move |_| {
+                            let _ = tx.try_send(source_key.clone());
+                        });
+                    } else if obj.manually_added() && obj.connected() {
+                        // Show trash button for connected manually-added servers.
+                        action_btn.set_icon_name("user-trash-symbolic");
+                        action_btn.set_tooltip_text(Some("Remove server"));
+                        action_btn.set_visible(true);
+                        let tx = delete_tx.clone();
+                        let source_key = obj.server_url();
+                        action_btn.connect_clicked(move |_| {
                             let _ = tx.try_send(source_key.clone());
                         });
                     } else {
-                        eject_btn.set_visible(false);
+                        action_btn.set_visible(false);
                     }
                 }
             }
         });
     }
 
-    // Unbind: hide the eject button to prevent signal accumulation
+    // Unbind: hide the action button to prevent signal accumulation
     // when list items are recycled.
     factory.connect_unbind(|_, list_item| {
         let list_item = list_item
@@ -214,7 +248,36 @@ pub fn build_sidebar(
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .width_request(180)
+        .vexpand(true)
         .build();
 
-    (scrolled, store, selection, disconnect_rx)
+    // ── Toolbar with + button above the list ────────────────────────
+    let add_button = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .css_classes(["flat"])
+        .tooltip_text("Add server")
+        .build();
+
+    let toolbar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .css_classes(["toolbar"])
+        .build();
+    toolbar.append(&add_button);
+
+    // Wrap scrolled + toolbar in a vertical box.
+    let sidebar_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .width_request(180)
+        .build();
+    sidebar_box.append(&scrolled);
+    sidebar_box.append(&toolbar);
+
+    (
+        sidebar_box,
+        store,
+        selection,
+        disconnect_rx,
+        delete_rx,
+        add_button,
+    )
 }
