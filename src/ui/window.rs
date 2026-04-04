@@ -2311,11 +2311,15 @@ fn apply_radio_columns(column_view: &gtk::ColumnView, radio: bool) {
         if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
             if let Some(title) = col.title() {
                 let title_str = title.to_string();
+                // Match on both "Artist" and "Country" since the column
+                // may already be renamed from a previous radio selection.
                 if radio {
-                    col.set_visible(RADIO_VISIBLE_COLUMNS.contains(&title_str.as_str()));
-                    // Rename "Artist" → "Country" for radio view.
-                    if title_str == "Artist" {
+                    let is_artist_col = title_str == "Artist" || title_str == "Country";
+                    if is_artist_col {
+                        col.set_visible(true);
                         col.set_title(Some("Country"));
+                    } else {
+                        col.set_visible(RADIO_VISIBLE_COLUMNS.contains(&title_str.as_str()));
                     }
                 } else {
                     // Restore all — the caller will apply user prefs after.
