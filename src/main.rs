@@ -123,12 +123,6 @@ fn main() {
 
     let about_action = gio::ActionEntry::builder("about")
         .activate(|app: &adw::Application, _, _| {
-            // Build the license text with copyright header + full GPL v3.
-            let license_text = format!(
-                "Copyright © 2026 John-Michael Mulesa\n\n{}",
-                include_str!("../LICENSE")
-            );
-
             let about = adw::AboutDialog::builder()
                 .application_name("Tributary")
                 .application_icon("tributary")
@@ -138,7 +132,6 @@ fn main() {
                 .issue_url("https://github.com/jm2/tributary/issues")
                 .copyright("© 2026 John-Michael Mulesa")
                 .license_type(gtk::License::Gpl30)
-                .license(license_text)
                 .build();
 
             if let Some(win) = app.active_window() {
@@ -147,17 +140,7 @@ fn main() {
         })
         .build();
 
-    let preferences_action = gio::ActionEntry::builder("preferences")
-        .activate(|app: &adw::Application, _, _| {
-            // Forward to the window-level action that has access to
-            // the ColumnView and browser widgets.
-            if let Some(win) = app.active_window() {
-                let _ = win.activate_action("show-preferences", None);
-            }
-        })
-        .build();
-
-    app.add_action_entries([quit_action, about_action, preferences_action]);
+    app.add_action_entries([quit_action, about_action]);
     // <primary> = Cmd on macOS, Ctrl on Linux/Windows.
     app.set_accels_for_action("app.quit", &["<primary>q"]);
 
