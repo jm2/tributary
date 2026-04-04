@@ -254,3 +254,29 @@ jobs:
           name: tributary-flatpak
           path: tributary.flatpak
           if-no-files-found: error
+
+  # ── SHA256 Checksums ───────────────────────────────────────────────────────
+  checksums:
+    name: SHA256 Checksums
+    runs-on: ubuntu-24.04
+    needs: [build-linux, build-macos, build-windows, build-flatpak]
+    if: always()
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          find . -type f \( -name '*.zip' -o -name '*.dmg' -o -name '*.flatpak' -o -name 'tributary' \) \
+            -exec sha256sum {} + | sed 's|  \./|  |' | sort -k2 > ../SHA256SUMS.txt
+          cat ../SHA256SUMS.txt
+
+      - name: Upload SHA256SUMS
+        uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: SHA256SUMS.txt
+          if-no-files-found: warn

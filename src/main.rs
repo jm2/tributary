@@ -86,7 +86,61 @@ fn main() {
     let quit_action = gio::ActionEntry::builder("quit")
         .activate(|app: &adw::Application, _, _| app.quit())
         .build();
-    app.add_action_entries([quit_action]);
+
+    // Register the app icon from the bundled PNG so it appears in the
+    // About dialog and window decorations even when the system icon
+    // theme doesn't include it.
+    {
+        let display = gtk::gdk::Display::default().expect("Could not get default display");
+        let icon_theme = gtk::IconTheme::for_display(&display);
+        // Add the project's data/ directory (contains tributary.png) as
+        // a search path.  At runtime the exe is in target/…/tributary,
+        // so we resolve relative to the source tree or installed prefix.
+        if let Ok(exe) = std::env::current_exe() {
+            // Development: <repo>/target/release/tributary → <repo>/data
+            if let Some(repo) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+                let data_dir = repo.join("data");
+                if data_dir.is_dir() {
+                    icon_theme.add_search_path(&data_dir);
+                }
+            }
+            // Installed / bundled: exe next to data/ or share/icons
+            if let Some(dir) = exe.parent() {
+                let data_dir = dir.join("data");
+                if data_dir.is_dir() {
+                    icon_theme.add_search_path(&data_dir);
+                }
+            }
+        }
+    }
+
+    let about_action = gio::ActionEntry::builder("about")
+        .activate(|app: &adw::Application, _, _| {
+            let about = adw::AboutDialog::builder()
+                .application_name("Tributary")
+                .application_icon("tributary")
+                .developer_name("John-Michael Mulesa")
+                .version(env!("CARGO_PKG_VERSION"))
+                .website("https://github.com/jm2/tributary")
+                .issue_url("https://github.com/jm2/tributary/issues")
+                .copyright("© 2026 John-Michael Mulesa")
+                .license_type(gtk::License::Gpl30)
+                .build();
+
+            if let Some(win) = app.active_window() {
+                about.present(Some(&win));
+            }
+        })
+        .build();
+
+    let preferences_action = gio::ActionEntry::builder("preferences")
+        .activate(|_app: &adw::Application, _, _| {
+            // TODO: open preferences window (item 6)
+            tracing::info!("Preferences action triggered (not yet implemented)");
+        })
+        .build();
+
+    app.add_action_entries([quit_action, about_action, preferences_action]);
     // <primary> = Cmd on macOS, Ctrl on Linux/Windows.
     app.set_accels_for_action("app.quit", &["<primary>q"]);
 

@@ -1073,13 +1073,15 @@ pub fn build_window(
             .build();
 
         // Debounce: only show the spinner if buffering persists for
-        // longer than this threshold.  For local files the pipeline
-        // typically reaches Playing in < 20 ms, so the spinner would
-        // just blink distractingly without the delay.
-        const BUFFERING_DELAY_MS: u32 = 100;
+        // longer than this threshold.  Increased from 100 ms to 300 ms
+        // to prevent sub-100 ms blinking on fast-loading local files.
+        const BUFFERING_DELAY_MS: u32 = 300;
         // Generation counter — incremented on every state change so
         // a stale timeout callback can detect it was superseded.
         let buffering_gen: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+        // Track whether we are in a buffering state so that
+        // PositionChanged can clear the spinner definitively.
+        let is_buffering: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = player_rx.recv().await {
@@ -1092,6 +1094,7 @@ pub fn build_window(
 
                         match state {
                             PlayerState::Buffering => {
+                                is_buffering.set(true);
                                 // Schedule the spinner after a short
                                 // delay — if Playing arrives first the
                                 // generation will have changed and the
@@ -1109,11 +1112,13 @@ pub fn build_window(
                                 );
                             }
                             PlayerState::Playing => {
+                                is_buffering.set(false);
                                 // Restore icon: show pause.
                                 play_btn.set_child(Option::<&gtk::Widget>::None);
                                 play_btn.set_icon_name("media-playback-pause-symbolic");
                             }
                             _ => {
+                                is_buffering.set(false);
                                 // Stopped or Paused: show play.
                                 play_btn.set_child(Option::<&gtk::Widget>::None);
                                 play_btn.set_icon_name("media-playback-start-symbolic");
@@ -1129,6 +1134,24 @@ pub fn build_window(
                         position_ms,
                         duration_ms,
                     } => {
+                        // If we receive a position tick while still in
+                        // the buffering state, audio is actually playing
+                        // — clear the spinner definitively.  This is the
+                        // sure-fire fix for remote streams where GStreamer
+                        // never sends a clean Playing state change after
+                        // buffering completes.
+                        if is_buffering.get() {
+                            is_buffering.set(false);
+                            let gen = buffering_gen.get().wrapping_add(1);
+                            buffering_gen.set(gen);
+                            play_btn.set_child(Option::<&gtk::Widget>::None);
+                            play_btn.set_icon_name("media-playback-pause-symbolic");
+
+                            if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                                ctrl.update_playback(true);
+                            }
+                        }
+
                         seeking.set(true);
                         progress_adj.set_upper(duration_ms as f64);
                         progress_adj.set_value(position_ms as f64);
@@ -1721,13 +1744,14 @@ fn restore_sort_state(column_view: &gtk::ColumnView) {
 // ── Sidebar category management ─────────────────────────────────────
 
 /// The fixed ordering of sidebar category headers.
-const CATEGORY_ORDER: &[&str] = &["Local", "Subsonic", "Jellyfin / Plex", "DAAP"];
+const CATEGORY_ORDER: &[&str] = &["Local", "Subsonic", "Jellyfin", "Plex", "DAAP"];
 
 /// Map a backend type string to its sidebar category header name.
 fn category_for_backend(backend_type: &str) -> &'static str {
     match backend_type {
         "subsonic" => "Subsonic",
-        "jellyfin" | "plex" => "Jellyfin / Plex",
+        "jellyfin" => "Jellyfin",
+        "plex" => "Plex",
         "daap" => "DAAP",
         _ => "Subsonic", // fallback
     }
