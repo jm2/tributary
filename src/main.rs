@@ -22,6 +22,7 @@ mod local;
 mod platform;
 #[allow(dead_code)]
 mod plex;
+mod radio;
 mod subsonic;
 mod ui;
 

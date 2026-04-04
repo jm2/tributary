@@ -7,7 +7,7 @@
 
 A high-performance, **Rhythmbox-style** media manager written in pure Rust with **GTK4** and **libadwaita**.
 
-Tributary provides a unified interface for managing and streaming music from multiple sources — local files, Subsonic/Navidrome, Jellyfin, Plex, and DAAP/iTunes shares — all through a single, responsive library view.
+Tributary provides a unified interface for managing and streaming music from multiple sources — local files, Subsonic/Navidrome, Jellyfin, Plex, DAAP/iTunes shares, and internet radio — all through a single, responsive library view.
 
 ## Features
 
@@ -31,6 +31,10 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Jellyfin UDP broadcast discovery | ✅ |
 | DAAP sidebar eject button (disconnect) | ✅ |
 | Password-only auth dialog (DAAP) | ✅ |
+| Regular discovery refresh (add/remove servers dynamically) | ✅ |
+| Manual server addition/deletion with `servers.json` persistence | ✅ |
+| Internet Radio (Top Clicked, Top Voted, Stations Near Me) | ✅ |
+| Geo-located radio stations with HTTPS geolocation consent | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
@@ -262,6 +266,10 @@ src/
 │   ├── dmap.rs             # DMAP binary TLV parser (nom-based, 24 tag types)
 │   ├── client.rs           # HTTP client (5-step session handshake)
 │   └── backend.rs          # MediaBackend impl (in-memory cache)
+├── radio/
+│   ├── mod.rs              # Internet Radio module root
+│   ├── api.rs              # RadioStation + GeoLocation serde types
+│   └── client.rs           # Radio-Browser API client (DNS mirror, geolocation)
 ├── platform/
 │   └── mod.rs              # OS-specific abstractions
 └── ui/

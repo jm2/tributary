@@ -589,6 +589,15 @@ pub fn build_sources() -> Vec<SourceObject> {
     vec![
         SourceObject::header("Local"),
         SourceObject::source("Local Filesystem", "local", "drive-harddisk-symbolic"),
+        // Internet Radio sources (always present).
+        SourceObject::header("Internet Radio"),
+        SourceObject::source("Top Clicked", "radio-topclick", "network-wireless-symbolic"),
+        SourceObject::source("Top Voted", "radio-topvote", "network-wireless-symbolic"),
+        SourceObject::source(
+            "Stations Near Me",
+            "radio-nearme",
+            "network-wireless-symbolic",
+        ),
     ]
 }
 

@@ -704,6 +704,7 @@ pub fn build_window(
         let status_label = status_label.clone();
         let column_view = column_view.clone();
         let current_pos = current_pos.clone();
+        let app_config = app_config.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
             let Some(item) = sel.selected_item() else {
@@ -724,9 +725,106 @@ pub fn build_window(
                 url.clone()
             };
 
+            let backend_type = src.backend_type();
+
+            // ── Radio source: fetch stations ────────────────────────
+            if is_radio_backend(&backend_type) {
+                *active_source_key.borrow_mut() = backend_type.clone();
+
+                // Switch to radio column layout.
+                apply_radio_columns(&column_view, true);
+                // Hide browser for radio.
+                browser_widget.set_visible(false);
+
+                // Handle "Stations Near Me" with geo consent.
+                if backend_type == "radio-nearme" {
+                    let app_config = app_config.clone();
+                    let rt_handle = rt_handle.clone();
+                    let track_store = track_store.clone();
+                    let master_tracks = master_tracks.clone();
+                    let browser_widget = browser_widget.clone();
+                    let browser_state = browser_state.clone();
+                    let status_label = status_label.clone();
+                    let column_view = column_view.clone();
+                    let active_source_key = active_source_key.clone();
+                    let sidebar_selection = sel.clone();
+                    let current_pos = current_pos.clone();
+                    let source_tracks = source_tracks.clone();
+                    let win = win.clone();
+
+                    handle_radio_nearme(
+                        &win,
+                        app_config,
+                        rt_handle,
+                        track_store,
+                        master_tracks,
+                        browser_widget,
+                        browser_state,
+                        status_label,
+                        column_view,
+                        active_source_key,
+                        sidebar_selection,
+                        current_pos,
+                        source_tracks,
+                    );
+                } else {
+                    // Top Clicked or Top Voted — fetch directly.
+                    let bt = backend_type.clone();
+                    let rt_handle = rt_handle.clone();
+                    let track_store = track_store.clone();
+                    let master_tracks = master_tracks.clone();
+                    let browser_widget = browser_widget.clone();
+                    let browser_state = browser_state.clone();
+                    let status_label = status_label.clone();
+                    let column_view = column_view.clone();
+                    let current_pos = current_pos.clone();
+
+                    let (stations_tx, stations_rx) = async_channel::bounded::<String>(1);
+
+                    rt_handle.spawn(async move {
+                        let client = crate::radio::RadioBrowserClient::new();
+                        let stations = if bt == "radio-topclick" {
+                            client.fetch_top_click(None).await
+                        } else {
+                            client.fetch_top_vote(None).await
+                        };
+                        let json = serde_json::to_string(&stations).unwrap_or_default();
+                        let _ = stations_tx.send(json).await;
+                    });
+
+                    glib::MainContext::default().spawn_local(async move {
+                        if let Ok(json) = stations_rx.recv().await {
+                            let stations: Vec<crate::radio::RadioStation> =
+                                serde_json::from_str(&json).unwrap_or_default();
+                            let objects: Vec<TrackObject> =
+                                stations.iter().map(radio_station_to_track_object).collect();
+                            display_tracks(
+                                &objects,
+                                &track_store,
+                                &master_tracks,
+                                &browser_widget,
+                                &browser_state,
+                                &status_label,
+                                &column_view,
+                            );
+                            current_pos.set(None);
+                        }
+                    });
+                }
+                return;
+            }
+
             // ── Connected source: switch view ───────────────────────
             if src.connected() {
                 *active_source_key.borrow_mut() = key.clone();
+
+                // Restore music column layout if coming from radio.
+                apply_radio_columns(&column_view, false);
+                // Restore browser visibility from config.
+                let cfg = app_config.borrow();
+                preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
+                drop(cfg);
+
                 let st = source_tracks.borrow();
                 let tracks = st.get(&key).cloned().unwrap_or_default();
                 display_tracks(
@@ -1982,7 +2080,14 @@ fn restore_sort_state(column_view: &gtk::ColumnView) {
 // ── Sidebar category management ─────────────────────────────────────
 
 /// The fixed ordering of sidebar category headers.
-const CATEGORY_ORDER: &[&str] = &["Local", "DAAP", "Subsonic", "Jellyfin", "Plex"];
+const CATEGORY_ORDER: &[&str] = &[
+    "Local",
+    "DAAP",
+    "Subsonic",
+    "Jellyfin",
+    "Plex",
+    "Internet Radio",
+];
 
 /// Map a backend type string to its sidebar category header name.
 fn category_for_backend(backend_type: &str) -> &'static str {
@@ -2163,6 +2268,254 @@ fn show_auth_dialog(
     });
 
     dialog.present(Some(window));
+}
+
+// ── Internet Radio helpers ──────────────────────────────────────────
+
+/// Columns to show when viewing radio stations.
+const RADIO_VISIBLE_COLUMNS: &[&str] = &["Title", "Artist", "Genre", "Bitrate", "Format"];
+
+/// Check if a backend type is a radio source.
+fn is_radio_backend(backend_type: &str) -> bool {
+    backend_type.starts_with("radio-")
+}
+
+/// Switch column visibility for radio mode or restore music mode.
+///
+/// When `radio = true`: show only radio-relevant columns.
+/// When `radio = false`: restore all columns from user preferences
+/// (caller should call `preferences::apply_column_visibility` after).
+fn apply_radio_columns(column_view: &gtk::ColumnView, radio: bool) {
+    let columns = column_view.columns();
+    for i in 0..columns.n_items() {
+        if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
+            if let Some(title) = col.title() {
+                let title = title.to_string();
+                if radio {
+                    col.set_visible(RADIO_VISIBLE_COLUMNS.contains(&title.as_str()));
+                } else {
+                    // Restore all — the caller will apply user prefs after.
+                    col.set_visible(true);
+                }
+            }
+        }
+    }
+}
+
+/// Convert a `RadioStation` to a `TrackObject` for display in the tracklist.
+///
+/// Mapping: name→title, country→artist, tags→genre, codec→format,
+/// bitrate→bitrate, url_resolved→uri.
+fn radio_station_to_track_object(station: &crate::radio::RadioStation) -> TrackObject {
+    TrackObject::new(
+        0,                // track_number (unused for radio)
+        &station.name,    // title = station name
+        0,                // duration_secs (live stream)
+        &station.country, // artist = country
+        "",               // album (unused for radio)
+        &station.tags,    // genre = tags
+        0,                // year (unused)
+        "",               // date_modified (unused)
+        station.bitrate,  // bitrate
+        0,                // sample_rate (unused)
+        0,                // play_count (unused)
+        &station.codec,   // format = codec
+        &station.url_resolved,
+    )
+}
+
+/// Handle the "Stations Near Me" radio source with geolocation consent.
+#[allow(clippy::too_many_arguments)]
+fn handle_radio_nearme(
+    window: &adw::ApplicationWindow,
+    app_config: Rc<RefCell<preferences::AppConfig>>,
+    rt_handle: tokio::runtime::Handle,
+    track_store: gtk::gio::ListStore,
+    master_tracks: Rc<RefCell<Vec<TrackObject>>>,
+    browser_widget: gtk::Box,
+    browser_state: browser::BrowserState,
+    status_label: gtk::Label,
+    column_view: gtk::ColumnView,
+    active_source_key: Rc<RefCell<String>>,
+    sidebar_selection: gtk::SingleSelection,
+    current_pos: Rc<Cell<Option<u32>>>,
+    source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+) {
+    let location_enabled = app_config.borrow().location_enabled;
+
+    match location_enabled {
+        Some(true) => {
+            // Already consented — fetch directly.
+            fetch_and_display_nearme(
+                rt_handle,
+                track_store,
+                master_tracks,
+                browser_widget,
+                browser_state,
+                status_label,
+                column_view,
+                current_pos,
+            );
+        }
+        Some(false) => {
+            // Previously declined — switch back to local.
+            info!("Location declined previously, switching to local");
+            *active_source_key.borrow_mut() = "local".to_string();
+            sidebar_selection.set_selected(1);
+
+            // Restore music columns.
+            apply_radio_columns(&column_view, false);
+            let cfg = app_config.borrow();
+            preferences::apply_column_visibility(&column_view, &cfg.visible_columns);
+            preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
+            drop(cfg);
+
+            let st = source_tracks.borrow();
+            let local_tracks = st.get("local").cloned().unwrap_or_default();
+            display_tracks(
+                &local_tracks,
+                &track_store,
+                &master_tracks,
+                &browser_widget,
+                &browser_state,
+                &status_label,
+                &column_view,
+            );
+        }
+        None => {
+            // Not yet asked — show consent dialog.
+            let dialog = adw::AlertDialog::builder()
+                .heading("Enable Location?")
+                .body(
+                    "Stations Near Me uses your approximate location (via IP address) \
+                     to find nearby radio stations.\n\n\
+                     Your IP address will be sent to ip-api.com to determine your \
+                     coordinates. No personal data is stored.",
+                )
+                .close_response("decline")
+                .default_response("enable")
+                .build();
+
+            dialog.add_response("decline", "No Thanks");
+            dialog.add_response("enable", "Enable Location");
+            dialog.set_response_appearance("enable", adw::ResponseAppearance::Suggested);
+
+            let app_config = app_config.clone();
+            let rt_handle = rt_handle.clone();
+            let track_store = track_store.clone();
+            let master_tracks = master_tracks.clone();
+            let browser_widget = browser_widget.clone();
+            let browser_state = browser_state.clone();
+            let status_label = status_label.clone();
+            let column_view = column_view.clone();
+            let active_source_key = active_source_key.clone();
+            let sidebar_selection = sidebar_selection.clone();
+            let current_pos = current_pos.clone();
+            let source_tracks = source_tracks.clone();
+
+            dialog.connect_response(None, move |_dialog, response| {
+                if response == "enable" {
+                    // Save consent.
+                    {
+                        let mut cfg = app_config.borrow_mut();
+                        cfg.location_enabled = Some(true);
+                        preferences::save_config(&cfg);
+                    }
+                    info!("Location enabled by user");
+
+                    fetch_and_display_nearme(
+                        rt_handle.clone(),
+                        track_store.clone(),
+                        master_tracks.clone(),
+                        browser_widget.clone(),
+                        browser_state.clone(),
+                        status_label.clone(),
+                        column_view.clone(),
+                        current_pos.clone(),
+                    );
+                } else {
+                    // Save decline.
+                    {
+                        let mut cfg = app_config.borrow_mut();
+                        cfg.location_enabled = Some(false);
+                        preferences::save_config(&cfg);
+                    }
+                    info!("Location declined by user, switching to local");
+
+                    *active_source_key.borrow_mut() = "local".to_string();
+                    sidebar_selection.set_selected(1);
+
+                    // Restore music columns.
+                    apply_radio_columns(&column_view, false);
+                    let cfg = app_config.borrow();
+                    preferences::apply_column_visibility(&column_view, &cfg.visible_columns);
+                    preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
+                    drop(cfg);
+
+                    let st = source_tracks.borrow();
+                    let local_tracks = st.get("local").cloned().unwrap_or_default();
+                    display_tracks(
+                        &local_tracks,
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
+                }
+            });
+
+            dialog.present(Some(window));
+        }
+    }
+}
+
+/// Fetch geolocation + nearby stations and display them.
+fn fetch_and_display_nearme(
+    rt_handle: tokio::runtime::Handle,
+    track_store: gtk::gio::ListStore,
+    master_tracks: Rc<RefCell<Vec<TrackObject>>>,
+    browser_widget: gtk::Box,
+    browser_state: browser::BrowserState,
+    status_label: gtk::Label,
+    column_view: gtk::ColumnView,
+    current_pos: Rc<Cell<Option<u32>>>,
+) {
+    let (stations_tx, stations_rx) = async_channel::bounded::<String>(1);
+
+    rt_handle.spawn(async move {
+        // First get geolocation.
+        if let Some((lat, lon)) = crate::radio::client::fetch_geolocation().await {
+            let client = crate::radio::RadioBrowserClient::new();
+            let stations = client.fetch_near_me(lat, lon, None).await;
+            // Send raw station data as serialized JSON; convert on GTK thread.
+            let json = serde_json::to_string(&stations).unwrap_or_default();
+            let _ = stations_tx.send(json).await;
+        } else {
+            tracing::warn!("Geolocation failed — showing empty station list");
+            let _ = stations_tx.send("[]".to_string()).await;
+        }
+    });
+
+    glib::MainContext::default().spawn_local(async move {
+        if let Ok(json) = stations_rx.recv().await {
+            let stations: Vec<crate::radio::RadioStation> =
+                serde_json::from_str(&json).unwrap_or_default();
+            let objects: Vec<TrackObject> =
+                stations.iter().map(radio_station_to_track_object).collect();
+            display_tracks(
+                &objects,
+                &track_store,
+                &master_tracks,
+                &browser_widget,
+                &browser_state,
+                &status_label,
+                &column_view,
+            );
+            current_pos.set(None);
+        }
+    });
 }
 
 // ── Manual server persistence (servers.json) ────────────────────────

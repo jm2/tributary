@@ -5,16 +5,37 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — v0.2.0
+## [0.2.0] — 2026-04-04
 
 ### Added
+- **Internet Radio** — New "Internet Radio" sidebar section with three sub-sources:
+  - **Top Clicked** — most-clicked stations from the Radio-Browser community database.
+  - **Top Voted** — highest-rated stations.
+  - **Stations Near Me** — geo-located stations sorted by distance, with user consent prompt for IP-based geolocation (via `ipapi.co` over HTTPS).
+  - Dynamic column switching: radio sources show Title, Country, Tags, Bitrate, Codec; music sources restore the full 12-column layout.
+  - Browser panes are hidden when viewing radio stations.
+  - DNS-based Radio-Browser API mirror resolution (`all.api.radio-browser.info`).
+  - Double-click plays the station's stream URL via GStreamer.
+- **Manual server addition** — `+` button in the sidebar toolbar opens an "Add Server" dialog with server type dropdown (Subsonic, Jellyfin, Plex), URL, username, and password fields. Servers are persisted to `servers.json` (type, name, URL only — no credentials stored).
+- **Manual server deletion** — Trash button on manually-added servers removes them from the sidebar and `servers.json`.
+- **Regular discovery refresh** — mDNS `ServiceRemoved` events now remove offline servers from the sidebar. Jellyfin UDP discovery re-broadcasts every 60 seconds; servers are removed after 3 consecutive missed cycles (3 minutes).
+- **`DiscoveryEvent` enum** — Discovery channel now carries `Found` and `Lost` variants instead of raw `DiscoveredServer` structs.
+- **`manually_added` field** on `SourceObject` — distinguishes user-added servers from auto-discovered ones. Manually-added servers are never auto-removed by discovery refresh.
+- **`location_enabled` preference** — Persisted in `config.json` to remember the user's geolocation consent choice.
 - **About dialog** — Ptyxis-style `adw::AboutDialog` with app icon, version, author (John-Michael Mulesa), website link to GitHub, and "Report an Issue" link to GitHub Issues.
 - **SHA256 checksums** — CI and Release workflows now generate and upload `SHA256SUMS.txt` for all build artifacts.
 - **Packit / Fedora COPR** — RPM spec and `.packit.yaml` for automated Fedora COPR builds.
 
 ### Changed
-- **Sidebar categories** — Jellyfin and Plex servers now appear under separate "Jellyfin" and "Plex" sidebar headers instead of the combined "Jellyfin / Plex" category.
+- **Sidebar** — Now returns a `gtk::Box` (scrolled list + toolbar) instead of a bare `ScrolledWindow`. The toolbar contains the `+` add-server button.
+- **Sidebar categories** — Jellyfin and Plex servers now appear under separate "Jellyfin" and "Plex" sidebar headers instead of the combined "Jellyfin / Plex" category. "Internet Radio" added as the last category.
 - **Buffering spinner** — Debounce threshold increased from 100 ms to 300 ms to prevent sub-100 ms blinking on fast-loading local files. Added `PositionChanged`-based fallback: if the elapsed time is advancing (audio is actually playing), the spinner is cleared definitively — fixing the endless spinner bug on some remote streams where GStreamer never emits a clean `Playing` state transition after buffering.
+- **Jellyfin UDP discovery** — Now runs in a continuous loop (60-second intervals) instead of a single broadcast, enabling dynamic server detection and removal.
+
+### Security
+- **HTTPS geolocation** — Switched from `http://ip-api.com` (plaintext) to `https://ipapi.co` (encrypted) for IP-based geolocation.
+- **Request timeouts** — All Radio-Browser API and geolocation HTTP requests now have a 15-second timeout to prevent indefinite hangs.
+- **Stream URL validation** — Radio station stream URLs are filtered to only allow `http://` and `https://` schemes, preventing `file://` or other scheme injection from malicious Radio-Browser entries.
 
 ### Removed
 - **Keyboard Shortcuts** menu item removed from the hamburger menu (was non-functional).
@@ -22,10 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Endless playback spinner on certain remote source tracks.
 - Spinner blinking at sub-100 ms intervals on local file playback.
+- `remove_empty_category_header` was previously dead code — now actively used by discovery `Lost` events.
 
 ---
 
-## [0.1.0] — 2026-03-28
+## [0.1.0] — 2026-04-02
 
 ### Added
 
@@ -89,5 +111,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
-[Unreleased]: https://github.com/jm2/tributary/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/jm2/tributary/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jm2/tributary/releases/tag/v0.1.0

@@ -40,6 +40,11 @@ pub struct AppConfig {
     pub visible_columns: Vec<String>,
     /// Path to the local music library folder.
     pub library_path: String,
+    /// Whether the user has consented to IP-based geolocation for
+    /// "Stations Near Me". `None` = not yet asked, `Some(true)` = accepted,
+    /// `Some(false)` = declined.
+    #[serde(default)]
+    pub location_enabled: Option<bool>,
 }
 
 /// Browser pane visibility toggles.
@@ -66,6 +71,7 @@ impl Default for AppConfig {
             },
             visible_columns: DEFAULT_VISIBLE.iter().map(|s| s.to_string()).collect(),
             library_path: music_dir,
+            location_enabled: None,
         }
     }
 }
