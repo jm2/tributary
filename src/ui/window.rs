@@ -1355,8 +1355,15 @@ fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         .set_label(&format!("{} \u{2014} {}", track.artist(), track.album()));
     ctx.current_pos.set(Some(position));
 
-    // ── Update album art from embedded tags (in-memory) ─────────
-    update_album_art(&ctx.album_art, &uri);
+    // ── Update album art ─────────────────────────────────────────
+    let cover_art_url = track.cover_art_url();
+    if !cover_art_url.is_empty() {
+        // Remote track with a cover art URL — fetch asynchronously.
+        fetch_remote_album_art(&ctx.album_art, &cover_art_url);
+    } else {
+        // Local track — extract from embedded tags.
+        update_album_art(&ctx.album_art, &uri);
+    }
 
     if let Some(ref mut ctrl) = *ctx.media_ctrl.borrow_mut() {
         ctrl.update_metadata(&track.title(), &track.artist(), &track.album());
@@ -1444,6 +1451,43 @@ fn update_album_art(image: &gtk::Image, uri: &str) {
             image.set_icon_name(Some("audio-x-generic-symbolic"));
         }
     }
+}
+
+/// Fetch remote album art asynchronously and display it on the header
+/// bar image widget.  Uses a one-shot channel to send the image bytes
+/// from the tokio runtime back to the GTK main thread.
+fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
+    // Set placeholder immediately while fetching.
+    image.set_icon_name(Some("audio-x-generic-symbolic"));
+
+    let url = cover_art_url.to_string();
+    let image = image.clone();
+
+    let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
+
+    // Fetch on a background thread (reqwest is already available).
+    tokio::task::spawn(async move {
+        match reqwest::get(&url).await {
+            Ok(resp) => {
+                if let Ok(bytes) = resp.bytes().await {
+                    let _ = tx.send(bytes.to_vec()).await;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to fetch remote album art");
+            }
+        }
+    });
+
+    // Receive on the GTK main thread.
+    glib::MainContext::default().spawn_local(async move {
+        if let Ok(data) = rx.recv().await {
+            let bytes = glib::Bytes::from(&data);
+            if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
+                image.set_paintable(Some(&texture));
+            }
+        }
+    });
 }
 
 /// Advance to the next track, respecting shuffle and repeat-all.
@@ -1643,7 +1687,7 @@ fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObject {
         })
         .unwrap_or_default();
 
-    TrackObject::new(
+    let obj = TrackObject::new(
         t.track_number.unwrap_or(0),
         &t.title,
         t.duration_secs.unwrap_or(0),
@@ -1659,7 +1703,14 @@ fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObject {
         t.play_count.unwrap_or(0),
         t.format.as_deref().unwrap_or(""),
         &uri,
-    )
+    );
+
+    // Propagate cover art URL for remote tracks.
+    if let Some(ref art_url) = t.cover_art_url {
+        obj.set_cover_art_url(art_url.as_str());
+    }
+
+    obj
 }
 
 /// Load the custom CSS from the embedded stylesheet.

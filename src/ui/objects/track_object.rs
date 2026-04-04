@@ -27,6 +27,8 @@ mod imp {
         pub format: RefCell<String>,
         /// Playable URI (`file:///…` or stream URL).
         pub uri: RefCell<String>,
+        /// Cover art URL for remote tracks (empty for local files).
+        pub cover_art_url: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -118,6 +120,13 @@ impl TrackObject {
     }
     pub fn uri(&self) -> String {
         self.imp().uri.borrow().clone()
+    }
+    pub fn cover_art_url(&self) -> String {
+        self.imp().cover_art_url.borrow().clone()
+    }
+
+    pub fn set_cover_art_url(&self, url: &str) {
+        self.imp().cover_art_url.replace(url.to_string());
     }
 
     pub fn duration_display(&self) -> String {

@@ -1,8 +1,8 @@
-//! Preferences window — unified settings for browser views, column
-//! visibility, and library location.
+//! Preferences window — unified settings for library location, browser
+//! views, and column visibility.
 //!
 //! Uses `adw::PreferencesDialog` with a single page containing three
-//! groups: Browser Views, Visible Columns, and Library Location.
+//! groups: Library Location, Browser Views, and Visible Columns.
 
 use adw::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -26,8 +26,8 @@ pub const ALL_COLUMNS: &[&str] = &[
     "Format",
 ];
 
-/// Columns visible by default.
-const DEFAULT_VISIBLE: &[&str] = &["#", "Title", "Time", "Artist", "Album", "Genre"];
+/// Columns visible by default — all columns enabled.
+const DEFAULT_VISIBLE: &[&str] = ALL_COLUMNS;
 
 // ── Persisted configuration ─────────────────────────────────────────────
 
@@ -110,150 +110,16 @@ pub fn show_preferences(
     browser_box: &gtk::Box,
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
 ) {
-    let prefs_window = adw::PreferencesDialog::builder()
+    let prefs_dialog = adw::PreferencesDialog::builder()
         .title("Preferences")
         .build();
 
     let page = adw::PreferencesPage::new();
-
-    // ── Browser Views group ─────────────────────────────────────────
-    let browser_group = adw::PreferencesGroup::builder()
-        .title("Browser Views")
-        .description("Toggle which filter panes are shown above the tracklist.")
-        .build();
-
     let cfg = config.borrow();
 
-    let genre_row = adw::SwitchRow::builder()
-        .title("Genre")
-        .active(cfg.browser_views.genre)
-        .build();
-
-    let artist_row = adw::SwitchRow::builder()
-        .title("Artist")
-        .active(cfg.browser_views.artist)
-        .build();
-
-    let album_row = adw::SwitchRow::builder()
-        .title("Album")
-        .active(cfg.browser_views.album)
-        .build();
-
-    browser_group.add(&genre_row);
-    browser_group.add(&artist_row);
-    browser_group.add(&album_row);
-
-    // Wire browser view toggles
-    {
-        let config = config.clone();
-        let browser_box = browser_box.clone();
-        let artist_row_ref = artist_row.clone();
-        let album_row_ref = album_row.clone();
-        genre_row.connect_active_notify(move |row| {
-            let mut cfg = config.borrow_mut();
-            cfg.browser_views.genre = row.is_active();
-            update_browser_visibility(&browser_box, &cfg.browser_views);
-            save_config(&cfg);
-            // Suppress unused variable warnings
-            let _ = (&artist_row_ref, &album_row_ref);
-        });
-    }
-    {
-        let config = config.clone();
-        let browser_box = browser_box.clone();
-        let genre_row_ref = genre_row.clone();
-        let album_row_ref = album_row.clone();
-        artist_row.connect_active_notify(move |row| {
-            let mut cfg = config.borrow_mut();
-            cfg.browser_views.artist = row.is_active();
-            update_browser_visibility(&browser_box, &cfg.browser_views);
-            save_config(&cfg);
-            let _ = (&genre_row_ref, &album_row_ref);
-        });
-    }
-    {
-        let config = config.clone();
-        let browser_box = browser_box.clone();
-        album_row.connect_active_notify(move |row| {
-            let mut cfg = config.borrow_mut();
-            cfg.browser_views.album = row.is_active();
-            update_browser_visibility(&browser_box, &cfg.browser_views);
-            save_config(&cfg);
-        });
-    }
-
-    page.add(&browser_group);
-
-    // ── Visible Columns group ───────────────────────────────────────
-    let columns_group = adw::PreferencesGroup::builder()
-        .title("Visible Columns")
-        .description("Choose which columns appear in the tracklist.")
-        .build();
-
-    let column_switches: Vec<(&str, adw::SwitchRow)> = ALL_COLUMNS
-        .iter()
-        .map(|&col_title| {
-            let is_visible = cfg.visible_columns.iter().any(|c| c == col_title);
-            let row = adw::SwitchRow::builder()
-                .title(col_title)
-                .active(is_visible)
-                .build();
-
-            // Wire each column toggle
-            let config = config.clone();
-            let cv = column_view.clone();
-            let title = col_title.to_string();
-            row.connect_active_notify(move |row| {
-                let mut cfg = config.borrow_mut();
-                if row.is_active() {
-                    if !cfg.visible_columns.contains(&title) {
-                        cfg.visible_columns.push(title.clone());
-                    }
-                } else {
-                    cfg.visible_columns.retain(|c| c != &title);
-                }
-                apply_column_visibility(&cv, &cfg.visible_columns);
-                save_config(&cfg);
-            });
-
-            columns_group.add(&row);
-            (col_title, row)
-        })
-        .collect();
-
-    // Reset to Defaults button
-    let reset_btn = gtk::Button::builder()
-        .label("Reset to Defaults")
-        .css_classes(["flat"])
-        .halign(gtk::Align::Center)
-        .margin_top(8)
-        .build();
-    {
-        let config = config.clone();
-        let cv = column_view.clone();
-        let switches = column_switches
-            .iter()
-            .map(|(t, r)| (t.to_string(), r.clone()))
-            .collect::<Vec<_>>();
-        reset_btn.connect_clicked(move |_| {
-            let mut cfg = config.borrow_mut();
-            cfg.visible_columns = DEFAULT_VISIBLE.iter().map(|s| s.to_string()).collect();
-            for (title, row) in &switches {
-                row.set_active(DEFAULT_VISIBLE.contains(&title.as_str()));
-            }
-            apply_column_visibility(&cv, &cfg.visible_columns);
-            save_config(&cfg);
-            info!("Column visibility reset to defaults");
-        });
-    }
-    columns_group.add(&reset_btn);
-
-    page.add(&columns_group);
-
-    // ── Library Location group ──────────────────────────────────────
+    // ── Library Location group (first) ──────────────────────────────
     let library_group = adw::PreferencesGroup::builder()
         .title("Library Location")
-        .description("The folder Tributary scans for local music files.")
         .build();
 
     let library_row = adw::ActionRow::builder()
@@ -267,7 +133,6 @@ pub fn show_preferences(
         .build();
     library_row.add_suffix(&browse_btn);
 
-    // Wire Browse button
     {
         let config = config.clone();
         let library_row = library_row.clone();
@@ -293,8 +158,6 @@ pub fn show_preferences(
                             let mut cfg = config.borrow_mut();
                             cfg.library_path = path_str;
                             save_config(&cfg);
-
-                            // TODO: trigger DB wipe + re-scan via engine channel
                         }
                     }
                 },
@@ -305,10 +168,155 @@ pub fn show_preferences(
     library_group.add(&library_row);
     page.add(&library_group);
 
-    prefs_window.add(&page);
-    drop(cfg); // release borrow before presenting
+    // ── Browser Views group (dense horizontal checkboxes) ───────────
+    let browser_group = adw::PreferencesGroup::builder()
+        .title("Browser Views")
+        .build();
 
-    prefs_window.present(Some(parent));
+    let browser_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(16)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
+
+    let genre_check = gtk::CheckButton::builder()
+        .label("Genre")
+        .active(cfg.browser_views.genre)
+        .build();
+    let artist_check = gtk::CheckButton::builder()
+        .label("Artist")
+        .active(cfg.browser_views.artist)
+        .build();
+    let album_check = gtk::CheckButton::builder()
+        .label("Album")
+        .active(cfg.browser_views.album)
+        .build();
+
+    browser_row.append(&genre_check);
+    browser_row.append(&artist_check);
+    browser_row.append(&album_check);
+
+    // Wire browser view toggles
+    {
+        let config = config.clone();
+        let browser_box = browser_box.clone();
+        genre_check.connect_toggled(move |btn| {
+            let mut cfg = config.borrow_mut();
+            cfg.browser_views.genre = btn.is_active();
+            update_browser_visibility(&browser_box, &cfg.browser_views);
+            save_config(&cfg);
+        });
+    }
+    {
+        let config = config.clone();
+        let browser_box = browser_box.clone();
+        artist_check.connect_toggled(move |btn| {
+            let mut cfg = config.borrow_mut();
+            cfg.browser_views.artist = btn.is_active();
+            update_browser_visibility(&browser_box, &cfg.browser_views);
+            save_config(&cfg);
+        });
+    }
+    {
+        let config = config.clone();
+        let browser_box = browser_box.clone();
+        album_check.connect_toggled(move |btn| {
+            let mut cfg = config.borrow_mut();
+            cfg.browser_views.album = btn.is_active();
+            update_browser_visibility(&browser_box, &cfg.browser_views);
+            save_config(&cfg);
+        });
+    }
+
+    browser_group.add(&browser_row);
+    page.add(&browser_group);
+
+    // ── Visible Columns group (dense grid with FlowBox) ─────────────
+    let columns_group = adw::PreferencesGroup::builder()
+        .title("Visible Columns")
+        .build();
+
+    let flow_box = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .max_children_per_line(3)
+        .min_children_per_line(3)
+        .homogeneous(true)
+        .row_spacing(4)
+        .column_spacing(8)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
+
+    let column_checks: Vec<(&str, gtk::CheckButton)> = ALL_COLUMNS
+        .iter()
+        .map(|&col_title| {
+            let is_visible = cfg.visible_columns.iter().any(|c| c == col_title);
+            let check = gtk::CheckButton::builder()
+                .label(col_title)
+                .active(is_visible)
+                .build();
+
+            // Wire each column toggle
+            let config = config.clone();
+            let cv = column_view.clone();
+            let title = col_title.to_string();
+            check.connect_toggled(move |btn| {
+                let mut cfg = config.borrow_mut();
+                if btn.is_active() {
+                    if !cfg.visible_columns.contains(&title) {
+                        cfg.visible_columns.push(title.clone());
+                    }
+                } else {
+                    cfg.visible_columns.retain(|c| c != &title);
+                }
+                apply_column_visibility(&cv, &cfg.visible_columns);
+                save_config(&cfg);
+            });
+
+            flow_box.append(&check);
+            (col_title, check)
+        })
+        .collect();
+
+    // Reset to Defaults button
+    let reset_btn = gtk::Button::builder()
+        .label("Reset to Defaults")
+        .css_classes(["flat"])
+        .halign(gtk::Align::Center)
+        .margin_top(4)
+        .build();
+    {
+        let config = config.clone();
+        let cv = column_view.clone();
+        let checks = column_checks
+            .iter()
+            .map(|(t, c)| (t.to_string(), c.clone()))
+            .collect::<Vec<_>>();
+        reset_btn.connect_clicked(move |_| {
+            let mut cfg = config.borrow_mut();
+            cfg.visible_columns = DEFAULT_VISIBLE.iter().map(|s| s.to_string()).collect();
+            for (title, check) in &checks {
+                check.set_active(DEFAULT_VISIBLE.contains(&title.as_str()));
+            }
+            apply_column_visibility(&cv, &cfg.visible_columns);
+            save_config(&cfg);
+            info!("Column visibility reset to defaults");
+        });
+    }
+
+    columns_group.add(&flow_box);
+    columns_group.add(&reset_btn);
+    page.add(&columns_group);
+
+    prefs_dialog.add(&page);
+    drop(cfg);
+
+    prefs_dialog.present(Some(parent));
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -331,7 +339,6 @@ pub fn apply_column_visibility(column_view: &gtk::ColumnView, visible: &[String]
 /// `ScrolledWindow` widgets).  If all three are hidden, hide the
 /// entire box.
 pub fn update_browser_visibility(browser_box: &gtk::Box, views: &BrowserViewsConfig) {
-    // The browser box children are: genre_scrolled, artist_scrolled, album_scrolled
     let mut child_idx = 0;
     let mut child = browser_box.first_child();
     while let Some(widget) = child {
@@ -346,7 +353,6 @@ pub fn update_browser_visibility(browser_box: &gtk::Box, views: &BrowserViewsCon
         child_idx += 1;
     }
 
-    // Hide the entire browser box if all panes are hidden.
     let any_visible = views.genre || views.artist || views.album;
     browser_box.set_visible(any_visible);
 }
