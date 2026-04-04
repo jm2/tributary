@@ -147,9 +147,12 @@ fn main() {
         .build();
 
     let preferences_action = gio::ActionEntry::builder("preferences")
-        .activate(|_app: &adw::Application, _, _| {
-            // TODO: open preferences window (item 6)
-            tracing::info!("Preferences action triggered (not yet implemented)");
+        .activate(|app: &adw::Application, _, _| {
+            // Forward to the window-level action that has access to
+            // the ColumnView and browser widgets.
+            if let Some(win) = app.active_window() {
+                win.activate_action("show-preferences", None);
+            }
         })
         .build();
 

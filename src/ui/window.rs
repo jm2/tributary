@@ -19,6 +19,7 @@ use crate::ui::header_bar::RepeatMode;
 use super::browser;
 use super::header_bar;
 use super::objects::{SourceObject, TrackObject};
+use super::preferences;
 use super::sidebar;
 use super::tracklist;
 
@@ -44,6 +45,10 @@ pub fn build_window(
     engine_rx: async_channel::Receiver<LibraryEvent>,
 ) {
     info!("Building main window (Phase 4 — audio + desktop integration)");
+
+    // ── Load and apply persisted preferences ─────────────────────────
+    let app_config: Rc<RefCell<preferences::AppConfig>> =
+        Rc::new(RefCell::new(preferences::load_config()));
 
     // ── Load custom CSS ──────────────────────────────────────────────
     load_css();
@@ -1230,6 +1235,27 @@ pub fn build_window(
                 }
             }
         });
+    }
+
+    // ── Apply persisted preferences (column visibility, browser) ─────
+    {
+        let cfg = app_config.borrow();
+        preferences::apply_column_visibility(&column_view, &cfg.visible_columns);
+        preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
+    }
+
+    // ── Wire preferences action to the window ────────────────────────
+    {
+        let win = window.clone();
+        let cv = column_view.clone();
+        let bw = browser_widget.clone();
+        let cfg = app_config.clone();
+        let prefs_action = gtk::gio::ActionEntry::builder("show-preferences")
+            .activate(move |_: &adw::ApplicationWindow, _, _| {
+                preferences::show_preferences(&win, &cv, &bw, &cfg);
+            })
+            .build();
+        window.add_action_entries([prefs_action]);
     }
 
     // ── Receive LibraryEvents on GTK main thread ─────────────────────

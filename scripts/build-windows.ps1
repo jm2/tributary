@@ -213,20 +213,59 @@ if ($SkipBundle) {
 # ── DLL Bundle ───────────────────────────────────────────────────────────────
 Write-Info "Bundling GTK4 DLLs and resources into $DIST ..."
 
-Remove-Item -Recurse -Force $DIST -ErrorAction SilentlyContinue
+# Helper: copy a single file only if the destination doesn't exist or the
+# source is newer.  This avoids re-copying hundreds of unchanged DLLs on
+# every build, saving significant time on incremental rebuilds.
+function Copy-IfNewer {
+    param([string]$Src, [string]$Dst)
+    if (-not (Test-Path $Dst)) {
+        Copy-Item $Src $Dst
+        return $true
+    }
+    $srcTime = (Get-Item $Src).LastWriteTimeUtc
+    $dstTime = (Get-Item $Dst).LastWriteTimeUtc
+    if ($srcTime -gt $dstTime) {
+        Copy-Item $Src $Dst -Force
+        return $true
+    }
+    return $false
+}
+
+# Helper: recursively sync a directory tree, copying only newer files.
+function Sync-Directory {
+    param([string]$SrcDir, [string]$DstDir)
+    $copied = 0
+    Get-ChildItem -Path $SrcDir -Recurse -File | ForEach-Object {
+        $relPath = $_.FullName.Substring($SrcDir.Length)
+        $destFile = Join-Path $DstDir $relPath
+        $destDir = Split-Path $destFile
+        if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Force $destDir | Out-Null }
+        if (Copy-IfNewer $_.FullName $destFile) { $copied++ }
+    }
+    return $copied
+}
+
 New-Item -ItemType Directory -Force $DIST | Out-Null
 New-Item -ItemType Directory -Force "$DIST\lib" | Out-Null
 
-# Copy the executable.
-Copy-Item $exePath $DIST
+# Always copy the executable (just built).
+Copy-Item $exePath $DIST -Force
 
-# Copy dynamic plugin folders.
-Write-Info "Copying GTK plugins and GStreamer codecs..."
+# Copy dynamic plugin folders (incremental — only newer files).
+Write-Info "Syncing GTK plugins and GStreamer codecs (incremental)..."
+$totalCopied = 0
+
 $loadersSrc = Join-Path $MsysPath "lib\gdk-pixbuf-2.0"
-if (Test-Path $loadersSrc) { Copy-Item -Recurse -Force $loadersSrc "$DIST\lib" | Out-Null }
+if (Test-Path $loadersSrc) {
+    $n = Sync-Directory $loadersSrc (Join-Path $DIST "lib\gdk-pixbuf-2.0")
+    $totalCopied += $n
+}
 
 $gstPluginSrc = Join-Path $MsysPath "lib\gstreamer-1.0"
-if (Test-Path $gstPluginSrc) { Copy-Item -Recurse -Force $gstPluginSrc "$DIST\lib" | Out-Null }
+if (Test-Path $gstPluginSrc) {
+    $n = Sync-Directory $gstPluginSrc (Join-Path $DIST "lib\gstreamer-1.0")
+    $totalCopied += $n
+}
 
 # Resolve all transitive dependencies for the EXE and Plugins.
 # Use the explicit MSYS2 path for ldd to ensure it exists in PowerShell.
@@ -246,35 +285,50 @@ foreach ($bin in $binariesToScan) {
             $dllName = $matches[1].Trim()
             $srcPath = Join-Path $MsysPath "bin\$dllName"
             
-            # If it exists in the MSYS2 bin folder, copy it to the root next to the exe.
+            # If it exists in the MSYS2 bin folder, copy only if newer or missing.
             if (Test-Path $srcPath) {
                 $destPath = Join-Path $DIST $dllName
-                if (-not (Test-Path $destPath)) {
-                    Copy-Item $srcPath $destPath
+                if (Copy-IfNewer $srcPath $destPath) {
                     Write-Host "  copied: $dllName"
+                    $totalCopied++
                 }
             }
         }
     }
 }
 
-# ── GTK Resources ────────────────────────────────────────────────────────────
-Write-Info "Copying GTK icons and schemas..."
+Write-Info "Incremental sync: $totalCopied file(s) updated."
+
+# ── GTK Resources (incremental) ──────────────────────────────────────────────
+Write-Info "Syncing GTK icons and schemas (incremental)..."
 
 foreach ($theme in @("hicolor", "Adwaita")) {
     $src  = Join-Path $MsysPath "share\icons\$theme"
     $dest = Join-Path $DIST   "share\icons\$theme"
-    if (Test-Path $src) { Copy-Item -Recurse -Force $src (Split-Path $dest) | Out-Null }
+    if (Test-Path $src) {
+        $n = Sync-Directory $src $dest
+        $totalCopied += $n
+    }
 }
 
 $schemasSrc  = Join-Path $MsysPath "share\glib-2.0\schemas"
 $schemasDest = Join-Path $DIST   "share\glib-2.0\schemas"
 if (Test-Path $schemasSrc) {
     New-Item -ItemType Directory -Force $schemasDest | Out-Null
-    Copy-Item "$schemasSrc\*.xml" $schemasDest -ErrorAction SilentlyContinue
-    $compiler = Join-Path $MsysPath "bin\glib-compile-schemas.exe"
-    if (Test-Path $compiler) { & $compiler $schemasDest }
+    # Only re-copy and recompile schemas if any XML files changed.
+    $schemasChanged = 0
+    Get-ChildItem "$schemasSrc\*.xml" -ErrorAction SilentlyContinue | ForEach-Object {
+        $destFile = Join-Path $schemasDest $_.Name
+        if (Copy-IfNewer $_.FullName $destFile) { $schemasChanged++ }
+    }
+    if ($schemasChanged -gt 0) {
+        $compiler = Join-Path $MsysPath "bin\glib-compile-schemas.exe"
+        if (Test-Path $compiler) { & $compiler $schemasDest }
+        $totalCopied += $schemasChanged
+    }
 }
+
+Write-Info "Total incremental sync: $totalCopied file(s) updated."
 
 # ── Zip Archive ──────────────────────────────────────────────────────────────
 Write-Info "Creating zip archive..."
