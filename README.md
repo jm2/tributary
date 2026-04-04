@@ -294,13 +294,39 @@ data/                        # .desktop, AppStream metainfo, icons
 
 ---
 
-## Development Phases
+## Usage
 
-1. **Phase 1:** ✅ Project skeleton, core traits, GTK4 window scaffold, CI/CD
-2. **Phase 2:** ✅ Full Rhythmbox-style UI with `GtkColumnView`, browser filtering, multi-pane layout
-3. **Phase 3:** ✅ Local backend — SQLite (`SeaORM`), `lofty` tag parsing, `notify` FS watching, async engine
-4. **Phase 4:** ✅ GStreamer audio playback (`playbin3`), MPRIS/SMTC/macOS Now Playing (`souvlaki`), full transport controls
-5. **Phase 5:** ✅ Remote backends — Subsonic/Navidrome, Jellyfin, Plex (REST/JSON), DAAP/iTunes Sharing (DMAP binary protocol), mDNS/UDP discovery, sidebar eject for DAAP
+### Browsing Your Library
+
+On first launch, Tributary scans your `~/Music` folder (configurable in Preferences) and displays all discovered tracks in the main tracklist. Use the **browser panes** above the tracklist to filter by Genre → Artist → Album. Click any column header to sort; click again to reverse; click a third time to clear the sort.
+
+### Connecting to Remote Servers
+
+Remote servers are discovered automatically via mDNS (DAAP, Subsonic, Plex) and UDP broadcast (Jellyfin). Discovered servers appear in the sidebar — click one to connect. Password-protected DAAP shares show a lock icon; passwordless shares connect with a single click.
+
+You can also configure servers via environment variables (see [Remote Backend Configuration](#remote-backend-configuration) above).
+
+### Playback Controls
+
+- **Play/Pause** — click the circular play button, or double-click any track in the tracklist
+- **Next / Previous** — skip buttons; Previous restarts the current track if more than 3 seconds in
+- **Shuffle** — randomises track order (avoids repeating the current track)
+- **Repeat** — cycles through Off → All → One
+- **Seek** — drag the progress scrubber
+- **Volume** — drag the volume slider (cubic perceptual curve)
+
+### Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+Q` / `Cmd+Q` | Quit |
+
+### Preferences
+
+Open **Preferences** from the hamburger menu (☰) to:
+- Change the local music library folder
+- Toggle browser filter panes (Genre, Artist, Album)
+- Show/hide tracklist columns
 
 ---
 
