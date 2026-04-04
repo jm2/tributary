@@ -51,14 +51,49 @@ pub struct RadioStation {
     pub geo_long: Option<f64>,
 }
 
-/// Response from the ipapi.co geolocation API (HTTPS, free tier).
-#[derive(Debug, Deserialize)]
+/// Geolocation result from the multi-provider cascade.
+#[derive(Debug)]
 pub struct GeoLocation {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub country_code: String,
+}
+
+// ── Provider-specific response types (internal) ─────────────────────
+
+/// Response from ipapi.co (HTTPS, free tier).
+#[derive(Debug, Deserialize)]
+pub struct IpApiCoResponse {
     #[serde(default)]
     pub latitude: f64,
     #[serde(default)]
     pub longitude: f64,
-    /// Present and `true` when the API returns an error.
+    #[serde(default)]
+    pub country_code: String,
     #[serde(default)]
     pub error: bool,
+}
+
+/// Response from ipwho.is (HTTPS, free tier).
+#[derive(Debug, Deserialize)]
+pub struct IpWhoIsResponse {
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub latitude: f64,
+    #[serde(default)]
+    pub longitude: f64,
+    #[serde(default)]
+    pub country_code: String,
+}
+
+/// Response from freeipapi.com (HTTPS, free tier).
+#[derive(Debug, Deserialize)]
+pub struct FreeIpApiResponse {
+    #[serde(default)]
+    pub latitude: f64,
+    #[serde(default)]
+    pub longitude: f64,
+    #[serde(default, rename = "countryCode")]
+    pub country_code: String,
 }

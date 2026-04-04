@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use super::api::{GeoLocation, RadioStation};
+use super::api::{FreeIpApiResponse, GeoLocation, IpApiCoResponse, IpWhoIsResponse, RadioStation};
 
 /// Default station fetch limit.
 const DEFAULT_LIMIT: u32 = 100;
@@ -65,10 +65,31 @@ impl RadioBrowserClient {
     }
 
     /// Fetch stations near the given coordinates, sorted by distance.
+    ///
+    /// Adds `has_geo_info=true` to ensure only stations with actual
+    /// coordinates are returned and properly distance-sorted.
+    /// If a `country_code` is provided, results are further filtered
+    /// to the user's country for better relevance.
     pub async fn fetch_near_me(&self, lat: f64, lon: f64, limit: Option<u32>) -> Vec<RadioStation> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
         let url = format!(
-            "{}/json/stations/search?geo_lat={lat}&geo_long={lon}&order=geo_distance&limit={limit}&hidebroken=true",
+            "{}/json/stations/search?geo_lat={lat}&geo_long={lon}&order=geo_distance&has_geo_info=true&limit={limit}&hidebroken=true",
+            self.base_url
+        );
+        self.fetch_stations(&url).await
+    }
+
+    /// Fetch stations near the given coordinates, filtered by country code.
+    pub async fn fetch_near_me_with_country(
+        &self,
+        lat: f64,
+        lon: f64,
+        country_code: &str,
+        limit: Option<u32>,
+    ) -> Vec<RadioStation> {
+        let limit = limit.unwrap_or(DEFAULT_LIMIT);
+        let url = format!(
+            "{}/json/stations/search?geo_lat={lat}&geo_long={lon}&order=geo_distance&has_geo_info=true&countrycode={country_code}&limit={limit}&hidebroken=true",
             self.base_url
         );
         self.fetch_stations(&url).await
@@ -108,30 +129,105 @@ impl RadioBrowserClient {
 
 /// Fetch the user's approximate geographic coordinates via IP geolocation.
 ///
-/// Uses `ipapi.co` which provides a free HTTPS tier (no API key required,
-/// 1000 requests/day). Returns `None` on any error.
-pub async fn fetch_geolocation() -> Option<(f64, f64)> {
-    let url = "https://ipapi.co/json/";
-    info!("Fetching geolocation from ipapi.co (HTTPS)");
-
+/// Uses a multi-provider cascade of reputable HTTPS geolocation APIs:
+/// 1. `ipapi.co` — HTTPS, global, 1000 req/day free
+/// 2. `ipwho.is` — HTTPS, global, no documented rate limit
+/// 3. `freeipapi.com` — HTTPS, global, 60 req/min free
+///
+/// Returns the first successful result with valid coordinates.
+/// Returns `None` if all providers fail.
+pub async fn fetch_geolocation() -> Option<GeoLocation> {
     let client = reqwest::Client::builder()
         .user_agent("Tributary/0.2")
         .timeout(REQUEST_TIMEOUT)
         .build()
         .ok()?;
 
-    let resp = client.get(url).send().await.ok()?;
-    let geo: GeoLocation = resp.json().await.ok()?;
-
-    if !geo.error && (geo.latitude != 0.0 || geo.longitude != 0.0) {
+    // ── Provider 1: ipapi.co ────────────────────────────────────────
+    info!("Geolocation: trying ipapi.co (HTTPS)");
+    if let Some(geo) = try_ipapi_co(&client).await {
         info!(
             lat = geo.latitude,
             lon = geo.longitude,
-            "Geolocation resolved"
+            cc = %geo.country_code,
+            "Geolocation resolved via ipapi.co"
         );
-        Some((geo.latitude, geo.longitude))
+        return Some(geo);
+    }
+
+    // ── Provider 2: ipwho.is ────────────────────────────────────────
+    info!("Geolocation: trying ipwho.is (HTTPS)");
+    if let Some(geo) = try_ipwhois(&client).await {
+        info!(
+            lat = geo.latitude,
+            lon = geo.longitude,
+            cc = %geo.country_code,
+            "Geolocation resolved via ipwho.is"
+        );
+        return Some(geo);
+    }
+
+    // ── Provider 3: freeipapi.com ───────────────────────────────────
+    info!("Geolocation: trying freeipapi.com (HTTPS)");
+    if let Some(geo) = try_freeipapi(&client).await {
+        info!(
+            lat = geo.latitude,
+            lon = geo.longitude,
+            cc = %geo.country_code,
+            "Geolocation resolved via freeipapi.com"
+        );
+        return Some(geo);
+    }
+
+    warn!("All geolocation providers failed");
+    None
+}
+
+/// Try ipapi.co geolocation.
+async fn try_ipapi_co(client: &reqwest::Client) -> Option<GeoLocation> {
+    let resp = client.get("https://ipapi.co/json/").send().await.ok()?;
+    let data: IpApiCoResponse = resp.json().await.ok()?;
+    if !data.error && (data.latitude != 0.0 || data.longitude != 0.0) {
+        Some(GeoLocation {
+            latitude: data.latitude,
+            longitude: data.longitude,
+            country_code: data.country_code,
+        })
     } else {
-        warn!("Geolocation API returned error or zero coordinates");
+        None
+    }
+}
+
+/// Try ipwho.is geolocation.
+async fn try_ipwhois(client: &reqwest::Client) -> Option<GeoLocation> {
+    let resp = client.get("https://ipwho.is/").send().await.ok()?;
+    let data: IpWhoIsResponse = resp.json().await.ok()?;
+    if data.success && (data.latitude != 0.0 || data.longitude != 0.0) {
+        Some(GeoLocation {
+            latitude: data.latitude,
+            longitude: data.longitude,
+            country_code: data.country_code,
+        })
+    } else {
+        None
+    }
+}
+
+/// Try freeipapi.com geolocation.
+async fn try_freeipapi(client: &reqwest::Client) -> Option<GeoLocation> {
+    let resp = client
+        .get("https://freeipapi.com/api/json")
+        .send()
+        .await
+        .ok()?;
+    let data: FreeIpApiResponse = resp.json().await.ok()?;
+    if data.latitude != 0.0 || data.longitude != 0.0 {
+        Some(GeoLocation {
+            latitude: data.latitude,
+            longitude: data.longitude,
+            country_code: data.country_code,
+        })
+    } else {
         None
     }
 }
@@ -143,8 +239,6 @@ pub async fn fetch_geolocation() -> Option<(f64, f64)> {
 /// Instead, we verify that DNS resolution succeeds (proving the service is
 /// reachable) and then use the fallback hostname which is covered by the cert.
 fn resolve_api_host() -> Option<String> {
-    // Resolve the DNS A records for the Radio-Browser discovery hostname.
-    // This validates that the Radio-Browser service is reachable.
     let addrs: Vec<_> = "all.api.radio-browser.info:443"
         .to_socket_addrs()
         .ok()?
@@ -154,10 +248,6 @@ fn resolve_api_host() -> Option<String> {
         return None;
     }
 
-    // DNS resolved successfully — the service is up.
-    // Use the well-known fallback hostname since TLS certs don't cover
-    // raw IPs. In the future, we could maintain a list of known mirrors
-    // and pick one randomly.
     info!(
         resolved_count = addrs.len(),
         host = FALLBACK_API_HOST,

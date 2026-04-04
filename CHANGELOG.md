@@ -33,11 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Jellyfin UDP discovery** — Now runs in a continuous loop (60-second intervals) instead of a single broadcast, enabling dynamic server detection and removal.
 
 ### Security
-- **HTTPS geolocation** — Switched from `http://ip-api.com` (plaintext) to `https://ipapi.co` (encrypted) for IP-based geolocation.
+- **HTTPS geolocation** — Multi-provider HTTPS cascade (`ipapi.co` → `ipwho.is` → `freeipapi.com`) for IP-based geolocation. All providers are reputable, global, and require no API keys.
 - **Request timeouts** — All Radio-Browser API and geolocation HTTP requests now have a 15-second timeout to prevent indefinite hangs. DAAP logout requests now use a 5-second timeout.
 - **Stream URL validation** — Radio station stream URLs are filtered to only allow `http://` and `https://` schemes, preventing `file://` or other scheme injection from malicious Radio-Browser entries.
 - **Auth token redaction in logs** — Added `redact_url_secrets()` utility that masks `X-Plex-Token`, `api_key` (Jellyfin), and Subsonic `t`/`s` (token/salt) query parameters before they reach log output. Applied to all debug-level request logging in Plex, Subsonic, and Jellyfin clients, and to the GStreamer `load_uri` info log. Subsonic salt (`s`) is only redacted when the token param (`t`) is also present, avoiding false positives on unrelated URLs.
 - **SQLite WAL mode** — Enabled `PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=5000` on database init for safer concurrent access and reduced `SQLITE_BUSY` errors.
+
+### UI Polish
+- **Preferences checkmarks** — Added CSS rule to fix low-resolution checkmark indicators on Windows (`checkbutton indicator` forced to 18×18px with explicit icon size).
+- **Radio column rename** — The "Artist" column is dynamically renamed to "Country" when viewing radio stations, and restored to "Artist" when switching back to music sources.
+- **Stations Near Me accuracy** — Added `has_geo_info=true` filter to Radio-Browser queries so only stations with actual coordinates are returned. Country code from geolocation is passed as `countrycode` filter for dramatically improved local relevance.
 
 ### Removed
 - **Keyboard Shortcuts** menu item removed from the hamburger menu (was non-functional).

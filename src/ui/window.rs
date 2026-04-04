@@ -2310,12 +2310,20 @@ fn apply_radio_columns(column_view: &gtk::ColumnView, radio: bool) {
     for i in 0..columns.n_items() {
         if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
             if let Some(title) = col.title() {
-                let title = title.to_string();
+                let title_str = title.to_string();
                 if radio {
-                    col.set_visible(RADIO_VISIBLE_COLUMNS.contains(&title.as_str()));
+                    col.set_visible(RADIO_VISIBLE_COLUMNS.contains(&title_str.as_str()));
+                    // Rename "Artist" → "Country" for radio view.
+                    if title_str == "Artist" {
+                        col.set_title(Some("Country"));
+                    }
                 } else {
                     // Restore all — the caller will apply user prefs after.
                     col.set_visible(true);
+                    // Rename "Country" back to "Artist" for music view.
+                    if title_str == "Country" {
+                        col.set_title(Some("Artist"));
+                    }
                 }
             }
         }
@@ -2505,10 +2513,25 @@ fn fetch_and_display_nearme(
     let (stations_tx, stations_rx) = async_channel::bounded::<String>(1);
 
     rt_handle.spawn(async move {
-        // First get geolocation.
-        if let Some((lat, lon)) = crate::radio::client::fetch_geolocation().await {
+        // First get geolocation (multi-provider cascade).
+        if let Some(geo) = crate::radio::client::fetch_geolocation().await {
             let client = crate::radio::RadioBrowserClient::new();
-            let stations = client.fetch_near_me(lat, lon, None).await;
+            // Use country-filtered search if we have a country code,
+            // otherwise fall back to global geo-distance search.
+            let stations = if !geo.country_code.is_empty() {
+                client
+                    .fetch_near_me_with_country(
+                        geo.latitude,
+                        geo.longitude,
+                        &geo.country_code,
+                        None,
+                    )
+                    .await
+            } else {
+                client
+                    .fetch_near_me(geo.latitude, geo.longitude, None)
+                    .await
+            };
             // Send raw station data as serialized JSON; convert on GTK thread.
             let json = serde_json::to_string(&stations).unwrap_or_default();
             let _ = stations_tx.send(json).await;
