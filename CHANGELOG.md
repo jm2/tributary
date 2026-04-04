@@ -34,8 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - **HTTPS geolocation** — Switched from `http://ip-api.com` (plaintext) to `https://ipapi.co` (encrypted) for IP-based geolocation.
-- **Request timeouts** — All Radio-Browser API and geolocation HTTP requests now have a 15-second timeout to prevent indefinite hangs.
+- **Request timeouts** — All Radio-Browser API and geolocation HTTP requests now have a 15-second timeout to prevent indefinite hangs. DAAP logout requests now use a 5-second timeout.
 - **Stream URL validation** — Radio station stream URLs are filtered to only allow `http://` and `https://` schemes, preventing `file://` or other scheme injection from malicious Radio-Browser entries.
+- **Auth token redaction in logs** — Added `redact_url_secrets()` utility that masks `X-Plex-Token`, `api_key` (Jellyfin), and Subsonic `t`/`s` (token/salt) query parameters before they reach log output. Applied to all debug-level request logging in Plex, Subsonic, and Jellyfin clients, and to the GStreamer `load_uri` info log. Subsonic salt (`s`) is only redacted when the token param (`t`) is also present, avoiding false positives on unrelated URLs.
+- **SQLite WAL mode** — Enabled `PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=5000` on database init for safer concurrent access and reduced `SQLITE_BUSY` errors.
 
 ### Removed
 - **Keyboard Shortcuts** menu item removed from the hamburger menu (was non-functional).
@@ -44,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Endless playback spinner on certain remote source tracks.
 - Spinner blinking at sub-100 ms intervals on local file playback.
 - `remove_empty_category_header` was previously dead code — now actively used by discovery `Lost` events.
+- **Runtime panic in `fetch_remote_album_art`** — `tokio::task::spawn` was called from the GTK main thread which has no tokio runtime context. Replaced with `Handle::try_current()` guard to safely spawn on the background runtime.
+- **Album art blocking GTK main thread** — `update_album_art()` now extracts embedded picture bytes on a background `std::thread`, sending results back via `async_channel`. Previously, `lofty::read_from_path()` ran synchronously on the GTK thread, causing UI freezes on large FLAC files.
+- **Tokio runtime premature shutdown** — Replaced `tokio::signal::ctrl_c()` parking with `std::future::pending()`. The `ctrl_c` approach was unreliable on Windows without a console and could drop in-flight async tasks if Ctrl+C fired before GTK exited.
+- **`DaapBackend::Drop` panic on shutdown** — The `Drop` impl now guards `tokio::task::spawn` with `Handle::try_current()` to avoid panicking when the runtime has already been dropped during process teardown.
+- **Double-wrapped LIKE pattern in local search** — `LocalBackend::search()` was passing `%query%` to SeaORM's `.contains()` which adds its own `%` wrapping, producing `%%query%%`. Now passes the raw query string.
+- **Unsafe `.unwrap()` on `ColumnViewColumn` downcast** — `restore_sort_state()` now uses `let Some(col) = ... else { continue }` instead of `.unwrap()`.
+- **Settings directory not pre-created** — `save_volume()` and all window settings persistence (`save_repeat_mode`, `save_shuffle`, `save_sort_state`) now ensure the `<data_dir>/tributary/` directory exists via `create_dir_all` before writing, preventing silent failures on first launch before the database initialises.
 
 ---
 
