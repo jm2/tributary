@@ -119,7 +119,7 @@ impl SubsonicClient {
             }
         }
 
-        debug!(url = %url, "Subsonic request");
+        debug!(url = %crate::audio::redact_url_secrets(url.as_str()), "Subsonic request");
 
         let resp = self.http.get(url.as_str()).send().await.map_err(|e| {
             BackendError::ConnectionFailed {

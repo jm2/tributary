@@ -228,7 +228,7 @@ impl PlexClient {
             }
         }
 
-        debug!(url = %url, "Plex request");
+        debug!(url = %crate::audio::redact_url_secrets(url.as_str()), "Plex request");
 
         let resp = self.http.get(url.as_str()).send().await.map_err(|e| {
             BackendError::ConnectionFailed {

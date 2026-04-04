@@ -431,9 +431,13 @@ impl Drop for DaapBackend {
             self.client.session_id()
         );
         let http = self.client.http_clone();
-        tokio::task::spawn(async move {
-            let _ = http.get(&url).send().await;
-        });
+        // Guard against missing runtime — during process shutdown the
+        // tokio runtime may already be dropped.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = http.get(&url).send().await;
+            });
+        }
     }
 }
 

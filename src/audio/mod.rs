@@ -118,7 +118,7 @@ impl Player {
     /// Immediately emits [`PlayerState::Buffering`] so the UI can show a
     /// spinner while the pipeline transitions to `Playing`.
     pub fn load_uri(&self, uri: &str) {
-        info!(uri, "Loading track");
+        info!(uri = %redact_url_secrets(uri), "Loading track");
         let _ = self.playbin.set_state(gst::State::Null);
         self.playbin.set_property("uri", uri);
         // Re-apply volume — the NULL transition resets it to 1.0.
@@ -417,6 +417,55 @@ fn load_saved_volume() -> Option<f64> {
 
 fn save_volume(level: f64) {
     if let Some(path) = volume_path() {
+        // Ensure the parent directory exists (may not on first launch
+        // if the DB hasn't been initialised yet).
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let _ = std::fs::write(path, format!("{level:.3}"));
     }
+}
+
+// ── URL secret redaction ────────────────────────────────────────────────
+
+/// Mask sensitive query parameters in URLs for safe logging.
+///
+/// Redacts `X-Plex-Token`, `api_key`, `t` (Subsonic token), and `s`
+/// (Subsonic salt) to prevent auth credentials from appearing in logs.
+pub fn redact_url_secrets(uri: &str) -> String {
+    // Note: "s" is only redacted when "t" is also present (Subsonic salt+token pair).
+    // This avoids false positives on unrelated URLs that happen to have an "s" param.
+    const SENSITIVE_PARAMS: &[&str] = &["X-Plex-Token", "api_key"];
+    const SUBSONIC_TOKEN_PARAMS: &[&str] = &["t", "s"];
+
+    let Ok(mut url) = url::Url::parse(uri) else {
+        return uri.to_string();
+    };
+
+    // Check if this looks like a Subsonic URL (has both "t" and "s" params).
+    let has_subsonic_token = url.query_pairs().any(|(k, _)| k == "t");
+
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| {
+            let should_redact = SENSITIVE_PARAMS.contains(&k.as_ref())
+                || (has_subsonic_token && SUBSONIC_TOKEN_PARAMS.contains(&k.as_ref()));
+            let v = if should_redact {
+                "REDACTED".to_string()
+            } else {
+                v.to_string()
+            };
+            (k.to_string(), v)
+        })
+        .collect();
+
+    if pairs.is_empty() {
+        return uri.to_string();
+    }
+
+    url.query_pairs_mut().clear();
+    for (k, v) in &pairs {
+        url.query_pairs_mut().append_pair(k, v);
+    }
+    url.to_string()
 }

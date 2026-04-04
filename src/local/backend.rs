@@ -47,14 +47,12 @@ impl MediaBackend for LocalBackend {
     }
 
     async fn search(&self, query: &str, limit: usize) -> BackendResult<SearchResults> {
-        let pattern = format!("%{query}%");
-
         let tracks: Vec<Track> = track::Entity::find()
             .filter(
                 Condition::any()
-                    .add(track::Column::Title.contains(&pattern))
-                    .add(track::Column::ArtistName.contains(&pattern))
-                    .add(track::Column::AlbumTitle.contains(&pattern)),
+                    .add(track::Column::Title.contains(query))
+                    .add(track::Column::ArtistName.contains(query))
+                    .add(track::Column::AlbumTitle.contains(query)),
             )
             .all(&self.db)
             .await

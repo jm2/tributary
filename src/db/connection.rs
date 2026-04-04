@@ -1,6 +1,6 @@
 //! Database connection factory and migration runner.
 
-use sea_orm::{Database, DatabaseConnection, DbErr};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbErr};
 use sea_orm_migration::MigratorTrait;
 use tracing::info;
 
@@ -22,6 +22,12 @@ pub async fn init_db() -> Result<DatabaseConnection, DbErr> {
 
     info!(path = %db_path.display(), "Opening database");
     let db = Database::connect(&db_url).await?;
+
+    // Enable WAL mode for better concurrent read/write performance.
+    // WAL allows readers to proceed without blocking on writers and
+    // significantly reduces SQLITE_BUSY errors under load.
+    db.execute_unprepared("PRAGMA journal_mode=WAL").await?;
+    db.execute_unprepared("PRAGMA busy_timeout=5000").await?;
 
     info!("Running pending migrations");
     Migrator::up(&db, None).await?;

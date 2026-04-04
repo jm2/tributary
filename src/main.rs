@@ -95,12 +95,13 @@ fn main() {
     );
     let rt_handle = rt.handle().clone();
 
-    // Keep the runtime alive on a background thread
+    // Keep the runtime alive on a background thread.
+    // We use `std::future::pending()` to park the runtime indefinitely —
+    // it will be torn down when the process exits via `std::process::exit`.
+    // Using `ctrl_c` was problematic: on Windows without a console it may
+    // never fire, and if it fires early it drops in-flight tasks.
     let _rt_thread = thread::spawn(move || {
-        rt.block_on(async {
-            // Park the runtime until the process exits
-            tokio::signal::ctrl_c().await.ok();
-        });
+        rt.block_on(std::future::pending::<()>());
     });
 
     // ── Library engine channel ───────────────────────────────────────

@@ -112,7 +112,7 @@ impl JellyfinClient {
             pw: password.to_string(),
         };
 
-        debug!(url = %auth_url, "Jellyfin auth request");
+        debug!(url = %crate::audio::redact_url_secrets(auth_url.as_str()), "Jellyfin auth request");
 
         let resp = pre_auth_http
             .post(auth_url.as_str())
@@ -240,7 +240,7 @@ impl JellyfinClient {
             }
         }
 
-        debug!(url = %url, "Jellyfin request");
+        debug!(url = %crate::audio::redact_url_secrets(url.as_str()), "Jellyfin request");
 
         let resp = self.http.get(url.as_str()).send().await.map_err(|e| {
             BackendError::ConnectionFailed {
@@ -280,7 +280,7 @@ impl JellyfinClient {
     /// Used for endpoints that return plain text (e.g. `/System/Ping`).
     pub async fn get_text(&self, endpoint: &str) -> BackendResult<String> {
         let url = self.api_url(endpoint);
-        debug!(url = %url, "Jellyfin text request");
+        debug!(url = %crate::audio::redact_url_secrets(url.as_str()), "Jellyfin text request");
 
         let resp = self.http.get(url.as_str()).send().await.map_err(|e| {
             BackendError::ConnectionFailed {

@@ -634,7 +634,11 @@ pub fn build_window(
                             if !logout_url.is_empty() {
                                 let rt = rt_handle.clone();
                                 rt.spawn(async move {
-                                    let _ = reqwest::get(&logout_url).await;
+                                    let client = reqwest::Client::builder()
+                                        .timeout(std::time::Duration::from_secs(5))
+                                        .build()
+                                        .unwrap_or_default();
+                                    let _ = client.get(&logout_url).send().await;
                                 });
                             }
                             break;
@@ -1635,6 +1639,9 @@ fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
 /// Extract embedded album art from a track's file and display it on the
 /// header bar image widget.  Falls back to the generic placeholder icon
 /// if no art is found or the URI is not a local file.
+///
+/// Tag reading is performed on a background thread to avoid blocking
+/// the GTK main loop — large FLAC files can take hundreds of ms to parse.
 fn update_album_art(image: &gtk::Image, uri: &str) {
     // Only attempt extraction for local file:// URIs.
     let path = match url::Url::parse(uri) {
@@ -1651,66 +1658,64 @@ fn update_album_art(image: &gtk::Image, uri: &str) {
         }
     };
 
-    // Read tags and extract the first embedded picture.
-    //
-    // Strategy:
-    //  1. Try the unified `Tag::pictures()` API (works for ID3, Vorbis, etc.)
-    //  2. For MP4/M4A files (iTunes Store purchases), the cover art is stored
-    //     in the `covr` atom.  lofty exposes this through `Mpeg4Ilst` which
-    //     may not surface via `pictures()` in all versions.  Fall back to
-    //     reading the raw MP4 atom data directly.
-    let texture = (|| -> Option<gtk::gdk::Texture> {
-        use lofty::file::TaggedFileExt;
+    // Set placeholder immediately while extracting on background thread.
+    image.set_icon_name(Some("audio-x-generic-symbolic"));
+    let image = image.clone();
 
-        let tagged_file = lofty::read_from_path(&path).ok()?;
+    let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
 
-        // ── Attempt 1: unified pictures() API ───────────────────────
-        for tag in tagged_file.tags() {
-            if let Some(picture) = tag.pictures().first() {
-                let bytes = glib::Bytes::from(picture.data());
-                if let Ok(tex) = gtk::gdk::Texture::from_bytes(&bytes) {
-                    return Some(tex);
-                }
+    // Extract album art bytes on a background thread to avoid blocking GTK.
+    std::thread::spawn(move || {
+        if let Some(bytes) = extract_album_art_bytes(&path) {
+            let _ = tx.send_blocking(bytes);
+        }
+    });
+
+    // Receive on the GTK main thread and create the texture.
+    glib::MainContext::default().spawn_local(async move {
+        if let Ok(data) = rx.recv().await {
+            let bytes = glib::Bytes::from(&data);
+            if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
+                image.set_paintable(Some(&texture));
             }
         }
+    });
+}
 
-        // ── Attempt 2: MP4-specific — read covr atom via mp4ameta ───
-        // lofty's Mpeg4Ilst tag should already be covered above, but
-        // as a belt-and-suspenders fallback for iTunes M4A files we
-        // also try the lower-level mp4ameta crate if available, or
-        // simply re-read with lofty's probe forcing the MP4 parser.
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if matches!(
-            ext.to_lowercase().as_str(),
-            "m4a" | "m4b" | "m4p" | "mp4" | "aac"
-        ) {
-            // Try reading with explicit MP4 file type hint.
-            use lofty::file::FileType;
-            use lofty::probe::Probe;
+/// Extract the first embedded picture from an audio file as raw bytes.
+///
+/// This is a blocking operation — call from a background thread only.
+fn extract_album_art_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+    use lofty::file::TaggedFileExt;
 
-            let probe = Probe::open(&path).ok()?.set_file_type(FileType::Mp4);
-            let tagged = probe.read().ok()?;
-            for tag in tagged.tags() {
-                if let Some(picture) = tag.pictures().first() {
-                    let bytes = glib::Bytes::from(picture.data());
-                    if let Ok(tex) = gtk::gdk::Texture::from_bytes(&bytes) {
-                        return Some(tex);
-                    }
-                }
-            }
-        }
+    let tagged_file = lofty::read_from_path(path).ok()?;
 
-        None
-    })();
-
-    match texture {
-        Some(tex) => {
-            image.set_paintable(Some(&tex));
-        }
-        None => {
-            image.set_icon_name(Some("audio-x-generic-symbolic"));
+    // ── Attempt 1: unified pictures() API ───────────────────────
+    for tag in tagged_file.tags() {
+        if let Some(picture) = tag.pictures().first() {
+            return Some(picture.data().to_vec());
         }
     }
+
+    // ── Attempt 2: MP4-specific fallback ────────────────────────
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if matches!(
+        ext.to_lowercase().as_str(),
+        "m4a" | "m4b" | "m4p" | "mp4" | "aac"
+    ) {
+        use lofty::file::FileType;
+        use lofty::probe::Probe;
+
+        let probe = Probe::open(path).ok()?.set_file_type(FileType::Mp4);
+        let tagged = probe.read().ok()?;
+        for tag in tagged.tags() {
+            if let Some(picture) = tag.pictures().first() {
+                return Some(picture.data().to_vec());
+            }
+        }
+    }
+
+    None
 }
 
 /// Fetch remote album art asynchronously and display it on the header
@@ -1725,19 +1730,27 @@ fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
 
     let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
 
-    // Fetch on a background thread (reqwest is already available).
-    tokio::task::spawn(async move {
-        match reqwest::get(&url).await {
-            Ok(resp) => {
-                if let Ok(bytes) = resp.bytes().await {
-                    let _ = tx.send(bytes.to_vec()).await;
+    // Fetch on the tokio runtime via a handle — the GTK main thread
+    // does not have a tokio runtime context, so `tokio::task::spawn`
+    // would panic here.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap_or_default();
+            match client.get(&url).send().await {
+                Ok(resp) => {
+                    if let Ok(bytes) = resp.bytes().await {
+                        let _ = tx.send(bytes.to_vec()).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "Failed to fetch remote album art");
                 }
             }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to fetch remote album art");
-            }
-        }
-    });
+        });
+    }
 
     // Receive on the GTK main thread.
     glib::MainContext::default().spawn_local(async move {
@@ -1991,6 +2004,17 @@ fn settings_path(name: &str) -> Option<std::path::PathBuf> {
     dirs::data_dir().map(|d| d.join("tributary").join(name))
 }
 
+/// Ensure the tributary data directory exists, then write a settings file.
+/// Silently ignores errors (best-effort persistence).
+fn write_setting(name: &str, content: &str) {
+    if let Some(path) = settings_path(name) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, content);
+    }
+}
+
 fn load_repeat_mode() -> RepeatMode {
     settings_path("repeat")
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -2003,14 +2027,12 @@ fn load_repeat_mode() -> RepeatMode {
 }
 
 fn save_repeat_mode(mode: RepeatMode) {
-    if let Some(path) = settings_path("repeat") {
-        let s = match mode {
-            RepeatMode::Off => "off",
-            RepeatMode::All => "all",
-            RepeatMode::One => "one",
-        };
-        let _ = std::fs::write(path, s);
-    }
+    let s = match mode {
+        RepeatMode::Off => "off",
+        RepeatMode::All => "all",
+        RepeatMode::One => "one",
+    };
+    write_setting("repeat", s);
 }
 
 fn load_shuffle() -> bool {
@@ -2021,9 +2043,7 @@ fn load_shuffle() -> bool {
 }
 
 fn save_shuffle(active: bool) {
-    if let Some(path) = settings_path("shuffle") {
-        let _ = std::fs::write(path, if active { "true" } else { "false" });
-    }
+    write_setting("shuffle", if active { "true" } else { "false" });
 }
 
 fn save_sort_state(column_view: &gtk::ColumnView) {
@@ -2041,9 +2061,7 @@ fn save_sort_state(column_view: &gtk::ColumnView) {
                 gtk::SortType::Descending => "desc",
                 _ => "asc",
             };
-            if let Some(path) = settings_path("sort") {
-                let _ = std::fs::write(path, format!("{title}\n{dir}"));
-            }
+            write_setting("sort", &format!("{title}\n{dir}"));
         }
         None => {
             // No active sort — remove saved state.
@@ -2068,7 +2086,9 @@ fn restore_sort_state(column_view: &gtk::ColumnView) {
     let columns = column_view.columns();
     for i in 0..columns.n_items() {
         if let Some(col) = columns.item(i) {
-            let col = col.downcast_ref::<gtk::ColumnViewColumn>().unwrap();
+            let Some(col) = col.downcast_ref::<gtk::ColumnViewColumn>() else {
+                continue;
+            };
             if col.title().is_some_and(|t| t == title) {
                 column_view.sort_by_column(Some(col), order);
                 return;
