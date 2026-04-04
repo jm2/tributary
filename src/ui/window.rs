@@ -2504,6 +2504,7 @@ fn handle_radio_nearme(
 }
 
 /// Fetch geolocation + nearby stations and display them.
+#[allow(clippy::too_many_arguments)]
 fn fetch_and_display_nearme(
     rt_handle: tokio::runtime::Handle,
     track_store: gtk::gio::ListStore,

@@ -23,6 +23,10 @@
     If specified, sets up the MSYS2 build environment and runs `cargo check` only.
     Useful for quick compilation checking from PowerShell without a full build.
 
+.PARAMETER Clippy
+    If specified, sets up the MSYS2 build environment and runs `cargo clippy -- -D warnings`.
+    Useful for running the Clippy linter from PowerShell without a full build.
+
 .PARAMETER Fmt
     If specified, sets up the MSYS2 build environment and runs `cargo fmt` only.
     Useful for formatting code from PowerShell without a full build.
@@ -33,6 +37,7 @@ param(
     [switch]$NoCargoBuild,
     [switch]$InnoSetup,
     [switch]$Check,
+    [switch]$Clippy,
     [switch]$Fmt
 )
 
@@ -140,6 +145,14 @@ if ($Check) {
     cargo check --target $RustTarget
     if ($LASTEXITCODE -ne 0) { Write-Err "cargo check failed." }
     Write-Info "Check passed."
+    exit 0
+}
+
+if ($Clippy) {
+    Write-Info "Running cargo clippy for $RustTarget..."
+    cargo clippy --target $RustTarget -- -D warnings
+    if ($LASTEXITCODE -ne 0) { Write-Err "cargo clippy failed." }
+    Write-Info "Clippy passed."
     exit 0
 }
 
