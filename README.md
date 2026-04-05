@@ -215,6 +215,9 @@ On Windows, the build script can also be used for quick formatting and type-chec
 
 # Type-check without a full build:
 .\scripts\build-windows.ps1 -Check
+
+# Run Clippy linter (warnings as errors):
+.\scripts\build-windows.ps1 -Clippy
 ```
 
 ---
