@@ -60,7 +60,7 @@ dirs = "6"
 fastrand = "2"
 
 # Subsonic / Jellyfin / Plex API client
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 
 # URL percent-encoding (Plex auth form body)
 urlencoding = "2"

@@ -148,6 +148,14 @@ pub fn build_window(
     let current_pos: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
     let seeking = Rc::new(Cell::new(false));
 
+    // ── Connection guard ─────────────────────────────────────────────
+    // Tracks which server URL is currently being connected to, and the
+    // sidebar position that was active before the connection attempt.
+    // Used to (a) only auto-select on RemoteSync if the source matches
+    // the pending connection, and (b) revert the sidebar on failure.
+    let pending_connection: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let pre_connect_selection: Rc<Cell<u32>> = Rc::new(Cell::new(1)); // default: local (index 1)
+
     // ── Per-source track storage ────────────────────────────────────
     // Key: "local" for local filesystem, or server URL for remote.
     let source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>> =
@@ -861,6 +869,10 @@ pub fn build_window(
             // For passwordless DAAP servers, bypass the dialog entirely
             // and connect directly.
             if backend_type == "daap" && !requires_password {
+                // Save the current selection so we can revert on failure.
+                pre_connect_selection.set(selected_pos);
+                *pending_connection.borrow_mut() = Some(url_for_closure.clone());
+
                 // Mark as connecting → spinner in sidebar.
                 if let Some(src) = sidebar_store
                     .item(selected_pos)
@@ -874,6 +886,9 @@ pub fn build_window(
 
                 let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
                 let sidebar_store_for_fail = sidebar_store.clone();
+                let sel_for_fail = sel.clone();
+                let pre_sel = pre_connect_selection.get();
+                let pending_for_fail = pending_connection.clone();
                 glib::MainContext::default().spawn_local(async move {
                     if fail_rx.recv().await.is_ok() {
                         if let Some(src) = sidebar_store_for_fail
@@ -885,6 +900,10 @@ pub fn build_window(
                             sidebar_store_for_fail.remove(selected_pos);
                             sidebar_store_for_fail.insert(selected_pos, &src);
                         }
+                        // Revert sidebar to the previous selection.
+                        sel_for_fail.set_selected(pre_sel);
+                        // Clear the pending connection guard.
+                        *pending_for_fail.borrow_mut() = None;
                     }
                 });
 
@@ -917,6 +936,13 @@ pub fn build_window(
             }
 
             let password_only = backend_type == "daap";
+
+            // Clone Rc's before moving into the auth dialog closure so
+            // the outer `Fn` closure can be called multiple times.
+            let pre_connect_for_auth = pre_connect_selection.clone();
+            let pending_for_auth = pending_connection.clone();
+            let sel_for_auth = sel.clone();
+
             show_auth_dialog(
                 &win,
                 &server_name,
@@ -938,10 +964,17 @@ pub fn build_window(
                         sidebar_store.remove(selected_pos);
                         sidebar_store.insert(selected_pos, &src);
                     }
+                    // Save the current selection so we can revert on failure.
+                    pre_connect_for_auth.set(selected_pos);
+                    *pending_for_auth.borrow_mut() = Some(server_url.clone());
+
                     // One-shot to signal failure back to the main thread so we
                     // can clear the spinner (GObjects are not Send).
                     let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
                     let sidebar_store_for_fail = sidebar_store.clone();
+                    let sel_for_fail = sel_for_auth.clone();
+                    let pre_sel = pre_connect_for_auth.get();
+                    let pending_for_fail = pending_for_auth.clone();
                     glib::MainContext::default().spawn_local(async move {
                         if fail_rx.recv().await.is_ok() {
                             if let Some(src) = sidebar_store_for_fail
@@ -953,6 +986,10 @@ pub fn build_window(
                                 sidebar_store_for_fail.remove(selected_pos);
                                 sidebar_store_for_fail.insert(selected_pos, &src);
                             }
+                            // Revert sidebar to the previous selection.
+                            sel_for_fail.set_selected(pre_sel);
+                            // Clear the pending connection guard.
+                            *pending_for_fail.borrow_mut() = None;
                         }
                     });
 
@@ -1421,13 +1458,27 @@ pub fn build_window(
                             }
                         }
 
-                        seeking.set(true);
-                        progress_adj.set_upper(duration_ms as f64);
-                        progress_adj.set_value(position_ms as f64);
-                        seeking.set(false);
-
+                        // Always update the elapsed time label.
                         position_label.set_label(&format_ms(position_ms));
-                        duration_label.set_label(&format_ms(duration_ms));
+
+                        // Only update the progress slider and duration label
+                        // when the stream has a known duration (> 0).
+                        // Live streams (radio) have duration_ms == 0.
+                        if duration_ms > 0 {
+                            seeking.set(true);
+                            progress_adj.set_upper(duration_ms as f64);
+                            progress_adj.set_value(position_ms as f64);
+                            seeking.set(false);
+                            duration_label.set_label(&format_ms(duration_ms));
+                        } else {
+                            // Live stream: keep slider at 0, show "LIVE" or
+                            // blank for the duration label.
+                            seeking.set(true);
+                            progress_adj.set_upper(1.0);
+                            progress_adj.set_value(0.0);
+                            seeking.set(false);
+                            duration_label.set_label("LIVE");
+                        }
                     }
 
                     PlayerEvent::TrackEnded => {
@@ -1719,8 +1770,9 @@ fn extract_album_art_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
 }
 
 /// Fetch remote album art asynchronously and display it on the header
-/// bar image widget.  Uses a one-shot channel to send the image bytes
-/// from the tokio runtime back to the GTK main thread.
+/// bar image widget.  Uses a background thread + one-shot channel to
+/// avoid depending on a tokio runtime context (which the GTK main
+/// thread does not have).
 fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
     // Set placeholder immediately while fetching.
     image.set_icon_name(Some("audio-x-generic-symbolic"));
@@ -1730,27 +1782,39 @@ fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
 
     let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
 
-    // Fetch on the tokio runtime via a handle — the GTK main thread
-    // does not have a tokio runtime context, so `tokio::task::spawn`
-    // would panic here.
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .build()
-                .unwrap_or_default();
-            match client.get(&url).send().await {
-                Ok(resp) => {
-                    if let Ok(bytes) = resp.bytes().await {
-                        let _ = tx.send(bytes.to_vec()).await;
+    // Fetch on a background thread using a blocking reqwest client.
+    // This avoids the need for a tokio runtime handle on the GTK thread.
+    std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_default();
+        match client.get(&url).send() {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    tracing::debug!(
+                        status = %resp.status(),
+                        "Remote album art HTTP error"
+                    );
+                    return;
+                }
+                match resp.bytes() {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        let _ = tx.send_blocking(bytes.to_vec());
+                    }
+                    Ok(_) => {
+                        tracing::debug!("Remote album art response was empty");
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "Failed to read album art bytes");
                     }
                 }
-                Err(e) => {
-                    tracing::debug!(error = %e, "Failed to fetch remote album art");
-                }
             }
-        });
-    }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to fetch remote album art");
+            }
+        }
+    });
 
     // Receive on the GTK main thread.
     glib::MainContext::default().spawn_local(async move {

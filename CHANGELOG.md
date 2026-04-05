@@ -5,6 +5,18 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-04-05
+
+### Fixed
+- **DAAP date modified 31 years in the future** — The DAAP backend was adding a 978,307,200-second epoch offset to `asdm` (song date modified) values, assuming they were relative to the DAAP epoch (2001-01-01). In practice, real-world DAAP servers (forked-daapd, OwnTone, etc.) send standard Unix timestamps. Removed the offset so dates display correctly. No other protocols were affected.
+- **Avahi duplicate hostname discovery** — When Avahi services are freshly registered (rather than available at startup), Avahi's conflict resolution can append `-2`, `-3`, etc. to hostnames. The mDNS discovery now strips these suffixes before building the dedup key, preventing duplicate sidebar entries like `myhost-2`.
+- **Preferences checkmarks low resolution on Windows/Linux** — The CSS selector was targeting the wrong GTK4 node (`checkbutton indicator` instead of `checkbutton check`). Fixed the selector to target the correct sub-node for crisp rendering across all platforms. Grid layout preserved.
+- **Inno Setup installer not fully silent for Winget** — Added `AppId` (stable GUID), `VersionInfoVersion`, `PrivilegesRequiredOverridesAllowed=commandline`, `DisableDirPage=auto`, `DisableProgramGroupPage=auto`, `CloseApplications=yes`, `CloseApplicationsFilter=tributary.exe`, and `SetupLogging=yes` to the Inno Setup script. These directives ensure Winget's `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-` flags work correctly for fully unattended installs.
+- **About Tributary icon missing on Windows and Linux (RPM)** — The About dialog referenced icon name `"tributary"` but the hicolor theme files are named `io.github.tributary.Tributary.png`. Changed the icon name to `io.github.tributary.Tributary` and updated the icon theme search paths to look in `data/icons/` (development) and `share/icons/` (installed). The Windows build script now bundles the app's hicolor icons into the dist folder.
+- **Failed server connection doesn't revert sidebar selection** — When a server connection attempt fails (timeout, bad credentials, etc.), the sidebar now reverts to the previously selected source instead of staying on the failed entry. A connection guard tracks the pending connection URL and pre-connection sidebar position, clearing the spinner and restoring selection on failure.
+- **Remote cover art not loading** — `fetch_remote_album_art()` relied on `tokio::runtime::Handle::try_current()` which silently fails on the GTK main thread (no tokio context). Replaced with a `std::thread` + `reqwest::blocking::Client` pattern (matching the local album art extractor), with a 15-second timeout. No auth tokens are logged.
+- **Radio station elapsed time not updating** — The GStreamer position timer required both position and duration to be queryable before emitting `PositionChanged` events. Live radio streams have no finite duration, so position ticks were never sent. Now emits ticks with `duration_ms: 0` for live streams. The UI shows elapsed time and displays "LIVE" instead of a duration, and the progress slider stays inactive. This also fixes the occasional endless buffering spinner on slow-to-load streams, since position ticks now clear the spinner for live streams too.
+
 ## [0.2.0] — 2026-04-04
 
 ### Added
@@ -125,5 +137,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
+[0.2.1]: https://github.com/jm2/tributary/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jm2/tributary/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jm2/tributary/releases/tag/v0.1.0

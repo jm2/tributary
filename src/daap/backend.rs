@@ -121,12 +121,12 @@ impl DaapBackend {
             let bitrate = dmap::find_u16(nodes, b"asbr");
             let sample_rate = dmap::find_u32(nodes, b"assr");
 
-            // DAAP date modified: seconds since 2001-01-01 00:00:00 UTC.
-            // Convert to DateTime<Utc> by adding the DAAP epoch offset
-            // (978307200 = seconds between Unix epoch and 2001-01-01).
-            let date_modified = dmap::find_u32(nodes, b"asdm").and_then(|daap_secs| {
-                chrono::DateTime::from_timestamp(i64::from(daap_secs) + 978_307_200, 0)
-            });
+            // DAAP date modified: most real-world DAAP servers (forked-daapd,
+            // OwnTone, etc.) send `asdm` as a standard Unix timestamp
+            // (seconds since 1970-01-01), NOT seconds since the DAAP epoch
+            // (2001-01-01).  Treat it as a plain Unix timestamp.
+            let date_modified = dmap::find_u32(nodes, b"asdm")
+                .and_then(|unix_secs| chrono::DateTime::from_timestamp(i64::from(unix_secs), 0));
 
             let track_uuid = deterministic_uuid(daap_id);
             let artist_uuid = deterministic_uuid_from_name(&artist_name);

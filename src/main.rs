@@ -127,7 +127,7 @@ fn main() {
         .activate(|app: &adw::Application, _, _| {
             let about = adw::AboutDialog::builder()
                 .application_name("Tributary")
-                .application_icon("tributary")
+                .application_icon("io.github.tributary.Tributary")
                 .developer_name("John-Michael Mulesa")
                 .version(env!("CARGO_PKG_VERSION"))
                 .website("https://github.com/jm2/tributary")
@@ -151,22 +151,27 @@ fn main() {
         if let Some(ref exe) = exe_path {
             if let Some(display) = gtk::gdk::Display::default() {
                 let icon_theme = gtk::IconTheme::for_display(&display);
-                // Development: <repo>/target/release/tributary → <repo>/data
+                // Development: <repo>/target/release/tributary → <repo>/data/icons
                 if let Some(repo) = exe
                     .parent()
                     .and_then(|p| p.parent())
                     .and_then(|p| p.parent())
                 {
-                    let data_dir = repo.join("data");
-                    if data_dir.is_dir() {
-                        icon_theme.add_search_path(&data_dir);
+                    let icons_dir = repo.join("data").join("icons");
+                    if icons_dir.is_dir() {
+                        icon_theme.add_search_path(&icons_dir);
                     }
                 }
-                // Installed / bundled: exe next to data/
+                // Installed / bundled: exe next to share/icons (Windows dist)
                 if let Some(dir) = exe.parent() {
-                    let data_dir = dir.join("data");
-                    if data_dir.is_dir() {
-                        icon_theme.add_search_path(&data_dir);
+                    let share_icons = dir.join("share").join("icons");
+                    if share_icons.is_dir() {
+                        icon_theme.add_search_path(&share_icons);
+                    }
+                    // Also check data/icons for Windows dist layout
+                    let data_icons = dir.join("data").join("icons");
+                    if data_icons.is_dir() {
+                        icon_theme.add_search_path(&data_icons);
                     }
                 }
             }

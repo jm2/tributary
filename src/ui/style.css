@@ -53,9 +53,3 @@
     min-height: 16px;
 }
 
-/* Fix low-resolution checkmark indicators (especially on Windows) */
-checkbutton indicator {
-    min-width: 18px;
-    min-height: 18px;
-    -gtk-icon-size: 18px;
-}

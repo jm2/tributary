@@ -308,13 +308,17 @@ impl Player {
             // Non-blocking check — only query when actually playing.
             let (_, state, _) = playbin.state(gst::ClockTime::ZERO);
             if state == gst::State::Playing {
-                if let (Some(pos), Some(dur)) = (
-                    playbin.query_position::<gst::ClockTime>(),
-                    playbin.query_duration::<gst::ClockTime>(),
-                ) {
+                if let Some(pos) = playbin.query_position::<gst::ClockTime>() {
+                    // Duration may be unknown for live streams (radio).
+                    // Send 0 for duration_ms so the UI can still update
+                    // the elapsed time label and clear the buffering spinner.
+                    let dur = playbin
+                        .query_duration::<gst::ClockTime>()
+                        .map(|d| d.mseconds())
+                        .unwrap_or(0);
                     let _ = tx.try_send(PlayerEvent::PositionChanged {
                         position_ms: pos.mseconds(),
-                        duration_ms: dur.mseconds(),
+                        duration_ms: dur,
                     });
                 }
             }

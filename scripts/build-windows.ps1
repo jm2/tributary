@@ -324,6 +324,15 @@ foreach ($theme in @("hicolor", "Adwaita")) {
     }
 }
 
+# Bundle the app's own hicolor icons (About dialog, etc.)
+$appIconsSrc = "data\icons\hicolor"
+if (Test-Path $appIconsSrc) {
+    $appIconsDest = Join-Path $DIST "share\icons\hicolor"
+    $n = Sync-Directory (Resolve-Path $appIconsSrc).Path $appIconsDest
+    $totalCopied += $n
+    Write-Info "Bundled app icons: $n file(s) synced."
+}
+
 $schemasSrc  = Join-Path $MsysPath "share\glib-2.0\schemas"
 $schemasDest = Join-Path $DIST   "share\glib-2.0\schemas"
 if (Test-Path $schemasSrc) {

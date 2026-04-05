@@ -174,8 +174,15 @@ fn process_mdns_event(
 ) {
     match event {
         mdns_sd::ServiceEvent::ServiceResolved(info) => {
-            let host = info.get_hostname().trim_end_matches('.').to_string();
+            let raw_host = info.get_hostname().trim_end_matches('.').to_string();
             let port = info.get_port();
+
+            // Strip Avahi conflict-resolution suffix (e.g., "myhost-2" → "myhost").
+            // Avahi appends "-N" when it discovers a naming conflict during late
+            // service registration.  We normalise to the base hostname so the
+            // dedup key matches the original and the duplicate is silently dropped.
+            let host = strip_avahi_suffix(&raw_host);
+
             let key = format!("{service_type}:{host}:{port}");
 
             if seen.contains_key(&key) {
@@ -185,13 +192,24 @@ fn process_mdns_event(
 
             let name = info
                 .get_property_val_str("name")
-                .map(|s| s.to_string())
+                .map(|s| {
+                    // Strip Avahi conflict suffix from the display name.
+                    // Some services (e.g. Navidrome) embed the hostname in
+                    // their TXT name like "Navidrome (hostname-2)".  Clean
+                    // the suffix both from bare names and parenthesized hostnames.
+                    strip_avahi_name_suffix(s)
+                })
                 .unwrap_or_else(|| {
-                    info.get_fullname()
+                    let raw_name = info
+                        .get_fullname()
                         .split('.')
                         .next()
                         .unwrap_or(&host)
-                        .to_string()
+                        .to_string();
+                    // Use strip_avahi_name_suffix to handle both bare
+                    // hostnames and parenthesized patterns like
+                    // "Navidrome (nr400-2)".
+                    strip_avahi_name_suffix(&raw_name)
                 });
 
             let scheme = if port == 443
@@ -406,5 +424,88 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
 
         // ── Wait before next broadcast cycle ────────────────────────
         std::thread::sleep(JELLYFIN_BROADCAST_INTERVAL);
+    }
+}
+
+// ── Avahi hostname helpers ──────────────────────────────────────────────
+
+/// Strip the Avahi conflict-resolution suffix from a hostname.
+///
+/// When Avahi detects a naming conflict during late service registration
+/// it appends `-2`, `-3`, etc. to the hostname.  This function strips
+/// that suffix so we can dedup against the original hostname.
+///
+/// Examples:
+/// - `"myhost-2"` → `"myhost"`
+/// - `"myhost-12"` → `"myhost"`
+/// - `"myhost"` → `"myhost"` (unchanged)
+/// - `"my-host"` → `"my-host"` (unchanged — no trailing digits)
+fn strip_avahi_suffix(hostname: &str) -> String {
+    // Match the pattern: ends with "-" followed by one or more digits.
+    if let Some(dash_pos) = hostname.rfind('-') {
+        let suffix = &hostname[dash_pos + 1..];
+        // Only strip if the suffix is purely numeric AND >= 2
+        // (Avahi conflict suffixes start at -2).
+        if !suffix.is_empty()
+            && suffix.chars().all(|c| c.is_ascii_digit())
+            && suffix.parse::<u32>().is_ok_and(|n| n >= 2)
+        {
+            return hostname[..dash_pos].to_string();
+        }
+    }
+    hostname.to_string()
+}
+
+/// Strip Avahi conflict-resolution suffixes from a service display name.
+///
+/// Handles two patterns:
+/// 1. Bare hostname: `"nr400-2"` → `"nr400"`
+/// 2. Parenthesized hostname: `"Navidrome (nr400-2)"` → `"Navidrome (nr400)"`
+fn strip_avahi_name_suffix(name: &str) -> String {
+    // Check for parenthesized hostname pattern: "Something (hostname-N)"
+    if let (Some(open), Some(close)) = (name.rfind('('), name.rfind(')')) {
+        if open < close {
+            let inside = name[open + 1..close].trim();
+            let cleaned = strip_avahi_suffix(inside);
+            if cleaned != inside {
+                return format!("{}({}){}", &name[..open], cleaned, &name[close + 1..]);
+            }
+        }
+    }
+    // Fall back to stripping the bare name.
+    strip_avahi_suffix(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{strip_avahi_name_suffix, strip_avahi_suffix};
+
+    #[test]
+    fn test_strip_avahi_suffix() {
+        assert_eq!(strip_avahi_suffix("myhost-2"), "myhost");
+        assert_eq!(strip_avahi_suffix("myhost-12"), "myhost");
+        assert_eq!(strip_avahi_suffix("myhost"), "myhost");
+        assert_eq!(strip_avahi_suffix("my-host"), "my-host");
+        assert_eq!(strip_avahi_suffix("my-host-3"), "my-host");
+        assert_eq!(strip_avahi_suffix("host-1"), "host-1"); // -1 is not a conflict suffix
+        assert_eq!(strip_avahi_suffix("host-0"), "host-0"); // -0 is not a conflict suffix
+    }
+
+    #[test]
+    fn test_strip_avahi_name_suffix() {
+        assert_eq!(
+            strip_avahi_name_suffix("Navidrome (nr400-2)"),
+            "Navidrome (nr400)"
+        );
+        assert_eq!(
+            strip_avahi_name_suffix("Navidrome (nr400)"),
+            "Navidrome (nr400)"
+        );
+        assert_eq!(strip_avahi_name_suffix("nr400-2"), "nr400");
+        assert_eq!(strip_avahi_name_suffix("nr400"), "nr400");
+        assert_eq!(
+            strip_avahi_name_suffix("My Server (my-host-3)"),
+            "My Server (my-host)"
+        );
     }
 }

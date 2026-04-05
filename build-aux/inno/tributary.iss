@@ -23,9 +23,12 @@
 [Setup]
 AppName=Tributary
 AppVersion={#AppVersion}
+AppId={{E8A3B2F1-7C4D-4E5A-9F6B-1D2E3F4A5B6C}
+VersionInfoVersion={#AppVersion}
 AppPublisher=Tributary Contributors
 AppPublisherURL=https://github.com/jm2/tributary
 AppSupportURL=https://github.com/jm2/tributary/issues
+AppUpdatesURL=https://github.com/jm2/tributary/releases
 DefaultDirName={autopf}\Tributary
 DefaultGroupName=Tributary
 UninstallDisplayIcon={app}\tributary.exe
@@ -37,6 +40,13 @@ SetupIconFile=..\..\data\tributary.ico
 LicenseFile=..\..\LICENSE
 WizardStyle=modern
 PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=commandline
+; Silent install support (Winget passes /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-)
+DisableDirPage=auto
+DisableProgramGroupPage=auto
+CloseApplications=yes
+CloseApplicationsFilter=tributary.exe
+SetupLogging=yes
 #if TargetArch == "arm64"
 ArchitecturesAllowed=arm64
 ArchitecturesInstallIn64BitMode=arm64

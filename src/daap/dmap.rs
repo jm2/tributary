@@ -100,8 +100,8 @@ fn tag_type(tag: &[u8; 4]) -> DmapType {
         b"asyr" => DmapType::U16, // song year
         b"asbr" => DmapType::U16, // song bitrate
 
-        // U32 integers (dates — seconds since DAAP epoch 2001-01-01)
-        b"asdm" => DmapType::U32, // song date modified
+        // U32 integers (dates — Unix timestamps in practice)
+        b"asdm" => DmapType::U32, // song date modified (Unix timestamp)
 
         // Strings
         b"minm" => DmapType::String, // item name
