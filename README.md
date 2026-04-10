@@ -9,6 +9,8 @@ A high-performance, **Rhythmbox-style** media manager written in pure Rust with 
 
 Tributary provides a unified interface for managing and streaming music from multiple sources — local files, Subsonic/Navidrome, Jellyfin, Plex, DAAP/iTunes shares, and internet radio — all through a single, responsive library view.
 
+![Tributary Main Interface](data/screenshot.png)
+
 ## Features
 
 | Feature | Status |
