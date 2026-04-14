@@ -5,6 +5,26 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — Unreleased
+
+### Added
+- **State/Province column for Internet Radio** — Radio stations now display a "State/Province" column (repurposing the Album column) alongside the existing Country column. The Radio-Browser API `state` field is populated for most US and international stations.
+- **Tiered "Stations Near Me" search** — Near Me now uses a three-tier search strategy: (1) geo-distance sorted stations with real coordinates, (2) stations matching the user's state/province (catches stations like WBAA that have state metadata but no coordinates), (3) country-only fallback sorted by votes. Results are merged and deduplicated, with nearby stations appearing first.
+- **Column drag-and-drop reordering** — Tracklist columns can now be reordered by dragging their headers. Column order is persisted to `config.json` and restored on launch.
+- **Local library playlists** — Regular and smart playlists for the local library backend. Playlists survive library folder changes via fingerprint-based track matching (title, artist, album, duration). Smart playlists support iTunes-style rules with 15 filterable fields, text/numeric/date operators, result limiting, and live updating.
+- **Fedora COPR installation instructions** — README now documents the `jmsqrd/tributary` COPR repository for one-command Fedora installation.
+- **Arch Linux AUR installation instructions** — README now documents the three AUR packages (`tributary`, `tributary-bin`, `tributary-git`).
+
+### Fixed
+- **SHA256 checksums only contained Flatpak artifacts** — The release workflow's `upload-artifact` steps were conditional on `workflow_dispatch`, so during `release` events the checksums job couldn't find non-Flatpak artifacts. Made artifact uploads unconditional for all platform jobs (macOS, Windows, DEB, RPM, Arch).
+- **Location consent dialog referenced wrong service** — The geolocation consent dialog said "ip-api.com" but the app actually uses a multi-provider HTTPS cascade (`ipapi.co`, `ipwho.is`, `freeipapi.com`). Updated to generic "a geolocation service" text.
+- **"Reset to Defaults" only reset column visibility** — The Preferences reset button now also resets column ordering to the default layout.
+- **Inno Setup post-install dialog could hang silent installs** — The `[Run]` section used `skipifsilent`, which still showed the "Launch Tributary" checkbox under `/SILENT` (only suppressed under `/VERYSILENT`). Changed to `skipifnotsilent` so the dialog is never shown during any silent install, preventing automation pipeline hangs (e.g. winget).
+
+### Changed
+- **Geolocation now extracts region/state** — All three geolocation providers (`ipapi.co`, `ipwho.is`, `freeipapi.com`) now return `region` data, enabling state-level radio station filtering.
+- **Radio column layout expanded** — Radio mode now shows 6 columns (Title, Country, State/Province, Tags, Bitrate, Format) instead of 5.
+
 ## [0.2.1] — 2026-04-05
 
 ### Fixed
@@ -137,6 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
+[0.3.0]: https://github.com/jm2/tributary/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/jm2/tributary/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jm2/tributary/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jm2/tributary/releases/tag/v0.1.0

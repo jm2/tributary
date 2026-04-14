@@ -1552,11 +1552,28 @@ pub fn build_window(
         });
     }
 
-    // ── Apply persisted preferences (column visibility, browser) ─────
+    // ── Apply persisted preferences (column visibility, order, browser) ─
     {
         let cfg = app_config.borrow();
         preferences::apply_column_visibility(&column_view, &cfg.visible_columns);
+        preferences::apply_column_order(&column_view, &cfg.column_order);
         preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
+    }
+
+    // ── Persist column order on drag-and-drop reorder ────────────────
+    {
+        let config = app_config.clone();
+        let cv = column_view.clone();
+        column_view
+            .columns()
+            .connect_items_changed(move |_list, _pos, _removed, _added| {
+                let order = preferences::read_column_order(&cv);
+                if !order.is_empty() {
+                    let mut cfg = config.borrow_mut();
+                    cfg.column_order = order;
+                    preferences::save_config(&cfg);
+                }
+            });
     }
 
     // ── Wire preferences action to the window ────────────────────────
@@ -2357,7 +2374,7 @@ fn show_auth_dialog(
 // ── Internet Radio helpers ──────────────────────────────────────────
 
 /// Columns to show when viewing radio stations.
-const RADIO_VISIBLE_COLUMNS: &[&str] = &["Title", "Artist", "Genre", "Bitrate", "Format"];
+const RADIO_VISIBLE_COLUMNS: &[&str] = &["Title", "Artist", "Album", "Genre", "Bitrate", "Format"];
 
 /// Check if a backend type is a radio source.
 fn is_radio_backend(backend_type: &str) -> bool {
@@ -2375,22 +2392,28 @@ fn apply_radio_columns(column_view: &gtk::ColumnView, radio: bool) {
         if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
             if let Some(title) = col.title() {
                 let title_str = title.to_string();
-                // Match on both "Artist" and "Country" since the column
+                // Match on both original and renamed titles since the column
                 // may already be renamed from a previous radio selection.
                 if radio {
                     let is_artist_col = title_str == "Artist" || title_str == "Country";
+                    let is_album_col = title_str == "Album" || title_str == "State/Province";
                     if is_artist_col {
                         col.set_visible(true);
                         col.set_title(Some("Country"));
+                    } else if is_album_col {
+                        col.set_visible(true);
+                        col.set_title(Some("State/Province"));
                     } else {
                         col.set_visible(RADIO_VISIBLE_COLUMNS.contains(&title_str.as_str()));
                     }
                 } else {
                     // Restore all — the caller will apply user prefs after.
                     col.set_visible(true);
-                    // Rename "Country" back to "Artist" for music view.
+                    // Rename radio columns back to music names.
                     if title_str == "Country" {
                         col.set_title(Some("Artist"));
+                    } else if title_str == "State/Province" {
+                        col.set_title(Some("Album"));
                     }
                 }
             }
@@ -2408,7 +2431,7 @@ fn radio_station_to_track_object(station: &crate::radio::RadioStation) -> TrackO
         &station.name,    // title = station name
         0,                // duration_secs (live stream)
         &station.country, // artist = country
-        "",               // album (unused for radio)
+        &station.state,   // album = state/province
         &station.tags,    // genre = tags
         0,                // year (unused)
         "",               // date_modified (unused)
@@ -2485,8 +2508,8 @@ fn handle_radio_nearme(
                 .body(
                     "Stations Near Me uses your approximate location (via IP address) \
                      to find nearby radio stations.\n\n\
-                     Your IP address will be sent to ip-api.com to determine your \
-                     coordinates. No personal data is stored.",
+                     Your IP address will be sent to a geolocation service to determine \
+                     your approximate coordinates. No personal data is stored.",
                 )
                 .close_response("decline")
                 .default_response("enable")
@@ -2568,6 +2591,13 @@ fn handle_radio_nearme(
 }
 
 /// Fetch geolocation + nearby stations and display them.
+///
+/// Uses a tiered search strategy:
+/// 1. Geo-distance sorted (stations with lat/lon in user's country)
+/// 2. State/province match (stations with state but no geo coords, e.g. WBAA)
+/// 3. Country-only fallback (remaining stations, sorted by votes)
+///
+/// Results are merged and deduplicated by `stationuuid`, preserving tier order.
 #[allow(clippy::too_many_arguments)]
 fn fetch_and_display_nearme(
     rt_handle: tokio::runtime::Handle,
@@ -2585,24 +2615,47 @@ fn fetch_and_display_nearme(
         // First get geolocation (multi-provider cascade).
         if let Some(geo) = crate::radio::client::fetch_geolocation().await {
             let client = crate::radio::RadioBrowserClient::new();
-            // Use country-filtered search if we have a country code,
-            // otherwise fall back to global geo-distance search.
-            let stations = if !geo.country_code.is_empty() {
+            let cc = &geo.country_code;
+
+            // Tier 1: Geo-distance sorted (stations with real coordinates).
+            let tier1 = if !cc.is_empty() {
                 client
-                    .fetch_near_me_with_country(
-                        geo.latitude,
-                        geo.longitude,
-                        &geo.country_code,
-                        None,
-                    )
+                    .fetch_near_me_with_country(geo.latitude, geo.longitude, cc, None)
                     .await
             } else {
                 client
                     .fetch_near_me(geo.latitude, geo.longitude, None)
                     .await
             };
-            // Send raw station data as serialized JSON; convert on GTK thread.
-            let json = serde_json::to_string(&stations).unwrap_or_default();
+            info!(tier1 = tier1.len(), "Near Me tier 1 (geo-distance)");
+
+            // Tier 2: State/province match (catches stations like WBAA).
+            let tier2 = if !cc.is_empty() && !geo.region.is_empty() {
+                client.fetch_near_me_with_state(cc, &geo.region, None).await
+            } else {
+                Vec::new()
+            };
+            info!(tier2 = tier2.len(), state = %geo.region, "Near Me tier 2 (state)");
+
+            // Tier 3: Country-only fallback.
+            let tier3 = if !cc.is_empty() {
+                client.fetch_near_me_country_only(cc, Some(50)).await
+            } else {
+                Vec::new()
+            };
+            info!(tier3 = tier3.len(), "Near Me tier 3 (country-only)");
+
+            // Merge and dedup by stationuuid, preserving tier order.
+            let mut seen = std::collections::HashSet::new();
+            let mut merged = Vec::new();
+            for station in tier1.into_iter().chain(tier2).chain(tier3) {
+                if seen.insert(station.stationuuid.clone()) {
+                    merged.push(station);
+                }
+            }
+            info!(total = merged.len(), "Near Me merged results");
+
+            let json = serde_json::to_string(&merged).unwrap_or_default();
             let _ = stations_tx.send(json).await;
         } else {
             tracing::warn!("Geolocation failed — showing empty station list");

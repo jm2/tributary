@@ -95,6 +95,41 @@ impl RadioBrowserClient {
         self.fetch_stations(&url).await
     }
 
+    /// Fetch stations in a specific state/province, sorted by votes.
+    ///
+    /// This catches stations that have state metadata but no geo coordinates
+    /// (e.g. WBAA in Indiana). No `has_geo_info` filter is applied.
+    pub async fn fetch_near_me_with_state(
+        &self,
+        country_code: &str,
+        state: &str,
+        limit: Option<u32>,
+    ) -> Vec<RadioStation> {
+        let limit = limit.unwrap_or(DEFAULT_LIMIT);
+        let encoded_state = urlencoding::encode(state);
+        let url = format!(
+            "{}/json/stations/search?countrycode={country_code}&state={encoded_state}&order=votes&reverse=true&limit={limit}&hidebroken=true",
+            self.base_url
+        );
+        self.fetch_stations(&url).await
+    }
+
+    /// Fetch stations by country only (no state/geo), sorted by votes.
+    ///
+    /// Fallback tier for stations with neither geo coordinates nor state.
+    pub async fn fetch_near_me_country_only(
+        &self,
+        country_code: &str,
+        limit: Option<u32>,
+    ) -> Vec<RadioStation> {
+        let limit = limit.unwrap_or(DEFAULT_LIMIT);
+        let url = format!(
+            "{}/json/stations/search?countrycode={country_code}&order=votes&reverse=true&limit={limit}&hidebroken=true",
+            self.base_url
+        );
+        self.fetch_stations(&url).await
+    }
+
     /// Internal: fetch and deserialize a list of stations from a URL.
     /// Filters out stations with non-HTTP(S) stream URLs for safety.
     async fn fetch_stations(&self, url: &str) -> Vec<RadioStation> {
@@ -192,6 +227,7 @@ async fn try_ipapi_co(client: &reqwest::Client) -> Option<GeoLocation> {
             latitude: data.latitude,
             longitude: data.longitude,
             country_code: data.country_code,
+            region: data.region,
         })
     } else {
         None
@@ -207,6 +243,7 @@ async fn try_ipwhois(client: &reqwest::Client) -> Option<GeoLocation> {
             latitude: data.latitude,
             longitude: data.longitude,
             country_code: data.country_code,
+            region: data.region,
         })
     } else {
         None
@@ -226,6 +263,7 @@ async fn try_freeipapi(client: &reqwest::Client) -> Option<GeoLocation> {
             latitude: data.latitude,
             longitude: data.longitude,
             country_code: data.country_code,
+            region: data.region,
         })
     } else {
         None

@@ -26,6 +26,10 @@ pub struct RadioStation {
     #[serde(default)]
     pub countrycode: String,
 
+    /// State/province name (e.g. "Indiana").
+    #[serde(default)]
+    pub state: String,
+
     /// Audio codec (e.g. "MP3", "AAC", "OGG").
     #[serde(default)]
     pub codec: String,
@@ -57,6 +61,8 @@ pub struct GeoLocation {
     pub latitude: f64,
     pub longitude: f64,
     pub country_code: String,
+    /// State/region name (e.g. "Indiana", "California").
+    pub region: String,
 }
 
 // ── Provider-specific response types (internal) ─────────────────────
@@ -70,6 +76,9 @@ pub struct IpApiCoResponse {
     pub longitude: f64,
     #[serde(default)]
     pub country_code: String,
+    /// State/region name (e.g. "California").
+    #[serde(default)]
+    pub region: String,
     #[serde(default)]
     pub error: bool,
 }
@@ -85,6 +94,9 @@ pub struct IpWhoIsResponse {
     pub longitude: f64,
     #[serde(default)]
     pub country_code: String,
+    /// State/region name.
+    #[serde(default)]
+    pub region: String,
 }
 
 /// Response from freeipapi.com (HTTPS, free tier).
@@ -96,4 +108,7 @@ pub struct FreeIpApiResponse {
     pub longitude: f64,
     #[serde(default, rename = "countryCode")]
     pub country_code: String,
+    /// State/region name.
+    #[serde(default, rename = "regionName")]
+    pub region: String,
 }

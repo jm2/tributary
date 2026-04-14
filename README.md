@@ -36,7 +36,9 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Regular discovery refresh (add/remove servers dynamically) | ✅ |
 | Manual server addition/deletion with `servers.json` persistence | ✅ |
 | Internet Radio (Top Clicked, Top Voted, Stations Near Me) | ✅ |
-| Geo-located radio stations with HTTPS geolocation consent | ✅ |
+| Tiered geo-location (geo-distance → state → country) | ✅ |
+| Column drag-and-drop reordering with persistence | ✅ |
+| Regular & smart playlists (iTunes-style rules engine) | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
@@ -59,6 +61,39 @@ Tributary provides a unified interface for managing and streaming music from mul
 ```
 
 All backends implement a single `MediaBackend` async trait, so the UI layer never knows or cares where the music comes from.
+
+---
+
+## Installation
+
+### Fedora (COPR)
+
+Tributary is available from the [jmsqrd/tributary](https://copr.fedorainfracloud.org/coprs/jmsqrd/tributary/) COPR repository:
+
+```bash
+sudo dnf copr enable jmsqrd/tributary
+sudo dnf install tributary
+```
+
+### Arch Linux (AUR)
+
+Tributary is available on the [AUR](https://aur.archlinux.org/) in three variants:
+
+| Package | Description |
+|---------|-------------|
+| [`tributary`](https://aur.archlinux.org/packages/tributary) | Build from the latest release source |
+| [`tributary-bin`](https://aur.archlinux.org/packages/tributary-bin) | Pre-built binary from the latest release |
+| [`tributary-git`](https://aur.archlinux.org/packages/tributary-git) | Build from the latest `main` branch commit |
+
+Install with your preferred AUR helper, for example:
+
+```bash
+yay -S tributary-bin
+```
+
+### Other Platforms
+
+Pre-built packages for Linux (Flatpak, .deb, .rpm), macOS (.dmg), and Windows (.exe installer, .zip) are available on the [Releases](https://github.com/jm2/tributary/releases) page.
 
 ---
 

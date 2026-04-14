@@ -190,6 +190,15 @@ async fn initial_scan(
         .collect();
 
     let _ = tx.send(LibraryEvent::FullSync(all_tracks)).await;
+
+    // Reconcile orphaned playlist entries with newly-discovered tracks.
+    let playlist_mgr = super::playlist_manager::PlaylistManager::new(db.clone());
+    match playlist_mgr.reconcile_all().await {
+        Ok(n) if n > 0 => info!(relinked = n, "Playlist entries reconciled after scan"),
+        Ok(_) => debug!("No orphaned playlist entries to reconcile"),
+        Err(e) => warn!(error = %e, "Playlist reconciliation failed"),
+    }
+
     let _ = tx.send(LibraryEvent::ScanComplete).await;
 
     info!(scanned, "Initial scan complete");

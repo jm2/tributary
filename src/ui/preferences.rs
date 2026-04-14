@@ -38,6 +38,9 @@ pub struct AppConfig {
     pub browser_views: BrowserViewsConfig,
     /// Which tracklist columns are visible (by title).
     pub visible_columns: Vec<String>,
+    /// Tracklist column display order (by title). Persisted across restarts.
+    #[serde(default = "default_column_order")]
+    pub column_order: Vec<String>,
     /// Path to the local music library folder.
     pub library_path: String,
     /// Whether the user has consented to IP-based geolocation for
@@ -45,6 +48,11 @@ pub struct AppConfig {
     /// `Some(false)` = declined.
     #[serde(default)]
     pub location_enabled: Option<bool>,
+}
+
+/// Default column order (used for `#[serde(default)]`).
+fn default_column_order() -> Vec<String> {
+    ALL_COLUMNS.iter().map(|s| s.to_string()).collect()
 }
 
 /// Browser pane visibility toggles.
@@ -70,6 +78,7 @@ impl Default for AppConfig {
                 album: true,
             },
             visible_columns: DEFAULT_VISIBLE.iter().map(|s| s.to_string()).collect(),
+            column_order: default_column_order(),
             library_path: music_dir,
             location_enabled: None,
         }
@@ -306,12 +315,14 @@ pub fn show_preferences(
         reset_btn.connect_clicked(move |_| {
             let mut cfg = config.borrow_mut();
             cfg.visible_columns = DEFAULT_VISIBLE.iter().map(|s| s.to_string()).collect();
+            cfg.column_order = default_column_order();
             for (title, check) in &checks {
                 check.set_active(DEFAULT_VISIBLE.contains(&title.as_str()));
             }
             apply_column_visibility(&cv, &cfg.visible_columns);
+            apply_column_order(&cv, &cfg.column_order);
             save_config(&cfg);
-            info!("Column visibility reset to defaults");
+            info!("Column visibility and order reset to defaults");
         });
     }
 
@@ -337,6 +348,51 @@ pub fn apply_column_visibility(column_view: &gtk::ColumnView, visible: &[String]
             }
         }
     }
+}
+
+/// Apply persisted column order to the `ColumnView`.
+///
+/// Iterates the saved order and moves each column to its target position
+/// using `insert_column` (which also removes from the old position).
+pub fn apply_column_order(column_view: &gtk::ColumnView, order: &[String]) {
+    if order.is_empty() {
+        return;
+    }
+    for (target_pos, title) in order.iter().enumerate() {
+        let columns = column_view.columns();
+        // Find the column with this title at its current position.
+        let mut found_at = None;
+        for i in 0..columns.n_items() {
+            if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
+                if let Some(col_title) = col.title() {
+                    if col_title.as_str() == title {
+                        found_at = Some((i, col.clone()));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((current_pos, col)) = found_at {
+            if current_pos as usize != target_pos {
+                column_view.remove_column(&col);
+                column_view.insert_column(target_pos as u32, &col);
+            }
+        }
+    }
+}
+
+/// Read the current column order from the `ColumnView`.
+pub fn read_column_order(column_view: &gtk::ColumnView) -> Vec<String> {
+    let columns = column_view.columns();
+    let mut order = Vec::new();
+    for i in 0..columns.n_items() {
+        if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
+            if let Some(title) = col.title() {
+                order.push(title.to_string());
+            }
+        }
+    }
+    order
 }
 
 /// Update browser pane visibility based on config.

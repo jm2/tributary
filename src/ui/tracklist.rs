@@ -38,6 +38,7 @@ pub fn build_tracklist(
 
     let column_view = gtk::ColumnView::builder()
         .model(&selection)
+        .reorderable(true)
         .show_column_separators(true)
         .show_row_separators(true)
         .css_classes(["data-table"])

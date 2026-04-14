@@ -71,4 +71,4 @@ Name: "{group}\Uninstall Tributary"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Tributary"; Filename: "{app}\tributary.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\tributary.exe"; Description: "Launch Tributary"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\tributary.exe"; Description: "Launch Tributary"; Flags: nowait postinstall skipifnotsilent

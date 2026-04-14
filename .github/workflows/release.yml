@@ -78,8 +78,7 @@ jobs:
         with:
           files: tributary-linux-${{ matrix.arch }}.flatpak
 
-      - name: Upload Flatpak as artifact (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload Flatpak as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: tributary-linux-${{ matrix.arch }}-flatpak
@@ -133,8 +132,7 @@ jobs:
         with:
           files: dist/tributary-macos-${{ matrix.arch }}.dmg
 
-      - name: Upload DMG as artifact (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload DMG as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: tributary-macos-${{ matrix.arch }}-dmg
@@ -253,8 +251,7 @@ jobs:
             dist/tributary-windows-${{ matrix.arch }}.zip
             dist/tributary-windows-${{ matrix.arch }}-setup.exe
 
-      - name: Upload Windows artifacts (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: tributary-windows-${{ matrix.arch }}
@@ -314,8 +311,7 @@ jobs:
         with:
           files: target/debian/tributary-${{ matrix.deb_arch }}.deb
 
-      - name: Upload .deb as artifact (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload .deb as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: tributary-${{ matrix.deb_arch }}-deb
@@ -379,8 +375,7 @@ jobs:
         with:
           files: target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
 
-      - name: Upload .rpm as artifact (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload .rpm as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: tributary-${{ matrix.rpm_arch }}-rpm
@@ -438,8 +433,7 @@ jobs:
         with:
           files: dist/tributary-x86_64.pkg.tar.zst
 
-      - name: Upload Arch package as artifact (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload Arch package as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: tributary-x86_64-arch
