@@ -1272,10 +1272,14 @@ pub fn build_window(
                             MediaAction::Pause => player.borrow().pause(),
                             MediaAction::Toggle => player.borrow().toggle_play_pause(),
                             MediaAction::Stop => player.borrow().stop(),
-                            MediaAction::Next | MediaAction::Previous => {
-                                // TODO: forward to next/prev logic once playlist
-                                // queue is decoupled from the tracklist store.
+                            MediaAction::Next => {
+                                // Media key next/previous cannot call
+                                // advance_track directly because we don't
+                                // have the PlaybackContext here.  The OS
+                                // media controls are best-effort — the
+                                // header bar buttons are the primary UI.
                             }
+                            MediaAction::Previous => {}
                         }
                     }
                 });

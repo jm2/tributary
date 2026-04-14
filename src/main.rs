@@ -19,8 +19,6 @@ mod jellyfin;
 #[allow(dead_code)]
 mod local;
 #[allow(dead_code)]
-mod platform;
-#[allow(dead_code)]
 mod plex;
 mod radio;
 mod subsonic;

@@ -178,7 +178,9 @@ impl MediaBackend for LocalBackend {
     }
 
     async fn get_cover_art(&self, _album_id: &Uuid) -> BackendResult<Option<Url>> {
-        // Phase 3: no cover art caching. On-the-fly extraction planned later.
+        // Cover art is extracted on-the-fly from embedded tags in window.rs
+        // (update_album_art / extract_album_art_bytes) rather than through
+        // this trait method.  Returns None — no separate cover art URL.
         Ok(None)
     }
 
