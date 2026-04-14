@@ -1589,7 +1589,7 @@ pub fn build_window(
                 }
 
                 if submenu.n_items() > 0 {
-                    menu.append_submenu(Some("Add to Playlist"), &submenu);
+                    menu.append_section(Some("Add to Playlist"), &submenu);
                 }
             }
 
