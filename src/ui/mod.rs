@@ -6,6 +6,7 @@ pub mod header_bar;
 pub mod objects;
 pub mod playlist_editor;
 pub mod preferences;
+pub mod properties_dialog;
 pub mod sidebar;
 pub mod tracklist;
 pub mod window;

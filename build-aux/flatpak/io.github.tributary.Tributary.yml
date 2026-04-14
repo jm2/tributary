@@ -14,7 +14,9 @@ finish-args:
   - --socket=pulseaudio
   # Network (for remote backends: Subsonic, Jellyfin, DAAP)
   - --share=network
-  # Read access to home dir for local music library
+  # Read/write access to music library for local playback and tag editing
+  - --filesystem=xdg-music:rw
+  # Read access to home dir for other music locations
   - --filesystem=home:ro
   # D-Bus for MPRIS media keys
   - --own-name=org.mpris.MediaPlayer2.tributary

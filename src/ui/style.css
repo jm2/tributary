@@ -53,3 +53,8 @@
     min-height: 16px;
 }
 
+/* Search entry in the browser filter bar */
+searchentry {
+    border-radius: 6px;
+}
+

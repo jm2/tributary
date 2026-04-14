@@ -178,8 +178,12 @@ pub fn build_window(
     let current_pos_for_filter = current_pos.clone();
 
     let on_filter = Box::new(
-        move |genre: Option<String>, artist: Option<String>, album: Option<String>| {
+        move |genre: Option<String>,
+              artist: Option<String>,
+              album: Option<String>,
+              search_text: String| {
             let master = master_for_filter.borrow();
+            let search_lower = search_text.to_lowercase();
             let matching: Vec<&TrackObject> = master
                 .iter()
                 .filter(|t| {
@@ -195,6 +199,16 @@ pub fn build_window(
                     }
                     if let Some(ref al) = album {
                         if &t.album() != al {
+                            return false;
+                        }
+                    }
+                    // Text search filter — match across title, artist, album, genre.
+                    if !search_lower.is_empty() {
+                        let matches = t.title().to_lowercase().contains(&search_lower)
+                            || t.artist().to_lowercase().contains(&search_lower)
+                            || t.album().to_lowercase().contains(&search_lower)
+                            || t.genre().to_lowercase().contains(&search_lower);
+                        if !matches {
                             return false;
                         }
                     }
@@ -1591,6 +1605,75 @@ pub fn build_window(
                 if submenu.n_items() > 0 {
                     menu.append_section(Some("Add to Playlist"), &submenu);
                 }
+            }
+
+            // ── Properties… ──────────────────────────────────────────
+            {
+                let props_action = gtk::gio::SimpleAction::new("properties", None);
+                let sm_for_props = sm.clone();
+                let selected_for_props = selected.clone();
+                let win_for_props = gesture.widget().and_then(|w| {
+                    w.root()
+                        .and_then(|r| r.downcast::<adw::ApplicationWindow>().ok())
+                });
+
+                props_action.connect_activate(move |_, _| {
+                    let Some(ref win) = win_for_props else { return };
+
+                    // Collect TrackInfo for selected tracks.
+                    let mut track_infos = Vec::new();
+                    let mut pos = 0u32;
+                    while pos < sm_for_props.n_items() {
+                        if selected_for_props.contains(pos) {
+                            if let Some(item) = sm_for_props.item(pos) {
+                                if let Some(track) = item.downcast_ref::<TrackObject>() {
+                                    let uri = track.uri();
+                                    // Only show properties for local file:// tracks.
+                                    if uri.starts_with("file://") {
+                                        track_infos.push(
+                                            super::properties_dialog::TrackInfo {
+                                                uri,
+                                                title: track.title(),
+                                                artist: track.artist(),
+                                                album: track.album(),
+                                                genre: track.genre(),
+                                                year: track.year_display(),
+                                                track_number: if track.track_number() > 0 {
+                                                    track.track_number().to_string()
+                                                } else {
+                                                    String::new()
+                                                },
+                                                disc_number: String::new(),
+                                                format: track.format(),
+                                                bitrate: track.bitrate_display(),
+                                                sample_rate: track.sample_rate_display(),
+                                                duration: track.duration_display(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        pos += 1;
+                    }
+
+                    if track_infos.is_empty() {
+                        return;
+                    }
+
+                    super::properties_dialog::show_properties_dialog(
+                        win,
+                        &track_infos,
+                        |_modified_paths| {
+                            // The filesystem watcher will pick up the
+                            // mtime change and trigger a re-scan
+                            // automatically.  No manual action needed.
+                        },
+                    );
+                });
+
+                action_group.add_action(&props_action);
+                menu.append(Some("Properties…"), Some("tracklist-ctx.properties"));
             }
 
             if menu.n_items() == 0 {

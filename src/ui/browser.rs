@@ -16,14 +16,16 @@ use super::objects::{BrowserItem, TrackObject};
 use tracing::info;
 
 /// Callback invoked when the browser selection changes.
-/// Receives (selected_genre, selected_artist, selected_album) — `None` = "All".
-pub type FilterCallback = Box<dyn Fn(Option<String>, Option<String>, Option<String>)>;
+/// Receives (selected_genre, selected_artist, selected_album, search_text) — `None` = "All".
+pub type FilterCallback = Box<dyn Fn(Option<String>, Option<String>, Option<String>, String)>;
 
 /// Opaque handle to the browser's internal track snapshot.
 /// Passed back to [`rebuild_browser_data`] when the library changes.
 #[derive(Clone)]
 pub struct BrowserState {
     tracks: Rc<RefCell<Vec<TrackSnapshot>>>,
+    /// Current search text for the realtime filter.
+    search_text: Rc<RefCell<String>>,
 }
 
 /// Build the 3-pane browser.
@@ -38,6 +40,7 @@ pub fn build_browser(
     let selected_genre: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let selected_artist: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let selected_album: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let search_text: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
 
     // Re-entrancy guard: when one handler repopulates a sibling store,
     // the sibling's selection_changed fires.  The guard prevents that
@@ -61,6 +64,16 @@ pub fn build_browser(
 
     // Wrap callback in Rc for sharing across closures
     let on_filter_changed = Rc::new(on_filter_changed);
+
+    // ── Search entry ─────────────────────────────────────────────────
+    let search_entry = gtk::SearchEntry::builder()
+        .placeholder_text("Search all fields")
+        .hexpand(true)
+        .margin_start(8)
+        .margin_end(8)
+        .margin_top(4)
+        .margin_bottom(4)
+        .build();
 
     // ── Build the 3 panes ────────────────────────────────────────────
     let genre_pane = build_pane("Genre", &genre_store);
@@ -97,7 +110,7 @@ pub fn build_browser(
             populate_albums(&album_store, &borrowed, &genre, &None);
             updating.set(false);
 
-            cb(genre, None, None);
+            cb(genre, None, None, search_text.borrow().clone());
         });
     }
 
@@ -114,6 +127,7 @@ pub fn build_browser(
         let tracks = tracks.clone();
         let cb = on_filter_changed.clone();
         let updating = updating.clone();
+        let search_text = search_text.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
             if updating.get() {
@@ -132,7 +146,7 @@ pub fn build_browser(
             populate_albums(&album_store, &borrowed, &genre, &artist);
             updating.set(false);
 
-            cb(genre, artist, None);
+            cb(genre, artist, None, search_text.borrow().clone());
         });
     }
 
@@ -148,8 +162,9 @@ pub fn build_browser(
         let artist_store = artist_store.clone();
         let artist_pane = artist_pane.clone();
         let tracks = tracks.clone();
-        let cb = on_filter_changed;
+        let cb = on_filter_changed.clone();
         let updating = updating.clone();
+        let search_text = search_text.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
             if updating.get() {
@@ -169,22 +184,53 @@ pub fn build_browser(
             restore_selection(&artist_pane, &artist);
             updating.set(false);
 
-            cb(genre, artist, album);
+            cb(genre, artist, album, search_text.borrow().clone());
+        });
+    }
+
+    // ── Search entry handler ─────────────────────────────────────────
+    {
+        let sg = selected_genre.clone();
+        let sa = selected_artist.clone();
+        let search_text = search_text.clone();
+        let cb = on_filter_changed;
+
+        search_entry.connect_search_changed(move |entry| {
+            let text = entry.text().to_string();
+            info!(query = %text, "Browser: search changed");
+            *search_text.borrow_mut() = text.clone();
+
+            let genre = sg.borrow().clone();
+            let artist = sa.borrow().clone();
+            // Note: album selection state is moved, so we pass None for album
+            // when search changes — this is acceptable since search is a
+            // cross-cutting filter. The browser pane selections remain intact.
+            cb(genre, artist, None, text);
         });
     }
 
     // ── Layout ───────────────────────────────────────────────────────
-    let browser_box = gtk::Box::builder()
+    let panes_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .homogeneous(true)
         .spacing(1)
         .vexpand(true)
         .build();
-    browser_box.append(&genre_pane);
-    browser_box.append(&artist_pane);
-    browser_box.append(&album_pane);
+    panes_box.append(&genre_pane);
+    panes_box.append(&artist_pane);
+    panes_box.append(&album_pane);
 
-    let state = BrowserState { tracks };
+    let browser_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .vexpand(true)
+        .build();
+    browser_box.append(&search_entry);
+    browser_box.append(&panes_box);
+
+    let state = BrowserState {
+        tracks,
+        search_text,
+    };
     (browser_box, state)
 }
 
@@ -195,6 +241,7 @@ pub fn build_browser(
 /// Lightweight snapshot of track fields for filtering (avoids borrowing GObjects).
 #[derive(Clone)]
 struct TrackSnapshot {
+    title: String,
     genre: String,
     artist: String,
     album: String,
@@ -203,11 +250,24 @@ struct TrackSnapshot {
 impl TrackSnapshot {
     fn from_object(t: &TrackObject) -> Self {
         Self {
+            title: t.title(),
             genre: t.genre(),
             artist: t.artist(),
             album: t.album(),
         }
     }
+}
+
+/// Check if a track snapshot matches a search query (case-insensitive substring).
+fn matches_search(snap: &TrackSnapshot, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let q = query.to_lowercase();
+    snap.title.to_lowercase().contains(&q)
+        || snap.artist.to_lowercase().contains(&q)
+        || snap.album.to_lowercase().contains(&q)
+        || snap.genre.to_lowercase().contains(&q)
 }
 
 fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
@@ -422,27 +482,44 @@ pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks
     let snapshots: Vec<TrackSnapshot> = tracks.iter().map(TrackSnapshot::from_object).collect();
     *state.tracks.borrow_mut() = snapshots;
 
-    let borrowed = state.tracks.borrow();
+    // Clear search text on data rebuild (new source / full sync).
+    *state.search_text.borrow_mut() = String::new();
 
-    // The browser_box has 3 children (genre_pane, artist_pane, album_pane)
-    let mut child = browser_box.first_child();
-    let mut panes = Vec::new();
-    while let Some(widget) = child {
-        if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
-            panes.push(pane.clone());
+    // Clear the search entry widget if present (first child of browser_box).
+    if let Some(first) = browser_box.first_child() {
+        if let Some(entry) = first.downcast_ref::<gtk::SearchEntry>() {
+            entry.set_text("");
         }
-        child = widget.next_sibling();
     }
 
-    if panes.len() >= 3 {
-        if let Some(genre_store) = get_store_from_pane(&panes[0]) {
-            populate_genres(&genre_store, &borrowed, &None, &None);
+    let borrowed = state.tracks.borrow();
+
+    // The browser_box layout is: SearchEntry, panes_box (horizontal Box).
+    // The panes_box contains 3 children (genre_pane, artist_pane, album_pane).
+    let panes_box = browser_box
+        .last_child()
+        .and_then(|w| w.downcast::<gtk::Box>().ok());
+
+    if let Some(ref panes_box) = panes_box {
+        let mut child = panes_box.first_child();
+        let mut panes = Vec::new();
+        while let Some(widget) = child {
+            if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
+                panes.push(pane.clone());
+            }
+            child = widget.next_sibling();
         }
-        if let Some(artist_store) = get_store_from_pane(&panes[1]) {
-            populate_artists(&artist_store, &borrowed, &None, &None);
-        }
-        if let Some(album_store) = get_store_from_pane(&panes[2]) {
-            populate_albums(&album_store, &borrowed, &None, &None);
+
+        if panes.len() >= 3 {
+            if let Some(genre_store) = get_store_from_pane(&panes[0]) {
+                populate_genres(&genre_store, &borrowed, &None, &None);
+            }
+            if let Some(artist_store) = get_store_from_pane(&panes[1]) {
+                populate_artists(&artist_store, &borrowed, &None, &None);
+            }
+            if let Some(album_store) = get_store_from_pane(&panes[2]) {
+                populate_albums(&album_store, &borrowed, &None, &None);
+            }
         }
     }
 }

@@ -30,9 +30,41 @@
   <url type="homepage">https://github.com/jm2/tributary</url>
   <url type="bugtracker">https://github.com/jm2/tributary/issues</url>
 
+  <developer id="io.github.tributary">
+    <name>Tributary Contributors</name>
+  </developer>
+
   <content_rating type="oars-1.1" />
 
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/jm2/tributary/main/data/screenshot.png</image>
+      <caption>Tributary main window with library browser and tracklist</caption>
+    </screenshot>
+  </screenshots>
+
   <releases>
+    <release version="0.3.0" date="2026-04-15">
+      <description>
+        <p>New features:</p>
+        <ul>
+          <li>Realtime text search filter above the browser panes — search across title, artist, album, and genre</li>
+          <li>Song properties dialog with metadata editing for MP3, M4A/AAC, OGG, and FLAC files</li>
+          <li>Batch metadata editing for multiple selected tracks</li>
+          <li>MusicBrainz auto-fill lookup in the properties dialog</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.2.1" date="2026-04-05">
+      <description>
+        <p>Bug fixes for DAAP date handling, Avahi discovery, preferences UI, and more.</p>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-04-04">
+      <description>
+        <p>Internet Radio, manual server addition, mDNS discovery refresh, About dialog, and more.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-03-30">
       <description>
         <p>Initial release — project skeleton and architecture.</p>

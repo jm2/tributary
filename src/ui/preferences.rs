@@ -397,22 +397,31 @@ pub fn read_column_order(column_view: &gtk::ColumnView) -> Vec<String> {
 
 /// Update browser pane visibility based on config.
 ///
-/// The browser `Box` contains three children (genre, artist, album
-/// `ScrolledWindow` widgets).  If all three are hidden, hide the
-/// entire box.
+/// The browser `Box` now has a vertical layout: SearchEntry at the top,
+/// then a horizontal panes_box containing three children (genre, artist,
+/// album pane `Box` widgets).  If all three panes are hidden, hide the
+/// entire browser box.  The search entry visibility follows the browser.
 pub fn update_browser_visibility(browser_box: &gtk::Box, views: &BrowserViewsConfig) {
-    let mut child_idx = 0;
-    let mut child = browser_box.first_child();
-    while let Some(widget) = child {
-        let visible = match child_idx {
-            0 => views.genre,
-            1 => views.artist,
-            2 => views.album,
-            _ => true,
-        };
-        widget.set_visible(visible);
-        child = widget.next_sibling();
-        child_idx += 1;
+    // The browser_box layout is: SearchEntry, panes_box (horizontal Box).
+    // Find the panes_box (last child, which is a horizontal Box).
+    let panes_box = browser_box
+        .last_child()
+        .and_then(|w| w.downcast::<gtk::Box>().ok());
+
+    if let Some(ref panes_box) = panes_box {
+        let mut child_idx = 0;
+        let mut child = panes_box.first_child();
+        while let Some(widget) = child {
+            let visible = match child_idx {
+                0 => views.genre,
+                1 => views.artist,
+                2 => views.album,
+                _ => true,
+            };
+            widget.set_visible(visible);
+            child = widget.next_sibling();
+            child_idx += 1;
+        }
     }
 
     let any_visible = views.genre || views.artist || views.album;
