@@ -1668,11 +1668,6 @@ pub fn build_window(
                     super::properties_dialog::show_properties_dialog(
                         win,
                         &track_infos,
-                        |_modified_paths| {
-                            // The filesystem watcher will pick up the
-                            // mtime change and trigger a re-scan
-                            // automatically.  No manual action needed.
-                        },
                     );
                 });
 
@@ -2484,11 +2479,7 @@ fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         return false;
     }
 
-    info!(
-        title = %track.title(),
-        artist = %track.artist(),
-        "Playing track"
-    );
+    tracing::debug!("Playing track");
 
     ctx.player.borrow().load_uri(&uri);
     ctx.title_label.set_label(&track.title());

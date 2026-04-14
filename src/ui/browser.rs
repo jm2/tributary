@@ -13,7 +13,7 @@ use gtk::gio;
 use gtk::prelude::*;
 
 use super::objects::{BrowserItem, TrackObject};
-use tracing::info;
+use tracing::debug;
 
 /// Callback invoked when the browser selection changes.
 /// Receives (selected_genre, selected_artist, selected_album, search_text) — `None` = "All".
@@ -100,7 +100,7 @@ pub fn build_browser(
                 return;
             }
             let genre = get_selected_label(sel);
-            info!(?genre, "Browser: genre changed");
+            debug!("Browser: genre changed");
             *sg.borrow_mut() = genre.clone();
             *sa.borrow_mut() = None;
             *sl.borrow_mut() = None;
@@ -135,7 +135,7 @@ pub fn build_browser(
                 return;
             }
             let artist = get_selected_label(sel);
-            info!(?artist, "Browser: artist changed");
+            debug!("Browser: artist changed");
             *sa.borrow_mut() = artist.clone();
             *sl.borrow_mut() = None;
             let genre = sg.borrow().clone();
@@ -172,7 +172,7 @@ pub fn build_browser(
                 return;
             }
             let album = get_selected_label(sel);
-            info!(?album, "Browser: album changed");
+            debug!("Browser: album changed");
             *sl.borrow_mut() = album.clone();
             let genre = sg.borrow().clone();
             let artist = sa.borrow().clone();
@@ -198,7 +198,7 @@ pub fn build_browser(
 
         search_entry.connect_search_changed(move |entry| {
             let text = entry.text().to_string();
-            info!(query = %text, "Browser: search changed");
+            debug!("Browser: search changed");
             *search_text.borrow_mut() = text.clone();
 
             let genre = sg.borrow().clone();

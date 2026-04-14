@@ -11,7 +11,6 @@ use anyhow::{Context, Result};
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::tag::{Accessor, TagExt};
-use tracing::info;
 
 /// Fields that can be edited in the properties dialog.
 ///
@@ -154,6 +153,6 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
     tag.save_to_path(path, WriteOptions::default())
         .with_context(|| format!("Failed to write tags to {}", path.display()))?;
 
-    info!(path = %path.display(), "Tags written successfully");
+    tracing::debug!("Tags written successfully");
     Ok(())
 }

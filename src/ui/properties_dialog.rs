@@ -45,11 +45,7 @@ pub struct TrackInfo {
 /// `on_saved` is called (on the GTK main thread) after tags have been
 /// successfully written, with the list of file paths that were modified.
 /// The caller should trigger a library re-scan for those paths.
-pub fn show_properties_dialog(
-    parent: &adw::ApplicationWindow,
-    tracks: &[TrackInfo],
-    _on_saved: impl Fn(Vec<String>) + 'static,
-) {
+pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackInfo]) {
     if tracks.is_empty() {
         return;
     }
@@ -584,12 +580,7 @@ fn musicbrainz_lookup(title: &str, artist: &str) -> Option<MusicBrainzResult> {
         (String::new(), String::new(), String::new())
     };
 
-    info!(
-        mb_title = %title,
-        mb_artist = %artist,
-        mb_album = %album,
-        "MusicBrainz result"
-    );
+    tracing::debug!("MusicBrainz lookup returned a result");
 
     Some(MusicBrainzResult {
         title,

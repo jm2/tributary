@@ -5,9 +5,13 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] — Unreleased
+## [0.3.0] — 2026-04-15
 
 ### Added
+- **Realtime text search filter** — A search bar above the browser panes filters the tracklist in real-time with case-insensitive substring matching across title, artist, album, and genre. Composes with the existing genre/artist/album browser selections. Search text clears automatically on source switch.
+- **Song properties dialog** — Right-click any track → "Properties…" opens a dedicated dialog with editable fields (Title, Artist, Album, Genre, Year, Track #, Disc #) and read-only info (Format, Bitrate, Sample Rate, Duration, File Path). Tags are written safely via `lofty` with explicit Save/Cancel buttons — no inline editing in the tracklist. Supports MP3 (ID3v2), M4A/AAC (MP4 atoms), OGG Vorbis, and FLAC.
+- **Batch metadata editing** — When multiple tracks are selected, the Properties dialog shows only batch-appropriate fields (Artist, Album, Genre, Year, Disc #). Fields with mixed values display a "Mixed" placeholder. Only user-modified fields are written; unchanged fields are left untouched per-file.
+- **MusicBrainz auto-fill** — Single-track Properties dialog includes a "MusicBrainz Lookup" button that queries the MusicBrainz Recording Search API by title + artist. Results populate the form fields but still require manual Save — no automatic writes.
 - **State/Province column for Internet Radio** — Radio stations now display a "State/Province" column (repurposing the Album column) alongside the existing Country column. The Radio-Browser API `state` field is populated for most US and international stations.
 - **Tiered "Stations Near Me" search** — Near Me now uses a three-tier search strategy: (1) geo-distance sorted stations with real coordinates, (2) stations matching the user's state/province (catches stations like WBAA that have state metadata but no coordinates), (3) country-only fallback sorted by votes. Results are merged and deduplicated, with nearby stations appearing first.
 - **Column drag-and-drop reordering** — Tracklist columns can now be reordered by dragging their headers. Column order is persisted to `config.json` and restored on launch.
@@ -15,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fedora COPR installation instructions** — README now documents the `jmsqrd/tributary` COPR repository for one-command Fedora installation.
 - **Arch Linux AUR installation instructions** — README now documents the three AUR packages (`tributary`, `tributary-bin`, `tributary-git`).
 - **Windows winget installation instructions** — README now documents `winget install jm2.Tributary`.
+- **Flathub readiness** — AppStream metainfo now includes `<developer>` tag, `<screenshots>` section, and full release history. Flatpak manifest updated with `xdg-music:rw` permission for tag editing.
 
 ### Fixed
 - **SHA256 checksums only contained Flatpak artifacts** — The release workflow's `upload-artifact` steps were conditional on `workflow_dispatch`, so during `release` events the checksums job couldn't find non-Flatpak artifacts. Made artifact uploads unconditional for all platform jobs (macOS, Windows, DEB, RPM, Arch).
@@ -25,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **Geolocation now extracts region/state** — All three geolocation providers (`ipapi.co`, `ipwho.is`, `freeipapi.com`) now return `region` data, enabling state-level radio station filtering.
 - **Radio column layout expanded** — Radio mode now shows 6 columns (Title, Country, State/Province, Tags, Bitrate, Format) instead of 5.
+- **Browser layout restructured** — The browser is now a vertical Box containing the search entry on top and the horizontal genre/artist/album panes below. `rebuild_browser_data` and `update_browser_visibility` updated accordingly.
+
+### Removed
+- **Dead `platform` module** — The Phase 1 stub `src/platform/mod.rs` (with its own `MediaControlsBackend` trait and no-op implementations) was never used and has been superseded by `src/desktop_integration/mod.rs` (souvlaki). Deleted the module and removed `mod platform` from `main.rs`.
 
 ## [0.2.1] — 2026-04-05
 
@@ -158,7 +167,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
-[0.3.0]: https://github.com/jm2/tributary/compare/v0.2.1...HEAD
+[0.3.0]: https://github.com/jm2/tributary/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/jm2/tributary/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jm2/tributary/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jm2/tributary/releases/tag/v0.1.0

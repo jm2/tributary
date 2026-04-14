@@ -10,7 +10,7 @@ use gtk::gio;
 use gtk::prelude::*;
 
 use super::objects::SourceObject;
-use tracing::info;
+use tracing::debug;
 
 /// Playlist action emitted from the sidebar context menu.
 #[derive(Debug, Clone)]
@@ -285,10 +285,8 @@ pub fn build_sidebar(
         if let Some(item) = selection_clone.selected_item() {
             if let Some(src) = item.downcast_ref::<SourceObject>() {
                 if !src.is_header() {
-                    info!(
-                        source = %src.name(),
+                    debug!(
                         backend = %src.backend_type(),
-                        connected = src.connected(),
                         "Sidebar: source selected"
                     );
                 }

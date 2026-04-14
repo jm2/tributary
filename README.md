@@ -39,6 +39,10 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Tiered geo-location (geo-distance → state → country) | ✅ |
 | Column drag-and-drop reordering with persistence | ✅ |
 | Regular & smart playlists (iTunes-style rules engine) | ✅ |
+| Realtime text search filter (title, artist, album, genre) | ✅ |
+| Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
+| Batch metadata editing (multi-select) | ✅ |
+| MusicBrainz auto-fill lookup | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
@@ -210,33 +214,6 @@ RUST_LOG=tributary=debug ./target/release/tributary
 RUST_LOG=tributary=trace ./target/release/tributary
 ```
 
-### Remote Backend Configuration
-
-Remote backends can be configured via environment variables or discovered automatically via mDNS/UDP.
-
-**Subsonic / Navidrome:**
-```bash
-SUBSONIC_URL=https://music.example.com SUBSONIC_USER=admin SUBSONIC_PASS=secret ./target/release/tributary
-```
-
-**Jellyfin:**
-```bash
-JELLYFIN_URL=https://jellyfin.example.com JELLYFIN_API_KEY=your-api-key JELLYFIN_USER_ID=your-user-id ./target/release/tributary
-```
-
-**Plex:**
-```bash
-PLEX_URL=https://plex.example.com:32400 PLEX_TOKEN=your-plex-token ./target/release/tributary
-```
-
-**DAAP (iTunes Sharing):**
-```bash
-DAAP_URL=http://192.168.1.50:3689 ./target/release/tributary
-# With password:
-DAAP_URL=http://192.168.1.50:3689 DAAP_PASSWORD=secret ./target/release/tributary
-```
-
-**Auto-discovery:** Subsonic, Plex, and DAAP servers are automatically discovered via mDNS (`_subsonic._tcp.local.`, `_plexmediasvr._tcp.local.`, `_daap._tcp.local.`). Jellyfin servers are discovered via UDP broadcast. Discovered servers appear in the sidebar and can be connected with a single click.
 
 ---
 
@@ -293,7 +270,10 @@ src/
 │   ├── mod.rs              # Local backend root
 │   ├── backend.rs          # MediaBackend impl (LocalBackend)
 │   ├── engine.rs           # Async scan + notify FS watcher + LibraryEvent channel
-│   └── tag_parser.rs       # lofty audio tag extraction
+│   ├── tag_parser.rs       # lofty audio tag extraction
+│   ├── tag_writer.rs       # lofty audio tag writing (MP3, M4A, OGG, FLAC)
+│   ├── playlist_manager.rs # Regular + smart playlist CRUD
+│   └── smart_rules.rs      # iTunes-style smart playlist rules engine
 ├── subsonic/
 │   ├── mod.rs              # Subsonic backend root
 │   ├── api.rs              # JSON response types (Subsonic REST API)
@@ -318,15 +298,16 @@ src/
 │   ├── mod.rs              # Internet Radio module root
 │   ├── api.rs              # RadioStation + GeoLocation serde types
 │   └── client.rs           # Radio-Browser API client (DNS mirror, geolocation)
-├── platform/
-│   └── mod.rs              # OS-specific abstractions
 └── ui/
     ├── mod.rs              # UI module root
     ├── window.rs           # Main window + backend integration bridge
     ├── header_bar.rs       # Playback controls, now-playing, progress, volume
     ├── sidebar.rs          # Source list (local + remote + discovered + eject)
-    ├── browser.rs          # Genre → Artist → Album filter panes
+    ├── browser.rs          # Search bar + Genre → Artist → Album filter panes
     ├── tracklist.rs        # GtkColumnView track listing
+    ├── properties_dialog.rs# Song properties editor (single + batch + MusicBrainz)
+    ├── playlist_editor.rs  # Smart playlist rules editor dialog
+    ├── preferences.rs      # Preferences dialog (library path, browser, columns)
     ├── dummy_data.rs       # Default sidebar source entries
     ├── style.css           # Custom CSS overrides
     └── objects/
@@ -360,7 +341,28 @@ On first launch, Tributary scans your `~/Music` folder (configurable in Preferen
 
 Remote servers are discovered automatically via mDNS (DAAP, Subsonic, Plex) and UDP broadcast (Jellyfin). Discovered servers appear in the sidebar — click one to connect. Password-protected DAAP shares show a lock icon; passwordless shares connect with a single click.
 
-You can also configure servers via environment variables (see [Remote Backend Configuration](#remote-backend-configuration) above).
+To manually add a server, click the **+** button in the sidebar toolbar and enter the server type (Subsonic, Jellyfin, or Plex), URL, and credentials. Manually-added servers are persisted across launches (credentials are entered in the UI only — they are not stored on disk).
+
+### Searching Your Library
+
+Use the **search bar** above the browser panes to filter tracks in real-time. The search matches across title, artist, album, and genre simultaneously, and composes with any active browser pane selections. Clear the search by clicking the ✕ button or pressing Escape.
+
+### Editing Song Metadata
+
+Right-click any local track and select **Properties…** to view and edit its metadata. The Properties dialog supports:
+
+- **Single-track editing** — Title, Artist, Album, Genre, Year, Track #, Disc # (plus read-only Format, Bitrate, Sample Rate, Duration, and File Path)
+- **Batch editing** — Select multiple tracks, then right-click → Properties. Only batch-appropriate fields are shown (Artist, Album, Genre, Year, Disc #). Fields with mixed values display "Mixed" as a placeholder; only fields you explicitly change are written.
+- **MusicBrainz Lookup** — In single-track mode, click "MusicBrainz Lookup" to search by title + artist. Results populate the form but are **not** saved automatically — you must click Save.
+
+All edits require an explicit **Save** click. Cancel discards all changes. Supported formats: MP3 (ID3v2), M4A/AAC, OGG Vorbis, and FLAC.
+
+### Playlists
+
+Tributary supports regular and smart playlists for the local library:
+
+- **Regular playlists** — Right-click the Playlists header in the sidebar to create a new playlist. Right-click tracks in the tracklist to add them. Playlists survive library folder changes via fingerprint-based track matching.
+- **Smart playlists** — iTunes-style rules engine with 15 filterable fields, text/numeric/date operators, result limiting, and live updating. Create via the sidebar context menu.
 
 ### Playback Controls
 

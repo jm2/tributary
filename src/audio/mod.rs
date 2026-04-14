@@ -118,7 +118,7 @@ impl Player {
     /// Immediately emits [`PlayerState::Buffering`] so the UI can show a
     /// spinner while the pipeline transitions to `Playing`.
     pub fn load_uri(&self, uri: &str) {
-        info!(uri = %redact_url_secrets(uri), "Loading track");
+        tracing::debug!("Loading track");
         let _ = self.playbin.set_state(gst::State::Null);
         self.playbin.set_property("uri", uri);
         // Re-apply volume — the NULL transition resets it to 1.0.
