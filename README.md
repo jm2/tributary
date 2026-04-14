@@ -91,9 +91,17 @@ Install with your preferred AUR helper, for example:
 yay -S tributary-bin
 ```
 
+### Windows (winget)
+
+Tributary is available via [winget](https://learn.microsoft.com/en-us/windows/package-manager/winget/):
+
+```powershell
+winget install jm2.Tributary
+```
+
 ### Other Platforms
 
-Pre-built packages for Linux (Flatpak, .deb, .rpm), macOS (.dmg), and Windows (.exe installer, .zip) are available on the [Releases](https://github.com/jm2/tributary/releases) page.
+Pre-built packages for Linux (Flatpak, .deb, .rpm), macOS (.dmg), and Windows (.exe installer, .zip) are also available on the [Releases](https://github.com/jm2/tributary/releases) page.
 
 ---
 
