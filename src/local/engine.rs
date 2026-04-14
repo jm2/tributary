@@ -42,6 +42,9 @@ pub enum LibraryEvent {
     ScanProgress(u64, u64),
     /// Initial scan complete.
     ScanComplete,
+    /// Playlists loaded from the database.
+    /// Vec of (id, name, is_smart).
+    PlaylistsLoaded(Vec<(String, String, bool)>),
     /// An error occurred.
     Error(String),
 }
@@ -197,6 +200,21 @@ async fn initial_scan(
         Ok(n) if n > 0 => info!(relinked = n, "Playlist entries reconciled after scan"),
         Ok(_) => debug!("No orphaned playlist entries to reconcile"),
         Err(e) => warn!(error = %e, "Playlist reconciliation failed"),
+    }
+
+    // Send playlist list to UI thread for sidebar population.
+    match playlist_mgr.list_playlists().await {
+        Ok(playlists) => {
+            let entries: Vec<(String, String, bool)> = playlists
+                .iter()
+                .map(|p| (p.id.clone(), p.name.clone(), p.is_smart))
+                .collect();
+            if !entries.is_empty() {
+                info!(count = entries.len(), "Sending playlists to UI");
+            }
+            let _ = tx.send(LibraryEvent::PlaylistsLoaded(entries)).await;
+        }
+        Err(e) => warn!(error = %e, "Failed to load playlists"),
     }
 
     let _ = tx.send(LibraryEvent::ScanComplete).await;

@@ -2017,6 +2017,53 @@ fn setup_library_events(
                     scan_spinner.set_visible(false);
                 }
 
+                LibraryEvent::PlaylistsLoaded(playlists) => {
+                    info!(count = playlists.len(), "Populating sidebar with playlists");
+
+                    // Find the "Playlists" header position in sidebar.
+                    let mut playlist_header_pos = None;
+                    let n = sidebar_store.n_items();
+                    for i in 0..n {
+                        if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>()
+                        {
+                            if src.is_header() && src.name() == "Playlists" {
+                                playlist_header_pos = Some(i);
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(header_pos) = playlist_header_pos {
+                        // Remove old playlist entries (between Playlists header
+                        // and the next header).
+                        let insert_pos = header_pos + 1;
+                        while insert_pos < sidebar_store.n_items() {
+                            if let Some(src) = sidebar_store
+                                .item(insert_pos)
+                                .and_downcast_ref::<SourceObject>()
+                            {
+                                if src.is_header() {
+                                    break; // Hit next section header.
+                                }
+                                let bt = src.backend_type();
+                                if bt == "playlist" || bt == "smart-playlist" {
+                                    sidebar_store.remove(insert_pos);
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+
+                        // Insert new playlist entries.
+                        for (idx, (id, name, is_smart)) in playlists.iter().enumerate() {
+                            let src = SourceObject::playlist(name, id, *is_smart);
+                            sidebar_store.insert(insert_pos + idx as u32, &src);
+                        }
+                    }
+                }
+
                 LibraryEvent::Error(msg) => {
                     tracing::error!(error = %msg, "Library engine error");
                     scan_spinner.set_spinning(false);

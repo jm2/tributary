@@ -35,6 +35,8 @@ mod imp {
         /// `servers.json`). Manually-added servers are never auto-removed by
         /// discovery refresh and show a trash/delete button in the sidebar.
         pub manually_added: Cell<bool>,
+        /// Playlist UUID for playlist sidebar entries.
+        pub playlist_id: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -146,6 +148,32 @@ impl SourceObject {
 
     pub fn set_manually_added(&self, val: bool) {
         self.imp().manually_added.set(val);
+    }
+
+    pub fn playlist_id(&self) -> String {
+        self.imp().playlist_id.borrow().clone()
+    }
+
+    /// Create a playlist sidebar entry.
+    pub fn playlist(name: &str, playlist_id: &str, is_smart: bool) -> Self {
+        let obj: Self = glib::Object::builder().build();
+        obj.imp().name.replace(name.to_string());
+        let bt = if is_smart {
+            "smart-playlist"
+        } else {
+            "playlist"
+        };
+        obj.imp().backend_type.replace(bt.to_string());
+        let icon = if is_smart {
+            "emblem-system-symbolic"
+        } else {
+            "view-list-symbolic"
+        };
+        obj.imp().icon_name.replace(icon.to_string());
+        obj.imp().is_header.set(false);
+        obj.imp().connected.set(true);
+        obj.imp().playlist_id.replace(playlist_id.to_string());
+        obj
     }
 
     /// Create a manually-added (unauthenticated) remote server row.
