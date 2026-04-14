@@ -48,7 +48,7 @@ pub struct TrackInfo {
 pub fn show_properties_dialog(
     parent: &adw::ApplicationWindow,
     tracks: &[TrackInfo],
-    on_saved: impl Fn(Vec<String>) + 'static,
+    _on_saved: impl Fn(Vec<String>) + 'static,
 ) {
     if tracks.is_empty() {
         return;
@@ -204,7 +204,7 @@ pub fn show_properties_dialog(
         add_info_row(&info_group, "Duration", &t.duration);
 
         // Show file path
-        if let Some(ref path) = file_paths.first() {
+        if let Some(path) = file_paths.first() {
             add_info_row(&info_group, "File", &path.to_string_lossy());
         }
 
@@ -332,10 +332,6 @@ pub fn show_properties_dialog(
 
     // ── Save ─────────────────────────────────────────────────────────
     let dialog_for_save = dialog.clone();
-    let original_values: Vec<(String, String)> = entries
-        .iter()
-        .map(|(name, entry)| (name.to_string(), entry.text().to_string()))
-        .collect();
 
     // Capture initial text values to detect what actually changed.
     let initial_texts: Vec<(String, String)> = entries
@@ -350,7 +346,6 @@ pub fn show_properties_dialog(
         .collect();
 
     let file_paths_for_save = file_paths.clone();
-    let is_batch_for_save = is_batch;
 
     save_button.connect_clicked(move |_| {
         // Build TagEdits from the form, only including changed fields.
@@ -392,7 +387,6 @@ pub fn show_properties_dialog(
         }
 
         let paths = file_paths_for_save.clone();
-        let on_saved = &on_saved;
 
         // Write tags on a background thread.
         let (tx, rx) = async_channel::bounded::<Vec<String>>(1);
@@ -435,7 +429,7 @@ pub fn show_properties_dialog(
         });
     });
 
-    dialog.present(parent);
+    dialog.present(Some(parent));
 }
 
 // ── Form helpers ────────────────────────────────────────────────────────

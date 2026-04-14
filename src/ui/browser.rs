@@ -93,6 +93,7 @@ pub fn build_browser(
         let tracks = tracks.clone();
         let cb = on_filter_changed.clone();
         let updating = updating.clone();
+        let search_text = search_text.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
             if updating.get() {
@@ -241,6 +242,7 @@ pub fn build_browser(
 /// Lightweight snapshot of track fields for filtering (avoids borrowing GObjects).
 #[derive(Clone)]
 struct TrackSnapshot {
+    #[allow(dead_code)] // Used by window.rs search filter via TrackObject, not directly here
     title: String,
     genre: String,
     artist: String,
@@ -256,18 +258,6 @@ impl TrackSnapshot {
             album: t.album(),
         }
     }
-}
-
-/// Check if a track snapshot matches a search query (case-insensitive substring).
-fn matches_search(snap: &TrackSnapshot, query: &str) -> bool {
-    if query.is_empty() {
-        return true;
-    }
-    let q = query.to_lowercase();
-    snap.title.to_lowercase().contains(&q)
-        || snap.artist.to_lowercase().contains(&q)
-        || snap.album.to_lowercase().contains(&q)
-        || snap.genre.to_lowercase().contains(&q)
 }
 
 fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
