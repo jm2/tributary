@@ -247,86 +247,115 @@ async fn watch_directory(
     // Keep watcher alive by holding it in scope
     let _watcher = watcher;
 
-    while let Some(event_result) = notify_rx.recv().await {
-        match event_result {
-            Ok(event) => {
-                handle_fs_event(db, tx, event).await;
+    // ── Debounced event processing ──────────────────────────────
+    // Collect filesystem events for a short window, deduplicate by
+    // path, then process the batch. This collapses the 3-5 duplicate
+    // Create/Modify events that Windows fires per file copy into a
+    // single parse+upsert, and removes the old per-file 500ms sleep.
+    const DEBOUNCE_MS: u64 = 1500;
+
+    loop {
+        // Wait for the first event.
+        let first = notify_rx.recv().await;
+        let Some(first) = first else { break };
+
+        // Collect the first event + any more that arrive within the
+        // debounce window into path sets.
+        let mut upsert_paths: HashSet<PathBuf> = HashSet::new();
+        let mut remove_paths: HashSet<PathBuf> = HashSet::new();
+
+        let mut collect_event = |event: notify::Event| {
+            use notify::EventKind;
+            for path in event.paths {
+                if !tag_parser::is_audio_file(&path) {
+                    continue;
+                }
+                match event.kind {
+                    EventKind::Create(_) | EventKind::Modify(_) => {
+                        remove_paths.remove(&path);
+                        upsert_paths.insert(path);
+                    }
+                    EventKind::Remove(_) => {
+                        upsert_paths.remove(&path);
+                        remove_paths.insert(path);
+                    }
+                    _ => {}
+                }
             }
-            Err(e) => {
-                warn!(error = %e, "Filesystem watcher error");
+        };
+
+        if let Ok(event) = first {
+            collect_event(event);
+        }
+
+        // Drain any additional events that arrive within the debounce window.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(DEBOUNCE_MS);
+        loop {
+            match tokio::time::timeout_at(deadline, notify_rx.recv()).await {
+                Ok(Some(Ok(event))) => collect_event(event),
+                Ok(Some(Err(e))) => {
+                    warn!(error = %e, "Filesystem watcher error");
+                }
+                _ => break, // Timeout or channel closed
+            }
+        }
+
+        // Process removals.
+        for path in &remove_paths {
+            let path_str = path.to_string_lossy().to_string();
+            debug!(path = %path_str, "File removed (debounced)");
+            if let Ok(Some(row)) = track::Entity::find()
+                .filter(track::Column::FilePath.eq(&path_str))
+                .one(db.as_ref())
+                .await
+            {
+                let _ = track::Entity::delete_by_id(&row.id).exec(db.as_ref()).await;
+            }
+            let _ = tx.send(LibraryEvent::TrackRemoved(path_str)).await;
+        }
+
+        // Process upserts concurrently.
+        if !upsert_paths.is_empty() {
+            debug!(count = upsert_paths.len(), "Processing debounced upserts");
+            let paths: Vec<PathBuf> = upsert_paths.into_iter().collect();
+
+            for path in paths {
+                if !path.exists() {
+                    continue;
+                }
+                let p = path.clone();
+                match tokio::task::spawn_blocking(move || tag_parser::parse_audio_file(&p)).await {
+                    Ok(Ok(parsed)) => {
+                        let path_str = parsed.file_path.clone();
+                        let existing = track::Entity::find()
+                            .filter(track::Column::FilePath.eq(&path_str))
+                            .one(db.as_ref())
+                            .await
+                            .ok()
+                            .flatten();
+
+                        match upsert_track(db.as_ref(), &parsed, existing.as_ref()).await {
+                            Ok(model) => {
+                                let t = db_model_to_track(&model);
+                                let _ = tx.send(LibraryEvent::TrackUpserted(Box::new(t))).await;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, path = %path.display(), "Failed to upsert track");
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, path = %path.display(), "Failed to parse audio file");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "spawn_blocking failed");
+                    }
+                }
             }
         }
     }
 
     Ok(())
-}
-
-async fn handle_fs_event(
-    db: &Arc<DatabaseConnection>,
-    tx: &async_channel::Sender<LibraryEvent>,
-    event: notify::Event,
-) {
-    use notify::EventKind;
-
-    for path in &event.paths {
-        if !tag_parser::is_audio_file(path) {
-            continue;
-        }
-
-        match event.kind {
-            EventKind::Create(_) | EventKind::Modify(_) => {
-                debug!(path = %path.display(), "File created/modified");
-                // Small delay to let writes complete
-                tokio::time::sleep(Duration::from_millis(500)).await;
-
-                if path.exists() {
-                    let p = path.clone();
-                    match tokio::task::spawn_blocking(move || tag_parser::parse_audio_file(&p))
-                        .await
-                    {
-                        Ok(Ok(parsed)) => {
-                            let path_str = parsed.file_path.clone();
-                            let existing = track::Entity::find()
-                                .filter(track::Column::FilePath.eq(&path_str))
-                                .one(db.as_ref())
-                                .await
-                                .ok()
-                                .flatten();
-
-                            match upsert_track(db.as_ref(), &parsed, existing.as_ref()).await {
-                                Ok(model) => {
-                                    let t = db_model_to_track(&model);
-                                    let _ = tx.send(LibraryEvent::TrackUpserted(Box::new(t))).await;
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, path = %path.display(), "Failed to upsert track");
-                                }
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            warn!(error = %e, path = %path.display(), "Failed to parse audio file");
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "spawn_blocking failed");
-                        }
-                    }
-                }
-            }
-            EventKind::Remove(_) => {
-                let path_str = path.to_string_lossy().to_string();
-                debug!(path = %path_str, "File removed");
-                if let Ok(Some(row)) = track::Entity::find()
-                    .filter(track::Column::FilePath.eq(&path_str))
-                    .one(db.as_ref())
-                    .await
-                {
-                    let _ = track::Entity::delete_by_id(&row.id).exec(db.as_ref()).await;
-                }
-                let _ = tx.send(LibraryEvent::TrackRemoved(path_str)).await;
-            }
-            _ => {}
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

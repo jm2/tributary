@@ -589,8 +589,6 @@ pub fn build_sources() -> Vec<SourceObject> {
     vec![
         SourceObject::header("Local"),
         SourceObject::source("Local Filesystem", "local", "drive-harddisk-symbolic"),
-        // Playlists section (entries populated dynamically after DB load).
-        SourceObject::header("Playlists"),
         // Internet Radio sources (always present).
         SourceObject::header("Internet Radio"),
         SourceObject::source("Top Clicked", "radio-topclick", "network-wireless-symbolic"),
@@ -600,6 +598,8 @@ pub fn build_sources() -> Vec<SourceObject> {
             "radio-nearme",
             "network-wireless-symbolic",
         ),
+        // Playlists section (entries populated dynamically after DB load).
+        SourceObject::header("Playlists"),
     ]
 }
 

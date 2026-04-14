@@ -34,7 +34,7 @@ pub fn build_tracklist(
 
     // Wrap store in a sort model so column header clicks sort the view.
     let sort_model = gtk::SortListModel::new(Some(store.clone()), None::<gtk::Sorter>);
-    let selection = gtk::SingleSelection::new(Some(sort_model.clone()));
+    let selection = gtk::MultiSelection::new(Some(sort_model.clone()));
 
     let column_view = gtk::ColumnView::builder()
         .model(&selection)

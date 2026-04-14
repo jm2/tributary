@@ -104,9 +104,13 @@ pub fn build_sidebar(
         list_item.set_child(Some(&row_box));
     });
 
+    // ── Playlist action channel (shared by header "+" button and context menu) ──
+    let (playlist_action_tx, playlist_action_rx) = async_channel::unbounded::<PlaylistAction>();
+
     {
         let disconnect_tx = disconnect_tx.clone();
         let delete_tx = delete_tx.clone();
+        let playlist_action_tx = playlist_action_tx.clone();
         factory.connect_bind(move |_, list_item| {
             let list_item = list_item
                 .downcast_ref::<gtk::ListItem>()
@@ -140,7 +144,6 @@ pub fn build_sidebar(
             if obj.is_header() {
                 icon.set_visible(false);
                 spinner.set_visible(false);
-                action_btn.set_visible(false);
                 label.set_text(&obj.name());
                 label.add_css_class("heading");
                 label.add_css_class("dim-label");
@@ -148,6 +151,45 @@ pub fn build_sidebar(
                 label.set_ellipsize(gtk::pango::EllipsizeMode::None);
                 list_item.set_activatable(false);
                 list_item.set_selectable(false);
+
+                // Show a "+" button on the Playlists header for creating
+                // new playlists (most discoverable entry point).
+                if obj.name() == "Playlists" {
+                    action_btn.set_icon_name("list-add-symbolic");
+                    action_btn.set_tooltip_text(Some("New playlist"));
+                    action_btn.set_visible(true);
+                    let tx = playlist_action_tx.clone();
+                    action_btn.connect_clicked(move |btn| {
+                        // Build a small popover menu with two options.
+                        let menu = gtk::gio::Menu::new();
+                        menu.append(Some("New Playlist"), Some("pl-add.create-regular"));
+                        menu.append(Some("New Smart Playlist"), Some("pl-add.create-smart"));
+
+                        let ag = gtk::gio::SimpleActionGroup::new();
+
+                        let tx_reg = tx.clone();
+                        let reg = gtk::gio::SimpleAction::new("create-regular", None);
+                        reg.connect_activate(move |_, _| {
+                            let _ = tx_reg.try_send(PlaylistAction::CreateRegular);
+                        });
+                        ag.add_action(&reg);
+
+                        let tx_smart = tx.clone();
+                        let smart = gtk::gio::SimpleAction::new("create-smart", None);
+                        smart.connect_activate(move |_, _| {
+                            let _ = tx_smart.try_send(PlaylistAction::CreateSmart);
+                        });
+                        ag.add_action(&smart);
+
+                        btn.insert_action_group("pl-add", Some(&ag));
+
+                        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+                        popover.set_parent(btn);
+                        popover.popup();
+                    });
+                } else {
+                    action_btn.set_visible(false);
+                }
             } else {
                 label.remove_css_class("heading");
                 label.set_margin_top(0);
@@ -281,9 +323,7 @@ pub fn build_sidebar(
         .build();
     toolbar.append(&add_button);
 
-    // ── Playlist context menu (right-click) ─────────────────────────
-    let (playlist_action_tx, playlist_action_rx) = async_channel::unbounded::<PlaylistAction>();
-
+    // ── Playlist right-click context menu ───────────────────────────
     {
         let gesture = gtk::GestureClick::new();
         gesture.set_button(3); // right-click

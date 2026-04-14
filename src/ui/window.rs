@@ -11,6 +11,8 @@ use adw::prelude::*;
 use gtk::glib;
 use tracing::{info, warn};
 
+use sea_orm::{EntityTrait, QueryFilter};
+
 use crate::audio::{PlayerEvent, PlayerState};
 use crate::desktop_integration::MediaAction;
 use crate::local::engine::{LibraryEngine, LibraryEvent};
@@ -1375,6 +1377,237 @@ pub fn build_window(
         });
     }
 
+    // ── Right-click context menu on tracklist ────────────────────────
+    {
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(3); // right-click
+        let sm = sort_model.clone();
+        let sidebar_store_for_ctx = sidebar_store_for_events.clone();
+        let active_source_key_for_ctx = active_source_key.clone();
+        let rt_handle_for_ctx = rt_handle.clone();
+        let track_store_for_ctx = track_store.clone();
+        let source_tracks_for_ctx = source_tracks.clone();
+        let master_tracks_for_ctx = master_tracks.clone();
+        let status_label_for_ctx = status_label.clone();
+        let browser_widget_for_ctx = browser_widget.clone();
+        let browser_state_for_ctx = browser_state.clone();
+
+        gesture.connect_pressed(move |gesture, _n_press, x, y| {
+            let Some(widget) = gesture.widget() else { return };
+            let Ok(cv) = widget.downcast::<gtk::ColumnView>() else { return };
+
+            let active_key = active_source_key_for_ctx.borrow().clone();
+            let is_playlist_view = active_key.starts_with("playlist:");
+
+            // Collect selected track URIs from the MultiSelection model.
+            let selection_model = cv.model();
+            let Some(sel) = selection_model.and_then(|m| m.downcast::<gtk::MultiSelection>().ok()) else {
+                return;
+            };
+            let selected = sel.selection();
+            if selected.is_empty() {
+                return;
+            }
+
+            let menu = gtk::gio::Menu::new();
+            let action_group = gtk::gio::SimpleActionGroup::new();
+
+            if is_playlist_view {
+                // ── Remove from Playlist ─────────────────────────────
+                let playlist_id = active_key.strip_prefix("playlist:").unwrap_or("").to_string();
+                let rt = rt_handle_for_ctx.clone();
+                let track_store = track_store_for_ctx.clone();
+                let source_tracks = source_tracks_for_ctx.clone();
+                let master_tracks = master_tracks_for_ctx.clone();
+                let status_label = status_label_for_ctx.clone();
+                let browser_widget = browser_widget_for_ctx.clone();
+                let browser_state = browser_state_for_ctx.clone();
+                let active_key = active_key.clone();
+
+                // Collect URIs of selected tracks.
+                let mut selected_uris = Vec::new();
+                let mut pos = 0u32;
+                while pos < sm.n_items() {
+                    if selected.contains(pos) {
+                        if let Some(item) = sm.item(pos) {
+                            if let Some(track) = item.downcast_ref::<TrackObject>() {
+                                selected_uris.push(track.uri());
+                            }
+                        }
+                    }
+                    pos += 1;
+                }
+
+                let remove_action = gtk::gio::SimpleAction::new("remove-from-playlist", None);
+                let uris = selected_uris.clone();
+                remove_action.connect_activate(move |_, _| {
+                    let pid = playlist_id.clone();
+                    let uris = uris.clone();
+                    let track_store = track_store.clone();
+                    let source_tracks = source_tracks.clone();
+                    let master_tracks = master_tracks.clone();
+                    let status_label = status_label.clone();
+                    let browser_widget = browser_widget.clone();
+                    let browser_state = browser_state.clone();
+                    let active_key = active_key.clone();
+
+                    // Remove from visible store immediately.
+                    for uri in &uris {
+                        for i in 0..track_store.n_items() {
+                            if let Some(t) = track_store.item(i).and_downcast_ref::<TrackObject>() {
+                                if t.uri() == *uri {
+                                    track_store.remove(i);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Update master + status.
+                    {
+                        let mut st = source_tracks.borrow_mut();
+                        if let Some(tracks) = st.get_mut(&active_key) {
+                            tracks.retain(|t| !uris.contains(&t.uri()));
+                        }
+                    }
+                    let st = source_tracks.borrow();
+                    let current = st.get(&active_key).cloned().unwrap_or_default();
+                    *master_tracks.borrow_mut() = current.clone();
+                    tracklist::update_status(&status_label, &current);
+                    browser::rebuild_browser_data(&browser_widget, &browser_state, &current);
+
+                    // Remove from DB in background.
+                    rt.spawn(async move {
+                        match crate::db::connection::init_db().await {
+                            Ok(db) => {
+                                let mgr = crate::local::playlist_manager::PlaylistManager::new(db.clone());
+                                // Get all entries for this playlist, match by track file path.
+                                if let Ok(entries) = crate::db::entities::playlist_entry::Entity::find()
+                                    .filter(
+                                        <crate::db::entities::playlist_entry::Column as sea_orm::ColumnTrait>::eq(
+                                            &crate::db::entities::playlist_entry::Column::PlaylistId,
+                                            &pid,
+                                        ),
+                                    )
+                                    .all(&db)
+                                    .await
+                                {
+                                    for entry in entries {
+                                        if let Some(ref track_id) = entry.track_id {
+                                            // Look up the track to get its file path / URI.
+                                            if let Ok(Some(track)) = crate::db::entities::track::Entity::find_by_id(track_id.clone())
+                                                .one(&db)
+                                                .await
+                                            {
+                                                let track_uri = url::Url::from_file_path(&track.file_path)
+                                                    .map(|u| u.to_string())
+                                                    .unwrap_or_default();
+                                                if uris.contains(&track_uri) {
+                                                    let _ = mgr.remove_entry(&entry.id).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to open DB for playlist remove");
+                            }
+                        }
+                    });
+                });
+                action_group.add_action(&remove_action);
+                menu.append(Some("Remove from Playlist"), Some("tracklist-ctx.remove-from-playlist"));
+            } else {
+                // ── Add to Playlist submenu ──────────────────────────
+                let submenu = gtk::gio::Menu::new();
+
+                // Find all regular playlists from the sidebar store.
+                let n = sidebar_store_for_ctx.n_items();
+                for i in 0..n {
+                    if let Some(src) = sidebar_store_for_ctx.item(i).and_downcast_ref::<SourceObject>() {
+                        if src.backend_type() == "playlist" {
+                            let pl_name = src.name();
+                            let pl_id = src.playlist_id();
+                            let action_name = format!("add-to-{}", pl_id.replace('-', "_"));
+
+                            // Collect selected URIs.
+                            let mut selected_uris = Vec::new();
+                            let mut pos = 0u32;
+                            while pos < sm.n_items() {
+                                if selected.contains(pos) {
+                                    if let Some(item) = sm.item(pos) {
+                                        if let Some(track) = item.downcast_ref::<TrackObject>() {
+                                            selected_uris.push(track.uri());
+                                        }
+                                    }
+                                }
+                                pos += 1;
+                            }
+
+                            let rt = rt_handle_for_ctx.clone();
+                            let add_action = gtk::gio::SimpleAction::new(&action_name, None);
+                            let uris = selected_uris;
+                            let pid = pl_id.clone();
+                            add_action.connect_activate(move |_, _| {
+                                let uris = uris.clone();
+                                let pid = pid.clone();
+                                rt.spawn(async move {
+                                    match crate::db::connection::init_db().await {
+                                        Ok(db) => {
+                                            let mgr = crate::local::playlist_manager::PlaylistManager::new(db.clone());
+                                            for uri in &uris {
+                                                // Convert file:// URI back to path, find track in DB.
+                                                if let Ok(url) = url::Url::parse(uri) {
+                                                    if let Ok(path) = url.to_file_path() {
+                                                        let path_str = path.to_string_lossy().to_string();
+                                                        if let Ok(Some(track)) = <crate::db::entities::track::Entity as sea_orm::EntityTrait>::find()
+                                                            .filter(<crate::db::entities::track::Column as sea_orm::ColumnTrait>::eq(
+                                                                &crate::db::entities::track::Column::FilePath,
+                                                                &path_str,
+                                                            ))
+                                                            .one(&db)
+                                                            .await
+                                                        {
+                                                            let _ = mgr.add_track(&pid, &track).await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            tracing::info!(playlist = %pid, count = uris.len(), "Tracks added to playlist");
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "Failed to open DB for playlist add");
+                                        }
+                                    }
+                                });
+                            });
+                            action_group.add_action(&add_action);
+                            submenu.append(Some(&pl_name), Some(&format!("tracklist-ctx.{action_name}")));
+                        }
+                    }
+                }
+
+                if submenu.n_items() > 0 {
+                    menu.append_submenu(Some("Add to Playlist"), &submenu);
+                }
+            }
+
+            if menu.n_items() == 0 {
+                return;
+            }
+
+            cv.insert_action_group("tracklist-ctx", Some(&action_group));
+
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(&cv);
+            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        });
+
+        column_view.add_controller(gesture);
+    }
+
     // ── Wire Next button ────────────────────────────────────────────
     {
         let player = player.clone();
@@ -2483,15 +2716,91 @@ fn setup_library_events(
                 }
 
                 LibraryEvent::TrackUpserted(track) => {
-                    info!(
-                        title = %track.title,
-                        artist = %track.artist_name,
-                        "Track upserted"
-                    );
+                    let obj = arch_track_to_object(&track);
+                    let uri = obj.uri();
+
+                    // Update source_tracks["local"].
+                    {
+                        let mut st = source_tracks.borrow_mut();
+                        let local = st.entry("local".to_string()).or_default();
+                        // Replace existing (by URI) or append.
+                        if let Some(pos) = local.iter().position(|t| t.uri() == uri) {
+                            local[pos] = obj.clone();
+                        } else {
+                            local.push(obj.clone());
+                        }
+                    }
+
+                    // If local is the active source, update the visible tracklist.
+                    if *active_source_key.borrow() == "local" {
+                        // Check if already in the store (update) or new (append).
+                        let mut found = false;
+                        for i in 0..track_store.n_items() {
+                            if let Some(existing) =
+                                track_store.item(i).and_downcast_ref::<TrackObject>()
+                            {
+                                if existing.uri() == uri {
+                                    track_store.remove(i);
+                                    track_store.insert(i, &obj);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !found {
+                            track_store.append(&obj);
+                        }
+
+                        // Update master tracks + status.
+                        let st = source_tracks.borrow();
+                        let local_tracks = st.get("local").cloned().unwrap_or_default();
+                        *master_tracks.borrow_mut() = local_tracks.clone();
+                        tracklist::update_status(&status_label, &local_tracks);
+                        browser::rebuild_browser_data(
+                            &browser_widget,
+                            &browser_state,
+                            &local_tracks,
+                        );
+                    }
                 }
 
                 LibraryEvent::TrackRemoved(path) => {
-                    info!(path = %path, "Track removed");
+                    // Build the file:// URI for comparison.
+                    let removed_uri = url::Url::from_file_path(&path)
+                        .map(|u| u.to_string())
+                        .unwrap_or_default();
+
+                    // Remove from source_tracks["local"].
+                    {
+                        let mut st = source_tracks.borrow_mut();
+                        if let Some(local) = st.get_mut("local") {
+                            local.retain(|t| t.uri() != removed_uri);
+                        }
+                    }
+
+                    // If local is the active source, remove from visible tracklist.
+                    if *active_source_key.borrow() == "local" {
+                        for i in 0..track_store.n_items() {
+                            if let Some(existing) =
+                                track_store.item(i).and_downcast_ref::<TrackObject>()
+                            {
+                                if existing.uri() == removed_uri {
+                                    track_store.remove(i);
+                                    break;
+                                }
+                            }
+                        }
+
+                        let st = source_tracks.borrow();
+                        let local_tracks = st.get("local").cloned().unwrap_or_default();
+                        *master_tracks.borrow_mut() = local_tracks.clone();
+                        tracklist::update_status(&status_label, &local_tracks);
+                        browser::rebuild_browser_data(
+                            &browser_widget,
+                            &browser_state,
+                            &local_tracks,
+                        );
+                    }
                 }
 
                 LibraryEvent::ScanProgress(done, total) => {
