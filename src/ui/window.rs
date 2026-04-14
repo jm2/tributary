@@ -135,8 +135,15 @@ pub fn build_window(
     }
 
     // ── Sidebar ──────────────────────────────────────────────────────
-    let (sidebar_widget, sidebar_store, sidebar_selection, disconnect_rx, delete_rx, add_button) =
-        sidebar::build_sidebar(&sources);
+    let (
+        sidebar_widget,
+        sidebar_store,
+        sidebar_selection,
+        disconnect_rx,
+        delete_rx,
+        add_button,
+        playlist_action_rx,
+    ) = sidebar::build_sidebar(&sources);
 
     // ── Tracklist (starts empty — populated by FullSync) ──────────────
     let empty_tracks: Vec<TrackObject> = Vec::new();
@@ -738,6 +745,89 @@ pub fn build_window(
             };
 
             let backend_type = src.backend_type();
+
+            // ── Playlist source: fetch playlist tracks ───────────────
+            if backend_type == "playlist" || backend_type == "smart-playlist" {
+                let playlist_id = src.playlist_id();
+                if playlist_id.is_empty() {
+                    return;
+                }
+
+                *active_source_key.borrow_mut() = format!("playlist:{playlist_id}");
+
+                // Restore music column layout (not radio).
+                apply_radio_columns(&column_view, false);
+                // Restore browser visibility from config.
+                let cfg = app_config.borrow();
+                preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
+                drop(cfg);
+
+                let is_smart = backend_type == "smart-playlist";
+                let rt_handle = rt_handle.clone();
+                let track_store = track_store.clone();
+                let master_tracks = master_tracks.clone();
+                let browser_widget = browser_widget.clone();
+                let browser_state = browser_state.clone();
+                let status_label = status_label.clone();
+                let column_view = column_view.clone();
+                let current_pos = current_pos.clone();
+                let pid = playlist_id.clone();
+
+                let (tracks_tx, tracks_rx) = async_channel::bounded::<String>(1);
+
+                rt_handle.spawn(async move {
+                    match crate::db::connection::init_db().await {
+                        Ok(db) => {
+                            let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
+                            let tracks = if is_smart {
+                                mgr.evaluate_smart_playlist(&pid).await
+                            } else {
+                                mgr.get_playlist_tracks(&pid).await
+                            };
+                            match tracks {
+                                Ok(models) => {
+                                    let arch_tracks: Vec<crate::architecture::models::Track> =
+                                        models
+                                            .iter()
+                                            .map(crate::local::engine::db_model_to_track)
+                                            .collect();
+                                    let json =
+                                        serde_json::to_string(&arch_tracks).unwrap_or_default();
+                                    let _ = tracks_tx.send(json).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Failed to load playlist tracks");
+                                    let _ = tracks_tx.send("[]".to_string()).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to open DB for playlist");
+                            let _ = tracks_tx.send("[]".to_string()).await;
+                        }
+                    }
+                });
+
+                glib::MainContext::default().spawn_local(async move {
+                    if let Ok(json) = tracks_rx.recv().await {
+                        let tracks: Vec<crate::architecture::models::Track> =
+                            serde_json::from_str(&json).unwrap_or_default();
+                        let objects: Vec<TrackObject> =
+                            tracks.iter().map(arch_track_to_object).collect();
+                        display_tracks(
+                            &objects,
+                            &track_store,
+                            &master_tracks,
+                            &browser_widget,
+                            &browser_state,
+                            &status_label,
+                            &column_view,
+                        );
+                        current_pos.set(None);
+                    }
+                });
+                return;
+            }
 
             // ── Radio source: fetch stations ────────────────────────
             if is_radio_backend(&backend_type) {
@@ -1587,6 +1677,405 @@ pub fn build_window(
             preferences::show_preferences(&win, &cv, &bw, &cfg);
         });
         window.add_action(&prefs_action);
+    }
+
+    // ── Handle playlist context menu actions ─────────────────────────
+    {
+        let sidebar_store = sidebar_store_for_events.clone();
+        let rt_handle = rt_handle.clone();
+        let win = window.clone();
+        let _engine_tx = engine_tx.clone();
+
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(action) = playlist_action_rx.recv().await {
+                match action {
+                    sidebar::PlaylistAction::CreateRegular => {
+                        info!("Creating new regular playlist");
+                        let sidebar_store = sidebar_store.clone();
+                        let rt_handle = rt_handle.clone();
+
+                        // Show a simple name entry dialog.
+                        let dialog = adw::AlertDialog::builder()
+                            .heading("New Playlist")
+                            .close_response("cancel")
+                            .default_response("create")
+                            .build();
+                        dialog.add_response("cancel", "Cancel");
+                        dialog.add_response("create", "Create");
+                        dialog.set_response_appearance(
+                            "create",
+                            adw::ResponseAppearance::Suggested,
+                        );
+
+                        let name_entry = gtk::Entry::builder()
+                            .placeholder_text("Playlist name")
+                            .activates_default(true)
+                            .build();
+                        dialog.set_extra_child(Some(&name_entry));
+
+                        dialog.connect_response(None, move |_dialog, response| {
+                            if response != "create" {
+                                return;
+                            }
+                            let name = name_entry.text().to_string();
+                            if name.is_empty() {
+                                return;
+                            }
+
+                            let sidebar_store = sidebar_store.clone();
+                            let (result_tx, result_rx) =
+                                async_channel::bounded::<(String, String, bool)>(1);
+
+                            rt_handle.spawn(async move {
+                                match crate::db::connection::init_db().await {
+                                    Ok(db) => {
+                                        let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
+                                        match mgr.create_playlist(&name, false).await {
+                                            Ok(pl) => {
+                                                let _ = result_tx
+                                                    .send((pl.id, pl.name, pl.is_smart))
+                                                    .await;
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(error = %e, "Failed to create playlist");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "Failed to open DB");
+                                    }
+                                }
+                            });
+
+                            glib::MainContext::default().spawn_local(async move {
+                                if let Ok((id, name, is_smart)) = result_rx.recv().await {
+                                    // Insert into sidebar under Playlists header.
+                                    let src = SourceObject::playlist(&name, &id, is_smart);
+                                    let n = sidebar_store.n_items();
+                                    for i in 0..n {
+                                        if let Some(s) = sidebar_store
+                                            .item(i)
+                                            .and_downcast_ref::<SourceObject>()
+                                        {
+                                            if s.is_header() && s.name() == "Playlists" {
+                                                // Find end of playlists section.
+                                                let mut pos = i + 1;
+                                                while pos < sidebar_store.n_items() {
+                                                    if let Some(next) = sidebar_store
+                                                        .item(pos)
+                                                        .and_downcast_ref::<SourceObject>()
+                                                    {
+                                                        if next.is_header() {
+                                                            break;
+                                                        }
+                                                        let bt = next.backend_type();
+                                                        if bt == "playlist"
+                                                            || bt == "smart-playlist"
+                                                        {
+                                                            pos += 1;
+                                                        } else {
+                                                            break;
+                                                        }
+                                                    } else {
+                                                        break;
+                                                    }
+                                                }
+                                                sidebar_store.insert(pos, &src);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        });
+
+                        dialog.present(Some(&win));
+                    }
+
+                    sidebar::PlaylistAction::CreateSmart => {
+                        info!("Creating new smart playlist");
+                        let sidebar_store = sidebar_store.clone();
+                        let rt_handle = rt_handle.clone();
+
+                        super::playlist_editor::show_smart_playlist_editor(
+                            &win,
+                            "Untitled",
+                            None,
+                            move |rules| {
+                                let sidebar_store = sidebar_store.clone();
+                                let (result_tx, result_rx) =
+                                    async_channel::bounded::<(String, String, bool)>(1);
+
+                                rt_handle.spawn(async move {
+                                    match crate::db::connection::init_db().await {
+                                        Ok(db) => {
+                                            let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
+                                            match mgr.create_playlist("Smart Playlist", true).await
+                                            {
+                                                Ok(pl) => {
+                                                    let _ =
+                                                        mgr.set_smart_rules(&pl.id, &rules).await;
+                                                    let _ = result_tx
+                                                        .send((pl.id, pl.name, pl.is_smart))
+                                                        .await;
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(error = %e, "Failed to create smart playlist");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "Failed to open DB");
+                                        }
+                                    }
+                                });
+
+                                glib::MainContext::default().spawn_local(async move {
+                                    if let Ok((id, name, is_smart)) = result_rx.recv().await {
+                                        let src = SourceObject::playlist(&name, &id, is_smart);
+                                        let n = sidebar_store.n_items();
+                                        for i in 0..n {
+                                            if let Some(s) = sidebar_store
+                                                .item(i)
+                                                .and_downcast_ref::<SourceObject>()
+                                            {
+                                                if s.is_header() && s.name() == "Playlists" {
+                                                    let mut pos = i + 1;
+                                                    while pos < sidebar_store.n_items() {
+                                                        if let Some(next) = sidebar_store
+                                                            .item(pos)
+                                                            .and_downcast_ref::<SourceObject>()
+                                                        {
+                                                            if next.is_header() {
+                                                                break;
+                                                            }
+                                                            let bt = next.backend_type();
+                                                            if bt == "playlist"
+                                                                || bt == "smart-playlist"
+                                                            {
+                                                                pos += 1;
+                                                            } else {
+                                                                break;
+                                                            }
+                                                        } else {
+                                                            break;
+                                                        }
+                                                    }
+                                                    sidebar_store.insert(pos, &src);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                            },
+                        );
+                    }
+
+                    sidebar::PlaylistAction::Rename(playlist_id) => {
+                        info!(id = %playlist_id, "Renaming playlist");
+                        let sidebar_store = sidebar_store.clone();
+                        let rt_handle = rt_handle.clone();
+                        let pid = playlist_id.clone();
+
+                        let dialog = adw::AlertDialog::builder()
+                            .heading("Rename Playlist")
+                            .close_response("cancel")
+                            .default_response("rename")
+                            .build();
+                        dialog.add_response("cancel", "Cancel");
+                        dialog.add_response("rename", "Rename");
+                        dialog.set_response_appearance(
+                            "rename",
+                            adw::ResponseAppearance::Suggested,
+                        );
+
+                        let name_entry = gtk::Entry::builder()
+                            .placeholder_text("New name")
+                            .activates_default(true)
+                            .build();
+                        dialog.set_extra_child(Some(&name_entry));
+
+                        dialog.connect_response(None, move |_dialog, response| {
+                            if response != "rename" {
+                                return;
+                            }
+                            let new_name = name_entry.text().to_string();
+                            if new_name.is_empty() {
+                                return;
+                            }
+
+                            let sidebar_store = sidebar_store.clone();
+                            let pid_for_db = pid.clone();
+                            let pid_for_ui = pid.clone();
+                            let new_name_for_ui = new_name.clone();
+                            let (done_tx, done_rx) = async_channel::bounded::<()>(1);
+
+                            rt_handle.spawn(async move {
+                                match crate::db::connection::init_db().await {
+                                    Ok(db) => {
+                                        let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
+                                        if let Err(e) =
+                                            mgr.rename_playlist(&pid_for_db, &new_name).await
+                                        {
+                                            tracing::error!(error = %e, "Failed to rename playlist");
+                                        }
+                                        let _ = done_tx.send(()).await;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "Failed to open DB");
+                                    }
+                                }
+                            });
+
+                            glib::MainContext::default().spawn_local(async move {
+                                if done_rx.recv().await.is_ok() {
+                                    // Update sidebar entry name.
+                                    for i in 0..sidebar_store.n_items() {
+                                        if let Some(src) = sidebar_store
+                                            .item(i)
+                                            .and_downcast_ref::<SourceObject>()
+                                        {
+                                            if src.playlist_id() == pid_for_ui {
+                                                let is_smart =
+                                                    src.backend_type() == "smart-playlist";
+                                                let new_src = SourceObject::playlist(
+                                                    &new_name_for_ui,
+                                                    &pid_for_ui,
+                                                    is_smart,
+                                                );
+                                                sidebar_store.remove(i);
+                                                sidebar_store.insert(i, &new_src);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        });
+
+                        dialog.present(Some(&win));
+                    }
+
+                    sidebar::PlaylistAction::Delete(playlist_id) => {
+                        info!(id = %playlist_id, "Deleting playlist");
+                        let sidebar_store = sidebar_store.clone();
+                        let rt_handle = rt_handle.clone();
+                        let pid = playlist_id.clone();
+
+                        let (done_tx, done_rx) = async_channel::bounded::<()>(1);
+
+                        rt_handle.spawn(async move {
+                            match crate::db::connection::init_db().await {
+                                Ok(db) => {
+                                    let mgr =
+                                        crate::local::playlist_manager::PlaylistManager::new(db);
+                                    if let Err(e) = mgr.delete_playlist(&pid).await {
+                                        tracing::error!(error = %e, "Failed to delete playlist");
+                                    }
+                                    let _ = done_tx.send(()).await;
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "Failed to open DB");
+                                }
+                            }
+                        });
+
+                        let pid = playlist_id.clone();
+                        glib::MainContext::default().spawn_local(async move {
+                            if done_rx.recv().await.is_ok() {
+                                for i in 0..sidebar_store.n_items() {
+                                    if let Some(src) = sidebar_store
+                                        .item(i)
+                                        .and_downcast_ref::<SourceObject>()
+                                    {
+                                        if src.playlist_id() == pid {
+                                            sidebar_store.remove(i);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    sidebar::PlaylistAction::EditSmart(playlist_id) => {
+                        info!(id = %playlist_id, "Editing smart playlist rules");
+                        let sidebar_store = sidebar_store.clone();
+                        let rt_handle = rt_handle.clone();
+                        let pid = playlist_id.clone();
+                        let win = win.clone();
+
+                        // Fetch existing rules from DB.
+                        let (rules_tx, rules_rx) = async_channel::bounded::<(
+                            String,
+                            Option<crate::local::smart_rules::SmartRules>,
+                        )>(1);
+
+                        let pid_fetch = pid.clone();
+                        rt_handle.spawn(async move {
+                            match crate::db::connection::init_db().await {
+                                Ok(db) => {
+                                    let mgr =
+                                        crate::local::playlist_manager::PlaylistManager::new(db);
+                                    match mgr.get_playlist(&pid_fetch).await {
+                                        Ok(Some(pl)) => {
+                                            let rules = pl
+                                                .smart_rules_json
+                                                .as_deref()
+                                                .and_then(|j| serde_json::from_str(j).ok());
+                                            let _ = rules_tx.send((pl.name, rules)).await;
+                                        }
+                                        _ => {
+                                            let _ = rules_tx
+                                                .send(("Smart Playlist".to_string(), None))
+                                                .await;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "Failed to open DB");
+                                }
+                            }
+                        });
+
+                        glib::MainContext::default().spawn_local(async move {
+                            if let Ok((name, existing_rules)) = rules_rx.recv().await {
+                                let rt_handle = rt_handle.clone();
+                                let _sidebar_store = sidebar_store.clone();
+                                let pid = pid.clone();
+
+                                super::playlist_editor::show_smart_playlist_editor(
+                                    &win,
+                                    &name,
+                                    existing_rules.as_ref(),
+                                    move |rules| {
+                                        let pid = pid.clone();
+                                        rt_handle.spawn(async move {
+                                            match crate::db::connection::init_db().await {
+                                                Ok(db) => {
+                                                    let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
+                                                    if let Err(e) =
+                                                        mgr.set_smart_rules(&pid, &rules).await
+                                                    {
+                                                        tracing::error!(error = %e, "Failed to save smart rules");
+                                                    } else {
+                                                        info!(id = %pid, "Smart playlist rules saved");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(error = %e, "Failed to open DB");
+                                                }
+                                            }
+                                        });
+                                    },
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+        });
     }
 
     // ── Receive LibraryEvents on GTK main thread ─────────────────────

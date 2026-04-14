@@ -12,15 +12,31 @@ use gtk::prelude::*;
 use super::objects::SourceObject;
 use tracing::info;
 
+/// Playlist action emitted from the sidebar context menu.
+#[derive(Debug, Clone)]
+pub enum PlaylistAction {
+    /// Create a new regular playlist.
+    CreateRegular,
+    /// Create a new smart playlist.
+    CreateSmart,
+    /// Rename a playlist (id).
+    Rename(String),
+    /// Delete a playlist (id).
+    Delete(String),
+    /// Edit smart playlist rules (id).
+    EditSmart(String),
+}
+
 /// Build the source sidebar.
 ///
-/// Returns `(sidebar_box, ListStore, SingleSelection, disconnect_rx, delete_rx, add_button)`.
+/// Returns `(sidebar_box, ListStore, SingleSelection, disconnect_rx, delete_rx, add_button, playlist_action_rx)`.
 ///
 /// * `disconnect_rx` emits the `server_url` of a DAAP source when the
 ///   user clicks its eject button.
 /// * `delete_rx` emits the `server_url` of a manually-added source when
 ///   the user clicks its trash button.
 /// * `add_button` is the `+` button for adding manual servers (wired in `window.rs`).
+/// * `playlist_action_rx` emits playlist CRUD actions from the context menu.
 pub fn build_sidebar(
     initial_sources: &[SourceObject],
 ) -> (
@@ -30,6 +46,7 @@ pub fn build_sidebar(
     async_channel::Receiver<String>,
     async_channel::Receiver<String>,
     gtk::Button,
+    async_channel::Receiver<PlaylistAction>,
 ) {
     let store = gio::ListStore::new::<SourceObject>();
     for src in initial_sources {
@@ -264,6 +281,111 @@ pub fn build_sidebar(
         .build();
     toolbar.append(&add_button);
 
+    // ── Playlist context menu (right-click) ─────────────────────────
+    let (playlist_action_tx, playlist_action_rx) = async_channel::unbounded::<PlaylistAction>();
+
+    {
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(3); // right-click
+        let store_for_ctx = store.clone();
+        let selection_for_ctx = selection.clone();
+        let tx = playlist_action_tx.clone();
+
+        gesture.connect_pressed(move |gesture, _n_press, x, y| {
+            let Some(widget) = gesture.widget() else {
+                return;
+            };
+            let Ok(list_view) = widget.downcast::<gtk::ListView>() else {
+                return;
+            };
+
+            // Determine which item was right-clicked by checking the
+            // currently selected item (GTK selects on press before
+            // gesture fires for ListView).
+            let pos = selection_for_ctx.selected();
+            let Some(item) = store_for_ctx.item(pos) else {
+                return;
+            };
+            let Some(src) = item.downcast_ref::<SourceObject>() else {
+                return;
+            };
+
+            let bt = src.backend_type();
+            let is_playlist = bt == "playlist" || bt == "smart-playlist";
+            let is_playlist_header = src.is_header() && src.name() == "Playlists";
+
+            if !is_playlist && !is_playlist_header {
+                return;
+            }
+
+            // Build context menu.
+            let menu = gtk::gio::Menu::new();
+
+            if is_playlist_header {
+                menu.append(Some("New Playlist"), Some("playlist.create-regular"));
+                menu.append(Some("New Smart Playlist"), Some("playlist.create-smart"));
+            } else if is_playlist {
+                menu.append(Some("Rename"), Some("playlist.rename"));
+                menu.append(Some("Delete"), Some("playlist.delete"));
+                if bt == "smart-playlist" {
+                    menu.append(Some("Edit Smart Playlist…"), Some("playlist.edit-smart"));
+                }
+            }
+
+            // Create action group.
+            let action_group = gtk::gio::SimpleActionGroup::new();
+
+            let tx_create_reg = tx.clone();
+            let create_reg = gtk::gio::SimpleAction::new("create-regular", None);
+            create_reg.connect_activate(move |_, _| {
+                let _ = tx_create_reg.try_send(PlaylistAction::CreateRegular);
+            });
+            action_group.add_action(&create_reg);
+
+            let tx_create_smart = tx.clone();
+            let create_smart = gtk::gio::SimpleAction::new("create-smart", None);
+            create_smart.connect_activate(move |_, _| {
+                let _ = tx_create_smart.try_send(PlaylistAction::CreateSmart);
+            });
+            action_group.add_action(&create_smart);
+
+            let pid = src.playlist_id();
+
+            let tx_rename = tx.clone();
+            let pid_rename = pid.clone();
+            let rename = gtk::gio::SimpleAction::new("rename", None);
+            rename.connect_activate(move |_, _| {
+                let _ = tx_rename.try_send(PlaylistAction::Rename(pid_rename.clone()));
+            });
+            action_group.add_action(&rename);
+
+            let tx_delete = tx.clone();
+            let pid_delete = pid.clone();
+            let delete = gtk::gio::SimpleAction::new("delete", None);
+            delete.connect_activate(move |_, _| {
+                let _ = tx_delete.try_send(PlaylistAction::Delete(pid_delete.clone()));
+            });
+            action_group.add_action(&delete);
+
+            let tx_edit = tx.clone();
+            let pid_edit = pid.clone();
+            let edit_smart = gtk::gio::SimpleAction::new("edit-smart", None);
+            edit_smart.connect_activate(move |_, _| {
+                let _ = tx_edit.try_send(PlaylistAction::EditSmart(pid_edit.clone()));
+            });
+            action_group.add_action(&edit_smart);
+
+            list_view.insert_action_group("playlist", Some(&action_group));
+
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(&list_view);
+            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        });
+
+        list_view.add_controller(gesture);
+    }
+
     // Wrap scrolled + toolbar in a vertical box.
     let sidebar_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -279,5 +401,6 @@ pub fn build_sidebar(
         disconnect_rx,
         delete_rx,
         add_button,
+        playlist_action_rx,
     )
 }
