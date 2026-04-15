@@ -44,31 +44,33 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Write-Info  { Write-Host "[tributary] $args" -ForegroundColor Green  }
-function Write-Warn  { Write-Host "[tributary] $args" -ForegroundColor Yellow }
-function Write-Err   { Write-Host "[tributary] $args" -ForegroundColor Red; exit 1 }
+function Write-Info { Write-Host "[tributary] $args" -ForegroundColor Green }
+function Write-Warn { Write-Host "[tributary] $args" -ForegroundColor Yellow }
+function Write-Err { Write-Host "[tributary] $args" -ForegroundColor Red; exit 1 }
 
 # Auto-detect ARM64 when env vars are not explicitly set.
 $NativeArch = if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
     "arm64"
-} elseif ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
+}
+elseif ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
     "arm64"
-} else {
+}
+else {
     "x64"
 }
 
 $RustTarget = if ($env:RUST_TARGET) { $env:RUST_TARGET } elseif ($NativeArch -eq "arm64") { "aarch64-pc-windows-gnu" } else { "x86_64-pc-windows-gnu" }
-$MsysEnv    = if ($env:MSYS_ENV) { $env:MSYS_ENV } elseif ($NativeArch -eq "arm64") { "clangarm64" } else { "ucrt64" }
+$MsysEnv = if ($env:MSYS_ENV) { $env:MSYS_ENV } elseif ($NativeArch -eq "arm64") { "clangarm64" } else { "ucrt64" }
 
 # Map the environment to the correct MSYS2 package prefix for error messages
 $PkgPrefix = switch ($MsysEnv) {
-    "ucrt64"     { "mingw-w64-ucrt-x86_64" }
+    "ucrt64" { "mingw-w64-ucrt-x86_64" }
     "clangarm64" { "mingw-w64-clang-aarch64" }
-    default      { "mingw-w64-$MsysEnv" }
+    default { "mingw-w64-$MsysEnv" }
 }
 
 $MsysPath = Join-Path $Msys2Root $MsysEnv
-$DIST     = "dist\tributary-windows"
+$DIST = "dist\tributary-windows"
 
 # ── Inno Setup only mode ─────────────────────────────────────────────────────
 # When -InnoSetup is passed with -SkipBundle, skip straight to installer creation
@@ -124,19 +126,21 @@ if (-not $NoCargoBuild -and -not (Get-Command cargo -ErrorAction SilentlyContinu
 
 # ── PKG_CONFIG setup ─────────────────────────────────────────────────────────
 $pkgConfigPath = Join-Path $MsysPath "lib\pkgconfig"
-if (-not (Test-Path $pkgConfigPath)) {
-    Write-Err "pkgconfig directory not found at $pkgConfigPath.`nIn MSYS2 shell, run:`n  pacman -S $PkgPrefix-pkg-config $PkgPrefix-toolchain"
+$pkgConfigExe = Join-Path $MsysPath "bin\pkg-config.exe"
+
+if (-not (Test-Path $pkgConfigExe)) {
+    Write-Err "pkgconfig executable not found in $MsysPath\bin.`nIn MSYS2 shell, run:`n  pacman -S $PkgPrefix-pkg-config $PkgPrefix-toolchain"
 }
 
-$env:PKG_CONFIG_PATH        = $pkgConfigPath
+$env:PKG_CONFIG_PATH = $pkgConfigPath
 $env:PKG_CONFIG_ALLOW_CROSS = "1"
 $env:PATH = "$MsysPath\bin;" + $env:PATH
 
 # Force Cargo to use MSYS2 tools instead of Rustup's incomplete bundled toolchain.
 $env:DLLTOOL = Join-Path $MsysPath "bin\dlltool.exe"
-$env:CC      = Join-Path $MsysPath "bin\gcc.exe"
-$env:CXX     = Join-Path $MsysPath "bin\g++.exe"
-$env:AR      = Join-Path $MsysPath "bin\ar.exe"
+$env:CC = Join-Path $MsysPath "bin\gcc.exe"
+$env:CXX = Join-Path $MsysPath "bin\g++.exe"
+$env:AR = Join-Path $MsysPath "bin\ar.exe"
 
 Write-Info "PKG_CONFIG_PATH set to $pkgConfigPath"
 
@@ -170,9 +174,9 @@ $pkgConfig = Join-Path $MsysPath "bin\pkg-config.exe"
 
 # Compile-time libraries (hard fail)
 $requiredPkgs = @(
-    @{ pc = "gtk4";           pkg = "gtk4" },
-    @{ pc = "libadwaita-1";   pkg = "libadwaita" },
-    @{ pc = "gstreamer-1.0";  pkg = "gstreamer" }
+    @{ pc = "gtk4"; pkg = "gtk4" },
+    @{ pc = "libadwaita-1"; pkg = "libadwaita" },
+    @{ pc = "gstreamer-1.0"; pkg = "gstreamer" }
 )
 
 $missing = @()
@@ -180,7 +184,8 @@ foreach ($dep in $requiredPkgs) {
     $rc = & $pkgConfig --exists $dep.pc 2>$null; $ok = $LASTEXITCODE -eq 0
     if ($ok) {
         Write-Host "  [ok] $($dep.pc)"
-    } else {
+    }
+    else {
         Write-Host "  [MISSING] $($dep.pc)" -ForegroundColor Red
         $missing += "$PkgPrefix-$($dep.pkg)"
     }
@@ -195,13 +200,14 @@ $pluginWarnings = @()
 foreach ($plugin in @("gst-plugins-good", "gst-plugins-bad", "gst-libav")) {
     $pattern = switch ($plugin) {
         "gst-plugins-good" { "libgstaudioparsers.dll" }
-        "gst-plugins-bad"  { "libgstfdkaac.dll" }
-        "gst-libav"        { "libgstlibav.dll" }
+        "gst-plugins-bad" { "libgstfdkaac.dll" }
+        "gst-libav" { "libgstlibav.dll" }
     }
     $probe = Join-Path $gstPluginDir $pattern
     if (Test-Path $probe) {
         Write-Host "  [ok] $plugin"
-    } else {
+    }
+    else {
         Write-Host "  [MISSING] $plugin (audio codecs)" -ForegroundColor Yellow
         $pluginWarnings += "$PkgPrefix-$plugin"
     }
@@ -216,7 +222,8 @@ Write-Info "All dependency checks passed."
 if (-not $NoCargoBuild) {
     Write-Info "Building Tributary (release) for $RustTarget..."
     cargo build --release --target $RustTarget
-} else {
+}
+else {
     Write-Info "Skipping cargo build (-NoCargoBuild specified)."
 }
 
@@ -325,7 +332,7 @@ Write-Info "Incremental sync: $totalCopied file(s) updated."
 Write-Info "Syncing GTK icons and schemas (incremental)..."
 
 foreach ($theme in @("hicolor", "Adwaita")) {
-    $src  = Join-Path $MsysPath "share\icons\$theme"
+    $src = Join-Path $MsysPath "share\icons\$theme"
     $dest = Join-Path $DIST   "share\icons\$theme"
     if (Test-Path $src) {
         $n = Sync-Directory $src $dest
@@ -342,7 +349,7 @@ if (Test-Path $appIconsSrc) {
     Write-Info "Bundled app icons: $n file(s) synced."
 }
 
-$schemasSrc  = Join-Path $MsysPath "share\glib-2.0\schemas"
+$schemasSrc = Join-Path $MsysPath "share\glib-2.0\schemas"
 $schemasDest = Join-Path $DIST   "share\glib-2.0\schemas"
 if (Test-Path $schemasSrc) {
     New-Item -ItemType Directory -Force $schemasDest | Out-Null
