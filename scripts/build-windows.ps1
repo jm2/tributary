@@ -59,7 +59,7 @@ else {
     "x64"
 }
 
-$RustTarget = if ($env:RUST_TARGET) { $env:RUST_TARGET } elseif ($NativeArch -eq "arm64") { "aarch64-pc-windows-gnu" } else { "x86_64-pc-windows-gnu" }
+$RustTarget = if ($env:RUST_TARGET) { $env:RUST_TARGET } elseif ($NativeArch -eq "arm64") { "aarch64-pc-windows-gnullvm" } else { "x86_64-pc-windows-gnu" }
 $MsysEnv = if ($env:MSYS_ENV) { $env:MSYS_ENV } elseif ($NativeArch -eq "arm64") { "clangarm64" } else { "ucrt64" }
 
 # Map the environment to the correct MSYS2 package prefix for error messages
@@ -120,8 +120,25 @@ if (-not (Test-Path $Msys2Root)) {
     Write-Err "MSYS2 not found at $Msys2Root. Install from https://www.msys2.org"
 }
 
-if (-not $NoCargoBuild -and -not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    Write-Err "cargo not found. Install Rust from https://rustup.rs"
+$cargoNeeded = (-not $NoCargoBuild) -or $Check -or $Clippy -or $Fmt
+if ($cargoNeeded -and -not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    Write-Err "cargo not found. Install Rustup from https://rustup.rs or winget install Rustlang.Rustup"
+}
+
+if ($cargoNeeded) {
+    $targetLibDir = rustc --target $RustTarget --print target-libdir 2>$null
+    if (-not $targetLibDir -or -not (Test-Path $targetLibDir)) {
+        if (Get-Command rustup -ErrorAction SilentlyContinue) {
+            Write-Info "Ensuring Rust target $RustTarget is installed via rustup..."
+            $null = rustup target add $RustTarget 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Err "Failed to install target $RustTarget with rustup."
+            }
+        }
+        else {
+            Write-Err "Rust target '$RustTarget' is missing from your compiler, and rustup is not available. Please install rustup via https://rustup.rs or winget install Rustlang.Rustup"
+        }
+    }
 }
 
 # ── PKG_CONFIG setup ─────────────────────────────────────────────────────────
@@ -137,10 +154,18 @@ $env:PKG_CONFIG_ALLOW_CROSS = "1"
 $env:PATH = "$MsysPath\bin;" + $env:PATH
 
 # Force Cargo to use MSYS2 tools instead of Rustup's incomplete bundled toolchain.
-$env:DLLTOOL = Join-Path $MsysPath "bin\dlltool.exe"
-$env:CC = Join-Path $MsysPath "bin\gcc.exe"
-$env:CXX = Join-Path $MsysPath "bin\g++.exe"
-$env:AR = Join-Path $MsysPath "bin\ar.exe"
+if ($MsysEnv -match "clang") {
+    $env:DLLTOOL = Join-Path $MsysPath "bin\llvm-dlltool.exe"
+    $env:CC = Join-Path $MsysPath "bin\clang.exe"
+    $env:CXX = Join-Path $MsysPath "bin\clang++.exe"
+    $env:AR = Join-Path $MsysPath "bin\llvm-ar.exe"
+}
+else {
+    $env:DLLTOOL = Join-Path $MsysPath "bin\dlltool.exe"
+    $env:CC = Join-Path $MsysPath "bin\gcc.exe"
+    $env:CXX = Join-Path $MsysPath "bin\g++.exe"
+    $env:AR = Join-Path $MsysPath "bin\ar.exe"
+}
 
 Write-Info "PKG_CONFIG_PATH set to $pkgConfigPath"
 
@@ -181,7 +206,7 @@ $requiredPkgs = @(
 
 $missing = @()
 foreach ($dep in $requiredPkgs) {
-    $rc = & $pkgConfig --exists $dep.pc 2>$null; $ok = $LASTEXITCODE -eq 0
+    $null = & $pkgConfig --exists $dep.pc 2>$null; $ok = $LASTEXITCODE -eq 0
     if ($ok) {
         Write-Host "  [ok] $($dep.pc)"
     }
