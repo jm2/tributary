@@ -133,6 +133,7 @@ impl DaapBackend {
             let album_uuid = deterministic_uuid_from_name(&album_title);
 
             let stream_url = self.client.stream_url(daap_id, &format);
+            let cover_art_url = self.client.cover_art_url(daap_id);
 
             let duration_secs = duration_ms.map(|ms| u64::from(ms) / 1000);
 
@@ -150,7 +151,7 @@ impl DaapBackend {
                 year: year.map(i32::from),
                 file_path: None,
                 stream_url: Some(stream_url),
-                cover_art_url: None,
+                cover_art_url: Some(cover_art_url),
                 date_added: None,
                 date_modified,
                 bitrate_kbps: bitrate.map(u32::from),

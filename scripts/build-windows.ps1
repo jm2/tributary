@@ -48,8 +48,17 @@ function Write-Info  { Write-Host "[tributary] $args" -ForegroundColor Green  }
 function Write-Warn  { Write-Host "[tributary] $args" -ForegroundColor Yellow }
 function Write-Err   { Write-Host "[tributary] $args" -ForegroundColor Red; exit 1 }
 
-$RustTarget = if ($env:RUST_TARGET) { $env:RUST_TARGET } else { "x86_64-pc-windows-gnu" }
-$MsysEnv    = if ($env:MSYS_ENV) { $env:MSYS_ENV } else { "ucrt64" }
+# Auto-detect ARM64 when env vars are not explicitly set.
+$NativeArch = if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
+    "arm64"
+} elseif ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
+    "arm64"
+} else {
+    "x64"
+}
+
+$RustTarget = if ($env:RUST_TARGET) { $env:RUST_TARGET } elseif ($NativeArch -eq "arm64") { "aarch64-pc-windows-gnu" } else { "x86_64-pc-windows-gnu" }
+$MsysEnv    = if ($env:MSYS_ENV) { $env:MSYS_ENV } elseif ($NativeArch -eq "arm64") { "clangarm64" } else { "ucrt64" }
 
 # Map the environment to the correct MSYS2 package prefix for error messages
 $PkgPrefix = switch ($MsysEnv) {

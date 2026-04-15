@@ -100,6 +100,13 @@ mkdir -p "${RESOURCES_DIR}/share/icons"
 cp -RL "${BREW_PREFIX}/share/icons/hicolor" "${RESOURCES_DIR}/share/icons/" 2>/dev/null || true
 cp -RL "${BREW_PREFIX}/share/icons/Adwaita" "${RESOURCES_DIR}/share/icons/" 2>/dev/null || true
 
+# Bundle the app's own hicolor icons (About dialog, etc.)
+APP_ICONS_SRC="data/icons/hicolor"
+if [[ -d "$APP_ICONS_SRC" ]]; then
+  info "Bundling app hicolor icons..."
+  cp -R "$APP_ICONS_SRC"/* "${RESOURCES_DIR}/share/icons/hicolor/" 2>/dev/null || true
+fi
+
 # Compile GTK Icon Caches (Fixes the missing SVG errors)
 info "Compiling icon caches..."
 command -v gtk4-update-icon-cache &>/dev/null && {

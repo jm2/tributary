@@ -2462,10 +2462,12 @@ fn display_tracks(
     status_label: &gtk::Label,
     column_view: &gtk::ColumnView,
 ) {
-    track_store.remove_all();
-    for obj in objects {
-        track_store.append(obj);
-    }
+    // Use splice() to replace all items in a single operation.
+    // This emits one `items-changed` signal instead of N individual
+    // signals, which is dramatically faster for large libraries
+    // (thousands of tracks) and prevents multi-second UI freezes.
+    track_store.splice(0, track_store.n_items(), objects);
+
     tracklist::update_status(status_label, objects);
     browser::rebuild_browser_data(browser_widget, browser_state, objects);
     *master_tracks.borrow_mut() = objects.to_vec();
@@ -2520,14 +2522,70 @@ fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     true
 }
 
-// Shared HTTP client for album art fetching — reused across track
-// changes to benefit from connection pooling and TLS session caching.
-// Created lazily on first use via `thread_local!`.
-thread_local! {
-    static ART_HTTP_CLIENT: reqwest::blocking::Client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap_or_default();
+// ── Persistent album art worker thread ──────────────────────────────
+// Instead of spawning a new std::thread for every track change (which
+// creates a new TLS session each time and adds thread-spawn overhead),
+// we use a single long-lived worker thread that receives fetch requests
+// via a channel.  A generation counter lets us discard stale results
+// when the user rapidly skips through tracks.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
+
+/// Global generation counter for album art requests.  Incremented on
+/// every track change; the worker checks this before sending results
+/// back to the GTK thread so stale fetches are silently dropped.
+static ART_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// Request sent to the album art worker thread.
+struct ArtRequest {
+    url: String,
+    generation: u32,
+    reply_tx: async_channel::Sender<Vec<u8>>,
+}
+
+/// Get (or lazily create) the sender for the persistent art worker.
+fn art_worker_tx() -> &'static std::sync::mpsc::Sender<ArtRequest> {
+    static TX: OnceLock<std::sync::mpsc::Sender<ArtRequest>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<ArtRequest>();
+        std::thread::Builder::new()
+            .name("art-worker".into())
+            .spawn(move || {
+                // Build the HTTP client once for the lifetime of this thread.
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .unwrap_or_default();
+
+                while let Ok(req) = rx.recv() {
+                    // Check if this request is still current before fetching.
+                    if ART_GENERATION.load(Ordering::Relaxed) != req.generation {
+                        continue; // Stale — user already changed tracks.
+                    }
+
+                    match client.get(&req.url).send() {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(bytes) = resp.bytes() {
+                                if !bytes.is_empty()
+                                    && ART_GENERATION.load(Ordering::Relaxed) == req.generation
+                                {
+                                    let _ = req.reply_tx.send_blocking(bytes.to_vec());
+                                }
+                            }
+                        }
+                        Ok(resp) => {
+                            tracing::debug!(status = %resp.status(), "Remote album art HTTP error");
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "Failed to fetch remote album art");
+                        }
+                    }
+                }
+            })
+            .expect("Failed to spawn art-worker thread");
+        tx
+    })
 }
 
 /// Extract embedded album art from a track's file and display it on the
@@ -2591,7 +2649,10 @@ fn extract_album_art_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
         }
     }
 
-    // ── Attempt 2: MP4-specific fallback ────────────────────────
+    // ── Attempt 2: MP4/M4A-specific fallback ────────────────────
+    // lofty's unified `pictures()` API may not expose MP4 atom-based
+    // cover art on all platforms.  Re-read with an explicit MP4 file
+    // type hint and also try the Ilst (iTunes metadata) tag directly.
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if matches!(
         ext.to_lowercase().as_str(),
@@ -2600,15 +2661,79 @@ fn extract_album_art_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
         use lofty::file::FileType;
         use lofty::probe::Probe;
 
-        let probe = Probe::open(path).ok()?.set_file_type(FileType::Mp4);
-        let tagged = probe.read().ok()?;
-        for tag in tagged.tags() {
-            if let Some(picture) = tag.pictures().first() {
-                return Some(picture.data().to_vec());
+        if let Ok(probe) = Probe::open(path) {
+            let probe = probe.set_file_type(FileType::Mp4);
+            if let Ok(tagged) = probe.read() {
+                // Try unified pictures() on the re-read file.
+                for tag in tagged.tags() {
+                    if let Some(picture) = tag.pictures().first() {
+                        return Some(picture.data().to_vec());
+                    }
+                }
+            }
+        }
+
+        // Attempt 3: Read the raw MP4 file and look for the `covr` atom
+        // directly.  Some M4A files (especially Apple-encoded) store art
+        // in a way that lofty's tag abstraction doesn't surface.
+        if let Ok(data) = std::fs::read(path) {
+            if let Some(art) = extract_mp4_covr_atom(&data) {
+                return Some(art);
             }
         }
     }
 
+    None
+}
+
+/// Brute-force search for the `covr` atom in raw MP4 data.
+///
+/// The iTunes `covr` atom stores cover art as:
+///   [4-byte size][4-byte "data"][8-byte flags][image bytes]
+/// nested inside `moov.udta.meta.ilst.covr`.
+///
+/// This is a last-resort fallback when lofty's tag parser doesn't
+/// expose the picture through its unified API.
+fn extract_mp4_covr_atom(data: &[u8]) -> Option<Vec<u8>> {
+    // Search for the "covr" atom marker.
+    let covr_tag = b"covr";
+    let data_tag = b"data";
+
+    for i in 0..data.len().saturating_sub(8) {
+        if &data[i..i + 4] == covr_tag {
+            // The `covr` atom size is in the 4 bytes before the tag.
+            if i < 4 {
+                continue;
+            }
+            let covr_size =
+                u32::from_be_bytes([data[i - 4], data[i - 3], data[i - 2], data[i - 1]]) as usize;
+            if covr_size < 16 || i - 4 + covr_size > data.len() {
+                continue;
+            }
+
+            // Inside `covr`, look for the `data` sub-atom.
+            let covr_start = i - 4;
+            let covr_end = covr_start + covr_size;
+            let inner = &data[i + 4..covr_end];
+
+            for j in 0..inner.len().saturating_sub(8) {
+                if &inner[j + 4..j + 8] == data_tag {
+                    let data_size =
+                        u32::from_be_bytes([inner[j], inner[j + 1], inner[j + 2], inner[j + 3]])
+                            as usize;
+                    if data_size < 16 || j + data_size > inner.len() {
+                        continue;
+                    }
+                    // Skip the 8-byte data atom header + 8 bytes of flags/reserved.
+                    let img_start = j + 16;
+                    let img_end = j + data_size;
+                    if img_end <= inner.len() && img_start < img_end {
+                        return Some(inner[img_start..img_end].to_vec());
+                    }
+                }
+            }
+        }
+    }
     None
 }
 
@@ -2620,49 +2745,37 @@ fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
     // Set placeholder immediately while fetching.
     image.set_icon_name(Some("audio-x-generic-symbolic"));
 
+    // Bump the generation counter so any in-flight fetch for the
+    // previous track is discarded when it completes.
+    let generation = ART_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+
     let url = cover_art_url.to_string();
     let image = image.clone();
 
-    let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
+    let (reply_tx, reply_rx) = async_channel::bounded::<Vec<u8>>(1);
 
-    // Fetch on a background thread using the shared HTTP client.
-    // This avoids the need for a tokio runtime handle on the GTK thread
-    // and reuses connections via the thread-local client pool.
-    std::thread::spawn(move || {
-        let result = ART_HTTP_CLIENT.with(|client| client.get(&url).send());
-        match result {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    tracing::debug!(
-                        status = %resp.status(),
-                        "Remote album art HTTP error"
-                    );
-                    return;
-                }
-                match resp.bytes() {
-                    Ok(bytes) if !bytes.is_empty() => {
-                        let _ = tx.send_blocking(bytes.to_vec());
-                    }
-                    Ok(_) => {
-                        tracing::debug!("Remote album art response was empty");
-                    }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "Failed to read album art bytes");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to fetch remote album art");
-            }
-        }
+    // Send the request to the persistent art worker thread.
+    // This reuses a single HTTP client with connection pooling,
+    // avoiding the overhead of spawning a new thread + TLS handshake
+    // for every track change.
+    let _ = art_worker_tx().send(ArtRequest {
+        url,
+        generation,
+        reply_tx,
     });
 
     // Receive on the GTK main thread.
     glib::MainContext::default().spawn_local(async move {
-        if let Ok(data) = rx.recv().await {
-            let bytes = glib::Bytes::from(&data);
-            if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
-                image.set_paintable(Some(&texture));
+        if let Ok(data) = reply_rx.recv().await {
+            // Double-check generation in case another track was selected
+            // while we were waiting for the channel.
+            if ART_GENERATION.load(Ordering::Relaxed) == generation {
+                let bytes = glib::Bytes::from(&data);
+                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
+                    image.set_paintable(Some(&texture));
+                }
             }
         }
     });

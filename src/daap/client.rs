@@ -322,6 +322,25 @@ impl DaapClient {
         Ok(mlit_items.into_iter().map(|s| s.to_vec()).collect())
     }
 
+    /// Construct a cover art URL for a track.
+    ///
+    /// DAAP serves artwork at `/databases/{db}/items/{id}/extra_data/artwork`.
+    /// The session-id is included as a query parameter.  `mw` and `mh`
+    /// request a maximum width/height so the server can down-scale.
+    pub fn cover_art_url(&self, song_id: u32) -> Url {
+        let path = format!(
+            "/databases/{}/items/{}/extra_data/artwork",
+            self.database_id, song_id
+        );
+        let mut url = self.base_url.clone();
+        url.set_path(&path);
+        url.query_pairs_mut()
+            .append_pair("session-id", &self.session_id.to_string())
+            .append_pair("mw", "300")
+            .append_pair("mh", "300");
+        url
+    }
+
     /// Construct a streaming URL for a track.
     ///
     /// The URL includes the session-id as a query parameter so

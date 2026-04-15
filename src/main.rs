@@ -54,13 +54,13 @@ fn main() {
 
         // GTK4 on Windows defaults to the Cairo software renderer which
         // makes libadwaita animations (dialog slide-in, fade, blur)
-        // extremely laggy.  Request the Vulkan renderer instead — GTK4
-        // will automatically fall back through ngl → gl → cairo if
-        // Vulkan is unavailable.  Only override if the user hasn't
-        // already set GSK_RENDERER (so power users can still force a
-        // specific renderer).
+        // extremely laggy.  Request the GL renderer for hardware
+        // acceleration — it is more universally compatible than Vulkan
+        // (which can fail on some drivers and under WSL).  Only override
+        // if the user hasn't already set GSK_RENDERER (so power users
+        // can still force a specific renderer).
         if std::env::var_os("GSK_RENDERER").is_none() {
-            std::env::set_var("GSK_RENDERER", "vulkan");
+            std::env::set_var("GSK_RENDERER", "gl");
         }
     }
 
@@ -71,6 +71,22 @@ fn main() {
     // set absolute paths so GTK/Adwaita can find icons, schemas, etc.
     #[cfg(target_os = "macos")]
     setup_macos_bundle_env();
+
+    // ── WSL: force GL renderer to avoid broken Vulkan/dzn ────────────
+    // WSL's Dozen (dzn) Vulkan driver is often incomplete and causes
+    // blank windows or rendering failures.  Detect WSL and force the
+    // GL renderer which works reliably with WSLg.
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("GSK_RENDERER").is_none() {
+            let is_wsl = std::env::var_os("WSL_DISTRO_NAME").is_some()
+                || std::env::var_os("WSL_INTEROP").is_some()
+                || std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists();
+            if is_wsl {
+                std::env::set_var("GSK_RENDERER", "gl");
+            }
+        }
+    }
 
     // ── Tracing ──────────────────────────────────────────────────────
     tracing_subscriber::fmt()
@@ -170,6 +186,17 @@ fn main() {
                     let data_icons = dir.join("data").join("icons");
                     if data_icons.is_dir() {
                         icon_theme.add_search_path(&data_icons);
+                    }
+                }
+                // macOS .app bundle: Contents/MacOS/Tributary-bin → Contents/Resources/share/icons
+                if let Some(dir) = exe.parent() {
+                    let bundle_icons = dir
+                        .parent() // Contents
+                        .map(|p| p.join("Resources").join("share").join("icons"));
+                    if let Some(ref icons) = bundle_icons {
+                        if icons.is_dir() {
+                            icon_theme.add_search_path(icons);
+                        }
                     }
                 }
             }
