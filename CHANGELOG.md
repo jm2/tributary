@@ -21,11 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Windows winget installation instructions** — README now documents `winget install jm2.Tributary`.
 - **Flathub readiness** — AppStream metainfo now includes `<developer>` tag, `<screenshots>` section, and full release history. Flatpak manifest updated with `xdg-music:rw` permission for tag editing.
 
+### Performance
+- **Shared database connection** — Playlist operations (load, create, rename, delete, add/remove tracks, smart rule editing) now reuse a single SQLite connection via `tokio::sync::OnceCell` instead of opening a new connection and re-running migrations on every action. Eliminates ~9 redundant `init_db()` calls per session.
+- **Debounced browser rebuilds during scan** — `TrackUpserted` and `TrackRemoved` events now defer the 3-pane browser rebuild by 500 ms using a generation-counter timer. During initial library scan with many files, this collapses dozens of consecutive rebuilds into a single update, preventing UI lag. The tracklist store is still updated immediately so tracks appear in real-time.
+- **Reused HTTP client for album art** — Remote album art fetching now uses a `thread_local!` `reqwest::blocking::Client` that persists across track changes, benefiting from connection pooling and TLS session caching instead of creating a new client per track.
+- **Search filter debounce (100 ms)** — The browser search entry now debounces filter callbacks by 100 ms using a generation-counter timer, preventing the expensive filter-and-rebuild from firing on every keystroke during fast typing.
+
 ### Fixed
 - **SHA256 checksums only contained Flatpak artifacts** — The release workflow's `upload-artifact` steps were conditional on `workflow_dispatch`, so during `release` events the checksums job couldn't find non-Flatpak artifacts. Made artifact uploads unconditional for all platform jobs (macOS, Windows, DEB, RPM, Arch).
 - **Location consent dialog referenced wrong service** — The geolocation consent dialog said "ip-api.com" but the app actually uses a multi-provider HTTPS cascade (`ipapi.co`, `ipwho.is`, `freeipapi.com`). Updated to generic "a geolocation service" text.
 - **"Reset to Defaults" only reset column visibility** — The Preferences reset button now also resets column ordering to the default layout.
 - **Inno Setup post-install dialog could hang silent installs** — The `[Run]` section used `skipifsilent`, which still showed the "Launch Tributary" checkbox under `/SILENT` (only suppressed under `/VERYSILENT`). Changed to `skipifnotsilent` so the dialog is never shown during any silent install, preventing automation pipeline hangs (e.g. winget).
+- **Context menu "Add to Playlist" showed scrollbars** — GTK4's `PopoverMenu::from_model()` wraps submenu sections in an internal `ScrolledWindow` that added unnecessary scrollbars even for menus with only 2–3 entries. Replaced the `append_section` submenu approach with a flat menu structure: a disabled "Add to Playlist" header item followed by indented playlist names as regular clickable items. No submenu = no internal ScrolledWindow = no scrollbars. Previous CSS-only and programmatic `ScrolledWindow` traversal fixes were insufficient.
+- **Right-click context menu selected wrong row** — The right-click handler used a hardcoded 25px row height estimate to guess which row was clicked, but didn't account for the column header height, causing consistent off-by-one selection errors. Removed the unreliable row-estimation block entirely — the context menu now operates on whatever row(s) are already selected via normal left-click.
 
 ### Changed
 - **Geolocation now extracts region/state** — All three geolocation providers (`ipapi.co`, `ipwho.is`, `freeipapi.com`) now return `region` data, enabling state-level radio station filtering.

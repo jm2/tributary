@@ -1422,6 +1422,7 @@ pub fn build_window(
             let Some(sel) = selection_model.and_then(|m| m.downcast::<gtk::MultiSelection>().ok()) else {
                 return;
             };
+
             let selected = sel.selection();
             if selected.is_empty() {
                 return;
@@ -1537,14 +1538,27 @@ pub fn build_window(
                 action_group.add_action(&remove_action);
                 menu.append(Some("Remove from Playlist"), Some("tracklist-ctx.remove-from-playlist"));
             } else {
-                // ── Add to Playlist submenu ──────────────────────────
-                let submenu = gtk::gio::Menu::new();
+                // ── Add to Playlist (flat list with disabled header) ─
+                // Use a flat menu structure instead of a submenu/section
+                // to avoid GTK4's internal ScrolledWindow which adds
+                // unwanted scrollbars for small menus.
+                let mut has_playlists = false;
 
                 // Find all regular playlists from the sidebar store.
                 let n = sidebar_store_for_ctx.n_items();
                 for i in 0..n {
                     if let Some(src) = sidebar_store_for_ctx.item(i).and_downcast_ref::<SourceObject>() {
                         if src.backend_type() == "playlist" {
+                            // Add the "Add to Playlist" header on first playlist found.
+                            if !has_playlists {
+                                has_playlists = true;
+                                // Disabled action renders as an unclickable label header.
+                                let header_action = gtk::gio::SimpleAction::new("add-to-playlist-header", None);
+                                header_action.set_enabled(false);
+                                action_group.add_action(&header_action);
+                                menu.append(Some("Add to Playlist"), Some("tracklist-ctx.add-to-playlist-header"));
+                            }
+
                             let pl_name = src.name();
                             let pl_id = src.playlist_id();
                             let action_name = format!("add-to-{}", pl_id.replace('-', "_"));
@@ -1601,13 +1615,9 @@ pub fn build_window(
                                 });
                             });
                             action_group.add_action(&add_action);
-                            submenu.append(Some(&pl_name), Some(&format!("tracklist-ctx.{action_name}")));
+                            menu.append(Some(&format!("  {pl_name}")), Some(&format!("tracklist-ctx.{action_name}")));
                         }
                     }
-                }
-
-                if submenu.n_items() > 0 {
-                    menu.append_section(Some("Add to Playlist"), &submenu);
                 }
             }
 
@@ -1684,6 +1694,12 @@ pub fn build_window(
             let popover = gtk::PopoverMenu::from_model(Some(&menu));
             popover.set_parent(&cv);
             popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+
+            // Disable the internal ScrolledWindow that GTK4 PopoverMenu
+            // creates — it adds unnecessary scrollbars for small menus
+            // like "Add to Playlist" with only a few entries.
+            disable_popover_scrollbars(&popover);
+
             popover.popup();
         });
 
@@ -2504,6 +2520,16 @@ fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     true
 }
 
+// Shared HTTP client for album art fetching — reused across track
+// changes to benefit from connection pooling and TLS session caching.
+// Created lazily on first use via `thread_local!`.
+thread_local! {
+    static ART_HTTP_CLIENT: reqwest::blocking::Client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+}
+
 /// Extract embedded album art from a track's file and display it on the
 /// header bar image widget.  Falls back to the generic placeholder icon
 /// if no art is found or the URI is not a local file.
@@ -2599,14 +2625,12 @@ fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
 
     let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
 
-    // Fetch on a background thread using a blocking reqwest client.
-    // This avoids the need for a tokio runtime handle on the GTK thread.
+    // Fetch on a background thread using the shared HTTP client.
+    // This avoids the need for a tokio runtime handle on the GTK thread
+    // and reuses connections via the thread-local client pool.
     std::thread::spawn(move || {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .unwrap_or_default();
-        match client.get(&url).send() {
+        let result = ART_HTTP_CLIENT.with(|client| client.get(&url).send());
+        match result {
             Ok(resp) => {
                 if !resp.status().is_success() {
                     tracing::debug!(
@@ -2716,6 +2740,13 @@ fn setup_library_events(
 ) {
     let browser_widget = browser_widget.clone();
     let column_view = column_view.clone();
+
+    // ── Debounce browser rebuilds for TrackUpserted / TrackRemoved ──
+    // During initial scan, dozens of upsert events fire in quick
+    // succession.  Instead of rebuilding the 3-pane browser on every
+    // single event, we defer the rebuild by 500 ms.  If another event
+    // arrives within that window the previous timer is invalidated.
+    let browser_rebuild_gen: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(event) = engine_rx.recv().await {
@@ -2829,16 +2860,36 @@ fn setup_library_events(
                             track_store.append(&obj);
                         }
 
-                        // Update master tracks + status.
+                        // Update master tracks immediately.
                         let st = source_tracks.borrow();
                         let local_tracks = st.get("local").cloned().unwrap_or_default();
                         *master_tracks.borrow_mut() = local_tracks.clone();
-                        tracklist::update_status(&status_label, &local_tracks);
-                        browser::rebuild_browser_data(
-                            &browser_widget,
-                            &browser_state,
-                            &local_tracks,
-                        );
+
+                        // Debounce browser rebuild + status update (500 ms).
+                        // The tracklist store is already up-to-date above;
+                        // only the 3-pane browser and status bar are deferred.
+                        let gen = browser_rebuild_gen.get().wrapping_add(1);
+                        browser_rebuild_gen.set(gen);
+
+                        let gen_rc = browser_rebuild_gen.clone();
+                        let source_tracks = source_tracks.clone();
+                        let browser_widget = browser_widget.clone();
+                        let browser_state = browser_state.clone();
+                        let status_label = status_label.clone();
+
+                        glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                            if gen_rc.get() != gen {
+                                return; // Superseded by a newer event.
+                            }
+                            let st = source_tracks.borrow();
+                            let local_tracks = st.get("local").cloned().unwrap_or_default();
+                            tracklist::update_status(&status_label, &local_tracks);
+                            browser::rebuild_browser_data(
+                                &browser_widget,
+                                &browser_state,
+                                &local_tracks,
+                            );
+                        });
                     }
                 }
 
@@ -2869,15 +2920,34 @@ fn setup_library_events(
                             }
                         }
 
+                        // Update master tracks immediately.
                         let st = source_tracks.borrow();
                         let local_tracks = st.get("local").cloned().unwrap_or_default();
                         *master_tracks.borrow_mut() = local_tracks.clone();
-                        tracklist::update_status(&status_label, &local_tracks);
-                        browser::rebuild_browser_data(
-                            &browser_widget,
-                            &browser_state,
-                            &local_tracks,
-                        );
+
+                        // Debounce browser rebuild + status update (500 ms).
+                        let gen = browser_rebuild_gen.get().wrapping_add(1);
+                        browser_rebuild_gen.set(gen);
+
+                        let gen_rc = browser_rebuild_gen.clone();
+                        let source_tracks = source_tracks.clone();
+                        let browser_widget = browser_widget.clone();
+                        let browser_state = browser_state.clone();
+                        let status_label = status_label.clone();
+
+                        glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                            if gen_rc.get() != gen {
+                                return; // Superseded by a newer event.
+                            }
+                            let st = source_tracks.borrow();
+                            let local_tracks = st.get("local").cloned().unwrap_or_default();
+                            tracklist::update_status(&status_label, &local_tracks);
+                            browser::rebuild_browser_data(
+                                &browser_widget,
+                                &browser_state,
+                                &local_tracks,
+                            );
+                        });
                     }
                 }
 
@@ -3225,6 +3295,27 @@ fn remove_empty_category_header(store: &gtk::gio::ListStore, category: &str) {
 ///
 /// `on_connect` is called with `(username, password)` if the user
 /// clicks Connect.  Cancel / Escape simply dismisses the dialog.
+/// Traverse a `PopoverMenu`'s widget tree and disable scrollbars on any
+/// internal `ScrolledWindow`.  GTK4's `PopoverMenu::from_model()` wraps
+/// its content in a `ScrolledWindow` that adds unnecessary scrollbars
+/// for small menus (e.g., "Add to Playlist" with only 2–3 entries).
+/// CSS `max-height: none` alone doesn't fix this because the
+/// `ScrolledWindow` has its own scroll policy independent of CSS.
+fn disable_popover_scrollbars(popover: &gtk::PopoverMenu) {
+    fn walk(widget: &gtk::Widget) {
+        if let Some(sw) = widget.downcast_ref::<gtk::ScrolledWindow>() {
+            sw.set_hscrollbar_policy(gtk::PolicyType::Never);
+            sw.set_vscrollbar_policy(gtk::PolicyType::Never);
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            walk(&c);
+            child = c.next_sibling();
+        }
+    }
+    walk(popover.upcast_ref::<gtk::Widget>());
+}
+
 fn show_auth_dialog(
     window: &adw::ApplicationWindow,
     server_name: &str,

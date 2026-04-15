@@ -10,6 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::gio;
+use gtk::glib;
 use gtk::prelude::*;
 
 use super::objects::{BrowserItem, TrackObject};
@@ -189,24 +190,39 @@ pub fn build_browser(
         });
     }
 
-    // ── Search entry handler ─────────────────────────────────────────
+    // ── Search entry handler (debounced 100ms) ───────────────────────
     {
         let sg = selected_genre.clone();
         let sa = selected_artist.clone();
         let search_text = search_text.clone();
         let cb = on_filter_changed;
+        let debounce_gen: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
         search_entry.connect_search_changed(move |entry| {
             let text = entry.text().to_string();
             debug!("Browser: search changed");
             *search_text.borrow_mut() = text.clone();
 
-            let genre = sg.borrow().clone();
-            let artist = sa.borrow().clone();
-            // Note: album selection state is moved, so we pass None for album
-            // when search changes — this is acceptable since search is a
-            // cross-cutting filter. The browser pane selections remain intact.
-            cb(genre, artist, None, text);
+            // Debounce: invalidate any pending timer and schedule a new one.
+            // 100ms is short enough to feel responsive but prevents the
+            // expensive filter callback from firing on every keystroke
+            // during fast typing.
+            let gen = debounce_gen.get().wrapping_add(1);
+            debounce_gen.set(gen);
+
+            let sg = sg.clone();
+            let sa = sa.clone();
+            let cb = cb.clone();
+            let gen_rc = debounce_gen.clone();
+
+            glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+                if gen_rc.get() != gen {
+                    return; // Superseded by a newer keystroke.
+                }
+                let genre = sg.borrow().clone();
+                let artist = sa.borrow().clone();
+                cb(genre, artist, None, text);
+            });
         });
     }
 
