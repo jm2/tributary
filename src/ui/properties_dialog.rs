@@ -257,30 +257,20 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
                 if let Ok(Some(result)) = rx.recv().await {
                     for (name, entry) in &entries {
                         match name.as_str() {
-                            "title" => {
-                                if !result.title.is_empty() {
-                                    entry.set_text(&result.title);
-                                }
+                            "title" if !result.title.is_empty() => {
+                                entry.set_text(&result.title);
                             }
-                            "artist" => {
-                                if !result.artist.is_empty() {
-                                    entry.set_text(&result.artist);
-                                }
+                            "artist" if !result.artist.is_empty() => {
+                                entry.set_text(&result.artist);
                             }
-                            "album" => {
-                                if !result.album.is_empty() {
-                                    entry.set_text(&result.album);
-                                }
+                            "album" if !result.album.is_empty() => {
+                                entry.set_text(&result.album);
                             }
-                            "year" => {
-                                if !result.year.is_empty() {
-                                    entry.set_text(&result.year);
-                                }
+                            "year" if !result.year.is_empty() => {
+                                entry.set_text(&result.year);
                             }
-                            "track_number" => {
-                                if !result.track_number.is_empty() {
-                                    entry.set_text(&result.track_number);
-                                }
+                            "track_number" if !result.track_number.is_empty() => {
+                                entry.set_text(&result.track_number);
                             }
                             _ => {}
                         }
