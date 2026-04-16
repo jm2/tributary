@@ -74,7 +74,7 @@ jobs:
 
       - name: Upload Flatpak to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: tributary-linux-${{ matrix.arch }}.flatpak
 
@@ -128,7 +128,7 @@ jobs:
 
       - name: Upload DMG to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/tributary-macos-${{ matrix.arch }}.dmg
 
@@ -245,7 +245,7 @@ jobs:
 
       - name: Upload Windows artifacts to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/tributary-windows-${{ matrix.arch }}.zip
@@ -307,7 +307,7 @@ jobs:
 
       - name: Upload .deb to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: target/debian/tributary-${{ matrix.deb_arch }}.deb
 
@@ -371,7 +371,7 @@ jobs:
 
       - name: Upload .rpm to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
 
@@ -429,7 +429,7 @@ jobs:
 
       - name: Upload Arch package to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/tributary-x86_64.pkg.tar.zst
 
@@ -462,7 +462,7 @@ jobs:
 
       - name: Upload SHA256SUMS to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: SHA256SUMS.txt
 
