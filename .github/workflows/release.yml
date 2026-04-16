@@ -79,7 +79,7 @@ jobs:
           files: tributary-linux-${{ matrix.arch }}.flatpak
 
       - name: Upload Flatpak as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tributary-linux-${{ matrix.arch }}-flatpak
           path: tributary-linux-${{ matrix.arch }}.flatpak
@@ -133,7 +133,7 @@ jobs:
           files: dist/tributary-macos-${{ matrix.arch }}.dmg
 
       - name: Upload DMG as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tributary-macos-${{ matrix.arch }}-dmg
           path: dist/tributary-macos-${{ matrix.arch }}.dmg
@@ -252,7 +252,7 @@ jobs:
             dist/tributary-windows-${{ matrix.arch }}-setup.exe
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tributary-windows-${{ matrix.arch }}
           path: |
@@ -312,7 +312,7 @@ jobs:
           files: target/debian/tributary-${{ matrix.deb_arch }}.deb
 
       - name: Upload .deb as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tributary-${{ matrix.deb_arch }}-deb
           path: target/debian/tributary-${{ matrix.deb_arch }}.deb
@@ -376,7 +376,7 @@ jobs:
           files: target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
 
       - name: Upload .rpm as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tributary-${{ matrix.rpm_arch }}-rpm
           path: target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
@@ -434,7 +434,7 @@ jobs:
           files: dist/tributary-x86_64.pkg.tar.zst
 
       - name: Upload Arch package as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tributary-x86_64-arch
           path: dist/tributary-x86_64.pkg.tar.zst
@@ -468,7 +468,7 @@ jobs:
 
       - name: Upload SHA256SUMS as artifact (workflow_dispatch)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SHA256SUMS
           path: SHA256SUMS.txt
