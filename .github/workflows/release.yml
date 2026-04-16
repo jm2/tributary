@@ -30,7 +30,7 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Install Flatpak natively on the runner instead of using an x86_64 container.
       - name: Install Flatpak & Dependencies
@@ -95,7 +95,7 @@ jobs:
             runner: macos-15
             rust_target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install system dependencies (Homebrew)
         run: |
@@ -163,7 +163,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up MSYS2 (${{ matrix.msystem }})
         uses: msys2/setup-msys2@v2
@@ -283,7 +283,7 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libdbus-1-dev
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -339,7 +339,7 @@ jobs:
             gstreamer1-devel gstreamer1-plugins-base-devel \
             pkgconf-pkg-config git curl
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -392,7 +392,7 @@ jobs:
           pacman -Syu --noconfirm git gtk4 libadwaita gstreamer sqlite \
             gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav dbus rust
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
