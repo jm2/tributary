@@ -110,7 +110,7 @@ jobs:
           targets: ${{ matrix.rust_target }}
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -188,7 +188,7 @@ jobs:
           targets: ${{ matrix.rust_target }}
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -292,7 +292,7 @@ jobs:
         run: cargo install cargo-deb
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -348,7 +348,7 @@ jobs:
         run: cargo install cargo-generate-rpm
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -395,7 +395,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
