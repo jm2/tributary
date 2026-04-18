@@ -19,13 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `daap/dmap.rs` — i8/i64 extraction, zero-length strings, nested containers, missing tags, partial headers, max values, UTF-8 strings.
   - `local/engine.rs` — `db_model_to_track()` conversion, None fields, invalid UUID fallback, invalid date handling, `get_mtime()` on nonexistent files.
 - **Property-based testing** — `proptest` added as dev-dependency with 3 property tests for the smart rules engine: "All mode ⊆ Any mode", "limiting never increases count", "empty rules returns all tracks".
-- **Developer build script flags** — `build-linux.sh` and `build-macos.sh` now support `--check`, `--fmt`, and `--clippy` quick-exit flags matching the existing Windows `build-windows.ps1 -Check/-Fmt/-Clippy` pattern.
+- **Developer build script flags** — `build-linux.sh` and `build-macos.sh` now support `--check`, `--fmt`, `--clippy`, and `--coverage` quick-exit flags matching the existing Windows `build-windows.ps1 -Check/-Fmt/-Clippy/-Coverage` pattern.
+- **Local coverage reporting** — All three build scripts support `--coverage` / `-Coverage` to run `cargo llvm-cov --summary-only` with auto-install. Coverage reports exclude untestable modules (UI, remote backends, DB migrations) via `--ignore-filename-regex` for meaningful percentages.
+- **DMAP parser tag coverage** — Added `mikd` (media item kind, I8) and `mper` (persistent ID, I64) to the DMAP tag classification table.
 
 ### Fixed
 - **Windows Winget/Add-Remove Programs showing version in app name** — Added `AppVerName=Tributary` to the Inno Setup script so the display name is just "Tributary" instead of "Tributary version 0.3.0" in Winget upgrade lists and Add/Remove Programs.
 
 ### Changed
+- **Windows x86_64 toolchain switched from GCC to Clang/LLVM** — The Windows x86_64 build now uses MSYS2's CLANG64 environment (`mingw-w64-clang-x86_64-*` packages) with the `x86_64-pc-windows-gnullvm` Rust target instead of UCRT64/GCC (`x86_64-pc-windows-gnu`). This unifies both Windows architectures (x86_64 and aarch64) on the same LLVM/Clang compiler family, improving toolchain consistency and enabling better LLVM integration for future sanitizer and profiling work. End-user binaries are identical native Windows PE executables.
 - **CI Clippy upgraded to pedantic** — The Linux CI Clippy step now uses `cargo clippy --all-targets -- -D warnings` which picks up the crate-level `#![warn(clippy::pedantic, clippy::nursery)]` configuration. macOS and Windows CI continue to use `-D warnings` (same effect since the crate-level warns are active).
+- **CI coverage excludes untestable modules** — The `cargo-llvm-cov` step now uses `--ignore-filename-regex` to exclude UI, remote backend clients, DB migrations, desktop integration, and `main.rs` from coverage reports, providing meaningful coverage percentages for testable core logic.
 
 ## [0.3.0] — 2026-04-15
 

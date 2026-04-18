@@ -83,7 +83,8 @@ if $COVERAGE; then
     cargo install cargo-llvm-cov --locked
   }
   info "Running code coverage..."
-  cargo llvm-cov --summary-only
+  cargo llvm-cov --summary-only \
+    --ignore-filename-regex '(ui/|jellyfin/|plex/|subsonic/|radio/|db/migration|desktop_integration/|main\.rs)'
   exit 0
 fi
 

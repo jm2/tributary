@@ -163,24 +163,24 @@ The app bundle is at `dist/Tributary.app`, and the DMG at `dist/Tributary.dmg`.
 
 ### Windows
 
-Requires [MSYS2](https://www.msys2.org) with the UCRT64 environment:
+Requires [MSYS2](https://www.msys2.org) with the CLANG64 environment:
 
 ```powershell
-# In an MSYS2 UCRT64 shell:
-pacman -S mingw-w64-ucrt-x86_64-gtk4 \
-          mingw-w64-ucrt-x86_64-libadwaita \
-          mingw-w64-ucrt-x86_64-gstreamer \
-          mingw-w64-ucrt-x86_64-gst-plugins-good \
-          mingw-w64-ucrt-x86_64-gst-plugins-bad \
-          mingw-w64-ucrt-x86_64-gst-libav \
-          mingw-w64-ucrt-x86_64-pkg-config \
-          mingw-w64-ucrt-x86_64-toolchain
+# In an MSYS2 CLANG64 shell:
+pacman -S mingw-w64-clang-x86_64-gtk4 \
+          mingw-w64-clang-x86_64-libadwaita \
+          mingw-w64-clang-x86_64-gstreamer \
+          mingw-w64-clang-x86_64-gst-plugins-good \
+          mingw-w64-clang-x86_64-gst-plugins-bad \
+          mingw-w64-clang-x86_64-gst-libav \
+          mingw-w64-clang-x86_64-pkg-config \
+          mingw-w64-clang-x86_64-toolchain
 ```
 
 Then, in PowerShell:
 ```powershell
-# Ensure Rust's GNU target is installed:
-rustup target add x86_64-pc-windows-gnu
+# Ensure Rust's LLVM target is installed:
+rustup target add x86_64-pc-windows-gnullvm
 
 # Build and bundle DLLs:
 .\scripts\build-windows.ps1

@@ -60,13 +60,14 @@ else {
     "x64"
 }
 
-$RustTarget = if ($env:RUST_TARGET) { $env:RUST_TARGET } elseif ($NativeArch -eq "arm64") { "aarch64-pc-windows-gnullvm" } else { "x86_64-pc-windows-gnu" }
-$MsysEnv = if ($env:MSYS_ENV) { $env:MSYS_ENV } elseif ($NativeArch -eq "arm64") { "clangarm64" } else { "ucrt64" }
+$RustTarget = if ($env:RUST_TARGET) { $env:RUST_TARGET } elseif ($NativeArch -eq "arm64") { "aarch64-pc-windows-gnullvm" } else { "x86_64-pc-windows-gnullvm" }
+$MsysEnv = if ($env:MSYS_ENV) { $env:MSYS_ENV } elseif ($NativeArch -eq "arm64") { "clangarm64" } else { "clang64" }
 
 # Map the environment to the correct MSYS2 package prefix for error messages
 $PkgPrefix = switch ($MsysEnv) {
-    "ucrt64" { "mingw-w64-ucrt-x86_64" }
+    "clang64" { "mingw-w64-clang-x86_64" }
     "clangarm64" { "mingw-w64-clang-aarch64" }
+    "ucrt64" { "mingw-w64-ucrt-x86_64" }
     default { "mingw-w64-$MsysEnv" }
 }
 
@@ -210,7 +211,7 @@ if ($Coverage) {
     $env:AR = $null
     $env:DLLTOOL = $null
     Write-Info "Running code coverage (MSVC toolchain)..."
-    cargo llvm-cov --summary-only
+    cargo llvm-cov --summary-only --ignore-filename-regex '(ui/|jellyfin/|plex/|subsonic/|radio/|db/migration|desktop_integration/|main\.rs)'
     if ($LASTEXITCODE -ne 0) { Write-Err "cargo llvm-cov failed." }
     Write-Info "Coverage complete."
     exit 0
