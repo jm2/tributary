@@ -3581,6 +3581,9 @@ fn apply_radio_columns(column_view: &gtk::ColumnView, radio: bool) {
     for i in 0..columns.n_items() {
         if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
             if let Some(title) = col.title() {
+                if title.is_empty() {
+                    continue; // sentinel column
+                }
                 let title_str = title.to_string();
                 // Match on both original and renamed titles since the column
                 // may already be renamed from a previous radio selection.

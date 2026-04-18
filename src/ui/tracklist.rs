@@ -144,6 +144,26 @@ pub fn build_tracklist(
         |a, b| a.format().cmp(&b.format()),
     );
 
+    // ── Sentinel (spacer) column ─────────────────────────────────────
+    // GTK4 auto-expands the rightmost column to fill remaining space,
+    // making it impossible for users to resize by dragging its right
+    // edge.  This invisible zero-width sentinel absorbs the expansion
+    // so every real column keeps a draggable resize handle.  (#12)
+    {
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(|_, list_item| {
+            let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
+            list_item.set_child(Some(&gtk::Label::new(None)));
+        });
+        let sentinel = gtk::ColumnViewColumn::builder()
+            .title("")
+            .factory(&factory)
+            .resizable(false)
+            .fixed_width(0)
+            .build();
+        column_view.append_column(&sentinel);
+    }
+
     // Connect the ColumnView's composite sorter to the SortListModel
     // so that clicking headers actually re-orders the rows.
     sort_model.set_sorter(column_view.sorter().as_ref());

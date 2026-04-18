@@ -350,11 +350,17 @@ pub fn show_preferences(
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Apply column visibility to the `ColumnView` based on the config.
+///
+/// Skips the sentinel column (empty title) used to absorb GTK4's
+/// rightmost-column auto-expansion.
 pub fn apply_column_visibility(column_view: &gtk::ColumnView, visible: &[String]) {
     let columns = column_view.columns();
     for i in 0..columns.n_items() {
         if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
             if let Some(title) = col.title() {
+                if title.is_empty() {
+                    continue; // sentinel column
+                }
                 col.set_visible(visible.iter().any(|v| v == title.as_str()));
             }
         }
@@ -393,13 +399,17 @@ pub fn apply_column_order(column_view: &gtk::ColumnView, order: &[String]) {
 }
 
 /// Read the current column order from the `ColumnView`.
+///
+/// Skips the sentinel column (empty title).
 pub fn read_column_order(column_view: &gtk::ColumnView) -> Vec<String> {
     let columns = column_view.columns();
     let mut order = Vec::new();
     for i in 0..columns.n_items() {
         if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
             if let Some(title) = col.title() {
-                order.push(title.to_string());
+                if !title.is_empty() {
+                    order.push(title.to_string());
+                }
             }
         }
     }
