@@ -93,6 +93,10 @@ fn tag_type(tag: &[u8; 4]) -> DmapType {
         b"mstt" => DmapType::U32, // status code
         b"mimc" => DmapType::U32, // item count
         b"msau" => DmapType::U8,  // authentication method (0 = none)
+        b"mikd" => DmapType::I8,  // media item kind
+
+        // I64 integers
+        b"mper" => DmapType::I64, // persistent id
 
         // U16 integers
         b"astn" => DmapType::U16, // song track number
@@ -424,5 +428,95 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert_eq!(find_string(&nodes, b"minm"), Some("Hello".to_string()));
         assert_eq!(find_u32(&nodes, b"miid"), Some(99));
+    }
+
+    #[test]
+    fn test_i8_extraction() {
+        let blob = make_tlv(b"mikd", &[0xFF]); // -1 as i8
+        let nodes = parse_dmap(&blob).expect("parse should succeed");
+        assert_eq!(nodes.len(), 1);
+        match &nodes[0].data {
+            DmapValue::I8(v) => assert_eq!(*v, -1),
+            other => panic!("expected I8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_i64_extraction() {
+        let blob = make_tlv(b"mper", &42i64.to_be_bytes());
+        let nodes = parse_dmap(&blob).expect("parse should succeed");
+        assert_eq!(nodes.len(), 1);
+        match &nodes[0].data {
+            DmapValue::I64(v) => assert_eq!(*v, 42),
+            other => panic!("expected I64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_zero_length_string() {
+        let blob = make_tlv(b"minm", b"");
+        let nodes = parse_dmap(&blob).expect("parse should succeed");
+        assert_eq!(find_string(&nodes, b"minm"), Some(String::new()));
+    }
+
+    #[test]
+    fn test_nested_containers() {
+        // Build: msrv → mlcl → mlit → minm="Deep"
+        let minm = make_tlv(b"minm", b"Deep");
+        let mlit = make_tlv(b"mlit", &minm);
+        let mlcl = make_tlv(b"mlcl", &mlit);
+        let msrv = make_tlv(b"msrv", &mlcl);
+
+        let nodes = parse_dmap(&msrv).expect("parse should succeed");
+        assert_eq!(nodes.len(), 1);
+
+        // Navigate: msrv → mlcl → mlit → minm
+        let DmapValue::Container(msrv_children) = &nodes[0].data else {
+            panic!("expected container");
+        };
+        let DmapValue::Container(mlcl_children) = &msrv_children[0].data else {
+            panic!("expected container");
+        };
+        let items = find_containers(mlcl_children, b"mlit");
+        assert_eq!(items.len(), 1);
+        assert_eq!(find_string(items[0], b"minm"), Some("Deep".to_string()));
+    }
+
+    #[test]
+    fn test_find_string_missing_tag() {
+        let blob = make_tlv(b"minm", b"Hello");
+        let nodes = parse_dmap(&blob).expect("parse should succeed");
+        assert_eq!(find_string(&nodes, b"miid"), None);
+    }
+
+    #[test]
+    fn test_find_u32_missing_tag() {
+        let blob = make_tlv(b"miid", &u32_bytes(42));
+        let nodes = parse_dmap(&blob).expect("parse should succeed");
+        assert_eq!(find_u32(&nodes, b"minm"), None);
+    }
+
+    #[test]
+    fn test_partial_header_returns_error() {
+        // Only 6 bytes — not enough for a full 8-byte TLV header.
+        let result = parse_dmap(&[b'm', b'i', b'n', b'm', 0, 0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_large_u32_value() {
+        let blob = make_tlv(b"miid", &u32_bytes(u32::MAX));
+        let nodes = parse_dmap(&blob).expect("parse should succeed");
+        assert_eq!(find_u32(&nodes, b"miid"), Some(u32::MAX));
+    }
+
+    #[test]
+    fn test_utf8_string() {
+        let blob = make_tlv(b"minm", "日本語テスト".as_bytes());
+        let nodes = parse_dmap(&blob).expect("parse should succeed");
+        assert_eq!(
+            find_string(&nodes, b"minm"),
+            Some("日本語テスト".to_string())
+        );
     }
 }

@@ -5,6 +5,42 @@
 //! creates the GTK4/libadwaita application, and hands off to the
 //! UI builder on activation.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// ── Clippy pedantic / nursery configuration ─────────────────────────────
+// Enable pedantic and nursery for deep static analysis, but selectively
+// allow lints that are too noisy for a GTK application codebase.
+#![warn(clippy::pedantic, clippy::nursery)]
+#![allow(
+    clippy::doc_markdown,            // Too many false positives on technical terms (GLib, SQLite, etc.)
+    clippy::similar_names,           // Intentional: artist_resp/artists_resp, value/value2 are clear
+    clippy::too_many_lines,          // GTK UI builders are inherently long
+    clippy::redundant_clone,         // GTK GObject clones are required for move closures
+    clippy::wildcard_imports,        // Standard pattern for gtk::prelude::*
+    clippy::cast_possible_truncation,// Deliberate u64↔i64↔u32 conversions for DB/UI interop
+    clippy::cast_sign_loss,          // Deliberate i32→u32 for DB model conversions
+    clippy::cast_possible_wrap,      // Deliberate u32→i32 for SeaORM compatibility
+    clippy::cast_precision_loss,     // u64→f64 for progress/duration display
+    clippy::cast_lossless,           // Allow explicit `as` casts for clarity
+    clippy::struct_field_names,      // track_number on Track is intentional
+    clippy::module_name_repetitions, // Acceptable for backend::BackendError etc.
+    clippy::items_after_statements,  // Common pattern in GTK signal handler setup
+    clippy::significant_drop_tightening, // False positives with GTK widget builders
+    clippy::redundant_closure_for_method_calls, // Often clearer with explicit closures
+    clippy::option_if_let_else,      // if-let is often clearer than map_or
+    clippy::match_same_arms,         // Intentional for exhaustive match documentation
+    clippy::trivially_copy_pass_by_ref, // &bool/&u32 in trait impls
+    clippy::needless_pass_by_value,  // GTK signal handlers require owned values
+    clippy::unreadable_literal,      // Constants like 86400, 604800 are well-known
+    clippy::map_unwrap_or,           // .map().unwrap_or() is often clearer than .map_or()
+    clippy::uninlined_format_args,   // format!("{}", x) vs format!("{x}") — both fine
+    clippy::unnecessary_literal_bound, // &str return types in trait impls
+    clippy::missing_const_for_fn,    // Many fns could be const but aren't worth marking
+    clippy::assigning_clones,        // clone_from() not always clearer
+    clippy::if_not_else,             // !x.is_empty() is often the natural condition
+    clippy::iter_over_hash_type,     // HashSet iteration order is fine for our use cases
+    clippy::ref_option,              // Option<&T> vs &Option<T> — existing API signatures
+    clippy::single_match_else,       // match with _ => {} is fine for clarity
+    clippy::derive_partial_eq_without_eq, // Not all PartialEq types need Eq
+)]
 
 #[allow(dead_code)]
 mod architecture;

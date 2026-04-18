@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # scripts/build-linux.sh
 # Tributary — Linux release build helper
-# Usage: ./scripts/build-linux.sh [--flatpak] [--deb] [--rpm] [--arch-pkg]
+# Usage: ./scripts/build-linux.sh [--flatpak] [--deb] [--rpm] [--arch-pkg] [--check] [--fmt] [--clippy]
 set -euo pipefail
 
 FLATPAK=false
 DEB=false
 RPM=false
 ARCH_PKG=false
+CHECK=false
+FMT=false
+CLIPPY=false
+COVERAGE=false
 
 for arg in "$@"; do
   case "$arg" in
@@ -15,6 +19,10 @@ for arg in "$@"; do
     --deb)       DEB=true ;;
     --rpm)       RPM=true ;;
     --arch-pkg)  ARCH_PKG=true ;;
+    --check)     CHECK=true ;;
+    --fmt)       FMT=true ;;
+    --clippy)    CLIPPY=true ;;
+    --coverage)  COVERAGE=true ;;
   esac
 done
 
@@ -46,6 +54,38 @@ check_pkg "dbus-1"        "libdbus-1-dev"         "dbus-devel"          "dbus"
 # They are declared in the .deb, .rpm, and PKGBUILD package metadata.
 
 info "All system dependencies satisfied."
+
+# ── Quick-exit modes: --check, --fmt, --clippy ───────────────────────────────
+if $FMT; then
+  info "Running cargo fmt..."
+  cargo fmt
+  info "Formatting complete."
+  exit 0
+fi
+
+if $CHECK; then
+  info "Running cargo check..."
+  cargo check
+  info "Check passed."
+  exit 0
+fi
+
+if $CLIPPY; then
+  info "Running cargo clippy (pedantic)..."
+  cargo clippy --all-targets -- -D warnings
+  info "Clippy passed."
+  exit 0
+fi
+
+if $COVERAGE; then
+  command -v cargo-llvm-cov &>/dev/null || {
+    info "Installing cargo-llvm-cov..."
+    cargo install cargo-llvm-cov --locked
+  }
+  info "Running code coverage..."
+  cargo llvm-cov --summary-only
+  exit 0
+fi
 
 # ── Rust Build ───────────────────────────────────────────────────────────────
 info "Building Tributary (release)..."

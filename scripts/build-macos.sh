@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # scripts/build-macos.sh
 # Tributary — macOS release build helper (.app + .dmg)
-# Usage: ./scripts/build-macos.sh [--dmg]
+# Usage: ./scripts/build-macos.sh [--dmg] [--check] [--fmt] [--clippy]
 set -euo pipefail
 
 MAKE_DMG=false
+CHECK=false
+FMT=false
+CLIPPY=false
+COVERAGE=false
 for arg in "$@"; do
-  [[ "$arg" == "--dmg" ]] && MAKE_DMG=true
+  case "$arg" in
+    --dmg)      MAKE_DMG=true ;;
+    --check)    CHECK=true ;;
+    --fmt)      FMT=true ;;
+    --clippy)   CLIPPY=true ;;
+    --coverage) COVERAGE=true ;;
+  esac
 done
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -42,11 +52,43 @@ fi
 
 info "All system dependencies satisfied."
 
-# ── Rust Build ───────────────────────────────────────────────────────────────
-info "Building Tributary (release)..."
-
 BREW_PREFIX="$(brew --prefix)"
 export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+# ── Quick-exit modes: --check, --fmt, --clippy ───────────────────────────────
+if $FMT; then
+  info "Running cargo fmt..."
+  cargo fmt
+  info "Formatting complete."
+  exit 0
+fi
+
+if $CHECK; then
+  info "Running cargo check..."
+  cargo check
+  info "Check passed."
+  exit 0
+fi
+
+if $CLIPPY; then
+  info "Running cargo clippy (pedantic)..."
+  cargo clippy --all-targets -- -D warnings
+  info "Clippy passed."
+  exit 0
+fi
+
+if $COVERAGE; then
+  command -v cargo-llvm-cov &>/dev/null || {
+    info "Installing cargo-llvm-cov..."
+    cargo install cargo-llvm-cov --locked
+  }
+  info "Running code coverage..."
+  cargo llvm-cov --summary-only
+  exit 0
+fi
+
+# ── Rust Build ───────────────────────────────────────────────────────────────
+info "Building Tributary (release)..."
 
 cargo build --release
 info "Binary built: $(pwd)/$BINARY"

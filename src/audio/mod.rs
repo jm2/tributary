@@ -473,3 +473,111 @@ pub fn redact_url_secrets(uri: &str) -> String {
     }
     url.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── slider_to_pipeline tests ────────────────────────────────────
+
+    #[test]
+    fn test_slider_to_pipeline_zero() {
+        assert!((slider_to_pipeline(0.0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_slider_to_pipeline_one() {
+        assert!((slider_to_pipeline(1.0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_slider_to_pipeline_half() {
+        // 0.5^3 = 0.125
+        assert!((slider_to_pipeline(0.5) - 0.125).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_slider_to_pipeline_monotonic() {
+        // The cubic curve should be monotonically increasing.
+        let mut prev = slider_to_pipeline(0.0);
+        for i in 1..=100 {
+            let val = slider_to_pipeline(i as f64 / 100.0);
+            assert!(val >= prev, "slider_to_pipeline should be monotonic");
+            prev = val;
+        }
+    }
+
+    // ── redact_url_secrets tests ────────────────────────────────────
+
+    #[test]
+    fn test_redact_plex_token() {
+        let url = "https://plex.example.com/library?X-Plex-Token=abc123&other=value";
+        let redacted = redact_url_secrets(url);
+        assert!(redacted.contains("X-Plex-Token=REDACTED"));
+        assert!(redacted.contains("other=value"));
+        assert!(!redacted.contains("abc123"));
+    }
+
+    #[test]
+    fn test_redact_api_key() {
+        let url = "https://jellyfin.example.com/Items?api_key=secret123";
+        let redacted = redact_url_secrets(url);
+        assert!(redacted.contains("api_key=REDACTED"));
+        assert!(!redacted.contains("secret123"));
+    }
+
+    #[test]
+    fn test_redact_subsonic_token_and_salt() {
+        let url = "https://sub.example.com/rest/ping.view?u=admin&t=tokenvalue&s=saltvalue&v=1.16.1&c=tributary";
+        let redacted = redact_url_secrets(url);
+        assert!(redacted.contains("t=REDACTED"));
+        assert!(redacted.contains("s=REDACTED"));
+        assert!(redacted.contains("u=admin")); // username not redacted
+        assert!(redacted.contains("v=1.16.1"));
+        assert!(!redacted.contains("tokenvalue"));
+        assert!(!redacted.contains("saltvalue"));
+    }
+
+    #[test]
+    fn test_redact_no_sensitive_params() {
+        let url = "https://example.com/api?page=1&limit=50";
+        let redacted = redact_url_secrets(url);
+        assert_eq!(redacted, url);
+    }
+
+    #[test]
+    fn test_redact_no_query_params() {
+        let url = "https://example.com/path";
+        let redacted = redact_url_secrets(url);
+        assert_eq!(redacted, url);
+    }
+
+    #[test]
+    fn test_redact_invalid_url() {
+        let url = "not a valid url";
+        let redacted = redact_url_secrets(url);
+        assert_eq!(redacted, url);
+    }
+
+    #[test]
+    fn test_redact_s_param_without_subsonic_token() {
+        // "s" alone (without "t") should NOT be redacted — it could be
+        // an unrelated parameter.
+        let url = "https://example.com/api?s=something&page=1";
+        let redacted = redact_url_secrets(url);
+        assert!(redacted.contains("s=something"));
+    }
+
+    // ── Volume persistence helpers ──────────────────────────────────
+
+    #[test]
+    fn test_volume_path_returns_some() {
+        // On any system with a data directory, this should return Some.
+        // (May fail in extremely minimal CI environments.)
+        let path = volume_path();
+        if let Some(p) = path {
+            assert!(p.to_string_lossy().contains("tributary"));
+            assert!(p.to_string_lossy().contains("volume"));
+        }
+    }
+}

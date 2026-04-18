@@ -27,3 +27,7 @@ Thumbs.db
 build-dir/
 repo/
 cargo-sources.json
+
+# Fuzz artifacts
+fuzz/artifacts/
+fuzz/corpus/

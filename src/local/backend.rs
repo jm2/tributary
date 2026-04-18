@@ -143,7 +143,7 @@ impl MediaBackend for LocalBackend {
                 .or_default()
                 .insert(row.album_title.clone());
         }
-        for (name, artist) in artist_map.iter_mut() {
+        for (name, artist) in &mut artist_map {
             if let Some(albums) = album_sets.get(name) {
                 artist.album_count = albums.len() as u32;
             }

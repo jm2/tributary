@@ -38,7 +38,8 @@ param(
     [switch]$InnoSetup,
     [switch]$Check,
     [switch]$Clippy,
-    [switch]$Fmt
+    [switch]$Fmt,
+    [switch]$Coverage
 )
 
 Set-StrictMode -Version Latest
@@ -188,9 +189,30 @@ if ($Check) {
 
 if ($Clippy) {
     Write-Info "Running cargo clippy for $RustTarget..."
-    cargo clippy --target $RustTarget -- -D warnings
+    cargo clippy --all-targets --target $RustTarget -- -D warnings -W clippy::pedantic -W clippy::nursery
     if ($LASTEXITCODE -ne 0) { Write-Err "cargo clippy failed." }
     Write-Info "Clippy passed."
+    exit 0
+}
+
+if ($Coverage) {
+    if (-not (Get-Command cargo-llvm-cov -ErrorAction SilentlyContinue)) {
+        Write-Info "Installing cargo-llvm-cov..."
+        cargo install cargo-llvm-cov --locked
+        if ($LASTEXITCODE -ne 0) { Write-Err "Failed to install cargo-llvm-cov." }
+    }
+    # cargo-llvm-cov requires the MSVC toolchain (LLVM source-based coverage
+    # only works with the MSVC backend).  Clear the MSYS2 compiler overrides
+    # so ring/cc-rs use the native MSVC tools instead of GNU ar/gcc.
+    Write-Info "Clearing MSYS2 compiler overrides for MSVC coverage build..."
+    $env:CC = $null
+    $env:CXX = $null
+    $env:AR = $null
+    $env:DLLTOOL = $null
+    Write-Info "Running code coverage (MSVC toolchain)..."
+    cargo llvm-cov --summary-only
+    if ($LASTEXITCODE -ne 0) { Write-Err "cargo llvm-cov failed." }
+    Write-Info "Coverage complete."
     exit 0
 }
 

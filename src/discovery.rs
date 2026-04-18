@@ -391,7 +391,7 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
 
         // ── Update miss counters and remove stale servers ───────────
         let mut to_remove = Vec::new();
-        for (address, (name, misses)) in known.iter_mut() {
+        for (address, (name, misses)) in &mut known {
             if responded_this_cycle.contains(address) {
                 *misses = 0;
             } else {

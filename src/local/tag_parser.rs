@@ -112,3 +112,76 @@ pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
         file_size_bytes,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_is_audio_file_supported_extensions() {
+        for ext in AUDIO_EXTENSIONS {
+            let filename = format!("test.{ext}");
+            let path = Path::new(&filename);
+            assert!(is_audio_file(path), "Expected {ext} to be recognized");
+        }
+    }
+
+    #[test]
+    fn test_is_audio_file_case_insensitive() {
+        assert!(is_audio_file(Path::new("song.FLAC")));
+        assert!(is_audio_file(Path::new("song.Mp3")));
+        assert!(is_audio_file(Path::new("song.M4A")));
+    }
+
+    #[test]
+    fn test_is_audio_file_unsupported() {
+        assert!(!is_audio_file(Path::new("image.png")));
+        assert!(!is_audio_file(Path::new("document.pdf")));
+        assert!(!is_audio_file(Path::new("video.mkv")));
+        assert!(!is_audio_file(Path::new("playlist.m3u")));
+        assert!(!is_audio_file(Path::new("readme.txt")));
+    }
+
+    #[test]
+    fn test_is_audio_file_no_extension() {
+        assert!(!is_audio_file(Path::new("noextension")));
+        assert!(!is_audio_file(Path::new(".")));
+        assert!(!is_audio_file(Path::new(".hidden")));
+    }
+
+    #[test]
+    fn test_is_audio_file_empty_path() {
+        assert!(!is_audio_file(Path::new("")));
+    }
+
+    #[test]
+    fn test_is_audio_file_dotfile_with_audio_ext() {
+        // .flac as a filename (no stem) — extension is "flac" on some platforms
+        // but Path::extension() returns None for ".flac" (it's the stem).
+        assert!(!is_audio_file(Path::new(".flac")));
+    }
+
+    #[test]
+    fn test_is_audio_file_nested_path() {
+        assert!(is_audio_file(Path::new(
+            "/home/user/Music/Artist/Album/track.flac"
+        )));
+        assert!(is_audio_file(Path::new("C:\\Users\\Music\\song.mp3")));
+    }
+
+    #[test]
+    fn test_audio_extensions_list_completeness() {
+        // Verify the list contains the most common formats.
+        assert!(AUDIO_EXTENSIONS.contains(&"flac"));
+        assert!(AUDIO_EXTENSIONS.contains(&"mp3"));
+        assert!(AUDIO_EXTENSIONS.contains(&"m4a"));
+        assert!(AUDIO_EXTENSIONS.contains(&"ogg"));
+        assert!(AUDIO_EXTENSIONS.contains(&"opus"));
+        assert!(AUDIO_EXTENSIONS.contains(&"wav"));
+        assert!(AUDIO_EXTENSIONS.contains(&"aac"));
+        assert!(AUDIO_EXTENSIONS.contains(&"wma"));
+        assert!(AUDIO_EXTENSIONS.contains(&"aiff"));
+        assert!(AUDIO_EXTENSIONS.contains(&"aif"));
+    }
+}

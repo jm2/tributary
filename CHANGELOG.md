@@ -5,6 +5,28 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 0.3.1
+
+### Added
+- **Pedantic Clippy analysis** — Enabled `clippy::pedantic` and `clippy::nursery` crate-wide with curated `#![allow(...)]` for GTK-specific patterns. All 392 initial warnings resolved. Pedantic linting now runs in CI on every push/PR and locally via `build-windows.ps1 -Clippy`, `build-linux.sh --clippy`, and `build-macos.sh --clippy`.
+- **`cargo audit` in CI** — New Security Audit job checks `Cargo.lock` against the RustSec Advisory Database on every push and pull request.
+- **Code coverage in CI** — `cargo-llvm-cov` generates HTML coverage reports on the Linux x86_64 CI job, uploaded as downloadable artifacts.
+- **Weekly fuzz testing** — `cargo-fuzz` target for the DMAP binary protocol parser runs for 5 minutes every Sunday via a scheduled GitHub Actions workflow. Crash artifacts are uploaded automatically.
+- **Comprehensive unit test suite** — Added 60+ new test functions (up from 11) covering:
+  - `smart_rules.rs` — all text/numeric/date operators, match modes (All/Any), limit by items/duration/size, sort ordering, leap year helper, date cutoff computation.
+  - `tag_parser.rs` — `is_audio_file()` for all extensions, case insensitivity, unsupported formats, edge cases.
+  - `audio/mod.rs` — `slider_to_pipeline()` curve properties, `redact_url_secrets()` for Plex/Jellyfin/Subsonic tokens, volume path helper.
+  - `daap/dmap.rs` — i8/i64 extraction, zero-length strings, nested containers, missing tags, partial headers, max values, UTF-8 strings.
+  - `local/engine.rs` — `db_model_to_track()` conversion, None fields, invalid UUID fallback, invalid date handling, `get_mtime()` on nonexistent files.
+- **Property-based testing** — `proptest` added as dev-dependency with 3 property tests for the smart rules engine: "All mode ⊆ Any mode", "limiting never increases count", "empty rules returns all tracks".
+- **Developer build script flags** — `build-linux.sh` and `build-macos.sh` now support `--check`, `--fmt`, and `--clippy` quick-exit flags matching the existing Windows `build-windows.ps1 -Check/-Fmt/-Clippy` pattern.
+
+### Fixed
+- **Windows Winget/Add-Remove Programs showing version in app name** — Added `AppVerName=Tributary` to the Inno Setup script so the display name is just "Tributary" instead of "Tributary version 0.3.0" in Winget upgrade lists and Add/Remove Programs.
+
+### Changed
+- **CI Clippy upgraded to pedantic** — The Linux CI Clippy step now uses `cargo clippy --all-targets -- -D warnings` which picks up the crate-level `#![warn(clippy::pedantic, clippy::nursery)]` configuration. macOS and Windows CI continue to use `-D warnings` (same effect since the crate-level warns are active).
+
 ## [0.3.0] — 2026-04-15
 
 ### Added

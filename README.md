@@ -227,20 +227,44 @@ Tributary includes a pre-commit hook that runs `cargo fmt --check` to prevent fo
 git config core.hooksPath hooks
 ```
 
-### Windows Helper Scripts
+### Developer Build Scripts
 
-On Windows, the build script can also be used for quick formatting and type-checking from PowerShell:
+All three platform build scripts support quick-exit modes for formatting, type-checking, and linting:
+
+```bash
+# Linux / macOS:
+./scripts/build-linux.sh --fmt       # or build-macos.sh --fmt
+./scripts/build-linux.sh --check     # or build-macos.sh --check
+./scripts/build-linux.sh --clippy    # or build-macos.sh --clippy
+```
 
 ```powershell
-# Format code:
+# Windows (PowerShell):
 .\scripts\build-windows.ps1 -Fmt
-
-# Type-check without a full build:
 .\scripts\build-windows.ps1 -Check
-
-# Run Clippy linter (warnings as errors):
 .\scripts\build-windows.ps1 -Clippy
 ```
+
+Clippy runs with `clippy::pedantic` and `clippy::nursery` enabled crate-wide (configured in `src/main.rs`).
+
+### Testing & Code Quality
+
+```bash
+# Run all tests (unit + proptest property-based):
+cargo test
+
+# Quick coverage summary (requires cargo-llvm-cov):
+cargo llvm-cov --summary-only
+
+# Full HTML coverage report:
+cargo llvm-cov --html --output-dir coverage
+```
+
+CI automatically runs on every push/PR:
+- **Security audit** — `cargo audit` checks dependencies against the RustSec Advisory Database
+- **Pedantic Clippy** — `clippy::pedantic` + `clippy::nursery` with `-D warnings`
+- **Code coverage** — `cargo-llvm-cov` HTML report uploaded as a CI artifact (Linux x86_64)
+- **Weekly fuzzing** — `cargo-fuzz` target for the DMAP binary parser (5 min, Sundays)
 
 ---
 

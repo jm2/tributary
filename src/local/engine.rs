@@ -460,3 +460,148 @@ pub fn db_model_to_track(model: &track::Model) -> Track {
         play_count: Some(model.play_count as u32),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_db_model_to_track_basic() {
+        let model = track::Model {
+            id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            file_path: "/music/song.flac".to_string(),
+            title: "Test Song".to_string(),
+            artist_name: "Test Artist".to_string(),
+            album_title: "Test Album".to_string(),
+            genre: Some("Rock".to_string()),
+            year: Some(2020),
+            track_number: Some(3),
+            disc_number: Some(1),
+            duration_secs: Some(240),
+            bitrate_kbps: Some(320),
+            sample_rate_hz: Some(44100),
+            format: Some("FLAC".to_string()),
+            play_count: 5,
+            date_added: "2025-01-15T10:30:00+00:00".to_string(),
+            date_modified: "2025-06-01T14:00:00+00:00".to_string(),
+            file_size_bytes: Some(30_000_000),
+        };
+
+        let track = db_model_to_track(&model);
+
+        assert_eq!(track.title, "Test Song");
+        assert_eq!(track.artist_name, "Test Artist");
+        assert_eq!(track.album_title, "Test Album");
+        assert_eq!(track.genre, Some("Rock".to_string()));
+        assert_eq!(track.year, Some(2020));
+        assert_eq!(track.track_number, Some(3));
+        assert_eq!(track.disc_number, Some(1));
+        assert_eq!(track.duration_secs, Some(240));
+        assert_eq!(track.bitrate_kbps, Some(320));
+        assert_eq!(track.sample_rate_hz, Some(44100));
+        assert_eq!(track.format, Some("FLAC".to_string()));
+        assert_eq!(track.play_count, Some(5));
+        assert_eq!(track.file_path, Some("/music/song.flac".to_string()));
+        assert!(track.stream_url.is_none());
+        assert!(track.cover_art_url.is_none());
+        assert!(track.date_added.is_some());
+        assert!(track.date_modified.is_some());
+    }
+
+    #[test]
+    fn test_db_model_to_track_none_fields() {
+        let model = track::Model {
+            id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
+            file_path: "/music/unknown.mp3".to_string(),
+            title: "Unknown".to_string(),
+            artist_name: "Unknown Artist".to_string(),
+            album_title: "Unknown Album".to_string(),
+            genre: None,
+            year: None,
+            track_number: None,
+            disc_number: None,
+            duration_secs: None,
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            format: None,
+            play_count: 0,
+            date_added: "2025-01-01T00:00:00+00:00".to_string(),
+            date_modified: "2025-01-01T00:00:00+00:00".to_string(),
+            file_size_bytes: None,
+        };
+
+        let track = db_model_to_track(&model);
+
+        assert_eq!(track.genre, None);
+        assert_eq!(track.year, None);
+        assert_eq!(track.track_number, None);
+        assert_eq!(track.disc_number, None);
+        assert_eq!(track.duration_secs, None);
+        assert_eq!(track.bitrate_kbps, None);
+        assert_eq!(track.sample_rate_hz, None);
+        assert_eq!(track.format, None);
+        assert_eq!(track.play_count, Some(0));
+    }
+
+    #[test]
+    fn test_db_model_to_track_invalid_uuid() {
+        let model = track::Model {
+            id: "not-a-valid-uuid".to_string(),
+            file_path: "/music/song.mp3".to_string(),
+            title: "Song".to_string(),
+            artist_name: "Artist".to_string(),
+            album_title: "Album".to_string(),
+            genre: None,
+            year: None,
+            track_number: None,
+            disc_number: None,
+            duration_secs: None,
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            format: None,
+            play_count: 0,
+            date_added: "2025-01-01T00:00:00+00:00".to_string(),
+            date_modified: "2025-01-01T00:00:00+00:00".to_string(),
+            file_size_bytes: None,
+        };
+
+        // Should not panic — falls back to a new random UUID.
+        let track = db_model_to_track(&model);
+        assert!(!track.id.is_nil());
+    }
+
+    #[test]
+    fn test_db_model_to_track_invalid_date() {
+        let model = track::Model {
+            id: "550e8400-e29b-41d4-a716-446655440002".to_string(),
+            file_path: "/music/song.mp3".to_string(),
+            title: "Song".to_string(),
+            artist_name: "Artist".to_string(),
+            album_title: "Album".to_string(),
+            genre: None,
+            year: None,
+            track_number: None,
+            disc_number: None,
+            duration_secs: None,
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            format: None,
+            play_count: 0,
+            date_added: "not-a-date".to_string(),
+            date_modified: "also-not-a-date".to_string(),
+            file_size_bytes: None,
+        };
+
+        let track = db_model_to_track(&model);
+        // Invalid dates should result in None, not a panic.
+        assert!(track.date_added.is_none());
+        assert!(track.date_modified.is_none());
+    }
+
+    #[test]
+    fn test_get_mtime_nonexistent_file() {
+        let result = get_mtime(std::path::Path::new("/nonexistent/path/file.flac"));
+        // Should return empty string, not panic.
+        assert!(result.is_empty());
+    }
+}

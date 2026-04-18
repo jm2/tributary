@@ -23,6 +23,7 @@
 [Setup]
 AppName=Tributary
 AppVersion={#AppVersion}
+AppVerName=Tributary
 AppId={{E8A3B2F1-7C4D-4E5A-9F6B-1D2E3F4A5B6C}
 VersionInfoVersion={#AppVersion}
 AppPublisher=Tributary Contributors

@@ -1885,8 +1885,8 @@ pub fn build_window(
                         // Only update the progress slider and duration label
                         // when the stream has a known duration (> 0).
                         // Live streams (radio) have duration_ms == 0.
+                        seeking.set(true);
                         if duration_ms > 0 {
-                            seeking.set(true);
                             progress_adj.set_upper(duration_ms as f64);
                             progress_adj.set_value(position_ms as f64);
                             seeking.set(false);
@@ -1894,7 +1894,6 @@ pub fn build_window(
                         } else {
                             // Live stream: keep slider at 0, show "LIVE" or
                             // blank for the duration label.
-                            seeking.set(true);
                             progress_adj.set_upper(1.0);
                             progress_adj.set_value(0.0);
                             seeking.set(false);
@@ -2599,7 +2598,7 @@ fn update_album_art(image: &gtk::Image, uri: &str) {
     let path = match url::Url::parse(uri) {
         Ok(u) if u.scheme() == "file" => match u.to_file_path() {
             Ok(p) => p,
-            Err(_) => {
+            Err(()) => {
                 image.set_icon_name(Some("audio-x-generic-symbolic"));
                 return;
             }

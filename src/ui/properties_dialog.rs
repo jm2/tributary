@@ -234,7 +234,7 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
         let artist_for_mb = tracks[0].artist.clone();
         let entries_for_mb: Vec<(String, gtk::Entry)> = entries
             .iter()
-            .map(|(name, entry)| (name.to_string(), entry.clone()))
+            .map(|(name, entry)| ((*name).to_string(), entry.clone()))
             .collect();
 
         mb_button.connect_clicked(move |btn| {
@@ -332,13 +332,13 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
     // Capture initial text values to detect what actually changed.
     let initial_texts: Vec<(String, String)> = entries
         .iter()
-        .map(|(name, entry)| (name.to_string(), entry.text().to_string()))
+        .map(|(name, entry)| ((*name).to_string(), entry.text().to_string()))
         .collect();
 
     // We need to capture entries for the save handler.
     let entries_for_save: Vec<(String, gtk::Entry)> = entries
         .iter()
-        .map(|(name, entry)| (name.to_string(), entry.clone()))
+        .map(|(name, entry)| ((*name).to_string(), entry.clone()))
         .collect();
 
     let file_paths_for_save = file_paths.clone();

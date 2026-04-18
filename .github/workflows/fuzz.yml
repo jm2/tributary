@@ -1,0 +1,61 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Run weekly on Sunday at 04:00 UTC.
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz Targets
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:41
+    steps:
+      - name: Install system dependencies
+        run: |
+          dnf install -y gcc gtk4-devel libadwaita-devel \
+            dbus-devel \
+            gstreamer1-devel gstreamer1-plugins-base-devel \
+            pkgconf-pkg-config git curl
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly (required for cargo-fuzz)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: fuzz-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: fuzz-cargo-
+
+      - name: Cache fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.sha }}
+          restore-keys: fuzz-corpus-
+
+      - name: Fuzz DMAP parser (5 minutes)
+        run: cargo +nightly fuzz run fuzz_dmap -- -max_total_time=300
+        continue-on-error: true
+
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

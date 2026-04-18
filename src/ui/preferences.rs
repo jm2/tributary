@@ -52,7 +52,7 @@ pub struct AppConfig {
 
 /// Default column order (used for `#[serde(default)]`).
 fn default_column_order() -> Vec<String> {
-    ALL_COLUMNS.iter().map(|s| s.to_string()).collect()
+    ALL_COLUMNS.iter().copied().map(str::to_string).collect()
 }
 
 /// Browser pane visibility toggles.
@@ -77,7 +77,11 @@ impl Default for AppConfig {
                 artist: true,
                 album: true,
             },
-            visible_columns: DEFAULT_VISIBLE.iter().map(|s| s.to_string()).collect(),
+            visible_columns: DEFAULT_VISIBLE
+                .iter()
+                .copied()
+                .map(str::to_string)
+                .collect(),
             column_order: default_column_order(),
             library_path: music_dir,
             location_enabled: None,
@@ -310,11 +314,15 @@ pub fn show_preferences(
         let cv = column_view.clone();
         let checks = column_checks
             .iter()
-            .map(|(t, c)| (t.to_string(), c.clone()))
+            .map(|(t, c)| ((*t).to_string(), c.clone()))
             .collect::<Vec<_>>();
         reset_btn.connect_clicked(move |_| {
             let mut cfg = config.borrow_mut();
-            cfg.visible_columns = DEFAULT_VISIBLE.iter().map(|s| s.to_string()).collect();
+            cfg.visible_columns = DEFAULT_VISIBLE
+                .iter()
+                .copied()
+                .map(str::to_string)
+                .collect();
             cfg.column_order = default_column_order();
             for (title, check) in &checks {
                 check.set_active(DEFAULT_VISIBLE.contains(&title.as_str()));
