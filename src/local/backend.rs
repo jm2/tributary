@@ -103,7 +103,7 @@ impl MediaBackend for LocalBackend {
         match sort {
             SortField::Title => albums.sort_by(|a, b| a.title.cmp(&b.title)),
             SortField::Artist => albums.sort_by(|a, b| a.artist_name.cmp(&b.artist_name)),
-            SortField::Year => albums.sort_by(|a, b| a.year.cmp(&b.year)),
+            SortField::Year => albums.sort_by_key(|a| a.year),
             _ => albums.sort_by(|a, b| a.title.cmp(&b.title)),
         }
 

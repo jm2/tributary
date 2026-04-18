@@ -30,7 +30,7 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Install Flatpak natively on the runner instead of using an x86_64 container.
       - name: Install Flatpak & Dependencies
@@ -74,12 +74,12 @@ jobs:
 
       - name: Upload Flatpak to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: tributary-linux-${{ matrix.arch }}.flatpak
 
       - name: Upload Flatpak as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tributary-linux-${{ matrix.arch }}-flatpak
           path: tributary-linux-${{ matrix.arch }}.flatpak
@@ -95,7 +95,7 @@ jobs:
             runner: macos-15
             rust_target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install system dependencies (Homebrew)
         run: |
@@ -110,7 +110,7 @@ jobs:
           targets: ${{ matrix.rust_target }}
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -128,12 +128,12 @@ jobs:
 
       - name: Upload DMG to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/tributary-macos-${{ matrix.arch }}.dmg
 
       - name: Upload DMG as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tributary-macos-${{ matrix.arch }}-dmg
           path: dist/tributary-macos-${{ matrix.arch }}.dmg
@@ -163,7 +163,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up MSYS2 (${{ matrix.msystem }})
         uses: msys2/setup-msys2@v2
@@ -188,7 +188,7 @@ jobs:
           targets: ${{ matrix.rust_target }}
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -245,14 +245,14 @@ jobs:
 
       - name: Upload Windows artifacts to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/tributary-windows-${{ matrix.arch }}.zip
             dist/tributary-windows-${{ matrix.arch }}-setup.exe
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tributary-windows-${{ matrix.arch }}
           path: |
@@ -283,7 +283,7 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libdbus-1-dev
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -292,7 +292,7 @@ jobs:
         run: cargo install cargo-deb
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -307,12 +307,12 @@ jobs:
 
       - name: Upload .deb to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: target/debian/tributary-${{ matrix.deb_arch }}.deb
 
       - name: Upload .deb as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tributary-${{ matrix.deb_arch }}-deb
           path: target/debian/tributary-${{ matrix.deb_arch }}.deb
@@ -339,7 +339,7 @@ jobs:
             gstreamer1-devel gstreamer1-plugins-base-devel \
             pkgconf-pkg-config git curl
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -348,7 +348,7 @@ jobs:
         run: cargo install cargo-generate-rpm
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -371,12 +371,12 @@ jobs:
 
       - name: Upload .rpm to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
 
       - name: Upload .rpm as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tributary-${{ matrix.rpm_arch }}-rpm
           path: target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
@@ -392,10 +392,10 @@ jobs:
           pacman -Syu --noconfirm git gtk4 libadwaita gstreamer sqlite \
             gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav dbus rust
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -429,12 +429,12 @@ jobs:
 
       - name: Upload Arch package to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/tributary-x86_64.pkg.tar.zst
 
       - name: Upload Arch package as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tributary-x86_64-arch
           path: dist/tributary-x86_64.pkg.tar.zst
@@ -447,7 +447,7 @@ jobs:
     if: always()
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -462,13 +462,13 @@ jobs:
 
       - name: Upload SHA256SUMS to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: SHA256SUMS.txt
 
       - name: Upload SHA256SUMS as artifact (workflow_dispatch)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SHA256SUMS
           path: SHA256SUMS.txt
