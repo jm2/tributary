@@ -15,6 +15,8 @@ fr:
     repeat_all: "Répétition : Tout"
     repeat_one: "Répétition : Un seul"
     shuffle: "Aléatoire"
+    output: "Sortie audio"
+    add_output: "Ajouter une sortie"
     main_menu: "Menu principal"
 
   # ── Sidebar ────────────────────────────────────────────────────────
@@ -94,6 +96,13 @@ fr:
     enable_location_body: "Stations à proximité utilise votre position approximative (via votre adresse IP) pour trouver les stations de radio proches.\n\nVotre adresse IP sera envoyée à un service de géolocalisation pour déterminer vos coordonnées approximatives. Aucune donnée personnelle n'est stockée."
     no_thanks: "Non merci"
     enable_location_btn: "Activer la localisation"
+    add_output_heading: "Ajouter une sortie"
+    add_output_body: "Saisissez les informations du serveur MPD."
+    add: "Ajouter"
+    output_name: "Nom"
+    output_name_placeholder: "MPD salon"
+    output_host: "Hôte"
+    output_port: "Port"
 
   # ── Context menu ───────────────────────────────────────────────────
   context:

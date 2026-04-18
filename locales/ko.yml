@@ -15,6 +15,8 @@ ko:
     repeat_all: "반복: 전체"
     repeat_one: "반복: 한 곡"
     shuffle: "셔플"
+    output: "오디오 출력"
+    add_output: "출력 추가"
     main_menu: "메인 메뉴"
 
   # ── Sidebar ────────────────────────────────────────────────────────
@@ -94,6 +96,13 @@ ko:
     enable_location_body: "내 주변 방송국은 IP 주소를 통해 대략적인 위치를 사용하여 근처 라디오 방송국을 찾습니다.\n\nIP 주소가 위치 확인 서비스로 전송되어 대략적인 좌표가 결정됩니다. 개인 데이터는 저장되지 않습니다."
     no_thanks: "아니요"
     enable_location_btn: "위치 활성화"
+    add_output_heading: "출력 추가"
+    add_output_body: "MPD 서버 정보를 입력하세요."
+    add: "추가"
+    output_name: "이름"
+    output_name_placeholder: "거실 MPD"
+    output_host: "호스트"
+    output_port: "포트"
 
   # ── Context menu ───────────────────────────────────────────────────
   context:

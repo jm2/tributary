@@ -47,6 +47,8 @@ Tributary provides a unified interface for managing and streaming music from mul
 | XDG music directory support (non-English locales) | ✅ |
 | Network connection guard (prevents duplicate auth) | ✅ |
 | i18n/l10n framework (13 languages, auto locale detection) | ✅ |
+| Audio output selector (local + MPD, iTunes AirPlay-style) | ✅ |
+| MPD output backend (sink-only, TCP with security hardening) | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 

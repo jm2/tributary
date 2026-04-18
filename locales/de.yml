@@ -15,6 +15,8 @@ de:
     repeat_all: "Wiederholung: Alle"
     repeat_one: "Wiederholung: Eins"
     shuffle: "Zufällig"
+    output: "Audioausgabe"
+    add_output: "Ausgabe hinzufügen"
     main_menu: "Hauptmenü"
 
   # ── Sidebar ────────────────────────────────────────────────────────
@@ -94,6 +96,13 @@ de:
     enable_location_body: "Sender in der Nähe verwendet Ihren ungefähren Standort (über Ihre IP-Adresse), um nahegelegene Radiosender zu finden.\n\nIhre IP-Adresse wird an einen Geolokalisierungsdienst gesendet, um Ihre ungefähren Koordinaten zu ermitteln. Es werden keine persönlichen Daten gespeichert."
     no_thanks: "Nein danke"
     enable_location_btn: "Standort aktivieren"
+    add_output_heading: "Ausgabe hinzufügen"
+    add_output_body: "Geben Sie die MPD-Serverdetails ein."
+    add: "Hinzufügen"
+    output_name: "Name"
+    output_name_placeholder: "Wohnzimmer MPD"
+    output_host: "Host"
+    output_port: "Port"
 
   # ── Context menu ───────────────────────────────────────────────────
   context:

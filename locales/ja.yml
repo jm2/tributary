@@ -15,6 +15,8 @@ ja:
     repeat_all: "リピート: 全曲"
     repeat_one: "リピート: 1曲"
     shuffle: "シャッフル"
+    output: "オーディオ出力"
+    add_output: "出力を追加"
     main_menu: "メインメニュー"
 
   # ── Sidebar ────────────────────────────────────────────────────────
@@ -94,6 +96,13 @@ ja:
     enable_location_body: "「近くの局」はIPアドレスからおおよその位置を取得し、近くのラジオ局を検索します。\n\nIPアドレスはジオロケーションサービスに送信され、おおよその座標が特定されます。個人データは保存されません。"
     no_thanks: "いいえ"
     enable_location_btn: "位置情報を有効にする"
+    add_output_heading: "出力を追加"
+    add_output_body: "MPDサーバーの詳細を入力してください。"
+    add: "追加"
+    output_name: "名前"
+    output_name_placeholder: "リビングルーム MPD"
+    output_host: "ホスト"
+    output_port: "ポート"
 
   # ── Context menu ───────────────────────────────────────────────────
   context:

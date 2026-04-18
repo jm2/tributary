@@ -15,6 +15,8 @@ zh-CN:
     repeat_all: "重复：全部"
     repeat_one: "重复：单曲"
     shuffle: "随机播放"
+    output: "音频输出"
+    add_output: "添加输出"
     main_menu: "主菜单"
 
   # ── Sidebar ────────────────────────────────────────────────────────
@@ -94,6 +96,13 @@ zh-CN:
     enable_location_body: "「附近电台」通过您的 IP 地址获取大致位置，以查找附近的电台。\n\n您的 IP 地址将发送到地理定位服务以确定大致坐标。不会存储任何个人数据。"
     no_thanks: "不用了"
     enable_location_btn: "启用位置"
+    add_output_heading: "添加输出"
+    add_output_body: "输入 MPD 服务器信息。"
+    add: "添加"
+    output_name: "名称"
+    output_name_placeholder: "客厅 MPD"
+    output_host: "主机"
+    output_port: "端口"
 
   # ── Context menu ───────────────────────────────────────────────────
   context:

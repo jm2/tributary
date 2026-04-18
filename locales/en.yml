@@ -15,6 +15,8 @@ en:
     repeat_all: "Repeat: All"
     repeat_one: "Repeat: One"
     shuffle: "Shuffle"
+    output: "Audio Output"
+    add_output: "Add output"
     main_menu: "Main Menu"
 
   # ── Sidebar ────────────────────────────────────────────────────────
@@ -98,6 +100,14 @@ en:
     enable_location_body: "Stations Near Me uses your approximate location (via IP address) to find nearby radio stations.\n\nYour IP address will be sent to a geolocation service to determine your approximate coordinates. No personal data is stored."
     no_thanks: "No Thanks"
     enable_location_btn: "Enable Location"
+    # Add Output dialog
+    add_output_heading: "Add Output"
+    add_output_body: "Enter the MPD server details."
+    add: "Add"
+    output_name: "Name"
+    output_name_placeholder: "Living Room MPD"
+    output_host: "Host"
+    output_port: "Port"
 
   # ── Context menu ───────────────────────────────────────────────────
   context:

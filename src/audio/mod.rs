@@ -1,8 +1,14 @@
-//! GStreamer audio playback engine.
+//! Audio playback engine and output abstraction.
 //!
-//! Provides a non-blocking [`Player`] that wraps a GStreamer `playbin3`
-//! pipeline and communicates state changes to the GTK main thread via
-//! an [`async_channel`].
+//! This module provides:
+//!
+//! - A non-blocking GStreamer [`Player`] that wraps a `playbin3` pipeline.
+//! - An [`AudioOutput`](output::AudioOutput) trait for abstracting over
+//!   different playback destinations (local speakers, MPD, AirPlay, etc.).
+//! - [`LocalOutput`](local_output::LocalOutput) — wraps [`Player`] for
+//!   local speaker output.
+//! - [`MpdOutput`](mpd_output::MpdOutput) — sends commands to an MPD
+//!   server over TCP.
 //!
 //! # Threading model
 //!
@@ -15,6 +21,10 @@
 //! The caller receives events by consuming the [`async_channel::Receiver`]
 //! inside a `glib::MainContext::default().spawn_local()` loop, identical
 //! to the pattern used by [`LibraryEngine`](crate::local::engine::LibraryEngine).
+
+pub mod local_output;
+pub mod mpd_output;
+pub mod output;
 
 use std::time::Duration;
 

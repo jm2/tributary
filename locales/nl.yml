@@ -15,6 +15,8 @@ nl:
     repeat_all: "Herhalen: Alles"
     repeat_one: "Herhalen: Eén"
     shuffle: "Willekeurig"
+    output: "Audio-uitvoer"
+    add_output: "Uitvoer toevoegen"
     main_menu: "Hoofdmenu"
 
   # ── Sidebar ────────────────────────────────────────────────────────
@@ -94,6 +96,13 @@ nl:
     enable_location_body: "Stations in de buurt gebruikt uw geschatte locatie (via IP-adres) om nabijgelegen radiostations te vinden.\n\nUw IP-adres wordt naar een geolocatiedienst gestuurd om uw geschatte coördinaten te bepalen. Er worden geen persoonlijke gegevens opgeslagen."
     no_thanks: "Nee bedankt"
     enable_location_btn: "Locatie inschakelen"
+    add_output_heading: "Uitvoer toevoegen"
+    add_output_body: "Voer de MPD-servergegevens in."
+    add: "Toevoegen"
+    output_name: "Naam"
+    output_name_placeholder: "Woonkamer MPD"
+    output_host: "Host"
+    output_port: "Poort"
 
   # ── Context menu ───────────────────────────────────────────────────
   context:

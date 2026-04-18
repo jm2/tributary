@@ -36,6 +36,8 @@ pub struct HeaderBarWidgets {
     pub duration_label: gtk::Label,
     pub volume_scale: gtk::Scale,
     pub volume_adj: gtk::Adjustment,
+    pub output_button: gtk::MenuButton,
+    pub output_list: gtk::ListBox,
 }
 
 /// Build the full header bar and return all interactive widgets.
@@ -202,6 +204,46 @@ pub fn build_header_bar() -> HeaderBarWidgets {
     volume_box.append(&volume_icon);
     volume_box.append(&volume_scale);
 
+    // ── Output selector (iTunes AirPlay-style) ───────────────────────
+    // A MenuButton with a Popover containing a ListBox of output
+    // destinations.  "My Computer" is always present; MPD sinks are
+    // added/removed dynamically via the "+" button at the bottom.
+    let output_list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+
+    // Default "My Computer" row — always present, always first.
+    let local_row = build_output_row("My Computer", "audio-speakers-symbolic", true);
+    output_list.append(&local_row);
+
+    let add_output_btn = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .css_classes(["flat"])
+        .tooltip_text(rust_i18n::t!("header.add_output").as_ref())
+        .halign(Align::Center)
+        .build();
+
+    let output_popover_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(8)
+        .margin_end(8)
+        .build();
+    output_popover_box.append(&output_list);
+    output_popover_box.append(&add_output_btn);
+
+    let output_popover = gtk::Popover::builder().child(&output_popover_box).build();
+
+    let output_button = gtk::MenuButton::builder()
+        .icon_name("audio-speakers-symbolic")
+        .popover(&output_popover)
+        .tooltip_text(rust_i18n::t!("header.output").as_ref())
+        .valign(Align::Center)
+        .build();
+
     // Modern GNOME primary menu (Ptyxis-style)
     let menu = gtk::gio::Menu::new();
     let section1 = gtk::gio::Menu::new();
@@ -233,6 +275,7 @@ pub fn build_header_bar() -> HeaderBarWidgets {
 
     header.pack_start(&playback_box);
     header.pack_end(&menu_btn);
+    header.pack_end(&output_button);
     header.pack_end(&right_box);
 
     HeaderBarWidgets {
@@ -252,5 +295,43 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         duration_label,
         volume_scale,
         volume_adj,
+        output_button,
+        output_list,
     }
+}
+
+// ── Output selector helpers ─────────────────────────────────────────────
+
+/// Build a single row for the output selector popover.
+///
+/// Each row shows an icon, the output name, and a checkmark image that
+/// is visible only for the currently active output.
+pub fn build_output_row(name: &str, icon_name: &str, active: bool) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(4)
+        .margin_end(4)
+        .margin_top(4)
+        .margin_bottom(4)
+        .build();
+
+    let icon = gtk::Image::builder().icon_name(icon_name).build();
+
+    let label = gtk::Label::builder()
+        .label(name)
+        .hexpand(true)
+        .halign(Align::Start)
+        .build();
+
+    let check = gtk::Image::builder()
+        .icon_name("object-select-symbolic")
+        .visible(active)
+        .build();
+    check.set_widget_name("output-check");
+
+    row.append(&icon);
+    row.append(&label);
+    row.append(&check);
+    row
 }
