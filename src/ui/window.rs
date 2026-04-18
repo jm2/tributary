@@ -284,9 +284,10 @@ pub fn build_window(
         .build();
 
     // ── Start the library engine on tokio ────────────────────────────
-    let music_dir = dirs::home_dir()
-        .expect("Could not determine home directory")
-        .join("Music");
+    // Use the configured library path from preferences, which defaults
+    // to the XDG / platform music directory (e.g. ~/Musique on French
+    // systems) via dirs::audio_dir() with a ~/Music fallback.
+    let music_dir = std::path::PathBuf::from(&app_config.borrow().library_path);
 
     let engine_tx_clone = engine_tx.clone();
     rt_handle.spawn(async move {
@@ -752,6 +753,25 @@ pub fn build_window(
                 return;
             }
 
+            // ── Connection guard: ignore clicks while a connection is pending ──
+            // This prevents duplicate auth dialogs and duplicate connection
+            // tasks when the user clicks a server that is still connecting
+            // (applies to all network sources: Subsonic, Jellyfin, Plex, DAAP).
+            if pending_connection.borrow().is_some() {
+                let pending_url = pending_connection.borrow().clone();
+                if let Some(ref pu) = pending_url {
+                    // If clicking the same server that's already connecting, just ignore.
+                    if src.server_url() == *pu {
+                        return;
+                    }
+                    // If clicking a different server while one is connecting,
+                    // also ignore — let the first connection finish first.
+                    if src.connecting() || (!src.connected() && !src.server_url().is_empty()) {
+                        return;
+                    }
+                }
+            }
+
             // Determine the source key.
             let url = src.server_url();
             let key = if url.is_empty() {
@@ -761,6 +781,32 @@ pub fn build_window(
             };
 
             let backend_type = src.backend_type();
+
+            // ── Local source: switch to local view ───────────────────
+            if key == "local" {
+                *active_source_key.borrow_mut() = "local".to_string();
+
+                // Restore music column layout if coming from radio.
+                apply_radio_columns(&column_view, false);
+                let cfg = app_config.borrow();
+                preferences::apply_column_visibility(&column_view, &cfg.visible_columns);
+                preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
+                drop(cfg);
+
+                let st = source_tracks.borrow();
+                let local_tracks = st.get("local").cloned().unwrap_or_default();
+                display_tracks(
+                    &local_tracks,
+                    &track_store,
+                    &master_tracks,
+                    &browser_widget,
+                    &browser_state,
+                    &status_label,
+                    &column_view,
+                );
+                current_pos.set(None);
+                return;
+            }
 
             // ── Playlist source: fetch playlist tracks ───────────────
             if backend_type == "playlist" || backend_type == "smart-playlist" {
@@ -2009,6 +2055,24 @@ pub fn build_window(
         window.add_action(&prefs_action);
     }
 
+    // ── Ctrl+F: focus browser search entry ───────────────────────────
+    {
+        let bw = browser_widget.clone();
+        let search_action = gtk::gio::SimpleAction::new("focus-search", None);
+        search_action.connect_activate(move |_, _| {
+            // The browser_widget is a vertical Box: SearchEntry on top,
+            // panes_box below.  Find the SearchEntry (first child).
+            if let Some(first) = bw.first_child() {
+                if let Some(entry) = first.downcast_ref::<gtk::SearchEntry>() {
+                    bw.set_visible(true);
+                    entry.grab_focus();
+                }
+            }
+        });
+        window.add_action(&search_action);
+    }
+    app.set_accels_for_action("win.focus-search", &["<primary>f"]);
+
     // ── Handle playlist context menu actions ─────────────────────────
     {
         let sidebar_store = sidebar_store_for_events.clone();
@@ -3152,7 +3216,7 @@ fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObject {
         t.duration_secs.unwrap_or(0),
         &t.artist_name,
         &t.album_title,
-        t.genre.as_deref().unwrap_or(""),
+        t.genre.as_deref().unwrap_or("Unknown"),
         t.year.unwrap_or(0),
         &t.date_modified
             .map(|dt| dt.format("%Y-%m-%d").to_string())

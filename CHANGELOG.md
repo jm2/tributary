@@ -5,7 +5,20 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.3.1
+## [Unreleased] — 0.4.0
+
+### Added
+- **Keyboard shortcut: Ctrl+F / Cmd+F to focus search** — Pressing `Ctrl+F` (or `Cmd+F` on macOS) now focuses the browser search entry and makes the browser visible if hidden. (#3)
+- **Connection guard for all network sources** — Clicking a sidebar server that is already connecting (spinner visible) no longer opens duplicate auth dialogs or spawns duplicate connection tasks. The guard applies to all backends (Subsonic, Jellyfin, Plex, DAAP) and prevents race conditions when impatient users double-click slow servers. (#13)
+
+### Fixed
+- **Non-English locale music folder not scanned** — The default library path now uses `dirs::audio_dir()` (XDG `$XDG_MUSIC_DIR`) which respects the system locale (e.g. `~/Musique` on French systems, `~/Musik` on German). Falls back to `~/Music` only if `audio_dir()` returns `None`. The library engine also reads the configured path from Preferences instead of hardcoding `~/Music`. (#22)
+- **Genre displays as blank for tracks without genre metadata** — Tracks with no genre tag now display "Unknown" instead of an empty cell in the tracklist, matching Rhythmbox behaviour. (#10)
+
+### Changed
+- **Version bumped to 0.4.0** for the new feature release cycle.
+
+## [0.3.1] — Unreleased (development)
 
 ### Added
 - **Pedantic Clippy analysis** — Enabled `clippy::pedantic` and `clippy::nursery` crate-wide with curated `#![allow(...)]` for GTK-specific patterns. All 392 initial warnings resolved. Pedantic linting now runs in CI on every push/PR and locally via `build-windows.ps1 -Clippy`, `build-linux.sh --clippy`, and `build-macos.sh --clippy`.

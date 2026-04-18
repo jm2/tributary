@@ -43,6 +43,9 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
 | Batch metadata editing (multi-select) | ✅ |
 | MusicBrainz auto-fill lookup | ✅ |
+| Keyboard shortcut: `Ctrl+F` / `Cmd+F` to search | ✅ |
+| XDG music directory support (non-English locales) | ✅ |
+| Network connection guard (prevents duplicate auth) | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
@@ -401,6 +404,7 @@ Tributary supports regular and smart playlists for the local library:
 
 | Shortcut | Action |
 |----------|--------|
+| `Ctrl+F` / `Cmd+F` | Focus search bar |
 | `Ctrl+Q` / `Cmd+Q` | Quit |
 
 ### Preferences

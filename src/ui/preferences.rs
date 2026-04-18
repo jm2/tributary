@@ -65,9 +65,12 @@ pub struct BrowserViewsConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let music_dir = dirs::home_dir()
+        // Use the XDG / platform music directory (e.g. ~/Musique on
+        // French systems) with a fallback to ~/Music for systems where
+        // dirs::audio_dir() returns None.
+        let music_dir = dirs::audio_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
             .unwrap_or_default()
-            .join("Music")
             .to_string_lossy()
             .to_string();
 
