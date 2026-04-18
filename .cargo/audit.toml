@@ -1,0 +1,8 @@
+# cargo-audit configuration
+# https://docs.rs/cargo-audit/latest/cargo_audit/config/
+
+[advisories]
+# rsa 0.9.10 — Marvin Attack (RUSTSEC-2023-0071)
+# No fixed version available; pulled in transitively via sqlx-mysql.
+# We don't use MySQL in production — SQLite only.
+ignore = ["RUSTSEC-2023-0071"]

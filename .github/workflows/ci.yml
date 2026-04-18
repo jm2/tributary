@@ -59,7 +59,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: linux-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: linux-${{ matrix.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: linux-${{ matrix.arch }}-cargo-
 
       - name: Check formatting

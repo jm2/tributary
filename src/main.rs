@@ -273,23 +273,18 @@ fn setup_macos_bundle_env() {
     use std::env;
     use std::path::PathBuf;
 
-    let exe = match env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+    let Ok(exe) = env::current_exe() else { return };
 
     // Canonicalise symlinks so we get the real path inside the bundle.
     let exe = exe.canonicalize().unwrap_or(exe);
 
     // Check we're inside a .app bundle:
     //   …/Tributary.app/Contents/MacOS/Tributary
-    let macos_dir = match exe.parent() {
-        Some(d) => d,
-        None => return,
+    let Some(macos_dir) = exe.parent() else {
+        return;
     };
-    let contents_dir = match macos_dir.parent() {
-        Some(d) => d,
-        None => return,
+    let Some(contents_dir) = macos_dir.parent() else {
+        return;
     };
 
     // Verify the directory structure looks like a .app bundle.

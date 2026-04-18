@@ -30,6 +30,11 @@
 .PARAMETER Fmt
     If specified, sets up the MSYS2 build environment and runs `cargo fmt` only.
     Useful for formatting code from PowerShell without a full build.
+
+.PARAMETER CargoUpdate
+    If specified, sets up the MSYS2 build environment and runs `cargo update` with
+    any additional arguments passed via -CargoUpdateArgs. Useful for updating
+    dependencies from PowerShell (e.g. -CargoUpdate -CargoUpdateArgs "-p rustls-webpki").
 #>
 param(
     [string]$Msys2Root = "C:\msys64",
@@ -39,7 +44,9 @@ param(
     [switch]$Check,
     [switch]$Clippy,
     [switch]$Fmt,
-    [switch]$Coverage
+    [switch]$Coverage,
+    [switch]$CargoUpdate,
+    [string]$CargoUpdateArgs = ""
 )
 
 Set-StrictMode -Version Latest
@@ -122,7 +129,7 @@ if (-not (Test-Path $Msys2Root)) {
     Write-Err "MSYS2 not found at $Msys2Root. Install from https://www.msys2.org"
 }
 
-$cargoNeeded = (-not $NoCargoBuild) -or $Check -or $Clippy -or $Fmt
+$cargoNeeded = (-not $NoCargoBuild) -or $Check -or $Clippy -or $Fmt -or $CargoUpdate
 if ($cargoNeeded -and -not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Err "cargo not found. Install Rustup from https://rustup.rs or winget install Rustlang.Rustup"
 }
@@ -193,6 +200,20 @@ if ($Clippy) {
     cargo clippy --all-targets --target $RustTarget -- -D warnings -W clippy::pedantic -W clippy::nursery
     if ($LASTEXITCODE -ne 0) { Write-Err "cargo clippy failed." }
     Write-Info "Clippy passed."
+    exit 0
+}
+
+if ($CargoUpdate) {
+    Write-Info "Running cargo update..."
+    if ($CargoUpdateArgs -ne "") {
+        $updateArgs = $CargoUpdateArgs -split '\s+'
+        cargo update @updateArgs
+    }
+    else {
+        cargo update
+    }
+    if ($LASTEXITCODE -ne 0) { Write-Err "cargo update failed." }
+    Write-Info "Cargo update complete."
     exit 0
 }
 
