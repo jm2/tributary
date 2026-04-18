@@ -59,6 +59,10 @@ dirs = "6"
 # Shuffle randomness (zero-dependency PRNG)
 fastrand = "2"
 
+# Internationalisation (i18n)
+rust-i18n = "3"
+sys-locale = "0.3"
+
 # Subsonic / Jellyfin / Plex API client
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 

@@ -1,0 +1,145 @@
+pt-BR:
+  # ── Application ────────────────────────────────────────────────────
+  app:
+    name: "Tributary"
+    not_playing: "Nada tocando"
+    scanning: "Escaneando biblioteca…"
+    live: "AO VIVO"
+
+  # ── Header bar ─────────────────────────────────────────────────────
+  header:
+    previous: "Anterior"
+    play: "Reproduzir"
+    next: "Próxima"
+    repeat_off: "Repetir: Desligado"
+    repeat_all: "Repetir: Tudo"
+    repeat_one: "Repetir: Uma"
+    shuffle: "Aleatório"
+    main_menu: "Menu principal"
+
+  # ── Sidebar ────────────────────────────────────────────────────────
+  sidebar:
+    local: "Local"
+    local_filesystem: "Sistema de arquivos local"
+    internet_radio: "Rádio pela Internet"
+    top_clicked: "Mais ouvidas"
+    top_voted: "Mais votadas"
+    stations_near_me: "Estações próximas"
+    playlists: "Listas de reprodução"
+    add_server: "Adicionar servidor"
+    new_playlist: "Nova lista de reprodução"
+    remove_server: "Remover servidor"
+    disconnect: "Desconectar"
+    new_playlist_menu: "Nova lista de reprodução"
+    new_smart_playlist_menu: "Nova lista inteligente"
+    rename: "Renomear"
+    delete: "Excluir"
+    edit_smart_playlist: "Editar lista inteligente…"
+
+  # ── Browser ────────────────────────────────────────────────────────
+  browser:
+    search_placeholder: "Pesquisar em todos os campos"
+    genre: "Gênero"
+    artist: "Artista"
+    album: "Álbum"
+    all: "Todos"
+
+  # ── Tracklist columns ──────────────────────────────────────────────
+  columns:
+    number: "#"
+    title: "Título"
+    time: "Duração"
+    artist: "Artista"
+    album: "Álbum"
+    genre: "Gênero"
+    year: "Ano"
+    date_modified: "Data de modificação"
+    bitrate: "Taxa de bits"
+    sample_rate: "Taxa de amostragem"
+    plays: "Reproduções"
+    format: "Formato"
+    country: "País"
+    state_province: "Estado"
+
+  # ── Preferences ────────────────────────────────────────────────────
+  preferences:
+    title: "Preferências"
+    library_location: "Localização da biblioteca"
+    music_folder: "Pasta de música"
+    browse: "Procurar…"
+    select_music_folder: "Selecionar pasta de música"
+    browser_views: "Painéis do navegador"
+    visible_columns: "Colunas visíveis"
+    reset_to_defaults: "Restaurar padrões"
+
+  # ── Dialogs ────────────────────────────────────────────────────────
+  dialogs:
+    cancel: "Cancelar"
+    connect: "Conectar"
+    create: "Criar"
+    rename: "Renomear"
+    save: "Salvar"
+    ok: "OK"
+    add_server_heading: "Adicionar servidor"
+    add_server_body: "Insira os dados do servidor para conectar."
+    connect_to: "Conectar a %{name}"
+    enter_password: "Insira a senha do compartilhamento (deixe em branco se não houver)"
+    username: "Nome de usuário"
+    password: "Senha"
+    new_playlist_heading: "Nova lista de reprodução"
+    playlist_name: "Nome da lista"
+    rename_playlist_heading: "Renomear lista de reprodução"
+    new_name: "Novo nome"
+    enable_location: "Ativar localização?"
+    enable_location_body: "Estações próximas usa sua localização aproximada (via endereço IP) para encontrar estações de rádio próximas.\n\nSeu endereço IP será enviado a um serviço de geolocalização para determinar suas coordenadas aproximadas. Nenhum dado pessoal é armazenado."
+    no_thanks: "Não, obrigado"
+    enable_location_btn: "Ativar localização"
+
+  # ── Context menu ───────────────────────────────────────────────────
+  context:
+    properties: "Propriedades…"
+    add_to_playlist: "Adicionar à lista de reprodução"
+    remove_from_playlist: "Remover da lista de reprodução"
+
+  # ── Properties dialog ──────────────────────────────────────────────
+  properties:
+    heading_single: "Propriedades — %{title}"
+    heading_batch: "Propriedades — %{count} faixas"
+    field_title: "Título"
+    field_artist: "Artista"
+    field_album: "Álbum"
+    field_genre: "Gênero"
+    field_year: "Ano"
+    field_track_number: "Faixa nº"
+    field_disc_number: "Disco nº"
+    field_format: "Formato"
+    field_bitrate: "Taxa de bits"
+    field_sample_rate: "Taxa de amostragem"
+    field_duration: "Duração"
+    field_file: "Arquivo"
+    musicbrainz_lookup: "Busca no MusicBrainz"
+    searching: "Buscando…"
+    not_found: "Não encontrado"
+    mixed: "Misto"
+
+  # ── Smart playlist editor ──────────────────────────────────────────
+  smart_playlist:
+    new_title: "Nova lista inteligente"
+    edit_title: "Editar lista inteligente: %{name}"
+    match_label: "Correspondência"
+    match_all: "Todas"
+    match_any: "Qualquer uma"
+    add_rule: "Adicionar regra"
+    remove_rule: "Remover regra"
+    limit_to: "Limitar a"
+    live_updating: "Atualização em tempo real"
+
+  # ── About dialog ───────────────────────────────────────────────────
+  about:
+    application_name: "Tributary"
+    developer_name: "John-Michael Mulesa"
+
+  # ── Status bar ─────────────────────────────────────────────────────
+  status:
+    songs_hours: "%{count} músicas, %{hours} horas"
+    songs_minutes: "%{count} músicas, %{minutes} minutos"

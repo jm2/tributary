@@ -1,0 +1,145 @@
+zh-TW:
+  # ── Application ────────────────────────────────────────────────────
+  app:
+    name: "Tributary"
+    not_playing: "未在播放"
+    scanning: "正在掃描音樂庫…"
+    live: "直播"
+
+  # ── Header bar ─────────────────────────────────────────────────────
+  header:
+    previous: "上一首"
+    play: "播放"
+    next: "下一首"
+    repeat_off: "重複：關閉"
+    repeat_all: "重複：全部"
+    repeat_one: "重複：單曲"
+    shuffle: "隨機播放"
+    main_menu: "主選單"
+
+  # ── Sidebar ────────────────────────────────────────────────────────
+  sidebar:
+    local: "本機"
+    local_filesystem: "本機檔案系統"
+    internet_radio: "網路電台"
+    top_clicked: "最熱門"
+    top_voted: "最高評分"
+    stations_near_me: "附近電台"
+    playlists: "播放清單"
+    add_server: "新增伺服器"
+    new_playlist: "新建播放清單"
+    remove_server: "移除伺服器"
+    disconnect: "中斷連線"
+    new_playlist_menu: "新建播放清單"
+    new_smart_playlist_menu: "新建智慧播放清單"
+    rename: "重新命名"
+    delete: "刪除"
+    edit_smart_playlist: "編輯智慧播放清單…"
+
+  # ── Browser ────────────────────────────────────────────────────────
+  browser:
+    search_placeholder: "搜尋所有欄位"
+    genre: "類型"
+    artist: "演出者"
+    album: "專輯"
+    all: "全部"
+
+  # ── Tracklist columns ──────────────────────────────────────────────
+  columns:
+    number: "#"
+    title: "標題"
+    time: "時間"
+    artist: "演出者"
+    album: "專輯"
+    genre: "類型"
+    year: "年份"
+    date_modified: "修改日期"
+    bitrate: "位元率"
+    sample_rate: "取樣率"
+    plays: "播放次數"
+    format: "格式"
+    country: "國家"
+    state_province: "縣市"
+
+  # ── Preferences ────────────────────────────────────────────────────
+  preferences:
+    title: "偏好設定"
+    library_location: "音樂庫位置"
+    music_folder: "音樂資料夾"
+    browse: "瀏覽…"
+    select_music_folder: "選擇音樂資料夾"
+    browser_views: "瀏覽器檢視"
+    visible_columns: "可見欄位"
+    reset_to_defaults: "恢復預設值"
+
+  # ── Dialogs ────────────────────────────────────────────────────────
+  dialogs:
+    cancel: "取消"
+    connect: "連線"
+    create: "建立"
+    rename: "重新命名"
+    save: "儲存"
+    ok: "確定"
+    add_server_heading: "新增伺服器"
+    add_server_body: "輸入伺服器資訊以進行連線。"
+    connect_to: "連線至 %{name}"
+    enter_password: "輸入共用密碼（若無請留空）"
+    username: "使用者名稱"
+    password: "密碼"
+    new_playlist_heading: "新建播放清單"
+    playlist_name: "播放清單名稱"
+    rename_playlist_heading: "重新命名播放清單"
+    new_name: "新名稱"
+    enable_location: "啟用定位？"
+    enable_location_body: "「附近電台」透過您的 IP 位址取得大致位置，以搜尋附近的電台。\n\n您的 IP 位址將傳送至地理定位服務以判定大致座標。不會儲存任何個人資料。"
+    no_thanks: "不用了"
+    enable_location_btn: "啟用定位"
+
+  # ── Context menu ───────────────────────────────────────────────────
+  context:
+    properties: "內容…"
+    add_to_playlist: "加入播放清單"
+    remove_from_playlist: "從播放清單移除"
+
+  # ── Properties dialog ──────────────────────────────────────────────
+  properties:
+    heading_single: "內容 — %{title}"
+    heading_batch: "內容 — %{count} 首曲目"
+    field_title: "標題"
+    field_artist: "演出者"
+    field_album: "專輯"
+    field_genre: "類型"
+    field_year: "年份"
+    field_track_number: "曲目編號"
+    field_disc_number: "碟片編號"
+    field_format: "格式"
+    field_bitrate: "位元率"
+    field_sample_rate: "取樣率"
+    field_duration: "時間"
+    field_file: "檔案"
+    musicbrainz_lookup: "MusicBrainz 查詢"
+    searching: "搜尋中…"
+    not_found: "找不到"
+    mixed: "混合"
+
+  # ── Smart playlist editor ──────────────────────────────────────────
+  smart_playlist:
+    new_title: "新建智慧播放清單"
+    edit_title: "編輯智慧播放清單：%{name}"
+    match_label: "符合條件"
+    match_all: "全部"
+    match_any: "任一"
+    add_rule: "新增規則"
+    remove_rule: "刪除規則"
+    limit_to: "限制為"
+    live_updating: "即時更新"
+
+  # ── About dialog ───────────────────────────────────────────────────
+  about:
+    application_name: "Tributary"
+    developer_name: "John-Michael Mulesa"
+
+  # ── Status bar ─────────────────────────────────────────────────────
+  status:
+    songs_hours: "%{count} 首曲目，%{hours} 小時"
+    songs_minutes: "%{count} 首曲目，%{minutes} 分鐘"

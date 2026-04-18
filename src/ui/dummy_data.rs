@@ -587,19 +587,31 @@ const TRACKS: &[TrackTuple] = &[
 /// when servers are discovered or configured — see `window.rs`.
 pub fn build_sources() -> Vec<SourceObject> {
     vec![
-        SourceObject::header("Local"),
-        SourceObject::source("Local Filesystem", "local", "drive-harddisk-symbolic"),
-        // Internet Radio sources (always present).
-        SourceObject::header("Internet Radio"),
-        SourceObject::source("Top Clicked", "radio-topclick", "network-wireless-symbolic"),
-        SourceObject::source("Top Voted", "radio-topvote", "network-wireless-symbolic"),
+        SourceObject::header(rust_i18n::t!("sidebar.local").as_ref()),
         SourceObject::source(
-            "Stations Near Me",
+            rust_i18n::t!("sidebar.local_filesystem").as_ref(),
+            "local",
+            "drive-harddisk-symbolic",
+        ),
+        // Internet Radio sources (always present).
+        SourceObject::header(rust_i18n::t!("sidebar.internet_radio").as_ref()),
+        SourceObject::source(
+            rust_i18n::t!("sidebar.top_clicked").as_ref(),
+            "radio-topclick",
+            "network-wireless-symbolic",
+        ),
+        SourceObject::source(
+            rust_i18n::t!("sidebar.top_voted").as_ref(),
+            "radio-topvote",
+            "network-wireless-symbolic",
+        ),
+        SourceObject::source(
+            rust_i18n::t!("sidebar.stations_near_me").as_ref(),
             "radio-nearme",
             "network-wireless-symbolic",
         ),
         // Playlists section (entries populated dynamically after DB load).
-        SourceObject::header("Playlists"),
+        SourceObject::header(rust_i18n::t!("sidebar.playlists").as_ref()),
     ]
 }
 

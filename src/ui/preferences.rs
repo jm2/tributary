@@ -133,7 +133,7 @@ pub fn show_preferences(
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
 ) {
     let prefs_dialog = adw::PreferencesDialog::builder()
-        .title("Preferences")
+        .title(rust_i18n::t!("preferences.title").as_ref())
         .build();
 
     let page = adw::PreferencesPage::new();
@@ -141,16 +141,16 @@ pub fn show_preferences(
 
     // ── Library Location group (first) ──────────────────────────────
     let library_group = adw::PreferencesGroup::builder()
-        .title("Library Location")
+        .title(rust_i18n::t!("preferences.library_location").as_ref())
         .build();
 
     let library_row = adw::ActionRow::builder()
-        .title("Music folder")
+        .title(rust_i18n::t!("preferences.music_folder").as_ref())
         .subtitle(&cfg.library_path)
         .build();
 
     let browse_btn = gtk::Button::builder()
-        .label("Browse…")
+        .label(rust_i18n::t!("preferences.browse").as_ref())
         .valign(gtk::Align::Center)
         .build();
     library_row.add_suffix(&browse_btn);
@@ -163,7 +163,7 @@ pub fn show_preferences(
             let config = config.clone();
             let library_row = library_row.clone();
             let dialog = gtk::FileDialog::builder()
-                .title("Select Music Folder")
+                .title(rust_i18n::t!("preferences.select_music_folder").as_ref())
                 .modal(true)
                 .build();
 
@@ -192,7 +192,7 @@ pub fn show_preferences(
 
     // ── Browser Views group (dense horizontal checkboxes) ───────────
     let browser_group = adw::PreferencesGroup::builder()
-        .title("Browser Views")
+        .title(rust_i18n::t!("preferences.browser_views").as_ref())
         .build();
 
     let browser_row = gtk::Box::builder()
@@ -205,15 +205,15 @@ pub fn show_preferences(
         .build();
 
     let genre_check = gtk::CheckButton::builder()
-        .label("Genre")
+        .label(rust_i18n::t!("browser.genre").as_ref())
         .active(cfg.browser_views.genre)
         .build();
     let artist_check = gtk::CheckButton::builder()
-        .label("Artist")
+        .label(rust_i18n::t!("browser.artist").as_ref())
         .active(cfg.browser_views.artist)
         .build();
     let album_check = gtk::CheckButton::builder()
-        .label("Album")
+        .label(rust_i18n::t!("browser.album").as_ref())
         .active(cfg.browser_views.album)
         .build();
 
@@ -258,7 +258,7 @@ pub fn show_preferences(
 
     // ── Visible Columns group (dense grid with FlowBox) ─────────────
     let columns_group = adw::PreferencesGroup::builder()
-        .title("Visible Columns")
+        .title(rust_i18n::t!("preferences.visible_columns").as_ref())
         .build();
 
     let flow_box = gtk::FlowBox::builder()
@@ -307,7 +307,7 @@ pub fn show_preferences(
 
     // Reset to Defaults button
     let reset_btn = gtk::Button::builder()
-        .label("Reset to Defaults")
+        .label(rust_i18n::t!("preferences.reset_to_defaults").as_ref())
         .css_classes(["flat"])
         .halign(gtk::Align::Center)
         .margin_top(4)

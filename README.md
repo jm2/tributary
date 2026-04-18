@@ -46,6 +46,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Keyboard shortcut: `Ctrl+F` / `Cmd+F` to search | ✅ |
 | XDG music directory support (non-English locales) | ✅ |
 | Network connection guard (prevents duplicate auth) | ✅ |
+| i18n/l10n framework (13 languages, auto locale detection) | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 

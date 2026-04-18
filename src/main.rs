@@ -42,6 +42,11 @@
     clippy::derive_partial_eq_without_eq, // Not all PartialEq types need Eq
 )]
 
+// ── i18n initialisation ─────────────────────────────────────────────────
+// Load translations from the `locales/` directory at compile time.
+// English is the fallback language; all missing keys resolve to English.
+rust_i18n::i18n!("locales", fallback = "en");
+
 #[allow(dead_code)]
 mod architecture;
 mod audio;
@@ -131,6 +136,11 @@ fn main() {
                 .unwrap_or_else(|_| "tributary=info".into()),
         )
         .init();
+
+    // ── i18n: detect system locale ───────────────────────────────────
+    let locale = sys_locale::get_locale().unwrap_or_else(|| "en".to_string());
+    rust_i18n::set_locale(&locale);
+    info!("Locale set to: {locale}");
 
     info!("Tributary v{} starting", env!("CARGO_PKG_VERSION"));
 

@@ -134,6 +134,23 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
     // `seen` maps `key` → `url` so we can reconstruct the URL on removal.
     let mut seen: HashMap<String, String> = HashMap::new();
 
+    // ── macOS re-browse support ──────────────────────────────────────
+    // On macOS, the first launch triggers a Local Network permission
+    // prompt.  The mDNS daemon is already running its browse() calls,
+    // but macOS blocks mDNS traffic until the user grants permission.
+    // After granting, the daemon doesn't automatically re-browse.
+    //
+    // We periodically re-issue browse() calls if no servers have been
+    // found yet, up to a maximum number of retries.
+    #[cfg(target_os = "macos")]
+    const REBROWSE_INTERVAL: Duration = Duration::from_secs(30);
+    #[cfg(target_os = "macos")]
+    const REBROWSE_MAX_ATTEMPTS: u32 = 3;
+    #[cfg(target_os = "macos")]
+    let mut rebrowse_attempts: u32 = 0;
+    #[cfg(target_os = "macos")]
+    let mut last_rebrowse = std::time::Instant::now();
+
     loop {
         let mut got_event = false;
 
@@ -155,6 +172,30 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
             while let Ok(event) = rx.try_recv() {
                 got_event = true;
                 process_mdns_event(event, "daap", &mut seen, &tx);
+            }
+        }
+
+        // ── macOS: re-browse if no servers found yet ─────────────────
+        // After the user grants Local Network permission, the daemon
+        // needs fresh browse() calls to discover services.
+        #[cfg(target_os = "macos")]
+        {
+            if seen.is_empty()
+                && rebrowse_attempts < REBROWSE_MAX_ATTEMPTS
+                && last_rebrowse.elapsed() >= REBROWSE_INTERVAL
+            {
+                rebrowse_attempts += 1;
+                last_rebrowse = std::time::Instant::now();
+                info!(
+                    attempt = rebrowse_attempts,
+                    "macOS: re-browsing mDNS services (no servers found yet)"
+                );
+
+                // Re-issue browse for each service type.  The daemon
+                // is still running; this just re-registers the queries.
+                let _ = daemon.browse(SUBSONIC_SERVICE);
+                let _ = daemon.browse(PLEX_SERVICE);
+                let _ = daemon.browse(DAAP_SERVICE);
             }
         }
 

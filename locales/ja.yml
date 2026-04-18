@@ -1,0 +1,145 @@
+ja:
+  # ── Application ────────────────────────────────────────────────────
+  app:
+    name: "Tributary"
+    not_playing: "再生停止中"
+    scanning: "ライブラリをスキャン中…"
+    live: "ライブ"
+
+  # ── Header bar ─────────────────────────────────────────────────────
+  header:
+    previous: "前へ"
+    play: "再生"
+    next: "次へ"
+    repeat_off: "リピート: オフ"
+    repeat_all: "リピート: 全曲"
+    repeat_one: "リピート: 1曲"
+    shuffle: "シャッフル"
+    main_menu: "メインメニュー"
+
+  # ── Sidebar ────────────────────────────────────────────────────────
+  sidebar:
+    local: "ローカル"
+    local_filesystem: "ローカルファイルシステム"
+    internet_radio: "インターネットラジオ"
+    top_clicked: "人気の局"
+    top_voted: "高評価の局"
+    stations_near_me: "近くの局"
+    playlists: "プレイリスト"
+    add_server: "サーバーを追加"
+    new_playlist: "新しいプレイリスト"
+    remove_server: "サーバーを削除"
+    disconnect: "切断"
+    new_playlist_menu: "新しいプレイリスト"
+    new_smart_playlist_menu: "新しいスマートプレイリスト"
+    rename: "名前を変更"
+    delete: "削除"
+    edit_smart_playlist: "スマートプレイリストを編集…"
+
+  # ── Browser ────────────────────────────────────────────────────────
+  browser:
+    search_placeholder: "全フィールドを検索"
+    genre: "ジャンル"
+    artist: "アーティスト"
+    album: "アルバム"
+    all: "すべて"
+
+  # ── Tracklist columns ──────────────────────────────────────────────
+  columns:
+    number: "#"
+    title: "タイトル"
+    time: "時間"
+    artist: "アーティスト"
+    album: "アルバム"
+    genre: "ジャンル"
+    year: "年"
+    date_modified: "更新日"
+    bitrate: "ビットレート"
+    sample_rate: "サンプルレート"
+    plays: "再生回数"
+    format: "形式"
+    country: "国"
+    state_province: "都道府県"
+
+  # ── Preferences ────────────────────────────────────────────────────
+  preferences:
+    title: "設定"
+    library_location: "ライブラリの場所"
+    music_folder: "音楽フォルダー"
+    browse: "参照…"
+    select_music_folder: "音楽フォルダーを選択"
+    browser_views: "ブラウザー表示"
+    visible_columns: "表示する列"
+    reset_to_defaults: "デフォルトに戻す"
+
+  # ── Dialogs ────────────────────────────────────────────────────────
+  dialogs:
+    cancel: "キャンセル"
+    connect: "接続"
+    create: "作成"
+    rename: "名前を変更"
+    save: "保存"
+    ok: "OK"
+    add_server_heading: "サーバーを追加"
+    add_server_body: "接続するサーバーの詳細を入力してください。"
+    connect_to: "%{name} に接続"
+    enter_password: "共有パスワードを入力してください（なければ空欄）"
+    username: "ユーザー名"
+    password: "パスワード"
+    new_playlist_heading: "新しいプレイリスト"
+    playlist_name: "プレイリスト名"
+    rename_playlist_heading: "プレイリストの名前を変更"
+    new_name: "新しい名前"
+    enable_location: "位置情報を有効にしますか？"
+    enable_location_body: "「近くの局」はIPアドレスからおおよその位置を取得し、近くのラジオ局を検索します。\n\nIPアドレスはジオロケーションサービスに送信され、おおよその座標が特定されます。個人データは保存されません。"
+    no_thanks: "いいえ"
+    enable_location_btn: "位置情報を有効にする"
+
+  # ── Context menu ───────────────────────────────────────────────────
+  context:
+    properties: "プロパティ…"
+    add_to_playlist: "プレイリストに追加"
+    remove_from_playlist: "プレイリストから削除"
+
+  # ── Properties dialog ──────────────────────────────────────────────
+  properties:
+    heading_single: "プロパティ — %{title}"
+    heading_batch: "プロパティ — %{count} 曲"
+    field_title: "タイトル"
+    field_artist: "アーティスト"
+    field_album: "アルバム"
+    field_genre: "ジャンル"
+    field_year: "年"
+    field_track_number: "トラック番号"
+    field_disc_number: "ディスク番号"
+    field_format: "形式"
+    field_bitrate: "ビットレート"
+    field_sample_rate: "サンプルレート"
+    field_duration: "時間"
+    field_file: "ファイル"
+    musicbrainz_lookup: "MusicBrainz 検索"
+    searching: "検索中…"
+    not_found: "見つかりません"
+    mixed: "混合"
+
+  # ── Smart playlist editor ──────────────────────────────────────────
+  smart_playlist:
+    new_title: "新しいスマートプレイリスト"
+    edit_title: "スマートプレイリストを編集: %{name}"
+    match_label: "一致条件"
+    match_all: "すべて"
+    match_any: "いずれか"
+    add_rule: "ルールを追加"
+    remove_rule: "ルールを削除"
+    limit_to: "制限"
+    live_updating: "リアルタイム更新"
+
+  # ── About dialog ───────────────────────────────────────────────────
+  about:
+    application_name: "Tributary"
+    developer_name: "John-Michael Mulesa"
+
+  # ── Status bar ─────────────────────────────────────────────────────
+  status:
+    songs_hours: "%{count} 曲、%{hours} 時間"
+    songs_minutes: "%{count} 曲、%{minutes} 分"

@@ -68,7 +68,7 @@ pub fn build_browser(
 
     // ── Search entry ─────────────────────────────────────────────────
     let search_entry = gtk::SearchEntry::builder()
-        .placeholder_text("Search all fields")
+        .placeholder_text(rust_i18n::t!("browser.search_placeholder").as_ref())
         .hexpand(true)
         .margin_start(8)
         .margin_end(8)

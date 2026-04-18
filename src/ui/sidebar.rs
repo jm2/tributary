@@ -312,7 +312,7 @@ pub fn build_sidebar(
     let add_button = gtk::Button::builder()
         .icon_name("list-add-symbolic")
         .css_classes(["flat"])
-        .tooltip_text("Add server")
+        .tooltip_text(rust_i18n::t!("sidebar.add_server").as_ref())
         .build();
 
     let toolbar = gtk::Box::builder()

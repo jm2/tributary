@@ -1,0 +1,145 @@
+ko:
+  # ── Application ────────────────────────────────────────────────────
+  app:
+    name: "Tributary"
+    not_playing: "재생 중이 아님"
+    scanning: "라이브러리 스캔 중…"
+    live: "라이브"
+
+  # ── Header bar ─────────────────────────────────────────────────────
+  header:
+    previous: "이전"
+    play: "재생"
+    next: "다음"
+    repeat_off: "반복: 끄기"
+    repeat_all: "반복: 전체"
+    repeat_one: "반복: 한 곡"
+    shuffle: "셔플"
+    main_menu: "메인 메뉴"
+
+  # ── Sidebar ────────────────────────────────────────────────────────
+  sidebar:
+    local: "로컬"
+    local_filesystem: "로컬 파일 시스템"
+    internet_radio: "인터넷 라디오"
+    top_clicked: "인기 방송국"
+    top_voted: "평점 높은 방송국"
+    stations_near_me: "내 주변 방송국"
+    playlists: "재생목록"
+    add_server: "서버 추가"
+    new_playlist: "새 재생목록"
+    remove_server: "서버 제거"
+    disconnect: "연결 끊기"
+    new_playlist_menu: "새 재생목록"
+    new_smart_playlist_menu: "새 스마트 재생목록"
+    rename: "이름 변경"
+    delete: "삭제"
+    edit_smart_playlist: "스마트 재생목록 편집…"
+
+  # ── Browser ────────────────────────────────────────────────────────
+  browser:
+    search_placeholder: "모든 필드 검색"
+    genre: "장르"
+    artist: "아티스트"
+    album: "앨범"
+    all: "전체"
+
+  # ── Tracklist columns ──────────────────────────────────────────────
+  columns:
+    number: "#"
+    title: "제목"
+    time: "시간"
+    artist: "아티스트"
+    album: "앨범"
+    genre: "장르"
+    year: "연도"
+    date_modified: "수정 날짜"
+    bitrate: "비트레이트"
+    sample_rate: "샘플레이트"
+    plays: "재생 횟수"
+    format: "형식"
+    country: "국가"
+    state_province: "시/도"
+
+  # ── Preferences ────────────────────────────────────────────────────
+  preferences:
+    title: "환경설정"
+    library_location: "라이브러리 위치"
+    music_folder: "음악 폴더"
+    browse: "찾아보기…"
+    select_music_folder: "음악 폴더 선택"
+    browser_views: "브라우저 보기"
+    visible_columns: "표시할 열"
+    reset_to_defaults: "기본값으로 재설정"
+
+  # ── Dialogs ────────────────────────────────────────────────────────
+  dialogs:
+    cancel: "취소"
+    connect: "연결"
+    create: "만들기"
+    rename: "이름 변경"
+    save: "저장"
+    ok: "확인"
+    add_server_heading: "서버 추가"
+    add_server_body: "연결할 서버 정보를 입력하세요."
+    connect_to: "%{name}에 연결"
+    enter_password: "공유 비밀번호를 입력하세요 (없으면 비워두세요)"
+    username: "사용자 이름"
+    password: "비밀번호"
+    new_playlist_heading: "새 재생목록"
+    playlist_name: "재생목록 이름"
+    rename_playlist_heading: "재생목록 이름 변경"
+    new_name: "새 이름"
+    enable_location: "위치를 활성화하시겠습니까?"
+    enable_location_body: "내 주변 방송국은 IP 주소를 통해 대략적인 위치를 사용하여 근처 라디오 방송국을 찾습니다.\n\nIP 주소가 위치 확인 서비스로 전송되어 대략적인 좌표가 결정됩니다. 개인 데이터는 저장되지 않습니다."
+    no_thanks: "아니요"
+    enable_location_btn: "위치 활성화"
+
+  # ── Context menu ───────────────────────────────────────────────────
+  context:
+    properties: "속성…"
+    add_to_playlist: "재생목록에 추가"
+    remove_from_playlist: "재생목록에서 제거"
+
+  # ── Properties dialog ──────────────────────────────────────────────
+  properties:
+    heading_single: "속성 — %{title}"
+    heading_batch: "속성 — %{count}곡"
+    field_title: "제목"
+    field_artist: "아티스트"
+    field_album: "앨범"
+    field_genre: "장르"
+    field_year: "연도"
+    field_track_number: "트랙 번호"
+    field_disc_number: "디스크 번호"
+    field_format: "형식"
+    field_bitrate: "비트레이트"
+    field_sample_rate: "샘플레이트"
+    field_duration: "시간"
+    field_file: "파일"
+    musicbrainz_lookup: "MusicBrainz 검색"
+    searching: "검색 중…"
+    not_found: "찾을 수 없음"
+    mixed: "혼합"
+
+  # ── Smart playlist editor ──────────────────────────────────────────
+  smart_playlist:
+    new_title: "새 스마트 재생목록"
+    edit_title: "스마트 재생목록 편집: %{name}"
+    match_label: "일치 조건"
+    match_all: "모두"
+    match_any: "하나라도"
+    add_rule: "규칙 추가"
+    remove_rule: "규칙 제거"
+    limit_to: "제한"
+    live_updating: "실시간 업데이트"
+
+  # ── About dialog ───────────────────────────────────────────────────
+  about:
+    application_name: "Tributary"
+    developer_name: "John-Michael Mulesa"
+
+  # ── Status bar ─────────────────────────────────────────────────────
+  status:
+    songs_hours: "%{count}곡, %{hours}시간"
+    songs_minutes: "%{count}곡, %{minutes}분"

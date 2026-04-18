@@ -43,24 +43,24 @@ pub fn build_header_bar() -> HeaderBarWidgets {
     // ── Left: Playback Controls ──────────────────────────────────────
     let btn_prev = gtk::Button::builder()
         .icon_name("media-skip-backward-symbolic")
-        .tooltip_text("Previous")
+        .tooltip_text(rust_i18n::t!("header.previous").as_ref())
         .build();
 
     let btn_play = gtk::Button::builder()
         .icon_name("media-playback-start-symbolic")
-        .tooltip_text("Play")
+        .tooltip_text(rust_i18n::t!("header.play").as_ref())
         .css_classes(["suggested-action", "circular"])
         .build();
 
     let btn_next = gtk::Button::builder()
         .icon_name("media-skip-forward-symbolic")
-        .tooltip_text("Next")
+        .tooltip_text(rust_i18n::t!("header.next").as_ref())
         .build();
 
     let repeat_mode: Rc<Cell<RepeatMode>> = Rc::new(Cell::new(RepeatMode::Off));
     let btn_repeat = gtk::ToggleButton::builder()
         .icon_name("media-playlist-repeat-symbolic")
-        .tooltip_text("Repeat: Off")
+        .tooltip_text(rust_i18n::t!("header.repeat_off").as_ref())
         .build();
 
     // Cycle Off → All → One on each click.
@@ -91,7 +91,7 @@ pub fn build_header_bar() -> HeaderBarWidgets {
 
     let btn_shuffle = gtk::ToggleButton::builder()
         .icon_name("media-playlist-shuffle-symbolic")
-        .tooltip_text("Shuffle")
+        .tooltip_text(rust_i18n::t!("header.shuffle").as_ref())
         .build();
 
     let playback_box = gtk::Box::builder()
