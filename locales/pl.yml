@@ -1,7 +1,7 @@
 # ── Application ────────────────────────────────────────────────────
 app:
   name: "Tributary"
-  not_playing: "Nic nie odtwarza"
+  not_playing: "Brak odtwarzania"
   scanning: "Skanowanie biblioteki…"
   live: "NA ŻYWO"
 

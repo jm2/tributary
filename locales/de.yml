@@ -84,7 +84,7 @@ dialogs:
   add_server_heading: "Server hinzufügen"
   add_server_body: "Geben Sie die Serverdetails ein, um eine Verbindung herzustellen."
   connect_to: "Verbinden mit %{name}"
-  enter_password: "Geben Sie das Freigabekennwort ein (leer lassen, wenn keines)"
+  enter_password: "Geben Sie das Freigabekennwort ein (leer lassen, falls nicht vorhanden)"
   username: "Benutzername"
   password: "Passwort"
   new_playlist_heading: "Neue Wiedergabeliste"

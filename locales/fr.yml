@@ -136,7 +136,7 @@ smart_playlist:
   edit_title: "Modifier la liste intelligente : %{name}"
   match_label: "Correspondance"
   match_all: "Toutes"
-  match_any: "N'importe laquelle"
+  match_any: "Au moins une"
   add_rule: "Ajouter une règle"
   remove_rule: "Supprimer la règle"
   limit_to: "Limiter à"
