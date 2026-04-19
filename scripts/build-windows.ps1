@@ -31,6 +31,14 @@
     If specified, sets up the MSYS2 build environment and runs `cargo fmt` only.
     Useful for formatting code from PowerShell without a full build.
 
+.PARAMETER Test
+    If specified, sets up the MSYS2 build environment and runs `cargo test --release`.
+    Useful for running the test suite from PowerShell without a full build.
+
+.PARAMETER Run
+    If specified, sets up the MSYS2 build environment, builds in release mode, and
+    runs the compiled binary. Useful for quick launch from PowerShell.
+
 .PARAMETER CargoUpdate
     If specified, sets up the MSYS2 build environment and runs `cargo update` with
     any additional arguments passed via -CargoUpdateArgs. Useful for updating
@@ -44,6 +52,8 @@ param(
     [switch]$Check,
     [switch]$Clippy,
     [switch]$Fmt,
+    [switch]$Test,
+    [switch]$Run,
     [switch]$Coverage,
     [switch]$CargoUpdate,
     [string]$CargoUpdateArgs = ""
@@ -129,7 +139,7 @@ if (-not (Test-Path $Msys2Root)) {
     Write-Err "MSYS2 not found at $Msys2Root. Install from https://www.msys2.org"
 }
 
-$cargoNeeded = (-not $NoCargoBuild) -or $Check -or $Clippy -or $Fmt -or $CargoUpdate
+$cargoNeeded = (-not $NoCargoBuild) -or $Check -or $Clippy -or $Fmt -or $Test -or $Run -or $CargoUpdate
 if ($cargoNeeded -and -not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Err "cargo not found. Install Rustup from https://rustup.rs or winget install Rustlang.Rustup"
 }
@@ -201,6 +211,25 @@ if ($Clippy) {
     if ($LASTEXITCODE -ne 0) { Write-Err "cargo clippy failed." }
     Write-Info "Clippy passed."
     exit 0
+}
+
+if ($Test) {
+    Write-Info "Running cargo test (release) for $RustTarget..."
+    cargo test --release --target $RustTarget
+    if ($LASTEXITCODE -ne 0) { Write-Err "cargo test failed." }
+    Write-Info "All tests passed."
+    exit 0
+}
+
+if ($Run) {
+    Write-Info "Building Tributary (release) for $RustTarget..."
+    cargo build --release --target $RustTarget
+    if ($LASTEXITCODE -ne 0) { Write-Err "cargo build failed." }
+    $runExePath = "target\$RustTarget\release\tributary.exe"
+    if (-not (Test-Path $runExePath)) { Write-Err "Binary not found at $runExePath" }
+    Write-Info "Launching $runExePath..."
+    & $runExePath
+    exit $LASTEXITCODE
 }
 
 if ($CargoUpdate) {

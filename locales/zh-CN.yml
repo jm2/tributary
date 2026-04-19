@@ -1,154 +1,153 @@
-zh-CN:
-  # ── Application ────────────────────────────────────────────────────
-  app:
-    name: "Tributary"
-    not_playing: "未在播放"
-    scanning: "正在扫描音乐库…"
-    live: "直播"
+# ── Application ────────────────────────────────────────────────────
+app:
+  name: "Tributary"
+  not_playing: "未在播放"
+  scanning: "正在扫描音乐库…"
+  live: "直播"
 
-  # ── Header bar ─────────────────────────────────────────────────────
-  header:
-    previous: "上一首"
-    play: "播放"
-    next: "下一首"
-    repeat_off: "重复：关闭"
-    repeat_all: "重复：全部"
-    repeat_one: "重复：单曲"
-    shuffle: "随机播放"
-    output: "音频输出"
-    add_output: "添加输出"
-    main_menu: "主菜单"
+# ── Header bar ─────────────────────────────────────────────────────
+header:
+  previous: "上一首"
+  play: "播放"
+  next: "下一首"
+  repeat_off: "重复：关闭"
+  repeat_all: "重复：全部"
+  repeat_one: "重复：单曲"
+  shuffle: "随机播放"
+  output: "音频输出"
+  add_output: "添加输出"
+  main_menu: "主菜单"
 
-  # ── Sidebar ────────────────────────────────────────────────────────
-  sidebar:
-    local: "本地"
-    local_filesystem: "本地文件系统"
-    internet_radio: "网络电台"
-    top_clicked: "最热门"
-    top_voted: "最高评分"
-    stations_near_me: "附近电台"
-    playlists: "播放列表"
-    add_server: "添加服务器"
-    new_playlist: "新建播放列表"
-    remove_server: "移除服务器"
-    disconnect: "断开连接"
-    new_playlist_menu: "新建播放列表"
-    new_smart_playlist_menu: "新建智能播放列表"
-    rename: "重命名"
-    delete: "删除"
-    edit_smart_playlist: "编辑智能播放列表…"
+# ── Sidebar ────────────────────────────────────────────────────────
+sidebar:
+  local: "本地"
+  local_filesystem: "本地文件系统"
+  internet_radio: "网络电台"
+  top_clicked: "最热门"
+  top_voted: "最高评分"
+  stations_near_me: "附近电台"
+  playlists: "播放列表"
+  add_server: "添加服务器"
+  new_playlist: "新建播放列表"
+  remove_server: "移除服务器"
+  disconnect: "断开连接"
+  new_playlist_menu: "新建播放列表"
+  new_smart_playlist_menu: "新建智能播放列表"
+  rename: "重命名"
+  delete: "删除"
+  edit_smart_playlist: "编辑智能播放列表…"
 
-  # ── Browser ────────────────────────────────────────────────────────
-  browser:
-    search_placeholder: "搜索所有字段"
-    genre: "流派"
-    artist: "艺术家"
-    album: "专辑"
-    all: "全部"
+# ── Browser ────────────────────────────────────────────────────────
+browser:
+  search_placeholder: "搜索所有字段"
+  genre: "流派"
+  artist: "艺术家"
+  album: "专辑"
+  all: "全部"
 
-  # ── Tracklist columns ──────────────────────────────────────────────
-  columns:
-    number: "#"
-    title: "标题"
-    time: "时长"
-    artist: "艺术家"
-    album: "专辑"
-    genre: "流派"
-    year: "年份"
-    date_modified: "修改日期"
-    bitrate: "比特率"
-    sample_rate: "采样率"
-    plays: "播放次数"
-    format: "格式"
-    country: "国家"
-    state_province: "省/州"
+# ── Tracklist columns ──────────────────────────────────────────────
+columns:
+  number: "#"
+  title: "标题"
+  time: "时长"
+  artist: "艺术家"
+  album: "专辑"
+  genre: "流派"
+  year: "年份"
+  date_modified: "修改日期"
+  bitrate: "比特率"
+  sample_rate: "采样率"
+  plays: "播放次数"
+  format: "格式"
+  country: "国家"
+  state_province: "省/州"
 
-  # ── Preferences ────────────────────────────────────────────────────
-  preferences:
-    title: "首选项"
-    library_location: "音乐库位置"
-    music_folder: "音乐文件夹"
-    browse: "浏览…"
-    select_music_folder: "选择音乐文件夹"
-    browser_views: "浏览器视图"
-    visible_columns: "可见列"
-    reset_to_defaults: "恢复默认设置"
+# ── Preferences ────────────────────────────────────────────────────
+preferences:
+  title: "首选项"
+  library_location: "音乐库位置"
+  music_folder: "音乐文件夹"
+  browse: "浏览…"
+  select_music_folder: "选择音乐文件夹"
+  browser_views: "浏览器视图"
+  visible_columns: "可见列"
+  reset_to_defaults: "恢复默认设置"
 
-  # ── Dialogs ────────────────────────────────────────────────────────
-  dialogs:
-    cancel: "取消"
-    connect: "连接"
-    create: "创建"
-    rename: "重命名"
-    save: "保存"
-    ok: "确定"
-    add_server_heading: "添加服务器"
-    add_server_body: "输入服务器信息以进行连接。"
-    connect_to: "连接到 %{name}"
-    enter_password: "输入共享密码（如果没有请留空）"
-    username: "用户名"
-    password: "密码"
-    new_playlist_heading: "新建播放列表"
-    playlist_name: "播放列表名称"
-    rename_playlist_heading: "重命名播放列表"
-    new_name: "新名称"
-    enable_location: "启用位置？"
-    enable_location_body: "「附近电台」通过您的 IP 地址获取大致位置，以查找附近的电台。\n\n您的 IP 地址将发送到地理定位服务以确定大致坐标。不会存储任何个人数据。"
-    no_thanks: "不用了"
-    enable_location_btn: "启用位置"
-    add_output_heading: "添加输出"
-    add_output_body: "输入 MPD 服务器信息。"
-    add: "添加"
-    output_name: "名称"
-    output_name_placeholder: "客厅 MPD"
-    output_host: "主机"
-    output_port: "端口"
+# ── Dialogs ────────────────────────────────────────────────────────
+dialogs:
+  cancel: "取消"
+  connect: "连接"
+  create: "创建"
+  rename: "重命名"
+  save: "保存"
+  ok: "确定"
+  add_server_heading: "添加服务器"
+  add_server_body: "输入服务器信息以进行连接。"
+  connect_to: "连接到 %{name}"
+  enter_password: "输入共享密码（如果没有请留空）"
+  username: "用户名"
+  password: "密码"
+  new_playlist_heading: "新建播放列表"
+  playlist_name: "播放列表名称"
+  rename_playlist_heading: "重命名播放列表"
+  new_name: "新名称"
+  enable_location: "启用位置？"
+  enable_location_body: "「附近电台」通过您的 IP 地址获取大致位置，以查找附近的电台。\n\n您的 IP 地址将发送到地理定位服务以确定大致坐标。不会存储任何个人数据。"
+  no_thanks: "不用了"
+  enable_location_btn: "启用位置"
+  add_output_heading: "添加输出"
+  add_output_body: "输入 MPD 服务器信息。"
+  add: "添加"
+  output_name: "名称"
+  output_name_placeholder: "客厅 MPD"
+  output_host: "主机"
+  output_port: "端口"
 
-  # ── Context menu ───────────────────────────────────────────────────
-  context:
-    properties: "属性…"
-    add_to_playlist: "添加到播放列表"
-    remove_from_playlist: "从播放列表中移除"
+# ── Context menu ───────────────────────────────────────────────────
+context:
+  properties: "属性…"
+  add_to_playlist: "添加到播放列表"
+  remove_from_playlist: "从播放列表中移除"
 
-  # ── Properties dialog ──────────────────────────────────────────────
-  properties:
-    heading_single: "属性 — %{title}"
-    heading_batch: "属性 — %{count} 首曲目"
-    field_title: "标题"
-    field_artist: "艺术家"
-    field_album: "专辑"
-    field_genre: "流派"
-    field_year: "年份"
-    field_track_number: "曲目编号"
-    field_disc_number: "碟片编号"
-    field_format: "格式"
-    field_bitrate: "比特率"
-    field_sample_rate: "采样率"
-    field_duration: "时长"
-    field_file: "文件"
-    musicbrainz_lookup: "MusicBrainz 查询"
-    searching: "搜索中…"
-    not_found: "未找到"
-    mixed: "混合"
+# ── Properties dialog ──────────────────────────────────────────────
+properties:
+  heading_single: "属性 — %{title}"
+  heading_batch: "属性 — %{count} 首曲目"
+  field_title: "标题"
+  field_artist: "艺术家"
+  field_album: "专辑"
+  field_genre: "流派"
+  field_year: "年份"
+  field_track_number: "曲目编号"
+  field_disc_number: "碟片编号"
+  field_format: "格式"
+  field_bitrate: "比特率"
+  field_sample_rate: "采样率"
+  field_duration: "时长"
+  field_file: "文件"
+  musicbrainz_lookup: "MusicBrainz 查询"
+  searching: "搜索中…"
+  not_found: "未找到"
+  mixed: "混合"
 
-  # ── Smart playlist editor ──────────────────────────────────────────
-  smart_playlist:
-    new_title: "新建智能播放列表"
-    edit_title: "编辑智能播放列表：%{name}"
-    match_label: "匹配条件"
-    match_all: "全部"
-    match_any: "任意"
-    add_rule: "添加规则"
-    remove_rule: "删除规则"
-    limit_to: "限制为"
-    live_updating: "实时更新"
+# ── Smart playlist editor ──────────────────────────────────────────
+smart_playlist:
+  new_title: "新建智能播放列表"
+  edit_title: "编辑智能播放列表：%{name}"
+  match_label: "匹配条件"
+  match_all: "全部"
+  match_any: "任意"
+  add_rule: "添加规则"
+  remove_rule: "删除规则"
+  limit_to: "限制为"
+  live_updating: "实时更新"
 
-  # ── About dialog ───────────────────────────────────────────────────
-  about:
-    application_name: "Tributary"
-    developer_name: "John-Michael Mulesa"
+# ── About dialog ───────────────────────────────────────────────────
+about:
+  application_name: "Tributary"
+  developer_name: "John-Michael Mulesa"
 
-  # ── Status bar ─────────────────────────────────────────────────────
-  status:
-    songs_hours: "%{count} 首曲目，%{hours} 小时"
-    songs_minutes: "%{count} 首曲目，%{minutes} 分钟"
+# ── Status bar ─────────────────────────────────────────────────────
+status:
+  songs_hours: "%{count} 首曲目，%{hours} 小时"
+  songs_minutes: "%{count} 首曲目，%{minutes} 分钟"

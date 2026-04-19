@@ -1,154 +1,153 @@
-nl:
-  # ── Application ────────────────────────────────────────────────────
-  app:
-    name: "Tributary"
-    not_playing: "Niets afspelen"
-    scanning: "Bibliotheek scannen…"
-    live: "LIVE"
+# ── Application ────────────────────────────────────────────────────
+app:
+  name: "Tributary"
+  not_playing: "Niets afspelen"
+  scanning: "Bibliotheek scannen…"
+  live: "LIVE"
 
-  # ── Header bar ─────────────────────────────────────────────────────
-  header:
-    previous: "Vorige"
-    play: "Afspelen"
-    next: "Volgende"
-    repeat_off: "Herhalen: Uit"
-    repeat_all: "Herhalen: Alles"
-    repeat_one: "Herhalen: Eén"
-    shuffle: "Willekeurig"
-    output: "Audio-uitvoer"
-    add_output: "Uitvoer toevoegen"
-    main_menu: "Hoofdmenu"
+# ── Header bar ─────────────────────────────────────────────────────
+header:
+  previous: "Vorige"
+  play: "Afspelen"
+  next: "Volgende"
+  repeat_off: "Herhalen: Uit"
+  repeat_all: "Herhalen: Alles"
+  repeat_one: "Herhalen: Eén"
+  shuffle: "Willekeurig"
+  output: "Audio-uitvoer"
+  add_output: "Uitvoer toevoegen"
+  main_menu: "Hoofdmenu"
 
-  # ── Sidebar ────────────────────────────────────────────────────────
-  sidebar:
-    local: "Lokaal"
-    local_filesystem: "Lokaal bestandssysteem"
-    internet_radio: "Internetradio"
-    top_clicked: "Meest beluisterd"
-    top_voted: "Hoogst gewaardeerd"
-    stations_near_me: "Stations in de buurt"
-    playlists: "Afspeellijsten"
-    add_server: "Server toevoegen"
-    new_playlist: "Nieuwe afspeellijst"
-    remove_server: "Server verwijderen"
-    disconnect: "Verbinding verbreken"
-    new_playlist_menu: "Nieuwe afspeellijst"
-    new_smart_playlist_menu: "Nieuwe slimme afspeellijst"
-    rename: "Hernoemen"
-    delete: "Verwijderen"
-    edit_smart_playlist: "Slimme afspeellijst bewerken…"
+# ── Sidebar ────────────────────────────────────────────────────────
+sidebar:
+  local: "Lokaal"
+  local_filesystem: "Lokaal bestandssysteem"
+  internet_radio: "Internetradio"
+  top_clicked: "Meest beluisterd"
+  top_voted: "Hoogst gewaardeerd"
+  stations_near_me: "Stations in de buurt"
+  playlists: "Afspeellijsten"
+  add_server: "Server toevoegen"
+  new_playlist: "Nieuwe afspeellijst"
+  remove_server: "Server verwijderen"
+  disconnect: "Verbinding verbreken"
+  new_playlist_menu: "Nieuwe afspeellijst"
+  new_smart_playlist_menu: "Nieuwe slimme afspeellijst"
+  rename: "Hernoemen"
+  delete: "Verwijderen"
+  edit_smart_playlist: "Slimme afspeellijst bewerken…"
 
-  # ── Browser ────────────────────────────────────────────────────────
-  browser:
-    search_placeholder: "Alle velden doorzoeken"
-    genre: "Genre"
-    artist: "Artiest"
-    album: "Album"
-    all: "Alles"
+# ── Browser ────────────────────────────────────────────────────────
+browser:
+  search_placeholder: "Alle velden doorzoeken"
+  genre: "Genre"
+  artist: "Artiest"
+  album: "Album"
+  all: "Alles"
 
-  # ── Tracklist columns ──────────────────────────────────────────────
-  columns:
-    number: "#"
-    title: "Titel"
-    time: "Tijd"
-    artist: "Artiest"
-    album: "Album"
-    genre: "Genre"
-    year: "Jaar"
-    date_modified: "Datum gewijzigd"
-    bitrate: "Bitrate"
-    sample_rate: "Samplefrequentie"
-    plays: "Keer afgespeeld"
-    format: "Formaat"
-    country: "Land"
-    state_province: "Provincie"
+# ── Tracklist columns ──────────────────────────────────────────────
+columns:
+  number: "#"
+  title: "Titel"
+  time: "Tijd"
+  artist: "Artiest"
+  album: "Album"
+  genre: "Genre"
+  year: "Jaar"
+  date_modified: "Datum gewijzigd"
+  bitrate: "Bitrate"
+  sample_rate: "Samplefrequentie"
+  plays: "Keer afgespeeld"
+  format: "Formaat"
+  country: "Land"
+  state_province: "Provincie"
 
-  # ── Preferences ────────────────────────────────────────────────────
-  preferences:
-    title: "Voorkeuren"
-    library_location: "Bibliotheeklocatie"
-    music_folder: "Muziekmap"
-    browse: "Bladeren…"
-    select_music_folder: "Muziekmap selecteren"
-    browser_views: "Browserweergaven"
-    visible_columns: "Zichtbare kolommen"
-    reset_to_defaults: "Standaardinstellingen herstellen"
+# ── Preferences ────────────────────────────────────────────────────
+preferences:
+  title: "Voorkeuren"
+  library_location: "Bibliotheeklocatie"
+  music_folder: "Muziekmap"
+  browse: "Bladeren…"
+  select_music_folder: "Muziekmap selecteren"
+  browser_views: "Browserweergaven"
+  visible_columns: "Zichtbare kolommen"
+  reset_to_defaults: "Standaardinstellingen herstellen"
 
-  # ── Dialogs ────────────────────────────────────────────────────────
-  dialogs:
-    cancel: "Annuleren"
-    connect: "Verbinden"
-    create: "Aanmaken"
-    rename: "Hernoemen"
-    save: "Opslaan"
-    ok: "OK"
-    add_server_heading: "Server toevoegen"
-    add_server_body: "Voer de servergegevens in om te verbinden."
-    connect_to: "Verbinden met %{name}"
-    enter_password: "Voer het wachtwoord in (laat leeg indien geen)"
-    username: "Gebruikersnaam"
-    password: "Wachtwoord"
-    new_playlist_heading: "Nieuwe afspeellijst"
-    playlist_name: "Naam afspeellijst"
-    rename_playlist_heading: "Afspeellijst hernoemen"
-    new_name: "Nieuwe naam"
-    enable_location: "Locatie inschakelen?"
-    enable_location_body: "Stations in de buurt gebruikt uw geschatte locatie (via IP-adres) om nabijgelegen radiostations te vinden.\n\nUw IP-adres wordt naar een geolocatiedienst gestuurd om uw geschatte coördinaten te bepalen. Er worden geen persoonlijke gegevens opgeslagen."
-    no_thanks: "Nee bedankt"
-    enable_location_btn: "Locatie inschakelen"
-    add_output_heading: "Uitvoer toevoegen"
-    add_output_body: "Voer de MPD-servergegevens in."
-    add: "Toevoegen"
-    output_name: "Naam"
-    output_name_placeholder: "Woonkamer MPD"
-    output_host: "Host"
-    output_port: "Poort"
+# ── Dialogs ────────────────────────────────────────────────────────
+dialogs:
+  cancel: "Annuleren"
+  connect: "Verbinden"
+  create: "Aanmaken"
+  rename: "Hernoemen"
+  save: "Opslaan"
+  ok: "OK"
+  add_server_heading: "Server toevoegen"
+  add_server_body: "Voer de servergegevens in om te verbinden."
+  connect_to: "Verbinden met %{name}"
+  enter_password: "Voer het wachtwoord in (laat leeg indien geen)"
+  username: "Gebruikersnaam"
+  password: "Wachtwoord"
+  new_playlist_heading: "Nieuwe afspeellijst"
+  playlist_name: "Naam afspeellijst"
+  rename_playlist_heading: "Afspeellijst hernoemen"
+  new_name: "Nieuwe naam"
+  enable_location: "Locatie inschakelen?"
+  enable_location_body: "Stations in de buurt gebruikt uw geschatte locatie (via IP-adres) om nabijgelegen radiostations te vinden.\n\nUw IP-adres wordt naar een geolocatiedienst gestuurd om uw geschatte coördinaten te bepalen. Er worden geen persoonlijke gegevens opgeslagen."
+  no_thanks: "Nee bedankt"
+  enable_location_btn: "Locatie inschakelen"
+  add_output_heading: "Uitvoer toevoegen"
+  add_output_body: "Voer de MPD-servergegevens in."
+  add: "Toevoegen"
+  output_name: "Naam"
+  output_name_placeholder: "Woonkamer MPD"
+  output_host: "Host"
+  output_port: "Poort"
 
-  # ── Context menu ───────────────────────────────────────────────────
-  context:
-    properties: "Eigenschappen…"
-    add_to_playlist: "Toevoegen aan afspeellijst"
-    remove_from_playlist: "Verwijderen uit afspeellijst"
+# ── Context menu ───────────────────────────────────────────────────
+context:
+  properties: "Eigenschappen…"
+  add_to_playlist: "Toevoegen aan afspeellijst"
+  remove_from_playlist: "Verwijderen uit afspeellijst"
 
-  # ── Properties dialog ──────────────────────────────────────────────
-  properties:
-    heading_single: "Eigenschappen — %{title}"
-    heading_batch: "Eigenschappen — %{count} nummers"
-    field_title: "Titel"
-    field_artist: "Artiest"
-    field_album: "Album"
-    field_genre: "Genre"
-    field_year: "Jaar"
-    field_track_number: "Nummer #"
-    field_disc_number: "Schijf #"
-    field_format: "Formaat"
-    field_bitrate: "Bitrate"
-    field_sample_rate: "Samplefrequentie"
-    field_duration: "Duur"
-    field_file: "Bestand"
-    musicbrainz_lookup: "MusicBrainz opzoeken"
-    searching: "Zoeken…"
-    not_found: "Niet gevonden"
-    mixed: "Gemengd"
+# ── Properties dialog ──────────────────────────────────────────────
+properties:
+  heading_single: "Eigenschappen — %{title}"
+  heading_batch: "Eigenschappen — %{count} nummers"
+  field_title: "Titel"
+  field_artist: "Artiest"
+  field_album: "Album"
+  field_genre: "Genre"
+  field_year: "Jaar"
+  field_track_number: "Nummer #"
+  field_disc_number: "Schijf #"
+  field_format: "Formaat"
+  field_bitrate: "Bitrate"
+  field_sample_rate: "Samplefrequentie"
+  field_duration: "Duur"
+  field_file: "Bestand"
+  musicbrainz_lookup: "MusicBrainz opzoeken"
+  searching: "Zoeken…"
+  not_found: "Niet gevonden"
+  mixed: "Gemengd"
 
-  # ── Smart playlist editor ──────────────────────────────────────────
-  smart_playlist:
-    new_title: "Nieuwe slimme afspeellijst"
-    edit_title: "Slimme afspeellijst bewerken: %{name}"
-    match_label: "Overeenkomen"
-    match_all: "Alle"
-    match_any: "Elke"
-    add_rule: "Regel toevoegen"
-    remove_rule: "Regel verwijderen"
-    limit_to: "Beperken tot"
-    live_updating: "Live bijwerken"
+# ── Smart playlist editor ──────────────────────────────────────────
+smart_playlist:
+  new_title: "Nieuwe slimme afspeellijst"
+  edit_title: "Slimme afspeellijst bewerken: %{name}"
+  match_label: "Overeenkomen"
+  match_all: "Alle"
+  match_any: "Elke"
+  add_rule: "Regel toevoegen"
+  remove_rule: "Regel verwijderen"
+  limit_to: "Beperken tot"
+  live_updating: "Live bijwerken"
 
-  # ── About dialog ───────────────────────────────────────────────────
-  about:
-    application_name: "Tributary"
-    developer_name: "John-Michael Mulesa"
+# ── About dialog ───────────────────────────────────────────────────
+about:
+  application_name: "Tributary"
+  developer_name: "John-Michael Mulesa"
 
-  # ── Status bar ─────────────────────────────────────────────────────
-  status:
-    songs_hours: "%{count} nummers, %{hours} uur"
-    songs_minutes: "%{count} nummers, %{minutes} minuten"
+# ── Status bar ─────────────────────────────────────────────────────
+status:
+  songs_hours: "%{count} nummers, %{hours} uur"
+  songs_minutes: "%{count} nummers, %{minutes} minuten"

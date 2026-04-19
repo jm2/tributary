@@ -140,9 +140,22 @@ fn main() {
         .init();
 
     // ── i18n: detect system locale ───────────────────────────────────
-    let locale = sys_locale::get_locale().unwrap_or_else(|| "en".to_string());
+    // Normalise the system locale for rust-i18n lookup:
+    // - Unify underscore separators to hyphens ("zh_CN" → "zh-CN").
+    // - Try the full locale first (e.g. "zh-CN", "pt-BR") to match
+    //   region-specific translation files.
+    // - Fall back to the base language code (e.g. "en-US" → "en") for
+    //   languages that only have a single translation file.
+    let raw_locale = sys_locale::get_locale().unwrap_or_else(|| "en".to_string());
+    let normalised = raw_locale.replace('_', "-");
+    let available = rust_i18n::available_locales!();
+    let locale = if available.contains(&normalised.as_str()) {
+        normalised
+    } else {
+        normalised.split('-').next().unwrap_or("en").to_string()
+    };
     rust_i18n::set_locale(&locale);
-    info!("Locale set to: {locale}");
+    info!("Locale set to: {locale} (system: {raw_locale})");
 
     info!("Tributary v{} starting", env!("CARGO_PKG_VERSION"));
 

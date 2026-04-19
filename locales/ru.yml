@@ -1,154 +1,153 @@
-ru:
-  # ── Application ────────────────────────────────────────────────────
-  app:
-    name: "Tributary"
-    not_playing: "Ничего не воспроизводится"
-    scanning: "Сканирование библиотеки…"
-    live: "ПРЯМОЙ ЭФИР"
+# ── Application ────────────────────────────────────────────────────
+app:
+  name: "Tributary"
+  not_playing: "Ничего не воспроизводится"
+  scanning: "Сканирование библиотеки…"
+  live: "ПРЯМОЙ ЭФИР"
 
-  # ── Header bar ─────────────────────────────────────────────────────
-  header:
-    previous: "Предыдущий"
-    play: "Воспроизвести"
-    next: "Следующий"
-    repeat_off: "Повтор: Выключен"
-    repeat_all: "Повтор: Все"
-    repeat_one: "Повтор: Один"
-    shuffle: "Перемешать"
-    output: "Аудиовыход"
-    add_output: "Добавить выход"
-    main_menu: "Главное меню"
+# ── Header bar ─────────────────────────────────────────────────────
+header:
+  previous: "Предыдущий"
+  play: "Воспроизвести"
+  next: "Следующий"
+  repeat_off: "Повтор: Выключен"
+  repeat_all: "Повтор: Все"
+  repeat_one: "Повтор: Один"
+  shuffle: "Перемешать"
+  output: "Аудиовыход"
+  add_output: "Добавить выход"
+  main_menu: "Главное меню"
 
-  # ── Sidebar ────────────────────────────────────────────────────────
-  sidebar:
-    local: "Локальные"
-    local_filesystem: "Локальная файловая система"
-    internet_radio: "Интернет-радио"
-    top_clicked: "Самые популярные"
-    top_voted: "Самые рейтинговые"
-    stations_near_me: "Станции поблизости"
-    playlists: "Плейлисты"
-    add_server: "Добавить сервер"
-    new_playlist: "Новый плейлист"
-    remove_server: "Удалить сервер"
-    disconnect: "Отключить"
-    new_playlist_menu: "Новый плейлист"
-    new_smart_playlist_menu: "Новый умный плейлист"
-    rename: "Переименовать"
-    delete: "Удалить"
-    edit_smart_playlist: "Редактировать умный плейлист…"
+# ── Sidebar ────────────────────────────────────────────────────────
+sidebar:
+  local: "Локальные"
+  local_filesystem: "Локальная файловая система"
+  internet_radio: "Интернет-радио"
+  top_clicked: "Самые популярные"
+  top_voted: "Самые рейтинговые"
+  stations_near_me: "Станции поблизости"
+  playlists: "Плейлисты"
+  add_server: "Добавить сервер"
+  new_playlist: "Новый плейлист"
+  remove_server: "Удалить сервер"
+  disconnect: "Отключить"
+  new_playlist_menu: "Новый плейлист"
+  new_smart_playlist_menu: "Новый умный плейлист"
+  rename: "Переименовать"
+  delete: "Удалить"
+  edit_smart_playlist: "Редактировать умный плейлист…"
 
-  # ── Browser ────────────────────────────────────────────────────────
-  browser:
-    search_placeholder: "Искать по всем полям"
-    genre: "Жанр"
-    artist: "Исполнитель"
-    album: "Альбом"
-    all: "Все"
+# ── Browser ────────────────────────────────────────────────────────
+browser:
+  search_placeholder: "Искать по всем полям"
+  genre: "Жанр"
+  artist: "Исполнитель"
+  album: "Альбом"
+  all: "Все"
 
-  # ── Tracklist columns ──────────────────────────────────────────────
-  columns:
-    number: "#"
-    title: "Название"
-    time: "Время"
-    artist: "Исполнитель"
-    album: "Альбом"
-    genre: "Жанр"
-    year: "Год"
-    date_modified: "Дата изменения"
-    bitrate: "Битрейт"
-    sample_rate: "Частота дискретизации"
-    plays: "Воспроизведения"
-    format: "Формат"
-    country: "Страна"
-    state_province: "Регион"
+# ── Tracklist columns ──────────────────────────────────────────────
+columns:
+  number: "#"
+  title: "Название"
+  time: "Время"
+  artist: "Исполнитель"
+  album: "Альбом"
+  genre: "Жанр"
+  year: "Год"
+  date_modified: "Дата изменения"
+  bitrate: "Битрейт"
+  sample_rate: "Частота дискретизации"
+  plays: "Воспроизведения"
+  format: "Формат"
+  country: "Страна"
+  state_province: "Регион"
 
-  # ── Preferences ────────────────────────────────────────────────────
-  preferences:
-    title: "Настройки"
-    library_location: "Расположение библиотеки"
-    music_folder: "Папка с музыкой"
-    browse: "Обзор…"
-    select_music_folder: "Выбрать папку с музыкой"
-    browser_views: "Панели браузера"
-    visible_columns: "Видимые столбцы"
-    reset_to_defaults: "Сбросить настройки"
+# ── Preferences ────────────────────────────────────────────────────
+preferences:
+  title: "Настройки"
+  library_location: "Расположение библиотеки"
+  music_folder: "Папка с музыкой"
+  browse: "Обзор…"
+  select_music_folder: "Выбрать папку с музыкой"
+  browser_views: "Панели браузера"
+  visible_columns: "Видимые столбцы"
+  reset_to_defaults: "Сбросить настройки"
 
-  # ── Dialogs ────────────────────────────────────────────────────────
-  dialogs:
-    cancel: "Отмена"
-    connect: "Подключить"
-    create: "Создать"
-    rename: "Переименовать"
-    save: "Сохранить"
-    ok: "ОК"
-    add_server_heading: "Добавить сервер"
-    add_server_body: "Введите данные сервера для подключения."
-    connect_to: "Подключиться к %{name}"
-    enter_password: "Введите пароль общей папки (оставьте пустым, если его нет)"
-    username: "Имя пользователя"
-    password: "Пароль"
-    new_playlist_heading: "Новый плейлист"
-    playlist_name: "Название плейлиста"
-    rename_playlist_heading: "Переименовать плейлист"
-    new_name: "Новое название"
-    enable_location: "Включить определение местоположения?"
-    enable_location_body: "«Станции поблизости» используют ваше приблизительное местоположение (по IP-адресу) для поиска ближайших радиостанций.\n\nВаш IP-адрес будет отправлен в службу геолокации для определения приблизительных координат. Персональные данные не сохраняются."
-    no_thanks: "Нет, спасибо"
-    enable_location_btn: "Включить местоположение"
-    add_output_heading: "Добавить выход"
-    add_output_body: "Введите данные сервера MPD."
-    add: "Добавить"
-    output_name: "Имя"
-    output_name_placeholder: "MPD гостиная"
-    output_host: "Хост"
-    output_port: "Порт"
+# ── Dialogs ────────────────────────────────────────────────────────
+dialogs:
+  cancel: "Отмена"
+  connect: "Подключить"
+  create: "Создать"
+  rename: "Переименовать"
+  save: "Сохранить"
+  ok: "ОК"
+  add_server_heading: "Добавить сервер"
+  add_server_body: "Введите данные сервера для подключения."
+  connect_to: "Подключиться к %{name}"
+  enter_password: "Введите пароль общей папки (оставьте пустым, если его нет)"
+  username: "Имя пользователя"
+  password: "Пароль"
+  new_playlist_heading: "Новый плейлист"
+  playlist_name: "Название плейлиста"
+  rename_playlist_heading: "Переименовать плейлист"
+  new_name: "Новое название"
+  enable_location: "Включить определение местоположения?"
+  enable_location_body: "«Станции поблизости» используют ваше приблизительное местоположение (по IP-адресу) для поиска ближайших радиостанций.\n\nВаш IP-адрес будет отправлен в службу геолокации для определения приблизительных координат. Персональные данные не сохраняются."
+  no_thanks: "Нет, спасибо"
+  enable_location_btn: "Включить местоположение"
+  add_output_heading: "Добавить выход"
+  add_output_body: "Введите данные сервера MPD."
+  add: "Добавить"
+  output_name: "Имя"
+  output_name_placeholder: "MPD гостиная"
+  output_host: "Хост"
+  output_port: "Порт"
 
-  # ── Context menu ───────────────────────────────────────────────────
-  context:
-    properties: "Свойства…"
-    add_to_playlist: "Добавить в плейлист"
-    remove_from_playlist: "Удалить из плейлиста"
+# ── Context menu ───────────────────────────────────────────────────
+context:
+  properties: "Свойства…"
+  add_to_playlist: "Добавить в плейлист"
+  remove_from_playlist: "Удалить из плейлиста"
 
-  # ── Properties dialog ──────────────────────────────────────────────
-  properties:
-    heading_single: "Свойства — %{title}"
-    heading_batch: "Свойства — %{count} треков"
-    field_title: "Название"
-    field_artist: "Исполнитель"
-    field_album: "Альбом"
-    field_genre: "Жанр"
-    field_year: "Год"
-    field_track_number: "Номер трека"
-    field_disc_number: "Номер диска"
-    field_format: "Формат"
-    field_bitrate: "Битрейт"
-    field_sample_rate: "Частота дискретизации"
-    field_duration: "Длительность"
-    field_file: "Файл"
-    musicbrainz_lookup: "Поиск в MusicBrainz"
-    searching: "Поиск…"
-    not_found: "Не найдено"
-    mixed: "Смешанное"
+# ── Properties dialog ──────────────────────────────────────────────
+properties:
+  heading_single: "Свойства — %{title}"
+  heading_batch: "Свойства — %{count} треков"
+  field_title: "Название"
+  field_artist: "Исполнитель"
+  field_album: "Альбом"
+  field_genre: "Жанр"
+  field_year: "Год"
+  field_track_number: "Номер трека"
+  field_disc_number: "Номер диска"
+  field_format: "Формат"
+  field_bitrate: "Битрейт"
+  field_sample_rate: "Частота дискретизации"
+  field_duration: "Длительность"
+  field_file: "Файл"
+  musicbrainz_lookup: "Поиск в MusicBrainz"
+  searching: "Поиск…"
+  not_found: "Не найдено"
+  mixed: "Смешанное"
 
-  # ── Smart playlist editor ──────────────────────────────────────────
-  smart_playlist:
-    new_title: "Новый умный плейлист"
-    edit_title: "Редактировать умный плейлист: %{name}"
-    match_label: "Соответствие"
-    match_all: "Все"
-    match_any: "Любое"
-    add_rule: "Добавить правило"
-    remove_rule: "Удалить правило"
-    limit_to: "Ограничить до"
-    live_updating: "Обновление в реальном времени"
+# ── Smart playlist editor ──────────────────────────────────────────
+smart_playlist:
+  new_title: "Новый умный плейлист"
+  edit_title: "Редактировать умный плейлист: %{name}"
+  match_label: "Соответствие"
+  match_all: "Все"
+  match_any: "Любое"
+  add_rule: "Добавить правило"
+  remove_rule: "Удалить правило"
+  limit_to: "Ограничить до"
+  live_updating: "Обновление в реальном времени"
 
-  # ── About dialog ───────────────────────────────────────────────────
-  about:
-    application_name: "Tributary"
-    developer_name: "John-Michael Mulesa"
+# ── About dialog ───────────────────────────────────────────────────
+about:
+  application_name: "Tributary"
+  developer_name: "John-Michael Mulesa"
 
-  # ── Status bar ─────────────────────────────────────────────────────
-  status:
-    songs_hours: "%{count} треков, %{hours} часов"
-    songs_minutes: "%{count} треков, %{minutes} минут"
+# ── Status bar ─────────────────────────────────────────────────────
+status:
+  songs_hours: "%{count} треков, %{hours} часов"
+  songs_minutes: "%{count} треков, %{minutes} минут"

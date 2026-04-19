@@ -927,15 +927,20 @@ pub fn build_window(
                 }
             }
 
+            let backend_type = src.backend_type();
+
             // Determine the source key.
+            // Remote sources use their server URL; local sources with a
+            // specific backend_type (radio, playlist) use that type as
+            // the key so they don't all collapse into "local".
             let url = src.server_url();
-            let key = if url.is_empty() {
+            let key = if !url.is_empty() {
+                url.clone()
+            } else if backend_type == "local" || backend_type.is_empty() {
                 "local".to_string()
             } else {
-                url.clone()
+                backend_type.clone()
             };
-
-            let backend_type = src.backend_type();
 
             // ── Local source: switch to local view ───────────────────
             if key == "local" {

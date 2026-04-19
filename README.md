@@ -253,6 +253,8 @@ All three platform build scripts support quick-exit modes for formatting, type-c
 .\scripts\build-windows.ps1 -Fmt
 .\scripts\build-windows.ps1 -Check
 .\scripts\build-windows.ps1 -Clippy
+.\scripts\build-windows.ps1 -Test
+.\scripts\build-windows.ps1 -Run
 ```
 
 Clippy runs with `clippy::pedantic` and `clippy::nursery` enabled crate-wide (configured in `src/main.rs`).
@@ -290,7 +292,11 @@ src/
 │   ├── backend.rs          # MediaBackend async trait
 │   └── error.rs            # BackendError (thiserror)
 ├── audio/
-│   └── mod.rs              # GStreamer Player (playbin3, bus watch, position timer)
+│   ├── mod.rs              # GStreamer Player (playbin3, bus watch, position timer)
+│   ├── output.rs           # AudioOutput trait abstraction
+│   ├── local_output.rs     # Local GStreamer playback (AudioOutput impl)
+│   ├── mpd_output.rs       # MPD TCP output (AudioOutput impl)
+│   └── airplay_output.rs   # AirPlay/RAOP output (scaffolding)
 ├── db/
 │   ├── mod.rs              # Database layer root
 │   ├── connection.rs       # SQLite init, XDG paths, migration runner
@@ -328,10 +334,14 @@ src/
 │   ├── dmap.rs             # DMAP binary TLV parser (nom-based, 24 tag types)
 │   ├── client.rs           # HTTP client (5-step session handshake)
 │   └── backend.rs          # MediaBackend impl (in-memory cache)
+├── device/
+│   ├── mod.rs              # Device trait + DeviceInfo (portable device abstraction)
+│   └── usb.rs              # USB mass storage detection (Linux, macOS, Windows)
 ├── radio/
 │   ├── mod.rs              # Internet Radio module root
 │   ├── api.rs              # RadioStation + GeoLocation serde types
-│   └── client.rs           # Radio-Browser API client (DNS mirror, geolocation)
+│   ├── client.rs           # Radio-Browser API client (DNS mirror, geolocation)
+│   └── geo.rs              # Haversine distance + US state/country centroid tables
 └── ui/
     ├── mod.rs              # UI module root
     ├── window.rs           # Main window + backend integration bridge
@@ -342,6 +352,12 @@ src/
     ├── properties_dialog.rs# Song properties editor (single + batch + MusicBrainz)
     ├── playlist_editor.rs  # Smart playlist rules editor dialog
     ├── preferences.rs      # Preferences dialog (library path, browser, columns)
+    ├── output_dialogs.rs   # Add Output dialog + outputs.json persistence
+    ├── server_dialogs.rs   # Add/auth server dialogs + servers.json persistence
+    ├── album_art.rs        # Album art extraction (embedded tags + remote fetch)
+    ├── playback.rs         # Playback context + track advance logic
+    ├── persistence.rs      # Settings persistence (sort, shuffle, repeat, CSS)
+    ├── radio.rs            # Radio-specific UI helpers (column switching, geo-sort)
     ├── dummy_data.rs       # Default sidebar source entries
     ├── style.css           # Custom CSS overrides
     └── objects/

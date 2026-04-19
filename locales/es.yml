@@ -1,154 +1,153 @@
-es:
-  # ── Application ────────────────────────────────────────────────────
-  app:
-    name: "Tributary"
-    not_playing: "Sin reproducción"
-    scanning: "Escaneando biblioteca…"
-    live: "EN VIVO"
+# ── Application ────────────────────────────────────────────────────
+app:
+  name: "Tributary"
+  not_playing: "Sin reproducción"
+  scanning: "Escaneando biblioteca…"
+  live: "EN VIVO"
 
-  # ── Header bar ─────────────────────────────────────────────────────
-  header:
-    previous: "Anterior"
-    play: "Reproducir"
-    next: "Siguiente"
-    repeat_off: "Repetir: Desactivado"
-    repeat_all: "Repetir: Todo"
-    repeat_one: "Repetir: Una"
-    shuffle: "Aleatorio"
-    output: "Salida de audio"
-    add_output: "Agregar salida"
-    main_menu: "Menú principal"
+# ── Header bar ─────────────────────────────────────────────────────
+header:
+  previous: "Anterior"
+  play: "Reproducir"
+  next: "Siguiente"
+  repeat_off: "Repetir: Desactivado"
+  repeat_all: "Repetir: Todo"
+  repeat_one: "Repetir: Una"
+  shuffle: "Aleatorio"
+  output: "Salida de audio"
+  add_output: "Agregar salida"
+  main_menu: "Menú principal"
 
-  # ── Sidebar ────────────────────────────────────────────────────────
-  sidebar:
-    local: "Local"
-    local_filesystem: "Sistema de archivos local"
-    internet_radio: "Radio por Internet"
-    top_clicked: "Más escuchadas"
-    top_voted: "Mejor valoradas"
-    stations_near_me: "Estaciones cercanas"
-    playlists: "Listas de reproducción"
-    add_server: "Añadir servidor"
-    new_playlist: "Nueva lista de reproducción"
-    remove_server: "Eliminar servidor"
-    disconnect: "Desconectar"
-    new_playlist_menu: "Nueva lista de reproducción"
-    new_smart_playlist_menu: "Nueva lista inteligente"
-    rename: "Renombrar"
-    delete: "Eliminar"
-    edit_smart_playlist: "Editar lista inteligente…"
+# ── Sidebar ────────────────────────────────────────────────────────
+sidebar:
+  local: "Local"
+  local_filesystem: "Sistema de archivos local"
+  internet_radio: "Radio por Internet"
+  top_clicked: "Más escuchadas"
+  top_voted: "Mejor valoradas"
+  stations_near_me: "Estaciones cercanas"
+  playlists: "Listas de reproducción"
+  add_server: "Añadir servidor"
+  new_playlist: "Nueva lista de reproducción"
+  remove_server: "Eliminar servidor"
+  disconnect: "Desconectar"
+  new_playlist_menu: "Nueva lista de reproducción"
+  new_smart_playlist_menu: "Nueva lista inteligente"
+  rename: "Renombrar"
+  delete: "Eliminar"
+  edit_smart_playlist: "Editar lista inteligente…"
 
-  # ── Browser ────────────────────────────────────────────────────────
-  browser:
-    search_placeholder: "Buscar en todos los campos"
-    genre: "Género"
-    artist: "Artista"
-    album: "Álbum"
-    all: "Todos"
+# ── Browser ────────────────────────────────────────────────────────
+browser:
+  search_placeholder: "Buscar en todos los campos"
+  genre: "Género"
+  artist: "Artista"
+  album: "Álbum"
+  all: "Todos"
 
-  # ── Tracklist columns ──────────────────────────────────────────────
-  columns:
-    number: "#"
-    title: "Título"
-    time: "Duración"
-    artist: "Artista"
-    album: "Álbum"
-    genre: "Género"
-    year: "Año"
-    date_modified: "Fecha de modificación"
-    bitrate: "Tasa de bits"
-    sample_rate: "Frecuencia de muestreo"
-    plays: "Reproducciones"
-    format: "Formato"
-    country: "País"
-    state_province: "Estado/Provincia"
+# ── Tracklist columns ──────────────────────────────────────────────
+columns:
+  number: "#"
+  title: "Título"
+  time: "Duración"
+  artist: "Artista"
+  album: "Álbum"
+  genre: "Género"
+  year: "Año"
+  date_modified: "Fecha de modificación"
+  bitrate: "Tasa de bits"
+  sample_rate: "Frecuencia de muestreo"
+  plays: "Reproducciones"
+  format: "Formato"
+  country: "País"
+  state_province: "Estado/Provincia"
 
-  # ── Preferences ────────────────────────────────────────────────────
-  preferences:
-    title: "Preferencias"
-    library_location: "Ubicación de la biblioteca"
-    music_folder: "Carpeta de música"
-    browse: "Examinar…"
-    select_music_folder: "Seleccionar carpeta de música"
-    browser_views: "Paneles del navegador"
-    visible_columns: "Columnas visibles"
-    reset_to_defaults: "Restablecer valores predeterminados"
+# ── Preferences ────────────────────────────────────────────────────
+preferences:
+  title: "Preferencias"
+  library_location: "Ubicación de la biblioteca"
+  music_folder: "Carpeta de música"
+  browse: "Examinar…"
+  select_music_folder: "Seleccionar carpeta de música"
+  browser_views: "Paneles del navegador"
+  visible_columns: "Columnas visibles"
+  reset_to_defaults: "Restablecer valores predeterminados"
 
-  # ── Dialogs ────────────────────────────────────────────────────────
-  dialogs:
-    cancel: "Cancelar"
-    connect: "Conectar"
-    create: "Crear"
-    rename: "Renombrar"
-    save: "Guardar"
-    ok: "Aceptar"
-    add_server_heading: "Añadir servidor"
-    add_server_body: "Introduzca los datos del servidor para conectarse."
-    connect_to: "Conectar a %{name}"
-    enter_password: "Introduzca la contraseña del recurso compartido (deje en blanco si no tiene)"
-    username: "Nombre de usuario"
-    password: "Contraseña"
-    new_playlist_heading: "Nueva lista de reproducción"
-    playlist_name: "Nombre de la lista"
-    rename_playlist_heading: "Renombrar lista de reproducción"
-    new_name: "Nuevo nombre"
-    enable_location: "¿Activar ubicación?"
-    enable_location_body: "Estaciones cercanas utiliza su ubicación aproximada (a través de su dirección IP) para encontrar emisoras de radio cercanas.\n\nSu dirección IP se enviará a un servicio de geolocalización para determinar sus coordenadas aproximadas. No se almacenan datos personales."
-    no_thanks: "No, gracias"
-    enable_location_btn: "Activar ubicación"
-    add_output_heading: "Agregar salida"
-    add_output_body: "Ingrese los datos del servidor MPD."
-    add: "Agregar"
-    output_name: "Nombre"
-    output_name_placeholder: "MPD sala de estar"
-    output_host: "Host"
-    output_port: "Puerto"
+# ── Dialogs ────────────────────────────────────────────────────────
+dialogs:
+  cancel: "Cancelar"
+  connect: "Conectar"
+  create: "Crear"
+  rename: "Renombrar"
+  save: "Guardar"
+  ok: "Aceptar"
+  add_server_heading: "Añadir servidor"
+  add_server_body: "Introduzca los datos del servidor para conectarse."
+  connect_to: "Conectar a %{name}"
+  enter_password: "Introduzca la contraseña del recurso compartido (deje en blanco si no tiene)"
+  username: "Nombre de usuario"
+  password: "Contraseña"
+  new_playlist_heading: "Nueva lista de reproducción"
+  playlist_name: "Nombre de la lista"
+  rename_playlist_heading: "Renombrar lista de reproducción"
+  new_name: "Nuevo nombre"
+  enable_location: "¿Activar ubicación?"
+  enable_location_body: "Estaciones cercanas utiliza su ubicación aproximada (a través de su dirección IP) para encontrar emisoras de radio cercanas.\n\nSu dirección IP se enviará a un servicio de geolocalización para determinar sus coordenadas aproximadas. No se almacenan datos personales."
+  no_thanks: "No, gracias"
+  enable_location_btn: "Activar ubicación"
+  add_output_heading: "Agregar salida"
+  add_output_body: "Ingrese los datos del servidor MPD."
+  add: "Agregar"
+  output_name: "Nombre"
+  output_name_placeholder: "MPD sala de estar"
+  output_host: "Host"
+  output_port: "Puerto"
 
-  # ── Context menu ───────────────────────────────────────────────────
-  context:
-    properties: "Propiedades…"
-    add_to_playlist: "Añadir a lista de reproducción"
-    remove_from_playlist: "Quitar de lista de reproducción"
+# ── Context menu ───────────────────────────────────────────────────
+context:
+  properties: "Propiedades…"
+  add_to_playlist: "Añadir a lista de reproducción"
+  remove_from_playlist: "Quitar de lista de reproducción"
 
-  # ── Properties dialog ──────────────────────────────────────────────
-  properties:
-    heading_single: "Propiedades — %{title}"
-    heading_batch: "Propiedades — %{count} pistas"
-    field_title: "Título"
-    field_artist: "Artista"
-    field_album: "Álbum"
-    field_genre: "Género"
-    field_year: "Año"
-    field_track_number: "Pista n.º"
-    field_disc_number: "Disco n.º"
-    field_format: "Formato"
-    field_bitrate: "Tasa de bits"
-    field_sample_rate: "Frecuencia de muestreo"
-    field_duration: "Duración"
-    field_file: "Archivo"
-    musicbrainz_lookup: "Búsqueda en MusicBrainz"
-    searching: "Buscando…"
-    not_found: "No encontrado"
-    mixed: "Mixto"
+# ── Properties dialog ──────────────────────────────────────────────
+properties:
+  heading_single: "Propiedades — %{title}"
+  heading_batch: "Propiedades — %{count} pistas"
+  field_title: "Título"
+  field_artist: "Artista"
+  field_album: "Álbum"
+  field_genre: "Género"
+  field_year: "Año"
+  field_track_number: "Pista n.º"
+  field_disc_number: "Disco n.º"
+  field_format: "Formato"
+  field_bitrate: "Tasa de bits"
+  field_sample_rate: "Frecuencia de muestreo"
+  field_duration: "Duración"
+  field_file: "Archivo"
+  musicbrainz_lookup: "Búsqueda en MusicBrainz"
+  searching: "Buscando…"
+  not_found: "No encontrado"
+  mixed: "Mixto"
 
-  # ── Smart playlist editor ──────────────────────────────────────────
-  smart_playlist:
-    new_title: "Nueva lista inteligente"
-    edit_title: "Editar lista inteligente: %{name}"
-    match_label: "Coincidencia"
-    match_all: "Todas"
-    match_any: "Cualquiera"
-    add_rule: "Añadir regla"
-    remove_rule: "Eliminar regla"
-    limit_to: "Limitar a"
-    live_updating: "Actualización en vivo"
+# ── Smart playlist editor ──────────────────────────────────────────
+smart_playlist:
+  new_title: "Nueva lista inteligente"
+  edit_title: "Editar lista inteligente: %{name}"
+  match_label: "Coincidencia"
+  match_all: "Todas"
+  match_any: "Cualquiera"
+  add_rule: "Añadir regla"
+  remove_rule: "Eliminar regla"
+  limit_to: "Limitar a"
+  live_updating: "Actualización en vivo"
 
-  # ── About dialog ───────────────────────────────────────────────────
-  about:
-    application_name: "Tributary"
-    developer_name: "John-Michael Mulesa"
+# ── About dialog ───────────────────────────────────────────────────
+about:
+  application_name: "Tributary"
+  developer_name: "John-Michael Mulesa"
 
-  # ── Status bar ─────────────────────────────────────────────────────
-  status:
-    songs_hours: "%{count} canciones, %{hours} horas"
-    songs_minutes: "%{count} canciones, %{minutes} minutos"
+# ── Status bar ─────────────────────────────────────────────────────
+status:
+  songs_hours: "%{count} canciones, %{hours} horas"
+  songs_minutes: "%{count} canciones, %{minutes} minutos"
