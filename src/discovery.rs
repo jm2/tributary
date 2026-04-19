@@ -215,6 +215,7 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
                 let _ = daemon.browse(SUBSONIC_SERVICE);
                 let _ = daemon.browse(PLEX_SERVICE);
                 let _ = daemon.browse(DAAP_SERVICE);
+                let _ = daemon.browse(RAOP_SERVICE);
             }
         }
 

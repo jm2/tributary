@@ -389,3 +389,77 @@ fn estimate_station_distance(
     // No location data at all.
     f64::MAX
 }
+
+#[cfg(test)]
+mod tests {
+    use super::estimate_station_distance;
+    use crate::radio::RadioStation;
+
+    /// Helper to build a minimal `RadioStation` for testing.
+    fn station(
+        geo_lat: Option<f64>,
+        geo_long: Option<f64>,
+        countrycode: &str,
+        state: &str,
+    ) -> RadioStation {
+        RadioStation {
+            stationuuid: String::new(),
+            name: String::new(),
+            url_resolved: String::new(),
+            country: String::new(),
+            countrycode: countrycode.to_string(),
+            state: state.to_string(),
+            codec: String::new(),
+            bitrate: 0,
+            tags: String::new(),
+            favicon: String::new(),
+            geo_lat,
+            geo_long,
+        }
+    }
+
+    #[test]
+    fn test_exact_coords_used_when_present() {
+        // Station at NYC (40.7, -74.0), user at Indianapolis (39.77, -86.16)
+        let s = station(Some(40.7128), Some(-74.006), "US", "New York");
+        let dist = estimate_station_distance(&s, 39.77, -86.16);
+        // NYC to Indianapolis is ~1000 km
+        assert!(dist > 900.0 && dist < 1200.0, "dist = {dist}");
+    }
+
+    #[test]
+    fn test_state_centroid_fallback() {
+        // Station with state but no coords (like WBAA in Indiana).
+        let s = station(None, None, "US", "Indiana");
+        let dist = estimate_station_distance(&s, 39.77, -86.16);
+        // Indiana centroid is very close to Indianapolis — should be < 100 km.
+        assert!(dist < 100.0, "dist = {dist}");
+    }
+
+    #[test]
+    fn test_country_centroid_fallback() {
+        // Station with country only, no state, no coords.
+        let s = station(None, None, "GB", "");
+        let dist = estimate_station_distance(&s, 39.77, -86.16);
+        // US to UK is ~6000-7000 km.
+        assert!(dist > 5000.0 && dist < 8000.0, "dist = {dist}");
+    }
+
+    #[test]
+    fn test_no_location_returns_max() {
+        // Station with no location data at all.
+        let s = station(None, None, "", "");
+        let dist = estimate_station_distance(&s, 39.77, -86.16);
+        // f64::MAX is a sentinel — check it's unreasonably large.
+        assert!(dist > 1e18, "expected f64::MAX, got {dist}");
+    }
+
+    #[test]
+    fn test_zero_coords_treated_as_missing() {
+        // Some stations report (0, 0) which is in the Gulf of Guinea — treat as missing.
+        let s = station(Some(0.0), Some(0.0), "US", "Indiana");
+        let dist = estimate_station_distance(&s, 39.77, -86.16);
+        // Should fall through to state centroid, not use (0,0).
+        assert!(dist < 100.0, "dist = {dist}");
+    }
+}

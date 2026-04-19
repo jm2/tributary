@@ -3,7 +3,9 @@
 //! Detects mounted removable drives that may contain music files.
 //! Platform-specific implementations scan the appropriate mount points.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
 
 use tracing::{debug, info};
 

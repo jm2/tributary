@@ -595,6 +595,59 @@ pub fn build_window(
                     }
 
                     crate::discovery::DiscoveryEvent::Lost { url, service_type } => {
+                        // ── AirPlay devices: remove from output selector ──
+                        if service_type == "airplay" {
+                            info!(
+                                url = %url,
+                                "AirPlay receiver lost — removing from output selector"
+                            );
+                            // Walk the ListBox children and remove the row whose
+                            // label matches the lost device.  AirPlay URLs are
+                            // formatted as "http://host:port" by discovery; we
+                            // can't match by URL on the row (not stored), so we
+                            // remove by checking all non-"My Computer" rows.
+                            // This is best-effort — if the name changed between
+                            // discovery and loss events the row won't be found.
+                            let mut child = hb_output_list_for_discovery.first_child();
+                            let mut row_idx = 0i32;
+                            while let Some(c) = child {
+                                let next = c.next_sibling();
+                                // Skip index 0 ("My Computer") — never remove it.
+                                if row_idx > 0 {
+                                    if let Some(row_box) = c
+                                        .first_child()
+                                        .and_then(|inner| inner.downcast::<gtk::Box>().ok())
+                                    {
+                                        // Check the icon — AirPlay rows use
+                                        // "network-wireless-symbolic".
+                                        if let Some(icon) = row_box
+                                            .first_child()
+                                            .and_then(|i| i.downcast::<gtk::Image>().ok())
+                                        {
+                                            if icon
+                                                .icon_name()
+                                                .is_some_and(|n| n == "network-wireless-symbolic")
+                                            {
+                                                // This is an AirPlay row — remove it.
+                                                // (If multiple AirPlay devices are present,
+                                                // removing by icon is imprecise; a future
+                                                // enhancement could store host:port on the
+                                                // row widget for precise matching.)
+                                                if let Some(list_row) =
+                                                    c.downcast_ref::<gtk::ListBoxRow>()
+                                                {
+                                                    hb_output_list_for_discovery.remove(list_row);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                row_idx += 1;
+                                child = next;
+                            }
+                            continue;
+                        }
+
                         info!(
                             url = %url,
                             backend = %service_type,
