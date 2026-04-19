@@ -1361,6 +1361,13 @@ pub fn build_window(
                 // Hide browser for radio.
                 browser_widget.set_visible(false);
 
+                // Clear the tracklist immediately so local songs don't
+                // show while radio stations are loading asynchronously.
+                track_store.remove_all();
+                tracklist::update_status(&status_label, &[]);
+                *master_tracks.borrow_mut() = Vec::new();
+                current_pos.set(None);
+
                 // Handle "Stations Near Me" with geo consent.
                 if backend_type == "radio-nearme" {
                     let app_config = app_config.clone();

@@ -139,6 +139,14 @@ fn main() {
         )
         .init();
 
+    // ── TLS crypto provider ──────────────────────────────────────────
+    // rustls 0.23+ requires an explicit process-level CryptoProvider.
+    // reqwest and sea-orm configure their own internally, but rust_cast
+    // (Chromecast Cast V2) uses rustls directly on background threads.
+    // Install the ring provider as the global default so all TLS
+    // connections work without per-callsite configuration.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // ── i18n: detect system locale ───────────────────────────────────
     // Normalise the system locale for rust-i18n lookup:
     // - Unify underscore separators to hyphens ("zh_CN" → "zh-CN").

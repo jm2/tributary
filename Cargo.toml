@@ -85,6 +85,10 @@ gstreamer = "0.25"
 # Chromecast (Cast V2 protocol) — MIT-licensed clean-room implementation
 rust_cast = "0.21"
 
+# TLS — explicit dependency to ensure the ring crypto provider is available
+# for rust_cast's TLS connections (rustls 0.23+ requires manual provider setup)
+rustls = { version = "0.23", features = ["ring"], default-features = false }
+
 # Desktop media controls (MPRIS / SMTC / Now Playing)
 souvlaki = "0.8"
 

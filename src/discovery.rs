@@ -4,7 +4,7 @@
 //! - **Subsonic:** mDNS browse for `_subsonic._tcp.local.`
 //! - **Plex:** mDNS browse for `_plexmediasvr._tcp.local.`
 //! - **DAAP:** mDNS browse for `_daap._tcp.local.`
-//! - **AirPlay:** mDNS browse for `_raop._tcp.local.`
+//! - **AirPlay:** mDNS browse for `_raop._tcp.local.` + `_airplay._tcp.local.`
 //! - **Chromecast:** mDNS browse for `_googlecast._tcp.local.`
 //! - **Jellyfin:** UDP broadcast `"Who is JellyfinServer?"` to `255.255.255.255:7359`
 //!
@@ -52,6 +52,9 @@ const PLEX_SERVICE: &str = "_plexmediasvr._tcp.local.";
 const DAAP_SERVICE: &str = "_daap._tcp.local.";
 /// AirPlay (RAOP) receivers for audio output streaming.
 const RAOP_SERVICE: &str = "_raop._tcp.local.";
+/// AirPlay 2 receivers — newer devices (HomePod, Apple TV, etc.) advertise
+/// via `_airplay._tcp.local.` instead of (or in addition to) legacy RAOP.
+const AIRPLAY2_SERVICE: &str = "_airplay._tcp.local.";
 /// Chromecast (Cast V2) devices for audio output streaming.
 const CHROMECAST_SERVICE: &str = "_googlecast._tcp.local.";
 
@@ -139,6 +142,14 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
         }
     };
 
+    let airplay2_rx = match daemon.browse(AIRPLAY2_SERVICE) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            warn!("mDNS browse failed for {AIRPLAY2_SERVICE}: {e}");
+            None
+        }
+    };
+
     let chromecast_rx = match daemon.browse(CHROMECAST_SERVICE) {
         Ok(r) => Some(r),
         Err(e) => {
@@ -151,13 +162,14 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
         && plex_rx.is_none()
         && daap_rx.is_none()
         && raop_rx.is_none()
+        && airplay2_rx.is_none()
         && chromecast_rx.is_none()
     {
         warn!("No mDNS services could be browsed");
         return;
     }
 
-    info!("mDNS discovery started for Subsonic + Plex + DAAP + AirPlay + Chromecast");
+    info!("mDNS discovery started for Subsonic + Plex + DAAP + AirPlay + AirPlay2 + Chromecast");
 
     // `seen` maps `key` → `url` so we can reconstruct the URL on removal.
     let mut seen: HashMap<String, String> = HashMap::new();
@@ -210,6 +222,17 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
             }
         }
 
+        if let Some(ref rx) = airplay2_rx {
+            while let Ok(event) = rx.try_recv() {
+                got_event = true;
+                // AirPlay 2 devices are treated the same as legacy RAOP
+                // for discovery purposes — both use "airplay" service type.
+                // The `seen` HashMap deduplicates by host:port, so devices
+                // advertising both _raop._tcp and _airplay._tcp only appear once.
+                process_mdns_event(event, "airplay", &mut seen, &tx);
+            }
+        }
+
         if let Some(ref rx) = chromecast_rx {
             while let Ok(event) = rx.try_recv() {
                 got_event = true;
@@ -239,6 +262,7 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
                 let _ = daemon.browse(PLEX_SERVICE);
                 let _ = daemon.browse(DAAP_SERVICE);
                 let _ = daemon.browse(RAOP_SERVICE);
+                let _ = daemon.browse(AIRPLAY2_SERVICE);
                 let _ = daemon.browse(CHROMECAST_SERVICE);
             }
         }
@@ -275,7 +299,7 @@ fn process_mdns_event(
                 return;
             }
 
-            let name = info
+            let raw_name = info
                 .get_property_val_str("name")
                 .map(|s| {
                     // Strip Avahi conflict suffix from the display name.
@@ -296,6 +320,15 @@ fn process_mdns_event(
                     // "Navidrome (nr400-2)".
                     strip_avahi_name_suffix(&raw_name)
                 });
+
+            // AirPlay / RAOP devices often use "MAC@DeviceName" as
+            // their mDNS instance name (e.g. "8EE58A500A56@Rear Lounge TV").
+            // Strip the MAC prefix for a cleaner display name.
+            let name = if service_type == "airplay" {
+                strip_airplay_mac_prefix(&raw_name)
+            } else {
+                raw_name
+            };
 
             let scheme = if port == 443
                 || info
@@ -627,6 +660,29 @@ fn process_chromecast_event(
     }
 }
 
+// ── AirPlay name helpers ────────────────────────────────────────────────
+
+/// Strip the `MAC@` prefix from AirPlay / RAOP device names.
+///
+/// AirPlay devices often register their mDNS instance name as
+/// `HEXMAC@FriendlyName` (e.g. `"8EE58A500A56@Rear Lounge TV"`).
+/// This function strips the MAC prefix to produce just `"Rear Lounge TV"`.
+///
+/// If no `@` is present or the prefix doesn't look like a hex MAC,
+/// the name is returned unchanged.
+fn strip_airplay_mac_prefix(name: &str) -> String {
+    if let Some(at_pos) = name.find('@') {
+        let prefix = &name[..at_pos];
+        // MAC addresses are 12 hex characters (6 bytes, no separators)
+        // or sometimes with colons/dashes.  Accept any all-hex prefix
+        // of reasonable length (≥ 6 chars).
+        if prefix.len() >= 6 && prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return name[at_pos + 1..].to_string();
+        }
+    }
+    name.to_string()
+}
+
 // ── Avahi hostname helpers ──────────────────────────────────────────────
 
 /// Strip the Avahi conflict-resolution suffix from a hostname.
@@ -656,29 +712,40 @@ fn strip_avahi_suffix(hostname: &str) -> String {
     hostname.to_string()
 }
 
-/// Strip Avahi conflict-resolution suffixes from a service display name.
+/// Strip conflict-resolution suffixes from a service display name.
 ///
-/// Handles two patterns:
-/// 1. Bare hostname: `"nr400-2"` → `"nr400"`
-/// 2. Parenthesized hostname: `"Navidrome (nr400-2)"` → `"Navidrome (nr400)"`
+/// Handles three patterns:
+/// 1. Bare hostname: `"nr400-2"` → `"nr400"` (Avahi `-N` suffix)
+/// 2. Parenthesized hostname: `"Navidrome (nr400-2)"` → `"Navidrome (nr400)"` (Avahi)
+/// 3. Bare numeric suffix: `"Rear Lounge TV (2)"` → `"Rear Lounge TV"` (Windows mDNS)
 fn strip_avahi_name_suffix(name: &str) -> String {
-    // Check for parenthesized hostname pattern: "Something (hostname-N)"
+    // Check for parenthesized pattern: "Something (…)"
     if let (Some(open), Some(close)) = (name.rfind('('), name.rfind(')')) {
         if open < close {
             let inside = name[open + 1..close].trim();
+
+            // Windows mDNS conflict pattern: bare number ≥ 2, e.g. "(2)", "(3)".
+            // Strip the entire parenthesized suffix including any preceding space.
+            if inside.chars().all(|c| c.is_ascii_digit())
+                && inside.parse::<u32>().is_ok_and(|n| n >= 2)
+            {
+                return name[..open].trim_end().to_string();
+            }
+
+            // Avahi conflict pattern: hostname with -N suffix inside parens.
             let cleaned = strip_avahi_suffix(inside);
             if cleaned != inside {
                 return format!("{}({}){}", &name[..open], cleaned, &name[close + 1..]);
             }
         }
     }
-    // Fall back to stripping the bare name.
+    // Fall back to stripping the bare name (Avahi -N on hostname).
     strip_avahi_suffix(name)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_avahi_name_suffix, strip_avahi_suffix};
+    use super::{strip_airplay_mac_prefix, strip_avahi_name_suffix, strip_avahi_suffix};
 
     #[test]
     fn test_strip_avahi_suffix() {
@@ -707,5 +774,39 @@ mod tests {
             strip_avahi_name_suffix("My Server (my-host-3)"),
             "My Server (my-host)"
         );
+        // Windows mDNS conflict suffix: bare number in parens.
+        assert_eq!(
+            strip_avahi_name_suffix("Rear Lounge TV (2)"),
+            "Rear Lounge TV"
+        );
+        assert_eq!(strip_avahi_name_suffix("Device (3)"), "Device");
+        // (1) is not a conflict suffix — unchanged.
+        assert_eq!(strip_avahi_name_suffix("Device (1)"), "Device (1)");
+        // (0) is not a conflict suffix — unchanged.
+        assert_eq!(strip_avahi_name_suffix("Device (0)"), "Device (0)");
+    }
+
+    #[test]
+    fn test_strip_airplay_mac_prefix() {
+        // Standard RAOP format: 12-char hex MAC @ device name.
+        assert_eq!(
+            strip_airplay_mac_prefix("8EE58A500A56@Rear Lounge TV"),
+            "Rear Lounge TV"
+        );
+        assert_eq!(
+            strip_airplay_mac_prefix("8A79AB138BA9@main bedroom TV"),
+            "main bedroom TV"
+        );
+        // No @ sign — unchanged.
+        assert_eq!(
+            strip_airplay_mac_prefix("Living Room HomePod"),
+            "Living Room HomePod"
+        );
+        // @ present but prefix is not hex — unchanged.
+        assert_eq!(strip_airplay_mac_prefix("user@hostname"), "user@hostname");
+        // Short hex prefix (< 6 chars) — unchanged.
+        assert_eq!(strip_airplay_mac_prefix("ABCD@Device"), "ABCD@Device");
+        // Exactly 6 hex chars — stripped.
+        assert_eq!(strip_airplay_mac_prefix("AABBCC@Speaker"), "Speaker");
     }
 }

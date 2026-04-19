@@ -4464,6 +4464,7 @@ dependencies = [
  "reqwest",
  "rust-i18n",
  "rust_cast",
+ "rustls",
  "sea-orm",
  "sea-orm-migration",
  "serde",
