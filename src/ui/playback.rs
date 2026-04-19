@@ -12,7 +12,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use tracing::warn;
 
-use crate::audio::output::AudioOutput;
+use crate::audio::output::{AudioOutput, OutputType};
 use crate::ui::header_bar::RepeatMode;
 use crate::ui::objects::TrackObject;
 
@@ -25,6 +25,9 @@ use super::album_art;
 pub struct PlaybackContext {
     pub model: gtk::SortListModel,
     pub active_output: Rc<RefCell<Box<dyn AudioOutput>>>,
+    /// Parking slot for the local output when a remote output is active.
+    /// Used by the Chromecast `file://` fallback to restore local playback.
+    pub parked_local: Rc<RefCell<Option<Box<dyn AudioOutput>>>>,
     pub album_art: gtk::Image,
     pub title_label: gtk::Label,
     pub artist_label: gtk::Label,
@@ -48,6 +51,20 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     if uri.is_empty() {
         warn!("Track has no playable URI");
         return false;
+    }
+
+    // ── Chromecast file:// guard ─────────────────────────────────
+    // Chromecast can only play HTTP(S) URLs.  If the active output is
+    // Chromecast and the track is a local file, automatically fall back
+    // to the local output so playback "just works" without an error.
+    let is_chromecast = ctx.active_output.borrow().output_type() == OutputType::Chromecast;
+    if is_chromecast && uri.starts_with("file://") {
+        tracing::info!("Chromecast cannot play local files — auto-switching to local output");
+        // Restore the parked local output.
+        if let Some(local) = ctx.parked_local.borrow_mut().take() {
+            *ctx.active_output.borrow_mut() = local;
+        }
+        // Now the active output is local — proceed to play on it.
     }
 
     tracing::debug!("Playing track");

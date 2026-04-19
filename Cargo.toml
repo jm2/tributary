@@ -82,6 +82,9 @@ nom = "8"
 # Audio playback (GStreamer pipeline)
 gstreamer = "0.25"
 
+# Chromecast (Cast V2 protocol) — MIT-licensed clean-room implementation
+rust_cast = "0.21"
+
 # Desktop media controls (MPRIS / SMTC / Now Playing)
 souvlaki = "0.8"
 

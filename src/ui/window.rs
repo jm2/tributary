@@ -14,6 +14,7 @@ use tracing::{info, warn};
 use sea_orm::{EntityTrait, QueryFilter};
 
 use crate::audio::airplay_output::AirPlayOutput;
+use crate::audio::chromecast_output::ChromecastOutput;
 use crate::audio::local_output::LocalOutput;
 use crate::audio::mpd_output::MpdOutput;
 use crate::audio::output::AudioOutput;
@@ -570,6 +571,70 @@ pub fn build_window(
                             continue;
                         }
 
+                        // ── Chromecast devices go to the output selector, not sidebar ──
+                        if server.service_type == "chromecast" {
+                            // Parse host:port from the cast:// URL.
+                            let cast_url = &server.url;
+                            let cast_name = server.name.clone();
+
+                            // Dedup: check if this Chromecast is already in outputs.
+                            let already_in_outputs = {
+                                let mut child = hb_output_list_for_discovery.first_child();
+                                let mut found = false;
+                                while let Some(c) = child {
+                                    if let Some(row_box) = c
+                                        .first_child()
+                                        .and_then(|inner| inner.downcast::<gtk::Box>().ok())
+                                    {
+                                        if let Some(label) = row_box
+                                            .first_child()
+                                            .and_then(|icon| icon.next_sibling())
+                                            .and_then(|l| l.downcast::<gtk::Label>().ok())
+                                        {
+                                            if label.text() == cast_name {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    child = c.next_sibling();
+                                }
+                                found
+                            };
+
+                            if !already_in_outputs {
+                                info!(
+                                    name = %cast_name,
+                                    url = %cast_url,
+                                    "Chromecast device discovered — adding to output selector"
+                                );
+                                let row = header_bar::build_output_row(
+                                    &cast_name,
+                                    "video-display-symbolic",
+                                    false,
+                                );
+                                // Extract host:port from cast://host:port URL.
+                                let host_port =
+                                    cast_url.strip_prefix("cast://").unwrap_or(cast_url);
+                                row.set_widget_name(host_port);
+                                hb_output_list_for_discovery.append(&row);
+                                // Propagate widget name to the wrapping ListBoxRow.
+                                if let Some(last_row) = hb_output_list_for_discovery.last_child() {
+                                    if let Some(list_row) =
+                                        last_row.downcast_ref::<gtk::ListBoxRow>()
+                                    {
+                                        if let Some(inner) = list_row.first_child() {
+                                            let name = inner.widget_name().to_string();
+                                            if !name.is_empty() && name != "GtkBox" {
+                                                list_row.set_widget_name(&name);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
                         // Dedup: check if this URL is already in the sidebar.
                         let already_exists = (0..store.n_items()).any(|i| {
                             store
@@ -646,6 +711,51 @@ pub fn build_window(
                     }
 
                     crate::discovery::DiscoveryEvent::Lost { url, service_type } => {
+                        // ── Chromecast devices: remove from output selector ──
+                        if service_type == "chromecast" {
+                            info!(
+                                url = %url,
+                                "Chromecast device lost — removing from output selector"
+                            );
+                            let mut child = hb_output_list_for_discovery.first_child();
+                            let mut row_idx = 0i32;
+                            while let Some(c) = child {
+                                let next = c.next_sibling();
+                                if row_idx > 0 {
+                                    if let Some(row_box) = c
+                                        .first_child()
+                                        .and_then(|inner| inner.downcast::<gtk::Box>().ok())
+                                    {
+                                        if let Some(icon) = row_box
+                                            .first_child()
+                                            .and_then(|i| i.downcast::<gtk::Image>().ok())
+                                        {
+                                            if icon
+                                                .icon_name()
+                                                .is_some_and(|n| n == "video-display-symbolic")
+                                            {
+                                                if let Some(list_row) =
+                                                    c.downcast_ref::<gtk::ListBoxRow>()
+                                                {
+                                                    // Match by widget name (host:port).
+                                                    let row_hp = list_row.widget_name().to_string();
+                                                    let lost_hp =
+                                                        url.strip_prefix("cast://").unwrap_or(&url);
+                                                    if row_hp == lost_hp {
+                                                        hb_output_list_for_discovery
+                                                            .remove(list_row);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                row_idx += 1;
+                                child = next;
+                            }
+                            continue;
+                        }
+
                         // ── AirPlay devices: remove from output selector ──
                         if service_type == "airplay" {
                             info!(
@@ -1706,6 +1816,7 @@ pub fn build_window(
     // If nothing is playing, start from track 0 (or random if shuffle).
     {
         let active_output = active_output.clone();
+        let parked_local = parked_local.clone();
         let media_ctrl = media_ctrl.clone();
         let album_art = hb.album_art.clone();
         let title_label = hb.title_label.clone();
@@ -1730,6 +1841,7 @@ pub fn build_window(
                     &PlaybackContext {
                         model: sort_model.clone(),
                         active_output: active_output.clone(),
+                        parked_local: parked_local.clone(),
                         album_art: album_art.clone(),
                         title_label: title_label.clone(),
                         artist_label: artist_label.clone(),
@@ -1785,7 +1897,7 @@ pub fn build_window(
                     // Check the icon on the activated row to distinguish
                     // AirPlay (network-wireless-symbolic) from MPD
                     // (network-server-symbolic).
-                    let is_airplay = activated_row
+                    let row_icon_name = activated_row
                         .first_child()
                         .and_then(|inner| inner.downcast::<gtk::Box>().ok())
                         .and_then(|row_box| {
@@ -1794,9 +1906,59 @@ pub fn build_window(
                                 .and_then(|i| i.downcast::<gtk::Image>().ok())
                         })
                         .and_then(|icon| icon.icon_name())
-                        .is_some_and(|n| n == "network-wireless-symbolic");
+                        .unwrap_or_default();
 
-                    if is_airplay {
+                    let is_airplay = row_icon_name == "network-wireless-symbolic";
+                    let is_chromecast = row_icon_name == "video-display-symbolic";
+
+                    if is_chromecast {
+                        // ── Switch to Chromecast output ──────────────
+                        let cast_name = activated_row
+                            .first_child()
+                            .and_then(|inner| inner.downcast::<gtk::Box>().ok())
+                            .and_then(|row_box| {
+                                row_box
+                                    .first_child()
+                                    .and_then(|icon| icon.next_sibling())
+                                    .and_then(|l| l.downcast::<gtk::Label>().ok())
+                            })
+                            .map(|l| l.text().to_string())
+                            .unwrap_or_default();
+
+                        let host_port = activated_row.widget_name().to_string();
+                        let (host, port) = if let Some(colon) = host_port.rfind(':') {
+                            let h = &host_port[..colon];
+                            let p = host_port[colon + 1..].parse::<u16>().unwrap_or(8009);
+                            (h.to_string(), p)
+                        } else {
+                            (host_port.clone(), 8009)
+                        };
+
+                        // Park the local output if needed.
+                        if parked_local.borrow().is_none() {
+                            let dummy: Box<dyn AudioOutput> = Box::new(MpdOutput::new(
+                                "_dummy",
+                                "127.0.0.1",
+                                1,
+                                event_sender.clone(),
+                            ));
+                            let local = std::mem::replace(&mut *active_output.borrow_mut(), dummy);
+                            *parked_local.borrow_mut() = Some(local);
+                        }
+
+                        let chromecast =
+                            ChromecastOutput::new(&cast_name, &host, port, event_sender.clone());
+                        *active_output.borrow_mut() = Box::new(chromecast);
+                        info!(
+                            name = %cast_name,
+                            host = %host,
+                            port,
+                            "Switched to Chromecast output"
+                        );
+
+                        // Chromecast supports volume — keep slider enabled.
+                        volume_scale.set_sensitive(true);
+                    } else if is_airplay {
                         // ── Switch to AirPlay output ─────────────────
                         // Extract the display name from the row label.
                         let airplay_name = activated_row
@@ -1976,12 +2138,14 @@ pub fn build_window(
         let sm = sort_model.clone();
         let current_pos = current_pos.clone();
 
+        let parked_local = parked_local.clone();
         column_view.connect_activate(move |_view, position| {
             play_track_at(
                 position,
                 &PlaybackContext {
                     model: sm.clone(),
                     active_output: active_output.clone(),
+                    parked_local: parked_local.clone(),
                     album_art: album_art.clone(),
                     title_label: title_label.clone(),
                     artist_label: artist_label.clone(),
@@ -2314,12 +2478,14 @@ pub fn build_window(
         let current_pos = current_pos.clone();
         let repeat_mode = hb.repeat_mode.clone();
         let shuffle = hb.shuffle_button.clone();
+        let parked_local = parked_local.clone();
 
         hb.next_button.connect_clicked(move |_| {
             advance_track(
                 &PlaybackContext {
                     model: sm.clone(),
                     active_output: active_output.clone(),
+                    parked_local: parked_local.clone(),
                     album_art: album_art.clone(),
                     title_label: title_label.clone(),
                     artist_label: artist_label.clone(),
@@ -2341,6 +2507,7 @@ pub fn build_window(
         let artist_label = hb.artist_label.clone();
         let sm = sort_model.clone();
         let current_pos = current_pos.clone();
+        let parked_local = parked_local.clone();
 
         hb.prev_button.connect_clicked(move |_| {
             let Some(pos) = current_pos.get() else { return };
@@ -2359,6 +2526,7 @@ pub fn build_window(
                     &PlaybackContext {
                         model: sm.clone(),
                         active_output: active_output.clone(),
+                        parked_local: parked_local.clone(),
                         album_art: album_art.clone(),
                         title_label: title_label.clone(),
                         artist_label: artist_label.clone(),
@@ -2386,6 +2554,7 @@ pub fn build_window(
         let seeking = seeking.clone();
         let media_ctrl = media_ctrl.clone();
         let active_output = active_output.clone();
+        let parked_local = parked_local.clone();
         let sm = sort_model.clone();
         let current_pos = current_pos.clone();
 
@@ -2509,6 +2678,7 @@ pub fn build_window(
                                     &PlaybackContext {
                                         model: sm.clone(),
                                         active_output: active_output.clone(),
+                                        parked_local: parked_local.clone(),
                                         album_art: album_art.clone(),
                                         title_label: title_label.clone(),
                                         artist_label: artist_label.clone(),
@@ -2525,6 +2695,7 @@ pub fn build_window(
                             &PlaybackContext {
                                 model: sm.clone(),
                                 active_output: active_output.clone(),
+                                parked_local: parked_local.clone(),
                                 album_art: album_art.clone(),
                                 title_label: title_label.clone(),
                                 artist_label: artist_label.clone(),

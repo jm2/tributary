@@ -5,6 +5,7 @@
 //! - **Plex:** mDNS browse for `_plexmediasvr._tcp.local.`
 //! - **DAAP:** mDNS browse for `_daap._tcp.local.`
 //! - **AirPlay:** mDNS browse for `_raop._tcp.local.`
+//! - **Chromecast:** mDNS browse for `_googlecast._tcp.local.`
 //! - **Jellyfin:** UDP broadcast `"Who is JellyfinServer?"` to `255.255.255.255:7359`
 //!
 //! All discovered servers are streamed to the GTK main thread via a
@@ -51,6 +52,8 @@ const PLEX_SERVICE: &str = "_plexmediasvr._tcp.local.";
 const DAAP_SERVICE: &str = "_daap._tcp.local.";
 /// AirPlay (RAOP) receivers for audio output streaming.
 const RAOP_SERVICE: &str = "_raop._tcp.local.";
+/// Chromecast (Cast V2) devices for audio output streaming.
+const CHROMECAST_SERVICE: &str = "_googlecast._tcp.local.";
 
 /// Jellyfin UDP discovery port.
 const JELLYFIN_DISCOVERY_PORT: u16 = 7359;
@@ -136,12 +139,25 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
         }
     };
 
-    if subsonic_rx.is_none() && plex_rx.is_none() && daap_rx.is_none() && raop_rx.is_none() {
+    let chromecast_rx = match daemon.browse(CHROMECAST_SERVICE) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            warn!("mDNS browse failed for {CHROMECAST_SERVICE}: {e}");
+            None
+        }
+    };
+
+    if subsonic_rx.is_none()
+        && plex_rx.is_none()
+        && daap_rx.is_none()
+        && raop_rx.is_none()
+        && chromecast_rx.is_none()
+    {
         warn!("No mDNS services could be browsed");
         return;
     }
 
-    info!("mDNS discovery started for Subsonic + Plex + DAAP + AirPlay");
+    info!("mDNS discovery started for Subsonic + Plex + DAAP + AirPlay + Chromecast");
 
     // `seen` maps `key` → `url` so we can reconstruct the URL on removal.
     let mut seen: HashMap<String, String> = HashMap::new();
@@ -194,6 +210,13 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
             }
         }
 
+        if let Some(ref rx) = chromecast_rx {
+            while let Ok(event) = rx.try_recv() {
+                got_event = true;
+                process_chromecast_event(event, &mut seen, &tx);
+            }
+        }
+
         // ── macOS: re-browse if no servers found yet ─────────────────
         // After the user grants Local Network permission, the daemon
         // needs fresh browse() calls to discover services.
@@ -216,6 +239,7 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
                 let _ = daemon.browse(PLEX_SERVICE);
                 let _ = daemon.browse(DAAP_SERVICE);
                 let _ = daemon.browse(RAOP_SERVICE);
+                let _ = daemon.browse(CHROMECAST_SERVICE);
             }
         }
 
@@ -485,6 +509,121 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
 
         // ── Wait before next broadcast cycle ────────────────────────
         std::thread::sleep(JELLYFIN_BROADCAST_INTERVAL);
+    }
+}
+
+// ── Chromecast mDNS event processing ────────────────────────────────────
+
+/// Process a Chromecast mDNS event.
+///
+/// Chromecast devices use `_googlecast._tcp.local.` and store the
+/// user-friendly device name in the `fn` TXT record field.  The Cast V2
+/// protocol port (typically 8009) comes from the SRV record.
+///
+/// Unlike other mDNS services, Chromecast URLs are formatted as
+/// `cast://<host>:<port>` (not HTTP) because the output selector
+/// extracts host:port directly.
+fn process_chromecast_event(
+    event: mdns_sd::ServiceEvent,
+    seen: &mut HashMap<String, String>,
+    tx: &async_channel::Sender<DiscoveryEvent>,
+) {
+    let service_type = "chromecast";
+
+    match event {
+        mdns_sd::ServiceEvent::ServiceResolved(info) => {
+            let raw_host = info.get_hostname().trim_end_matches('.').to_string();
+            let port = info.get_port();
+            let host = strip_avahi_suffix(&raw_host);
+
+            let key = format!("{service_type}:{host}:{port}");
+
+            if seen.contains_key(&key) {
+                debug!(key, "mDNS: Chromecast duplicate, skipping");
+                return;
+            }
+
+            // Extract friendly name from the `fn` TXT record field.
+            // Chromecast devices always publish this.  Fall back to the
+            // mDNS instance name if `fn` is missing.
+            let name = info
+                .get_property_val_str("fn")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    info.get_fullname()
+                        .split('.')
+                        .next()
+                        .unwrap_or(&host)
+                        .to_string()
+                });
+
+            // Use a cast:// URL scheme so the output selector can
+            // distinguish Chromecast URLs from HTTP server URLs.
+            let url = format!("cast://{host}:{port}");
+
+            seen.insert(key.clone(), url.clone());
+
+            info!(
+                name = %name,
+                url = %url,
+                "mDNS: Chromecast device discovered"
+            );
+
+            let _ = tx.try_send(DiscoveryEvent::Found(DiscoveredServer {
+                name,
+                url,
+                service_type: service_type.to_string(),
+                requires_password: None,
+            }));
+        }
+
+        mdns_sd::ServiceEvent::ServiceRemoved(_svc_type, fullname) => {
+            let instance = fullname.split('.').next().unwrap_or("").to_string();
+
+            let mut removed_url = None;
+            let mut removed_key = None;
+            for (key, url) in seen.iter() {
+                if key.starts_with(&format!("{service_type}:")) {
+                    let key_host = key
+                        .strip_prefix(&format!("{service_type}:"))
+                        .unwrap_or("")
+                        .split(':')
+                        .next()
+                        .unwrap_or("");
+                    if fullname.contains(key_host) || instance == key_host {
+                        removed_url = Some(url.clone());
+                        removed_key = Some(key.clone());
+                        break;
+                    }
+                }
+            }
+
+            if let (Some(key), Some(url)) = (removed_key, removed_url) {
+                seen.remove(&key);
+
+                info!(
+                    url = %url,
+                    fullname = %fullname,
+                    "mDNS: Chromecast device removed"
+                );
+
+                let _ = tx.try_send(DiscoveryEvent::Lost {
+                    url,
+                    service_type: service_type.to_string(),
+                });
+            } else {
+                debug!(
+                    fullname = %fullname,
+                    "mDNS: Chromecast ServiceRemoved for unknown device, ignoring"
+                );
+            }
+        }
+
+        mdns_sd::ServiceEvent::SearchStarted(svc) => {
+            debug!(service = %svc, "mDNS Chromecast search started");
+        }
+
+        _ => {}
     }
 }
 

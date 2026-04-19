@@ -15,6 +15,12 @@
 //!   mDNS browsing.  Discovered devices appear automatically in the
 //!   output selector popover.
 //!
+//! - [`ChromecastOutput`](super::chromecast_output::ChromecastOutput) —
+//!   streams to Chromecast (audio) devices discovered via
+//!   `_googlecast._tcp.local.` mDNS browsing using the Cast V2 protocol
+//!   (`rust_cast` crate).  Discovered devices appear automatically in
+//!   the output selector popover.
+//!
 //! # Architecture
 //!
 //! The output layer is strictly a **sink** abstraction.  It controls
@@ -34,6 +40,8 @@ pub enum OutputType {
     Mpd,
     /// AirPlay receiver (RAOP protocol) discovered via mDNS.
     AirPlay,
+    /// Chromecast (Cast V2 protocol) discovered via mDNS.
+    Chromecast,
     // Future: PulseAudio, PipeWire, JACK, …
 }
 
