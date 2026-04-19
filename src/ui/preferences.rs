@@ -222,9 +222,25 @@ pub fn show_preferences(
         .active(cfg.browser_views.album)
         .build();
 
+    let album_artist_check = gtk::CheckButton::builder()
+        .label("Group by Album Artist")
+        .active(cfg.group_by_album_artist)
+        .build();
+
     browser_row.append(&genre_check);
     browser_row.append(&artist_check);
     browser_row.append(&album_check);
+    browser_row.append(&album_artist_check);
+
+    // Wire album artist toggle
+    {
+        let config = config.clone();
+        album_artist_check.connect_toggled(move |btn| {
+            let mut cfg = config.borrow_mut();
+            cfg.group_by_album_artist = btn.is_active();
+            save_config(&cfg);
+        });
+    }
 
     // Wire browser view toggles
     {

@@ -101,54 +101,51 @@ pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk
         .placeholder_text(rust_i18n::t!("dialogs.output_name_placeholder").as_ref())
         .text("MPD")
         .activates_default(true)
+        .hexpand(true)
         .build();
 
     let host_entry = gtk::Entry::builder()
         .placeholder_text("localhost")
         .text("localhost")
         .activates_default(true)
+        .hexpand(true)
         .build();
 
     let port_spin = gtk::SpinButton::with_range(1.0, 65535.0, 1.0);
     port_spin.set_value(6600.0);
+    port_spin.set_hexpand(true);
 
-    let vbox = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_top(8)
+    // Use a GtkGrid for consistent label alignment.
+    let grid = gtk::Grid::builder()
+        .row_spacing(12)
+        .column_spacing(16)
+        .margin_top(12)
+        .margin_bottom(4)
+        .margin_start(8)
+        .margin_end(8)
         .build();
 
-    let name_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+    let name_label = gtk::Label::builder()
+        .label(rust_i18n::t!("dialogs.output_name").as_ref())
+        .halign(gtk::Align::End)
         .build();
-    name_row.append(&gtk::Label::new(Some(
-        rust_i18n::t!("dialogs.output_name").as_ref(),
-    )));
-    name_row.append(&name_entry);
-
-    let host_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+    let host_label = gtk::Label::builder()
+        .label(rust_i18n::t!("dialogs.output_host").as_ref())
+        .halign(gtk::Align::End)
         .build();
-    host_row.append(&gtk::Label::new(Some(
-        rust_i18n::t!("dialogs.output_host").as_ref(),
-    )));
-    host_row.append(&host_entry);
-
-    let port_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+    let port_label = gtk::Label::builder()
+        .label(rust_i18n::t!("dialogs.output_port").as_ref())
+        .halign(gtk::Align::End)
         .build();
-    port_row.append(&gtk::Label::new(Some(
-        rust_i18n::t!("dialogs.output_port").as_ref(),
-    )));
-    port_row.append(&port_spin);
 
-    vbox.append(&name_row);
-    vbox.append(&host_row);
-    vbox.append(&port_row);
-    dialog.set_extra_child(Some(&vbox));
+    grid.attach(&name_label, 0, 0, 1, 1);
+    grid.attach(&name_entry, 1, 0, 1, 1);
+    grid.attach(&host_label, 0, 1, 1, 1);
+    grid.attach(&host_entry, 1, 1, 1, 1);
+    grid.attach(&port_label, 0, 2, 1, 1);
+    grid.attach(&port_spin, 1, 2, 1, 1);
+
+    dialog.set_extra_child(Some(&grid));
 
     let output_list = output_list.clone();
     let name_entry_c = name_entry.clone();

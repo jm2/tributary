@@ -318,10 +318,52 @@ pub fn show_smart_playlist_editor(
     vbox.append(&limit_row);
     vbox.append(&live_check);
 
+    // ── Sort order section ──────────────────────────────────────────
+    let sort_label = gtk::Label::builder()
+        .label("Sort by:")
+        .halign(gtk::Align::Start)
+        .margin_top(4)
+        .build();
+    vbox.append(&sort_label);
+
+    let sort_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .build();
+
+    let sort_box_rc = std::rc::Rc::new(std::cell::RefCell::new(sort_box.clone()));
+
+    // Populate with existing sort criteria.
+    let initial_sort = existing_rules
+        .map(|r| r.sort_order.clone())
+        .unwrap_or_default();
+    for criterion in &initial_sort {
+        let row = build_sort_row(Some(criterion), sort_box_rc.clone());
+        sort_box.append(&row);
+    }
+
+    let add_sort_btn = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .css_classes(["flat", "circular"])
+        .tooltip_text("Add sort level")
+        .halign(gtk::Align::End)
+        .build();
+    {
+        let sb = sort_box_rc.clone();
+        add_sort_btn.connect_clicked(move |_| {
+            let row = build_sort_row(None, sb.clone());
+            sb.borrow().append(&row);
+        });
+    }
+
+    vbox.append(&sort_box);
+    vbox.append(&add_sort_btn);
+
     dialog.set_extra_child(Some(&vbox));
 
     // ── Response handler ────────────────────────────────────────────
     let rules_box_for_save = rules_box_rc.clone();
+    let sort_box_for_save = sort_box_rc.clone();
 
     dialog.connect_response(None, move |_dialog, response| {
         if response != "ok" {
@@ -337,6 +379,19 @@ pub fn show_smart_playlist_editor(
             if let Some(row) = widget.downcast_ref::<gtk::Box>() {
                 if let Some(rule) = extract_rule_from_row(row) {
                     rules.push(rule);
+                }
+            }
+            child = widget.next_sibling();
+        }
+
+        // Collect sort criteria from the UI.
+        let sort_box = sort_box_for_save.borrow();
+        let mut sort_order = Vec::new();
+        let mut child = sort_box.first_child();
+        while let Some(widget) = child {
+            if let Some(row) = widget.downcast_ref::<gtk::Box>() {
+                if let Some(criterion) = extract_sort_from_row(row) {
+                    sort_order.push(criterion);
                 }
             }
             child = widget.next_sibling();
@@ -385,7 +440,7 @@ pub fn show_smart_playlist_editor(
             rules,
             limit,
             live_updating: live_check.is_active(),
-            sort_order: Vec::new(),
+            sort_order,
         };
 
         on_save(smart_rules);
@@ -660,4 +715,144 @@ fn extract_rule_from_row(row: &gtk::Box) -> Option<SmartRule> {
         operator,
         value,
     })
+}
+
+// ── Sort row builder ────────────────────────────────────────────────
+
+/// Sort field names for the dropdown (must match `SortField` enum order).
+const SORT_FIELD_NAMES: &[&str] = &[
+    "Artist",
+    "Album Artist",
+    "Album",
+    "Title",
+    "Year",
+    "Track Number",
+    "Disc Number",
+    "Genre",
+    "Duration",
+    "Bitrate",
+    "Play Count",
+    "Date Added",
+    "Date Modified",
+];
+
+/// Map dropdown index to `SortField`.
+fn index_to_sort_field(idx: u32) -> SortField {
+    match idx {
+        0 => SortField::Artist,
+        1 => SortField::AlbumArtist,
+        2 => SortField::Album,
+        3 => SortField::Title,
+        4 => SortField::Year,
+        5 => SortField::TrackNumber,
+        6 => SortField::DiscNumber,
+        7 => SortField::Genre,
+        8 => SortField::Duration,
+        9 => SortField::Bitrate,
+        10 => SortField::PlayCount,
+        11 => SortField::DateAdded,
+        12 => SortField::DateModified,
+        _ => SortField::Artist,
+    }
+}
+
+/// Map `SortField` to dropdown index.
+fn sort_field_to_index(field: SortField) -> u32 {
+    match field {
+        SortField::Artist => 0,
+        SortField::AlbumArtist => 1,
+        SortField::Album => 2,
+        SortField::Title => 3,
+        SortField::Year => 4,
+        SortField::TrackNumber => 5,
+        SortField::DiscNumber => 6,
+        SortField::Genre => 7,
+        SortField::Duration => 8,
+        SortField::Bitrate => 9,
+        SortField::PlayCount => 10,
+        SortField::DateAdded => 11,
+        SortField::DateModified => 12,
+    }
+}
+
+/// Build a single sort criterion row with field dropdown and direction toggle.
+fn build_sort_row(
+    existing: Option<&SortCriterion>,
+    sort_box: std::rc::Rc<std::cell::RefCell<gtk::Box>>,
+) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .build();
+
+    let field_model = gtk::StringList::new(SORT_FIELD_NAMES);
+    let field_dropdown = gtk::DropDown::builder()
+        .model(&field_model)
+        .selected(existing.map(|c| sort_field_to_index(c.field)).unwrap_or(0))
+        .hexpand(true)
+        .build();
+
+    let dir_model = gtk::StringList::new(&["Ascending", "Descending"]);
+    let dir_dropdown = gtk::DropDown::builder()
+        .model(&dir_model)
+        .selected(
+            existing
+                .map(|c| u32::from(c.direction == SortDirection::Descending))
+                .unwrap_or(0),
+        )
+        .build();
+
+    let remove_btn = gtk::Button::builder()
+        .icon_name("list-remove-symbolic")
+        .css_classes(["flat", "circular"])
+        .tooltip_text("Remove sort level")
+        .build();
+
+    row.append(&field_dropdown);
+    row.append(&dir_dropdown);
+    row.append(&remove_btn);
+
+    // Wire remove button.
+    {
+        let sb = sort_box;
+        let row_ref = row.clone();
+        remove_btn.connect_clicked(move |_| {
+            sb.borrow().remove(&row_ref);
+        });
+    }
+
+    // Store widget names for extraction.
+    field_dropdown.set_widget_name("sort-field");
+    dir_dropdown.set_widget_name("sort-dir");
+
+    row
+}
+
+/// Extract a `SortCriterion` from a sort row's widgets.
+fn extract_sort_from_row(row: &gtk::Box) -> Option<SortCriterion> {
+    let mut field_dropdown: Option<gtk::DropDown> = None;
+    let mut dir_dropdown: Option<gtk::DropDown> = None;
+
+    let mut child = row.first_child();
+    while let Some(widget) = child {
+        let name = widget.widget_name();
+        if name == "sort-field" {
+            field_dropdown = widget.downcast_ref::<gtk::DropDown>().cloned();
+        } else if name == "sort-dir" {
+            dir_dropdown = widget.downcast_ref::<gtk::DropDown>().cloned();
+        }
+        child = widget.next_sibling();
+    }
+
+    let field_dd = field_dropdown?;
+    let dir_dd = dir_dropdown?;
+
+    let field = index_to_sort_field(field_dd.selected());
+    let direction = if dir_dd.selected() == 1 {
+        SortDirection::Descending
+    } else {
+        SortDirection::Ascending
+    };
+
+    Some(SortCriterion { field, direction })
 }

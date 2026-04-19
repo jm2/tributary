@@ -227,8 +227,21 @@ fn main() {
             if let Some(display) = gtk::gdk::Display::default() {
                 let icon_theme = gtk::IconTheme::for_display(&display);
                 // Development: <repo>/target/release/tributary → <repo>/data/icons
+                // Also handles `-Run` mode where exe is in target/<profile>/.
                 if let Some(repo) = exe
                     .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                {
+                    let icons_dir = repo.join("data").join("icons");
+                    if icons_dir.is_dir() {
+                        icon_theme.add_search_path(&icons_dir);
+                    }
+                }
+                // Also try two levels up (target/x86_64-pc-windows-gnullvm/release/)
+                if let Some(repo) = exe
+                    .parent()
+                    .and_then(|p| p.parent())
                     .and_then(|p| p.parent())
                     .and_then(|p| p.parent())
                 {
