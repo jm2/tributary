@@ -881,6 +881,7 @@ pub fn build_window(
     // ── Sidebar selection: source switching + auth dialog ───────────
     let sidebar_store_for_events = sidebar_store.clone();
     let sidebar_sel_for_events = sidebar_selection.clone();
+    let pending_connection_for_events = pending_connection.clone();
     {
         let sel = sidebar_selection.clone();
         let engine_tx = engine_tx.clone();
@@ -1453,6 +1454,7 @@ pub fn build_window(
                 sidebar_store_for_events,
                 sidebar_sel_for_events,
                 scan_spinner,
+                pending_connection_for_events.clone(),
             );
             return;
         }
@@ -2755,6 +2757,7 @@ pub fn build_window(
         sidebar_store_for_events,
         sidebar_sel_for_events,
         scan_spinner,
+        pending_connection_for_events,
     );
 }
 
@@ -2800,6 +2803,7 @@ fn setup_library_events(
     sidebar_store: gtk::gio::ListStore,
     sidebar_selection: gtk::SingleSelection,
     scan_spinner: gtk::Spinner,
+    pending_connection: Rc<RefCell<Option<String>>>,
 ) {
     let browser_widget = browser_widget.clone();
     let column_view = column_view.clone();
@@ -2867,6 +2871,9 @@ fn setup_library_events(
                                 sidebar_store.insert(i, &src);
                                 // Auto-select this source.
                                 sidebar_selection.set_selected(i);
+                                // Clear the pending connection guard now that
+                                // the connection succeeded.
+                                *pending_connection.borrow_mut() = None;
                                 break;
                             }
                         }
