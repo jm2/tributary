@@ -48,6 +48,10 @@ pub struct AppConfig {
     /// `Some(false)` = declined.
     #[serde(default)]
     pub location_enabled: Option<bool>,
+    /// Whether the browser Artist pane groups by Album Artist instead of
+    /// the track-level Artist tag. Default: false (group by Artist).
+    #[serde(default)]
+    pub group_by_album_artist: bool,
 }
 
 /// Default column order (used for `#[serde(default)]`).
@@ -88,6 +92,7 @@ impl Default for AppConfig {
             column_order: default_column_order(),
             library_path: music_dir,
             location_enabled: None,
+            group_by_album_artist: false,
         }
     }
 }

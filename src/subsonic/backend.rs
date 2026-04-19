@@ -414,6 +414,7 @@ fn song_to_track(
         id,
         title: song.title.clone().unwrap_or_else(|| "Unknown".into()),
         artist_name: song.artist.clone().unwrap_or_else(|| "Unknown".into()),
+        album_artist_name: None,
         artist_id,
         album_title: song.album.clone().unwrap_or_default(),
         album_id,

@@ -19,6 +19,44 @@ pub struct SmartRules {
     pub limit: Option<SmartLimit>,
     /// Whether the playlist auto-updates when the library changes.
     pub live_updating: bool,
+    /// Optional compound sort order applied to the final results.
+    /// Each criterion is applied in sequence (multi-key sort).
+    /// Example: Artist ascending → Year ascending → Track # ascending
+    /// produces the Tauon-style "artists alphabetised, albums chronological" layout.
+    #[serde(default)]
+    pub sort_order: Vec<SortCriterion>,
+}
+
+/// A single sort criterion for compound playlist ordering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SortCriterion {
+    pub field: SortField,
+    pub direction: SortDirection,
+}
+
+/// Fields available for compound sort ordering.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum SortField {
+    Artist,
+    AlbumArtist,
+    Album,
+    Title,
+    Year,
+    TrackNumber,
+    DiscNumber,
+    Genre,
+    Duration,
+    Bitrate,
+    PlayCount,
+    DateAdded,
+    DateModified,
+}
+
+/// Sort direction.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
 }
 
 /// Match mode for combining rules.
@@ -41,6 +79,7 @@ pub struct SmartRule {
 pub enum RuleField {
     Title,
     Artist,
+    AlbumArtist,
     Album,
     Genre,
     Year,
@@ -141,6 +180,7 @@ pub enum LimitSort {
 pub trait SmartTrack {
     fn title(&self) -> &str;
     fn artist(&self) -> &str;
+    fn album_artist(&self) -> &str;
     fn album(&self) -> &str;
     fn genre(&self) -> &str;
     fn year(&self) -> Option<i32>;
@@ -163,6 +203,9 @@ impl SmartTrack for crate::db::entities::track::Model {
     }
     fn artist(&self) -> &str {
         &self.artist_name
+    }
+    fn album_artist(&self) -> &str {
+        self.album_artist_name.as_deref().unwrap_or("")
     }
     fn album(&self) -> &str {
         &self.album_title
@@ -229,6 +272,11 @@ pub fn evaluate<T: SmartTrack + Clone>(rules: &SmartRules, tracks: &[T]) -> Vec<
         .cloned()
         .collect();
 
+    // Apply compound sort order if specified.
+    if !rules.sort_order.is_empty() {
+        apply_compound_sort(&mut results, &rules.sort_order);
+    }
+
     // Apply limit if configured.
     if let Some(limit) = &rules.limit {
         apply_limit(&mut results, limit);
@@ -237,11 +285,58 @@ pub fn evaluate<T: SmartTrack + Clone>(rules: &SmartRules, tracks: &[T]) -> Vec<
     results
 }
 
+/// Apply a multi-key compound sort to the results.
+///
+/// Criteria are applied in order: the first criterion is the primary sort,
+/// the second breaks ties in the first, etc.  This enables Tauon-style
+/// generator code ordering like "Artist asc → Year asc → Track # asc".
+fn apply_compound_sort<T: SmartTrack>(results: &mut [T], criteria: &[SortCriterion]) {
+    if criteria.is_empty() {
+        return;
+    }
+    results.sort_by(|a, b| {
+        for criterion in criteria {
+            let cmp = compare_by_sort_field(a, b, criterion.field);
+            let cmp = match criterion.direction {
+                SortDirection::Ascending => cmp,
+                SortDirection::Descending => cmp.reverse(),
+            };
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+/// Compare two tracks by a single sort field.
+fn compare_by_sort_field<T: SmartTrack>(a: &T, b: &T, field: SortField) -> std::cmp::Ordering {
+    match field {
+        SortField::Artist => a.artist().to_lowercase().cmp(&b.artist().to_lowercase()),
+        SortField::AlbumArtist => a
+            .album_artist()
+            .to_lowercase()
+            .cmp(&b.album_artist().to_lowercase()),
+        SortField::Album => a.album().to_lowercase().cmp(&b.album().to_lowercase()),
+        SortField::Title => a.title().to_lowercase().cmp(&b.title().to_lowercase()),
+        SortField::Year => a.year().cmp(&b.year()),
+        SortField::TrackNumber => a.track_number().cmp(&b.track_number()),
+        SortField::DiscNumber => a.disc_number().cmp(&b.disc_number()),
+        SortField::Genre => a.genre().to_lowercase().cmp(&b.genre().to_lowercase()),
+        SortField::Duration => a.duration_secs().cmp(&b.duration_secs()),
+        SortField::Bitrate => a.bitrate_kbps().cmp(&b.bitrate_kbps()),
+        SortField::PlayCount => a.play_count().cmp(&b.play_count()),
+        SortField::DateAdded => a.date_added().cmp(b.date_added()),
+        SortField::DateModified => a.date_modified().cmp(b.date_modified()),
+    }
+}
+
 /// Evaluate a single rule against a track.
 fn evaluate_rule<T: SmartTrack>(rule: &SmartRule, track: &T) -> bool {
     match rule.field {
         RuleField::Title => eval_text(track.title(), &rule.operator, &rule.value),
         RuleField::Artist => eval_text(track.artist(), &rule.operator, &rule.value),
+        RuleField::AlbumArtist => eval_text(track.album_artist(), &rule.operator, &rule.value),
         RuleField::Album => eval_text(track.album(), &rule.operator, &rule.value),
         RuleField::Genre => eval_text(track.genre(), &rule.operator, &rule.value),
         RuleField::Format => eval_text(track.format(), &rule.operator, &rule.value),
@@ -596,6 +691,9 @@ mod tests {
         fn artist(&self) -> &str {
             &self.artist
         }
+        fn album_artist(&self) -> &str {
+            "" // TestTrack doesn't have album_artist
+        }
         fn album(&self) -> &str {
             &self.album
         }
@@ -921,6 +1019,7 @@ mod tests {
             ],
             limit: None,
             live_updating: true,
+            sort_order: Vec::new(),
         };
 
         let result = evaluate(&rules, &[t.clone()]);
@@ -955,6 +1054,7 @@ mod tests {
             ],
             limit: None,
             live_updating: true,
+            sort_order: Vec::new(),
         };
 
         // Genre doesn't match but year does → included.
@@ -970,6 +1070,7 @@ mod tests {
             rules: vec![],
             limit: None,
             live_updating: true,
+            sort_order: Vec::new(),
         };
         let result = evaluate(&rules, &[t]);
         assert_eq!(result.len(), 1);
@@ -992,6 +1093,7 @@ mod tests {
                 selected_by: LimitSort::Title,
             }),
             live_updating: true,
+            sort_order: Vec::new(),
         };
 
         let result = evaluate(&rules, &tracks);
@@ -1017,6 +1119,7 @@ mod tests {
                 selected_by: LimitSort::Title,
             }),
             live_updating: true,
+            sort_order: Vec::new(),
         };
 
         let result = evaluate(&rules, &tracks);
@@ -1047,6 +1150,7 @@ mod tests {
                 selected_by: LimitSort::Title,
             }),
             live_updating: true,
+            sort_order: Vec::new(),
         };
 
         let result = evaluate(&rules, &tracks);
@@ -1143,6 +1247,7 @@ mod tests {
                 selected_by: LimitSort::Title,
             }),
             live_updating: true,
+            sort_order: Vec::new(),
         };
 
         let result = evaluate(&rules, &tracks);
@@ -1169,6 +1274,7 @@ mod tests {
                 selected_by: LimitSort::MostPlayed,
             }),
             live_updating: true,
+            sort_order: Vec::new(),
         };
 
         let result = evaluate(&rules, &[t1, t2, t3]);
@@ -1223,6 +1329,7 @@ mod tests {
                     ],
                     limit: None,
                     live_updating: true,
+                    sort_order: Vec::new(),
                 };
 
                 let rules_any = SmartRules {
@@ -1230,6 +1337,7 @@ mod tests {
                     rules: rules_all.rules.clone(),
                     limit: None,
                     live_updating: true,
+                    sort_order: Vec::new(),
                 };
 
                 let result_all = evaluate(&rules_all, &tracks);
@@ -1252,6 +1360,7 @@ mod tests {
                     rules: vec![],
                     limit: None,
                     live_updating: true,
+                    sort_order: Vec::new(),
                 };
 
                 let rules_limited = SmartRules {
@@ -1263,6 +1372,7 @@ mod tests {
                         selected_by: LimitSort::Title,
                     }),
                     live_updating: true,
+                    sort_order: Vec::new(),
                 };
 
                 let unlimited = evaluate(&rules_unlimited, &tracks);
@@ -1281,6 +1391,7 @@ mod tests {
                     rules: vec![],
                     limit: None,
                     live_updating: true,
+                    sort_order: Vec::new(),
                 };
 
                 let result = evaluate(&rules, &tracks);

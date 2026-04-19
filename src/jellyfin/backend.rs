@@ -553,6 +553,7 @@ fn jellyfin_item_to_track(
             .map(|a| a.name.clone())
             .or_else(|| item.album_artist.clone())
             .unwrap_or_else(|| "Unknown".into()),
+        album_artist_name: item.album_artist.clone(),
         artist_id,
         album_title: item.album.clone().unwrap_or_default(),
         album_id,

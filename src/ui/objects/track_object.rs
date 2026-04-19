@@ -17,6 +17,7 @@ mod imp {
         pub title: RefCell<String>,
         pub duration_secs: Cell<u64>,
         pub artist: RefCell<String>,
+        pub album_artist: RefCell<String>,
         pub album: RefCell<String>,
         pub genre: RefCell<String>,
         pub year: Cell<i32>,
@@ -94,6 +95,9 @@ impl TrackObject {
     pub fn artist(&self) -> String {
         self.imp().artist.borrow().clone()
     }
+    pub fn album_artist(&self) -> String {
+        self.imp().album_artist.borrow().clone()
+    }
     pub fn album(&self) -> String {
         self.imp().album.borrow().clone()
     }
@@ -127,6 +131,10 @@ impl TrackObject {
 
     pub fn set_cover_art_url(&self, url: &str) {
         self.imp().cover_art_url.replace(url.to_string());
+    }
+
+    pub fn set_album_artist(&self, name: &str) {
+        self.imp().album_artist.replace(name.to_string());
     }
 
     pub fn duration_display(&self) -> String {

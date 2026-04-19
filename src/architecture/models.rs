@@ -25,6 +25,10 @@ pub struct Track {
     /// Display name of the performing artist.
     pub artist_name: String,
 
+    /// Album artist (used for grouping when different from track artist).
+    #[serde(default)]
+    pub album_artist_name: Option<String>,
+
     /// Artist unique identifier (if resolvable).
     pub artist_id: Option<Uuid>,
 

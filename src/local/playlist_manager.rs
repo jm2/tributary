@@ -240,6 +240,7 @@ impl PlaylistManager {
             rules: Vec::new(),
             limit: None,
             live_updating: true,
+            sort_order: Vec::new(),
         });
 
         let all_tracks = track::Entity::find().all(&self.db).await?;

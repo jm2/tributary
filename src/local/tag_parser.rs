@@ -27,6 +27,7 @@ pub struct ParsedTrack {
     pub file_path: String,
     pub title: String,
     pub artist_name: String,
+    pub album_artist_name: Option<String>,
     pub album_title: String,
     pub genre: Option<String>,
     pub year: Option<i32>,
@@ -65,6 +66,11 @@ pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
         .and_then(|t| t.artist().map(|s| s.to_string()))
         .unwrap_or_else(|| "Unknown Artist".to_string());
 
+    let album_artist_name = tag.and_then(|t| {
+        use lofty::tag::ItemKey;
+        t.get_string(&ItemKey::AlbumArtist).map(str::to_string)
+    });
+
     let album_title = tag
         .and_then(|t| t.album().map(|s| s.to_string()))
         .unwrap_or_else(|| "Unknown Album".to_string());
@@ -99,6 +105,7 @@ pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
         file_path: path.to_string_lossy().to_string(),
         title,
         artist_name,
+        album_artist_name,
         album_title,
         genre,
         year: year.map(|y| y as i32),

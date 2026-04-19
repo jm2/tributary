@@ -457,6 +457,7 @@ fn plex_track_to_track(
             .grandparent_title
             .clone()
             .unwrap_or_else(|| "Unknown".into()),
+        album_artist_name: None,
         artist_id,
         album_title: plex.parent_title.clone().unwrap_or_default(),
         album_id,

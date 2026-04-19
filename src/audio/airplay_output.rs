@@ -168,6 +168,7 @@ impl AirPlayOutput {
     /// This requires `shairport-sync` to be installed on the system.
     /// Uses GStreamer to decode audio into raw S16LE PCM, piped to
     /// `shairport-sync` via its stdin pipe backend.
+    #[allow(unused_variables)]
     fn try_shairport_sync(host: &str, port: u16, uri: &str) -> Result<(), String> {
         // Check if shairport-sync is available on PATH.
         #[cfg(not(target_os = "windows"))]

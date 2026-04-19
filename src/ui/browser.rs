@@ -262,6 +262,9 @@ struct TrackSnapshot {
     title: String,
     genre: String,
     artist: String,
+    /// Album artist (used for browser grouping when the preference is on).
+    #[allow(dead_code)] // Will be used when group_by_album_artist preference is wired
+    album_artist: String,
     album: String,
 }
 
@@ -271,7 +274,21 @@ impl TrackSnapshot {
             title: t.title(),
             genre: t.genre(),
             artist: t.artist(),
+            album_artist: t.album_artist(),
             album: t.album(),
+        }
+    }
+
+    /// Return the artist name to use for browser grouping.
+    ///
+    /// When `use_album_artist` is true and the track has a non-empty
+    /// album artist tag, return it; otherwise fall back to the track artist.
+    #[allow(dead_code)] // Will be used when group_by_album_artist preference is wired
+    fn browser_artist(&self, use_album_artist: bool) -> &str {
+        if use_album_artist && !self.album_artist.is_empty() {
+            &self.album_artist
+        } else {
+            &self.artist
         }
     }
 }

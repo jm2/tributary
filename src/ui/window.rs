@@ -3407,6 +3407,11 @@ fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObject {
         obj.set_cover_art_url(art_url.as_str());
     }
 
+    // Propagate album artist for browser grouping.
+    if let Some(ref aa) = t.album_artist_name {
+        obj.set_album_artist(aa);
+    }
+
     obj
 }
 

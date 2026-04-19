@@ -14,6 +14,7 @@ use crate::local::smart_rules::*;
 const FIELD_NAMES: &[&str] = &[
     "Title",
     "Artist",
+    "Album Artist",
     "Album",
     "Genre",
     "Year",
@@ -34,19 +35,20 @@ fn index_to_field(idx: u32) -> RuleField {
     match idx {
         0 => RuleField::Title,
         1 => RuleField::Artist,
-        2 => RuleField::Album,
-        3 => RuleField::Genre,
-        4 => RuleField::Year,
-        5 => RuleField::TrackNumber,
-        6 => RuleField::DiscNumber,
-        7 => RuleField::Duration,
-        8 => RuleField::Bitrate,
-        9 => RuleField::SampleRate,
-        10 => RuleField::Format,
-        11 => RuleField::PlayCount,
-        12 => RuleField::DateAdded,
-        13 => RuleField::DateModified,
-        14 => RuleField::FileSize,
+        2 => RuleField::AlbumArtist,
+        3 => RuleField::Album,
+        4 => RuleField::Genre,
+        5 => RuleField::Year,
+        6 => RuleField::TrackNumber,
+        7 => RuleField::DiscNumber,
+        8 => RuleField::Duration,
+        9 => RuleField::Bitrate,
+        10 => RuleField::SampleRate,
+        11 => RuleField::Format,
+        12 => RuleField::PlayCount,
+        13 => RuleField::DateAdded,
+        14 => RuleField::DateModified,
+        15 => RuleField::FileSize,
         _ => RuleField::Title,
     }
 }
@@ -56,19 +58,20 @@ fn field_to_index(field: &RuleField) -> u32 {
     match field {
         RuleField::Title => 0,
         RuleField::Artist => 1,
-        RuleField::Album => 2,
-        RuleField::Genre => 3,
-        RuleField::Year => 4,
-        RuleField::TrackNumber => 5,
-        RuleField::DiscNumber => 6,
-        RuleField::Duration => 7,
-        RuleField::Bitrate => 8,
-        RuleField::SampleRate => 9,
-        RuleField::Format => 10,
-        RuleField::PlayCount => 11,
-        RuleField::DateAdded => 12,
-        RuleField::DateModified => 13,
-        RuleField::FileSize => 14,
+        RuleField::AlbumArtist => 2,
+        RuleField::Album => 3,
+        RuleField::Genre => 4,
+        RuleField::Year => 5,
+        RuleField::TrackNumber => 6,
+        RuleField::DiscNumber => 7,
+        RuleField::Duration => 8,
+        RuleField::Bitrate => 9,
+        RuleField::SampleRate => 10,
+        RuleField::Format => 11,
+        RuleField::PlayCount => 12,
+        RuleField::DateAdded => 13,
+        RuleField::DateModified => 14,
+        RuleField::FileSize => 15,
     }
 }
 
@@ -83,6 +86,7 @@ fn field_type(field: &RuleField) -> FieldType {
     match field {
         RuleField::Title
         | RuleField::Artist
+        | RuleField::AlbumArtist
         | RuleField::Album
         | RuleField::Genre
         | RuleField::Format => FieldType::Text,
@@ -381,6 +385,7 @@ pub fn show_smart_playlist_editor(
             rules,
             limit,
             live_updating: live_check.is_active(),
+            sort_order: Vec::new(),
         };
 
         on_save(smart_rules);

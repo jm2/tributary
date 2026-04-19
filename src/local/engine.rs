@@ -376,6 +376,7 @@ async fn upsert_track(
         let mut active: track::ActiveModel = row.clone().into();
         active.title = Set(parsed.title.clone());
         active.artist_name = Set(parsed.artist_name.clone());
+        active.album_artist_name = Set(parsed.album_artist_name.clone());
         active.album_title = Set(parsed.album_title.clone());
         active.genre = Set(parsed.genre.clone());
         active.year = Set(parsed.year);
@@ -399,6 +400,7 @@ async fn upsert_track(
             file_path: Set(parsed.file_path.clone()),
             title: Set(parsed.title.clone()),
             artist_name: Set(parsed.artist_name.clone()),
+            album_artist_name: Set(parsed.album_artist_name.clone()),
             album_title: Set(parsed.album_title.clone()),
             genre: Set(parsed.genre.clone()),
             year: Set(parsed.year),
@@ -437,6 +439,7 @@ pub fn db_model_to_track(model: &track::Model) -> Track {
         id: Uuid::parse_str(&model.id).unwrap_or_else(|_| Uuid::new_v4()),
         title: model.title.clone(),
         artist_name: model.artist_name.clone(),
+        album_artist_name: model.album_artist_name.clone(),
         artist_id: None,
         album_title: model.album_title.clone(),
         album_id: None,
@@ -472,6 +475,7 @@ mod tests {
             file_path: "/music/song.flac".to_string(),
             title: "Test Song".to_string(),
             artist_name: "Test Artist".to_string(),
+            album_artist_name: Some("Test Album Artist".to_string()),
             album_title: "Test Album".to_string(),
             genre: Some("Rock".to_string()),
             year: Some(2020),
@@ -515,6 +519,7 @@ mod tests {
             file_path: "/music/unknown.mp3".to_string(),
             title: "Unknown".to_string(),
             artist_name: "Unknown Artist".to_string(),
+            album_artist_name: None,
             album_title: "Unknown Album".to_string(),
             genre: None,
             year: None,
@@ -550,6 +555,7 @@ mod tests {
             file_path: "/music/song.mp3".to_string(),
             title: "Song".to_string(),
             artist_name: "Artist".to_string(),
+            album_artist_name: None,
             album_title: "Album".to_string(),
             genre: None,
             year: None,
@@ -577,6 +583,7 @@ mod tests {
             file_path: "/music/song.mp3".to_string(),
             title: "Song".to_string(),
             artist_name: "Artist".to_string(),
+            album_artist_name: None,
             album_title: "Album".to_string(),
             genre: None,
             year: None,

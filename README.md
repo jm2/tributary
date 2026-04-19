@@ -51,6 +51,8 @@ Tributary provides a unified interface for managing and streaming music from mul
 | MPD output backend (sink-only, TCP with security hardening) | ✅ |
 | Output switching (click to swap local ↔ MPD) | ✅ |
 | AirPlay output (RAOP discovery + streaming) | ✅ |
+| Album artist sort (preference toggle) | ✅ |
+| Smart playlist compound sort (multi-key ordering) | ✅ |
 | Geo-distance sorting for Stations Near Me | ✅ |
 | USB device browsing (sidebar + tracklist scan) | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |

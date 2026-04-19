@@ -141,6 +141,7 @@ impl DaapBackend {
                 id: track_uuid,
                 title,
                 artist_name: artist_name.clone(),
+                album_artist_name: None,
                 artist_id: Some(artist_uuid),
                 album_title: album_title.clone(),
                 album_id: Some(album_uuid),
