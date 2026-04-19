@@ -5,7 +5,7 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.4.0
+## [0.4.0] — 2026-04-19
 
 ### Added
 - **Chromecast audio output** — New `src/audio/chromecast_output.rs` implementing the `AudioOutput` trait for Chromecast (Cast V2) devices using the MIT-licensed `rust_cast` crate. `OutputType::Chromecast` variant added to the output type enum. Discovery integration browses `_googlecast._tcp.local.` via mDNS and automatically adds discovered Chromecast devices to the output selector popover with `"video-display-symbolic"` icon. The friendly name is extracted from the mDNS `fn` TXT record field. Clicking a Chromecast row connects via TLS (port 8009), launches the Default Media Receiver app, and sends `media.load()` with the track URL. Supports play, pause, stop, seek, and volume control (0.0–1.0 linear). Remote sources (Subsonic, Jellyfin, Plex, radio) work out of the box since their stream URLs are already HTTP; local `file:///` URIs are rejected with a clear error message (embedded HTTP server for local file casting deferred to a follow-up). Includes 7 unit tests.
