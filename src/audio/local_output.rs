@@ -8,14 +8,12 @@ use super::output::{AudioOutput, OutputType};
 use super::{Player, PlayerState};
 
 /// Local GStreamer output — delegates to the existing [`Player`].
-#[allow(dead_code)]
 pub struct LocalOutput {
     player: Player,
 }
 
 impl LocalOutput {
     /// Create a new local output wrapping the given [`Player`].
-    #[allow(dead_code)]
     pub fn new(player: Player) -> Self {
         Self { player }
     }

@@ -38,13 +38,12 @@ use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerState};
 
 /// Timeout for TCP connect and individual read/write operations.
-#[allow(dead_code)]
 const TCP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// MPD audio output — sends commands to an MPD server.
-#[allow(dead_code)]
 pub struct MpdOutput {
     /// Human-readable name shown in the output selector.
+    #[allow(dead_code)]
     display_name: String,
     /// MPD server hostname or IP.
     host: String,
@@ -62,7 +61,6 @@ impl MpdOutput {
     ///
     /// Does **not** establish a connection — that happens lazily on the
     /// first playback command.
-    #[allow(dead_code)]
     pub fn new(
         display_name: &str,
         host: &str,

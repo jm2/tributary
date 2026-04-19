@@ -13,6 +13,9 @@ use tracing::{info, warn};
 
 use sea_orm::{EntityTrait, QueryFilter};
 
+use crate::audio::local_output::LocalOutput;
+use crate::audio::mpd_output::MpdOutput;
+use crate::audio::output::AudioOutput;
 use crate::audio::{PlayerEvent, PlayerState};
 use crate::desktop_integration::MediaAction;
 use crate::local::engine::{LibraryEngine, LibraryEvent};
@@ -1346,10 +1349,23 @@ pub fn build_window(
             return;
         }
     };
-    let player = Rc::new(RefCell::new(player));
+    // Grab the event sender before wrapping in LocalOutput — needed
+    // to give MpdOutput (and future outputs) a sender into the same
+    // player_rx event loop.
+    let event_sender = player.event_sender();
 
-    // Sync the volume slider to the player's persisted volume.
-    hb.volume_adj.set_value(player.borrow().volume());
+    // Wrap the raw Player in LocalOutput → Box<dyn AudioOutput>.
+    let local_output = LocalOutput::new(player);
+    let active_output: Rc<RefCell<Box<dyn AudioOutput>>> =
+        Rc::new(RefCell::new(Box::new(local_output)));
+
+    // Parking slot for the local output when an MPD output is active.
+    // When switching to MPD we move the LocalOutput out of active_output
+    // into this slot; when switching back we move it back.
+    let parked_local: Rc<RefCell<Option<Box<dyn AudioOutput>>>> = Rc::new(RefCell::new(None));
+
+    // Sync the volume slider to the output's persisted volume.
+    hb.volume_adj.set_value(active_output.borrow().volume());
 
     // ── Extract native window handle (HWND on Windows) ──────────────
     let hwnd = extract_hwnd(&window);
@@ -1358,15 +1374,15 @@ pub fn build_window(
     let media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>> =
         match crate::desktop_integration::MediaController::new(hwnd) {
             Ok((ctrl, media_rx)) => {
-                let player = player.clone();
+                let active_output = active_output.clone();
                 glib::MainContext::default().spawn_local(async move {
                     while let Ok(action) = media_rx.recv().await {
                         info!(?action, "OS media key");
                         match action {
-                            MediaAction::Play => player.borrow().play(),
-                            MediaAction::Pause => player.borrow().pause(),
-                            MediaAction::Toggle => player.borrow().toggle_play_pause(),
-                            MediaAction::Stop => player.borrow().stop(),
+                            MediaAction::Play => active_output.borrow().play(),
+                            MediaAction::Pause => active_output.borrow().pause(),
+                            MediaAction::Toggle => active_output.borrow().toggle_play_pause(),
+                            MediaAction::Stop => active_output.borrow().stop(),
                             MediaAction::Next => {
                                 // Media key next/previous cannot call
                                 // advance_track directly because we don't
@@ -1389,7 +1405,7 @@ pub fn build_window(
     // ── Wire play/pause button ──────────────────────────────────────
     // If nothing is playing, start from track 0 (or random if shuffle).
     {
-        let player = player.clone();
+        let active_output = active_output.clone();
         let media_ctrl = media_ctrl.clone();
         let album_art = hb.album_art.clone();
         let title_label = hb.title_label.clone();
@@ -1401,7 +1417,7 @@ pub fn build_window(
         hb.play_button.connect_clicked(move |_| {
             if current_pos.get().is_some() {
                 // Already have a track loaded — just toggle.
-                player.borrow().toggle_play_pause();
+                active_output.borrow().toggle_play_pause();
             } else if sort_model.n_items() > 0 {
                 // Nothing playing — start from the list.
                 let pos = if shuffle.is_active() {
@@ -1413,7 +1429,7 @@ pub fn build_window(
                     pos,
                     &PlaybackContext {
                         model: sort_model.clone(),
-                        player: player.clone(),
+                        active_output: active_output.clone(),
                         album_art: album_art.clone(),
                         title_label: title_label.clone(),
                         artist_label: artist_label.clone(),
@@ -1436,21 +1452,117 @@ pub fn build_window(
         save_shuffle(btn.is_active());
     });
 
+    // ── Wire output selector row-click handler ──────────────────────
+    // Clicking a row in the output popover swaps the active output.
+    // Index 0 = "My Computer" (LocalOutput), index 1+ = saved MPD outputs.
+    {
+        let active_output = active_output.clone();
+        let parked_local = parked_local.clone();
+        let event_sender = event_sender.clone();
+        let volume_scale = hb.volume_scale.clone();
+        let _output_list = hb.output_list.clone();
+        let output_button = hb.output_button.clone();
+
+        hb.output_list
+            .connect_row_activated(move |list_box, activated_row| {
+                let idx = activated_row.index();
+
+                // ── Stop the current output before switching ──────────
+                active_output.borrow().stop();
+
+                if idx == 0 {
+                    // ── Switch to "My Computer" (LocalOutput) ─────────
+                    // If the local output is parked, move it back.
+                    if let Some(local) = parked_local.borrow_mut().take() {
+                        *active_output.borrow_mut() = local;
+                        info!("Switched to local output (My Computer)");
+                    }
+                    // else: already local, no-op.
+
+                    volume_scale.set_sensitive(true);
+                } else {
+                    // ── Switch to an MPD output ───────────────────────
+                    // Load saved outputs to find the one at this index.
+                    let saved = load_saved_outputs();
+                    let saved_idx = (idx - 1) as usize;
+                    if let Some(entry) = saved.get(saved_idx) {
+                        // Park the current output if it's local (index was 0 before).
+                        if parked_local.borrow().is_none() {
+                            // The current active_output is the local one — park it.
+                            let dummy: Box<dyn AudioOutput> = Box::new(MpdOutput::new(
+                                "_dummy",
+                                "127.0.0.1",
+                                1,
+                                event_sender.clone(),
+                            ));
+                            let local = std::mem::replace(&mut *active_output.borrow_mut(), dummy);
+                            *parked_local.borrow_mut() = Some(local);
+                        }
+                        // Now replace active_output with the selected MPD output.
+                        let mpd = MpdOutput::new(
+                            &entry.name,
+                            &entry.host,
+                            entry.port,
+                            event_sender.clone(),
+                        );
+                        *active_output.borrow_mut() = Box::new(mpd);
+                        info!(
+                            name = %entry.name,
+                            host = %entry.host,
+                            port = entry.port,
+                            "Switched to MPD output"
+                        );
+
+                        volume_scale.set_sensitive(false);
+                    }
+                }
+
+                // ── Update checkmark visibility on all rows ───────────
+                let mut row_idx = 0i32;
+                let mut child = list_box.first_child();
+                while let Some(c) = child {
+                    // Each row is a gtk::ListBoxRow wrapping our gtk::Box.
+                    if let Some(row_box) = c
+                        .first_child()
+                        .and_then(|inner| inner.downcast::<gtk::Box>().ok())
+                    {
+                        // The checkmark is the last child Image with widget name "output-check".
+                        let mut box_child = row_box.first_child();
+                        while let Some(bc) = box_child {
+                            if let Some(img) = bc.downcast_ref::<gtk::Image>() {
+                                if img.widget_name() == "output-check" {
+                                    img.set_visible(row_idx == idx);
+                                }
+                            }
+                            box_child = bc.next_sibling();
+                        }
+                    }
+                    row_idx += 1;
+                    child = c.next_sibling();
+                }
+
+                // Close the popover after selection.
+                if let Some(popover) = output_button.popover() {
+                    popover.popdown();
+                }
+            });
+    }
+
     // ── Wire volume scale ───────────────────────────────────────────
     {
-        let player = player.clone();
+        let active_output = active_output.clone();
         hb.volume_adj.connect_value_changed(move |adj| {
-            player.borrow_mut().set_volume(adj.value());
+            active_output.borrow_mut().set_volume(adj.value());
         });
     }
 
     // ── Wire progress scrubber (seek on user interaction) ───────────
     {
-        let player = player.clone();
+        let active_output = active_output.clone();
         let seeking = seeking.clone();
         hb.progress_adj.connect_value_changed(move |adj| {
             if !seeking.get() {
-                player.borrow().seek_to(adj.value() as u64);
+                active_output.borrow().seek_to(adj.value() as u64);
             }
         });
     }
@@ -1466,7 +1578,7 @@ pub fn build_window(
 
     // ── Wire tracklist double-click → load track ────────────────────
     {
-        let player = player.clone();
+        let active_output = active_output.clone();
         let media_ctrl = media_ctrl.clone();
         let album_art = hb.album_art.clone();
         let title_label = hb.title_label.clone();
@@ -1479,7 +1591,7 @@ pub fn build_window(
                 position,
                 &PlaybackContext {
                     model: sm.clone(),
-                    player: player.clone(),
+                    active_output: active_output.clone(),
                     album_art: album_art.clone(),
                     title_label: title_label.clone(),
                     artist_label: artist_label.clone(),
@@ -1803,7 +1915,7 @@ pub fn build_window(
 
     // ── Wire Next button ────────────────────────────────────────────
     {
-        let player = player.clone();
+        let active_output = active_output.clone();
         let media_ctrl = media_ctrl.clone();
         let album_art = hb.album_art.clone();
         let title_label = hb.title_label.clone();
@@ -1817,7 +1929,7 @@ pub fn build_window(
             advance_track(
                 &PlaybackContext {
                     model: sm.clone(),
-                    player: player.clone(),
+                    active_output: active_output.clone(),
                     album_art: album_art.clone(),
                     title_label: title_label.clone(),
                     artist_label: artist_label.clone(),
@@ -1832,7 +1944,7 @@ pub fn build_window(
 
     // ── Wire Previous button ────────────────────────────────────────
     {
-        let player = player.clone();
+        let active_output = active_output.clone();
         let media_ctrl = media_ctrl.clone();
         let album_art = hb.album_art.clone();
         let title_label = hb.title_label.clone();
@@ -1844,9 +1956,9 @@ pub fn build_window(
             let Some(pos) = current_pos.get() else { return };
 
             // If more than 3 s into the track, restart it.
-            let position_ms = player.borrow().position_ms().unwrap_or(0);
+            let position_ms = active_output.borrow().position_ms().unwrap_or(0);
             if position_ms > PREV_RESTART_THRESHOLD_MS {
-                player.borrow().seek_to(0);
+                active_output.borrow().seek_to(0);
                 return;
             }
 
@@ -1856,7 +1968,7 @@ pub fn build_window(
                     pos - 1,
                     &PlaybackContext {
                         model: sm.clone(),
-                        player: player.clone(),
+                        active_output: active_output.clone(),
                         album_art: album_art.clone(),
                         title_label: title_label.clone(),
                         artist_label: artist_label.clone(),
@@ -1865,7 +1977,7 @@ pub fn build_window(
                     },
                 );
             } else {
-                player.borrow().seek_to(0);
+                active_output.borrow().seek_to(0);
             }
         });
     }
@@ -1883,7 +1995,7 @@ pub fn build_window(
         let shuffle = hb.shuffle_button.clone();
         let seeking = seeking.clone();
         let media_ctrl = media_ctrl.clone();
-        let player = player.clone();
+        let active_output = active_output.clone();
         let sm = sort_model.clone();
         let current_pos = current_pos.clone();
 
@@ -2006,7 +2118,7 @@ pub fn build_window(
                                     pos,
                                     &PlaybackContext {
                                         model: sm.clone(),
-                                        player: player.clone(),
+                                        active_output: active_output.clone(),
                                         album_art: album_art.clone(),
                                         title_label: title_label.clone(),
                                         artist_label: artist_label.clone(),
@@ -2022,7 +2134,7 @@ pub fn build_window(
                         let advanced = advance_track(
                             &PlaybackContext {
                                 model: sm.clone(),
-                                player: player.clone(),
+                                active_output: active_output.clone(),
                                 album_art: album_art.clone(),
                                 title_label: title_label.clone(),
                                 artist_label: artist_label.clone(),

@@ -12,6 +12,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use tracing::warn;
 
+use crate::audio::output::AudioOutput;
 use crate::ui::header_bar::RepeatMode;
 use crate::ui::objects::TrackObject;
 
@@ -23,7 +24,7 @@ use super::album_art;
 /// tracks, update the now-playing UI, and track the current position.
 pub struct PlaybackContext {
     pub model: gtk::SortListModel,
-    pub player: Rc<RefCell<crate::audio::Player>>,
+    pub active_output: Rc<RefCell<Box<dyn AudioOutput>>>,
     pub album_art: gtk::Image,
     pub title_label: gtk::Label,
     pub artist_label: gtk::Label,
@@ -51,7 +52,7 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
 
     tracing::debug!("Playing track");
 
-    ctx.player.borrow().load_uri(&uri);
+    ctx.active_output.borrow().load_uri(&uri);
     ctx.title_label.set_label(&track.title());
     ctx.artist_label
         .set_label(&format!("{} \u{2014} {}", track.artist(), track.album()));

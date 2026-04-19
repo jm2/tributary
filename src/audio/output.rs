@@ -42,20 +42,22 @@ pub enum OutputType {
 /// All methods are designed to be called from the **GTK main thread**.
 /// Implementations that perform network I/O (e.g. MPD) must handle
 /// that internally without blocking the main thread.
-#[allow(dead_code)]
 pub trait AudioOutput {
     /// Human-readable display name for the output selector UI.
     ///
     /// Examples: "My Computer", "Living Room MPD".
+    #[allow(dead_code)]
     fn name(&self) -> &str;
 
     /// The output type, used for icon selection in the popover.
+    #[allow(dead_code)]
     fn output_type(&self) -> OutputType;
 
     /// Whether this output supports application-controlled volume.
     ///
     /// When `false`, the header bar volume slider should be disabled
     /// (greyed out).  MPD manages its own volume independently.
+    #[allow(dead_code)]
     fn supports_volume(&self) -> bool;
 
     // ── Playback controls ───────────────────────────────────────────
@@ -93,6 +95,7 @@ pub trait AudioOutput {
     // ── State queries ───────────────────────────────────────────────
 
     /// Non-blocking query of the current playback state.
+    #[allow(dead_code)]
     fn state(&self) -> PlayerState;
 
     /// Current playback position in milliseconds, or `None` if unknown.

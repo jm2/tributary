@@ -73,6 +73,16 @@ pub struct Player {
 }
 
 impl Player {
+    /// Return a clone of the event sender.
+    ///
+    /// Used to give `MpdOutput` (or other non-GStreamer outputs) a sender
+    /// that feeds into the **same** `player_rx` event loop, so position
+    /// ticks, state changes, and errors from any output are handled
+    /// uniformly by the single `PlayerEvent` consumer in `window.rs`.
+    pub fn event_sender(&self) -> async_channel::Sender<PlayerEvent> {
+        self.event_tx.clone()
+    }
+
     /// Initialise GStreamer, build the pipeline, and start the bus watch
     /// and position polling timer.
     ///

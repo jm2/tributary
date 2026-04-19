@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod client;
+pub mod geo;
 
 pub use api::RadioStation;
 pub use client::RadioBrowserClient;

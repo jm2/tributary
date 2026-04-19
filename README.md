@@ -49,6 +49,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | i18n/l10n framework (13 languages, auto locale detection) | ✅ |
 | Audio output selector (local + MPD, iTunes AirPlay-style) | ✅ |
 | MPD output backend (sink-only, TCP with security hardening) | ✅ |
+| Output switching (click to swap local ↔ MPD) | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
