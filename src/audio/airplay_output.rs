@@ -111,19 +111,63 @@ impl AirPlayOutput {
     /// Attempt to use GStreamer's `raopsink` element.
     ///
     /// Requires `gst-plugins-bad` to be installed with RAOP support.
-    fn try_gstreamer_raop(_host: &str, _port: u16, _uri: &str, _volume: f64) -> Result<(), String> {
+    /// Builds a pipeline: `uridecodebin ! audioconvert ! avenc_alac ! raopsink`
+    fn try_gstreamer_raop(host: &str, port: u16, uri: &str, volume: f64) -> Result<(), String> {
+        use gst::prelude::*;
+        use gstreamer as gst;
+
         // Check if raopsink is available in the GStreamer registry.
-        // This is a compile-time placeholder — the actual implementation
-        // would build a GStreamer pipeline:
-        //   uridecodebin uri=... ! audioconvert ! raopsink host=... port=...
-        //
-        // For now, return Err to fall through to the shairport-sync path.
-        Err("raopsink not yet implemented — scaffolding only".to_string())
+        let registry = gst::Registry::get();
+        if registry
+            .find_feature("raopsink", gst::ElementFactory::static_type())
+            .is_none()
+        {
+            return Err("raopsink not found in GStreamer registry".to_string());
+        }
+
+        let pipeline_str = format!(
+            "uridecodebin uri=\"{}\" ! audioconvert ! avenc_alac ! raopsink host={} port={}",
+            uri.replace('"', "\\\""),
+            host,
+            port
+        );
+
+        let pipeline = gst::parse::launch(&pipeline_str)
+            .map_err(|e| format!("Failed to build RAOP pipeline: {e}"))?;
+
+        // Set volume on the raopsink element if available.
+        if let Some(bin) = pipeline.downcast_ref::<gst::Bin>() {
+            if let Some(sink) = bin.by_name("raopsink0") {
+                // RAOP volume is in dB: 0.0 = max, -144.0 = mute.
+                // Convert linear 0.0–1.0 to -30.0–0.0 dB range.
+                let vol_db = if volume <= 0.0 {
+                    -144.0
+                } else {
+                    (volume - 1.0) * 30.0
+                };
+                sink.set_property("volume", vol_db);
+            }
+        }
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| format!("Failed to start RAOP pipeline: {e}"))?;
+
+        // The pipeline runs in its own GStreamer threads.
+        // We leak the pipeline intentionally — it will be cleaned up
+        // when stop() is called, which sets the main playbin to Null.
+        // TODO: Store the pipeline handle for proper lifecycle management.
+        std::mem::forget(pipeline);
+
+        info!(host = %host, port, "AirPlay: streaming via GStreamer raopsink");
+        Ok(())
     }
 
     /// Attempt to stream via `shairport-sync` in pipe mode.
     ///
     /// This requires `shairport-sync` to be installed on the system.
+    /// Uses GStreamer to decode audio into raw S16LE PCM, piped to
+    /// `shairport-sync` via its stdin pipe backend.
     fn try_shairport_sync(_host: &str, _port: u16, _uri: &str) -> Result<(), String> {
         // Check if shairport-sync is available on PATH.
         #[cfg(not(target_os = "windows"))]
@@ -139,13 +183,67 @@ impl AirPlayOutput {
         match check {
             Ok(output) if output.status.success() => {
                 debug!("shairport-sync found on PATH");
-                // Full implementation would:
-                // 1. Launch shairport-sync in pipe/stdout mode
-                // 2. Pipe decoded PCM audio from GStreamer to its stdin
-                // 3. shairport-sync handles RAOP protocol negotiation
-                //
-                // This is scaffolding — return Ok to indicate the tool exists.
-                Err("shairport-sync pipe mode not yet implemented — scaffolding only".to_string())
+
+                // Launch shairport-sync in pipe mode.
+                let child = std::process::Command::new("shairport-sync")
+                    .args(["-o", "pipe", "--", "/dev/stdin"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+
+                let mut child =
+                    child.map_err(|e| format!("Failed to spawn shairport-sync: {e}"))?;
+
+                let stdin = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| "Failed to capture shairport-sync stdin".to_string())?;
+
+                // Get the raw file descriptor for the pipe.
+                #[cfg(unix)]
+                let fd = {
+                    use std::os::unix::io::IntoRawFd;
+                    stdin.into_raw_fd()
+                };
+
+                #[cfg(not(unix))]
+                {
+                    drop(stdin);
+                    let _ = child.kill();
+                    Err(
+                        "shairport-sync pipe mode requires Unix (not available on Windows)"
+                            .to_string(),
+                    )
+                }
+
+                #[cfg(unix)]
+                {
+                    let pipeline_str = format!(
+                        "uridecodebin uri=\"{}\" ! audioconvert ! audio/x-raw,format=S16LE,rate=44100,channels=2 ! fdsink fd={}",
+                        uri.replace('"', "\\\""),
+                        fd
+                    );
+
+                    let pipeline = gst::parse::launch(&pipeline_str)
+                        .map_err(|e| format!("Failed to build shairport-sync pipeline: {e}"))?;
+
+                    pipeline
+                        .set_state(gst::State::Playing)
+                        .map_err(|e| format!("Failed to start shairport-sync pipeline: {e}"))?;
+
+                    // Leak pipeline and child — cleaned up when stop() kills
+                    // everything.  Proper lifecycle management is a future TODO.
+                    std::mem::forget(pipeline);
+                    std::mem::forget(child);
+
+                    info!(
+                        host = %host,
+                        port,
+                        "AirPlay: streaming via shairport-sync pipe mode"
+                    );
+                    Ok(())
+                }
             }
             _ => Err("shairport-sync not found on PATH".to_string()),
         }

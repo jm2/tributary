@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 use sea_orm::{EntityTrait, QueryFilter};
 
+use crate::audio::airplay_output::AirPlayOutput;
 use crate::audio::local_output::LocalOutput;
 use crate::audio::mpd_output::MpdOutput;
 use crate::audio::output::AudioOutput;
@@ -70,9 +71,33 @@ pub fn build_window(
     // ── Load custom CSS ──────────────────────────────────────────────
     load_css();
 
+    // ── Detect USB devices and add to sidebar ────────────────────────
+    let usb_devices = crate::device::usb::detect_usb_devices();
+
     // ── Sidebar sources ────────────────────────────────────────────────
     let sources = super::dummy_data::build_sources();
     let mut sources = sources;
+
+    // Add detected USB devices under a "Devices" category header.
+    if !usb_devices.is_empty() {
+        sources.push(SourceObject::header("Devices"));
+        for dev in &usb_devices {
+            let src =
+                SourceObject::source(&dev.name, "usb-device", "drive-removable-media-symbolic");
+            // Store the mount point path as the server_url for retrieval
+            // when the user clicks the device in the sidebar.
+            let obj = SourceObject::discovered(
+                &dev.name,
+                "usb-device",
+                &dev.mount_point.to_string_lossy(),
+            );
+            obj.set_connected(true);
+            obj.set_requires_password(false);
+            obj.set_icon_name("drive-removable-media-symbolic");
+            sources.push(obj);
+            let _ = src; // consumed above via discovered()
+        }
+    }
 
     // Load manually-added servers from servers.json.
     let saved_servers = load_saved_servers();
@@ -514,7 +539,33 @@ pub fn build_window(
                                     "network-wireless-symbolic",
                                     false,
                                 );
+                                // Store the host:port on the ListBoxRow's
+                                // widget name so the output selector can
+                                // extract it when the user clicks the row.
+                                if let Ok(parsed) = url::Url::parse(airplay_url) {
+                                    let host = parsed.host_str().unwrap_or("").to_string();
+                                    let port = parsed.port().unwrap_or(7000);
+                                    // The row is a gtk::Box; when appended to
+                                    // the ListBox it gets wrapped in a
+                                    // gtk::ListBoxRow — set the name on the
+                                    // Box and propagate it to the ListBoxRow
+                                    // after appending.
+                                    row.set_widget_name(&format!("{host}:{port}"));
+                                }
                                 hb_output_list_for_discovery.append(&row);
+                                // Propagate widget name to the wrapping ListBoxRow.
+                                if let Some(last_row) = hb_output_list_for_discovery.last_child() {
+                                    if let Some(list_row) =
+                                        last_row.downcast_ref::<gtk::ListBoxRow>()
+                                    {
+                                        if let Some(inner) = list_row.first_child() {
+                                            let name = inner.widget_name().to_string();
+                                            if !name.is_empty() && name != "GtkBox" {
+                                                list_row.set_widget_name(&name);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -1049,6 +1100,145 @@ pub fn build_window(
                         current_pos.set(None);
                     }
                 });
+                return;
+            }
+
+            // ── USB device source: scan and display music files ──────
+            if backend_type == "usb-device" {
+                let mount_point = src.server_url();
+                if mount_point.is_empty() {
+                    return;
+                }
+
+                *active_source_key.borrow_mut() = key.clone();
+
+                // Restore music column layout if coming from radio.
+                apply_radio_columns(&column_view, false);
+                let cfg = app_config.borrow();
+                preferences::apply_column_visibility(&column_view, &cfg.visible_columns);
+                preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
+                drop(cfg);
+
+                // Check if we already scanned this device.
+                let already_scanned = source_tracks.borrow().contains_key(&key);
+                if already_scanned {
+                    let st = source_tracks.borrow();
+                    let tracks = st.get(&key).cloned().unwrap_or_default();
+                    display_tracks(
+                        &tracks,
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
+                    current_pos.set(None);
+                } else {
+                    // Scan on a background thread to avoid blocking UI.
+                    let mount = mount_point.clone();
+                    let source_key = key.clone();
+                    let track_store = track_store.clone();
+                    let master_tracks = master_tracks.clone();
+                    let source_tracks = source_tracks.clone();
+                    let browser_widget = browser_widget.clone();
+                    let browser_state = browser_state.clone();
+                    let status_label = status_label.clone();
+                    let column_view = column_view.clone();
+                    let active_source_key = active_source_key.clone();
+                    let current_pos = current_pos.clone();
+
+                    // Serialisable track data for cross-thread transfer.
+                    // TrackObject is a GObject (not Send), so we send
+                    // tuples of raw data from the background thread and
+                    // construct TrackObjects on the GTK main thread.
+                    type ScanRow = (
+                        u32,
+                        String,
+                        u64,
+                        String,
+                        String,
+                        String,
+                        i32,
+                        String,
+                        u32,
+                        u32,
+                        String,
+                        String,
+                    );
+                    let (scan_tx, scan_rx) = async_channel::unbounded::<ScanRow>();
+
+                    // Background thread: walk the device filesystem.
+                    std::thread::spawn(move || {
+                        let mount_path = std::path::Path::new(&mount);
+                        for entry in walkdir::WalkDir::new(mount_path)
+                            .follow_links(true)
+                            .into_iter()
+                            .filter_map(|e| e.ok())
+                        {
+                            let path = entry.path();
+                            if !path.is_file() {
+                                continue;
+                            }
+                            if !crate::local::tag_parser::is_audio_file(path) {
+                                continue;
+                            }
+                            if let Ok(parsed) = crate::local::tag_parser::parse_audio_file(path) {
+                                let uri = url::Url::from_file_path(path)
+                                    .map(|u| u.to_string())
+                                    .unwrap_or_default();
+                                let row: ScanRow = (
+                                    parsed.track_number.unwrap_or(0),
+                                    parsed.title,
+                                    parsed.duration_secs.unwrap_or(0),
+                                    parsed.artist_name,
+                                    parsed.album_title,
+                                    parsed.genre.unwrap_or_else(|| "Unknown".to_string()),
+                                    parsed.year.unwrap_or(0),
+                                    parsed.date_modified.format("%Y-%m-%d").to_string(),
+                                    parsed.bitrate_kbps.unwrap_or(0),
+                                    parsed.sample_rate_hz.unwrap_or(0),
+                                    parsed.format,
+                                    uri,
+                                );
+                                let _ = scan_tx.try_send(row);
+                            }
+                        }
+                        // Close the sender to signal completion.
+                        drop(scan_tx);
+                    });
+
+                    // Collect results on the GTK main thread.
+                    glib::MainContext::default().spawn_local(async move {
+                        let mut objects = Vec::new();
+                        while let Ok(row) = scan_rx.recv().await {
+                            let obj = TrackObject::new(
+                                row.0, &row.1, row.2, &row.3, &row.4, &row.5, row.6, &row.7, row.8,
+                                row.9, 0, &row.10, &row.11,
+                            );
+                            objects.push(obj);
+                        }
+
+                        // Store for future source switches.
+                        source_tracks
+                            .borrow_mut()
+                            .insert(source_key.clone(), objects.clone());
+
+                        // Display if still the active source.
+                        if *active_source_key.borrow() == source_key {
+                            display_tracks(
+                                &objects,
+                                &track_store,
+                                &master_tracks,
+                                &browser_widget,
+                                &browser_state,
+                                &status_label,
+                                &column_view,
+                            );
+                            current_pos.set(None);
+                        }
+                    });
+                }
                 return;
             }
 
@@ -1591,14 +1781,50 @@ pub fn build_window(
 
                     volume_scale.set_sensitive(true);
                 } else {
-                    // ── Switch to an MPD output ───────────────────────
-                    // Load saved outputs to find the one at this index.
-                    let saved = load_saved_outputs();
-                    let saved_idx = (idx - 1) as usize;
-                    if let Some(entry) = saved.get(saved_idx) {
-                        // Park the current output if it's local (index was 0 before).
+                    // ── Determine if this is an MPD or AirPlay row ────
+                    // Check the icon on the activated row to distinguish
+                    // AirPlay (network-wireless-symbolic) from MPD
+                    // (network-server-symbolic).
+                    let is_airplay = activated_row
+                        .first_child()
+                        .and_then(|inner| inner.downcast::<gtk::Box>().ok())
+                        .and_then(|row_box| {
+                            row_box
+                                .first_child()
+                                .and_then(|i| i.downcast::<gtk::Image>().ok())
+                        })
+                        .and_then(|icon| icon.icon_name())
+                        .is_some_and(|n| n == "network-wireless-symbolic");
+
+                    if is_airplay {
+                        // ── Switch to AirPlay output ─────────────────
+                        // Extract the display name from the row label.
+                        let airplay_name = activated_row
+                            .first_child()
+                            .and_then(|inner| inner.downcast::<gtk::Box>().ok())
+                            .and_then(|row_box| {
+                                row_box
+                                    .first_child()
+                                    .and_then(|icon| icon.next_sibling())
+                                    .and_then(|l| l.downcast::<gtk::Label>().ok())
+                            })
+                            .map(|l| l.text().to_string())
+                            .unwrap_or_default();
+
+                        // Extract host:port from the row's widget name
+                        // (set during discovery, format "host:port").
+                        let host_port = activated_row.widget_name().to_string();
+                        let (host, port) = if let Some(colon) = host_port.rfind(':') {
+                            let h = &host_port[..colon];
+                            let p = host_port[colon + 1..].parse::<u16>().unwrap_or(7000);
+                            (h.to_string(), p)
+                        } else {
+                            // Fallback: try to parse from the name or use defaults.
+                            (host_port.clone(), 7000)
+                        };
+
+                        // Park the local output if needed.
                         if parked_local.borrow().is_none() {
-                            // The current active_output is the local one — park it.
                             let dummy: Box<dyn AudioOutput> = Box::new(MpdOutput::new(
                                 "_dummy",
                                 "127.0.0.1",
@@ -1608,22 +1834,76 @@ pub fn build_window(
                             let local = std::mem::replace(&mut *active_output.borrow_mut(), dummy);
                             *parked_local.borrow_mut() = Some(local);
                         }
-                        // Now replace active_output with the selected MPD output.
-                        let mpd = MpdOutput::new(
-                            &entry.name,
-                            &entry.host,
-                            entry.port,
-                            event_sender.clone(),
-                        );
-                        *active_output.borrow_mut() = Box::new(mpd);
+
+                        let airplay =
+                            AirPlayOutput::new(&airplay_name, &host, port, event_sender.clone());
+                        *active_output.borrow_mut() = Box::new(airplay);
                         info!(
-                            name = %entry.name,
-                            host = %entry.host,
-                            port = entry.port,
-                            "Switched to MPD output"
+                            name = %airplay_name,
+                            host = %host,
+                            port,
+                            "Switched to AirPlay output"
                         );
 
                         volume_scale.set_sensitive(false);
+                    } else {
+                        // ── Switch to an MPD output ───────────────────
+                        // Load saved outputs to find the one at this index.
+                        let saved = load_saved_outputs();
+                        // Count non-AirPlay rows before this one (excluding
+                        // index 0 = "My Computer") to get the saved_idx.
+                        let mut mpd_idx = 0usize;
+                        let mut child = list_box.first_child();
+                        let mut row_count = 0i32;
+                        while let Some(c) = child {
+                            if row_count > 0 && row_count < idx {
+                                // Check if this row is NOT an AirPlay row.
+                                let is_ap = c
+                                    .first_child()
+                                    .and_then(|inner| inner.downcast::<gtk::Box>().ok())
+                                    .and_then(|rb| {
+                                        rb.first_child()
+                                            .and_then(|i| i.downcast::<gtk::Image>().ok())
+                                    })
+                                    .and_then(|icon| icon.icon_name())
+                                    .is_some_and(|n| n == "network-wireless-symbolic");
+                                if !is_ap {
+                                    mpd_idx += 1;
+                                }
+                            }
+                            row_count += 1;
+                            child = c.next_sibling();
+                        }
+
+                        if let Some(entry) = saved.get(mpd_idx) {
+                            // Park the current output if it's local.
+                            if parked_local.borrow().is_none() {
+                                let dummy: Box<dyn AudioOutput> = Box::new(MpdOutput::new(
+                                    "_dummy",
+                                    "127.0.0.1",
+                                    1,
+                                    event_sender.clone(),
+                                ));
+                                let local =
+                                    std::mem::replace(&mut *active_output.borrow_mut(), dummy);
+                                *parked_local.borrow_mut() = Some(local);
+                            }
+                            let mpd = MpdOutput::new(
+                                &entry.name,
+                                &entry.host,
+                                entry.port,
+                                event_sender.clone(),
+                            );
+                            *active_output.borrow_mut() = Box::new(mpd);
+                            info!(
+                                name = %entry.name,
+                                host = %entry.host,
+                                port = entry.port,
+                                "Switched to MPD output"
+                            );
+
+                            volume_scale.set_sensitive(false);
+                        }
                     }
                 }
 
