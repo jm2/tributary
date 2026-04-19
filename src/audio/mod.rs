@@ -22,6 +22,7 @@
 //! inside a `glib::MainContext::default().spawn_local()` loop, identical
 //! to the pattern used by [`LibraryEngine`](crate::local::engine::LibraryEngine).
 
+pub mod airplay_output;
 pub mod local_output;
 pub mod mpd_output;
 pub mod output;

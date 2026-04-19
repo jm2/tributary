@@ -241,7 +241,9 @@ pub fn handle_radio_nearme(
 /// 2. State/province match (stations with state but no geo coords, e.g. WBAA)
 /// 3. Country-only fallback (remaining stations, sorted by votes)
 ///
-/// Results are merged and deduplicated by `stationuuid`, preserving tier order.
+/// Results are merged, deduplicated by `stationuuid`, and sorted by
+/// estimated distance using the Haversine formula with centroid lookups
+/// for stations that lack precise coordinates.
 #[allow(clippy::too_many_arguments)]
 fn fetch_and_display_nearme(
     rt_handle: tokio::runtime::Handle,
@@ -297,7 +299,29 @@ fn fetch_and_display_nearme(
                     merged.push(station);
                 }
             }
-            info!(total = merged.len(), "Near Me merged results");
+            info!(
+                total = merged.len(),
+                "Near Me merged results (before geo sort)"
+            );
+
+            // ── Sort by estimated distance using Haversine ──────────
+            // For each station, compute distance from the user's location:
+            // - If station has geo_lat/geo_long → use actual coordinates
+            // - If station has state (US) → use state centroid
+            // - If station has countrycode → use country centroid
+            // - Otherwise → f64::MAX (sorts to end)
+            let user_lat = geo.latitude;
+            let user_lon = geo.longitude;
+
+            merged.sort_by(|a, b| {
+                let dist_a = estimate_station_distance(a, user_lat, user_lon);
+                let dist_b = estimate_station_distance(b, user_lat, user_lon);
+                dist_a
+                    .partial_cmp(&dist_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            info!(total = merged.len(), "Near Me results sorted by distance");
 
             let json = serde_json::to_string(&merged).unwrap_or_default();
             let _ = stations_tx.send(json).await;
@@ -325,4 +349,43 @@ fn fetch_and_display_nearme(
             current_pos.set(None);
         }
     });
+}
+
+/// Estimate the distance (km) from the user to a radio station.
+///
+/// Uses the best available location data:
+/// 1. Station's `geo_lat`/`geo_long` if present → exact Haversine distance
+/// 2. Station's `state` field (US stations) → state centroid distance
+/// 3. Station's `countrycode` → country centroid distance
+/// 4. No location data → `f64::MAX` (sorts to the end)
+fn estimate_station_distance(
+    station: &crate::radio::RadioStation,
+    user_lat: f64,
+    user_lon: f64,
+) -> f64 {
+    use crate::radio::geo::{country_centroid, haversine_km, us_state_centroid};
+
+    // Best: actual coordinates from the station record.
+    if let (Some(lat), Some(lon)) = (station.geo_lat, station.geo_long) {
+        if lat != 0.0 || lon != 0.0 {
+            return haversine_km(user_lat, user_lon, lat, lon);
+        }
+    }
+
+    // Good: US state centroid (catches stations like WBAA in Indiana).
+    if !station.state.is_empty() && station.countrycode == "US" {
+        if let Some((lat, lon)) = us_state_centroid(&station.state) {
+            return haversine_km(user_lat, user_lon, lat, lon);
+        }
+    }
+
+    // Fallback: country centroid.
+    if !station.countrycode.is_empty() {
+        if let Some((lat, lon)) = country_centroid(&station.countrycode) {
+            return haversine_km(user_lat, user_lon, lat, lon);
+        }
+    }
+
+    // No location data at all.
+    f64::MAX
 }

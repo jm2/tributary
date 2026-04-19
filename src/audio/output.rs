@@ -10,12 +10,10 @@
 //! - [`MpdOutput`](super::mpd_output::MpdOutput) — sends MPD protocol
 //!   commands over TCP to a remote (or local) MPD server.
 //!
-//! # Planned implementations
-//!
-//! - **AirPlay 2 output** — stream to AirPlay receivers discovered via
-//!   `_raop._tcp.local.` mDNS browsing (shairport-sync compatible).
-//!   Discovered devices will appear automatically in the output selector
-//!   popover alongside manually-added MPD sinks.
+//! - [`AirPlayOutput`](super::airplay_output::AirPlayOutput) — streams
+//!   to AirPlay (RAOP) receivers discovered via `_raop._tcp.local.`
+//!   mDNS browsing.  Discovered devices appear automatically in the
+//!   output selector popover.
 //!
 //! # Architecture
 //!
@@ -34,7 +32,9 @@ pub enum OutputType {
     Local,
     /// MPD server (Music Player Daemon) over TCP.
     Mpd,
-    // Future: AirPlay, PulseAudio, PipeWire, JACK, …
+    /// AirPlay receiver (RAOP protocol) discovered via mDNS.
+    AirPlay,
+    // Future: PulseAudio, PipeWire, JACK, …
 }
 
 /// Trait that all audio output backends implement.

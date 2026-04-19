@@ -464,11 +464,61 @@ pub fn build_window(
         let browser_state_for_discovery = browser_state.clone();
         let status_label_for_discovery = status_label.clone();
         let column_view_for_discovery = column_view.clone();
+        let hb_output_list_for_discovery = hb.output_list.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = discovery_rx.recv().await {
                 match event {
                     crate::discovery::DiscoveryEvent::Found(server) => {
+                        // ── AirPlay devices go to the output selector, not sidebar ──
+                        if server.service_type == "airplay" {
+                            // Parse host:port from the URL for the output selector.
+                            // The URL looks like "http://host:port".
+                            let airplay_url = &server.url;
+                            let airplay_name = server.name.clone();
+
+                            // Dedup: check if this AirPlay device is already in outputs.
+                            let already_in_outputs = {
+                                let mut child = hb_output_list_for_discovery.first_child();
+                                let mut found = false;
+                                while let Some(c) = child {
+                                    if let Some(row_box) = c
+                                        .first_child()
+                                        .and_then(|inner| inner.downcast::<gtk::Box>().ok())
+                                    {
+                                        // Check the label (second child of the row box).
+                                        if let Some(label) = row_box
+                                            .first_child()
+                                            .and_then(|icon| icon.next_sibling())
+                                            .and_then(|l| l.downcast::<gtk::Label>().ok())
+                                        {
+                                            if label.text() == airplay_name {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    child = c.next_sibling();
+                                }
+                                found
+                            };
+
+                            if !already_in_outputs {
+                                info!(
+                                    name = %airplay_name,
+                                    url = %airplay_url,
+                                    "AirPlay receiver discovered — adding to output selector"
+                                );
+                                let row = header_bar::build_output_row(
+                                    &airplay_name,
+                                    "network-wireless-symbolic",
+                                    false,
+                                );
+                                hb_output_list_for_discovery.append(&row);
+                            }
+                            continue;
+                        }
+
                         // Dedup: check if this URL is already in the sidebar.
                         let already_exists = (0..store.n_items()).any(|i| {
                             store

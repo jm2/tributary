@@ -5,7 +5,6 @@
 //! Uses compiled-in centroid lookup tables — no external API dependency.
 
 /// Earth's mean radius in kilometres.
-#[allow(dead_code)]
 const EARTH_RADIUS_KM: f64 = 6371.0;
 
 /// Compute the great-circle distance between two points on Earth
@@ -19,7 +18,6 @@ const EARTH_RADIUS_KM: f64 = 6371.0;
 /// # Returns
 ///
 /// Distance in kilometres.
-#[allow(dead_code)]
 pub fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let d_lat = (lat2 - lat1).to_radians();
     let d_lon = (lon2 - lon1).to_radians();
@@ -42,7 +40,6 @@ pub fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 ///
 /// Returns `Some((latitude, longitude))` for recognised state names
 /// (case-insensitive), or `None` if the state is not found.
-#[allow(dead_code)]
 pub fn us_state_centroid(state: &str) -> Option<(f64, f64)> {
     let lower = state.to_lowercase();
     US_STATE_CENTROIDS
@@ -56,7 +53,6 @@ pub fn us_state_centroid(state: &str) -> Option<(f64, f64)> {
 ///
 /// Returns `Some((latitude, longitude))` for recognised codes
 /// (case-insensitive), or `None` if the code is not found.
-#[allow(dead_code)]
 pub fn country_centroid(country_code: &str) -> Option<(f64, f64)> {
     let upper = country_code.to_uppercase();
     COUNTRY_CENTROIDS
@@ -68,7 +64,6 @@ pub fn country_centroid(country_code: &str) -> Option<(f64, f64)> {
 // ── US state centroids (approximate geographic centres) ─────────────
 // Source: Wikipedia / US Census Bureau centroid data.
 
-#[allow(dead_code)]
 const US_STATE_CENTROIDS: &[(&str, f64, f64)] = &[
     ("alabama", 32.806671, -86.791130),
     ("alaska", 63.588753, -154.493062),
@@ -128,7 +123,6 @@ const US_STATE_CENTROIDS: &[(&str, f64, f64)] = &[
 // ISO 3166-1 alpha-2 codes.  Covers the top ~60 countries by radio
 // station count in the Radio-Browser database.
 
-#[allow(dead_code)]
 const COUNTRY_CENTROIDS: &[(&str, f64, f64)] = &[
     ("AD", 42.546245, 1.601554),
     ("AE", 23.424076, 53.847818),

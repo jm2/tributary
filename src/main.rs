@@ -54,6 +54,8 @@ mod audio;
 mod daap;
 mod db;
 mod desktop_integration;
+#[allow(dead_code)]
+mod device;
 mod discovery;
 #[allow(dead_code)]
 mod jellyfin;

@@ -1,8 +1,10 @@
-//! Zero-config network discovery for Subsonic, Jellyfin, Plex, and DAAP servers.
+//! Zero-config network discovery for Subsonic, Jellyfin, Plex, DAAP servers,
+//! and AirPlay (RAOP) audio receivers.
 //!
 //! - **Subsonic:** mDNS browse for `_subsonic._tcp.local.`
 //! - **Plex:** mDNS browse for `_plexmediasvr._tcp.local.`
 //! - **DAAP:** mDNS browse for `_daap._tcp.local.`
+//! - **AirPlay:** mDNS browse for `_raop._tcp.local.`
 //! - **Jellyfin:** UDP broadcast `"Who is JellyfinServer?"` to `255.255.255.255:7359`
 //!
 //! All discovered servers are streamed to the GTK main thread via a
@@ -47,6 +49,8 @@ pub enum DiscoveryEvent {
 const SUBSONIC_SERVICE: &str = "_subsonic._tcp.local.";
 const PLEX_SERVICE: &str = "_plexmediasvr._tcp.local.";
 const DAAP_SERVICE: &str = "_daap._tcp.local.";
+/// AirPlay (RAOP) receivers for audio output streaming.
+const RAOP_SERVICE: &str = "_raop._tcp.local.";
 
 /// Jellyfin UDP discovery port.
 const JELLYFIN_DISCOVERY_PORT: u16 = 7359;
@@ -124,12 +128,20 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
         }
     };
 
-    if subsonic_rx.is_none() && plex_rx.is_none() && daap_rx.is_none() {
+    let raop_rx = match daemon.browse(RAOP_SERVICE) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            warn!("mDNS browse failed for {RAOP_SERVICE}: {e}");
+            None
+        }
+    };
+
+    if subsonic_rx.is_none() && plex_rx.is_none() && daap_rx.is_none() && raop_rx.is_none() {
         warn!("No mDNS services could be browsed");
         return;
     }
 
-    info!("mDNS discovery started for Subsonic + Plex + DAAP");
+    info!("mDNS discovery started for Subsonic + Plex + DAAP + AirPlay");
 
     // `seen` maps `key` → `url` so we can reconstruct the URL on removal.
     let mut seen: HashMap<String, String> = HashMap::new();
@@ -172,6 +184,13 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
             while let Ok(event) = rx.try_recv() {
                 got_event = true;
                 process_mdns_event(event, "daap", &mut seen, &tx);
+            }
+        }
+
+        if let Some(ref rx) = raop_rx {
+            while let Ok(event) = rx.try_recv() {
+                got_event = true;
+                process_mdns_event(event, "airplay", &mut seen, &tx);
             }
         }
 

@@ -50,6 +50,9 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Audio output selector (local + MPD, iTunes AirPlay-style) | ✅ |
 | MPD output backend (sink-only, TCP with security hardening) | ✅ |
 | Output switching (click to swap local ↔ MPD) | ✅ |
+| AirPlay output (RAOP discovery + scaffolding) | 🔧 Scaffolding |
+| Geo-distance sorting for Stations Near Me | ✅ |
+| USB device detection (Linux, macOS, Windows) | 🔧 Scaffolding |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
