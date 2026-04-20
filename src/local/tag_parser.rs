@@ -68,7 +68,7 @@ pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
 
     let album_artist_name = tag.and_then(|t| {
         use lofty::tag::ItemKey;
-        t.get_string(&ItemKey::AlbumArtist).map(str::to_string)
+        t.get_string(ItemKey::AlbumArtist).map(str::to_string)
     });
 
     let album_title = tag
@@ -76,7 +76,11 @@ pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
         .unwrap_or_else(|| "Unknown Album".to_string());
 
     let genre = tag.and_then(|t| t.genre().map(|s| s.to_string()));
-    let year = tag.and_then(|t| t.year());
+    let year = tag.and_then(|t| {
+        use lofty::tag::ItemKey;
+        t.get_string(ItemKey::Year)
+            .and_then(|s| s.parse::<i32>().ok())
+    });
     let track_number = tag.and_then(|t| t.track());
     let disc_number = tag.and_then(|t| t.disk());
 
@@ -108,7 +112,7 @@ pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
         album_artist_name,
         album_title,
         genre,
-        year: year.map(|y| y as i32),
+        year,
         track_number,
         disc_number,
         duration_secs,

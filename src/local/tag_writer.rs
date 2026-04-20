@@ -119,9 +119,13 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
 
     if let Some(ref year_str) = edits.year {
         if year_str.is_empty() {
-            tag.remove_year();
-        } else if let Ok(y) = year_str.parse::<u32>() {
-            tag.set_year(y);
+            tag.remove_key(lofty::tag::ItemKey::Year);
+        } else if let Ok(_y) = year_str.parse::<u32>() {
+            use lofty::tag::{ItemKey, ItemValue, TagItem};
+            tag.insert(TagItem::new(
+                ItemKey::Year,
+                ItemValue::Text(year_str.clone()),
+            ));
         }
     }
 

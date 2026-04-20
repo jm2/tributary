@@ -157,7 +157,7 @@ fn main() {
     let raw_locale = sys_locale::get_locale().unwrap_or_else(|| "en".to_string());
     let normalised = raw_locale.replace('_', "-");
     let available = rust_i18n::available_locales!();
-    let locale = if available.contains(&normalised.as_str()) {
+    let locale = if available.iter().any(|l| l == normalised.as_str()) {
         normalised
     } else {
         normalised.split('-').next().unwrap_or("en").to_string()

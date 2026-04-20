@@ -320,6 +320,7 @@ Write-Info "All dependency checks passed."
 if (-not $NoCargoBuild) {
     Write-Info "Building Tributary (release) for $RustTarget..."
     cargo build --release --target $RustTarget
+    if ($LASTEXITCODE -ne 0) { Write-Err "cargo build failed." }
 }
 else {
     Write-Info "Skipping cargo build (-NoCargoBuild specified)."

@@ -41,7 +41,11 @@ impl SubsonicClient {
             let mut hasher = Md5::new();
             hasher.update(password.as_bytes());
             hasher.update(salt.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hasher.finalize().iter().fold(String::new(), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
         };
 
         let http = Client::builder()
