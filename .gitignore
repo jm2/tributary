@@ -31,3 +31,6 @@ cargo-sources.json
 # Fuzz artifacts
 fuzz/artifacts/
 fuzz/corpus/
+
+# Winget manifests
+/manifests/
