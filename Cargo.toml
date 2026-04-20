@@ -44,7 +44,7 @@ sea-orm = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "m
 sea-orm-migration = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 
 # Local backend — audio tag parsing
-lofty = "0.22"
+lofty = "0.24"
 
 # Local backend — filesystem watching
 notify = "8"
@@ -60,21 +60,21 @@ dirs = "6"
 fastrand = "2"
 
 # Internationalisation (i18n)
-rust-i18n = "3"
+rust-i18n = "4"
 sys-locale = "0.3"
 
 # Subsonic / Jellyfin / Plex API client
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "rustls", "blocking"], default-features = false }
 
 # URL percent-encoding (Plex auth form body)
 urlencoding = "2"
 
 # JSON value type (Jellyfin ImageTags parsing)
 serde_json = "1"
-md-5 = "0.10"
+md-5 = "0.11"
 
 # mDNS service discovery (Subsonic/DAAP auto-detect)
-mdns-sd = "0.12"
+mdns-sd = "0.19"
 
 # DAAP/DMAP binary protocol parsing
 nom = "8"
