@@ -25,7 +25,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Playback controls (play/pause, next/prev, seek, volume) | ✅ |
 | Shuffle & repeat (off / all / one) with persistence | ✅ |
 | Column sort persistence | ✅ |
-| Subsonic / Navidrome backend | ✅ |
+| Subsonic / Navidrome / Nextcloud Music backend | ✅ |
 | Jellyfin backend | ✅ |
 | Plex backend | ✅ |
 | DAAP / iTunes Sharing backend (DMAP binary protocol) | ✅ |
@@ -327,7 +327,7 @@ src/
 ├── subsonic/
 │   ├── mod.rs              # Subsonic backend root
 │   ├── api.rs              # JSON response types (Subsonic REST API)
-│   ├── client.rs           # HTTP client (MD5 token auth, request building)
+│   ├── client.rs           # HTTP client (token + legacy auth, request building)
 │   └── backend.rs          # MediaBackend impl (in-memory cache)
 ├── jellyfin/
 │   ├── mod.rs              # Jellyfin backend root

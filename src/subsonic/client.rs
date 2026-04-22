@@ -3,7 +3,7 @@
 
 use md5::{Digest, Md5};
 use reqwest::Client;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::architecture::backend::BackendResult;
@@ -17,36 +17,53 @@ const API_VERSION: &str = "1.16.1";
 /// Client identifier sent with every request.
 const CLIENT_NAME: &str = "Tributary";
 
+/// Authentication mode used for API requests.
+#[derive(Clone)]
+enum AuthMode {
+    /// Modern token/salt authentication (Subsonic API ≥ 1.13.0).
+    /// Sends `t=md5(password+salt)` and `s=salt`.
+    Token { token: String, salt: String },
+
+    /// Legacy plaintext authentication for servers that do not support
+    /// token auth (e.g. Nextcloud Music).
+    /// Sends `p=enc:<hex-encoded password>`.
+    /// Only permitted over HTTPS.
+    Plaintext { hex_password: String },
+}
+
+impl std::fmt::Debug for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Token { .. } => f.debug_struct("Token").finish_non_exhaustive(),
+            Self::Plaintext { .. } => f.debug_struct("Plaintext").finish_non_exhaustive(),
+        }
+    }
+}
+
 /// Holds credentials and a reusable `reqwest::Client`.
 pub struct SubsonicClient {
     base_url: Url,
     username: String,
-    /// Pre-computed: md5(password + salt)
-    token: String,
-    salt: String,
+    /// Raw password retained so we can switch auth modes on fallback.
+    password: String,
+    auth: AuthMode,
     http: Client,
 }
 
 impl SubsonicClient {
     /// Build a new client.  Generates a random salt and computes the
     /// authentication token immediately (no network call).
+    ///
+    /// Starts in **token auth** mode.  Call
+    /// [`switch_to_plaintext_auth`] to fall back to hex-encoded
+    /// plaintext (only allowed over HTTPS).
     pub fn new(server_url: &str, username: &str, password: &str) -> BackendResult<Self> {
         let base_url = Url::parse(server_url).map_err(|e| BackendError::ConnectionFailed {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
         })?;
 
-        let salt: String = (0..12).map(|_| fastrand::alphanumeric()).collect();
-        let token = {
-            let mut hasher = Md5::new();
-            hasher.update(password.as_bytes());
-            hasher.update(salt.as_bytes());
-            hasher.finalize().iter().fold(String::new(), |mut acc, b| {
-                use std::fmt::Write;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            })
-        };
+        let auth = Self::make_token_auth(password);
 
         let http = Client::builder()
             .user_agent(CLIENT_NAME)
@@ -61,10 +78,46 @@ impl SubsonicClient {
         Ok(Self {
             base_url,
             username: username.to_string(),
-            token,
-            salt,
+            password: password.to_string(),
+            auth,
             http,
         })
+    }
+
+    /// Switch to hex-encoded plaintext authentication.
+    ///
+    /// Returns an error if the server URL is not HTTPS — we refuse
+    /// to send even hex-encoded passwords over unencrypted connections.
+    pub fn switch_to_plaintext_auth(&mut self) -> BackendResult<()> {
+        if self.base_url.scheme() != "https" {
+            return Err(BackendError::ConnectionFailed {
+                message: format!(
+                    "Refusing to use plaintext authentication over insecure connection ({}). \
+                     This server requires legacy auth which sends the password in the URL. \
+                     Please use HTTPS.",
+                    self.base_url.scheme(),
+                ),
+                source: None,
+            });
+        }
+
+        let hex_password = self
+            .password
+            .as_bytes()
+            .iter()
+            .fold(String::new(), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
+
+        warn!(
+            server = %self.base_url,
+            "Switching to hex-encoded plaintext auth (server does not support token auth)"
+        );
+
+        self.auth = AuthMode::Plaintext { hex_password };
+        Ok(())
     }
 
     /// Build a full API URL with authentication query parameters.
@@ -78,8 +131,17 @@ impl SubsonicClient {
         {
             let mut q = url.query_pairs_mut();
             q.append_pair("u", &self.username);
-            q.append_pair("t", &self.token);
-            q.append_pair("s", &self.salt);
+
+            match &self.auth {
+                AuthMode::Token { token, salt } => {
+                    q.append_pair("t", token);
+                    q.append_pair("s", salt);
+                }
+                AuthMode::Plaintext { hex_password } => {
+                    q.append_pair("p", &format!("enc:{hex_password}"));
+                }
+            }
+
             q.append_pair("v", API_VERSION);
             q.append_pair("c", CLIENT_NAME);
             q.append_pair("f", "json");
@@ -153,14 +215,18 @@ impl SubsonicClient {
                 .map(|e| format!("Subsonic error {}: {}", e.code, e.message))
                 .unwrap_or_else(|| "Unknown Subsonic error".into());
 
-            // Code 40 = wrong credentials
-            if envelope
-                .response
-                .error
-                .as_ref()
-                .is_some_and(|e| e.code == 40)
-            {
-                return Err(BackendError::AuthenticationFailed { message: msg });
+            if let Some(err) = &envelope.response.error {
+                match err.code {
+                    // Code 40 = wrong credentials
+                    40 => {
+                        return Err(BackendError::AuthenticationFailed { message: msg });
+                    }
+                    // Code 41 = token auth not supported
+                    41 => {
+                        return Err(BackendError::TokenAuthNotSupported { message: msg });
+                    }
+                    _ => {}
+                }
             }
 
             return Err(BackendError::ConnectionFailed {
@@ -170,5 +236,23 @@ impl SubsonicClient {
         }
 
         Ok(envelope)
+    }
+
+    // ── Internal helpers ────────────────────────────────────────────────
+
+    /// Compute token auth params from a password.
+    fn make_token_auth(password: &str) -> AuthMode {
+        let salt: String = (0..12).map(|_| fastrand::alphanumeric()).collect();
+        let token = {
+            let mut hasher = Md5::new();
+            hasher.update(password.as_bytes());
+            hasher.update(salt.as_bytes());
+            hasher.finalize().iter().fold(String::new(), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
+        };
+        AuthMode::Token { token, salt }
     }
 }

@@ -60,6 +60,14 @@ impl SubsonicBackend {
     /// Connect to a Subsonic server, authenticate, and fetch the full
     /// library into memory.
     ///
+    /// Authentication strategy:
+    /// 1. Try **token auth** first (`t=md5(password+salt)` + `s=salt`).
+    /// 2. If the server returns error code **41** ("token auth not
+    ///    supported" — e.g. Nextcloud Music), automatically retry with
+    ///    **hex-encoded plaintext** auth (`p=enc:<hex>`).
+    /// 3. The plaintext fallback is **refused over plain HTTP** — only
+    ///    HTTPS connections are permitted for this mode.
+    ///
     /// # Arguments
     /// * `name` — display name for the sidebar (e.g. "Navidrome (home)")
     /// * `server_url` — base URL including scheme (e.g. `https://music.example.com`)
@@ -70,11 +78,27 @@ impl SubsonicBackend {
         username: &str,
         password: &str,
     ) -> BackendResult<Self> {
-        let client = SubsonicClient::new(server_url, username, password)?;
+        let mut client = SubsonicClient::new(server_url, username, password)?;
 
-        // Verify connectivity.
-        client.get("ping.view").await?;
-        info!(server = %server_url, "Subsonic ping OK");
+        // Try token auth first (modern, recommended).
+        match client.get("ping.view").await {
+            Ok(_) => {
+                info!(server = %server_url, "Subsonic ping OK (token auth)");
+            }
+            Err(BackendError::TokenAuthNotSupported { message }) => {
+                // Server doesn't support token auth — fall back to
+                // hex-encoded plaintext, but only over HTTPS.
+                info!(
+                    server = %server_url,
+                    reason = %message,
+                    "Token auth rejected, falling back to hex-encoded plaintext"
+                );
+                client.switch_to_plaintext_auth()?;
+                client.get("ping.view").await?;
+                info!(server = %server_url, "Subsonic ping OK (plaintext auth)");
+            }
+            Err(e) => return Err(e),
+        }
 
         let backend = Self {
             display_name: name.to_string(),

@@ -22,6 +22,12 @@ pub enum BackendError {
     #[error("Authentication failed: {message}")]
     AuthenticationFailed { message: String },
 
+    /// The server does not support token-based authentication
+    /// (Subsonic error code 41).  The caller should retry with
+    /// plaintext / hex-encoded credentials.
+    #[error("Token authentication not supported: {message}")]
+    TokenAuthNotSupported { message: String },
+
     /// A requested entity was not found.
     #[error("{entity_type} not found: {id}")]
     NotFound { entity_type: String, id: Uuid },

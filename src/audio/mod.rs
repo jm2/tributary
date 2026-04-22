@@ -461,21 +461,31 @@ fn save_volume(level: f64) {
 pub fn redact_url_secrets(uri: &str) -> String {
     // Note: "s" is only redacted when "t" is also present (Subsonic salt+token pair).
     // This avoids false positives on unrelated URLs that happen to have an "s" param.
+    // "p" is the legacy plaintext password parameter (used by Nextcloud Music etc.).
     const SENSITIVE_PARAMS: &[&str] = &["X-Plex-Token", "api_key"];
     const SUBSONIC_TOKEN_PARAMS: &[&str] = &["t", "s"];
+    const SUBSONIC_PASSWORD_PARAMS: &[&str] = &["p"];
 
     let Ok(mut url) = url::Url::parse(uri) else {
         return uri.to_string();
     };
 
-    // Check if this looks like a Subsonic URL (has both "t" and "s" params).
+    // Check if this looks like a Subsonic URL.
+    // Token auth: has "t" (token) — we also redact "s" (salt).
+    // Plaintext auth: has "p" AND "u" AND "c" (Subsonic always sends
+    // username and client name alongside "p").  We require all three
+    // to avoid false positives on unrelated URLs with a "p" parameter.
     let has_subsonic_token = url.query_pairs().any(|(k, _)| k == "t");
+    let has_subsonic_password = url.query_pairs().any(|(k, _)| k == "p")
+        && url.query_pairs().any(|(k, _)| k == "u")
+        && url.query_pairs().any(|(k, _)| k == "c");
 
     let pairs: Vec<(String, String)> = url
         .query_pairs()
         .map(|(k, v)| {
             let should_redact = SENSITIVE_PARAMS.contains(&k.as_ref())
-                || (has_subsonic_token && SUBSONIC_TOKEN_PARAMS.contains(&k.as_ref()));
+                || (has_subsonic_token && SUBSONIC_TOKEN_PARAMS.contains(&k.as_ref()))
+                || (has_subsonic_password && SUBSONIC_PASSWORD_PARAMS.contains(&k.as_ref()));
             let v = if should_redact {
                 "REDACTED".to_string()
             } else {
@@ -588,6 +598,31 @@ mod tests {
         let url = "https://example.com/api?s=something&page=1";
         let redacted = redact_url_secrets(url);
         assert!(redacted.contains("s=something"));
+    }
+
+    #[test]
+    fn test_redact_subsonic_plaintext_password() {
+        // Nextcloud Music style: p=enc:<hex> with no t= or s= params.
+        let url = "https://nc.example.com/apps/music/subsonic/rest/ping.view?u=admin&p=enc%3A68656c6c6f&v=1.16.1&c=Tributary&f=json";
+        let redacted = redact_url_secrets(url);
+        assert!(
+            redacted.contains("p=REDACTED"),
+            "p= param should be redacted: {redacted}"
+        );
+        assert!(redacted.contains("u=admin")); // username not redacted
+        assert!(redacted.contains("v=1.16.1"));
+        assert!(!redacted.contains("68656c6c6f")); // hex password must not appear
+    }
+
+    #[test]
+    fn test_redact_p_param_without_subsonic_context() {
+        // A "p" parameter on a non-Subsonic URL should NOT be redacted.
+        let url = "https://example.com/api?p=page1&limit=50";
+        let redacted = redact_url_secrets(url);
+        assert!(
+            redacted.contains("p=page1"),
+            "unrelated p= should not be redacted: {redacted}"
+        );
     }
 
     // ── Volume persistence helpers ──────────────────────────────────

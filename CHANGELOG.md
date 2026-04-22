@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.1] — Unreleased
 
+### Added
+- **Nextcloud Music (Subsonic) compatibility** — Tributary now auto-detects servers that require legacy plaintext authentication (Subsonic error code 41) and automatically falls back to hex-encoded password auth (`p=enc:<hex>`). Token-based auth (`t=`/`s=`) is always tried first; plaintext fallback is only used when the server explicitly rejects token auth, and is **refused over plain HTTP** — only HTTPS connections are permitted. This enables Nextcloud Music, older Subsonic servers, and other legacy-auth-only implementations. (#25)
+
 ### Changed
 - **Modularized `window.rs` (3,730 → 1,776 lines)** — Refactored the monolithic main window module into 6 focused sub-modules for improved maintainability and AI-assisted development:
   - `window_state.rs` — Shared `WindowState` struct bundling 16+ `Rc<RefCell<…>>` UI state fields for dependency injection across modules.
@@ -16,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `discovery_handler.rs` — mDNS/DNS-SD event handler (sidebar + output list add/remove for discovered servers, AirPlay receivers, and Chromecast devices). Deduplicated device-check logic into shared helpers.
   - `source_connect.rs` — Sidebar selection-changed handler (source switching for local, playlist, USB, radio, connected remote, and unauthenticated remote sources with auth dialog flows).
 - **Dead code cleanup** — Removed orphaned `disable_popover_scrollbars` from `window.rs` (now only in `context_menu.rs`). Cleaned up unused imports (`sea_orm`, `AirPlayOutput`, `ChromecastOutput`, `MpdOutput`, radio functions, `show_auth_dialog`) that migrated to sub-modules.
+
+### Security
+- **Plaintext password redacted from logs** — `redact_url_secrets()` now masks the Subsonic `p=` query parameter (hex-encoded password used in legacy auth) before it reaches log output. Detection uses a multi-param heuristic (`p` + `u` + `c` present) to avoid false positives on unrelated URLs. Added 2 new unit tests.
+- **`AuthMode` Debug hardened** — Replaced the `#[derive(Debug)]` on the internal `AuthMode` enum with a manual `Debug` impl that redacts all secret fields (token, salt, hex password), preventing accidental credential leakage if the struct is ever debug-formatted.
 
 ## [0.4.0] — 2026-04-19
 
