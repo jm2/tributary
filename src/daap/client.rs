@@ -163,7 +163,7 @@ impl DaapClient {
         );
         debug!(url = %update_url, "DAAP: requesting update");
 
-        let resp =
+        let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
             http.get(&update_url)
                 .send()
                 .await
@@ -202,7 +202,7 @@ impl DaapClient {
         );
         debug!(url = %databases_url, "DAAP: requesting databases");
 
-        let resp =
+        let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
             http.get(&databases_url)
                 .send()
                 .await
@@ -277,7 +277,7 @@ impl DaapClient {
         );
         debug!(url = %url, "DAAP: fetching tracks");
 
-        let resp =
+        let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
             self.http
                 .get(&url)
                 .send()
@@ -364,7 +364,7 @@ impl DaapClient {
             self.base_url.as_str().trim_end_matches('/'),
             self.session_id
         );
-        match self.http.get(&url).send().await {
+        match self.http.get(&url).send().await { // lgtm[rs/cleartext-transmission] DAAP uses plaintext HTTP by design.
             Ok(_) => info!("DAAP logout OK"),
             Err(e) => warn!(error = %e, "DAAP logout failed (best-effort)"),
         }
