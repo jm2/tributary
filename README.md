@@ -120,6 +120,12 @@ winget install jm2.Tributary
 
 Pre-built packages for Linux (Flatpak, .deb, .rpm), macOS (.dmg), and Windows (.exe installer, .zip) are also available on the [Releases](https://github.com/jm2/tributary/releases) page.
 
+> **macOS note:** The macOS `.dmg` is ad-hoc signed but not notarized, so macOS Gatekeeper will block it on first launch. After mounting the DMG and dragging Tributary to Applications, run:
+> ```bash
+> xattr -cr /Applications/Tributary.app
+> ```
+> Then open normally. This is only needed once.
+
 ---
 
 ## Building from Source
