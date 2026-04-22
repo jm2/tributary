@@ -5,6 +5,18 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — Unreleased
+
+### Changed
+- **Modularized `window.rs` (3,730 → 1,776 lines)** — Refactored the monolithic main window module into 6 focused sub-modules for improved maintainability and AI-assisted development:
+  - `window_state.rs` — Shared `WindowState` struct bundling 16+ `Rc<RefCell<…>>` UI state fields for dependency injection across modules.
+  - `playlist_actions.rs` — Playlist CRUD logic (create, rename, delete, reorder entries).
+  - `output_switch.rs` — Output selector popover click handler (local, MPD, AirPlay, Chromecast switching).
+  - `context_menu.rs` — Tracklist right-click menu (add/remove from playlist, Properties dialog).
+  - `discovery_handler.rs` — mDNS/DNS-SD event handler (sidebar + output list add/remove for discovered servers, AirPlay receivers, and Chromecast devices). Deduplicated device-check logic into shared helpers.
+  - `source_connect.rs` — Sidebar selection-changed handler (source switching for local, playlist, USB, radio, connected remote, and unauthenticated remote sources with auth dialog flows).
+- **Dead code cleanup** — Removed orphaned `disable_popover_scrollbars` from `window.rs` (now only in `context_menu.rs`). Cleaned up unused imports (`sea_orm`, `AirPlayOutput`, `ChromecastOutput`, `MpdOutput`, radio functions, `show_auth_dialog`) that migrated to sub-modules.
+
 ## [0.4.0] — 2026-04-19
 
 ### Added

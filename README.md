@@ -305,7 +305,8 @@ src/
 │   ├── output.rs           # AudioOutput trait abstraction
 │   ├── local_output.rs     # Local GStreamer playback (AudioOutput impl)
 │   ├── mpd_output.rs       # MPD TCP output (AudioOutput impl)
-│   └── airplay_output.rs   # AirPlay/RAOP output (scaffolding)
+│   ├── airplay_output.rs   # AirPlay/RAOP output (scaffolding)
+│   └── chromecast_output.rs# Chromecast/Cast V2 output
 ├── db/
 │   ├── mod.rs              # Database layer root
 │   ├── connection.rs       # SQLite init, XDG paths, migration runner
@@ -353,7 +354,13 @@ src/
 │   └── geo.rs              # Haversine distance + US state/country centroid tables
 └── ui/
     ├── mod.rs              # UI module root
-    ├── window.rs           # Main window + backend integration bridge
+    ├── window.rs           # Main window orchestration (GTK lifecycle + event wiring)
+    ├── window_state.rs     # Shared WindowState struct (Rc/RefCell state bundle)
+    ├── source_connect.rs   # Sidebar selection handler (source switching + auth flows)
+    ├── discovery_handler.rs# mDNS/DNS-SD event handler (sidebar + output list)
+    ├── context_menu.rs     # Tracklist right-click menu (playlist ops + properties)
+    ├── playlist_actions.rs # Playlist CRUD (create, rename, delete, reorder)
+    ├── output_switch.rs    # Output selector click handler (local/MPD/AirPlay/Cast)
     ├── header_bar.rs       # Playback controls, now-playing, progress, volume
     ├── sidebar.rs          # Source list (local + remote + discovered + eject)
     ├── browser.rs          # Search bar + Genre → Artist → Album filter panes

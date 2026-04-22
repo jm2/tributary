@@ -134,7 +134,8 @@ impl RadioBrowserClient {
     /// Filters out stations with non-HTTP(S) stream URLs for safety.
     async fn fetch_stations(&self, url: &str) -> Vec<RadioStation> {
         debug!(url = %url, "Fetching radio stations");
-        match self.client.get(url).send().await { // lgtm[rs/cleartext-transmission] Base URL is always HTTPS; station stream URLs may be HTTP but carry no sensitive data.
+        match self.client.get(url).send().await {
+            // lgtm[rs/cleartext-transmission] Base URL is always HTTPS; station stream URLs may be HTTP but carry no sensitive data.
             Ok(resp) => match resp.json::<Vec<RadioStation>>().await {
                 Ok(stations) => {
                     // Filter out stations with non-HTTP(S) stream URLs

@@ -364,7 +364,8 @@ impl DaapClient {
             self.base_url.as_str().trim_end_matches('/'),
             self.session_id
         );
-        match self.http.get(&url).send().await { // lgtm[rs/cleartext-transmission] DAAP uses plaintext HTTP by design.
+        match self.http.get(&url).send().await {
+            // lgtm[rs/cleartext-transmission] DAAP uses plaintext HTTP by design.
             Ok(_) => info!("DAAP logout OK"),
             Err(e) => warn!(error = %e, "DAAP logout failed (best-effort)"),
         }
