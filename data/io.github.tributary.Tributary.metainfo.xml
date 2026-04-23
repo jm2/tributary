@@ -44,6 +44,29 @@
   </screenshots>
 
   <releases>
+    <release version="0.4.1" date="2026-04-23">
+      <description>
+        <p>Bug fix release for macOS:</p>
+        <ul>
+          <li>Fixed broken symlinks in .app bundle causing xattr -cr failures (~60 missing files)</li>
+          <li>Fixed GStreamer playback failure ("not-negotiated" error) due to disabled plugin registry scanning</li>
+          <li>Fixed pixbuf loaders with .dylib extension not being code-signed</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.0" date="2026-04-19">
+      <description>
+        <p>Major feature release:</p>
+        <ul>
+          <li>Audio output selector (local, MPD, AirPlay, Chromecast)</li>
+          <li>Album artist sort preference</li>
+          <li>Smart playlist compound sort (multi-key ordering)</li>
+          <li>USB device browsing</li>
+          <li>i18n framework with 13 languages</li>
+          <li>Nextcloud Music compatibility</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-04-15">
       <description>
         <p>New features:</p>

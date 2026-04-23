@@ -127,7 +127,8 @@ export GDK_PIXBUF_MODULE_FILE="$BUNDLE_ROOT/Resources/lib/gdk-pixbuf-2.0/2.10.0/
 export GST_PLUGIN_SYSTEM_PATH=""
 export GST_PLUGIN_PATH="$BUNDLE_ROOT/Resources/lib/gstreamer-1.0"
 export GST_PLUGIN_SCANNER="$DIR/gst-plugin-scanner"
-export GST_REGISTRY_UPDATE=no
+# Set a bundle-local registry path so the first launch scans bundled plugins
+export GST_REGISTRY="$BUNDLE_ROOT/Contents/MacOS/gst-registry.bin"
 
 # Launch the actual Rust binary
 exec "$DIR/Tributary-bin" "$@"
@@ -159,14 +160,14 @@ command -v gtk4-update-icon-cache &>/dev/null && {
 
 # GLib schemas
 mkdir -p "${RESOURCES_DIR}/share/glib-2.0/schemas"
-cp -R "${BREW_PREFIX}/share/glib-2.0/schemas" "${RESOURCES_DIR}/share/glib-2.0/" 2>/dev/null || true
+cp -RL "${BREW_PREFIX}/share/glib-2.0/schemas" "${RESOURCES_DIR}/share/glib-2.0/" 2>/dev/null || true
 glib-compile-schemas "${RESOURCES_DIR}/share/glib-2.0/schemas" 2>/dev/null || true
 
 # GDK pixbuf loaders
 PIXBUF_LOADER_DIR="${BREW_PREFIX}/lib/gdk-pixbuf-2.0"
 if [[ -d "$PIXBUF_LOADER_DIR" ]]; then
   mkdir -p "${RESOURCES_DIR}/lib"
-  cp -R "$PIXBUF_LOADER_DIR" "${RESOURCES_DIR}/lib/" 2>/dev/null || true
+  cp -RL "$PIXBUF_LOADER_DIR" "${RESOURCES_DIR}/lib/" 2>/dev/null || true
 fi
 
 # ── Bundle GStreamer plugins ─────────────────────────────────────────────────
@@ -337,11 +338,14 @@ if [[ -f "$GST_SCANNER_DEST" ]]; then
   fix_rpaths "$GST_SCANNER_DEST"
 fi
 
+# Remove any stale GStreamer registry from a previous build
+rm -f "${APP_BUNDLE}/Contents/MacOS/gst-registry.bin"
+
 # Fix rpaths in pixbuf loaders
 PIXBUF_LOADERS_DEST="${RESOURCES_DIR}/lib/gdk-pixbuf-2.0/2.10.0/loaders"
 if [[ -d "$PIXBUF_LOADERS_DEST" ]]; then
   info "Fixing rpaths in pixbuf loaders..."
-  for loader in "${PIXBUF_LOADERS_DEST}"/*.so; do
+  for loader in "${PIXBUF_LOADERS_DEST}"/*.so "${PIXBUF_LOADERS_DEST}"/*.dylib; do
     [[ -f "$loader" ]] || continue
     chmod u+w "$loader"
     fix_rpaths "$loader"
@@ -353,6 +357,15 @@ PIXBUF_CACHE="${RESOURCES_DIR}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
 if [[ -f "$PIXBUF_CACHE" ]]; then
   info "Patching pixbuf loaders.cache for bundle paths..."
   sed -i '' "s|${BREW_PREFIX}/lib/gdk-pixbuf-2.0/2.10.0/loaders/|${RESOURCES_DIR}/lib/gdk-pixbuf-2.0/2.10.0/loaders/|g" "$PIXBUF_CACHE" 2>/dev/null || true
+fi
+
+# Verify critical GStreamer plugins for audio playback
+if [[ -d "$GST_PLUGIN_DEST" ]]; then
+  for critical_plugin in libgstcoreelements libgstisomp4 libgstlibav libgstaudioparsers libgstaudioconvert libgstaudioresample libgstosxaudio; do
+    if ! ls "$GST_PLUGIN_DEST"/${critical_plugin}.dylib 1>/dev/null 2>&1; then
+      warn "Missing critical GStreamer plugin: ${critical_plugin}"
+    fi
+  done
 fi
 
 # Verify Adwaita icons
@@ -370,7 +383,7 @@ info "Ad-hoc code signing the bundle..."
 
 find "${FRAMEWORKS_DIR}" -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
 [[ -d "$GST_PLUGIN_DEST" ]] && find "$GST_PLUGIN_DEST" -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
-[[ -d "$PIXBUF_LOADERS_DEST" ]] && find "$PIXBUF_LOADERS_DEST" -name '*.so' -exec codesign --force --sign - {} \; 2>/dev/null || true
+[[ -d "$PIXBUF_LOADERS_DEST" ]] && find "$PIXBUF_LOADERS_DEST" \( -name '*.so' -o -name '*.dylib' \) -exec codesign --force --sign - {} \; 2>/dev/null || true
 [[ -f "$GST_SCANNER_DEST" ]] && codesign --force --sign - "$GST_SCANNER_DEST" 2>/dev/null || true
 
 codesign --force --sign - "$BIN" 2>/dev/null || true

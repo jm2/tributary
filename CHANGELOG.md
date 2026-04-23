@@ -5,7 +5,7 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.1] — Unreleased
+## [0.4.1] — 2026-04-23
 
 ### Added
 - **Nextcloud Music (Subsonic) compatibility** — Tributary now auto-detects servers that require legacy plaintext authentication (Subsonic error code 41) and automatically falls back to hex-encoded password auth (`p=enc:<hex>`). Token-based auth (`t=`/`s=`) is always tried first; plaintext fallback is only used when the server explicitly rejects token auth, and is **refused over plain HTTP** — only HTTPS connections are permitted. This enables Nextcloud Music, older Subsonic servers, and other legacy-auth-only implementations. (#25)
@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `discovery_handler.rs` — mDNS/DNS-SD event handler (sidebar + output list add/remove for discovered servers, AirPlay receivers, and Chromecast devices). Deduplicated device-check logic into shared helpers.
   - `source_connect.rs` — Sidebar selection-changed handler (source switching for local, playlist, USB, radio, connected remote, and unauthenticated remote sources with auth dialog flows).
 - **Dead code cleanup** — Removed orphaned `disable_popover_scrollbars` from `window.rs` (now only in `context_menu.rs`). Cleaned up unused imports (`sea_orm`, `AirPlayOutput`, `ChromecastOutput`, `MpdOutput`, radio functions, `show_auth_dialog`) that migrated to sub-modules.
+
+### Fixed
+- **macOS `.app` bundle: `xattr -cr` fails on ~60 missing files** — The build script copied GLib schemas and GDK-Pixbuf loaders with `cp -R`, which preserves Homebrew's Cellar symlinks. On the user's machine those symlink targets don't exist, causing `xattr: No such file` errors for every `.gschema.xml`, `.so`, and `.dylib` in the bundle. Changed to `cp -RL` (dereference) so real file contents are bundled. The icon copy already used `-RL`; this makes schemas and pixbuf loaders consistent.
+- **macOS `.app` bundle: songs fail to play (GStreamer "not-negotiated" error)** — The bash launcher wrapper set `GST_REGISTRY_UPDATE=no`, which prevented GStreamer from scanning the bundled plugin directory on first launch. With no registry, GStreamer loaded zero decoder plugins, so `qtdemux` could demux MP4/AAC but found no downstream decoder — resulting in `streaming stopped, reason not-negotiated (-4)`. Replaced with an explicit `GST_REGISTRY` path pointing inside the bundle, allowing the first launch to build a fresh registry. Added build-time cleanup of stale registry files and a verification step that warns if critical GStreamer plugins (coreelements, isomp4, libav, audioparsers, audioconvert, audioresample, osxaudio) are missing.
+- **macOS pixbuf loaders with `.dylib` extension not code-signed** — The rpath-fixing and ad-hoc code-signing loops only matched `*.so` files. After symlink dereferencing, loaders may be `.dylib` files. Both loops now handle both extensions.
 
 ### Security
 - **Plaintext password redacted from logs** — `redact_url_secrets()` now masks the Subsonic `p=` query parameter (hex-encoded password used in legacy auth) before it reaches log output. Detection uses a multi-param heuristic (`p` + `u` + `c` present) to avoid false positives on unrelated URLs. Added 2 new unit tests.
@@ -263,6 +268,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
+[0.4.1]: https://github.com/jm2/tributary/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/jm2/tributary/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/jm2/tributary/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jm2/tributary/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/jm2/tributary/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jm2/tributary/compare/v0.1.0...v0.2.0
