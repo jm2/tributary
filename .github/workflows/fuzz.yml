@@ -35,7 +35,7 @@ jobs:
         run: cargo install cargo-fuzz --locked
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -45,7 +45,7 @@ jobs:
           restore-keys: fuzz-cargo-
 
       - name: Cache fuzz corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.sha }}
