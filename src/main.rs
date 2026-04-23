@@ -380,6 +380,26 @@ fn setup_macos_bundle_env() {
         // Force a fresh registry scan so stale system paths don't win.
         let registry = macos_dir.join("gst-registry.bin");
         env::set_var("GST_REGISTRY", &registry);
+
+        // Delete any stale registry that shipped with the bundle.
+        // The CI builder generates a registry containing /opt/homebrew/
+        // paths.  On the user's machine those paths don't exist, so
+        // GStreamer finds zero decoder plugins (→ "not-negotiated").
+        // We detect staleness by checking whether the registry mentions
+        // our current plugin directory; if not, we delete it so
+        // gst::init() rescans the bundled plugins.
+        if registry.is_file() {
+            let is_stale = std::fs::read(&registry)
+                .map(|bytes| {
+                    let needle = gst_plugins.to_string_lossy();
+                    // Binary file — search for the path as raw bytes.
+                    !bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+                })
+                .unwrap_or(true); // If unreadable, treat as stale.
+            if is_stale {
+                let _ = std::fs::remove_file(&registry);
+            }
+        }
     }
 
     // GST_PLUGIN_SCANNER — bundled helper binary that scans plugins.
