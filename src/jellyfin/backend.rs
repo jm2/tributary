@@ -22,7 +22,7 @@ use super::client::JellyfinClient;
 // ── Constants ───────────────────────────────────────────────────────────
 
 /// Page size for paginated item fetches.
-const PAGE_SIZE: u32 = 500;
+const PAGE_SIZE: u32 = 5_000;
 
 // ── Discovery result ────────────────────────────────────────────────────
 
@@ -156,15 +156,22 @@ impl JellyfinBackend {
         let mut jellyfin_id_to_uuid = HashMap::new();
 
         for lib in &self.music_libraries {
-            // ── Fetch tracks ────────────────────────────────────────
-            let tracks = self
-                .fetch_all_items(
-                    &items_endpoint,
-                    &lib.id,
+            let items_ep = items_endpoint.clone();
+            let lib_id = lib.id.clone();
+
+            // Fetch tracks, albums, and artists concurrently — they
+            // are independent API calls and the Jellyfin server handles
+            // parallel requests without issue.
+            let (tracks, albums, artists) = tokio::try_join!(
+                self.fetch_all_items(
+                    &items_ep,
+                    &lib_id,
                     "Audio",
                     "MediaSources,Genres,UserData,DateCreated",
-                )
-                .await?;
+                ),
+                self.fetch_all_items(&items_ep, &lib_id, "MusicAlbum", "Genres"),
+                self.fetch_all_items(&items_ep, &lib_id, "MusicArtist", ""),
+            )?;
 
             for item in &tracks {
                 let track_uuid = deterministic_uuid(&item.id);
@@ -193,11 +200,6 @@ impl JellyfinBackend {
                 all_tracks.push(track);
             }
 
-            // ── Fetch albums ────────────────────────────────────────
-            let albums = self
-                .fetch_all_items(&items_endpoint, &lib.id, "MusicAlbum", "Genres")
-                .await?;
-
             for item in &albums {
                 let album_uuid = deterministic_uuid(&item.id);
                 let artist_id = item.artist_items.first().map(|a| deterministic_uuid(&a.id));
@@ -225,11 +227,6 @@ impl JellyfinBackend {
                     total_duration_secs: item.run_time_ticks.map(|t| t / 10_000_000),
                 });
             }
-
-            // ── Fetch artists ───────────────────────────────────────
-            let artists = self
-                .fetch_all_items(&items_endpoint, &lib.id, "MusicArtist", "")
-                .await?;
 
             for item in &artists {
                 let artist_uuid = deterministic_uuid(&item.id);

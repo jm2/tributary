@@ -1392,11 +1392,13 @@ fn setup_library_events(
                                 let src = src.clone();
                                 sidebar_store.remove(i);
                                 sidebar_store.insert(i, &src);
+                                // Clear the pending connection guard BEFORE
+                                // auto-selecting so the selection_changed handler
+                                // isn't blocked by the guard (it checks
+                                // pending_connection and early-returns if set).
+                                *pending_connection.borrow_mut() = None;
                                 // Auto-select this source.
                                 sidebar_selection.set_selected(i);
-                                // Clear the pending connection guard now that
-                                // the connection succeeded.
-                                *pending_connection.borrow_mut() = None;
                                 break;
                             }
                         }
