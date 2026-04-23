@@ -128,7 +128,7 @@ export GST_PLUGIN_SYSTEM_PATH=""
 export GST_PLUGIN_PATH="$BUNDLE_ROOT/Resources/lib/gstreamer-1.0"
 export GST_PLUGIN_SCANNER="$DIR/gst-plugin-scanner"
 # Set a bundle-local registry path so the first launch scans bundled plugins
-export GST_REGISTRY="$BUNDLE_ROOT/Contents/MacOS/gst-registry.bin"
+export GST_REGISTRY="$DIR/gst-registry.bin"
 
 # Launch the actual Rust binary
 exec "$DIR/Tributary-bin" "$@"
@@ -338,8 +338,8 @@ if [[ -f "$GST_SCANNER_DEST" ]]; then
   fix_rpaths "$GST_SCANNER_DEST"
 fi
 
-# Remove any stale GStreamer registry from a previous build
-rm -f "${APP_BUNDLE}/Contents/MacOS/gst-registry.bin"
+# (Stale GStreamer registry cleanup moved to end of script,
+# after code signing, to prevent re-generation.)
 
 # Fix rpaths in pixbuf loaders
 PIXBUF_LOADERS_DEST="${RESOURCES_DIR}/lib/gdk-pixbuf-2.0/2.10.0/loaders"
@@ -396,6 +396,13 @@ if codesign --verify --verbose "$APP_BUNDLE" 2>/dev/null; then
 else
   warn "Code signature verification failed."
 fi
+
+# Remove any stale GStreamer registry that the build may have generated.
+# This must happen AFTER code signing — if the registry is present during
+# signing, its hash goes into the seal and first-launch will invalidate it
+# when GStreamer overwrites it.  Deleting it here forces a clean first-launch
+# scan that writes a registry referencing the bundle-local plugin paths.
+rm -f "${APP_BUNDLE}/Contents/MacOS/gst-registry.bin"
 
 # ── DMG ──────────────────────────────────────────────────────────────────────
 if $MAKE_DMG; then
