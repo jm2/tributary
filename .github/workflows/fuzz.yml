@@ -26,7 +26,7 @@ jobs:
             gstreamer1-devel gstreamer1-plugins-base-devel \
             pkgconf-pkg-config git curl
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust nightly (required for cargo-fuzz)
         uses: dtolnay/rust-toolchain@nightly

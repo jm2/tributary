@@ -19,7 +19,7 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run cargo audit
