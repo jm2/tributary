@@ -115,6 +115,24 @@ impl Player {
             })
             .map_err(|e| anyhow::anyhow!("Failed to create playbin element: {e}"))?;
 
+        // ── macOS: work around GStreamer ≤1.28 channel-negotiation bug ──
+        // On multi-channel audio devices (e.g. monitors with spatial audio
+        // speakers reporting 8 channels to Core Audio), osxaudiosink
+        // advertises channels=[1,N] in its caps.  audioconvert's
+        // fixate_caps then picks the maximum channel count and sets
+        // channel-mask=0x0 (no positions).  The resulting 2→N channel
+        // conversion fails with "Failed to make converter", surfacing as
+        // "not-negotiated" on every file.
+        //
+        // Workaround: use playbin's "element-setup" signal to intercept
+        // osxaudiosink when it is created, and install a pad probe on its
+        // sink pad that rewrites CAPS query results to cap channels at 2.
+        // This makes audioconvert preserve the source channel count.
+        //
+        // TODO: remove once GStreamer ships a fix (likely ≥1.28.3 or 1.30).
+        #[cfg(target_os = "macos")]
+        Self::install_macos_channel_cap(&playbin);
+
         let volume = load_saved_volume().unwrap_or(1.0);
         playbin.set_property("volume", slider_to_pipeline(volume));
 
@@ -403,6 +421,83 @@ impl Player {
                 "No bundled GStreamer plugin directory found — using system plugins"
             );
         }
+    }
+
+    /// Install a pad probe on `osxaudiosink` that caps the negotiated
+    /// channel count to stereo.
+    ///
+    /// On multi-channel Core Audio devices (e.g. monitors reporting 8
+    /// channels), `audioconvert` fixates to the device maximum and then
+    /// fails to build a channel converter because the fixated caps have
+    /// `channel-mask=0x0` (no positions).
+    ///
+    /// This method connects to playbin's `element-setup` signal and,
+    /// when `osxaudiosink` is created, installs a `QUERY_DOWNSTREAM`
+    /// pad probe on its sink pad.  The probe intercepts `CAPS` queries
+    /// and rewrites the `channels` field from `[1, N]` to `[1, 2]`,
+    /// causing `audioconvert` to preserve the source channel count.
+    #[cfg(target_os = "macos")]
+    fn install_macos_channel_cap(playbin: &gst::Element) {
+        use gst::prelude::*;
+
+        playbin.connect("element-setup", false, |args| {
+            let element = args[1].get::<gst::Element>().ok()?;
+            let factory = element.factory()?;
+            if factory.name() != "osxaudiosink" {
+                return None;
+            }
+
+            let pad = element.static_pad("sink")?;
+            pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |pad, info| {
+                let Some(query) = info.query_mut() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                if query.type_() != gst::QueryType::Caps {
+                    return gst::PadProbeReturn::Ok;
+                }
+
+                // Let the original handler run first so we can rewrite
+                // its result.
+                let parent = pad.parent_element();
+                let handled = if let Some(ref el) = parent {
+                    gst::Pad::query_default(pad, Some(el), query)
+                } else {
+                    false
+                };
+                if !handled {
+                    return gst::PadProbeReturn::Ok;
+                }
+
+                // Rewrite every structure's channels field to [1, 2].
+                if let gst::QueryViewMut::Caps(ref mut q) = query.view_mut() {
+                    if let Some(result) = q.result_owned() {
+                        let mut capped = gst::Caps::new_empty();
+                        {
+                            let capped_mut = capped.make_mut();
+                            for i in 0..result.size() {
+                                if let Some(s) = result.structure(i) {
+                                    let mut s = s.to_owned();
+                                    if s.name().as_str() == "audio/x-raw" && s.has_field("channels")
+                                    {
+                                        s.set("channels", gst::IntRange::new(1, 2));
+                                    }
+                                    capped_mut.append_structure(s);
+                                }
+                            }
+                        }
+                        q.set_result(&capped);
+                    }
+                }
+
+                gst::PadProbeReturn::Handled
+            });
+
+            info!(
+                "macOS: installed channel-cap probe on osxaudiosink \
+                 (GStreamer ≤1.28 workaround)"
+            );
+            None
+        });
     }
 }
 
