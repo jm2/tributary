@@ -11,9 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Multiple music directories** — Tributary now supports scanning and watching multiple library folders simultaneously. The preferences UI allows adding and removing directories. Existing single-path configs are automatically migrated to the new `library_paths` format on first launch. (#31)
 - **XSPF playlist import/export** — Right-click any playlist to export it as an XSPF file, or use "Import Playlist…" on the Playlists header to import external playlists. Imported tracks are matched against your local library using fingerprint-based reconciliation (title, artist, album, duration) for resilience against file path changes.
 - **Default smart playlists** — Three smart playlists are automatically seeded on first launch: "Recently Added" (last 30 days), "Recently Played" (last 14 days), and "Top 25 Most Played".
+- **Chromecast local file streaming** — Chromecast devices can now play local audio files. An embedded, LAN-only HTTP server (`axum`) serves files via UUID-keyed URLs — no path traversal possible. The server binds to the machine's LAN IP on an OS-assigned port and starts on-demand when the first local file is cast. Supports HTTP byte-range requests for seeking. Persistent Cast V2 connections with heartbeat keep-alive and media status polling for position tracking. (#1)
+- **USB mass storage file transfer** — New `device::transfer` module enables async file copy from the local library to mounted USB devices, preserving directory structure with same-size dedup skip and progress reporting. (#8)
 - **Window position persistence** — Tributary now remembers its window size and maximized state across restarts.
 - **Windows 11 Snap Layout support** — The maximize button area now correctly triggers the native Windows 11 Snap Layout flyout via `WM_NCHITTEST` subclassing, enabling direct window tiling without losing GTK4's CSD appearance.
-- **macOS "Open With" support** — Tributary now appears in Finder's "Open With" menu for audio files (MP3, FLAC, OGG, Opus, AAC, WAV, AIFF) via `CFBundleDocumentTypes` in Info.plist. (#36)
+- **macOS "Open With" support** — Tributary now appears in Finder's "Open With" menu for audio files (MP3, FLAC, OGG, Opus, AAC, WAV, AIFF) via `CFBundleDocumentTypes` in Info.plist and `HANDLES_OPEN` application flag. (#36)
 - **Linux file association** — Added `MimeType` entry to the `.desktop` file for audio MIME types.
 
 ### Changed

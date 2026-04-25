@@ -24,6 +24,7 @@
 //! definitions and detection logic are complete; sync/transfer
 //! operations are not yet implemented.
 
+pub mod transfer;
 pub mod usb;
 
 /// Information about a detected portable device.

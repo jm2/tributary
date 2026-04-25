@@ -27,17 +27,23 @@
 //! selector.  The friendly name is extracted from the mDNS TXT record
 //! `fn` field.
 //!
-//! # Limitations
+//! # Local file support
 //!
-//! - **Remote sources only (initial release):** Chromecast requires
-//!   HTTP(S) URLs for `media.load()`.  Subsonic, Jellyfin, Plex, and
-//!   radio streams work out of the box since they are already HTTP.
-//!   Local `file:///` URIs are not supported — an embedded HTTP server
-//!   for local file casting will be added in a follow-up.
-//! - **Position tracking:** Not yet implemented; `position_ms()` returns
-//!   `None`.  A future enhancement will poll Cast media status for
-//!   accurate position reporting.
+//! Local `file:///` URIs are automatically rewritten to HTTP URLs
+//! served by [`CastHttpServer`](super::cast_http_server::CastHttpServer),
+//! a minimal LAN-only embedded server.  The server is started on-demand
+//! when the first local file is cast and remains running for the
+//! duration of the session.
+//!
+//! # Persistent connection
+//!
+//! A background thread maintains a persistent TLS connection to the
+//! Chromecast device, with a heartbeat PING every 5 seconds.  This
+//! keeps the Cast session alive and enables position polling.
 
+use std::sync::{Arc, Mutex};
+
+use super::cast_http_server::CastHttpServer;
 use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerState};
 
@@ -46,6 +52,12 @@ use tracing::{debug, error, info, warn};
 /// Default Media Receiver app ID — the built-in Google receiver that
 /// accepts arbitrary media URLs.
 const DEFAULT_MEDIA_RECEIVER_APP_ID: &str = "CC1AD845";
+
+/// Heartbeat interval in seconds.
+const HEARTBEAT_INTERVAL_SECS: u64 = 5;
+
+/// Position polling interval in seconds.
+const POSITION_POLL_INTERVAL_SECS: u64 = 1;
 
 /// Chromecast audio output — streams to a Cast V2 device.
 pub struct ChromecastOutput {
@@ -61,6 +73,10 @@ pub struct ChromecastOutput {
     volume: f64,
     /// Current playback state (best-guess, updated optimistically).
     current_state: PlayerState,
+    /// Shared reference to the embedded HTTP server for local file casting.
+    cast_server: Arc<Mutex<Option<CastHttpServer>>>,
+    /// Tokio runtime handle for spawning async tasks.
+    rt_handle: Option<tokio::runtime::Handle>,
 }
 
 impl ChromecastOutput {
@@ -88,41 +104,112 @@ impl ChromecastOutput {
             event_tx,
             volume: 1.0,
             current_state: PlayerState::Stopped,
+            cast_server: Arc::new(Mutex::new(None)),
+            rt_handle: tokio::runtime::Handle::try_current().ok(),
         }
+    }
+
+    /// Resolve a URI for Chromecast playback.
+    ///
+    /// If the URI is a `file://` path, starts the embedded HTTP server
+    /// (if not already running) and rewrites the URI to an HTTP URL.
+    /// Otherwise returns the URI unchanged.
+    fn resolve_uri(&self, uri: &str) -> Result<String, String> {
+        if !uri.starts_with("file://") {
+            return Ok(uri.to_string());
+        }
+
+        // Extract the file path from the URI.
+        let path_str = uri
+            .strip_prefix("file://")
+            .unwrap_or(uri)
+            .trim_start_matches('/');
+
+        // On Windows, file:///C:/path → C:/path
+        // On Unix, file:///path → /path
+        #[cfg(target_os = "windows")]
+        let file_path = std::path::PathBuf::from(path_str);
+        #[cfg(not(target_os = "windows"))]
+        let file_path = std::path::PathBuf::from(format!("/{path_str}"));
+
+        if !file_path.exists() {
+            return Err(format!("File not found: {}", file_path.display()));
+        }
+
+        // Canonicalize to resolve symlinks and prevent path traversal.
+        let file_path = file_path
+            .canonicalize()
+            .map_err(|e| format!("Failed to canonicalize path: {e}"))?;
+
+        // Start the HTTP server if needed.
+        let mut server_guard = self
+            .cast_server
+            .lock()
+            .map_err(|e| format!("Server lock poisoned: {e}"))?;
+
+        if server_guard.is_none() {
+            let rt = self
+                .rt_handle
+                .as_ref()
+                .ok_or("No tokio runtime available")?;
+
+            let server = rt
+                .block_on(CastHttpServer::start())
+                .map_err(|e| format!("Failed to start cast HTTP server: {e}"))?;
+
+            info!(addr = %server.addr(), "Cast HTTP server started for local file casting");
+            *server_guard = Some(server);
+        }
+
+        let server = server_guard.as_ref().unwrap();
+        let http_url = server.register_file(&file_path);
+        Ok(http_url)
     }
 
     /// Connect to the Chromecast device, launch the Default Media
     /// Receiver, and load the given media URL.
     ///
     /// Runs on a background thread to avoid blocking the GTK main thread.
+    /// Starts a heartbeat + position polling loop after successful load.
     fn cast_media(&self, uri: &str) {
         let host = self.host.clone();
         let port = self.port;
-        let uri = uri.to_string();
         let tx = self.event_tx.clone();
         let volume = self.volume;
 
-        std::thread::spawn(move || {
-            if let Err(e) = Self::cast_media_sync(&host, port, &uri, volume) {
-                error!(error = %e, "Chromecast: media load failed");
+        // Resolve file:// URIs to HTTP URLs.
+        let resolved_uri = match self.resolve_uri(uri) {
+            Ok(u) => u,
+            Err(e) => {
+                error!(error = %e, "Failed to resolve URI for casting");
                 let _ = tx.try_send(PlayerEvent::Error(format!("Chromecast: {e}")));
+                return;
+            }
+        };
+
+        std::thread::spawn(move || {
+            match Self::cast_media_with_session(&host, port, &resolved_uri, volume, tx.clone()) {
+                Ok(()) => {}
+                Err(e) => {
+                    error!(error = %e, "Chromecast: media load failed");
+                    let _ = tx.try_send(PlayerEvent::Error(format!("Chromecast: {e}")));
+                }
             }
         });
     }
 
-    /// Synchronous Cast V2 media load (runs on background thread).
-    fn cast_media_sync(host: &str, port: u16, uri: &str, volume: f64) -> Result<(), String> {
+    /// Connect, launch app, load media, then maintain a persistent
+    /// connection with heartbeat and position polling.
+    fn cast_media_with_session(
+        host: &str,
+        port: u16,
+        uri: &str,
+        volume: f64,
+        tx: async_channel::Sender<PlayerEvent>,
+    ) -> Result<(), String> {
         use rust_cast::channels::media::StreamType;
         use rust_cast::channels::receiver::CastDeviceApp;
         use rust_cast::CastDevice;
-
-        // Reject local file URIs — Chromecast can only play HTTP(S).
-        if uri.starts_with("file://") {
-            return Err("Chromecast cannot play local files (file:// URIs). \
-                 Only HTTP(S) stream URLs are supported. \
-                 Try playing from a remote source (Subsonic, Jellyfin, Plex, or radio)."
-                .to_string());
-        }
 
         info!(host = %host, port, "Chromecast: connecting via Cast V2");
 
@@ -137,7 +224,7 @@ impl ChromecastOutput {
             .connect("receiver-0")
             .map_err(|e| format!("Connection channel failed: {e}"))?;
 
-        // Set volume on the device (0.0–1.0 linear — matches our API).
+        // Set volume on the device.
         device
             .receiver
             .set_volume(volume as f32)
@@ -162,10 +249,10 @@ impl ChromecastOutput {
             .connect(&transport_id)
             .map_err(|e| format!("App connection failed: {e}"))?;
 
-        // Determine content type from URI extension (best-effort).
+        // Determine content type from URI extension.
         let content_type = guess_content_type(uri);
 
-        // Determine stream type — live for radio (no duration), buffered otherwise.
+        // Determine stream type.
         let stream_type = if uri.contains("/radio/")
             || std::path::Path::new(uri)
                 .extension()
@@ -203,10 +290,89 @@ impl ChromecastOutput {
 
         info!(host = %host, "Chromecast: media loaded successfully");
 
-        // The CastDevice is dropped here, which closes the TLS connection.
-        // This is intentional for the initial scaffolding — a persistent
-        // connection for play/pause/seek control will be added in a
-        // follow-up enhancement.
+        // Signal playing state.
+        let _ = tx.try_send(PlayerEvent::StateChanged(PlayerState::Playing));
+
+        // ── Persistent connection: heartbeat + position polling ──────
+        //
+        // Keep the connection alive by sending PINGs and polling media
+        // status for position updates.
+        let heartbeat_interval = std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
+        let position_interval = std::time::Duration::from_secs(POSITION_POLL_INTERVAL_SECS);
+
+        let mut last_heartbeat = std::time::Instant::now();
+        let mut last_position_poll = std::time::Instant::now();
+
+        loop {
+            // Send heartbeat PING to keep the connection alive.
+            if last_heartbeat.elapsed() >= heartbeat_interval {
+                if let Err(e) = device.heartbeat.ping() {
+                    debug!(error = %e, "Chromecast: heartbeat failed, session ended");
+                    break;
+                }
+                last_heartbeat = std::time::Instant::now();
+            }
+
+            // Poll media status for position updates.
+            if last_position_poll.elapsed() >= position_interval {
+                match device.media.get_status(&transport_id, None) {
+                    Ok(status) => {
+                        if let Some(entry) = status.entries.first() {
+                            // Report position.
+                            if let Some(current_time) = entry.current_time {
+                                let position_ms = (current_time as f64 * 1000.0) as u64;
+                                let duration_ms = entry
+                                    .media
+                                    .as_ref()
+                                    .and_then(|m| m.duration)
+                                    .map(|d| (d as f64 * 1000.0) as u64)
+                                    .unwrap_or(0);
+
+                                let _ = tx.try_send(PlayerEvent::PositionChanged {
+                                    position_ms,
+                                    duration_ms,
+                                });
+                            }
+
+                            // Check if playback has ended via idle_reason.
+                            use rust_cast::channels::media::IdleReason;
+                            match entry.idle_reason {
+                                Some(IdleReason::Finished) => {
+                                    info!("Chromecast: track ended");
+                                    let _ = tx.try_send(PlayerEvent::TrackEnded);
+                                    break;
+                                }
+                                Some(
+                                    IdleReason::Cancelled
+                                    | IdleReason::Error
+                                    | IdleReason::Interrupted,
+                                ) => {
+                                    info!(reason = ?entry.idle_reason, "Chromecast: playback ended");
+                                    let _ = tx
+                                        .try_send(PlayerEvent::StateChanged(PlayerState::Stopped));
+                                    break;
+                                }
+                                None => {
+                                    // Still playing — continue polling.
+                                }
+                            }
+                        } else {
+                            // No active media session — playback has ended.
+                            debug!("Chromecast: no active media session, stopping poll");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "Chromecast: media status poll failed");
+                        break;
+                    }
+                }
+                last_position_poll = std::time::Instant::now();
+            }
+
+            // Sleep briefly to avoid busy-looping.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
 
         Ok(())
     }
@@ -343,6 +509,7 @@ fn guess_content_type(uri: &str) -> &'static str {
         "opus" => "audio/opus",
         "wav" => "audio/wav",
         "aac" | "m4a" => "audio/mp4",
+        "aiff" | "aif" => "audio/aiff",
         "m3u8" => "application/x-mpegURL",
         "pls" => "audio/x-scpls",
         // Default: let the Chromecast figure it out.
@@ -428,8 +595,10 @@ impl AudioOutput for ChromecastOutput {
     }
 
     fn position_ms(&self) -> Option<u64> {
-        // Position tracking not yet implemented for Chromecast.
-        // A future enhancement will poll Cast media status.
+        // Position is now reported via the persistent connection's
+        // media status polling loop, which sends PositionChanged events.
+        // This method returns None because the position is delivered
+        // asynchronously via the event channel.
         None
     }
 }

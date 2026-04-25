@@ -51,11 +51,18 @@ Tributary provides a unified interface for managing and streaming music from mul
 | MPD output backend (sink-only, TCP with security hardening) | ✅ |
 | Output switching (click to swap local ↔ MPD) | ✅ |
 | AirPlay output (RAOP discovery + streaming) | ✅ |
-| Chromecast output (Cast V2 — Subsonic, Jellyfin, Plex, radio) | 🚧 Remote sources only |
+| Chromecast output (Cast V2 — local files + remote sources) | ✅ |
 | Album artist sort (preference toggle) | ✅ |
 | Smart playlist compound sort (multi-key ordering) | ✅ |
 | Geo-distance sorting for Stations Near Me | ✅ |
 | USB device browsing (sidebar + tracklist scan) | ✅ |
+| USB file transfer (copy to device with progress) | ✅ |
+| Multiple music library directories | ✅ |
+| Playlist import/export (XSPF) | ✅ |
+| Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ |
+| Window position persistence | ✅ |
+| Windows 11 Snap Layout support | ✅ |
+| macOS "Open With" file association | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
@@ -306,7 +313,8 @@ src/
 │   ├── local_output.rs     # Local GStreamer playback (AudioOutput impl)
 │   ├── mpd_output.rs       # MPD TCP output (AudioOutput impl)
 │   ├── airplay_output.rs   # AirPlay/RAOP output (scaffolding)
-│   └── chromecast_output.rs# Chromecast/Cast V2 output
+│   ├── chromecast_output.rs# Chromecast/Cast V2 output (local + remote)
+│   └── cast_http_server.rs # Embedded LAN-only HTTP server for Chromecast
 ├── db/
 │   ├── mod.rs              # Database layer root
 │   ├── connection.rs       # SQLite init, XDG paths, migration runner
@@ -346,7 +354,8 @@ src/
 │   └── backend.rs          # MediaBackend impl (in-memory cache)
 ├── device/
 │   ├── mod.rs              # Device trait + DeviceInfo (portable device abstraction)
-│   └── usb.rs              # USB mass storage detection (Linux, macOS, Windows)
+│   ├── usb.rs              # USB mass storage detection (Linux, macOS, Windows)
+│   └── transfer.rs         # Async file copy to USB devices with progress
 ├── radio/
 │   ├── mod.rs              # Internet Radio module root
 │   ├── api.rs              # RadioStation + GeoLocation serde types
@@ -373,6 +382,7 @@ src/
     ├── album_art.rs        # Album art extraction (embedded tags + remote fetch)
     ├── playback.rs         # Playback context + track advance logic
     ├── persistence.rs      # Settings persistence (sort, shuffle, repeat, CSS)
+    ├── playlist_io.rs      # XSPF playlist import/export with fingerprint matching
     ├── radio.rs            # Radio-specific UI helpers (column switching, geo-sort)
     ├── dummy_data.rs       # Default sidebar source entries
     ├── style.css           # Custom CSS overrides
@@ -449,7 +459,7 @@ Tributary supports regular and smart playlists for the local library:
 ### Preferences
 
 Open **Preferences** from the hamburger menu (☰) to:
-- Change the local music library folder
+- Change the local music library folders (supports multiple directories)
 - Toggle browser filter panes (Genre, Artist, Album)
 - Show/hide tracklist columns
 
