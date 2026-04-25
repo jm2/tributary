@@ -23,8 +23,8 @@ use super::header_bar;
 use super::objects::{SourceObject, TrackObject};
 use super::output_dialogs::{load_saved_outputs, show_add_output_dialog};
 use super::persistence::{
-    extract_hwnd, load_css, load_repeat_mode, load_shuffle, restore_sort_state, save_repeat_mode,
-    save_shuffle, save_sort_state,
+    extract_hwnd, load_css, load_repeat_mode, load_shuffle, load_window_geometry,
+    restore_sort_state, save_repeat_mode, save_shuffle, save_sort_state, save_window_geometry,
 };
 use super::playback::{advance_track, format_ms, play_track_at, PlaybackContext};
 use super::preferences;
@@ -326,25 +326,48 @@ pub fn build_window(
     content.append(&hb.header);
     content.append(&main_paned);
 
+    // Restore persisted window geometry (size + maximized state).
+    let saved_geo = load_window_geometry();
+    let win_width = saved_geo.as_ref().map(|g| g.width).unwrap_or(DEFAULT_WIDTH);
+    let win_height = saved_geo
+        .as_ref()
+        .map(|g| g.height)
+        .unwrap_or(DEFAULT_HEIGHT);
+
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Tributary")
-        .default_width(DEFAULT_WIDTH)
-        .default_height(DEFAULT_HEIGHT)
+        .default_width(win_width)
+        .default_height(win_height)
         .content(&content)
         .build();
 
+    if saved_geo.is_some_and(|g| g.is_maximized) {
+        window.maximize();
+    }
+
+    // Save window geometry on close.
+    window.connect_close_request(|w| {
+        save_window_geometry(w);
+        glib::Propagation::Proceed
+    });
+
     // ── Start the library engine on tokio ────────────────────────────
-    // Use the configured library path from preferences, which defaults
+    // Use the configured library paths from preferences, which default
     // to the XDG / platform music directory (e.g. ~/Musique on French
     // systems) via dirs::audio_dir() with a ~/Music fallback.
-    let music_dir = std::path::PathBuf::from(&app_config.borrow().library_path);
+    let music_dirs: Vec<std::path::PathBuf> = app_config
+        .borrow()
+        .library_paths
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
 
     let engine_tx_clone = engine_tx.clone();
     rt_handle.spawn(async move {
         match crate::db::connection::init_db().await {
             Ok(db) => {
-                let engine = LibraryEngine::new(db, music_dir, engine_tx_clone);
+                let engine = LibraryEngine::new(db, music_dirs, engine_tx_clone);
                 engine.run().await;
             }
             Err(e) => {
@@ -740,6 +763,27 @@ pub fn build_window(
 
     // ── Extract native window handle (HWND on Windows) ──────────────
     let hwnd = extract_hwnd(&window);
+
+    // ── Enable Windows 11 Snap Layout ───────────────────────────────
+    // Install a WM_NCHITTEST subclass so hovering over the maximize
+    // button triggers the native Snap Layout flyout.
+    #[cfg(target_os = "windows")]
+    if let Some(hwnd_ptr) = hwnd {
+        // Default maximize button rect: top-right area of the window.
+        // GTK4 CSD maximize button is typically at (width - 92, 0, 46, 36).
+        // We use a conservative estimate; the exact rect can be refined
+        // by reading the header bar widget's allocation.
+        let w = win_width;
+        super::win32_snap::enable_snap_layout(hwnd_ptr, (w - 92, 0, 46, 36));
+
+        // Update the snap rect when the window is resized.
+        let hwnd_snap = hwnd_ptr;
+        window.connect_default_width_notify(move |win| {
+            let (w, _) = win.default_size();
+            super::win32_snap::update_maximize_rect((w - 92, 0, 46, 36));
+            let _ = hwnd_snap; // keep ptr alive for future refinement
+        });
+    }
 
     // ── Create OS media controls ────────────────────────────────────
     let media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>> =

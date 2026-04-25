@@ -9,4 +9,5 @@ Terminal=false
 Categories=Audio;Music;Player;GNOME;GTK;
 Keywords=Music;Audio;Player;Library;FLAC;MP3;Subsonic;Jellyfin;
 StartupWMClass=tributary
+MimeType=audio/mpeg;audio/flac;audio/ogg;audio/mp4;audio/aac;audio/x-wav;audio/aiff;audio/opus;
 StartupNotify=true

@@ -20,5 +20,7 @@ pub mod server_dialogs;
 pub mod sidebar;
 pub mod source_connect;
 pub mod tracklist;
+#[cfg(target_os = "windows")]
+pub mod win32_snap;
 pub mod window;
 pub mod window_state;

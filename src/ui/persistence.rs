@@ -126,7 +126,37 @@ pub fn load_css() {
     );
 }
 
-// ── Native window handle extraction ─────────────────────────────────
+// ── Window geometry persistence ─────────────────────────────────
+
+/// Persisted window size + maximized state.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct WindowGeometry {
+    pub width: i32,
+    pub height: i32,
+    pub is_maximized: bool,
+}
+
+/// Save window geometry to disk.
+pub fn save_window_geometry(window: &adw::ApplicationWindow) {
+    let (width, height) = window.default_size();
+    let geo = WindowGeometry {
+        width,
+        height,
+        is_maximized: window.is_maximized(),
+    };
+    if let Ok(json) = serde_json::to_string(&geo) {
+        write_setting("window.json", &json);
+    }
+}
+
+/// Load persisted window geometry, if any.
+pub fn load_window_geometry() -> Option<WindowGeometry> {
+    settings_path("window.json")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+// ── Native window handle extraction ─────────────────────────────
 
 /// Extract the native window handle for `souvlaki`.
 #[cfg(target_os = "windows")]

@@ -25,6 +25,10 @@ pub enum PlaylistAction {
     Delete(String),
     /// Edit smart playlist rules (id).
     EditSmart(String),
+    /// Import a playlist from an XSPF file.
+    ImportPlaylist,
+    /// Export a playlist to an XSPF file (id).
+    ExportPlaylist(String),
 }
 
 /// Build the source sidebar.
@@ -362,11 +366,16 @@ pub fn build_sidebar(
             if is_playlist_header {
                 menu.append(Some("New Playlist"), Some("playlist.create-regular"));
                 menu.append(Some("New Smart Playlist"), Some("playlist.create-smart"));
+                menu.append(Some("Import Playlist\u{2026}"), Some("playlist.import"));
             } else if is_playlist {
                 menu.append(Some("Rename"), Some("playlist.rename"));
+                menu.append(Some("Export\u{2026}"), Some("playlist.export"));
                 menu.append(Some("Delete"), Some("playlist.delete"));
                 if bt == "smart-playlist" {
-                    menu.append(Some("Edit Smart Playlist…"), Some("playlist.edit-smart"));
+                    menu.append(
+                        Some("Edit Smart Playlist\u{2026}"),
+                        Some("playlist.edit-smart"),
+                    );
                 }
             }
 
@@ -412,6 +421,21 @@ pub fn build_sidebar(
                 let _ = tx_edit.try_send(PlaylistAction::EditSmart(pid_edit.clone()));
             });
             action_group.add_action(&edit_smart);
+
+            let tx_import = tx.clone();
+            let import_action = gtk::gio::SimpleAction::new("import", None);
+            import_action.connect_activate(move |_, _| {
+                let _ = tx_import.try_send(PlaylistAction::ImportPlaylist);
+            });
+            action_group.add_action(&import_action);
+
+            let tx_export = tx.clone();
+            let pid_export = pid.clone();
+            let export_action = gtk::gio::SimpleAction::new("export", None);
+            export_action.connect_activate(move |_, _| {
+                let _ = tx_export.try_send(PlaylistAction::ExportPlaylist(pid_export.clone()));
+            });
+            action_group.add_action(&export_action);
 
             list_view.insert_action_group("playlist", Some(&action_group));
 

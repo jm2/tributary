@@ -323,6 +323,93 @@ impl PlaylistManager {
         );
         Ok(relinked)
     }
+
+    // ── Default smart playlists ──────────────────────────────────────
+
+    /// Seed default smart playlists on first launch.
+    ///
+    /// Creates: Recently Added, Recently Played, Top 25 Most Played.
+    /// Called from the engine when the playlist table is empty.
+    pub async fn seed_defaults(&self) -> Result<Vec<playlist::Model>, DbErr> {
+        let mut created = Vec::new();
+
+        // 1. Recently Added — Date Added is in the last 30 days
+        let rules_recently_added = smart_rules::SmartRules {
+            match_mode: smart_rules::MatchMode::All,
+            rules: vec![smart_rules::SmartRule {
+                field: smart_rules::RuleField::DateAdded,
+                operator: smart_rules::RuleOperator::IsInTheLast {
+                    amount: 30,
+                    unit: smart_rules::DateUnit::Days,
+                },
+                value: smart_rules::RuleValue::Number(30),
+            }],
+            limit: None,
+            live_updating: true,
+            sort_order: vec![smart_rules::SortCriterion {
+                field: smart_rules::SortField::DateAdded,
+                direction: smart_rules::SortDirection::Descending,
+            }],
+        };
+        let pl = self.create_playlist("Recently Added", true).await?;
+        self.set_smart_rules(&pl.id, &rules_recently_added).await?;
+        info!(id = %pl.id, "Seeded: Recently Added");
+        created.push(pl);
+
+        // 2. Recently Played — Date Modified in last 14 days AND Play Count > 0
+        let rules_recently_played = smart_rules::SmartRules {
+            match_mode: smart_rules::MatchMode::All,
+            rules: vec![
+                smart_rules::SmartRule {
+                    field: smart_rules::RuleField::DateModified,
+                    operator: smart_rules::RuleOperator::IsInTheLast {
+                        amount: 14,
+                        unit: smart_rules::DateUnit::Days,
+                    },
+                    value: smart_rules::RuleValue::Number(14),
+                },
+                smart_rules::SmartRule {
+                    field: smart_rules::RuleField::PlayCount,
+                    operator: smart_rules::RuleOperator::GreaterThan,
+                    value: smart_rules::RuleValue::Number(0),
+                },
+            ],
+            limit: None,
+            live_updating: true,
+            sort_order: vec![smart_rules::SortCriterion {
+                field: smart_rules::SortField::DateModified,
+                direction: smart_rules::SortDirection::Descending,
+            }],
+        };
+        let pl = self.create_playlist("Recently Played", true).await?;
+        self.set_smart_rules(&pl.id, &rules_recently_played).await?;
+        info!(id = %pl.id, "Seeded: Recently Played");
+        created.push(pl);
+
+        // 3. Top 25 Most Played — Play Count > 0, limit 25, sort by Most Played
+        let rules_top25 = smart_rules::SmartRules {
+            match_mode: smart_rules::MatchMode::All,
+            rules: vec![smart_rules::SmartRule {
+                field: smart_rules::RuleField::PlayCount,
+                operator: smart_rules::RuleOperator::GreaterThan,
+                value: smart_rules::RuleValue::Number(0),
+            }],
+            limit: Some(smart_rules::SmartLimit {
+                value: 25,
+                unit: smart_rules::LimitUnit::Items,
+                selected_by: smart_rules::LimitSort::MostPlayed,
+            }),
+            live_updating: true,
+            sort_order: vec![],
+        };
+        let pl = self.create_playlist("Top 25 Most Played", true).await?;
+        self.set_smart_rules(&pl.id, &rules_top25).await?;
+        info!(id = %pl.id, "Seeded: Top 25 Most Played");
+        created.push(pl);
+
+        info!(count = created.len(), "Default smart playlists seeded");
+        Ok(created)
+    }
 }
 
 /// Get current time as RFC3339 string.

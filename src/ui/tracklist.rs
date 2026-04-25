@@ -303,6 +303,15 @@ fn add_sorted_column<F, S>(
         label.set_text(&getter(&track));
     });
 
+    // Clear label text on recycle to prevent stale data from appearing
+    // in the wrong row during rapid scrolling (GTK4 recycling issue).
+    factory.connect_unbind(|_, list_item| {
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
+        if let Some(label) = list_item.child().and_downcast::<gtk::Label>() {
+            label.set_text("");
+        }
+    });
+
     let sorter = gtk::CustomSorter::new(move |a, b| {
         let ta = a.downcast_ref::<TrackObject>().unwrap();
         let tb = b.downcast_ref::<TrackObject>().unwrap();

@@ -242,6 +242,27 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key>     <string>tributary</string>
   <key>NSHighResolutionCapable</key> <true/>
   <key>LSMinimumSystemVersion</key>  <string>13.0</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Audio File</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.mp3</string>
+        <string>public.mpeg-4-audio</string>
+        <string>org.xiph.flac</string>
+        <string>org.xiph.ogg-vorbis</string>
+        <string>org.xiph.opus</string>
+        <string>com.microsoft.waveform-audio</string>
+        <string>public.aiff-audio</string>
+      </array>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST

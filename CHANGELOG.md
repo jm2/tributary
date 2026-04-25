@@ -5,6 +5,24 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — Unreleased
+
+### Added
+- **Multiple music directories** — Tributary now supports scanning and watching multiple library folders simultaneously. The preferences UI allows adding and removing directories. Existing single-path configs are automatically migrated to the new `library_paths` format on first launch. (#31)
+- **XSPF playlist import/export** — Right-click any playlist to export it as an XSPF file, or use "Import Playlist…" on the Playlists header to import external playlists. Imported tracks are matched against your local library using fingerprint-based reconciliation (title, artist, album, duration) for resilience against file path changes.
+- **Default smart playlists** — Three smart playlists are automatically seeded on first launch: "Recently Added" (last 30 days), "Recently Played" (last 14 days), and "Top 25 Most Played".
+- **Window position persistence** — Tributary now remembers its window size and maximized state across restarts.
+- **Windows 11 Snap Layout support** — The maximize button area now correctly triggers the native Windows 11 Snap Layout flyout via `WM_NCHITTEST` subclassing, enabling direct window tiling without losing GTK4's CSD appearance.
+- **macOS "Open With" support** — Tributary now appears in Finder's "Open With" menu for audio files (MP3, FLAC, OGG, Opus, AAC, WAV, AIFF) via `CFBundleDocumentTypes` in Info.plist. (#36)
+- **Linux file association** — Added `MimeType` entry to the `.desktop` file for audio MIME types.
+
+### Changed
+
+### Fixed
+- **Column display recycling bug** — Added `connect_unbind` handlers to all tracklist column factories to clear label text when rows are recycled, preventing stale data from appearing in the wrong row during rapid scrolling.
+
+---
+
 ## [0.4.1] — 2026-04-23
 
 ### Added

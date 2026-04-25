@@ -5,7 +5,7 @@
 //! groups: Library Location, Browser Views, and Visible Columns.
 
 use adw::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::info;
 
 // ── Default column visibility ───────────────────────────────────────────
@@ -41,8 +41,15 @@ pub struct AppConfig {
     /// Tracklist column display order (by title). Persisted across restarts.
     #[serde(default = "default_column_order")]
     pub column_order: Vec<String>,
-    /// Path to the local music library folder.
-    pub library_path: String,
+    /// Paths to local music library folders.
+    ///
+    /// Migrated from the old single `library_path: String` field.
+    /// The custom deserializer handles both formats seamlessly.
+    #[serde(
+        default = "default_library_paths",
+        deserialize_with = "deserialize_library_paths"
+    )]
+    pub library_paths: Vec<String>,
     /// Whether the user has consented to IP-based geolocation for
     /// "Stations Near Me". `None` = not yet asked, `Some(true)` = accepted,
     /// `Some(false)` = declined.
@@ -59,6 +66,39 @@ fn default_column_order() -> Vec<String> {
     ALL_COLUMNS.iter().copied().map(str::to_string).collect()
 }
 
+/// Default library paths: platform music directory with ~/Music fallback.
+fn default_library_paths() -> Vec<String> {
+    let music_dir = dirs::audio_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    vec![music_dir]
+}
+
+/// Custom deserializer that handles both the old `library_path: String`
+/// format and the new `library_paths: Vec<String>` format seamlessly.
+///
+/// When reading an old config.json that has `"library_path": "/some/path"`,
+/// serde will encounter this field name and type mismatch. We use an
+/// untagged enum to try both representations.
+fn deserialize_library_paths<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => Ok(vec![s]),
+        OneOrMany::Many(v) => Ok(v),
+    }
+}
+
 /// Browser pane visibility toggles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserViewsConfig {
@@ -69,15 +109,6 @@ pub struct BrowserViewsConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        // Use the XDG / platform music directory (e.g. ~/Musique on
-        // French systems) with a fallback to ~/Music for systems where
-        // dirs::audio_dir() returns None.
-        let music_dir = dirs::audio_dir()
-            .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
         Self {
             browser_views: BrowserViewsConfig {
                 genre: true,
@@ -90,10 +121,19 @@ impl Default for AppConfig {
                 .map(str::to_string)
                 .collect(),
             column_order: default_column_order(),
-            library_path: music_dir,
+            library_paths: default_library_paths(),
             location_enabled: None,
             group_by_album_artist: false,
         }
+    }
+}
+
+impl AppConfig {
+    /// Convenience getter: primary library path (first in the list).
+    /// Used by callers that only need the main directory.
+    #[allow(dead_code)] // Will be used by Chromecast and other features.
+    pub fn primary_library_path(&self) -> &str {
+        self.library_paths.first().map(|s| s.as_str()).unwrap_or("")
     }
 }
 
@@ -103,11 +143,26 @@ fn config_path() -> Option<std::path::PathBuf> {
 }
 
 /// Load the configuration from disk, falling back to defaults.
+///
+/// Handles migration from the old `library_path` (single string) format:
+/// the raw JSON is pre-processed to rename the key before deserialization.
 pub fn load_config() -> AppConfig {
-    config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Some(path) = config_path() else {
+        return AppConfig::default();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return AppConfig::default();
+    };
+
+    // Pre-process: if the JSON has "library_path" but not "library_paths",
+    // rename the key so serde's custom deserializer receives it correctly.
+    let json_str = if raw.contains("\"library_path\"") && !raw.contains("\"library_paths\"") {
+        raw.replace("\"library_path\"", "\"library_paths\"")
+    } else {
+        raw
+    };
+
+    serde_json::from_str(&json_str).unwrap_or_default()
 }
 
 /// Save the configuration to disk.
@@ -144,29 +199,39 @@ pub fn show_preferences(
     let page = adw::PreferencesPage::new();
     let cfg = config.borrow();
 
-    // ── Library Location group (first) ──────────────────────────────
+    // ── Library Location group (supports multiple folders) ──────────
     let library_group = adw::PreferencesGroup::builder()
         .title(rust_i18n::t!("preferences.library_location").as_ref())
         .build();
 
-    let library_row = adw::ActionRow::builder()
-        .title(rust_i18n::t!("preferences.music_folder").as_ref())
-        .subtitle(&cfg.library_path)
+    // Container for per-path rows (lives inside the group).
+    let paths_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
         .build();
 
-    let browse_btn = gtk::Button::builder()
+    let paths_box_rc = std::rc::Rc::new(std::cell::RefCell::new(paths_box.clone()));
+
+    // Build a row for each existing library path.
+    for lib_path in &cfg.library_paths {
+        let row = build_library_path_row(lib_path, config.clone(), paths_box_rc.clone());
+        paths_box.append(&row);
+    }
+
+    // "Add Folder…" button.
+    let add_folder_btn = gtk::Button::builder()
         .label(rust_i18n::t!("preferences.browse").as_ref())
-        .valign(gtk::Align::Center)
+        .icon_name("list-add-symbolic")
+        .halign(gtk::Align::Start)
+        .css_classes(["flat"])
         .build();
-    library_row.add_suffix(&browse_btn);
-
     {
         let config = config.clone();
-        let library_row = library_row.clone();
+        let paths_box_rc = paths_box_rc.clone();
         let parent = parent.clone();
-        browse_btn.connect_clicked(move |_| {
+        add_folder_btn.connect_clicked(move |_| {
             let config = config.clone();
-            let library_row = library_row.clone();
+            let paths_box_rc = paths_box_rc.clone();
             let dialog = gtk::FileDialog::builder()
                 .title(rust_i18n::t!("preferences.select_music_folder").as_ref())
                 .modal(true)
@@ -179,12 +244,22 @@ pub fn show_preferences(
                     if let Ok(folder) = result {
                         if let Some(path) = folder.path() {
                             let path_str = path.to_string_lossy().to_string();
-                            info!(path = %path_str, "Library folder changed");
-                            library_row.set_subtitle(&path_str);
-
+                            // Don't add duplicates.
                             let mut cfg = config.borrow_mut();
-                            cfg.library_path = path_str;
+                            if cfg.library_paths.contains(&path_str) {
+                                return;
+                            }
+                            info!(path = %path_str, "Library folder added");
+                            cfg.library_paths.push(path_str.clone());
                             save_config(&cfg);
+                            drop(cfg);
+
+                            let row = build_library_path_row(
+                                &path_str,
+                                config.clone(),
+                                paths_box_rc.clone(),
+                            );
+                            paths_box_rc.borrow().append(&row);
                         }
                     }
                 },
@@ -192,7 +267,8 @@ pub fn show_preferences(
         });
     }
 
-    library_group.add(&library_row);
+    library_group.add(&paths_box);
+    library_group.add(&add_folder_btn);
     page.add(&library_group);
 
     // ── Browser Views group (dense horizontal checkboxes) ───────────
@@ -468,4 +544,43 @@ pub fn update_browser_visibility(browser_box: &gtk::Box, views: &BrowserViewsCon
 
     let any_visible = views.genre || views.artist || views.album;
     browser_box.set_visible(any_visible);
+}
+
+/// Build a single library-path row for the preferences dialog.
+///
+/// Each row shows the folder path as an `ActionRow` with a "Remove" button.
+/// Removing the last path is prevented (at least one directory is required).
+fn build_library_path_row(
+    path: &str,
+    config: std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    paths_box: std::rc::Rc<std::cell::RefCell<gtk::Box>>,
+) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(rust_i18n::t!("preferences.music_folder").as_ref())
+        .subtitle(path)
+        .build();
+
+    let remove_btn = gtk::Button::builder()
+        .icon_name("list-remove-symbolic")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "circular"])
+        .tooltip_text("Remove folder")
+        .build();
+    row.add_suffix(&remove_btn);
+
+    let path_owned = path.to_string();
+    let row_clone = row.clone();
+    remove_btn.connect_clicked(move |_| {
+        let mut cfg = config.borrow_mut();
+        // Prevent removing the last directory.
+        if cfg.library_paths.len() <= 1 {
+            return;
+        }
+        cfg.library_paths.retain(|p| p != &path_owned);
+        save_config(&cfg);
+        drop(cfg);
+        paths_box.borrow().remove(&row_clone);
+    });
+
+    row
 }

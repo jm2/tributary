@@ -56,34 +56,42 @@ pub enum LibraryEvent {
 /// The background scanning and watching engine.
 pub struct LibraryEngine {
     db: DatabaseConnection,
-    music_dir: PathBuf,
+    music_dirs: Vec<PathBuf>,
     tx: async_channel::Sender<LibraryEvent>,
 }
 
 impl LibraryEngine {
     /// Create a new engine. Does NOT start scanning yet.
+    ///
+    /// Accepts multiple music directories — all will be scanned and watched.
     pub fn new(
         db: DatabaseConnection,
-        music_dir: PathBuf,
+        music_dirs: Vec<PathBuf>,
         tx: async_channel::Sender<LibraryEvent>,
     ) -> Self {
-        Self { db, music_dir, tx }
+        Self { db, music_dirs, tx }
     }
 
-    /// Run the engine: initial scan, then continuous FS watching.
+    /// Run the engine: initial scan across all directories, then continuous
+    /// FS watching on each.
     pub async fn run(self) {
         let db = Arc::new(self.db);
 
-        // ── Initial scan ─────────────────────────────────────────────
-        info!(dir = %self.music_dir.display(), "Starting initial library scan");
-        if let Err(e) = initial_scan(&db, &self.music_dir, &self.tx).await {
+        // ── Initial scan (all directories) ───────────────────────────
+        for dir in &self.music_dirs {
+            info!(dir = %dir.display(), "Starting initial library scan");
+        }
+        if let Err(e) = initial_scan(&db, &self.music_dirs, &self.tx).await {
             error!(error = %e, "Initial scan failed");
             let _ = self.tx.send(LibraryEvent::Error(e.to_string())).await;
         }
 
-        // ── Filesystem watcher ───────────────────────────────────────
-        info!(dir = %self.music_dir.display(), "Starting filesystem watcher");
-        if let Err(e) = watch_directory(&db, &self.music_dir, &self.tx).await {
+        // ── Filesystem watcher (all directories) ─────────────────────
+        info!(
+            count = self.music_dirs.len(),
+            "Starting filesystem watchers"
+        );
+        if let Err(e) = watch_directories(&db, &self.music_dirs, &self.tx).await {
             error!(error = %e, "Filesystem watcher failed");
             let _ = self.tx.send(LibraryEvent::Error(e.to_string())).await;
         }
@@ -96,20 +104,23 @@ impl LibraryEngine {
 
 async fn initial_scan(
     db: &DatabaseConnection,
-    music_dir: &Path,
+    music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
 ) -> anyhow::Result<()> {
-    let dir = music_dir.to_path_buf();
+    let dirs = music_dirs.to_vec();
 
-    // Collect audio files (blocking I/O in spawn_blocking)
+    // Collect audio files from ALL directories (blocking I/O in spawn_blocking)
     let audio_files: Vec<PathBuf> = tokio::task::spawn_blocking(move || {
-        WalkDir::new(&dir)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| tag_parser::is_audio_file(e.path()))
-            .map(|e| e.into_path())
+        dirs.iter()
+            .flat_map(|dir| {
+                WalkDir::new(dir)
+                    .follow_links(true)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_file())
+                    .filter(|e| tag_parser::is_audio_file(e.path()))
+                    .map(|e| e.into_path())
+            })
             .collect()
     })
     .await?;
@@ -203,8 +214,22 @@ async fn initial_scan(
     }
 
     // Send playlist list to UI thread for sidebar population.
+    // If no playlists exist yet, seed the default smart playlists.
     match playlist_mgr.list_playlists().await {
         Ok(playlists) => {
+            let playlists = if playlists.is_empty() {
+                info!("No playlists found — seeding defaults");
+                match playlist_mgr.seed_defaults().await {
+                    Ok(defaults) => defaults,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to seed default playlists");
+                        Vec::new()
+                    }
+                }
+            } else {
+                playlists
+            };
+
             let entries: Vec<(String, String, bool)> = playlists
                 .iter()
                 .map(|p| (p.id.clone(), p.name.clone(), p.is_smart))
@@ -227,9 +252,9 @@ async fn initial_scan(
 // Filesystem watcher
 // ---------------------------------------------------------------------------
 
-async fn watch_directory(
+async fn watch_directories(
     db: &Arc<DatabaseConnection>,
-    music_dir: &Path,
+    music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
 ) -> anyhow::Result<()> {
     let (notify_tx, mut notify_rx) = mpsc::channel::<notify::Result<notify::Event>>(256);
@@ -241,7 +266,10 @@ async fn watch_directory(
         notify::Config::default().with_poll_interval(Duration::from_secs(2)),
     )?;
 
-    watcher.watch(music_dir.as_ref(), RecursiveMode::Recursive)?;
+    for dir in music_dirs {
+        watcher.watch(dir.as_ref(), RecursiveMode::Recursive)?;
+        info!(dir = %dir.display(), "Watching directory");
+    }
     info!("Filesystem watcher active");
 
     // Keep watcher alive by holding it in scope
