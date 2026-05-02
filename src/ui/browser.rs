@@ -27,6 +27,9 @@ pub struct BrowserState {
     tracks: Rc<RefCell<Vec<TrackSnapshot>>>,
     /// Current search text for the realtime filter.
     search_text: Rc<RefCell<String>>,
+    /// When true, the Artist pane groups by album artist (with fallback
+    /// to track artist for tracks that don't carry an album-artist tag).
+    use_album_artist: Rc<Cell<bool>>,
 }
 
 /// Build the 3-pane browser.
@@ -35,8 +38,10 @@ pub struct BrowserState {
 /// `BrowserState` and pass it to [`rebuild_browser_data`] on FullSync.
 pub fn build_browser(
     all_tracks: &[TrackObject],
+    use_album_artist: bool,
     on_filter_changed: FilterCallback,
 ) -> (gtk::Box, BrowserState) {
+    let use_album_artist: Rc<Cell<bool>> = Rc::new(Cell::new(use_album_artist));
     // Shared filter state
     let selected_genre: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let selected_artist: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -59,9 +64,10 @@ pub fn build_browser(
     ));
 
     // Initial population
-    populate_genres(&genre_store, &tracks.borrow(), &None, &None);
-    populate_artists(&artist_store, &tracks.borrow(), &None, &None);
-    populate_albums(&album_store, &tracks.borrow(), &None, &None);
+    let use_aa = use_album_artist.get();
+    populate_genres(&genre_store, &tracks.borrow(), &None, &None, use_aa);
+    populate_artists(&artist_store, &tracks.borrow(), &None, &None, use_aa);
+    populate_albums(&album_store, &tracks.borrow(), &None, &None, use_aa);
 
     // Wrap callback in Rc for sharing across closures
     let on_filter_changed = Rc::new(on_filter_changed);
@@ -95,6 +101,7 @@ pub fn build_browser(
         let cb = on_filter_changed.clone();
         let updating = updating.clone();
         let search_text = search_text.clone();
+        let use_aa = use_album_artist.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
             if updating.get() {
@@ -108,8 +115,9 @@ pub fn build_browser(
 
             updating.set(true);
             let borrowed = tracks.borrow();
-            populate_artists(&artist_store, &borrowed, &genre, &None);
-            populate_albums(&album_store, &borrowed, &genre, &None);
+            let flag = use_aa.get();
+            populate_artists(&artist_store, &borrowed, &genre, &None, flag);
+            populate_albums(&album_store, &borrowed, &genre, &None, flag);
             updating.set(false);
 
             cb(genre, None, None, search_text.borrow().clone());
@@ -130,6 +138,7 @@ pub fn build_browser(
         let cb = on_filter_changed.clone();
         let updating = updating.clone();
         let search_text = search_text.clone();
+        let use_aa = use_album_artist.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
             if updating.get() {
@@ -143,9 +152,10 @@ pub fn build_browser(
 
             updating.set(true);
             let borrowed = tracks.borrow();
-            populate_genres(&genre_store, &borrowed, &artist, &None);
+            let flag = use_aa.get();
+            populate_genres(&genre_store, &borrowed, &artist, &None, flag);
             restore_selection(&genre_pane, &genre);
-            populate_albums(&album_store, &borrowed, &genre, &artist);
+            populate_albums(&album_store, &borrowed, &genre, &artist, flag);
             updating.set(false);
 
             cb(genre, artist, None, search_text.borrow().clone());
@@ -167,6 +177,7 @@ pub fn build_browser(
         let cb = on_filter_changed.clone();
         let updating = updating.clone();
         let search_text = search_text.clone();
+        let use_aa = use_album_artist.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
             if updating.get() {
@@ -180,9 +191,10 @@ pub fn build_browser(
 
             updating.set(true);
             let borrowed = tracks.borrow();
-            populate_genres(&genre_store, &borrowed, &artist, &album);
+            let flag = use_aa.get();
+            populate_genres(&genre_store, &borrowed, &artist, &album, flag);
             restore_selection(&genre_pane, &genre);
-            populate_artists(&artist_store, &borrowed, &genre, &album);
+            populate_artists(&artist_store, &borrowed, &genre, &album, flag);
             restore_selection(&artist_pane, &artist);
             updating.set(false);
 
@@ -247,6 +259,7 @@ pub fn build_browser(
     let state = BrowserState {
         tracks,
         search_text,
+        use_album_artist,
     };
     (browser_box, state)
 }
@@ -263,7 +276,6 @@ struct TrackSnapshot {
     genre: String,
     artist: String,
     /// Album artist (used for browser grouping when the preference is on).
-    #[allow(dead_code)] // Will be used when group_by_album_artist preference is wired
     album_artist: String,
     album: String,
 }
@@ -283,7 +295,6 @@ impl TrackSnapshot {
     ///
     /// When `use_album_artist` is true and the track has a non-empty
     /// album artist tag, return it; otherwise fall back to the track artist.
-    #[allow(dead_code)] // Will be used when group_by_album_artist preference is wired
     fn browser_artist(&self, use_album_artist: bool) -> &str {
         if use_album_artist && !self.album_artist.is_empty() {
             &self.album_artist
@@ -412,12 +423,13 @@ fn populate_genres(
     tracks: &[TrackSnapshot],
     artist_filter: &Option<String>,
     album_filter: &Option<String>,
+    use_album_artist: bool,
 ) {
     store.remove_all();
     let mut map = std::collections::BTreeMap::<String, u32>::new();
     for t in tracks {
         if let Some(a) = artist_filter {
-            if &t.artist != a {
+            if t.browser_artist(use_album_artist) != a {
                 continue;
             }
         }
@@ -440,6 +452,7 @@ fn populate_artists(
     tracks: &[TrackSnapshot],
     genre_filter: &Option<String>,
     album_filter: &Option<String>,
+    use_album_artist: bool,
 ) {
     store.remove_all();
     let mut map = std::collections::BTreeMap::<String, u32>::new();
@@ -454,7 +467,8 @@ fn populate_artists(
                 continue;
             }
         }
-        *map.entry(t.artist.clone()).or_insert(0) += 1;
+        *map.entry(t.browser_artist(use_album_artist).to_string())
+            .or_insert(0) += 1;
     }
     let total: u32 = map.values().sum();
     store.append(&BrowserItem::new("All", total));
@@ -468,6 +482,7 @@ fn populate_albums(
     tracks: &[TrackSnapshot],
     genre_filter: &Option<String>,
     artist_filter: &Option<String>,
+    use_album_artist: bool,
 ) {
     store.remove_all();
     let mut map = std::collections::BTreeMap::<String, u32>::new();
@@ -478,7 +493,7 @@ fn populate_albums(
             }
         }
         if let Some(a) = artist_filter {
-            if &t.artist != a {
+            if t.browser_artist(use_album_artist) != a {
                 continue;
             }
         }
@@ -516,6 +531,7 @@ pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks
     }
 
     let borrowed = state.tracks.borrow();
+    let use_aa = state.use_album_artist.get();
 
     // The browser_box layout is: SearchEntry, panes_box (horizontal Box).
     // The panes_box contains 3 children (genre_pane, artist_pane, album_pane).
@@ -535,13 +551,54 @@ pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks
 
         if panes.len() >= 3 {
             if let Some(genre_store) = get_store_from_pane(&panes[0]) {
-                populate_genres(&genre_store, &borrowed, &None, &None);
+                populate_genres(&genre_store, &borrowed, &None, &None, use_aa);
             }
             if let Some(artist_store) = get_store_from_pane(&panes[1]) {
-                populate_artists(&artist_store, &borrowed, &None, &None);
+                populate_artists(&artist_store, &borrowed, &None, &None, use_aa);
             }
             if let Some(album_store) = get_store_from_pane(&panes[2]) {
-                populate_albums(&album_store, &borrowed, &None, &None);
+                populate_albums(&album_store, &borrowed, &None, &None, use_aa);
+            }
+        }
+    }
+}
+
+/// Toggle album-artist grouping and rebuild the browser panes.
+///
+/// Updates the shared flag, then refreshes all three panes from the
+/// current snapshot.  Selections reset to "All" because the artist
+/// pane's contents are about to change.
+pub fn set_album_artist_grouping(
+    browser_box: &gtk::Box,
+    state: &BrowserState,
+    enabled: bool,
+) {
+    state.use_album_artist.set(enabled);
+
+    let borrowed = state.tracks.borrow();
+    let panes_box = browser_box
+        .last_child()
+        .and_then(|w| w.downcast::<gtk::Box>().ok());
+
+    if let Some(ref panes_box) = panes_box {
+        let mut child = panes_box.first_child();
+        let mut panes = Vec::new();
+        while let Some(widget) = child {
+            if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
+                panes.push(pane.clone());
+            }
+            child = widget.next_sibling();
+        }
+
+        if panes.len() >= 3 {
+            if let Some(genre_store) = get_store_from_pane(&panes[0]) {
+                populate_genres(&genre_store, &borrowed, &None, &None, enabled);
+            }
+            if let Some(artist_store) = get_store_from_pane(&panes[1]) {
+                populate_artists(&artist_store, &borrowed, &None, &None, enabled);
+            }
+            if let Some(album_store) = get_store_from_pane(&panes[2]) {
+                populate_albums(&album_store, &borrowed, &None, &None, enabled);
             }
         }
     }

@@ -7,6 +7,7 @@ pub mod discovery_handler;
 pub mod dummy_data;
 pub mod header_bar;
 pub mod objects;
+pub mod open_files;
 pub mod output_dialogs;
 pub mod output_switch;
 pub mod persistence;

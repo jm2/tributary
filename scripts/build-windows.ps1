@@ -39,10 +39,18 @@
     If specified, sets up the MSYS2 build environment, builds in release mode, and
     runs the compiled binary. Useful for quick launch from PowerShell.
 
+.PARAMETER Coverage
+    If specified, sets up the MSYS2 build environment and runs `cargo llvm-cov`
+    with the project's curated --ignore-filename-regex.  Installs cargo-llvm-cov
+    if it is not already present.
+
 .PARAMETER CargoUpdate
     If specified, sets up the MSYS2 build environment and runs `cargo update` with
     any additional arguments passed via -CargoUpdateArgs. Useful for updating
     dependencies from PowerShell (e.g. -CargoUpdate -CargoUpdateArgs "-p rustls-webpki").
+
+.PARAMETER Help
+    Show this help and exit.  Equivalent to `Get-Help .\scripts\build-windows.ps1 -Full`.
 #>
 param(
     [string]$Msys2Root = "C:\msys64",
@@ -56,11 +64,21 @@ param(
     [switch]$Run,
     [switch]$Coverage,
     [switch]$CargoUpdate,
-    [string]$CargoUpdateArgs = ""
+    [string]$CargoUpdateArgs = "",
+    [switch]$Help
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# ── --help / -Help / -? short-circuit ──────────────────────────────────────────
+# Print the comment-based help and exit before any environment setup runs.
+# Also accept the bash-style `--help` arg for parity with build-linux.sh /
+# build-macos.sh; it arrives as an unbound positional, so we sniff $args.
+if ($Help -or ($args -contains '--help') -or ($args -contains '-h')) {
+    Get-Help -Full $PSCommandPath
+    exit 0
+}
 
 function Write-Info { Write-Host "[tributary] $args" -ForegroundColor Green }
 function Write-Warn { Write-Host "[tributary] $args" -ForegroundColor Yellow }

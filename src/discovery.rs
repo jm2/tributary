@@ -225,11 +225,15 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
         if let Some(ref rx) = airplay2_rx {
             while let Ok(event) = rx.try_recv() {
                 got_event = true;
-                // AirPlay 2 devices are treated the same as legacy RAOP
-                // for discovery purposes — both use "airplay" service type.
-                // The `seen` HashMap deduplicates by host:port, so devices
-                // advertising both _raop._tcp and _airplay._tcp only appear once.
-                process_mdns_event(event, "airplay", &mut seen, &tx);
+                // `_airplay._tcp` records belong to AirPlay 2-capable
+                // receivers (and most are AirPlay 2-only).  We tag them
+                // with a distinct service type so the discovery handler
+                // can route them separately from legacy RAOP entries —
+                // today that means filtering them out of the output
+                // popover, since the current sender path only speaks
+                // RAOP.  When AirPlay 2 sender support lands, this is
+                // the channel where it will plug in.
+                process_mdns_event(event, "airplay2", &mut seen, &tx);
             }
         }
 
@@ -324,7 +328,7 @@ fn process_mdns_event(
             // AirPlay / RAOP devices often use "MAC@DeviceName" as
             // their mDNS instance name (e.g. "8EE58A500A56@Rear Lounge TV").
             // Strip the MAC prefix for a cleaner display name.
-            let name = if service_type == "airplay" {
+            let name = if service_type == "airplay" || service_type == "airplay2" {
                 strip_airplay_mac_prefix(&raw_name)
             } else {
                 raw_name

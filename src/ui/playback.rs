@@ -133,6 +133,63 @@ pub fn advance_track(ctx: &PlaybackContext, repeat_mode: RepeatMode, shuffle: bo
     }
 }
 
+/// Play a local file directly, bypassing the library tracklist.
+///
+/// Used by the OS "Open With" / `xdg-open` handler.  Reads tags via
+/// lofty, updates the now-playing UI (labels, album art, OS media
+/// overlay), and asks the active output to play the file.  Sets
+/// `current_pos` to `None` because the file is not part of `ctx.model`,
+/// so Next/Previous fall back to "start from the top of the list" —
+/// which is the right behaviour after the user has finished listening
+/// to the file they opened from outside.
+///
+/// Returns `true` if playback was initiated, `false` if the file could
+/// not be parsed or has no playable URI representation.
+pub fn play_local_file(path: &std::path::Path, ctx: &PlaybackContext) -> bool {
+    use crate::ui::album_art;
+
+    let parsed = match crate::local::tag_parser::parse_audio_file(path) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "Open With: failed to parse audio file");
+            return false;
+        }
+    };
+
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let uri = format!("file://{}", canonical.display());
+
+    // Chromecast can't play file:// — restore the parked local output
+    // first, mirroring the guard in play_track_at.
+    let is_chromecast = ctx.active_output.borrow().output_type() == OutputType::Chromecast;
+    if is_chromecast {
+        tracing::info!("Open With: Chromecast cannot play local files — switching to local output");
+        if let Some(local) = ctx.parked_local.borrow_mut().take() {
+            *ctx.active_output.borrow_mut() = local;
+        }
+    }
+
+    ctx.active_output.borrow().load_uri(&uri);
+    ctx.active_output.borrow().play();
+
+    ctx.title_label.set_label(&parsed.title);
+    ctx.artist_label.set_label(&format!(
+        "{} \u{2014} {}",
+        parsed.artist_name, parsed.album_title
+    ));
+    album_art::update_album_art(&ctx.album_art, &uri);
+
+    if let Some(ref mut ctrl) = *ctx.media_ctrl.borrow_mut() {
+        ctrl.update_metadata(&parsed.title, &parsed.artist_name, &parsed.album_title);
+    }
+
+    // The file isn't in ctx.model, so the position cursor doesn't apply.
+    ctx.current_pos.set(None);
+
+    tracing::info!(path = %path.display(), "Open With: playback started");
+    true
+}
+
 /// Format milliseconds as `m:ss` (or `h:mm:ss` for ≥ 1 hour).
 pub fn format_ms(ms: u64) -> String {
     let total_secs = ms / 1000;

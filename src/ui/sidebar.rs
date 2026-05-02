@@ -68,48 +68,167 @@ pub fn build_sidebar(
     // Channel for manual server delete (trash) requests.
     let (delete_tx, delete_rx) = async_channel::unbounded::<String>();
 
-    let factory = gtk::SignalListItemFactory::new();
-
-    factory.connect_setup(|_, list_item| {
-        let list_item = list_item
-            .downcast_ref::<gtk::ListItem>()
-            .expect("ListItem expected");
-        let row_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
-            .margin_start(8)
-            .margin_end(8)
-            .margin_top(4)
-            .margin_bottom(4)
-            .build();
-
-        let icon = gtk::Image::builder().pixel_size(16).build();
-        let spinner = gtk::Spinner::builder()
-            .spinning(true)
-            .width_request(16)
-            .height_request(16)
-            .visible(false)
-            .build();
-        let label = gtk::Label::builder()
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
-        // Action button: eject (DAAP) or trash (manual) — reused widget.
-        let action_btn = gtk::Button::builder()
-            .css_classes(["flat", "circular"])
-            .visible(false)
-            .build();
-
-        row_box.append(&icon);
-        row_box.append(&spinner);
-        row_box.append(&label);
-        row_box.append(&action_btn);
-        list_item.set_child(Some(&row_box));
-    });
-
     // ── Playlist action channel (shared by header "+" button and context menu) ──
     let (playlist_action_tx, playlist_action_rx) = async_channel::unbounded::<PlaylistAction>();
+
+    let factory = gtk::SignalListItemFactory::new();
+
+    {
+        let store_for_setup = store.clone();
+        let tx_for_setup = playlist_action_tx.clone();
+        factory.connect_setup(move |_, list_item| {
+            let list_item = list_item
+                .downcast_ref::<gtk::ListItem>()
+                .expect("ListItem expected");
+            let row_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(8)
+                .margin_start(8)
+                .margin_end(8)
+                .margin_top(4)
+                .margin_bottom(4)
+                .build();
+
+            let icon = gtk::Image::builder().pixel_size(16).build();
+            let spinner = gtk::Spinner::builder()
+                .spinning(true)
+                .width_request(16)
+                .height_request(16)
+                .visible(false)
+                .build();
+            let label = gtk::Label::builder()
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .build();
+            // Action button: eject (DAAP) or trash (manual) — reused widget.
+            let action_btn = gtk::Button::builder()
+                .css_classes(["flat", "circular"])
+                .visible(false)
+                .build();
+
+            row_box.append(&icon);
+            row_box.append(&spinner);
+            row_box.append(&label);
+            row_box.append(&action_btn);
+            list_item.set_child(Some(&row_box));
+
+            // Per-row right-click gesture.
+            //
+            // The gesture is attached to row_box (not the ListView) because
+            // header rows are non-selectable, which means a ListView-level
+            // handler that resolves the target via `selection.selected()`
+            // can never see the "Playlists" header.  Per-row gestures sidestep
+            // that entirely: they resolve the target via `list_item.position()`,
+            // which tracks the current binding even for non-selectable rows.
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(3);
+            let store_for_gesture = store_for_setup.clone();
+            let tx_for_gesture = tx_for_setup.clone();
+            let list_item_for_gesture = list_item.clone();
+            let row_box_for_gesture = row_box.clone();
+            gesture.connect_pressed(move |_, _n_press, x, y| {
+                let pos = list_item_for_gesture.position();
+                let Some(item) = store_for_gesture.item(pos) else {
+                    return;
+                };
+                let Some(src) = item.downcast_ref::<SourceObject>() else {
+                    return;
+                };
+
+                let bt = src.backend_type();
+                let is_playlist = bt == "playlist" || bt == "smart-playlist";
+                let is_playlist_header = src.is_header() && src.name() == "Playlists";
+                if !is_playlist && !is_playlist_header {
+                    return;
+                }
+
+                let menu = gtk::gio::Menu::new();
+                if is_playlist_header {
+                    menu.append(Some("New Playlist"), Some("playlist.create-regular"));
+                    menu.append(Some("New Smart Playlist"), Some("playlist.create-smart"));
+                    menu.append(Some("Import Playlist\u{2026}"), Some("playlist.import"));
+                } else if is_playlist {
+                    menu.append(Some("Rename"), Some("playlist.rename"));
+                    menu.append(Some("Export\u{2026}"), Some("playlist.export"));
+                    menu.append(Some("Delete"), Some("playlist.delete"));
+                    if bt == "smart-playlist" {
+                        menu.append(
+                            Some("Edit Smart Playlist\u{2026}"),
+                            Some("playlist.edit-smart"),
+                        );
+                    }
+                }
+
+                let action_group = gtk::gio::SimpleActionGroup::new();
+                let pid = src.playlist_id();
+
+                let tx = tx_for_gesture.clone();
+                let create_reg = gtk::gio::SimpleAction::new("create-regular", None);
+                create_reg.connect_activate(move |_, _| {
+                    let _ = tx.try_send(PlaylistAction::CreateRegular);
+                });
+                action_group.add_action(&create_reg);
+
+                let tx = tx_for_gesture.clone();
+                let create_smart = gtk::gio::SimpleAction::new("create-smart", None);
+                create_smart.connect_activate(move |_, _| {
+                    let _ = tx.try_send(PlaylistAction::CreateSmart);
+                });
+                action_group.add_action(&create_smart);
+
+                let tx = tx_for_gesture.clone();
+                let pid_clone = pid.clone();
+                let rename = gtk::gio::SimpleAction::new("rename", None);
+                rename.connect_activate(move |_, _| {
+                    let _ = tx.try_send(PlaylistAction::Rename(pid_clone.clone()));
+                });
+                action_group.add_action(&rename);
+
+                let tx = tx_for_gesture.clone();
+                let pid_clone = pid.clone();
+                let delete = gtk::gio::SimpleAction::new("delete", None);
+                delete.connect_activate(move |_, _| {
+                    let _ = tx.try_send(PlaylistAction::Delete(pid_clone.clone()));
+                });
+                action_group.add_action(&delete);
+
+                let tx = tx_for_gesture.clone();
+                let pid_clone = pid.clone();
+                let edit_smart = gtk::gio::SimpleAction::new("edit-smart", None);
+                edit_smart.connect_activate(move |_, _| {
+                    let _ = tx.try_send(PlaylistAction::EditSmart(pid_clone.clone()));
+                });
+                action_group.add_action(&edit_smart);
+
+                let tx = tx_for_gesture.clone();
+                let import = gtk::gio::SimpleAction::new("import", None);
+                import.connect_activate(move |_, _| {
+                    let _ = tx.try_send(PlaylistAction::ImportPlaylist);
+                });
+                action_group.add_action(&import);
+
+                let tx = tx_for_gesture.clone();
+                let pid_clone = pid.clone();
+                let export = gtk::gio::SimpleAction::new("export", None);
+                export.connect_activate(move |_, _| {
+                    let _ = tx.try_send(PlaylistAction::ExportPlaylist(pid_clone.clone()));
+                });
+                action_group.add_action(&export);
+
+                row_box_for_gesture.insert_action_group("playlist", Some(&action_group));
+
+                let popover = gtk::PopoverMenu::from_model(Some(&menu));
+                popover.set_parent(&row_box_for_gesture);
+                #[allow(clippy::cast_possible_truncation)]
+                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                    x as i32, y as i32, 1, 1,
+                )));
+                popover.popup();
+            });
+            row_box.add_controller(gesture);
+        });
+    }
 
     {
         let disconnect_tx = disconnect_tx.clone();
@@ -164,10 +283,14 @@ pub fn build_sidebar(
                     action_btn.set_visible(true);
                     let tx = playlist_action_tx.clone();
                     action_btn.connect_clicked(move |btn| {
-                        // Build a small popover menu with two options.
+                        // Build a small popover menu with playlist actions.
                         let menu = gtk::gio::Menu::new();
                         menu.append(Some("New Playlist"), Some("pl-add.create-regular"));
                         menu.append(Some("New Smart Playlist"), Some("pl-add.create-smart"));
+                        menu.append(
+                            Some("Import Playlist\u{2026}"),
+                            Some("pl-add.import"),
+                        );
 
                         let ag = gtk::gio::SimpleActionGroup::new();
 
@@ -184,6 +307,13 @@ pub fn build_sidebar(
                             let _ = tx_smart.try_send(PlaylistAction::CreateSmart);
                         });
                         ag.add_action(&smart);
+
+                        let tx_import = tx.clone();
+                        let import = gtk::gio::SimpleAction::new("import", None);
+                        import.connect_activate(move |_, _| {
+                            let _ = tx_import.try_send(PlaylistAction::ImportPlaylist);
+                        });
+                        ag.add_action(&import);
 
                         btn.insert_action_group("pl-add", Some(&ag));
 
@@ -324,129 +454,6 @@ pub fn build_sidebar(
         .css_classes(["toolbar"])
         .build();
     toolbar.append(&add_button);
-
-    // ── Playlist right-click context menu ───────────────────────────
-    {
-        let gesture = gtk::GestureClick::new();
-        gesture.set_button(3); // right-click
-        let store_for_ctx = store.clone();
-        let selection_for_ctx = selection.clone();
-        let tx = playlist_action_tx.clone();
-
-        gesture.connect_pressed(move |gesture, _n_press, x, y| {
-            let Some(widget) = gesture.widget() else {
-                return;
-            };
-            let Ok(list_view) = widget.downcast::<gtk::ListView>() else {
-                return;
-            };
-
-            // Determine which item was right-clicked by checking the
-            // currently selected item (GTK selects on press before
-            // gesture fires for ListView).
-            let pos = selection_for_ctx.selected();
-            let Some(item) = store_for_ctx.item(pos) else {
-                return;
-            };
-            let Some(src) = item.downcast_ref::<SourceObject>() else {
-                return;
-            };
-
-            let bt = src.backend_type();
-            let is_playlist = bt == "playlist" || bt == "smart-playlist";
-            let is_playlist_header = src.is_header() && src.name() == "Playlists";
-
-            if !is_playlist && !is_playlist_header {
-                return;
-            }
-
-            // Build context menu.
-            let menu = gtk::gio::Menu::new();
-
-            if is_playlist_header {
-                menu.append(Some("New Playlist"), Some("playlist.create-regular"));
-                menu.append(Some("New Smart Playlist"), Some("playlist.create-smart"));
-                menu.append(Some("Import Playlist\u{2026}"), Some("playlist.import"));
-            } else if is_playlist {
-                menu.append(Some("Rename"), Some("playlist.rename"));
-                menu.append(Some("Export\u{2026}"), Some("playlist.export"));
-                menu.append(Some("Delete"), Some("playlist.delete"));
-                if bt == "smart-playlist" {
-                    menu.append(
-                        Some("Edit Smart Playlist\u{2026}"),
-                        Some("playlist.edit-smart"),
-                    );
-                }
-            }
-
-            // Create action group.
-            let action_group = gtk::gio::SimpleActionGroup::new();
-
-            let tx_create_reg = tx.clone();
-            let create_reg = gtk::gio::SimpleAction::new("create-regular", None);
-            create_reg.connect_activate(move |_, _| {
-                let _ = tx_create_reg.try_send(PlaylistAction::CreateRegular);
-            });
-            action_group.add_action(&create_reg);
-
-            let tx_create_smart = tx.clone();
-            let create_smart = gtk::gio::SimpleAction::new("create-smart", None);
-            create_smart.connect_activate(move |_, _| {
-                let _ = tx_create_smart.try_send(PlaylistAction::CreateSmart);
-            });
-            action_group.add_action(&create_smart);
-
-            let pid = src.playlist_id();
-
-            let tx_rename = tx.clone();
-            let pid_rename = pid.clone();
-            let rename = gtk::gio::SimpleAction::new("rename", None);
-            rename.connect_activate(move |_, _| {
-                let _ = tx_rename.try_send(PlaylistAction::Rename(pid_rename.clone()));
-            });
-            action_group.add_action(&rename);
-
-            let tx_delete = tx.clone();
-            let pid_delete = pid.clone();
-            let delete = gtk::gio::SimpleAction::new("delete", None);
-            delete.connect_activate(move |_, _| {
-                let _ = tx_delete.try_send(PlaylistAction::Delete(pid_delete.clone()));
-            });
-            action_group.add_action(&delete);
-
-            let tx_edit = tx.clone();
-            let pid_edit = pid.clone();
-            let edit_smart = gtk::gio::SimpleAction::new("edit-smart", None);
-            edit_smart.connect_activate(move |_, _| {
-                let _ = tx_edit.try_send(PlaylistAction::EditSmart(pid_edit.clone()));
-            });
-            action_group.add_action(&edit_smart);
-
-            let tx_import = tx.clone();
-            let import_action = gtk::gio::SimpleAction::new("import", None);
-            import_action.connect_activate(move |_, _| {
-                let _ = tx_import.try_send(PlaylistAction::ImportPlaylist);
-            });
-            action_group.add_action(&import_action);
-
-            let tx_export = tx.clone();
-            let pid_export = pid.clone();
-            let export_action = gtk::gio::SimpleAction::new("export", None);
-            export_action.connect_activate(move |_, _| {
-                let _ = tx_export.try_send(PlaylistAction::ExportPlaylist(pid_export.clone()));
-            });
-            action_group.add_action(&export_action);
-
-            list_view.insert_action_group("playlist", Some(&action_group));
-
-            let popover = gtk::PopoverMenu::from_model(Some(&menu));
-            popover.set_parent(&list_view);
-            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.popup();
-        });
-
-        list_view.add_controller(gesture);
-    }
 
     // Wrap scrolled + toolbar in a vertical box.
     let sidebar_box = gtk::Box::builder()

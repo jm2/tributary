@@ -191,6 +191,7 @@ pub fn show_preferences(
     column_view: &gtk::ColumnView,
     browser_box: &gtk::Box,
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
 ) {
     let prefs_dialog = adw::PreferencesDialog::builder()
         .title(rust_i18n::t!("preferences.title").as_ref())
@@ -311,10 +312,15 @@ pub fn show_preferences(
     // Wire album artist toggle
     {
         let config = config.clone();
+        let on_change = on_album_artist_changed.clone();
         album_artist_check.connect_toggled(move |btn| {
-            let mut cfg = config.borrow_mut();
-            cfg.group_by_album_artist = btn.is_active();
-            save_config(&cfg);
+            let active = btn.is_active();
+            {
+                let mut cfg = config.borrow_mut();
+                cfg.group_by_album_artist = active;
+                save_config(&cfg);
+            }
+            on_change(active);
         });
     }
 

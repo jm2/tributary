@@ -1,8 +1,31 @@
 #!/usr/bin/env bash
 # scripts/build-macos.sh
 # Tributary — macOS release build helper (.app + .dmg)
-# Usage: ./scripts/build-macos.sh [--dmg] [--check] [--fmt] [--clippy]
 set -euo pipefail
+
+print_usage() {
+  cat <<'EOF'
+Tributary — macOS build helper (.app bundle, optional .dmg).
+
+Usage:
+  ./scripts/build-macos.sh [options]
+
+With no options, performs a full release build, creates the .app bundle,
+fixes dylib rpaths, and ad-hoc code-signs the bundle.
+
+Quick-exit modes (run one task and exit):
+  --fmt             Run `cargo fmt`.
+  --check           Run `cargo check`.
+  --clippy          Run `cargo clippy --all-targets -- -D warnings` (pedantic).
+  --coverage        Run `cargo llvm-cov` summary (installs cargo-llvm-cov if needed).
+
+Packaging:
+  --dmg             After bundling, create dist/Tributary.dmg via create-dmg.
+
+Other:
+  -h, --help        Show this help and exit.
+EOF
+}
 
 MAKE_DMG=false
 CHECK=false
@@ -11,11 +34,13 @@ CLIPPY=false
 COVERAGE=false
 for arg in "$@"; do
   case "$arg" in
+    -h|--help)  print_usage; exit 0 ;;
     --dmg)      MAKE_DMG=true ;;
     --check)    CHECK=true ;;
     --fmt)      FMT=true ;;
     --clippy)   CLIPPY=true ;;
     --coverage) COVERAGE=true ;;
+    *)          echo "Unknown option: $arg" >&2; print_usage >&2; exit 2 ;;
   esac
 done
 

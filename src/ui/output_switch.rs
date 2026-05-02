@@ -177,6 +177,7 @@ fn handle_airplay_switch(
     park_local_if_needed(active_output, parked_local, event_sender);
 
     let airplay = AirPlayOutput::new(&airplay_name, &host, port, event_sender.clone());
+    let supports_volume = airplay.supports_volume();
     *active_output.borrow_mut() = Box::new(airplay);
     info!(
         name = %airplay_name,
@@ -185,7 +186,7 @@ fn handle_airplay_switch(
         "Switched to AirPlay output"
     );
 
-    volume_scale.set_sensitive(false);
+    volume_scale.set_sensitive(supports_volume);
 }
 
 /// Switch to an MPD output.

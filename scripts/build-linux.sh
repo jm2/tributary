@@ -1,8 +1,33 @@
 #!/usr/bin/env bash
 # scripts/build-linux.sh
 # Tributary — Linux release build helper
-# Usage: ./scripts/build-linux.sh [--flatpak] [--deb] [--rpm] [--arch-pkg] [--check] [--fmt] [--clippy]
 set -euo pipefail
+
+print_usage() {
+  cat <<'EOF'
+Tributary — Linux build helper.
+
+Usage:
+  ./scripts/build-linux.sh [options]
+
+With no options, performs a full release build (cargo build --release).
+
+Quick-exit modes (run one task and exit):
+  --fmt             Run `cargo fmt`.
+  --check           Run `cargo check`.
+  --clippy          Run `cargo clippy --all-targets -- -D warnings` (pedantic).
+  --coverage        Run `cargo llvm-cov` summary (installs cargo-llvm-cov if needed).
+
+Packaging (after the release build):
+  --flatpak         Build a Flatpak bundle (requires flatpak-builder, python3).
+  --deb             Build a .deb package via cargo-deb.
+  --rpm             Build an .rpm package via cargo-generate-rpm.
+  --arch-pkg        Build an Arch .pkg.tar.zst via makepkg.
+
+Other:
+  -h, --help        Show this help and exit.
+EOF
+}
 
 FLATPAK=false
 DEB=false
@@ -15,6 +40,7 @@ COVERAGE=false
 
 for arg in "$@"; do
   case "$arg" in
+    -h|--help)   print_usage; exit 0 ;;
     --flatpak)   FLATPAK=true ;;
     --deb)       DEB=true ;;
     --rpm)       RPM=true ;;
@@ -23,6 +49,7 @@ for arg in "$@"; do
     --fmt)       FMT=true ;;
     --clippy)    CLIPPY=true ;;
     --coverage)  COVERAGE=true ;;
+    *)           echo "Unknown option: $arg" >&2; print_usage >&2; exit 2 ;;
   esac
 done
 

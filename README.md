@@ -50,7 +50,8 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Audio output selector (local + MPD, iTunes AirPlay-style) | ✅ |
 | MPD output backend (sink-only, TCP with security hardening) | ✅ |
 | Output switching (click to swap local ↔ MPD) | ✅ |
-| AirPlay output (RAOP discovery + streaming) | ✅ |
+| AirPlay 1 (RAOP) output | ✅ Requires a working `raopsink` GStreamer element or `shairport-sync` on `PATH`; falls back automatically |
+| AirPlay 2 / HomeKit output | ❌ Not yet supported — see [AirPlay 2 roadmap](#airplay-2-roadmap) below |
 | Chromecast output (Cast V2 — local files + remote sources) | ✅ |
 | Album artist sort (preference toggle) | ✅ |
 | Smart playlist compound sort (multi-key ordering) | ✅ |
@@ -331,6 +332,7 @@ src/
 │   ├── tag_parser.rs       # lofty audio tag extraction
 │   ├── tag_writer.rs       # lofty audio tag writing (MP3, M4A, OGG, FLAC)
 │   ├── playlist_manager.rs # Regular + smart playlist CRUD
+│   ├── playlist_io.rs      # XSPF playlist import/export with fingerprint matching
 │   └── smart_rules.rs      # iTunes-style smart playlist rules engine
 ├── subsonic/
 │   ├── mod.rs              # Subsonic backend root
@@ -382,7 +384,6 @@ src/
     ├── album_art.rs        # Album art extraction (embedded tags + remote fetch)
     ├── playback.rs         # Playback context + track advance logic
     ├── persistence.rs      # Settings persistence (sort, shuffle, repeat, CSS)
-    ├── playlist_io.rs      # XSPF playlist import/export with fingerprint matching
     ├── radio.rs            # Radio-specific UI helpers (column switching, geo-sort)
     ├── dummy_data.rs       # Default sidebar source entries
     ├── style.css           # Custom CSS overrides
@@ -462,6 +463,29 @@ Open **Preferences** from the hamburger menu (☰) to:
 - Change the local music library folders (supports multiple directories)
 - Toggle browser filter panes (Genre, Artist, Album)
 - Show/hide tracklist columns
+
+---
+
+## AirPlay 2 roadmap
+
+AirPlay 2 receivers (HomePod, recent Apple TVs, AirPlay-2-certified third-party speakers) advertise via `_airplay._tcp.local.` and are detected by the discovery layer today, but the output implementation only speaks the legacy RAOP protocol via GStreamer's `raopsink` element. AirPlay 2 uses a different protocol stack and cannot be driven by `raopsink`, so AirPlay-2-only devices are filtered out of the output selector to avoid silent playback failures. Re-enabling them requires real sender-side support to land first.
+
+Sender-side AirPlay 2 support requires, at minimum:
+
+1. **A pairing/handshake step** to establish an authenticated session with the receiver before any audio is sent.
+2. **An encrypted control channel** carrying the post-handshake messaging.
+3. **An audio streaming path** delivering encoded audio in the format and timing the receiver expects.
+4. **Multi-device clock sync** — only relevant if multi-room playback is in scope.
+
+Each of these has specifics (key exchange algorithms, audio codec, RTSP/HTTP verbs, timing format) that need to be confirmed against current AirPlay 2 reverse-engineering work before any concrete dependency or implementation can be committed. This README intentionally does not enumerate those details — they belong in a design doc once an implementation path is chosen.
+
+Likely paths forward (each to be evaluated when the work begins):
+
+- **Subprocess delegation** to a maintained external tool, in the same spirit as the existing `shairport-sync` fallback on the RAOP path. Cheaper to integrate, but adds a runtime dependency outside the single-binary distribution model.
+- **A pure-Rust sender implementation**, either in-tree or as a contributed `gst-plugins-rs` element, so it can plug into the same pipeline pattern `raopsink` uses today. Higher engineering cost; cleanest distribution story.
+- **Wait for an upstream component** to mature to the point that one of the above becomes obviously preferable.
+
+The hook for whichever path is chosen is `service_type: "airplay2"` in [`src/discovery.rs`](src/discovery.rs); today that branch is dropped by [`src/ui/discovery_handler.rs`](src/ui/discovery_handler.rs), and that's where AirPlay 2 sender support will plug in.
 
 ---
 

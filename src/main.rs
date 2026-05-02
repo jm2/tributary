@@ -293,10 +293,14 @@ fn main() {
     // ── File open handler (macOS "Open With" / Linux xdg-open) ────────
     //
     // When the OS opens files with Tributary (e.g. Finder → Open With),
-    // GIO delivers them here.  We log the file paths for now — full
-    // integration with the player will happen once the window is up.
-    // On macOS, the first `open` signal may arrive *before* `activate`,
-    // so we stash the paths in a static for the window to pick up.
+    // GIO delivers them here.  We push them onto a thread-local queue
+    // (see `ui::open_files`) and then either:
+    //
+    //   * activate the app — on first launch, the window is not yet
+    //     built; the queue is drained at the end of `build_window`;
+    //   * or, if a window is already live, fire the application-level
+    //     `play-pending-files` GAction registered by `build_window` to
+    //     drain the queue immediately.
     app.connect_open(move |app, files, _hint| {
         let mut paths = Vec::new();
         for file in files {
@@ -305,25 +309,15 @@ fn main() {
                 paths.push(path);
             }
         }
-
-        // If the app already has a window, it has already been activated.
-        // Otherwise, activate will create the window and it can check
-        // the pending files.
-        if app.active_window().is_none() {
-            // Stash the paths; activate will consume them.
-            // For now, just activate the app — file playback integration
-            // will be validated on the macOS build.
-            app.activate();
+        if paths.is_empty() {
+            return;
         }
+        ui::open_files::enqueue(paths);
 
-        // TODO: When the window is visible, load the first path into
-        // the player.  This requires a channel from main→window or
-        // a shared state mechanism.
-        if !paths.is_empty() {
-            info!(
-                count = paths.len(),
-                "Files received via Open With (playback integration pending macOS validation)"
-            );
+        if app.active_window().is_none() {
+            app.activate();
+        } else if let Some(action) = app.lookup_action("play-pending-files") {
+            action.activate(None);
         }
     });
 

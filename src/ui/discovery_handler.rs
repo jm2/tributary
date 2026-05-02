@@ -40,6 +40,22 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                         continue;
                     }
 
+                    // ── AirPlay 2 (`_airplay._tcp`) — not yet supported ──
+                    // The current output path uses GStreamer's `raopsink`
+                    // and only speaks legacy RAOP, so an AirPlay 2-only
+                    // receiver (HomePod, recent Apple TV) cannot actually
+                    // play audio if selected.  Drop the event here until
+                    // a sender-side AirPlay 2 implementation lands.  See
+                    // the AirPlay 2 roadmap section in README.md.
+                    if server.service_type == "airplay2" {
+                        info!(
+                            name = %server.name,
+                            url = %server.url,
+                            "AirPlay 2 receiver discovered — skipping (sender support not yet implemented)"
+                        );
+                        continue;
+                    }
+
                     // ── Chromecast devices go to the output selector, not sidebar ──
                     if server.service_type == "chromecast" {
                         handle_chromecast_found(&output_list, &server);
@@ -94,6 +110,12 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                     // ── AirPlay devices: remove from output selector ──
                     if service_type == "airplay" {
                         handle_airplay_lost(&output_list, &url);
+                        continue;
+                    }
+
+                    // ── AirPlay 2: matched the Found drop above; nothing
+                    //    was added to the popover, so nothing to remove.
+                    if service_type == "airplay2" {
                         continue;
                     }
 

@@ -228,6 +228,7 @@ pub fn build_window(
     let master_for_filter = master_tracks.clone();
     let current_pos_for_filter = current_pos.clone();
 
+    let app_config_for_filter = app_config.clone();
     let on_filter = Box::new(
         move |genre: Option<String>,
               artist: Option<String>,
@@ -235,6 +236,7 @@ pub fn build_window(
               search_text: String| {
             let master = master_for_filter.borrow();
             let search_lower = search_text.to_lowercase();
+            let use_album_artist = app_config_for_filter.borrow().group_by_album_artist;
             let matching: Vec<&TrackObject> = master
                 .iter()
                 .filter(|t| {
@@ -244,7 +246,18 @@ pub fn build_window(
                         }
                     }
                     if let Some(ref a) = artist {
-                        if &t.artist() != a {
+                        // When album-artist grouping is on, match against
+                        // the album-artist tag (falling back to track artist
+                        // for tracks that lack one), so selecting an album
+                        // artist returns every track on that artist's albums
+                        // even on compilation discs.
+                        let track_aa = t.album_artist();
+                        let key = if use_album_artist && !track_aa.is_empty() {
+                            track_aa
+                        } else {
+                            t.artist()
+                        };
+                        if &key != a {
                             return false;
                         }
                     }
@@ -295,7 +308,9 @@ pub fn build_window(
         },
     );
 
-    let (browser_widget, browser_state) = browser::build_browser(&empty_tracks, on_filter);
+    let initial_use_album_artist = app_config.borrow().group_by_album_artist;
+    let (browser_widget, browser_state) =
+        browser::build_browser(&empty_tracks, initial_use_album_artist, on_filter);
 
     // ── Right content ────────────────────────────────────────────────
     let right_paned = gtk::Paned::builder()
@@ -1254,15 +1269,80 @@ pub fn build_window(
             });
     }
 
+    // ── "Open With" pending-files action ────────────────────────────
+    //
+    // The OS file-open handler in main.rs queues paths in
+    // `super::open_files`.  We expose a stateless application-level
+    // GAction `app.play-pending-files` that drains the queue and plays
+    // the file(s) on the active output.  The action is registered on
+    // the GApplication (not the window) so the file-open handler can
+    // look it up via `app.lookup_action`.
+    {
+        let active_output = active_output.clone();
+        let parked_local = parked_local.clone();
+        let media_ctrl = media_ctrl.clone();
+        let album_art = hb.album_art.clone();
+        let title_label = hb.title_label.clone();
+        let artist_label = hb.artist_label.clone();
+        let sm = sort_model.clone();
+        let current_pos = current_pos.clone();
+
+        let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
+        play_pending.connect_activate(move |_, _| {
+            let paths = super::open_files::drain();
+            if paths.is_empty() {
+                return;
+            }
+            // Play only the first file for now.  If multiple files were
+            // delivered, the rest are dropped — multi-file Open With with
+            // a temp playlist is a separate feature.
+            let ctx = super::playback::PlaybackContext {
+                model: sm.clone(),
+                active_output: active_output.clone(),
+                parked_local: parked_local.clone(),
+                album_art: album_art.clone(),
+                title_label: title_label.clone(),
+                artist_label: artist_label.clone(),
+                media_ctrl: media_ctrl.clone(),
+                current_pos: current_pos.clone(),
+            };
+            for path in paths {
+                if super::playback::play_local_file(&path, &ctx) {
+                    break;
+                }
+            }
+        });
+        app.add_action(&play_pending);
+
+        // Drain any paths that arrived before the window was built
+        // (the typical case on first-launch Open With).
+        play_pending.activate(None);
+    }
+
     // ── Wire preferences action to the window ────────────────────────
     {
         let win = window.clone();
         let cv = column_view.clone();
         let bw = browser_widget.clone();
         let cfg = app_config.clone();
+        let bs = browser_state.clone();
+        let master_for_pref = master_tracks.clone();
         let prefs_action = gtk::gio::SimpleAction::new("show-preferences", None);
         prefs_action.connect_activate(move |_, _| {
-            preferences::show_preferences(&win, &cv, &bw, &cfg);
+            let bw_for_cb = bw.clone();
+            let bs_for_cb = bs.clone();
+            let master_for_cb = master_for_pref.clone();
+            let on_aa_change: std::rc::Rc<dyn Fn(bool)> =
+                std::rc::Rc::new(move |enabled: bool| {
+                    // Refresh the browser snapshot so the album-artist
+                    // grouping change takes effect against the latest
+                    // library state, not just whatever was loaded when
+                    // the browser was first built.
+                    let tracks = master_for_cb.borrow().clone();
+                    browser::rebuild_browser_data(&bw_for_cb, &bs_for_cb, &tracks);
+                    browser::set_album_artist_grouping(&bw_for_cb, &bs_for_cb, enabled);
+                });
+            preferences::show_preferences(&win, &cv, &bw, &cfg, on_aa_change);
         });
         window.add_action(&prefs_action);
     }
