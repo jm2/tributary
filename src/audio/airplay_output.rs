@@ -190,10 +190,7 @@ impl AirPlayOutput {
                         debug = ?err.debug(),
                         "AirPlay pipeline error"
                     );
-                    let _ = tx.try_send(PlayerEvent::Error(format!(
-                        "AirPlay: {}",
-                        err.error()
-                    )));
+                    let _ = tx.try_send(PlayerEvent::Error(format!("AirPlay: {}", err.error())));
                 }
                 MessageView::StateChanged(s) => {
                     if let Some(pipeline) = pipeline_weak.upgrade() {
@@ -204,9 +201,7 @@ impl AirPlayOutput {
                             let mapped = match s.current() {
                                 gst::State::Playing => Some(PlayerState::Playing),
                                 gst::State::Paused => Some(PlayerState::Paused),
-                                gst::State::Ready | gst::State::Null => {
-                                    Some(PlayerState::Stopped)
-                                }
+                                gst::State::Ready | gst::State::Null => Some(PlayerState::Stopped),
                                 gst::State::VoidPending => None,
                             };
                             if let Some(state) = mapped {

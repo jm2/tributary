@@ -221,9 +221,7 @@ pub fn build_sidebar(
                 let popover = gtk::PopoverMenu::from_model(Some(&menu));
                 popover.set_parent(&row_box_for_gesture);
                 #[allow(clippy::cast_possible_truncation)]
-                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
-                    x as i32, y as i32, 1, 1,
-                )));
+                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
                 popover.popup();
             });
             row_box.add_controller(gesture);
@@ -287,10 +285,7 @@ pub fn build_sidebar(
                         let menu = gtk::gio::Menu::new();
                         menu.append(Some("New Playlist"), Some("pl-add.create-regular"));
                         menu.append(Some("New Smart Playlist"), Some("pl-add.create-smart"));
-                        menu.append(
-                            Some("Import Playlist\u{2026}"),
-                            Some("pl-add.import"),
-                        );
+                        menu.append(Some("Import Playlist\u{2026}"), Some("pl-add.import"));
 
                         let ag = gtk::gio::SimpleActionGroup::new();
 

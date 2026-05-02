@@ -568,11 +568,7 @@ pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks
 /// Updates the shared flag, then refreshes all three panes from the
 /// current snapshot.  Selections reset to "All" because the artist
 /// pane's contents are about to change.
-pub fn set_album_artist_grouping(
-    browser_box: &gtk::Box,
-    state: &BrowserState,
-    enabled: bool,
-) {
+pub fn set_album_artist_grouping(browser_box: &gtk::Box, state: &BrowserState, enabled: bool) {
     state.use_album_artist.set(enabled);
 
     let borrowed = state.tracks.borrow();

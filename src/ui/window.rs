@@ -1332,16 +1332,15 @@ pub fn build_window(
             let bw_for_cb = bw.clone();
             let bs_for_cb = bs.clone();
             let master_for_cb = master_for_pref.clone();
-            let on_aa_change: std::rc::Rc<dyn Fn(bool)> =
-                std::rc::Rc::new(move |enabled: bool| {
-                    // Refresh the browser snapshot so the album-artist
-                    // grouping change takes effect against the latest
-                    // library state, not just whatever was loaded when
-                    // the browser was first built.
-                    let tracks = master_for_cb.borrow().clone();
-                    browser::rebuild_browser_data(&bw_for_cb, &bs_for_cb, &tracks);
-                    browser::set_album_artist_grouping(&bw_for_cb, &bs_for_cb, enabled);
-                });
+            let on_aa_change: std::rc::Rc<dyn Fn(bool)> = std::rc::Rc::new(move |enabled: bool| {
+                // Refresh the browser snapshot so the album-artist
+                // grouping change takes effect against the latest
+                // library state, not just whatever was loaded when
+                // the browser was first built.
+                let tracks = master_for_cb.borrow().clone();
+                browser::rebuild_browser_data(&bw_for_cb, &bs_for_cb, &tracks);
+                browser::set_album_artist_grouping(&bw_for_cb, &bs_for_cb, enabled);
+            });
             preferences::show_preferences(&win, &cv, &bw, &cfg, on_aa_change);
         });
         window.add_action(&prefs_action);
