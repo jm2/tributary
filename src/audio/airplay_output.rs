@@ -61,6 +61,8 @@ struct Session {
 /// AirPlay audio output — streams to a RAOP receiver.
 pub struct AirPlayOutput {
     /// Human-readable name from mDNS discovery (e.g. "Living Room").
+    /// Read by the `AudioOutput::name` trait method.
+    #[allow(dead_code)]
     display_name: String,
     /// Receiver hostname or IP address.
     host: String,
