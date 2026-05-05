@@ -24,11 +24,24 @@ use std::sync::Mutex;
 // Win32 constants.
 const WM_NCHITTEST: u32 = 0x0084;
 const WM_NCDESTROY: u32 = 0x0082;
+const WM_GETMINMAXINFO: u32 = 0x0024;
 const HTMAXBUTTON: isize = 9;
+
+const MONITOR_DEFAULTTONEAREST: u32 = 0x0002;
+
+const GWL_STYLE: i32 = -16;
+const GWL_EXSTYLE: i32 = -20;
 
 const SUBCLASS_ID: usize = 0x5472_6962; // "Trib" in hex
 
 // Win32 FFI declarations — using raw types to avoid a `windows` crate dependency.
+//
+// `SetWindowSubclass` / `RemoveWindowSubclass` / `DefSubclassProc` live in
+// `comctl32.dll`, which is not auto-linked by the Rust toolchain. MinGW
+// happens to pull it in today via implicit defaults, but the explicit
+// `#[link]` attribute makes the dependency intentional and protects against
+// future toolchain changes.
+#[link(name = "comctl32")]
 #[allow(non_snake_case)]
 extern "system" {
     fn SetWindowSubclass(
@@ -59,9 +72,15 @@ extern "system" {
     ) -> i32;
 
     fn DefSubclassProc(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
+}
 
+#[allow(non_snake_case)]
+extern "system" {
     fn GetCursorPos(point: *mut Point) -> i32;
     fn ScreenToClient(hwnd: *mut c_void, point: *mut Point) -> i32;
+    fn MonitorFromWindow(hwnd: *mut c_void, dwFlags: u32) -> *mut c_void;
+    fn GetMonitorInfoW(hMonitor: *mut c_void, lpmi: *mut MonitorInfo) -> i32;
+    fn GetWindowLongPtrW(hwnd: *mut c_void, nIndex: i32) -> isize;
 }
 
 /// Win32 POINT structure (client coordinates).
@@ -70,6 +89,35 @@ extern "system" {
 struct Point {
     x: i32,
     y: i32,
+}
+
+/// Win32 RECT structure.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+/// Win32 MONITORINFO structure.
+#[repr(C)]
+struct MonitorInfo {
+    cb_size: u32,
+    rc_monitor: Rect,
+    rc_work: Rect,
+    dw_flags: u32,
+}
+
+/// Win32 MINMAXINFO structure (passed via `lparam` on `WM_GETMINMAXINFO`).
+#[repr(C)]
+struct MinMaxInfo {
+    pt_reserved: Point,
+    pt_max_size: Point,
+    pt_max_position: Point,
+    pt_min_track_size: Point,
+    pt_max_track_size: Point,
 }
 
 /// Stored maximize button rectangle (client coordinates).
@@ -87,6 +135,28 @@ pub fn enable_snap_layout(hwnd: *mut c_void, maximize_rect: (i32, i32, i32, i32)
     if let Ok(mut rect) = MAX_BUTTON_RECT.lock() {
         *rect = Some(maximize_rect);
     }
+
+    // Diagnostic: dump the window styles so we can see what GTK4 actually
+    // sets on Windows. Snap Assist's "fill the other quadrants" picker only
+    // includes windows that look like a normal top-level (WS_THICKFRAME +
+    // WS_MAXIMIZEBOX present, WS_EX_TOOLWINDOW absent). If GTK's CSD is
+    // missing one of these, that's the root of the snap-list-omission bug.
+    // SAFETY: GetWindowLongPtrW is a stateless query against a valid HWND.
+    let (style, ex_style) = unsafe {
+        (
+            GetWindowLongPtrW(hwnd, GWL_STYLE),
+            GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
+        )
+    };
+    tracing::info!(
+        style = format!("{:#010x}", style as u32),
+        ex_style = format!("{:#010x}", ex_style as u32),
+        ws_thickframe = (style as u32 & 0x0004_0000) != 0,
+        ws_maximizebox = (style as u32 & 0x0001_0000) != 0,
+        ws_caption = (style as u32 & 0x00C0_0000) == 0x00C0_0000,
+        ws_ex_toolwindow = (ex_style as u32 & 0x0000_0080) != 0,
+        "Window styles before Snap Layout subclass install"
+    );
 
     // SAFETY: SetWindowSubclass is a standard Win32 API. We pass a valid HWND
     // (extracted by gdk4-win32), a static extern fn, and a unique subclass ID.
@@ -145,6 +215,48 @@ unsafe extern "system" fn subclass_proc(
 
             // Outside the button — let GTK handle it.
             // SAFETY: DefSubclassProc forwards to the original wndproc.
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        WM_GETMINMAXINFO => {
+            // Clip the maximised window's bounds to the monitor's *work area*
+            // (screen rect minus taskbar / docked appbars) so a maximised
+            // window doesn't overhang the taskbar. GTK4 CSD on Windows
+            // doesn't override this message, so without this handler the
+            // default tracking size lets the window cover the taskbar until
+            // the next move forces Windows to re-evaluate.
+            //
+            // SAFETY: lparam on WM_GETMINMAXINFO is always a valid
+            // pointer to a MINMAXINFO supplied by the OS. MonitorFromWindow
+            // returns NULL only on invalid HWND; we null-check before deref.
+            unsafe {
+                let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                if !monitor.is_null() {
+                    let mut mi = MonitorInfo {
+                        cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+                        rc_monitor: Rect::default(),
+                        rc_work: Rect::default(),
+                        dw_flags: 0,
+                    };
+                    if GetMonitorInfoW(monitor, &mut mi) != 0 {
+                        let mmi = lparam as *mut MinMaxInfo;
+                        if !mmi.is_null() {
+                            // ptMaxPosition is expressed relative to the
+                            // primary monitor's coordinate system.
+                            (*mmi).pt_max_position.x = mi.rc_work.left - mi.rc_monitor.left;
+                            (*mmi).pt_max_position.y = mi.rc_work.top - mi.rc_monitor.top;
+                            (*mmi).pt_max_size.x = mi.rc_work.right - mi.rc_work.left;
+                            (*mmi).pt_max_size.y = mi.rc_work.bottom - mi.rc_work.top;
+                            // Cap the user-resizable maximum at the work
+                            // area too, so dragging-resize can't exceed it.
+                            (*mmi).pt_max_track_size.x = mi.rc_work.right - mi.rc_work.left;
+                            (*mmi).pt_max_track_size.y = mi.rc_work.bottom - mi.rc_work.top;
+                            return 0;
+                        }
+                    }
+                }
+            }
+            // SAFETY: fall through to the default handler if any of the
+            // monitor queries failed.
             unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
         }
         WM_NCDESTROY => {
