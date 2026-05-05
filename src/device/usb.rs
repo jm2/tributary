@@ -9,20 +9,13 @@ use std::path::PathBuf;
 
 use tracing::{debug, info};
 
-use super::{DeviceInfo, DeviceType};
-
-/// Audio file extensions to look for when scanning devices.
-const AUDIO_EXTENSIONS: &[&str] = &[
-    "mp3", "flac", "ogg", "opus", "m4a", "aac", "wma", "wav", "aiff", "aif", "ape", "wv", "mpc",
-    "tta",
-];
+use super::DeviceInfo;
 
 /// Detect mounted USB mass storage devices that may contain music.
 ///
 /// Returns a list of `DeviceInfo` for each detected removable volume.
 /// This is a non-blocking scan of mount points — it does not perform
 /// deep filesystem traversal.
-#[allow(dead_code)]
 pub fn detect_usb_devices() -> Vec<DeviceInfo> {
     let mut devices = Vec::new();
 
@@ -44,43 +37,7 @@ pub fn detect_usb_devices() -> Vec<DeviceInfo> {
     devices
 }
 
-/// Check if a directory likely contains music files by scanning its
-/// top-level contents (non-recursive, fast).
-#[allow(dead_code)]
-fn has_music_files(path: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return false;
-    };
-
-    for entry in entries.flatten() {
-        let entry_path = entry.path();
-        if entry_path.is_file() {
-            if let Some(ext) = entry_path.extension().and_then(|e| e.to_str()) {
-                if AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
-                    return true;
-                }
-            }
-        }
-        // Also check one level of subdirectories (e.g. Music/)
-        if entry_path.is_dir() {
-            if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
-                for sub in sub_entries.flatten() {
-                    if sub.path().is_file() {
-                        if let Some(ext) = sub.path().extension().and_then(|e| e.to_str()) {
-                            if AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
 /// Extract a human-readable name from a mount point path.
-#[allow(dead_code)]
 fn volume_name(path: &Path) -> String {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -114,9 +71,6 @@ fn detect_linux(devices: &mut Vec<DeviceInfo>) {
                 devices.push(DeviceInfo {
                     name,
                     mount_point: path,
-                    capacity_bytes: None,
-                    free_bytes: None,
-                    device_type: DeviceType::UsbMassStorage,
                 });
             }
         }
@@ -145,9 +99,6 @@ fn detect_macos(devices: &mut Vec<DeviceInfo>) {
         let name = volume_name(&path);
 
         // Skip the system volume (typically "Macintosh HD").
-        // The root filesystem is always mounted at /Volumes/Macintosh HD
-        // (or similar). We detect it by checking if it's the same device
-        // as the root filesystem.
         if path == Path::new("/Volumes/Macintosh HD")
             || path == Path::new("/Volumes/Macintosh HD - Data")
         {
@@ -158,9 +109,6 @@ fn detect_macos(devices: &mut Vec<DeviceInfo>) {
         devices.push(DeviceInfo {
             name,
             mount_point: path,
-            capacity_bytes: None,
-            free_bytes: None,
-            device_type: DeviceType::UsbMassStorage,
         });
     }
 }
@@ -198,9 +146,6 @@ fn detect_windows(devices: &mut Vec<DeviceInfo>) {
                 devices.push(DeviceInfo {
                     name,
                     mount_point: path,
-                    capacity_bytes: None,
-                    free_bytes: None,
-                    device_type: DeviceType::UsbMassStorage,
                 });
             }
         }
@@ -221,26 +166,6 @@ mod tests {
     fn test_volume_name_root() {
         let path = Path::new("/");
         assert_eq!(volume_name(path), "USB Device");
-    }
-
-    #[test]
-    fn test_audio_extensions_contains_common() {
-        assert!(AUDIO_EXTENSIONS.contains(&"mp3"));
-        assert!(AUDIO_EXTENSIONS.contains(&"flac"));
-        assert!(AUDIO_EXTENSIONS.contains(&"m4a"));
-        assert!(AUDIO_EXTENSIONS.contains(&"ogg"));
-    }
-
-    #[test]
-    fn test_audio_extensions_no_video() {
-        assert!(!AUDIO_EXTENSIONS.contains(&"mp4"));
-        assert!(!AUDIO_EXTENSIONS.contains(&"mkv"));
-        assert!(!AUDIO_EXTENSIONS.contains(&"avi"));
-    }
-
-    #[test]
-    fn test_has_music_files_nonexistent() {
-        assert!(!has_music_files(Path::new("/nonexistent/path/12345")));
     }
 
     #[test]

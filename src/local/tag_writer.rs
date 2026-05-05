@@ -73,14 +73,70 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
         );
     }
 
-    let mut tagged_file = lofty::read_from_path(path)
-        .with_context(|| format!("Failed to read tags from {}", path.display()))?;
+    // Atomic-ish write: copy the file to a sibling temp path, apply tags
+    // there, then atomically rename it back. This way a power loss /
+    // panic / disk-full mid-write leaves the original audio file
+    // untouched. The cost is a full file copy per save, which is fine
+    // for tag editing (interactive, not a hot path).
+    let temp_path = sibling_temp_path(path);
+    std::fs::copy(path, &temp_path).with_context(|| {
+        format!(
+            "Failed to copy {} to {} for atomic tag write",
+            path.display(),
+            temp_path.display()
+        )
+    })?;
+
+    // From here on, ensure the temp file is removed on any error path.
+    let result = write_tags_to(&temp_path, edits);
+
+    match result {
+        Ok(()) => {
+            // Best-effort: copy permissions from the original so the
+            // renamed file matches what it replaces.
+            if let Ok(meta) = std::fs::metadata(path) {
+                let _ = std::fs::set_permissions(&temp_path, meta.permissions());
+            }
+            std::fs::rename(&temp_path, path).with_context(|| {
+                format!(
+                    "Failed to atomically replace {} with tagged temp {}",
+                    path.display(),
+                    temp_path.display()
+                )
+            })?;
+            tracing::debug!("Tags written successfully");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            Err(e)
+        }
+    }
+}
+
+/// Build a sibling temp path next to `path` so `rename` stays on the
+/// same filesystem (cross-FS rename returns `EXDEV`).
+fn sibling_temp_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".tributary-tag-tmp");
+    let mut out = path.to_path_buf();
+    out.set_file_name(name);
+    out
+}
+
+/// Apply `edits` to the tags of the file at `temp_path` in-place.
+fn write_tags_to(temp_path: &Path, edits: &TagEdits) -> Result<()> {
+    let mut tagged_file = lofty::read_from_path(temp_path)
+        .with_context(|| format!("Failed to read tags from {}", temp_path.display()))?;
 
     // Get or create the primary tag for this file type.
     let tag = tagged_file.primary_tag_mut().ok_or_else(|| {
         anyhow::anyhow!(
             "No primary tag found and cannot create one for {}",
-            path.display()
+            temp_path.display()
         )
     })?;
 
@@ -153,10 +209,9 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
         }
     }
 
-    // Save back to the file.
-    tag.save_to_path(path, WriteOptions::default())
-        .with_context(|| format!("Failed to write tags to {}", path.display()))?;
+    // Save back to the temp file.
+    tag.save_to_path(temp_path, WriteOptions::default())
+        .with_context(|| format!("Failed to write tags to {}", temp_path.display()))?;
 
-    tracing::debug!("Tags written successfully");
     Ok(())
 }

@@ -397,6 +397,16 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
                 Some("MusicAlbum") => {
                     let uuid = deterministic_uuid(&item.id);
                     let artist_id = item.artist_items.first().map(|a| deterministic_uuid(&a.id));
+                    let cover_art_url = if item
+                        .image_tags
+                        .as_ref()
+                        .and_then(|v| v.get("Primary"))
+                        .is_some()
+                    {
+                        Some(self.client.image_url(&item.id))
+                    } else {
+                        None
+                    };
                     albums.push(Album {
                         id: uuid,
                         title: item.name.clone().unwrap_or_default(),
@@ -404,19 +414,29 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
                         artist_id,
                         year: item.production_year,
                         genre: item.genres.first().cloned(),
-                        cover_art_url: Some(self.client.image_url(&item.id)),
+                        cover_art_url,
                         track_count: item.child_count.unwrap_or(0),
                         total_duration_secs: item.run_time_ticks.map(|t| t / 10_000_000),
                     });
                 }
                 Some("MusicArtist") => {
                     let uuid = deterministic_uuid(&item.id);
+                    let cover_art_url = if item
+                        .image_tags
+                        .as_ref()
+                        .and_then(|v| v.get("Primary"))
+                        .is_some()
+                    {
+                        Some(self.client.image_url(&item.id))
+                    } else {
+                        None
+                    };
                     artists.push(Artist {
                         id: uuid,
                         name: item.name.clone().unwrap_or_default(),
                         album_count: item.album_count.unwrap_or(0),
                         track_count: 0,
-                        cover_art_url: Some(self.client.image_url(&item.id)),
+                        cover_art_url,
                     });
                 }
                 _ => {}

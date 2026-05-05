@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Column display recycling bug** — Added `connect_unbind` handlers to all tracklist column factories to clear label text when rows are recycled, preventing stale data from appearing in the wrong row during rapid scrolling.
+- **Playlist timestamps were epoch seconds, not RFC3339** — `PlaylistManager::now_rfc3339()` was writing bare `as_secs()` integers (e.g., `"1735689600"`) into the `playlists.created_at` and `updated_at` columns instead of ISO-8601 strings. Replaced with `chrono::Utc::now().to_rfc3339()`. Track timestamps in `engine.rs` were already correct.
+- **Chromecast `toggle_play_pause` always sent Pause** — The handler unconditionally sent `CastCommand::Pause` regardless of current state, so OS media keys / spacebar could never resume Cast playback once paused. `current_state` is now wrapped in `Arc<Mutex<PlayerState>>`, optimistically updated on commands, and authoritatively refreshed from the device's `player_state` field on every status poll. `state()` now reflects the live device state.
+- **Chromecast `state()` always returned `Stopped`** — `current_state` was initialized to `Stopped` and never reassigned. Wired the polling loop to update the shared mutex on every device status response.
+- **Jellyfin search results showed broken cover-art for items without primary image** — `JellyfinBackend::search()` unconditionally generated `cover_art_url` for `MusicAlbum` and `MusicArtist` results even when `image_tags["Primary"]` was absent. `refresh_library()` already validated this correctly; `search()` now mirrors the same check.
+
+### Removed
+- **Smart-playlist `Most/Least Recently Played` limit sort** — These `LimitSort` variants existed in the enum and editor dropdown but had no `last_played` column to sort against, so they silently no-op'd at evaluation time. Removed the variants and corresponding UI options. They will be reintroduced once playback statistics (`play_count` increments, `last_played` timestamps) are persisted end-to-end.
+
+### Known limitations
+- **Auth tokens travel in stream/cover-art URLs for Jellyfin and Plex** — Tributary's debug logger redacts `api_key=` and `X-Plex-Token=` via `redact_url_secrets()`, but the URLs handed to GStreamer's `playbin3` (and to the album-art HTTP fetcher) are the unredacted originals. This is the auth model these servers expose for media URLs; the tokens may therefore appear in GStreamer's own debug output and in HTTP access logs upstream of Tributary. Mitigation: keep `GST_DEBUG` unset at runtime and prefer HTTPS endpoints. Subsonic uses a salted-MD5 token (not a bearer secret) so this consideration does not apply.
 
 ---
 

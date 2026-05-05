@@ -414,11 +414,5 @@ impl PlaylistManager {
 
 /// Get current time as RFC3339 string.
 fn now_rfc3339() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Simple ISO date for now — we don't have chrono.
-    format!("{secs}")
+    chrono::Utc::now().to_rfc3339()
 }

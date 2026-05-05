@@ -313,8 +313,12 @@ fn add_sorted_column<F, S>(
     });
 
     let sorter = gtk::CustomSorter::new(move |a, b| {
-        let ta = a.downcast_ref::<TrackObject>().unwrap();
-        let tb = b.downcast_ref::<TrackObject>().unwrap();
+        let ta = a
+            .downcast_ref::<TrackObject>()
+            .expect("sort model contains TrackObject");
+        let tb = b
+            .downcast_ref::<TrackObject>()
+            .expect("sort model contains TrackObject");
         sort_fn(ta, tb).into()
     });
 

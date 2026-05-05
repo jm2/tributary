@@ -154,6 +154,10 @@ pub enum LimitUnit {
 }
 
 /// How to select items when limiting.
+///
+/// Recently-played sort variants are intentionally absent: tracks have
+/// no `last_played` column yet, so those modes would silently no-op.
+/// Re-add them once playback statistics are persisted.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum LimitSort {
     Random,
@@ -167,8 +171,6 @@ pub enum LimitSort {
     LeastPlayed,
     MostRecentlyAdded,
     LeastRecentlyAdded,
-    MostRecentlyPlayed,
-    LeastRecentlyPlayed,
 }
 
 // ── Track adapter trait ─────────────────────────────────────────────
@@ -574,9 +576,6 @@ fn apply_limit<T: SmartTrack>(results: &mut Vec<T>, limit: &SmartLimit) {
         }
         LimitSort::LeastRecentlyAdded => {
             results.sort_by(|a, b| a.date_added().cmp(b.date_added()));
-        }
-        LimitSort::MostRecentlyPlayed | LimitSort::LeastRecentlyPlayed => {
-            // No last_played field yet — fall through to no-op sort.
         }
     }
 

@@ -15,7 +15,7 @@
 //! - **OS-assigned port**: Uses port 0 for dynamic assignment.
 //! - **Graceful shutdown**: Can be stopped when no longer needed.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -57,22 +57,27 @@ impl CastHttpServer {
         let lan_ip = local_ip_address::local_ip()
             .map_err(|e| anyhow::anyhow!("Failed to determine LAN IP: {e}"))?;
 
-        // Ensure we got an IPv4 address.
+        // Ensure we got an IPv4 address. A loopback address is unusable
+        // here — Chromecasts on the LAN cannot reach 127.0.0.1, so fail
+        // loud rather than silently bind to something the device can
+        // never connect to.
         let ipv4 = match lan_ip {
-            std::net::IpAddr::V4(v4) => v4,
-            std::net::IpAddr::V6(_) => {
-                // Fallback: try to find an IPv4 address from the list.
-                local_ip_address::list_afinet_netifas()
-                    .map_err(|e| anyhow::anyhow!("Failed to list network interfaces: {e}"))?
-                    .into_iter()
-                    .find_map(|(_name, ip)| match ip {
-                        std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_link_local() => {
-                            Some(v4)
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or(Ipv4Addr::LOCALHOST)
-            }
+            std::net::IpAddr::V4(v4) if !v4.is_loopback() => v4,
+            _ => local_ip_address::list_afinet_netifas()
+                .map_err(|e| anyhow::anyhow!("Failed to list network interfaces: {e}"))?
+                .into_iter()
+                .find_map(|(_name, ip)| match ip {
+                    std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_link_local() => {
+                        Some(v4)
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No LAN-routable IPv4 address available — Chromecast \
+                         cannot reach this host. Connect to a network and retry."
+                    )
+                })?,
         };
 
         let files = Arc::new(DashMap::new());

@@ -134,8 +134,6 @@ const LIMIT_SORTS: &[&str] = &[
     "Least Played",
     "Most Recently Added",
     "Least Recently Added",
-    "Most Recently Played",
-    "Least Recently Played",
 ];
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -269,8 +267,6 @@ pub fn show_smart_playlist_editor(
                     LimitSort::LeastPlayed => 8,
                     LimitSort::MostRecentlyAdded => 9,
                     LimitSort::LeastRecentlyAdded => 10,
-                    LimitSort::MostRecentlyPlayed => 11,
-                    LimitSort::LeastRecentlyPlayed => 12,
                 })
                 .unwrap_or(0),
         )
@@ -422,8 +418,6 @@ pub fn show_smart_playlist_editor(
                 8 => LimitSort::LeastPlayed,
                 9 => LimitSort::MostRecentlyAdded,
                 10 => LimitSort::LeastRecentlyAdded,
-                11 => LimitSort::MostRecentlyPlayed,
-                12 => LimitSort::LeastRecentlyPlayed,
                 _ => LimitSort::Random,
             };
             Some(SmartLimit {

@@ -103,6 +103,19 @@ impl AirPlayOutput {
         }
     }
 
+    /// Lock the session, recovering transparently from poisoning.
+    ///
+    /// A poisoned `Mutex` here means a previous holder panicked. The bus
+    /// watch runs on the GLib main loop, so a panic in any of its
+    /// branches (or in `close_session`) would otherwise propagate as an
+    /// app-wide crash on the next lock — even though we don't actually
+    /// rely on any invariant the panicking thread might have left
+    /// half-built. `into_inner()` returns the underlying value either
+    /// way, which is the behaviour we want.
+    fn session_lock(&self) -> std::sync::MutexGuard<'_, Option<Session>> {
+        self.session.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Linear 0.0–1.0 volume → RAOP dB scale (-30.0 = quiet, 0.0 = max).
     fn volume_to_db(linear: f64) -> f64 {
         if linear <= 0.0 {
@@ -129,7 +142,7 @@ impl AirPlayOutput {
                     .set_state(gst::State::Paused)
                     .map_err(|e| format!("RAOP pipeline preroll failed: {e}"))?;
                 info!(host = %host, port, "AirPlay: session opened via raopsink");
-                *self.session.lock().expect("session mutex poisoned") = Some(Session {
+                *self.session_lock() = Some(Session {
                     pipeline,
                     sps_child: None,
                     _bus_watch: bus_watch,
@@ -145,7 +158,7 @@ impl AirPlayOutput {
                     .set_state(gst::State::Paused)
                     .map_err(|e| format!("shairport-sync pipeline preroll failed: {e}"))?;
                 info!(host = %host, port, "AirPlay: session opened via shairport-sync");
-                *self.session.lock().expect("session mutex poisoned") = Some(Session {
+                *self.session_lock() = Some(Session {
                     pipeline,
                     sps_child: Some(sps_child),
                     _bus_watch: bus_watch,
@@ -157,7 +170,7 @@ impl AirPlayOutput {
 
     /// Tear down the active session — pipeline → Null, kill child if any.
     fn close_session(&self) {
-        let mut guard = self.session.lock().expect("session mutex poisoned");
+        let mut guard = self.session_lock();
         if let Some(mut sess) = guard.take() {
             let _ = sess.pipeline.set_state(gst::State::Null);
             if let Some(ref mut child) = sess.sps_child {
@@ -321,7 +334,7 @@ impl AirPlayOutput {
 
     /// Apply a state transition to the active pipeline, if any.
     fn set_pipeline_state(&self, target: gst::State) {
-        let guard = self.session.lock().expect("session mutex poisoned");
+        let guard = self.session_lock();
         if let Some(ref sess) = *guard {
             if let Err(e) = sess.pipeline.set_state(target) {
                 warn!(error = %e, ?target, "AirPlay: state transition failed");
@@ -391,7 +404,7 @@ impl AudioOutput for AirPlayOutput {
 
     fn toggle_play_pause(&self) {
         let target = {
-            let guard = self.session.lock().expect("session mutex poisoned");
+            let guard = self.session_lock();
             guard.as_ref().and_then(|sess| {
                 let (_, current, _) = sess.pipeline.state(Some(gst::ClockTime::ZERO));
                 match current {
@@ -413,7 +426,7 @@ impl AudioOutput for AirPlayOutput {
 
     fn set_volume(&mut self, level: f64) {
         self.volume = level.clamp(0.0, 1.0);
-        let guard = self.session.lock().expect("session mutex poisoned");
+        let guard = self.session_lock();
         if let Some(ref sess) = *guard {
             if let Some(sink) = sess.pipeline.by_name("raop") {
                 sink.set_property("volume", Self::volume_to_db(self.volume));
@@ -426,7 +439,7 @@ impl AudioOutput for AirPlayOutput {
     }
 
     fn state(&self) -> PlayerState {
-        let guard = self.session.lock().expect("session mutex poisoned");
+        let guard = self.session_lock();
         guard.as_ref().map_or(PlayerState::Stopped, |sess| {
             let (_, current, _) = sess.pipeline.state(Some(gst::ClockTime::ZERO));
             match current {
@@ -438,7 +451,7 @@ impl AudioOutput for AirPlayOutput {
     }
 
     fn position_ms(&self) -> Option<u64> {
-        let guard = self.session.lock().expect("session mutex poisoned");
+        let guard = self.session_lock();
         let sess = guard.as_ref()?;
         sess.pipeline
             .query_position::<gst::ClockTime>()

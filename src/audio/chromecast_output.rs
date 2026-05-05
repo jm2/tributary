@@ -71,8 +71,9 @@ pub struct ChromecastOutput {
     event_tx: async_channel::Sender<PlayerEvent>,
     /// Cached volume level (0.0–1.0).
     volume: f64,
-    /// Current playback state (best-guess, updated optimistically).
-    current_state: PlayerState,
+    /// Shared playback state — updated optimistically on commands and
+    /// authoritatively from the polling loop's media status.
+    current_state: Arc<Mutex<PlayerState>>,
     /// Shared reference to the embedded HTTP server for local file casting.
     cast_server: Arc<Mutex<Option<CastHttpServer>>>,
     /// Tokio runtime handle for spawning async tasks.
@@ -103,7 +104,7 @@ impl ChromecastOutput {
             port,
             event_tx,
             volume: 1.0,
-            current_state: PlayerState::Stopped,
+            current_state: Arc::new(Mutex::new(PlayerState::Stopped)),
             cast_server: Arc::new(Mutex::new(None)),
             rt_handle: tokio::runtime::Handle::try_current().ok(),
         }
@@ -176,6 +177,7 @@ impl ChromecastOutput {
         let port = self.port;
         let tx = self.event_tx.clone();
         let volume = self.volume;
+        let state = Arc::clone(&self.current_state);
 
         // Resolve file:// URIs to HTTP URLs.
         let resolved_uri = match self.resolve_uri(uri) {
@@ -188,11 +190,21 @@ impl ChromecastOutput {
         };
 
         std::thread::spawn(move || {
-            match Self::cast_media_with_session(&host, port, &resolved_uri, volume, tx.clone()) {
+            match Self::cast_media_with_session(
+                &host,
+                port,
+                &resolved_uri,
+                volume,
+                tx.clone(),
+                state.clone(),
+            ) {
                 Ok(()) => {}
                 Err(e) => {
                     error!(error = %e, "Chromecast: media load failed");
                     let _ = tx.try_send(PlayerEvent::Error(format!("Chromecast: {e}")));
+                    if let Ok(mut s) = state.lock() {
+                        *s = PlayerState::Stopped;
+                    }
                 }
             }
         });
@@ -206,6 +218,7 @@ impl ChromecastOutput {
         uri: &str,
         volume: f64,
         tx: async_channel::Sender<PlayerEvent>,
+        state: Arc<Mutex<PlayerState>>,
     ) -> Result<(), String> {
         use rust_cast::channels::media::StreamType;
         use rust_cast::channels::receiver::CastDeviceApp;
@@ -291,6 +304,9 @@ impl ChromecastOutput {
         info!(host = %host, "Chromecast: media loaded successfully");
 
         // Signal playing state.
+        if let Ok(mut s) = state.lock() {
+            *s = PlayerState::Playing;
+        }
         let _ = tx.try_send(PlayerEvent::StateChanged(PlayerState::Playing));
 
         // ── Persistent connection: heartbeat + position polling ──────
@@ -334,11 +350,34 @@ impl ChromecastOutput {
                                 });
                             }
 
+                            // Authoritative state from the device.
+                            use rust_cast::channels::media::PlayerState as CastPlayerState;
+                            let mapped = match entry.player_state {
+                                CastPlayerState::Playing => Some(PlayerState::Playing),
+                                CastPlayerState::Paused => Some(PlayerState::Paused),
+                                CastPlayerState::Buffering => Some(PlayerState::Buffering),
+                                CastPlayerState::Idle => None,
+                            };
+                            if let Some(new_state) = mapped {
+                                let prev = {
+                                    let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+                                    let prev = *s;
+                                    *s = new_state;
+                                    prev
+                                };
+                                if prev != new_state {
+                                    let _ = tx.try_send(PlayerEvent::StateChanged(new_state));
+                                }
+                            }
+
                             // Check if playback has ended via idle_reason.
                             use rust_cast::channels::media::IdleReason;
                             match entry.idle_reason {
                                 Some(IdleReason::Finished) => {
                                     info!("Chromecast: track ended");
+                                    if let Ok(mut s) = state.lock() {
+                                        *s = PlayerState::Stopped;
+                                    }
                                     let _ = tx.try_send(PlayerEvent::TrackEnded);
                                     break;
                                 }
@@ -348,6 +387,9 @@ impl ChromecastOutput {
                                     | IdleReason::Interrupted,
                                 ) => {
                                     info!(reason = ?entry.idle_reason, "Chromecast: playback ended");
+                                    if let Ok(mut s) = state.lock() {
+                                        *s = PlayerState::Stopped;
+                                    }
                                     let _ = tx
                                         .try_send(PlayerEvent::StateChanged(PlayerState::Stopped));
                                     break;
@@ -359,11 +401,17 @@ impl ChromecastOutput {
                         } else {
                             // No active media session — playback has ended.
                             debug!("Chromecast: no active media session, stopping poll");
+                            if let Ok(mut s) = state.lock() {
+                                *s = PlayerState::Stopped;
+                            }
                             break;
                         }
                     }
                     Err(e) => {
                         debug!(error = %e, "Chromecast: media status poll failed");
+                        if let Ok(mut s) = state.lock() {
+                            *s = PlayerState::Stopped;
+                        }
                         break;
                     }
                 }
@@ -542,16 +590,25 @@ impl AudioOutput for ChromecastOutput {
 
     fn play(&self) {
         debug!("Chromecast: play");
+        if let Ok(mut s) = self.current_state.lock() {
+            *s = PlayerState::Playing;
+        }
         self.send_cast_command(CastCommand::Play);
     }
 
     fn pause(&self) {
         debug!("Chromecast: pause");
+        if let Ok(mut s) = self.current_state.lock() {
+            *s = PlayerState::Paused;
+        }
         self.send_cast_command(CastCommand::Pause);
     }
 
     fn stop(&self) {
         debug!("Chromecast: stop");
+        if let Ok(mut s) = self.current_state.lock() {
+            *s = PlayerState::Stopped;
+        }
         self.send_cast_command(CastCommand::Stop);
         let _ = self
             .event_tx
@@ -559,10 +616,16 @@ impl AudioOutput for ChromecastOutput {
     }
 
     fn toggle_play_pause(&self) {
-        // Without persistent state tracking, we optimistically send pause.
-        // A future enhancement with persistent connection will query state.
         debug!("Chromecast: toggle play/pause");
-        self.send_cast_command(CastCommand::Pause);
+        let current = self
+            .current_state
+            .lock()
+            .map(|s| *s)
+            .unwrap_or(PlayerState::Stopped);
+        match current {
+            PlayerState::Playing | PlayerState::Buffering => self.pause(),
+            PlayerState::Paused | PlayerState::Stopped => self.play(),
+        }
     }
 
     fn seek_to(&self, position_ms: u64) {
@@ -592,6 +655,9 @@ impl AudioOutput for ChromecastOutput {
 
     fn state(&self) -> PlayerState {
         self.current_state
+            .lock()
+            .map(|s| *s)
+            .unwrap_or(PlayerState::Stopped)
     }
 
     fn position_ms(&self) -> Option<u64> {
