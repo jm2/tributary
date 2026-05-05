@@ -139,6 +139,9 @@ jobs:
           key: macos-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: macos-${{ matrix.arch }}-cargo-
 
+      - name: Check formatting
+        run: cargo fmt --check
+
       - name: Clippy (debug, --all-targets)
         run: |
           BREW_PREFIX="$(brew --prefix)"
@@ -236,10 +239,17 @@ jobs:
           key: windows-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: windows-${{ matrix.arch }}-cargo-
 
-      # Full strict-lint pass only on x86_64 — the windows-11-arm runner
-      # is materially slower than the rest, so we skip the extra clippy
-      # passes and the cargo-test step there. ARM64 still gets a build
-      # to confirm cross-compile health and produces a release artifact.
+      # Run fmt unconditionally — it's sub-second and fails fast, so a
+      # fmt-broken commit short-circuits the slow ARM64 runner before
+      # any compile work happens.
+      - name: Check formatting
+        run: cargo fmt --check
+
+      # Heavier strict-lint passes only on x86_64 — the windows-11-arm
+      # runner is materially slower than the rest, so we skip the extra
+      # clippy passes and the cargo-test step there. ARM64 still gets a
+      # build to confirm cross-compile health and produces a release
+      # artifact.
       - name: Clippy (debug, --all-targets)
         if: matrix.arch == 'x86_64'
         run: |
