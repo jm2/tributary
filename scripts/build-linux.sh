@@ -15,7 +15,9 @@ With no options, performs a full release build (cargo build --release).
 Quick-exit modes (run one task and exit):
   --fmt             Run `cargo fmt`.
   --check           Run `cargo check`.
-  --clippy          Run `cargo clippy --all-targets -- -D warnings` (pedantic).
+  --clippy          Run cargo clippy in --all-targets (debug, with tests) and
+                    --release modes; pedantic + nursery groups are configured
+                    via [lints.clippy] in Cargo.toml.
   --coverage        Run `cargo llvm-cov` summary (installs cargo-llvm-cov if needed).
 
 Packaging (after the release build):
@@ -98,8 +100,10 @@ if $CHECK; then
 fi
 
 if $CLIPPY; then
-  info "Running cargo clippy (pedantic)..."
+  info "Running cargo clippy (debug, --all-targets)..."
   cargo clippy --all-targets -- -D warnings
+  info "Running cargo clippy (release)..."
+  cargo clippy --release -- -D warnings
   info "Clippy passed."
   exit 0
 fi

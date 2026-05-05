@@ -224,9 +224,12 @@ if ($Check) {
 }
 
 if ($Clippy) {
-    Write-Info "Running cargo clippy for $RustTarget..."
-    cargo clippy --all-targets --target $RustTarget -- -D warnings -W clippy::pedantic -W clippy::nursery
-    if ($LASTEXITCODE -ne 0) { Write-Err "cargo clippy failed." }
+    Write-Info "Running cargo clippy for $RustTarget (debug --all-targets)..."
+    cargo clippy --all-targets --target $RustTarget -- -D warnings
+    if ($LASTEXITCODE -ne 0) { Write-Err "cargo clippy (debug) failed." }
+    Write-Info "Running cargo clippy for $RustTarget (release)..."
+    cargo clippy --release --target $RustTarget -- -D warnings
+    if ($LASTEXITCODE -ne 0) { Write-Err "cargo clippy (release) failed." }
     Write-Info "Clippy passed."
     exit 0
 }

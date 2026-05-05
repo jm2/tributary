@@ -157,3 +157,14 @@ proptest = "1"
 opt-level = 3
 lto = "thin"
 strip = true
+
+# ── Lints ────────────────────────────────────────────────────────────
+#
+# Pedantic + nursery groups are enabled at "warn" level so every cargo
+# invocation (CI, local build scripts, IDE checks) sees the same lint
+# surface. Build/CI scripts add `-D warnings` to elevate them to
+# errors; in editors and during exploratory work the warnings stay as
+# warnings so they don't block iteration.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }

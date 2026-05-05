@@ -68,8 +68,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
-      - name: Clippy (pedantic lint)
+      - name: Clippy (debug, --all-targets)
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (release)
+        run: cargo clippy --release -- -D warnings
 
       - name: Build (release)
         run: cargo build --release
@@ -136,17 +139,29 @@ jobs:
           key: macos-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: macos-${{ matrix.arch }}-cargo-
 
-      - name: Clippy (lint)
+      - name: Clippy (debug, --all-targets)
         run: |
           BREW_PREFIX="$(brew --prefix)"
           export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig"
-          cargo clippy --target ${{ matrix.rust_target }} -- -D warnings
+          cargo clippy --all-targets --target ${{ matrix.rust_target }} -- -D warnings
+
+      - name: Clippy (release)
+        run: |
+          BREW_PREFIX="$(brew --prefix)"
+          export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig"
+          cargo clippy --release --target ${{ matrix.rust_target }} -- -D warnings
 
       - name: Build (release)
         run: |
           BREW_PREFIX="$(brew --prefix)"
           export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig"
           cargo build --release --target ${{ matrix.rust_target }}
+
+      - name: Run tests
+        run: |
+          BREW_PREFIX="$(brew --prefix)"
+          export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig"
+          cargo test --release --target ${{ matrix.rust_target }}
 
       - name: Create .app bundle and .dmg
         run: |
@@ -221,17 +236,43 @@ jobs:
           key: windows-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: windows-${{ matrix.arch }}-cargo-
 
-      - name: Clippy (lint)
+      # Full strict-lint pass only on x86_64 — the windows-11-arm runner
+      # is materially slower than the rest, so we skip the extra clippy
+      # passes and the cargo-test step there. ARM64 still gets a build
+      # to confirm cross-compile health and produces a release artifact.
+      - name: Clippy (debug, --all-targets)
+        if: matrix.arch == 'x86_64'
         run: |
           export PKG_CONFIG_ALLOW_CROSS="1"
           export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
-          cargo clippy --target ${{ matrix.rust_target }} -- -D warnings
+          cargo clippy --all-targets --target ${{ matrix.rust_target }} -- -D warnings
+
+      - name: Clippy (release)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PKG_CONFIG_ALLOW_CROSS="1"
+          export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
+          cargo clippy --release --target ${{ matrix.rust_target }} -- -D warnings
+
+      - name: Clippy (release, ARM64-only fast path)
+        if: matrix.arch == 'aarch64'
+        run: |
+          export PKG_CONFIG_ALLOW_CROSS="1"
+          export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
+          cargo clippy --release --target ${{ matrix.rust_target }} -- -D warnings
 
       - name: Build (release)
         run: |
           export PKG_CONFIG_ALLOW_CROSS="1"
           export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
           cargo build --release --target ${{ matrix.rust_target }}
+
+      - name: Run tests
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PKG_CONFIG_ALLOW_CROSS="1"
+          export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
+          cargo test --release --target ${{ matrix.rust_target }}
 
       - name: Bundle DLLs and create zip
         run: |
