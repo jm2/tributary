@@ -483,60 +483,19 @@ fn eval_date(field_val: &str, op: &RuleOperator, value: &RuleValue) -> bool {
 }
 
 /// Compute the date string N days/weeks/months ago from now.
+///
+/// Months are treated as 30-day windows for parity with how the editor
+/// presents the option (a calendar-aware "previous month" subtraction
+/// is not what users expect from "in the last 3 months").
 fn compute_date_cutoff(amount: u32, unit: DateUnit) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let secs_ago: u64 = match unit {
-        DateUnit::Days => amount as u64 * 86400,
-        DateUnit::Weeks => amount as u64 * 604800,
-        DateUnit::Months => amount as u64 * 2592000, // ~30 days
+    let days_ago: i64 = match unit {
+        DateUnit::Days => i64::from(amount),
+        DateUnit::Weeks => i64::from(amount) * 7,
+        DateUnit::Months => i64::from(amount) * 30,
     };
 
-    let cutoff = now.saturating_sub(secs_ago);
-
-    // Convert epoch seconds to a simple ISO-8601 date string.
-    // We use a basic calculation since we don't have chrono.
-    let secs_per_day = 86400u64;
-    let days = cutoff / secs_per_day;
-    // Approximate: days since 1970-01-01
-    let mut year = 1970i32;
-    let mut remaining_days = days as i32;
-
-    loop {
-        let year_days = if is_leap_year(year) { 366 } else { 365 };
-        if remaining_days < year_days {
-            break;
-        }
-        remaining_days -= year_days;
-        year += 1;
-    }
-
-    let month_days: [i32; 12] = if is_leap_year(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut month = 1;
-    for &md in &month_days {
-        if remaining_days < md {
-            break;
-        }
-        remaining_days -= md;
-        month += 1;
-    }
-
-    let day = remaining_days + 1;
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(days_ago);
+    cutoff.format("%Y-%m-%d").to_string()
 }
 
 /// Apply result limiting: sort then truncate.
@@ -1206,16 +1165,6 @@ mod tests {
         assert!(evaluate_rule(&rule, &t)); // case-insensitive
     }
 
-    // ── Leap year helper ────────────────────────────────────────────
-
-    #[test]
-    fn test_is_leap_year() {
-        assert!(is_leap_year(2000));
-        assert!(is_leap_year(2024));
-        assert!(!is_leap_year(1900));
-        assert!(!is_leap_year(2023));
-    }
-
     // ── Date cutoff computation ─────────────────────────────────────
 
     #[test]
@@ -1225,6 +1174,17 @@ mod tests {
         assert_eq!(cutoff.len(), 10);
         assert_eq!(&cutoff[4..5], "-");
         assert_eq!(&cutoff[7..8], "-");
+        // Re-parsing the result must succeed.
+        chrono::NaiveDate::parse_from_str(&cutoff, "%Y-%m-%d")
+            .expect("compute_date_cutoff returns a parseable YYYY-MM-DD");
+    }
+
+    #[test]
+    fn test_compute_date_cutoff_arithmetic() {
+        // 7 days vs 1 week must produce the same date.
+        let a = compute_date_cutoff(7, DateUnit::Days);
+        let b = compute_date_cutoff(1, DateUnit::Weeks);
+        assert_eq!(a, b);
     }
 
     // ── Limit sort ordering ─────────────────────────────────────────

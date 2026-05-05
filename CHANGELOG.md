@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Known limitations
 - **Auth tokens travel in stream/cover-art URLs for Jellyfin and Plex** — Tributary's debug logger redacts `api_key=` and `X-Plex-Token=` via `redact_url_secrets()`, but the URLs handed to GStreamer's `playbin3` (and to the album-art HTTP fetcher) are the unredacted originals. This is the auth model these servers expose for media URLs; the tokens may therefore appear in GStreamer's own debug output and in HTTP access logs upstream of Tributary. Mitigation: keep `GST_DEBUG` unset at runtime and prefer HTTPS endpoints. Subsonic uses a salted-MD5 token (not a bearer secret) so this consideration does not apply.
 
+### Privacy
+- **"Stations Near Me" requires opt-in IP geolocation** — As before, this feature sends one HTTPS request to a small cascade of public geolocation services (`ipapi.co`, `ipwho.is`, `freeipapi.com`) to derive an approximate location. The consent dialog (introduced in 0.4.0) gates the first request and the choice is remembered in `config.json`; declining keeps every other Tributary feature working offline-or-LAN-only.
+
 ---
 
 ## [0.4.1] — 2026-04-23

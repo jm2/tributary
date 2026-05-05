@@ -144,8 +144,11 @@ fn config_path() -> Option<std::path::PathBuf> {
 
 /// Load the configuration from disk, falling back to defaults.
 ///
-/// Handles migration from the old `library_path` (single string) format:
-/// the raw JSON is pre-processed to rename the key before deserialization.
+/// Handles migration from the legacy `library_path` (single string)
+/// format. We parse to a `serde_json::Value` first and rename the key
+/// programmatically rather than doing a textual `String::replace`,
+/// which would corrupt user-supplied values that happened to contain
+/// the literal substring `"library_path"`.
 pub fn load_config() -> AppConfig {
     let Some(path) = config_path() else {
         return AppConfig::default();
@@ -154,15 +157,21 @@ pub fn load_config() -> AppConfig {
         return AppConfig::default();
     };
 
-    // Pre-process: if the JSON has "library_path" but not "library_paths",
-    // rename the key so serde's custom deserializer receives it correctly.
-    let json_str = if raw.contains("\"library_path\"") && !raw.contains("\"library_paths\"") {
-        raw.replace("\"library_path\"", "\"library_paths\"")
-    } else {
-        raw
+    // Parse to a generic Value so we can rewrite the legacy key safely.
+    let mut value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return AppConfig::default(),
     };
 
-    serde_json::from_str(&json_str).unwrap_or_default()
+    if let Some(obj) = value.as_object_mut() {
+        if !obj.contains_key("library_paths") {
+            if let Some(legacy) = obj.remove("library_path") {
+                obj.insert("library_paths".to_string(), legacy);
+            }
+        }
+    }
+
+    serde_json::from_value(value).unwrap_or_default()
 }
 
 /// Save the configuration to disk.

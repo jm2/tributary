@@ -540,11 +540,25 @@ pub fn setup_source_connect(state: &WindowState) {
 
         let password_only = backend_type == "daap";
 
+        // Set the pending-connection guard *before* the auth dialog is
+        // shown so a second sidebar click while the dialog is open is
+        // ignored at the top of this handler. The submit closure and
+        // the cancel callback below clear it when appropriate.
+        *pending_connection.borrow_mut() = Some(url_for_closure.clone());
+        pre_connect_selection.set(selected_pos);
+
         // Clone Rc's before moving into the auth dialog closure so
         // the outer `Fn` closure can be called multiple times.
         let pre_connect_for_auth = pre_connect_selection.clone();
         let pending_for_auth = pending_connection.clone();
         let sel_for_auth = sel.clone();
+
+        // If the user cancels / escapes the auth dialog, drop the
+        // pending-connection guard so the next sidebar click works.
+        let pending_for_cancel = pending_connection.clone();
+        let on_cancel = move || {
+            *pending_for_cancel.borrow_mut() = None;
+        };
 
         show_auth_dialog(
             &win,
@@ -712,6 +726,7 @@ pub fn setup_source_connect(state: &WindowState) {
                     }
                 });
             },
+            on_cancel,
         );
     });
 }

@@ -379,7 +379,16 @@ impl DaapClient {
     pub async fn probe_requires_password(server_url: &str) -> Option<bool> {
         let http = build_http_client().ok()?;
         let url = format!("{}/server-info", server_url.trim_end_matches('/'));
-        let resp = http.get(&url).send().await.ok()?;
+        // Cap the probe at 5s — a malicious or hung DAAP server should
+        // not be able to stall the discovery flow forever. The shared
+        // client doesn't carry a timeout because real streams can be
+        // long-lived; this is a per-request override.
+        let resp = http
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }

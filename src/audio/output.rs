@@ -32,7 +32,6 @@ use super::PlayerState;
 
 /// Identifies the type of an audio output for UI purposes (icon, label).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum OutputType {
     /// Local GStreamer pipeline (system speakers / headphones).
     Local,
@@ -53,19 +52,19 @@ pub enum OutputType {
 pub trait AudioOutput {
     /// Human-readable display name for the output selector UI.
     ///
-    /// Examples: "My Computer", "Living Room MPD".
+    /// Examples: "My Computer", "Living Room MPD". Currently consumed
+    /// only by tests; the active-output label in the header bar is
+    /// driven from the source list rather than the output instance.
     #[allow(dead_code)]
     fn name(&self) -> &str;
 
     /// The output type, used for icon selection in the popover.
-    #[allow(dead_code)]
     fn output_type(&self) -> OutputType;
 
     /// Whether this output supports application-controlled volume.
     ///
     /// When `false`, the header bar volume slider should be disabled
     /// (greyed out).  MPD manages its own volume independently.
-    #[allow(dead_code)]
     fn supports_volume(&self) -> bool;
 
     // ── Playback controls ───────────────────────────────────────────
@@ -103,6 +102,10 @@ pub trait AudioOutput {
     // ── State queries ───────────────────────────────────────────────
 
     /// Non-blocking query of the current playback state.
+    ///
+    /// Currently every output reports state asynchronously through the
+    /// `PlayerEvent` channel; this method exists for future on-demand
+    /// queries and is not yet polled by the UI.
     #[allow(dead_code)]
     fn state(&self) -> PlayerState;
 

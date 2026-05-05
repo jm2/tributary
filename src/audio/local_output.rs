@@ -17,13 +17,6 @@ impl LocalOutput {
     pub fn new(player: Player) -> Self {
         Self { player }
     }
-
-    /// Access the underlying [`Player`] for bus-watch or timer setup
-    /// that the window bridge needs.
-    #[allow(dead_code)]
-    pub fn player(&self) -> &Player {
-        &self.player
-    }
 }
 
 impl AudioOutput for LocalOutput {

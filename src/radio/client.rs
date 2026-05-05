@@ -34,14 +34,23 @@ impl RadioBrowserClient {
         let base_url = format!("https://{host}");
         info!(base_url = %base_url, "Radio-Browser API client initialized");
 
-        Self {
-            base_url,
-            client: reqwest::Client::builder()
-                .user_agent("Tributary/0.2")
-                .timeout(REQUEST_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
-        }
+        let client = match reqwest::Client::builder()
+            .user_agent("Tributary/0.2")
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to build configured reqwest::Client for Radio-Browser; \
+                     falling back to default (no timeout)"
+                );
+                reqwest::Client::default()
+            }
+        };
+
+        Self { base_url, client }
     }
 
     /// Fetch top-clicked stations.

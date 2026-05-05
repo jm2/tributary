@@ -153,13 +153,23 @@ impl MediaBackend for LocalBackend {
     }
 
     async fn get_album_tracks(&self, _album_id: &Uuid) -> BackendResult<Vec<Track>> {
-        // For now, album_id isn't stored in DB.  This will be wired up
-        // when we have a proper album registry; for now return empty.
-        Ok(vec![])
+        // The local backend derives albums from track rows on the fly
+        // and assigns ephemeral UUIDs in `list_albums()`. Until album
+        // identity is persisted, lookup-by-album-id has no stable key
+        // to query against; callers should filter the local track list
+        // by album_title themselves rather than rely on this method.
+        Err(BackendError::Unsupported {
+            operation: "LocalBackend::get_album_tracks (album IDs are not persisted)".into(),
+        })
     }
 
     async fn get_artist_tracks(&self, _artist_id: &Uuid) -> BackendResult<Vec<Track>> {
-        Ok(vec![])
+        // Same shape as get_album_tracks above: artist IDs are
+        // synthesised per-call and not persisted, so a stable
+        // by-id lookup is not implementable today.
+        Err(BackendError::Unsupported {
+            operation: "LocalBackend::get_artist_tracks (artist IDs are not persisted)".into(),
+        })
     }
 
     async fn get_stream_url(&self, track_id: &Uuid) -> BackendResult<Url> {

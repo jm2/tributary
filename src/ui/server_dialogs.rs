@@ -84,13 +84,16 @@ pub fn remove_saved_server(url: &str) {
 /// and empty passwords are allowed (open shares).
 ///
 /// `on_connect` is called with `(username, password)` if the user
-/// clicks Connect.  Cancel / Escape simply dismisses the dialog.
+/// clicks Connect. `on_cancel` is called if the user dismisses the
+/// dialog (Cancel / Escape / clicked off) so the caller can clear any
+/// pending-connection state it set up before showing the dialog.
 pub fn show_auth_dialog(
     window: &adw::ApplicationWindow,
     server_name: &str,
     server_url: &str,
     password_only: bool,
     on_connect: impl Fn(String, String) + 'static,
+    on_cancel: impl FnOnce() + 'static,
 ) {
     let body = if password_only {
         format!("{server_url}\nEnter the share password (leave blank if none)")
@@ -134,20 +137,35 @@ pub fn show_auth_dialog(
 
     let user_entry_clone = user_entry.clone();
     let pass_entry_clone = pass_entry.clone();
+    let on_cancel_cell = std::rc::Rc::new(std::cell::RefCell::new(Some(on_cancel)));
 
     dialog.connect_response(None, move |_dialog, response| {
         if response == "connect" {
-            if password_only {
+            let submitted = if password_only {
                 // DAAP: password only, allow empty (open shares).
                 let pass = pass_entry_clone.text().to_string();
                 on_connect(String::new(), pass);
+                true
             } else {
                 let user = user_entry_clone.text().to_string();
                 let pass = pass_entry_clone.text().to_string();
                 if !user.is_empty() && !pass.is_empty() {
                     on_connect(user, pass);
+                    true
+                } else {
+                    // User clicked Connect with empty fields — treat as
+                    // a cancel so the pending-connection guard clears.
+                    false
+                }
+            };
+            if !submitted {
+                if let Some(cb) = on_cancel_cell.borrow_mut().take() {
+                    cb();
                 }
             }
+        } else if let Some(cb) = on_cancel_cell.borrow_mut().take() {
+            // Cancel / Escape / dismissed.
+            cb();
         }
     });
 

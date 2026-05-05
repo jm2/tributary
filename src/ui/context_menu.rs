@@ -155,15 +155,24 @@ fn build_remove_from_playlist_action(
         let browser_state = browser_state.clone();
         let active_key = active_key.clone();
 
-        // Remove from visible store immediately.
-        for uri in &uris {
-            for i in 0..track_store.n_items() {
-                if let Some(t) = track_store.item(i).and_downcast_ref::<TrackObject>() {
-                    if t.uri() == *uri {
-                        track_store.remove(i);
-                        break;
-                    }
-                }
+        // Remove from visible store immediately. One pass over the
+        // store, indexing into a `HashSet` so removing N selected items
+        // from a list of M tracks is O(N+M) rather than O(N*M).
+        let to_remove: std::collections::HashSet<&str> =
+            uris.iter().map(|s| s.as_str()).collect();
+        let mut i: u32 = 0;
+        while i < track_store.n_items() {
+            let matched = track_store
+                .item(i)
+                .and_downcast_ref::<TrackObject>()
+                .map(|t| to_remove.contains(t.uri().as_str()))
+                .unwrap_or(false);
+            if matched {
+                track_store.remove(i);
+                // Don't advance `i` — the next item shifted down into
+                // this slot.
+            } else {
+                i += 1;
             }
         }
 
@@ -171,7 +180,7 @@ fn build_remove_from_playlist_action(
         {
             let mut st = source_tracks.borrow_mut();
             if let Some(tracks) = st.get_mut(&active_key) {
-                tracks.retain(|t| !uris.contains(&t.uri()));
+                tracks.retain(|t| !to_remove.contains(t.uri().as_str()));
             }
         }
         let st = source_tracks.borrow();

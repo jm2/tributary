@@ -23,11 +23,15 @@ struct ArtRequest {
 }
 
 /// Get (or lazily create) the sender for the persistent art worker.
-fn art_worker_tx() -> &'static std::sync::mpsc::Sender<ArtRequest> {
-    static TX: OnceLock<std::sync::mpsc::Sender<ArtRequest>> = OnceLock::new();
+///
+/// Returns `None` if the worker thread could not be spawned. Callers
+/// should treat that as "remote album art unavailable" and skip
+/// fetching — the local-tag-extraction path still works regardless.
+fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
+    static TX: OnceLock<Option<std::sync::mpsc::Sender<ArtRequest>>> = OnceLock::new();
     TX.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<ArtRequest>();
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("art-worker".into())
             .spawn(move || {
                 // Build the HTTP client once for the lifetime of this thread.
@@ -60,10 +64,20 @@ fn art_worker_tx() -> &'static std::sync::mpsc::Sender<ArtRequest> {
                         }
                     }
                 }
-            })
-            .expect("Failed to spawn art-worker thread");
-        tx
+            });
+
+        match spawn_result {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to spawn art-worker thread; remote album art will be skipped"
+                );
+                None
+            }
+        }
     })
+    .as_ref()
 }
 
 /// Extract embedded album art from a track's file and display it on the
@@ -338,12 +352,16 @@ pub fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
     // Send the request to the persistent art worker thread.
     // This reuses a single HTTP client with connection pooling,
     // avoiding the overhead of spawning a new thread + TLS handshake
-    // for every track change.
-    let _ = art_worker_tx().send(ArtRequest {
-        url,
-        generation,
-        reply_tx,
-    });
+    // for every track change. If the worker isn't available (thread
+    // spawn failed at startup), silently skip — there's nothing to
+    // fetch with and the placeholder icon will show instead.
+    if let Some(tx) = art_worker_tx() {
+        let _ = tx.send(ArtRequest {
+            url,
+            generation,
+            reply_tx,
+        });
+    }
 
     // Receive on the GTK main thread.
     glib::MainContext::default().spawn_local(async move {

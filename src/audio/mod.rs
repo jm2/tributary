@@ -168,9 +168,12 @@ impl Player {
 
         // Signal buffering immediately — the bus watch will send
         // `Playing` once the pipeline actually reaches that state.
-        let _ = self
+        if let Err(e) = self
             .event_tx
-            .try_send(PlayerEvent::StateChanged(PlayerState::Buffering));
+            .try_send(PlayerEvent::StateChanged(PlayerState::Buffering))
+        {
+            warn!(error = %e, "dropped Buffering event — UI consumer may be stalled");
+        }
 
         let _ = self.playbin.set_state(gst::State::Playing);
     }
@@ -191,9 +194,12 @@ impl Player {
     pub fn stop(&self) {
         debug!("stop");
         let _ = self.playbin.set_state(gst::State::Null);
-        let _ = self
+        if let Err(e) = self
             .event_tx
-            .try_send(PlayerEvent::StateChanged(PlayerState::Stopped));
+            .try_send(PlayerEvent::StateChanged(PlayerState::Stopped))
+        {
+            warn!(error = %e, "dropped Stopped event — UI consumer may be stalled");
+        }
     }
 
     /// Toggle between Playing ↔ Paused.
@@ -230,7 +236,6 @@ impl Player {
     }
 
     /// Current pipeline volume (0.0 – 1.0).
-    #[allow(dead_code)]
     pub fn volume(&self) -> f64 {
         self.volume
     }
@@ -238,7 +243,6 @@ impl Player {
     // ── State / position queries ────────────────────────────────────
 
     /// Non-blocking query of the current playback state.
-    #[allow(dead_code)]
     pub fn state(&self) -> PlayerState {
         let (_, current, _) = self.playbin.state(gst::ClockTime::ZERO);
         match current {
@@ -278,7 +282,9 @@ impl Player {
             match msg.view() {
                 MessageView::Eos(_) => {
                     info!("End of stream");
-                    let _ = tx.try_send(PlayerEvent::TrackEnded);
+                    if let Err(e) = tx.try_send(PlayerEvent::TrackEnded) {
+                        warn!(error = %e, "dropped TrackEnded event — UI consumer may be stalled");
+                    }
                 }
 
                 MessageView::Error(err) => {
@@ -288,7 +294,9 @@ impl Player {
                         debug = ?err.debug(),
                         "Pipeline error"
                     );
-                    let _ = tx.try_send(PlayerEvent::Error(err.error().to_string()));
+                    if let Err(e) = tx.try_send(PlayerEvent::Error(err.error().to_string())) {
+                        warn!(error = %e, "dropped Error event — UI consumer may be stalled");
+                    }
                 }
 
                 MessageView::StateChanged(sc) => {

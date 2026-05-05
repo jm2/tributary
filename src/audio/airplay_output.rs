@@ -80,7 +80,6 @@ impl AirPlayOutput {
     ///
     /// Does **not** establish a connection — that happens lazily on the
     /// first playback command.
-    #[allow(dead_code)]
     pub fn new(
         display_name: &str,
         host: &str,

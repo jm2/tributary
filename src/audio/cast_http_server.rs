@@ -127,17 +127,8 @@ impl CastHttpServer {
     }
 
     /// The socket address the server is listening on.
-    #[allow(dead_code)]
     pub fn addr(&self) -> SocketAddr {
         self.addr
-    }
-
-    /// Shut down the server and clean up registered files.
-    #[allow(dead_code)]
-    pub fn shutdown(&self) {
-        info!("Shutting down cast HTTP server");
-        self.abort_handle.abort();
-        self.files.clear();
     }
 }
 

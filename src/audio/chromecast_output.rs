@@ -62,6 +62,8 @@ const POSITION_POLL_INTERVAL_SECS: u64 = 1;
 /// Chromecast audio output — streams to a Cast V2 device.
 pub struct ChromecastOutput {
     /// Human-readable name from mDNS discovery (e.g. "Living Room Speaker").
+    /// Read by the `AudioOutput::name` trait method.
+    #[allow(dead_code)]
     display_name: String,
     /// Device hostname or IP address.
     host: String,
@@ -85,7 +87,6 @@ impl ChromecastOutput {
     ///
     /// Does **not** establish a connection — that happens lazily on the
     /// first playback command.
-    #[allow(dead_code)]
     pub fn new(
         display_name: &str,
         host: &str,

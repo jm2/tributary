@@ -43,6 +43,7 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(5);
 /// MPD audio output — sends commands to an MPD server.
 pub struct MpdOutput {
     /// Human-readable name shown in the output selector.
+    /// Read by the `AudioOutput::name` trait method.
     #[allow(dead_code)]
     display_name: String,
     /// MPD server hostname or IP.
@@ -81,7 +82,6 @@ impl MpdOutput {
     /// greeting line (`OK MPD x.y.z`).
     ///
     /// Returns `Ok(version_string)` on success.
-    #[allow(dead_code)]
     pub fn probe(host: &str, port: u16) -> Result<String, String> {
         let addr = format!("{host}:{port}");
         let addrs: Vec<_> = addr
@@ -199,13 +199,28 @@ impl MpdOutput {
     }
 }
 
-/// Sanitise a string for inclusion in an MPD command.
+/// Sanitise a string for inclusion in an MPD command, ready to be
+/// wrapped in double quotes by the caller.
 ///
-/// Strips `\n` and `\r` to prevent command injection via crafted
-/// filenames or URIs.  The MPD protocol is newline-delimited, so
-/// embedded newlines could inject arbitrary commands.
+/// MPD's protocol is newline-delimited and arguments may be quoted with
+/// `"`; within a quoted argument, `\\` and `\"` are the only escape
+/// sequences. We therefore:
+///   1. Strip `\n` / `\r` (newline-protocol injection).
+///   2. Backslash-escape `\` and `"` so the surrounding quotes stay
+///      balanced when the input contains either.
 fn sanitise_mpd_arg(s: &str) -> String {
-    s.chars().filter(|&c| c != '\n' && c != '\r').collect()
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' | '\r' => {}
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(c);
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 impl AudioOutput for MpdOutput {
@@ -255,8 +270,10 @@ impl AudioOutput for MpdOutput {
     }
 
     fn seek_to(&self, position_ms: u64) {
+        // MPD's seekcur accepts a fractional number of seconds; use
+        // millisecond resolution rather than rounding to one decimal.
         let secs = position_ms as f64 / 1000.0;
-        self.send_commands(&format!("seekcur {secs:.1}"));
+        self.send_commands(&format!("seekcur {secs:.3}"));
     }
 
     fn set_volume(&mut self, level: f64) {
@@ -313,8 +330,24 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitise_preserves_quotes() {
-        // MPD uses double quotes for arguments — they should pass through.
-        assert_eq!(sanitise_mpd_arg("it's a \"test\""), "it's a \"test\"");
+    fn test_sanitise_escapes_quotes_and_backslashes() {
+        // The caller wraps the sanitised string in `"…"`. Both `"` and
+        // `\` must be backslash-escaped for the surrounding quotes to
+        // close where we expect.
+        assert_eq!(sanitise_mpd_arg(r#"it's a "test""#), r#"it's a \"test\""#);
+        assert_eq!(sanitise_mpd_arg(r"a\b"), r"a\\b");
+        assert_eq!(sanitise_mpd_arg(r#"a\"b"#), r#"a\\\"b"#);
+    }
+
+    #[test]
+    fn test_sanitise_quote_injection_attempt() {
+        // A URI containing a stray `"` would otherwise close our
+        // surrounding quote and let the rest inject a new command.
+        let malicious = r#"http://x/a.flac"; delete 0"#;
+        let safe = sanitise_mpd_arg(malicious);
+        // Nothing in the sanitised output ends the quoted argument
+        // early — every `"` is escaped.
+        assert!(!safe.contains('\n'));
+        assert!(!safe.replace("\\\"", "").contains('"'));
     }
 }
