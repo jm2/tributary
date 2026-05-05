@@ -488,6 +488,11 @@ pub fn setup_source_connect(state: &WindowState) {
             }
 
             let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
+            // Separate signal for "server actually does require a password":
+            // the no-password connect came back with AuthenticationFailed, so
+            // we flip the flag and re-fire the selection to let the existing
+            // auth-dialog branch handle it.
+            let (auth_needed_tx, auth_needed_rx) = async_channel::bounded::<()>(1);
             let sidebar_store_for_fail = sidebar_store.clone();
             let sel_for_fail = sel.clone();
             let pre_sel = pre_connect_selection.get();
@@ -510,6 +515,32 @@ pub fn setup_source_connect(state: &WindowState) {
                 }
             });
 
+            let sidebar_store_for_auth = sidebar_store.clone();
+            let sel_for_auth = sel.clone();
+            let pending_for_auth = pending_connection.clone();
+            glib::MainContext::default().spawn_local(async move {
+                if auth_needed_rx.recv().await.is_ok() {
+                    // Clear connecting state and flip requires_password so the
+                    // re-fired selection lands in the auth-dialog branch.
+                    if let Some(src) = sidebar_store_for_auth
+                        .item(selected_pos)
+                        .and_downcast_ref::<SourceObject>()
+                    {
+                        src.set_connecting(false);
+                        src.set_requires_password(true);
+                        let src = src.clone();
+                        sidebar_store_for_auth.remove(selected_pos);
+                        sidebar_store_for_auth.insert(selected_pos, &src);
+                    }
+                    // Drop the pending guard and re-fire selection-changed.
+                    // Setting the same position is a no-op in GtkSingleSelection,
+                    // so deselect (INVALID_LIST_POSITION) then reselect.
+                    *pending_for_auth.borrow_mut() = None;
+                    sel_for_auth.set_selected(gtk::INVALID_LIST_POSITION);
+                    sel_for_auth.set_selected(selected_pos);
+                }
+            });
+
             let engine_tx = engine_tx.clone();
             let server_url = url_for_closure.clone();
             let server_name = name_for_closure.clone();
@@ -525,6 +556,15 @@ pub fn setup_source_connect(state: &WindowState) {
                                 tracks,
                             })
                             .await;
+                    }
+                    Err(crate::architecture::error::BackendError::AuthenticationFailed {
+                        ..
+                    }) => {
+                        info!(
+                            server = %server_url,
+                            "DAAP server requires a password — re-prompting via auth dialog"
+                        );
+                        let _ = auth_needed_tx.send(()).await;
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "DAAP connection failed");

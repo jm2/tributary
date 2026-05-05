@@ -83,7 +83,14 @@ impl SourceObject {
         obj.imp().server_url.replace(server_url.to_string());
         obj.imp().is_header.set(false);
         obj.imp().connected.set(false);
-        obj.imp().requires_password.set(true); // assume locked until probed
+        // Assume open until probed. forked-daapd / OwnTone / iTunes shares
+        // default to no password; defaulting `true` here caused a race where
+        // a click before `probe_daap_password` finished would force-show the
+        // auth dialog even for open shares. The connect path now retries via
+        // the auth dialog if a passwordless connect comes back with
+        // `AuthenticationFailed`, so a wrong guess for password-protected
+        // shares self-corrects on the failure response.
+        obj.imp().requires_password.set(false);
         obj
     }
 
