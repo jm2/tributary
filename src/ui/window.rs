@@ -780,24 +780,48 @@ pub fn build_window(
     let hwnd = extract_hwnd(&window);
 
     // ── Enable Windows 11 Snap Layout ───────────────────────────────
-    // Install a WM_NCHITTEST subclass so hovering over the maximize
-    // button triggers the native Snap Layout flyout.
+    // Install a WM_NCHITTEST / WM_GETMINMAXINFO subclass on the
+    // top-level HWND.
+    //
+    // `window.present()` is supposed to allocate the native surface,
+    // but in practice on Windows the surface isn't always ready by the
+    // time we read it back here. If `extract_hwnd` returns None, defer
+    // the install to the first `notify::is-active`, which fires once
+    // the window is mapped.
     #[cfg(target_os = "windows")]
-    if let Some(hwnd_ptr) = hwnd {
-        // Default maximize button rect: top-right area of the window.
-        // GTK4 CSD maximize button is typically at (width - 92, 0, 46, 36).
-        // We use a conservative estimate; the exact rect can be refined
-        // by reading the header bar widget's allocation.
-        let w = win_width;
-        super::win32_snap::enable_snap_layout(hwnd_ptr, (w - 92, 0, 46, 36));
+    {
+        if let Some(hwnd_ptr) = hwnd {
+            tracing::info!("Installing Snap Layout subclass (HWND ready at present)");
+            super::win32_snap::enable_snap_layout(hwnd_ptr, (win_width - 92, 0, 46, 36));
 
-        // Update the snap rect when the window is resized.
-        let hwnd_snap = hwnd_ptr;
-        window.connect_default_width_notify(move |win| {
-            let (w, _) = win.default_size();
-            super::win32_snap::update_maximize_rect((w - 92, 0, 46, 36));
-            let _ = hwnd_snap; // keep ptr alive for future refinement
-        });
+            window.connect_default_width_notify(move |win| {
+                let (w, _) = win.default_size();
+                super::win32_snap::update_maximize_rect((w - 92, 0, 46, 36));
+            });
+        } else {
+            tracing::warn!(
+                "HWND not available immediately after window.present() — deferring Snap Layout install to first notify::is-active"
+            );
+            let installed = std::rc::Rc::new(std::cell::Cell::new(false));
+            let installed_for_handler = installed.clone();
+            window.connect_is_active_notify(move |w| {
+                if installed_for_handler.get() {
+                    return;
+                }
+                let Some(hwnd_ptr) = extract_hwnd(w) else {
+                    return;
+                };
+                tracing::info!("Installing Snap Layout subclass (deferred, HWND now ready)");
+                let (cw, _) = w.default_size();
+                super::win32_snap::enable_snap_layout(hwnd_ptr, (cw - 92, 0, 46, 36));
+                installed_for_handler.set(true);
+
+                w.connect_default_width_notify(move |win| {
+                    let (cw, _) = win.default_size();
+                    super::win32_snap::update_maximize_rect((cw - 92, 0, 46, 36));
+                });
+            });
+        }
     }
 
     // ── Create OS media controls ────────────────────────────────────

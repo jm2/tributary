@@ -22,6 +22,7 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 // Win32 constants.
+const WM_NCCALCSIZE: u32 = 0x0083;
 const WM_NCHITTEST: u32 = 0x0084;
 const WM_NCDESTROY: u32 = 0x0082;
 const WM_GETMINMAXINFO: u32 = 0x0024;
@@ -31,6 +32,22 @@ const MONITOR_DEFAULTTONEAREST: u32 = 0x0002;
 
 const GWL_STYLE: i32 = -16;
 const GWL_EXSTYLE: i32 = -20;
+
+// Window styles required for Windows 11 Snap Assist to include the window
+// in its quadrant-fill picker. GTK4 CSD on Windows strips most of these
+// because it draws its own title bar; we add them back and suppress the
+// resulting OS-drawn frame via WM_NCCALCSIZE.
+const WS_CAPTION: u32 = 0x00C0_0000;
+const WS_THICKFRAME: u32 = 0x0004_0000;
+const WS_SYSMENU: u32 = 0x0008_0000;
+const WS_MINIMIZEBOX: u32 = 0x0002_0000;
+const WS_MAXIMIZEBOX: u32 = 0x0001_0000;
+
+// SetWindowPos flags.
+const SWP_NOSIZE: u32 = 0x0001;
+const SWP_NOMOVE: u32 = 0x0002;
+const SWP_NOZORDER: u32 = 0x0004;
+const SWP_FRAMECHANGED: u32 = 0x0020;
 
 const SUBCLASS_ID: usize = 0x5472_6962; // "Trib" in hex
 
@@ -81,6 +98,16 @@ extern "system" {
     fn MonitorFromWindow(hwnd: *mut c_void, dwFlags: u32) -> *mut c_void;
     fn GetMonitorInfoW(hMonitor: *mut c_void, lpmi: *mut MonitorInfo) -> i32;
     fn GetWindowLongPtrW(hwnd: *mut c_void, nIndex: i32) -> isize;
+    fn SetWindowLongPtrW(hwnd: *mut c_void, nIndex: i32, dwNewLong: isize) -> isize;
+    fn SetWindowPos(
+        hwnd: *mut c_void,
+        hwnd_insert_after: *mut c_void,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        uFlags: u32,
+    ) -> i32;
 }
 
 /// Win32 POINT structure (client coordinates).
@@ -165,6 +192,48 @@ pub fn enable_snap_layout(hwnd: *mut c_void, maximize_rect: (i32, i32, i32, i32)
         SetWindowSubclass(hwnd, subclass_proc, SUBCLASS_ID, 0);
     }
 
+    // Restore the window styles that GTK4 CSD strips on Windows. Snap Assist
+    // only includes a window in its "fill the other quadrants" picker if the
+    // HWND looks like a normal top-level: WS_CAPTION + WS_THICKFRAME +
+    // WS_MAXIMIZEBOX + WS_SYSMENU + WS_MINIMIZEBOX. WS_THICKFRAME is also
+    // required for the maximize-button hover flyout.
+    //
+    // Adding WS_CAPTION normally tells Windows to draw a native title bar in
+    // the non-client area — but our subclass intercepts WM_NCCALCSIZE and
+    // returns 0, which collapses the non-client area to nothing, so GTK's
+    // CSD continues to own the entire client area. The OS just *believes*
+    // there's a frame, which is enough for Snap Assist eligibility.
+    //
+    // SAFETY: standard Win32 calls on a valid HWND.
+    unsafe {
+        let new_style = (style as u32)
+            | WS_CAPTION
+            | WS_THICKFRAME
+            | WS_SYSMENU
+            | WS_MINIMIZEBOX
+            | WS_MAXIMIZEBOX;
+        if (new_style as isize) != style {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, new_style as isize);
+            // SWP_FRAMECHANGED forces the window to recompute its frame,
+            // which resends WM_NCCALCSIZE. Our subclass is already installed,
+            // so it will swallow the resulting non-client area to keep CSD intact.
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+            tracing::info!(
+                old_style = format!("{:#010x}", style as u32),
+                new_style = format!("{:#010x}", new_style),
+                "Restored snap-eligible window styles"
+            );
+        }
+    }
+
     tracing::info!("Windows 11 Snap Layout subclass installed");
 }
 
@@ -195,6 +264,16 @@ unsafe extern "system" fn subclass_proc(
     _ref_data: usize,
 ) -> isize {
     match msg {
+        WM_NCCALCSIZE => {
+            // Adding WS_CAPTION + WS_THICKFRAME makes the window snap-eligible,
+            // but Windows would then draw a native title bar in the non-client
+            // area. Returning 0 (for either wparam form) tells Windows the
+            // client area equals the proposed window rect — i.e., zero
+            // non-client area — so GTK4's CSD continues to render the entire
+            // window unchanged. The OS believes there's a frame for snap
+            // purposes; nothing actually gets drawn there.
+            0
+        }
         WM_NCHITTEST => {
             // Get cursor position in client coordinates.
             let mut pt = Point::default();
