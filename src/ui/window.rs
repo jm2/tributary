@@ -26,7 +26,7 @@ use super::persistence::{
     extract_hwnd, load_css, load_repeat_mode, load_shuffle, load_window_geometry,
     restore_sort_state, save_repeat_mode, save_shuffle, save_sort_state, save_window_geometry,
 };
-use super::playback::{advance_track, format_ms, play_track_at, PlaybackContext};
+use super::playback::{advance_track, format_ms, play_track_at, previous_track, PlaybackContext};
 use super::preferences;
 use super::server_dialogs::{load_saved_servers, remove_saved_server, show_add_server_dialog};
 use super::sidebar;
@@ -801,10 +801,36 @@ pub fn build_window(
     }
 
     // ── Create OS media controls ────────────────────────────────────
-    let media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>> =
+    //
+    // The Next / Previous handlers need a `PlaybackContext`, which in
+    // turn references the album-art widget, title/artist labels, and
+    // the OS media controller itself. We capture the fields up-front
+    // into the spawn_local closure (cloned each iteration so the
+    // PlaybackContext can be built fresh per event without moving the
+    // captured Rc's out of the closure).
+    let media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>> = {
+        // The PlaybackContext takes a `media_ctrl` field that needs to
+        // be the same Rc the rest of the UI uses, so we declare the
+        // outer `Rc` first as `None`, build the controller, then store
+        // it inside.
+        let ctrl_slot: Rc<RefCell<Option<crate::desktop_integration::MediaController>>> =
+            Rc::new(RefCell::new(None));
+
         match crate::desktop_integration::MediaController::new(hwnd) {
             Ok((ctrl, media_rx)) => {
+                *ctrl_slot.borrow_mut() = Some(ctrl);
+
                 let active_output = active_output.clone();
+                let parked_local = parked_local.clone();
+                let album_art = hb.album_art.clone();
+                let title_label = hb.title_label.clone();
+                let artist_label = hb.artist_label.clone();
+                let sm = sort_model.clone();
+                let current_pos = current_pos.clone();
+                let repeat_mode = hb.repeat_mode.clone();
+                let shuffle = hb.shuffle_button.clone();
+                let ctrl_for_ctx = ctrl_slot.clone();
+
                 glib::MainContext::default().spawn_local(async move {
                     while let Ok(action) = media_rx.recv().await {
                         info!(?action, "OS media key");
@@ -814,23 +840,59 @@ pub fn build_window(
                             MediaAction::Toggle => active_output.borrow().toggle_play_pause(),
                             MediaAction::Stop => active_output.borrow().stop(),
                             MediaAction::Next => {
-                                // Media key next/previous cannot call
-                                // advance_track directly because we don't
-                                // have the PlaybackContext here.  The OS
-                                // media controls are best-effort — the
-                                // header bar buttons are the primary UI.
+                                advance_track(
+                                    &PlaybackContext {
+                                        model: sm.clone(),
+                                        active_output: active_output.clone(),
+                                        parked_local: parked_local.clone(),
+                                        album_art: album_art.clone(),
+                                        title_label: title_label.clone(),
+                                        artist_label: artist_label.clone(),
+                                        media_ctrl: ctrl_for_ctx.clone(),
+                                        current_pos: current_pos.clone(),
+                                    },
+                                    repeat_mode.get(),
+                                    shuffle.is_active(),
+                                );
                             }
-                            MediaAction::Previous => {}
+                            MediaAction::Previous => {
+                                // Mirror the header-bar heuristic: if
+                                // we're past the restart threshold,
+                                // restart the current track; otherwise
+                                // step back.
+                                let position_ms = active_output.borrow().position_ms().unwrap_or(0);
+                                if position_ms > PREV_RESTART_THRESHOLD_MS {
+                                    active_output.borrow().seek_to(0);
+                                } else {
+                                    let stepped = previous_track(
+                                        &PlaybackContext {
+                                            model: sm.clone(),
+                                            active_output: active_output.clone(),
+                                            parked_local: parked_local.clone(),
+                                            album_art: album_art.clone(),
+                                            title_label: title_label.clone(),
+                                            artist_label: artist_label.clone(),
+                                            media_ctrl: ctrl_for_ctx.clone(),
+                                            current_pos: current_pos.clone(),
+                                        },
+                                        repeat_mode.get(),
+                                    );
+                                    if !stepped {
+                                        active_output.borrow().seek_to(0);
+                                    }
+                                }
+                            }
                         }
                     }
                 });
-                Rc::new(RefCell::new(Some(ctrl)))
             }
             Err(e) => {
                 warn!(error = %e, "Media controls unavailable — media keys disabled");
-                Rc::new(RefCell::new(None))
             }
-        };
+        }
+
+        ctrl_slot
+    };
 
     // ── Wire play/pause button ──────────────────────────────────────
     // If nothing is playing, start from track 0 (or random if shuffle).
@@ -1013,10 +1075,9 @@ pub fn build_window(
         let sm = sort_model.clone();
         let current_pos = current_pos.clone();
         let parked_local = parked_local.clone();
+        let repeat_mode = hb.repeat_mode.clone();
 
         hb.prev_button.connect_clicked(move |_| {
-            let Some(pos) = current_pos.get() else { return };
-
             // If more than 3 s into the track, restart it.
             let position_ms = active_output.borrow().position_ms().unwrap_or(0);
             if position_ms > PREV_RESTART_THRESHOLD_MS {
@@ -1024,22 +1085,23 @@ pub fn build_window(
                 return;
             }
 
-            // Otherwise go to the previous track (or restart track 0).
-            if pos > 0 {
-                play_track_at(
-                    pos - 1,
-                    &PlaybackContext {
-                        model: sm.clone(),
-                        active_output: active_output.clone(),
-                        parked_local: parked_local.clone(),
-                        album_art: album_art.clone(),
-                        title_label: title_label.clone(),
-                        artist_label: artist_label.clone(),
-                        media_ctrl: media_ctrl.clone(),
-                        current_pos: current_pos.clone(),
-                    },
-                );
-            } else {
+            let stepped = previous_track(
+                &PlaybackContext {
+                    model: sm.clone(),
+                    active_output: active_output.clone(),
+                    parked_local: parked_local.clone(),
+                    album_art: album_art.clone(),
+                    title_label: title_label.clone(),
+                    artist_label: artist_label.clone(),
+                    media_ctrl: media_ctrl.clone(),
+                    current_pos: current_pos.clone(),
+                },
+                repeat_mode.get(),
+            );
+
+            // If we couldn't step back (track 0 with repeat off, or no
+            // current track), restart whatever is playing instead.
+            if !stepped {
                 active_output.borrow().seek_to(0);
             }
         });

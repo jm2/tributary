@@ -81,12 +81,24 @@ pub fn build_header_bar() -> HeaderBarWidgets {
             };
             mode.set(next);
             let (icon, tooltip, active) = match next {
-                RepeatMode::Off => ("media-playlist-repeat-symbolic", "Repeat: Off", false),
-                RepeatMode::All => ("media-playlist-repeat-symbolic", "Repeat: All", true),
-                RepeatMode::One => ("media-playlist-repeat-song-symbolic", "Repeat: One", true),
+                RepeatMode::Off => (
+                    "media-playlist-repeat-symbolic",
+                    rust_i18n::t!("header.repeat_off"),
+                    false,
+                ),
+                RepeatMode::All => (
+                    "media-playlist-repeat-symbolic",
+                    rust_i18n::t!("header.repeat_all"),
+                    true,
+                ),
+                RepeatMode::One => (
+                    "media-playlist-repeat-song-symbolic",
+                    rust_i18n::t!("header.repeat_one"),
+                    true,
+                ),
             };
             btn.set_icon_name(icon);
-            btn.set_tooltip_text(Some(tooltip));
+            btn.set_tooltip_text(Some(tooltip.as_ref()));
             btn.set_active(active);
         });
     }

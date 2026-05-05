@@ -133,6 +133,32 @@ pub fn advance_track(ctx: &PlaybackContext, repeat_mode: RepeatMode, shuffle: bo
     }
 }
 
+/// Step back to the previous track, respecting repeat-all wrap-around.
+///
+/// This is the positional inverse of [`advance_track`] and intentionally
+/// has no "restart current track if past N seconds" behaviour — that
+/// heuristic belongs to the UI/key callers, which know what threshold
+/// they want to use. Returns `true` if a new track was loaded.
+pub fn previous_track(ctx: &PlaybackContext, repeat_mode: RepeatMode) -> bool {
+    let n = ctx.model.n_items();
+    if n == 0 {
+        return false;
+    }
+
+    let Some(pos) = ctx.current_pos.get() else {
+        // Nothing playing — start from the top of the list.
+        return play_track_at(0, ctx);
+    };
+
+    if pos > 0 {
+        play_track_at(pos - 1, ctx)
+    } else if repeat_mode == RepeatMode::All {
+        play_track_at(n - 1, ctx)
+    } else {
+        false
+    }
+}
+
 /// Play a local file directly, bypassing the library tracklist.
 ///
 /// Used by the OS "Open With" / `xdg-open` handler.  Reads tags via

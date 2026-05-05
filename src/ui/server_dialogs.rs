@@ -96,31 +96,31 @@ pub fn show_auth_dialog(
     on_cancel: impl FnOnce() + 'static,
 ) {
     let body = if password_only {
-        format!("{server_url}\nEnter the share password (leave blank if none)")
+        format!("{server_url}\n{}", rust_i18n::t!("dialogs.enter_password"))
     } else {
         server_url.to_string()
     };
 
     let dialog = adw::AlertDialog::builder()
-        .heading(format!("Connect to {server_name}"))
+        .heading(rust_i18n::t!("dialogs.connect_to", name = server_name).as_ref())
         .body(&body)
         .close_response("cancel")
         .default_response("connect")
         .build();
 
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("connect", "Connect");
+    dialog.add_response("cancel", rust_i18n::t!("dialogs.cancel").as_ref());
+    dialog.add_response("connect", rust_i18n::t!("dialogs.connect").as_ref());
     dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
 
     // ── Credential entry fields ─────────────────────────────────────
     let user_entry = gtk::Entry::builder()
-        .placeholder_text("Username")
+        .placeholder_text(rust_i18n::t!("dialogs.username").as_ref())
         .activates_default(true)
         .visible(!password_only)
         .build();
 
     let pass_entry = gtk::PasswordEntry::builder()
-        .placeholder_text("Password")
+        .placeholder_text(rust_i18n::t!("dialogs.password").as_ref())
         .show_peek_icon(true)
         .activates_default(true)
         .build();
@@ -186,17 +186,18 @@ pub fn show_add_server_dialog(
     rt_handle: &tokio::runtime::Handle,
 ) {
     let dialog = adw::AlertDialog::builder()
-        .heading("Add Server")
-        .body("Enter the server details to connect.")
+        .heading(rust_i18n::t!("dialogs.add_server_heading").as_ref())
+        .body(rust_i18n::t!("dialogs.add_server_body").as_ref())
         .close_response("cancel")
         .default_response("connect")
         .build();
 
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("connect", "Connect");
+    dialog.add_response("cancel", rust_i18n::t!("dialogs.cancel").as_ref());
+    dialog.add_response("connect", rust_i18n::t!("dialogs.connect").as_ref());
     dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
 
     // ── Server type dropdown ─────────────────────────────────────────
+    // Backend names are proper nouns; left untranslated by design.
     let type_model = gtk::StringList::new(&["Subsonic", "Jellyfin", "Plex"]);
     let type_dropdown = gtk::DropDown::builder()
         .model(&type_model)
@@ -209,12 +210,12 @@ pub fn show_add_server_dialog(
         .build();
 
     let user_entry = gtk::Entry::builder()
-        .placeholder_text("Username")
+        .placeholder_text(rust_i18n::t!("dialogs.username").as_ref())
         .activates_default(true)
         .build();
 
     let pass_entry = gtk::PasswordEntry::builder()
-        .placeholder_text("Password")
+        .placeholder_text(rust_i18n::t!("dialogs.password").as_ref())
         .show_peek_icon(true)
         .activates_default(true)
         .build();
