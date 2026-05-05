@@ -33,6 +33,10 @@ pub struct PlaybackContext {
     pub artist_label: gtk::Label,
     pub media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>>,
     pub current_pos: Rc<Cell<Option<u32>>>,
+    /// The tracklist `ColumnView` — used to scroll the currently
+    /// playing row into view on track change so the user doesn't lose
+    /// their place when sequential / shuffled playback advances.
+    pub column_view: gtk::ColumnView,
 }
 
 /// Try to play the track at `position` in the given model.
@@ -74,6 +78,16 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     ctx.artist_label
         .set_label(&format!("{} \u{2014} {}", track.artist(), track.album()));
     ctx.current_pos.set(Some(position));
+
+    // Scroll the playing row into view. FOCUS gives keyboard nav a
+    // sensible jumping-off point; SELECT keeps the visible selection
+    // consistent with what's actually playing.
+    ctx.column_view.scroll_to(
+        position,
+        None,
+        gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
+        None,
+    );
 
     // ── Update album art ─────────────────────────────────────────
     let cover_art_url = track.cover_art_url();

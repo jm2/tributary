@@ -830,6 +830,7 @@ pub fn build_window(
                 let repeat_mode = hb.repeat_mode.clone();
                 let shuffle = hb.shuffle_button.clone();
                 let ctrl_for_ctx = ctrl_slot.clone();
+                let column_view_for_keys = column_view.clone();
 
                 glib::MainContext::default().spawn_local(async move {
                     while let Ok(action) = media_rx.recv().await {
@@ -850,6 +851,7 @@ pub fn build_window(
                                         artist_label: artist_label.clone(),
                                         media_ctrl: ctrl_for_ctx.clone(),
                                         current_pos: current_pos.clone(),
+                                        column_view: column_view_for_keys.clone(),
                                     },
                                     repeat_mode.get(),
                                     shuffle.is_active(),
@@ -874,6 +876,7 @@ pub fn build_window(
                                             artist_label: artist_label.clone(),
                                             media_ctrl: ctrl_for_ctx.clone(),
                                             current_pos: current_pos.clone(),
+                                            column_view: column_view_for_keys.clone(),
                                         },
                                         repeat_mode.get(),
                                     );
@@ -906,6 +909,7 @@ pub fn build_window(
         let sort_model = sort_model.clone();
         let current_pos = current_pos.clone();
         let shuffle = hb.shuffle_button.clone();
+        let column_view_c = column_view.clone();
 
         hb.play_button.connect_clicked(move |_| {
             if current_pos.get().is_some() {
@@ -929,6 +933,7 @@ pub fn build_window(
                         artist_label: artist_label.clone(),
                         media_ctrl: media_ctrl.clone(),
                         current_pos: current_pos.clone(),
+                        column_view: column_view_c.clone(),
                     },
                 );
             }
@@ -993,6 +998,7 @@ pub fn build_window(
         let artist_label = hb.artist_label.clone();
         let sm = sort_model.clone();
         let current_pos = current_pos.clone();
+        let cv = column_view.clone();
 
         let parked_local = parked_local.clone();
         column_view.connect_activate(move |_view, position| {
@@ -1007,6 +1013,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     current_pos: current_pos.clone(),
+                    column_view: cv.clone(),
                 },
             );
         });
@@ -1046,6 +1053,7 @@ pub fn build_window(
         let repeat_mode = hb.repeat_mode.clone();
         let shuffle = hb.shuffle_button.clone();
         let parked_local = parked_local.clone();
+        let cv = column_view.clone();
 
         hb.next_button.connect_clicked(move |_| {
             advance_track(
@@ -1058,6 +1066,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     current_pos: current_pos.clone(),
+                    column_view: cv.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
@@ -1076,6 +1085,7 @@ pub fn build_window(
         let current_pos = current_pos.clone();
         let parked_local = parked_local.clone();
         let repeat_mode = hb.repeat_mode.clone();
+        let cv = column_view.clone();
 
         hb.prev_button.connect_clicked(move |_| {
             // If more than 3 s into the track, restart it.
@@ -1095,6 +1105,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     current_pos: current_pos.clone(),
+                    column_view: cv.clone(),
                 },
                 repeat_mode.get(),
             );
@@ -1124,6 +1135,7 @@ pub fn build_window(
         let parked_local = parked_local.clone();
         let sm = sort_model.clone();
         let current_pos = current_pos.clone();
+        let cv = column_view.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -1251,6 +1263,7 @@ pub fn build_window(
                                         artist_label: artist_label.clone(),
                                         media_ctrl: media_ctrl.clone(),
                                         current_pos: current_pos.clone(),
+                                        column_view: cv.clone(),
                                     },
                                 );
                                 continue;
@@ -1268,6 +1281,7 @@ pub fn build_window(
                                 artist_label: artist_label.clone(),
                                 media_ctrl: media_ctrl.clone(),
                                 current_pos: current_pos.clone(),
+                                column_view: cv.clone(),
                             },
                             mode,
                             shuffle.is_active(),
@@ -1348,6 +1362,7 @@ pub fn build_window(
         let artist_label = hb.artist_label.clone();
         let sm = sort_model.clone();
         let current_pos = current_pos.clone();
+        let cv = column_view.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
         play_pending.connect_activate(move |_, _| {
@@ -1367,6 +1382,7 @@ pub fn build_window(
                 artist_label: artist_label.clone(),
                 media_ctrl: media_ctrl.clone(),
                 current_pos: current_pos.clone(),
+                column_view: cv.clone(),
             };
             for path in paths {
                 if super::playback::play_local_file(&path, &ctx) {
