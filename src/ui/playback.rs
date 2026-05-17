@@ -74,9 +74,12 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     tracing::debug!("Playing track");
 
     ctx.active_output.borrow().load_uri(&uri);
-    ctx.title_label.set_label(&track.title());
-    ctx.artist_label
-        .set_label(&format!("{} \u{2014} {}", track.artist(), track.album()));
+    let title = track.title();
+    ctx.title_label.set_label(&title);
+    ctx.title_label.set_tooltip_text(Some(&title));
+    let artist_album = format!("{} \u{2014} {}", track.artist(), track.album());
+    ctx.artist_label.set_label(&artist_album);
+    ctx.artist_label.set_tooltip_text(Some(&artist_album));
     ctx.current_pos.set(Some(position));
 
     // Scroll the playing row into view. FOCUS gives keyboard nav a
@@ -213,10 +216,10 @@ pub fn play_local_file(path: &std::path::Path, ctx: &PlaybackContext) -> bool {
     ctx.active_output.borrow().play();
 
     ctx.title_label.set_label(&parsed.title);
-    ctx.artist_label.set_label(&format!(
-        "{} \u{2014} {}",
-        parsed.artist_name, parsed.album_title
-    ));
+    ctx.title_label.set_tooltip_text(Some(&parsed.title));
+    let artist_album = format!("{} \u{2014} {}", parsed.artist_name, parsed.album_title);
+    ctx.artist_label.set_label(&artist_album);
+    ctx.artist_label.set_tooltip_text(Some(&artist_album));
     album_art::update_album_art(&ctx.album_art, &uri);
 
     if let Some(ref mut ctrl) = *ctx.media_ctrl.borrow_mut() {
