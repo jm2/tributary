@@ -74,8 +74,9 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     tracing::debug!("Playing track");
 
     ctx.active_output.borrow().load_uri(&uri);
-    ctx.title_label.set_label(&track.title());
-    ctx.title_label.set_tooltip_text(Some(&track.title()));
+    let title = track.title();
+    ctx.title_label.set_label(&title);
+    ctx.title_label.set_tooltip_text(Some(&title));
     let artist_album = format!("{} \u{2014} {}", track.artist(), track.album());
     ctx.artist_label.set_label(&artist_album);
     ctx.artist_label.set_tooltip_text(Some(&artist_album));
