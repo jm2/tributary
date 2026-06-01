@@ -12,7 +12,11 @@ jobs:
   fuzz:
     name: Fuzz Targets
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The fuzz crate depends on the full `tributary` library, so this builds
+    # and ASAN-instruments the entire dependency tree (GTK4, GStreamer,
+    # SeaORM, aws-lc-sys, ...) with codegen-units=1 from a cold cache before
+    # the 5-minute fuzz run. Allow generous headroom for that compile.
+    timeout-minutes: 60
     container:
       image: fedora:44
     steps:
