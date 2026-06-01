@@ -18,7 +18,7 @@ jobs:
     steps:
       - name: Install system dependencies
         run: |
-          dnf install -y gcc gtk4-devel libadwaita-devel \
+          dnf install -y gcc gcc-c++ gtk4-devel libadwaita-devel \
             dbus-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel \
             pkgconf-pkg-config git curl
