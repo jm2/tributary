@@ -66,14 +66,20 @@ fn default_column_order() -> Vec<String> {
     ALL_COLUMNS.iter().copied().map(str::to_string).collect()
 }
 
-/// Default library paths: platform music directory with ~/Music fallback.
+/// Default library paths: the platform music directory (with a `~/Music`
+/// fallback), but only if it actually exists on disk.
+///
+/// On a fresh profile with no music directory, this returns an empty list
+/// rather than a phantom path — first launch then shows no library folders
+/// instead of failing the initial scan/watch with a "folder not found" error.
+/// This only affects the *default* (first launch, or a config missing the
+/// field); paths a user has explicitly configured are preserved verbatim even
+/// if they later go missing.
 fn default_library_paths() -> Vec<String> {
-    let music_dir = dirs::audio_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    vec![music_dir]
+    match dirs::audio_dir().or_else(|| dirs::home_dir().map(|h| h.join("Music"))) {
+        Some(dir) if dir.is_dir() => vec![dir.to_string_lossy().to_string()],
+        _ => Vec::new(),
+    }
 }
 
 /// Custom deserializer that handles both the old `library_path: String`
@@ -214,34 +220,47 @@ pub fn show_preferences(
         .title(rust_i18n::t!("preferences.library_location").as_ref())
         .build();
 
-    // Container for per-path rows (lives inside the group).
+    // The "+" (add) and the per-row "−" (remove) buttons all live inside this
+    // one content box, so they share its trailing edge and line up by
+    // construction — no DPI-fragile fixed margins. (A header-suffix "+" can't
+    // be made to align with the rows, because adw lays the group header and
+    // the row list out in separate containers with different insets.)
+    let library_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .build();
+
+    // "+" at the bottom-right of the group body, after the folder rows.
+    let add_folder_btn = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .halign(gtk::Align::End)
+        .css_classes(["flat", "circular"])
+        .tooltip_text("Add folder")
+        .build();
+
+    // One row per folder: path on the left, "−" flush to the right edge.
     let paths_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
         .build();
-
-    let paths_box_rc = std::rc::Rc::new(std::cell::RefCell::new(paths_box.clone()));
-
-    // Build a row for each existing library path.
     for lib_path in &cfg.library_paths {
-        let row = build_library_path_row(lib_path, config.clone(), paths_box_rc.clone());
-        paths_box.append(&row);
+        paths_box.append(&build_library_path_row(
+            lib_path,
+            config.clone(),
+            paths_box.clone(),
+        ));
     }
+    library_box.append(&paths_box);
+    library_box.append(&add_folder_btn);
 
-    // "Add Folder…" button.
-    let add_folder_btn = gtk::Button::builder()
-        .label(rust_i18n::t!("preferences.browse").as_ref())
-        .icon_name("list-add-symbolic")
-        .halign(gtk::Align::Start)
-        .css_classes(["flat"])
-        .build();
+    // Add a folder via the file chooser.
     {
         let config = config.clone();
-        let paths_box_rc = paths_box_rc.clone();
+        let paths_box = paths_box.clone();
         let parent = parent.clone();
         add_folder_btn.connect_clicked(move |_| {
             let config = config.clone();
-            let paths_box_rc = paths_box_rc.clone();
+            let paths_box = paths_box.clone();
             let dialog = gtk::FileDialog::builder()
                 .title(rust_i18n::t!("preferences.select_music_folder").as_ref())
                 .modal(true)
@@ -267,9 +286,9 @@ pub fn show_preferences(
                             let row = build_library_path_row(
                                 &path_str,
                                 config.clone(),
-                                paths_box_rc.clone(),
+                                paths_box.clone(),
                             );
-                            paths_box_rc.borrow().append(&row);
+                            paths_box.append(&row);
                         }
                     }
                 },
@@ -277,8 +296,7 @@ pub fn show_preferences(
         });
     }
 
-    library_group.add(&paths_box);
-    library_group.add(&add_folder_btn);
+    library_group.add(&library_box);
     page.add(&library_group);
 
     // ── Browser Views group (dense horizontal checkboxes) ───────────
@@ -286,9 +304,13 @@ pub fn show_preferences(
         .title(rust_i18n::t!("preferences.browser_views").as_ref())
         .build();
 
-    let browser_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(16)
+    // Same homogeneous 3-column grid as Visible Columns, so the two groups'
+    // checkboxes line up column-to-column.
+    let browser_grid = gtk::Grid::builder()
+        .column_homogeneous(true)
+        .row_spacing(4)
+        .column_spacing(8)
+        .hexpand(true)
         .margin_start(12)
         .margin_end(12)
         .margin_top(8)
@@ -298,25 +320,35 @@ pub fn show_preferences(
     let genre_check = gtk::CheckButton::builder()
         .label(rust_i18n::t!("browser.genre").as_ref())
         .active(cfg.browser_views.genre)
+        .hexpand(true)
+        .halign(gtk::Align::Start)
         .build();
     let artist_check = gtk::CheckButton::builder()
         .label(rust_i18n::t!("browser.artist").as_ref())
         .active(cfg.browser_views.artist)
+        .hexpand(true)
+        .halign(gtk::Align::Start)
         .build();
     let album_check = gtk::CheckButton::builder()
         .label(rust_i18n::t!("browser.album").as_ref())
         .active(cfg.browser_views.album)
+        .hexpand(true)
+        .halign(gtk::Align::Start)
         .build();
 
     let album_artist_check = gtk::CheckButton::builder()
         .label("Group by Album Artist")
         .active(cfg.group_by_album_artist)
+        .hexpand(true)
+        .halign(gtk::Align::Start)
         .build();
 
-    browser_row.append(&genre_check);
-    browser_row.append(&artist_check);
-    browser_row.append(&album_check);
-    browser_row.append(&album_artist_check);
+    // Row 0: the three browser panes (one per grid column).
+    browser_grid.attach(&genre_check, 0, 0, 1, 1);
+    browser_grid.attach(&artist_check, 1, 0, 1, 1);
+    browser_grid.attach(&album_check, 2, 0, 1, 1);
+    // Row 1: the grouping toggle spans the full width (its label is longer).
+    browser_grid.attach(&album_artist_check, 0, 1, 3, 1);
 
     // Wire album artist toggle
     {
@@ -365,7 +397,7 @@ pub fn show_preferences(
         });
     }
 
-    browser_group.add(&browser_row);
+    browser_group.add(&browser_grid);
     page.add(&browser_group);
 
     // ── Visible Columns group (dense grid with FlowBox) ─────────────
@@ -373,26 +405,35 @@ pub fn show_preferences(
         .title(rust_i18n::t!("preferences.visible_columns").as_ref())
         .build();
 
-    let flow_box = gtk::FlowBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .max_children_per_line(3)
-        .min_children_per_line(3)
-        .homogeneous(true)
+    // A homogeneous Grid (rather than a FlowBox) so every column is equal
+    // width and the grid fills the group's clamped width: the leftmost column
+    // is flush with the left edge and the rightmost with the right edge, and
+    // the checkboxes line up column-to-column on every row.
+    let columns_grid = gtk::Grid::builder()
+        .column_homogeneous(true)
         .row_spacing(4)
         .column_spacing(8)
+        .hexpand(true)
         .margin_start(12)
         .margin_end(12)
         .margin_top(8)
         .margin_bottom(8)
         .build();
 
+    const COLUMNS_PER_ROW: usize = 3;
+
     let column_checks: Vec<(&str, gtk::CheckButton)> = ALL_COLUMNS
         .iter()
-        .map(|&col_title| {
+        .enumerate()
+        .map(|(i, &col_title)| {
             let is_visible = cfg.visible_columns.iter().any(|c| c == col_title);
             let check = gtk::CheckButton::builder()
                 .label(col_title)
                 .active(is_visible)
+                // Fill the homogeneous cell, but keep the label left-aligned
+                // so column text aligns down each grid column.
+                .hexpand(true)
+                .halign(gtk::Align::Start)
                 .build();
 
             // Wire each column toggle
@@ -412,7 +453,9 @@ pub fn show_preferences(
                 save_config(&cfg);
             });
 
-            flow_box.append(&check);
+            let col = (i % COLUMNS_PER_ROW) as i32;
+            let row = (i / COLUMNS_PER_ROW) as i32;
+            columns_grid.attach(&check, col, row, 1, 1);
             (col_title, check)
         })
         .collect();
@@ -449,7 +492,7 @@ pub fn show_preferences(
         });
     }
 
-    columns_group.add(&flow_box);
+    columns_group.add(&columns_grid);
     columns_group.add(&reset_btn);
     page.add(&columns_group);
 
@@ -561,18 +604,27 @@ pub fn update_browser_visibility(browser_box: &gtk::Box, views: &BrowserViewsCon
     browser_box.set_visible(any_visible);
 }
 
-/// Build a single library-path row for the preferences dialog.
+/// Build a library-folder row: the path (left, ellipsized) and its own "−"
+/// remove button flush to the right edge, so it lines up under the group's
+/// "+". A plain `Label` is used (no Pango markup), so no escaping is needed.
 ///
-/// Each row shows the folder path as an `ActionRow` with a "Remove" button.
-/// Removing the last path is prevented (at least one directory is required).
+/// Removing a folder is always allowed — an empty list is a valid state (e.g.
+/// first launch when no music folder exists yet).
 fn build_library_path_row(
     path: &str,
     config: std::rc::Rc<std::cell::RefCell<AppConfig>>,
-    paths_box: std::rc::Rc<std::cell::RefCell<gtk::Box>>,
-) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .title(rust_i18n::t!("preferences.music_folder").as_ref())
-        .subtitle(path)
+    paths_box: gtk::Box,
+) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+
+    let label = gtk::Label::builder()
+        .label(path)
+        .hexpand(true)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
 
     let remove_btn = gtk::Button::builder()
@@ -581,20 +633,19 @@ fn build_library_path_row(
         .css_classes(["flat", "circular"])
         .tooltip_text("Remove folder")
         .build();
-    row.add_suffix(&remove_btn);
+
+    row.append(&label);
+    row.append(&remove_btn);
 
     let path_owned = path.to_string();
     let row_clone = row.clone();
     remove_btn.connect_clicked(move |_| {
-        let mut cfg = config.borrow_mut();
-        // Prevent removing the last directory.
-        if cfg.library_paths.len() <= 1 {
-            return;
+        {
+            let mut cfg = config.borrow_mut();
+            cfg.library_paths.retain(|p| p != &path_owned);
+            save_config(&cfg);
         }
-        cfg.library_paths.retain(|p| p != &path_owned);
-        save_config(&cfg);
-        drop(cfg);
-        paths_box.borrow().remove(&row_clone);
+        paths_box.remove(&row_clone);
     });
 
     row

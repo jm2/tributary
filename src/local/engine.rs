@@ -109,6 +109,14 @@ async fn initial_scan(
 ) -> anyhow::Result<()> {
     let dirs = music_dirs.to_vec();
 
+    // Missing directories are skipped silently by WalkDir below; warn so an
+    // unexpectedly empty library is easy to diagnose.
+    for dir in music_dirs {
+        if !dir.is_dir() {
+            warn!(dir = %dir.display(), "Library folder does not exist — skipping scan");
+        }
+    }
+
     // Collect audio files from ALL directories (blocking I/O in spawn_blocking)
     let audio_files: Vec<PathBuf> = tokio::task::spawn_blocking(move || {
         dirs.iter()
@@ -266,8 +274,20 @@ async fn watch_directories(
         notify::Config::default().with_poll_interval(Duration::from_secs(2)),
     )?;
 
+    // Watch each directory independently. A missing or unwatchable directory
+    // (e.g. a first-launch default that doesn't exist, or a folder that was
+    // removed after being configured) is skipped with a warning rather than
+    // aborting the whole watcher — so one bad path can't stop the others from
+    // being watched, and it never surfaces as a hard scan error to the user.
     for dir in music_dirs {
-        watcher.watch(dir.as_ref(), RecursiveMode::Recursive)?;
+        if !dir.is_dir() {
+            warn!(dir = %dir.display(), "Library folder does not exist — skipping watch");
+            continue;
+        }
+        if let Err(e) = watcher.watch(dir.as_ref(), RecursiveMode::Recursive) {
+            warn!(dir = %dir.display(), error = %e, "Failed to watch directory — skipping");
+            continue;
+        }
         info!(dir = %dir.display(), "Watching directory");
     }
     info!("Filesystem watcher active");
