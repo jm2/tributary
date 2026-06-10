@@ -57,7 +57,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Smart playlist compound sort (multi-key ordering) | ✅ |
 | Geo-distance sorting for Stations Near Me | ✅ |
 | USB device browsing (sidebar + tracklist scan) | ✅ |
-| USB file transfer (copy to device with progress) | ✅ |
+| USB file transfer (copy to device with progress) | ❌ Planned ([#8](https://github.com/jm2/tributary/issues/8)) |
 | Multiple music library directories | ✅ |
 | Playlist import/export (XSPF) | ✅ |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ |
@@ -356,8 +356,7 @@ src/
 │   └── backend.rs          # MediaBackend impl (in-memory cache)
 ├── device/
 │   ├── mod.rs              # Device trait + DeviceInfo (portable device abstraction)
-│   ├── usb.rs              # USB mass storage detection (Linux, macOS, Windows)
-│   └── transfer.rs         # Async file copy to USB devices with progress
+│   └── usb.rs              # USB mass storage detection (Linux, macOS, Windows)
 ├── radio/
 │   ├── mod.rs              # Internet Radio module root
 │   ├── api.rs              # RadioStation + GeoLocation serde types
