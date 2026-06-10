@@ -172,7 +172,7 @@ impl DaapClient {
             base_url.as_str().trim_end_matches('/'),
             session_id
         );
-        debug!(url = %update_url, "DAAP: requesting update");
+        debug!(url = %crate::audio::redact_url_secrets(&update_url), "DAAP: requesting update");
 
         let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
             http.get(&update_url)
@@ -211,7 +211,7 @@ impl DaapClient {
             session_id,
             revision
         );
-        debug!(url = %databases_url, "DAAP: requesting databases");
+        debug!(url = %crate::audio::redact_url_secrets(&databases_url), "DAAP: requesting databases");
 
         let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
             http.get(&databases_url)
@@ -286,7 +286,7 @@ impl DaapClient {
             self.revision,
             TRACK_META,
         );
-        debug!(url = %url, "DAAP: fetching tracks");
+        debug!(url = %crate::audio::redact_url_secrets(&url), "DAAP: fetching tracks");
 
         let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
             self.http
