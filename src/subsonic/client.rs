@@ -1,6 +1,8 @@
 //! Low-level Subsonic HTTP client — authentication, request building,
 //! and JSON deserialization.
 
+use std::time::Duration;
+
 use md5::{Digest, Md5};
 use reqwest::Client;
 use tracing::{debug, info, warn};
@@ -16,6 +18,15 @@ const API_VERSION: &str = "1.16.1";
 
 /// Client identifier sent with every request.
 const CLIENT_NAME: &str = "Tributary";
+
+/// Connection-establishment timeout for API requests.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Idle read timeout.  Guards against a server that accepts the
+/// connection but then stalls without sending (or only trickles) data,
+/// while still allowing a large-but-healthy library transfer to complete
+/// (the timeout resets after each successful read).
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Authentication mode used for API requests.
 #[derive(Clone)]
@@ -63,10 +74,40 @@ impl SubsonicClient {
             source: Some(Box::new(e)),
         })?;
 
+        // Reject non-hierarchical / wrong-scheme URLs up front.  `Url::parse`
+        // happily accepts opaque inputs like `localhost:4533` (a scheme-less
+        // host:port the user most likely meant as `http://localhost:4533`),
+        // but building request paths from such a URL would panic later in
+        // `api_url` via `path_segments_mut`.  Fail cleanly instead.
+        if base_url.cannot_be_a_base() || !matches!(base_url.scheme(), "http" | "https") {
+            return Err(BackendError::ConnectionFailed {
+                message: format!(
+                    "Invalid server URL '{server_url}': must start with http:// or https://"
+                ),
+                source: None,
+            });
+        }
+
+        // Token auth still transmits (username, salt, md5(password+salt)) in
+        // the URL query string.  Over plain HTTP those can be captured by an
+        // on-path attacker and replayed, or used for offline password
+        // cracking (the salt is known and MD5 is fast).  Warn loudly — the
+        // plaintext fallback is already HTTPS-gated, token auth was not.
+        if base_url.scheme() != "https" {
+            warn!(
+                server = %base_url,
+                "Subsonic token auth over an insecure (non-HTTPS) connection: the username, \
+                 salt and token are sent in cleartext and can be captured and brute-forced. \
+                 Use HTTPS where possible."
+            );
+        }
+
         let auth = Self::make_token_auth(password);
 
         let http = Client::builder()
             .user_agent(CLIENT_NAME)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .map_err(|e| BackendError::ConnectionFailed {
                 message: format!("Failed to build HTTP client: {e}"),
@@ -188,6 +229,12 @@ impl SubsonicClient {
         debug!(url = %crate::audio::redact_url_secrets(url.as_str()), "Subsonic request");
 
         let resp = self.http.get(url.as_str()).send().await.map_err(|e| {
+            // Strip the request URL from the error before it is formatted or
+            // boxed: it carries the auth token + salt (or the hex-encoded
+            // plaintext password) in its query string, and reqwest's Display
+            // appends the full URL — which would leak the credential into
+            // always-on error-level logs on routine transport failures.
+            let e = e.without_url();
             BackendError::ConnectionFailed {
                 message: format!("HTTP request failed: {e}"),
                 source: Some(Box::new(e)),
@@ -201,11 +248,15 @@ impl SubsonicClient {
             });
         }
 
-        let envelope: SubsonicEnvelope =
-            resp.json().await.map_err(|e| BackendError::ParseError {
+        let envelope: SubsonicEnvelope = resp.json().await.map_err(|e| {
+            // A body-read failure here can also carry the credential-bearing
+            // request URL; strip it before formatting/boxing into the error.
+            let e = e.without_url();
+            BackendError::ParseError {
                 message: format!("Failed to parse Subsonic JSON: {e}"),
                 source: Some(Box::new(e)),
-            })?;
+            }
+        })?;
 
         if envelope.response.status != "ok" {
             let msg = envelope

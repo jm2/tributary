@@ -61,6 +61,19 @@ impl MediaController {
     pub fn new(
         hwnd: Option<*mut std::ffi::c_void>,
     ) -> anyhow::Result<(Self, async_channel::Receiver<MediaAction>)> {
+        // On Windows, souvlaki's SMTC backend does `hwnd.expect(...)`, which
+        // panics (and aborts across the GLib FFI boundary, killing the app)
+        // when the native surface/HWND isn't ready yet. Guard here and return
+        // a recoverable error instead — the caller degrades gracefully when
+        // media controls are unavailable. On Linux/macOS the hwnd is always
+        // None and is ignored, so this guard is Windows-only.
+        #[cfg(target_os = "windows")]
+        if hwnd.is_none() {
+            anyhow::bail!(
+                "Windows media controls require an HWND, but the window surface is not ready yet"
+            );
+        }
+
         let config = PlatformConfig {
             dbus_name: "tributary",
             display_name: "Tributary",
@@ -146,6 +159,17 @@ impl MediaController {
 
     /// Tell the OS that playback has stopped entirely.
     pub fn set_stopped(&mut self) {
+        // Also clear the now-playing text so the OS overlay doesn't keep
+        // showing the last track after playback stops. Mirror the idle
+        // metadata published at construction.
+        if let Err(e) = self.controls.set_metadata(MediaMetadata {
+            title: Some("Tributary"),
+            artist: Some("No track loaded"),
+            album: Some(""),
+            ..Default::default()
+        }) {
+            warn!("Failed to clear media metadata on stop: {e:?}");
+        }
         if let Err(e) = self.controls.set_playback(MediaPlayback::Stopped) {
             warn!("Failed to set stopped state: {e:?}");
         }

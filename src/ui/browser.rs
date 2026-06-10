@@ -133,6 +133,8 @@ pub fn build_browser(
         let sl = selected_album.clone();
         let genre_store = genre_store.clone();
         let genre_pane = genre_pane.clone();
+        let artist_store = artist_store.clone();
+        let artist_pane = artist_pane.clone();
         let album_store = album_store.clone();
         let tracks = tracks.clone();
         let cb = on_filter_changed.clone();
@@ -155,6 +157,16 @@ pub fn build_browser(
             let flag = use_aa.get();
             populate_genres(&genre_store, &borrowed, &artist, &None, flag);
             restore_selection(&genre_pane, &genre);
+            // When the user clears the artist filter ("All"), a prior album
+            // selection may have narrowed the Artist pane down to a single
+            // artist. Restore the full genre-filtered artist list so the
+            // user can pick a different artist again (issue #30). Only do
+            // this for the artist→All case — a normal artist pick must keep
+            // cross-filtering genres/albums without wiping the artist list.
+            if artist.is_none() {
+                populate_artists(&artist_store, &borrowed, &genre, &None, flag);
+                restore_selection(&artist_pane, &artist);
+            }
             populate_albums(&album_store, &borrowed, &genre, &artist, flag);
             updating.set(false);
 

@@ -41,6 +41,7 @@
 //! Chromecast device, with a heartbeat PING every 5 seconds.  This
 //! keeps the Cast session alive and enables position polling.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::cast_http_server::CastHttpServer;
@@ -80,6 +81,13 @@ pub struct ChromecastOutput {
     cast_server: Arc<Mutex<Option<CastHttpServer>>>,
     /// Tokio runtime handle for spawning async tasks.
     rt_handle: Option<tokio::runtime::Handle>,
+    /// Monotonic session generation.  Bumped on every `cast_media`, `stop`,
+    /// and on `Drop`; each spawned polling thread captures the generation it
+    /// was started with and exits as soon as the shared counter advances past
+    /// it.  This cancels the previous session's thread (and its TLS
+    /// connection) on a manual track change so we don't leak threads or race
+    /// duplicate position/state/TrackEnded events.
+    session_generation: Arc<AtomicU64>,
 }
 
 impl ChromecastOutput {
@@ -92,6 +100,7 @@ impl ChromecastOutput {
         host: &str,
         port: u16,
         event_tx: async_channel::Sender<PlayerEvent>,
+        initial_volume: f64,
     ) -> Self {
         info!(
             host = %host,
@@ -104,10 +113,20 @@ impl ChromecastOutput {
             host: host.to_string(),
             port,
             event_tx,
-            volume: 1.0,
+            // Seed from the current slider value so switching to this device
+            // doesn't reset the effective volume to maximum.
+            volume: initial_volume.clamp(0.0, 1.0),
             current_state: Arc::new(Mutex::new(PlayerState::Stopped)),
             cast_server: Arc::new(Mutex::new(None)),
+            // Constructed on the GTK main thread, which is not a tokio runtime
+            // context, so this is `None` in practice — local-file casting via
+            // the embedded `CastHttpServer` is therefore inactive (the UI also
+            // routes `file://` tracks to the local output before they reach
+            // here; see `play_track_at`).  Wiring this up requires threading a
+            // real runtime handle from `build_window` and starting the server
+            // via `Handle::spawn` rather than `block_on` on the main thread.
             rt_handle: tokio::runtime::Handle::try_current().ok(),
+            session_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -180,6 +199,12 @@ impl ChromecastOutput {
         let volume = self.volume;
         let state = Arc::clone(&self.current_state);
 
+        // Cancel any previous session's polling thread by advancing the
+        // generation; this thread owns `my_generation` and stops as soon as
+        // the shared counter moves past it.
+        let generation = Arc::clone(&self.session_generation);
+        let my_generation = self.session_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
         // Resolve file:// URIs to HTTP URLs.
         let resolved_uri = match self.resolve_uri(uri) {
             Ok(u) => u,
@@ -198,6 +223,8 @@ impl ChromecastOutput {
                 volume,
                 tx.clone(),
                 state.clone(),
+                &generation,
+                my_generation,
             ) {
                 Ok(()) => {}
                 Err(e) => {
@@ -213,6 +240,7 @@ impl ChromecastOutput {
 
     /// Connect, launch app, load media, then maintain a persistent
     /// connection with heartbeat and position polling.
+    #[allow(clippy::too_many_arguments)]
     fn cast_media_with_session(
         host: &str,
         port: u16,
@@ -220,6 +248,8 @@ impl ChromecastOutput {
         volume: f64,
         tx: async_channel::Sender<PlayerEvent>,
         state: Arc<Mutex<PlayerState>>,
+        generation: &AtomicU64,
+        my_generation: u64,
     ) -> Result<(), String> {
         use rust_cast::channels::media::StreamType;
         use rust_cast::channels::receiver::CastDeviceApp;
@@ -227,6 +257,13 @@ impl ChromecastOutput {
 
         info!(host = %host, port, "Chromecast: connecting via Cast V2");
 
+        // Host verification is disabled because Cast V2 devices present
+        // self-signed certificates with no verifiable hostname — this is
+        // inherent to the protocol, not a configurable weakness.  As a
+        // consequence the TLS channel is unauthenticated and session/transport
+        // ids and status fields are trusted as supplied by the peer; on a
+        // hostile LAN an IP impersonator could hijack the session.  Numeric
+        // fields from the device are handled with saturating casts below.
         let device = CastDevice::connect_without_host_verification(host, port)
             .map_err(|e| format!("TLS connect failed: {e}"))?;
 
@@ -321,6 +358,14 @@ impl ChromecastOutput {
         let mut last_position_poll = std::time::Instant::now();
 
         loop {
+            // Stop promptly if a newer session (or stop/Drop) superseded us,
+            // so we don't leak this thread + TLS connection or emit stale
+            // position/state events into the shared channel.
+            if generation.load(Ordering::SeqCst) != my_generation {
+                debug!("Chromecast: session superseded, ending poll loop");
+                break;
+            }
+
             // Send heartbeat PING to keep the connection alive.
             if last_heartbeat.elapsed() >= heartbeat_interval {
                 if let Err(e) = device.heartbeat.ping() {
@@ -447,6 +492,8 @@ impl ChromecastOutput {
     fn send_cast_command_sync(host: &str, port: u16, command: CastCommand) -> Result<(), String> {
         use rust_cast::CastDevice;
 
+        // Host verification is unavoidably disabled for Cast V2 (self-signed
+        // device certs); see the rationale in `cast_media_with_session`.
         let device = CastDevice::connect_without_host_verification(host, port)
             .map_err(|e| format!("TLS connect failed: {e}"))?;
 
@@ -607,6 +654,9 @@ impl AudioOutput for ChromecastOutput {
 
     fn stop(&self) {
         debug!("Chromecast: stop");
+        // Cancel the active polling thread so it stops emitting events and
+        // releases its TLS connection.
+        self.session_generation.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut s) = self.current_state.lock() {
             *s = PlayerState::Stopped;
         }
@@ -670,6 +720,16 @@ impl AudioOutput for ChromecastOutput {
     }
 }
 
+impl Drop for ChromecastOutput {
+    fn drop(&mut self) {
+        // Signal any in-flight polling thread to stop so it doesn't keep
+        // emitting events into the shared channel (now driving a different
+        // output) or hold its TLS connection open after this output is
+        // replaced.
+        self.session_generation.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,21 +737,21 @@ mod tests {
     #[test]
     fn test_chromecast_output_name() {
         let (tx, _rx) = async_channel::unbounded();
-        let output = ChromecastOutput::new("Living Room Speaker", "192.168.1.50", 8009, tx);
+        let output = ChromecastOutput::new("Living Room Speaker", "192.168.1.50", 8009, tx, 1.0);
         assert_eq!(output.name(), "Living Room Speaker");
     }
 
     #[test]
     fn test_chromecast_output_type() {
         let (tx, _rx) = async_channel::unbounded();
-        let output = ChromecastOutput::new("Test", "127.0.0.1", 8009, tx);
+        let output = ChromecastOutput::new("Test", "127.0.0.1", 8009, tx, 1.0);
         assert_eq!(output.output_type(), OutputType::Chromecast);
     }
 
     #[test]
     fn test_chromecast_supports_volume() {
         let (tx, _rx) = async_channel::unbounded();
-        let output = ChromecastOutput::new("Test", "127.0.0.1", 8009, tx);
+        let output = ChromecastOutput::new("Test", "127.0.0.1", 8009, tx, 1.0);
         assert!(output.supports_volume());
     }
 
@@ -699,7 +759,7 @@ mod tests {
     fn test_chromecast_volume_clamp() {
         let (tx, _rx) = async_channel::unbounded();
         // Use a non-routable IP and unusual port to prevent actual connection attempts.
-        let mut output = ChromecastOutput::new("Test", "192.0.2.1", 1, tx);
+        let mut output = ChromecastOutput::new("Test", "192.0.2.1", 1, tx, 1.0);
         // Note: set_volume spawns a thread that will fail to connect,
         // but the volume field is updated synchronously.
         output.volume = 1.5_f64.clamp(0.0, 1.0);
@@ -711,14 +771,14 @@ mod tests {
     #[test]
     fn test_chromecast_initial_state() {
         let (tx, _rx) = async_channel::unbounded();
-        let output = ChromecastOutput::new("Test", "127.0.0.1", 8009, tx);
+        let output = ChromecastOutput::new("Test", "127.0.0.1", 8009, tx, 1.0);
         assert_eq!(output.state(), PlayerState::Stopped);
     }
 
     #[test]
     fn test_chromecast_no_position() {
         let (tx, _rx) = async_channel::unbounded();
-        let output = ChromecastOutput::new("Test", "127.0.0.1", 8009, tx);
+        let output = ChromecastOutput::new("Test", "127.0.0.1", 8009, tx, 1.0);
         assert!(output.position_ms().is_none());
     }
 

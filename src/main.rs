@@ -233,6 +233,17 @@ fn main() {
     app.set_accels_for_action("app.quit", &["<primary>q"]);
 
     app.connect_activate(move |app| {
+        // Single-instance guard: re-activating an already-running instance
+        // (re-launching the binary, clicking the launcher/dock icon, or any
+        // OS re-activation) re-emits `activate` on the primary instance.
+        // Present the existing window instead of building a second one,
+        // which would also register a duplicate OS media controller /
+        // MPRIS service and double-fire media keys.
+        if let Some(win) = app.active_window() {
+            win.present();
+            return;
+        }
+
         // Register the app icon search path now that GTK has a display.
         if let Some(ref exe) = exe_path {
             if let Some(display) = gtk::gdk::Display::default() {

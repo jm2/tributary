@@ -23,11 +23,16 @@ static SHARED_DB: OnceCell<DatabaseConnection> = OnceCell::const_new();
 pub async fn get_or_init_db() -> Result<DatabaseConnection, DbErr> {
     let db = SHARED_DB
         .get_or_try_init(|| async {
+            // Return errors instead of panicking: callers wrap this in
+            // graceful `match init_db() { Err(e) => … }` handling, and a
+            // panic inside this spawned task would be swallowed by tokio,
+            // silently killing the library engine with no user feedback.
             let data_dir = dirs::data_dir()
-                .expect("Could not determine XDG data directory")
+                .ok_or_else(|| DbErr::Custom("Could not determine data directory".into()))?
                 .join("tributary");
 
-            std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
+            std::fs::create_dir_all(&data_dir)
+                .map_err(|e| DbErr::Custom(format!("Failed to create data directory: {e}")))?;
 
             let db_path = data_dir.join("library.db");
             let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
@@ -38,6 +43,19 @@ pub async fn get_or_init_db() -> Result<DatabaseConnection, DbErr> {
             // Enable WAL mode for better concurrent read/write performance.
             // WAL allows readers to proceed without blocking on writers and
             // significantly reduces SQLITE_BUSY errors under load.
+            //
+            // NOTE: `journal_mode=WAL` is a persistent, file-level setting, so
+            // it applies regardless of which pooled connection executes it.
+            // `busy_timeout`, however, is per-connection, so this statement
+            // only configures the single connection borrowed here. It is
+            // currently harmless because sqlx-sqlite already applies
+            // `busy_timeout=5s` AND `foreign_keys=ON` to *every* connection by
+            // default — and that default `foreign_keys=ON` is what makes the
+            // playlist_entries FK cascade/orphan cleanup actually work. If the
+            // connection is ever rebuilt from explicit `ConnectOptions` (or
+            // sqlx changes its defaults), set these per-connection PRAGMAs via
+            // `SqliteConnectOptions::foreign_keys(true).busy_timeout(...)
+            // .journal_mode(Wal)` so every pooled connection is deterministic.
             db.execute_unprepared("PRAGMA journal_mode=WAL").await?;
             db.execute_unprepared("PRAGMA busy_timeout=5000").await?;
 

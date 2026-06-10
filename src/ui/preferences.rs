@@ -6,7 +6,7 @@
 
 use adw::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 // ── Default column visibility ───────────────────────────────────────────
 
@@ -35,8 +35,10 @@ const DEFAULT_VISIBLE: &[&str] = ALL_COLUMNS;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Which browser panes are visible.
+    #[serde(default)]
     pub browser_views: BrowserViewsConfig,
     /// Which tracklist columns are visible (by title).
+    #[serde(default = "default_visible_columns")]
     pub visible_columns: Vec<String>,
     /// Tracklist column display order (by title). Persisted across restarts.
     #[serde(default = "default_column_order")]
@@ -64,6 +66,19 @@ pub struct AppConfig {
 /// Default column order (used for `#[serde(default)]`).
 fn default_column_order() -> Vec<String> {
     ALL_COLUMNS.iter().copied().map(str::to_string).collect()
+}
+
+/// Default visible columns (used for `#[serde(default)]`).
+///
+/// Having a serde default means an older/partial config that omits
+/// `visible_columns` falls back field-by-field instead of discarding the
+/// entire parsed config (which would also wipe the user's library paths).
+fn default_visible_columns() -> Vec<String> {
+    DEFAULT_VISIBLE
+        .iter()
+        .copied()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Default library paths: the platform music directory (with a `~/Music`
@@ -111,6 +126,17 @@ pub struct BrowserViewsConfig {
     pub genre: bool,
     pub artist: bool,
     pub album: bool,
+}
+
+impl Default for BrowserViewsConfig {
+    fn default() -> Self {
+        // All three panes visible by default (matches `AppConfig::default`).
+        Self {
+            genre: true,
+            artist: true,
+            album: true,
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -177,7 +203,13 @@ pub fn load_config() -> AppConfig {
         }
     }
 
-    serde_json::from_value(value).unwrap_or_default()
+    match serde_json::from_value(value) {
+        Ok(config) => config,
+        Err(e) => {
+            warn!(error = %e, "Failed to deserialize config.json — falling back to defaults");
+            AppConfig::default()
+        }
+    }
 }
 
 /// Save the configuration to disk.
@@ -238,6 +270,19 @@ pub fn show_preferences(
         .tooltip_text("Add folder")
         .build();
 
+    // Hint shown once the user adds or removes a folder. The running
+    // library engine only reads the configured paths at startup, so a
+    // restart is required before a newly-added folder is scanned/watched
+    // (and a removed folder stops being watched). Hidden until a change.
+    let restart_hint = gtk::Label::builder()
+        .label("Restart Tributary to apply library folder changes")
+        .css_classes(["dim-label", "caption"])
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .visible(false)
+        .margin_top(2)
+        .build();
+
     // One row per folder: path on the left, "−" flush to the right edge.
     let paths_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -248,19 +293,23 @@ pub fn show_preferences(
             lib_path,
             config.clone(),
             paths_box.clone(),
+            restart_hint.clone(),
         ));
     }
     library_box.append(&paths_box);
     library_box.append(&add_folder_btn);
+    library_box.append(&restart_hint);
 
     // Add a folder via the file chooser.
     {
         let config = config.clone();
         let paths_box = paths_box.clone();
         let parent = parent.clone();
+        let restart_hint = restart_hint.clone();
         add_folder_btn.connect_clicked(move |_| {
             let config = config.clone();
             let paths_box = paths_box.clone();
+            let restart_hint = restart_hint.clone();
             let dialog = gtk::FileDialog::builder()
                 .title(rust_i18n::t!("preferences.select_music_folder").as_ref())
                 .modal(true)
@@ -287,8 +336,14 @@ pub fn show_preferences(
                                 &path_str,
                                 config.clone(),
                                 paths_box.clone(),
+                                restart_hint.clone(),
                             );
                             paths_box.append(&row);
+                            // The engine won't pick up the new folder until
+                            // the next launch — tell the user a restart is
+                            // needed instead of leaving them with an empty
+                            // library.
+                            restart_hint.set_visible(true);
                         }
                     }
                 },
@@ -475,16 +530,24 @@ pub fn show_preferences(
             .map(|(t, c)| ((*t).to_string(), c.clone()))
             .collect::<Vec<_>>();
         reset_btn.connect_clicked(move |_| {
-            let mut cfg = config.borrow_mut();
-            cfg.visible_columns = DEFAULT_VISIBLE
-                .iter()
-                .copied()
-                .map(str::to_string)
-                .collect();
-            cfg.column_order = default_column_order();
+            // Scope the mutable borrow so it is dropped before `set_active`
+            // below. `set_active` synchronously re-enters each column's
+            // `connect_toggled` handler, which takes its own `borrow_mut` —
+            // holding the borrow across the loop would panic with
+            // `BorrowMutError` (and abort across the GLib FFI boundary).
+            {
+                let mut cfg = config.borrow_mut();
+                cfg.visible_columns = DEFAULT_VISIBLE
+                    .iter()
+                    .copied()
+                    .map(str::to_string)
+                    .collect();
+                cfg.column_order = default_column_order();
+            }
             for (title, check) in &checks {
                 check.set_active(DEFAULT_VISIBLE.contains(&title.as_str()));
             }
+            let cfg = config.borrow();
             apply_column_visibility(&cv, &cfg.visible_columns);
             apply_column_order(&cv, &cfg.column_order);
             save_config(&cfg);
@@ -614,6 +677,7 @@ fn build_library_path_row(
     path: &str,
     config: std::rc::Rc<std::cell::RefCell<AppConfig>>,
     paths_box: gtk::Box,
+    restart_hint: gtk::Label,
 ) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -646,6 +710,10 @@ fn build_library_path_row(
             save_config(&cfg);
         }
         paths_box.remove(&row_clone);
+        // The engine keeps watching the removed folder until the next
+        // launch — surface a restart hint so the stale tracks aren't
+        // mistaken for a bug.
+        restart_hint.set_visible(true);
     });
 
     row

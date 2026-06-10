@@ -128,6 +128,16 @@ pub fn load_css() {
 
 // ── Window geometry persistence ─────────────────────────────────
 
+/// Sane bounds for a persisted window dimension. Values outside this range
+/// (0, negative, or absurdly large) usually mean a corrupted or hand-edited
+/// `window.json`; they are replaced with a default so the app never launches
+/// with a degenerate / off-screen window or feeds nonsensical coordinates
+/// into the Win32 Snap-Layout hit-test math.
+const MIN_WINDOW_DIM: i32 = 200;
+const MAX_WINDOW_DIM: i32 = 20_000;
+const DEFAULT_WINDOW_WIDTH: i32 = 1400;
+const DEFAULT_WINDOW_HEIGHT: i32 = 850;
+
 /// Persisted window size + maximized state.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct WindowGeometry {
@@ -150,10 +160,22 @@ pub fn save_window_geometry(window: &adw::ApplicationWindow) {
 }
 
 /// Load persisted window geometry, if any.
+///
+/// Validates the deserialized dimensions: structurally-valid JSON with
+/// out-of-range numbers (0, negative, or enormous) is clamped to a default
+/// rather than applied verbatim.
 pub fn load_window_geometry() -> Option<WindowGeometry> {
-    settings_path("window.json")
+    let mut geo: WindowGeometry = settings_path("window.json")
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())?;
+
+    if !(MIN_WINDOW_DIM..=MAX_WINDOW_DIM).contains(&geo.width) {
+        geo.width = DEFAULT_WINDOW_WIDTH;
+    }
+    if !(MIN_WINDOW_DIM..=MAX_WINDOW_DIM).contains(&geo.height) {
+        geo.height = DEFAULT_WINDOW_HEIGHT;
+    }
+    Some(geo)
 }
 
 // ── Native window handle extraction ─────────────────────────────

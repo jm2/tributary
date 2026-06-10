@@ -155,19 +155,26 @@ fn build_remove_from_playlist_action(
         let browser_state = browser_state.clone();
         let active_key = active_key.clone();
 
-        // Remove from visible store immediately. One pass over the
-        // store, indexing into a `HashSet` so removing N selected items
-        // from a list of M tracks is O(N+M) rather than O(N*M).
-        let to_remove: std::collections::HashSet<&str> =
-            uris.iter().map(|s| s.as_str()).collect();
+        // Remove from the visible store immediately. Honour the per-URI
+        // selection count so that selecting one of N duplicate rows removes
+        // exactly one occurrence, not all N.
+        let mut remaining = selection_counts(&uris);
         let mut i: u32 = 0;
         while i < track_store.n_items() {
-            let matched = track_store
+            let uri = track_store
                 .item(i)
-                .and_downcast_ref::<TrackObject>()
-                .map(|t| to_remove.contains(t.uri().as_str()))
-                .unwrap_or(false);
-            if matched {
+                .and_downcast::<TrackObject>()
+                .map(|t| t.uri());
+            let mut remove = false;
+            if let Some(u) = uri.as_deref() {
+                if let Some(count) = remaining.get_mut(u) {
+                    if *count > 0 {
+                        *count -= 1;
+                        remove = true;
+                    }
+                }
+            }
+            if remove {
                 track_store.remove(i);
                 // Don't advance `i` — the next item shifted down into
                 // this slot.
@@ -176,11 +183,18 @@ fn build_remove_from_playlist_action(
             }
         }
 
-        // Update master + status.
+        // Update master + status (same per-URI count limit as the store).
         {
             let mut st = source_tracks.borrow_mut();
             if let Some(tracks) = st.get_mut(&active_key) {
-                tracks.retain(|t| !to_remove.contains(t.uri().as_str()));
+                let mut remaining = selection_counts(&uris);
+                tracks.retain(|t| match remaining.get_mut(t.uri().as_str()) {
+                    Some(count) if *count > 0 => {
+                        *count -= 1;
+                        false // remove this occurrence
+                    }
+                    _ => true, // keep
+                });
             }
         }
         let st = source_tracks.borrow();
@@ -205,6 +219,10 @@ fn build_remove_from_playlist_action(
                         .all(&db)
                         .await
                     {
+                        // Honour the per-URI selection count so duplicate
+                        // entries are removed one-for-one with the selected
+                        // rows rather than all at once.
+                        let mut remaining = selection_counts(&uris);
                         for entry in entries {
                             if let Some(ref track_id) = entry.track_id {
                                 // Look up the track to get its file path / URI.
@@ -215,8 +233,11 @@ fn build_remove_from_playlist_action(
                                     let track_uri = url::Url::from_file_path(&track.file_path)
                                         .map(|u| u.to_string())
                                         .unwrap_or_default();
-                                    if uris.contains(&track_uri) {
-                                        let _ = mgr.remove_entry(&entry.id).await;
+                                    if let Some(count) = remaining.get_mut(track_uri.as_str()) {
+                                        if *count > 0 {
+                                            *count -= 1;
+                                            let _ = mgr.remove_entry(&entry.id).await;
+                                        }
                                     }
                                 }
                             }
@@ -283,8 +304,14 @@ fn build_add_to_playlist_actions(
                         match crate::db::connection::init_db().await {
                             Ok(db) => {
                                 let mgr = crate::local::playlist_manager::PlaylistManager::new(db.clone());
+                                let mut added = 0usize;
+                                let mut skipped = 0usize;
                                 for uri in &uris {
                                     // Convert file:// URI back to path, find track in DB.
+                                    // Remote (http/https) tracks have no local DB row and
+                                    // cannot be added to a local playlist — count them as
+                                    // skipped rather than dropping them silently.
+                                    let mut ok = false;
                                     if let Ok(url) = url::Url::parse(uri) {
                                         if let Ok(path) = url.to_file_path() {
                                             let path_str = path.to_string_lossy().to_string();
@@ -296,12 +323,27 @@ fn build_add_to_playlist_actions(
                                                 .one(&db)
                                                 .await
                                             {
-                                                let _ = mgr.add_track(&pid, &track).await;
+                                                ok = mgr.add_track(&pid, &track).await.is_ok();
                                             }
                                         }
                                     }
+                                    if ok {
+                                        added += 1;
+                                    } else {
+                                        skipped += 1;
+                                    }
                                 }
-                                tracing::info!(playlist = %pid, count = uris.len(), "Tracks added to playlist");
+                                if skipped > 0 {
+                                    tracing::warn!(
+                                        playlist = %pid,
+                                        added,
+                                        skipped,
+                                        "Some tracks could not be added (remote or missing tracks aren't supported in local playlists)"
+                                    );
+                                }
+                                // Report the count actually inserted, not the
+                                // full selection size.
+                                tracing::info!(playlist = %pid, count = added, "Tracks added to playlist");
                             }
                             Err(e) => {
                                 tracing::error!(error = %e, "Failed to open DB for playlist add");
@@ -387,6 +429,20 @@ fn build_properties_action(
 // ═══════════════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════
+
+/// Build a map of `uri -> number of selected rows with that uri`.
+///
+/// A playlist may legitimately contain the same track more than once, so
+/// removal must honour the count of selected rows (remove exactly N
+/// occurrences) rather than treating the selection as a set and deleting
+/// every matching entry.
+fn selection_counts(uris: &[String]) -> std::collections::HashMap<&str, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for uri in uris {
+        *counts.entry(uri.as_str()).or_insert(0) += 1;
+    }
+    counts
+}
 
 /// Collect URIs of selected tracks from the sort model.
 fn collect_selected_uris(sm: &gtk::SortListModel, selected: &gtk::Bitset) -> Vec<String> {

@@ -42,9 +42,11 @@ pub struct TrackInfo {
 
 /// Show the properties dialog for one or more tracks.
 ///
-/// `on_saved` is called (on the GTK main thread) after tags have been
-/// successfully written, with the list of file paths that were modified.
-/// The caller should trigger a library re-scan for those paths.
+/// On **Save**, changed tags are written to the files on a background
+/// thread. There is no explicit rescan callback: the library DB and the
+/// open tracklist are refreshed asynchronously by the filesystem watcher
+/// for files inside a watched library folder. If any file fails to write,
+/// the user is notified and the dialog stays open so they can retry.
 pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackInfo]) {
     if tracks.is_empty() {
         return;
@@ -318,6 +320,7 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
 
     // ── Save ─────────────────────────────────────────────────────────
     let dialog_for_save = dialog.clone();
+    let parent_for_save = parent.clone();
 
     // Capture initial text values to detect what actually changed.
     let initial_texts: Vec<(String, String)> = entries
@@ -374,12 +377,14 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
 
         let paths = file_paths_for_save.clone();
 
-        // Write tags on a background thread.
-        let (tx, rx) = async_channel::bounded::<Vec<String>>(1);
+        // Write tags on a background thread, tracking both the files that
+        // were written and the ones that failed.
+        let (tx, rx) = async_channel::bounded::<(Vec<String>, Vec<String>)>(1);
         let edits = edits.clone();
 
         std::thread::spawn(move || {
             let mut modified = Vec::new();
+            let mut failed = Vec::new();
             for path in &paths {
                 match crate::local::tag_writer::write_tags(path, &edits) {
                     Ok(()) => {
@@ -391,25 +396,37 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
                             error = %e,
                             "Failed to write tags"
                         );
+                        failed.push(path.to_string_lossy().to_string());
                     }
                 }
             }
-            let _ = tx.send_blocking(modified);
+            let _ = tx.send_blocking((modified, failed));
         });
 
         let dialog = dialog_for_save.clone();
-        // We need to move on_saved into the async block, but it's behind a reference.
-        // Instead, collect the paths and call on_saved synchronously after await.
-        glib::MainContext::default().spawn_local({
-            let dialog = dialog.clone();
-            async move {
-                if let Ok(modified) = rx.recv().await {
-                    if !modified.is_empty() {
-                        info!(count = modified.len(), "Tags saved successfully");
-                    }
+        let parent = parent_for_save.clone();
+        glib::MainContext::default().spawn_local(async move {
+            if let Ok((modified, failed)) = rx.recv().await {
+                if !modified.is_empty() {
+                    info!(count = modified.len(), "Tags saved successfully");
+                }
+                if failed.is_empty() {
                     dialog.close();
-                    // Note: on_saved callback is called from the connect_clicked
-                    // closure scope, not here. We handle it differently below.
+                } else {
+                    // Surface the failure instead of closing silently, so the
+                    // user knows the edit didn't fully apply. Keep the dialog
+                    // open so they can retry.
+                    let total = modified.len() + failed.len();
+                    let body = format!(
+                        "{} of {total} file(s) could not be saved and were left unchanged.",
+                        failed.len()
+                    );
+                    let alert = adw::AlertDialog::builder()
+                        .heading("Could Not Save Some Files")
+                        .body(&body)
+                        .build();
+                    alert.add_response("ok", "OK");
+                    alert.present(Some(&parent));
                 }
             }
         });

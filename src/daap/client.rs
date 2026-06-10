@@ -9,6 +9,8 @@
 //! 3. `GET /update` → revision-number
 //! 4. `GET /databases` → database-id
 
+use std::time::Duration;
+
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
 use reqwest::Client;
 use tracing::{debug, info, warn};
@@ -21,6 +23,15 @@ use super::dmap::{self, DmapNode, DmapValue};
 
 /// Client identifier sent with every request.
 const CLIENT_NAME: &str = "Tributary";
+
+/// Connection-establishment timeout for DAAP requests.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Idle read timeout.  Guards against a malicious or hung DAAP server
+/// that accepts the connection but then stalls (or only trickles) the
+/// response body — without capping the total time for a large-but-healthy
+/// library transfer (the timeout resets after each successful read).
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Client version advertised to the DAAP server.
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -381,11 +392,11 @@ impl DaapClient {
         let url = format!("{}/server-info", server_url.trim_end_matches('/'));
         // Cap the probe at 5s — a malicious or hung DAAP server should
         // not be able to stall the discovery flow forever. The shared
-        // client doesn't carry a timeout because real streams can be
-        // long-lived; this is a per-request override.
+        // client already sets connect/read timeouts; this tighter total
+        // per-request timeout keeps the discovery probe snappy.
         let resp = http
             .get(&url)
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .ok()?;
@@ -445,6 +456,8 @@ fn build_http_client() -> BackendResult<Client> {
     Client::builder()
         .user_agent(format!("{CLIENT_NAME}/{CLIENT_VERSION}"))
         .default_headers(headers)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
         .build()
         .map_err(|e| BackendError::ConnectionFailed {
             message: format!("Failed to build DAAP HTTP client: {e}"),

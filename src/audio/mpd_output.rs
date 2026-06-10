@@ -175,7 +175,12 @@ impl MpdOutput {
                 .write_all(format!("{line}\n").as_bytes())
                 .map_err(|e| format!("Write: {e}"))?;
 
-            // Read response until "OK" or "ACK".
+            // Read response until "OK" or "ACK". The 5s read timeout only
+            // fires on silence, so a misbehaving server that streams endless
+            // non-terminating data lines could keep this loop (and its worker
+            // thread/socket) alive indefinitely. In practice the commands we
+            // send (clear/add/play/pause/stop/seekcur) return only a handful
+            // of lines, so no overall deadline is imposed here.
             loop {
                 let mut resp = String::new();
                 reader

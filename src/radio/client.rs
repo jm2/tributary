@@ -97,8 +97,12 @@ impl RadioBrowserClient {
         limit: Option<u32>,
     ) -> Vec<RadioStation> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
+        // Percent-encode the externally-sourced country code (it comes
+        // verbatim from a third-party geolocation provider) so a value
+        // containing `&`/`=`/`#` cannot inject extra query parameters.
+        let encoded_cc = urlencoding::encode(country_code);
         let url = format!(
-            "{}/json/stations/search?geo_lat={lat}&geo_long={lon}&order=geo_distance&has_geo_info=true&countrycode={country_code}&limit={limit}&hidebroken=true",
+            "{}/json/stations/search?geo_lat={lat}&geo_long={lon}&order=geo_distance&has_geo_info=true&countrycode={encoded_cc}&limit={limit}&hidebroken=true",
             self.base_url
         );
         self.fetch_stations(&url).await
@@ -115,9 +119,11 @@ impl RadioBrowserClient {
         limit: Option<u32>,
     ) -> Vec<RadioStation> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
+        // Percent-encode the externally-sourced country code (see above).
+        let encoded_cc = urlencoding::encode(country_code);
         let encoded_state = urlencoding::encode(state);
         let url = format!(
-            "{}/json/stations/search?countrycode={country_code}&state={encoded_state}&order=votes&reverse=true&limit={limit}&hidebroken=true",
+            "{}/json/stations/search?countrycode={encoded_cc}&state={encoded_state}&order=votes&reverse=true&limit={limit}&hidebroken=true",
             self.base_url
         );
         self.fetch_stations(&url).await
@@ -132,8 +138,10 @@ impl RadioBrowserClient {
         limit: Option<u32>,
     ) -> Vec<RadioStation> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
+        // Percent-encode the externally-sourced country code (see above).
+        let encoded_cc = urlencoding::encode(country_code);
         let url = format!(
-            "{}/json/stations/search?countrycode={country_code}&order=votes&reverse=true&limit={limit}&hidebroken=true",
+            "{}/json/stations/search?countrycode={encoded_cc}&order=votes&reverse=true&limit={limit}&hidebroken=true",
             self.base_url
         );
         self.fetch_stations(&url).await

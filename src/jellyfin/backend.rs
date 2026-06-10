@@ -24,6 +24,12 @@ use super::client::JellyfinClient;
 /// Page size for paginated item fetches.
 const PAGE_SIZE: u32 = 5_000;
 
+/// Hard cap on the number of pages fetched per item type.  A safety valve
+/// against a misbehaving server that never signals the end of the list:
+/// `MAX_PAGES * PAGE_SIZE` items is far larger than any real library, so
+/// this never truncates a legitimate catalogue.
+const MAX_PAGES: u32 = 10_000;
+
 // ── Discovery result ────────────────────────────────────────────────────
 
 /// A music library discovered on the Jellyfin server.
@@ -291,6 +297,7 @@ impl JellyfinBackend {
     ) -> BackendResult<Vec<JellyfinItem>> {
         let mut all_items = Vec::new();
         let mut start_index: u32 = 0;
+        let mut pages_fetched: u32 = 0;
 
         loop {
             let start_str = start_index.to_string();
@@ -313,10 +320,31 @@ impl JellyfinBackend {
 
             let page_count = resp.items.len() as u32;
             all_items.extend(resp.items);
+            pages_fetched += 1;
 
-            if start_index + page_count >= resp.total_record_count {
+            // Terminate on the actual page contents, NOT the server-supplied
+            // `TotalRecordCount`.  Trusting that count is unsafe: a short or
+            // empty page while the count stays higher would loop forever
+            // (re-requesting the same StartIndex and flooding the server),
+            // and a missing/zero count would stop after one page and silently
+            // truncate the library.  A page smaller than the requested limit
+            // (including an empty page) means we have reached the end.
+            if page_count < PAGE_SIZE {
                 break;
             }
+
+            // Defensive cap against a server that keeps returning full pages
+            // forever.
+            if pages_fetched >= MAX_PAGES {
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    parent_id = %parent_id,
+                    pages_fetched,
+                    "Jellyfin pagination hit the page cap; stopping (library may be incomplete)"
+                );
+                break;
+            }
+
             start_index += page_count;
         }
 

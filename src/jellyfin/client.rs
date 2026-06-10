@@ -1,6 +1,8 @@
 //! Low-level Jellyfin HTTP client — authentication header injection,
 //! request building, and JSON deserialization.
 
+use std::time::Duration;
+
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
 use reqwest::Client;
 use tracing::{debug, info};
@@ -16,6 +18,15 @@ const CLIENT_NAME: &str = "Tributary";
 
 /// Client version advertised to the Jellyfin server.
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Connection-establishment timeout for API requests.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Idle read timeout.  Guards against a server that accepts the
+/// connection but then stalls without sending (or only trickles) data,
+/// while still allowing a large-but-healthy library transfer to complete
+/// (the timeout resets after each successful read).
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Holds credentials and a reusable `reqwest::Client` with the
 /// `X-Emby-Authorization` header pre-configured on every request.
@@ -43,6 +54,7 @@ impl JellyfinClient {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
         })?;
+        validate_base_url(server_url, &base_url)?;
 
         let http = build_http_client(api_key)?;
 
@@ -70,6 +82,7 @@ impl JellyfinClient {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
         })?;
+        validate_base_url(server_url, &base_url)?;
 
         // Build a temporary client WITHOUT a token for the auth request.
         let pre_auth_header = format!(
@@ -91,6 +104,8 @@ impl JellyfinClient {
         let pre_auth_http = Client::builder()
             .user_agent(CLIENT_NAME)
             .default_headers(pre_auth_headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .map_err(|e| BackendError::ConnectionFailed {
                 message: format!("Failed to build HTTP client: {e}"),
@@ -332,9 +347,54 @@ fn build_http_client(api_key: &str) -> BackendResult<Client> {
     Client::builder()
         .user_agent(CLIENT_NAME)
         .default_headers(default_headers)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .redirect(redirect_policy())
         .build()
         .map_err(|e| BackendError::ConnectionFailed {
             message: format!("Failed to build HTTP client: {e}"),
             source: Some(Box::new(e)),
         })
+}
+
+/// Redirect policy for API requests.
+///
+/// The `X-Emby-Authorization` token rides on every request as a default
+/// header, and reqwest does NOT strip custom auth headers on cross-host
+/// redirects (only the standard `Authorization`/`Cookie` set).  Follow
+/// only same-host redirects so a compromised or MITM'd server cannot
+/// bounce the client to an attacker host and harvest the token.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > 10 {
+            return attempt.error("too many redirects");
+        }
+        let same_host = {
+            let prev_host = attempt.previous().last().and_then(Url::host_str);
+            prev_host == attempt.url().host_str()
+        };
+        if same_host {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// Reject server URLs that would later panic during request building.
+///
+/// `Url::parse` accepts opaque, cannot-be-a-base inputs such as a
+/// scheme-less `host:port` (e.g. `myserver:8096`), but `api_url` /
+/// `authenticate` build paths via `path_segments_mut`, which panics on
+/// such URLs.  Surface a clean error instead.
+fn validate_base_url(server_url: &str, base_url: &Url) -> BackendResult<()> {
+    if base_url.cannot_be_a_base() || !matches!(base_url.scheme(), "http" | "https") {
+        return Err(BackendError::ConnectionFailed {
+            message: format!(
+                "Invalid server URL '{server_url}': must start with http:// or https://"
+            ),
+            source: None,
+        });
+    }
+    Ok(())
 }

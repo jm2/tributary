@@ -81,6 +81,7 @@ extern "system" {
     fn MonitorFromWindow(hwnd: *mut c_void, dwFlags: u32) -> *mut c_void;
     fn GetMonitorInfoW(hMonitor: *mut c_void, lpmi: *mut MonitorInfo) -> i32;
     fn GetWindowLongPtrW(hwnd: *mut c_void, nIndex: i32) -> isize;
+    fn GetDpiForWindow(hwnd: *mut c_void) -> u32;
 }
 
 /// Win32 POINT structure (client coordinates).
@@ -207,7 +208,21 @@ unsafe extern "system" fn subclass_proc(
             // Check if cursor is within the maximize button rect.
             if let Ok(guard) = MAX_BUTTON_RECT.lock() {
                 if let Some((x, y, w, h)) = *guard {
-                    if pt.x >= x && pt.x <= x + w && pt.y >= y && pt.y <= y + h {
+                    // The rect is stored in GTK *logical* pixels, but the
+                    // cursor coords from ScreenToClient are *physical*
+                    // device pixels (GTK4 is per-monitor DPI aware on
+                    // Windows). Scale the rect to physical pixels using the
+                    // window's DPI so the hit-test lines up at any display
+                    // scale (e.g. 150% / 200%), not just 100%.
+                    // SAFETY: GetDpiForWindow is a stateless query on a
+                    // valid HWND; it returns 0 only on failure (→ scale 1.0).
+                    let dpi = unsafe { GetDpiForWindow(hwnd) };
+                    let scale = if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 };
+                    let px = (f64::from(x) * scale) as i32;
+                    let py = (f64::from(y) * scale) as i32;
+                    let pw = (f64::from(w) * scale) as i32;
+                    let ph = (f64::from(h) * scale) as i32;
+                    if pt.x >= px && pt.x <= px + pw && pt.y >= py && pt.y <= py + ph {
                         return HTMAXBUTTON;
                     }
                 }

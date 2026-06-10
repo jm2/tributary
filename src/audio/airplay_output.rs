@@ -54,6 +54,11 @@ struct Session {
     /// Only `Some` when the shairport-sync fallback path is in use —
     /// the child must outlive the pipeline and be killed on `stop()`.
     sps_child: Option<Child>,
+    /// Owning handle to the pipe write-end fed to `fdsink fd=…` in the
+    /// shairport-sync fallback.  `fdsink` does not close a descriptor it
+    /// did not open, so we keep ownership here and let it close when the
+    /// session is dropped — otherwise every session would leak one fd.
+    _stdin_file: Option<std::fs::File>,
     /// Bus watch guard — dropping it removes the watch.
     _bus_watch: gst::bus::BusWatchGuard,
 }
@@ -87,6 +92,7 @@ impl AirPlayOutput {
         host: &str,
         port: u16,
         event_tx: async_channel::Sender<PlayerEvent>,
+        initial_volume: f64,
     ) -> Self {
         info!(
             host = %host,
@@ -99,7 +105,10 @@ impl AirPlayOutput {
             host: host.to_string(),
             port,
             event_tx,
-            volume: 1.0,
+            // Seed from the current slider value so switching to this device
+            // doesn't reset the effective volume to maximum (0 dB) on the
+            // first track load.
+            volume: initial_volume.clamp(0.0, 1.0),
             session: Arc::new(Mutex::new(None)),
         }
     }
@@ -146,14 +155,16 @@ impl AirPlayOutput {
                 *self.session_lock() = Some(Session {
                     pipeline,
                     sps_child: None,
+                    _stdin_file: None,
                     _bus_watch: bus_watch,
                 });
                 Ok(())
             }
             Err(e1) => {
                 warn!(error = %e1, "raopsink unavailable, trying shairport-sync");
-                let (pipeline, sps_child) = Self::build_shairport_pipeline(host, port, uri)
-                    .map_err(|e2| format!("Both AirPlay paths failed: {e1}; {e2}"))?;
+                let (pipeline, sps_child, stdin_file) =
+                    Self::build_shairport_pipeline(host, port, uri)
+                        .map_err(|e2| format!("Both AirPlay paths failed: {e1}; {e2}"))?;
                 let bus_watch = self.attach_bus_watch(&pipeline)?;
                 pipeline
                     .set_state(gst::State::Paused)
@@ -162,6 +173,7 @@ impl AirPlayOutput {
                 *self.session_lock() = Some(Session {
                     pipeline,
                     sps_child: Some(sps_child),
+                    _stdin_file: Some(stdin_file),
                     _bus_watch: bus_watch,
                 });
                 Ok(())
@@ -272,7 +284,7 @@ impl AirPlayOutput {
         host: &str,
         port: u16,
         uri: &str,
-    ) -> Result<(gst::Pipeline, Child), String> {
+    ) -> Result<(gst::Pipeline, Child, std::fs::File), String> {
         let _ = (host, port); // shairport-sync uses its own discovery.
 
         // Locate shairport-sync.
@@ -298,9 +310,21 @@ impl AirPlayOutput {
             .take()
             .ok_or_else(|| "Failed to capture shairport-sync stdin".to_string())?;
 
+        // Reclaim ownership of the raw fd as a `File`: `into_raw_fd` releases
+        // Rust's ownership (so `ChildStdin`'s Drop won't close it), and
+        // `fdsink` never closes a descriptor it didn't open.  Wrapping it back
+        // in a `File` means the fd is closed when the session is dropped,
+        // rather than leaked once per shairport-sync session.
+        let stdin_file = {
+            use std::os::unix::io::{FromRawFd, IntoRawFd};
+            let raw = stdin.into_raw_fd();
+            // SAFETY: `raw` was just produced by `into_raw_fd`, which transfers
+            // ownership of a valid, open fd; we are the sole owner now.
+            unsafe { std::fs::File::from_raw_fd(raw) }
+        };
         let fd = {
-            use std::os::unix::io::IntoRawFd;
-            stdin.into_raw_fd()
+            use std::os::unix::io::AsRawFd;
+            stdin_file.as_raw_fd()
         };
 
         let pipeline_str = format!(
@@ -320,7 +344,7 @@ impl AirPlayOutput {
             "shairport-sync launch did not yield a Pipeline".to_string()
         })?;
 
-        Ok((pipeline, child))
+        Ok((pipeline, child, stdin_file))
     }
 
     /// Windows fallback: shairport-sync pipe mode is Unix-only.
@@ -329,7 +353,7 @@ impl AirPlayOutput {
         _host: &str,
         _port: u16,
         _uri: &str,
-    ) -> Result<(gst::Pipeline, Child), String> {
+    ) -> Result<(gst::Pipeline, Child, std::fs::File), String> {
         Err("shairport-sync pipe mode requires Unix".to_string())
     }
 
@@ -382,6 +406,11 @@ impl AudioOutput for AirPlayOutput {
             let _ = self
                 .event_tx
                 .try_send(PlayerEvent::StateChanged(PlayerState::Stopped));
+        } else {
+            // `open_session` only prerolls the pipeline to Paused; like every
+            // other output, `load_uri` must actually start playback, so drive
+            // it to Playing now that buffers are prerolled.
+            self.set_pipeline_state(gst::State::Playing);
         }
     }
 
@@ -467,28 +496,28 @@ mod tests {
     #[test]
     fn test_airplay_output_name() {
         let (tx, _rx) = async_channel::unbounded();
-        let output = AirPlayOutput::new("Living Room", "192.168.1.100", 7000, tx);
+        let output = AirPlayOutput::new("Living Room", "192.168.1.100", 7000, tx, 1.0);
         assert_eq!(output.name(), "Living Room");
     }
 
     #[test]
     fn test_airplay_output_type() {
         let (tx, _rx) = async_channel::unbounded();
-        let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx);
+        let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
         assert_eq!(output.output_type(), OutputType::AirPlay);
     }
 
     #[test]
     fn test_airplay_supports_volume() {
         let (tx, _rx) = async_channel::unbounded();
-        let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx);
+        let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
         assert!(output.supports_volume());
     }
 
     #[test]
     fn test_airplay_volume_clamp() {
         let (tx, _rx) = async_channel::unbounded();
-        let mut output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx);
+        let mut output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
         output.set_volume(1.5);
         assert!((output.volume() - 1.0).abs() < f64::EPSILON);
         output.set_volume(-0.5);
@@ -506,14 +535,14 @@ mod tests {
     #[test]
     fn test_airplay_no_position_without_session() {
         let (tx, _rx) = async_channel::unbounded();
-        let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx);
+        let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
         assert!(output.position_ms().is_none());
     }
 
     #[test]
     fn test_airplay_initial_state() {
         let (tx, _rx) = async_channel::unbounded();
-        let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx);
+        let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
         assert_eq!(output.state(), PlayerState::Stopped);
     }
 }

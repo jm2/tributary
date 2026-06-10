@@ -227,6 +227,7 @@ pub fn build_window(
     let status_label_for_filter = status_label.clone();
     let master_for_filter = master_tracks.clone();
     let current_pos_for_filter = current_pos.clone();
+    let sort_model_for_filter = sort_model.clone();
 
     let app_config_for_filter = app_config.clone();
     let on_filter = Box::new(
@@ -237,7 +238,7 @@ pub fn build_window(
             let master = master_for_filter.borrow();
             let search_lower = search_text.to_lowercase();
             let use_album_artist = app_config_for_filter.borrow().group_by_album_artist;
-            let matching: Vec<&TrackObject> = master
+            let filtered: Vec<TrackObject> = master
                 .iter()
                 .filter(|t| {
                     if let Some(ref g) = genre {
@@ -278,33 +279,40 @@ pub fn build_window(
                     }
                     true
                 })
+                // Clone bumps the GObject refcount, so the same instance may
+                // live in both `master_tracks` and the store.
+                .cloned()
                 .collect();
 
-            track_store_for_filter.remove_all();
-            let mut snapshot = Vec::new();
-            for t in &matching {
-                let new_t = TrackObject::new(
-                    t.track_number(),
-                    &t.title(),
-                    t.duration_secs(),
-                    &t.artist(),
-                    &t.album(),
-                    &t.genre(),
-                    t.year(),
-                    &t.date_modified(),
-                    t.bitrate_kbps(),
-                    t.sample_rate_hz(),
-                    t.play_count(),
-                    &t.format(),
-                    &t.uri(),
-                );
-                track_store_for_filter.append(&new_t);
-                snapshot.push(new_t);
-            }
-            tracklist::update_status(&status_label_for_filter, &snapshot);
+            // Capture the currently-playing track's URI (if any) from the
+            // sorted model BEFORE rebuilding the store, so we can restore
+            // the playback position afterwards (see below).
+            let playing_uri = current_pos_for_filter.get().and_then(|pos| {
+                sort_model_for_filter
+                    .item(pos)
+                    .and_downcast::<TrackObject>()
+                    .map(|t| t.uri())
+            });
 
-            // Invalidate playback position — the store indices changed.
-            current_pos_for_filter.set(None);
+            // Replace the whole store in a single splice. This emits one
+            // `items-changed` signal instead of N appends and keeps the rows'
+            // identity so the now-playing row can still be matched.
+            track_store_for_filter.splice(0, track_store_for_filter.n_items(), &filtered);
+            tracklist::update_status(&status_label_for_filter, &filtered);
+
+            // Preserve the playback position across the filter: if the
+            // playing track is still visible, re-point `current_pos` at its
+            // new sorted index so sequential auto-advance keeps working;
+            // only clear it when the playing track was filtered out.
+            let new_pos = playing_uri.and_then(|uri| {
+                (0..sort_model_for_filter.n_items()).find(|&i| {
+                    sort_model_for_filter
+                        .item(i)
+                        .and_downcast::<TrackObject>()
+                        .is_some_and(|t| t.uri() == uri)
+                })
+            });
+            current_pos_for_filter.set(new_pos);
         },
     );
 
@@ -1008,7 +1016,16 @@ pub fn build_window(
     restore_sort_state(&column_view);
     if let Some(sorter) = column_view.sorter() {
         let cv = column_view.clone();
+        let active_source_key = active_source_key.clone();
         sorter.connect_changed(move |_, _| {
+            // Don't persist sort state while viewing a radio station: in
+            // radio mode the Artist/Album columns are renamed to
+            // Country/State-Province, so the saved title could never be
+            // re-matched against the music-mode columns on the next launch
+            // (issue #38).
+            if super::radio::is_radio_backend(&active_source_key.borrow()) {
+                return;
+            }
             save_sort_state(&cv);
         });
     }
@@ -1357,9 +1374,16 @@ pub fn build_window(
     {
         let config = app_config.clone();
         let cv = column_view.clone();
+        let active_source_key = active_source_key.clone();
         column_view
             .columns()
             .connect_items_changed(move |_list, _pos, _removed, _added| {
+                // Skip persistence while in radio mode — the renamed
+                // Artist→Country / Album→State-Province columns would
+                // corrupt the saved column order (issue #38).
+                if super::radio::is_radio_backend(&active_source_key.borrow()) {
+                    return;
+                }
                 let order = preferences::read_column_order(&cv);
                 if !order.is_empty() {
                     let mut cfg = config.borrow_mut();
@@ -1607,6 +1631,7 @@ fn setup_library_events(
                         .insert(source_key.clone(), objects.clone());
 
                     // Update the sidebar item: mark connected, force rebind.
+                    let mut auto_selected = false;
                     for i in 0..sidebar_store.n_items() {
                         if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>()
                         {
@@ -1624,14 +1649,19 @@ fn setup_library_events(
                                 *pending_connection.borrow_mut() = None;
                                 // Auto-select this source.
                                 sidebar_selection.set_selected(i);
+                                auto_selected = true;
                                 break;
                             }
                         }
                     }
 
-                    // Display if this source is now active (set by
-                    // the selection_changed handler triggered above).
-                    if *active_source_key.borrow() == source_key {
+                    // Display if this source is now active. Skip when the
+                    // auto-select above already fired the selection_changed
+                    // handler, which renders the same tracklist/browser —
+                    // this avoids a redundant double render on connect.
+                    // (The explicit call still handles re-syncing a source
+                    // that is already connected and active.)
+                    if !auto_selected && *active_source_key.borrow() == source_key {
                         display_tracks(
                             &objects,
                             &track_store,

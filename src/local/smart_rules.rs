@@ -266,6 +266,10 @@ pub fn evaluate<T: SmartTrack + Clone>(rules: &SmartRules, tracks: &[T]) -> Vec<
                 .map(|rule| evaluate_rule(rule, *track))
                 .collect();
 
+            // Boundary semantics for an empty rules vector are intentionally
+            // asymmetric: `All` is vacuously true (matches every track) while
+            // `Any` is vacuously false (matches none), mirroring AND/OR over
+            // zero terms.
             match rules.match_mode {
                 MatchMode::All => matches.iter().all(|m| *m),
                 MatchMode::Any => matches.iter().any(|m| *m),
@@ -292,13 +296,28 @@ pub fn evaluate<T: SmartTrack + Clone>(rules: &SmartRules, tracks: &[T]) -> Vec<
 /// Criteria are applied in order: the first criterion is the primary sort,
 /// the second breaks ties in the first, etc.  This enables Tauon-style
 /// generator code ordering like "Artist asc → Year asc → Track # asc".
-fn apply_compound_sort<T: SmartTrack>(results: &mut [T], criteria: &[SortCriterion]) {
+///
+/// Uses decorate-sort-undecorate: each track's per-criterion comparison keys
+/// (including lowercased text keys) are computed once up front, instead of
+/// re-lowercasing both operands on every `sort_by` comparison (which would be
+/// O(N log N) Unicode-folding allocations for compound sorts).
+fn apply_compound_sort<T: SmartTrack>(results: &mut Vec<T>, criteria: &[SortCriterion]) {
     if criteria.is_empty() {
         return;
     }
-    results.sort_by(|a, b| {
-        for criterion in criteria {
-            let cmp = compare_by_sort_field(a, b, criterion.field);
+
+    // Decorate: precompute the comparison keys for each track once.
+    let mut decorated: Vec<(Vec<SortKey>, T)> = results
+        .drain(..)
+        .map(|track| {
+            let keys = criteria.iter().map(|c| sort_key(&track, c.field)).collect();
+            (keys, track)
+        })
+        .collect();
+
+    decorated.sort_by(|a, b| {
+        for (idx, criterion) in criteria.iter().enumerate() {
+            let cmp = a.0[idx].cmp(&b.0[idx]);
             let cmp = match criterion.direction {
                 SortDirection::Ascending => cmp,
                 SortDirection::Descending => cmp.reverse(),
@@ -309,27 +328,38 @@ fn apply_compound_sort<T: SmartTrack>(results: &mut [T], criteria: &[SortCriteri
         }
         std::cmp::Ordering::Equal
     });
+
+    // Undecorate: drop the keys and keep the sorted tracks.
+    results.extend(decorated.into_iter().map(|(_, track)| track));
 }
 
-/// Compare two tracks by a single sort field.
-fn compare_by_sort_field<T: SmartTrack>(a: &T, b: &T, field: SortField) -> std::cmp::Ordering {
+/// A precomputed comparison key for a single sort field.
+///
+/// Text fields are stored lowercased (case-insensitive compare); date fields
+/// keep their raw RFC3339 string (lexicographic compare); numeric fields keep
+/// their optional integer value (`None` sorts first, matching `Option` order).
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum SortKey {
+    Text(String),
+    Int(Option<i64>),
+}
+
+/// Build the comparison key for a track's value in a single sort field.
+fn sort_key<T: SmartTrack>(track: &T, field: SortField) -> SortKey {
     match field {
-        SortField::Artist => a.artist().to_lowercase().cmp(&b.artist().to_lowercase()),
-        SortField::AlbumArtist => a
-            .album_artist()
-            .to_lowercase()
-            .cmp(&b.album_artist().to_lowercase()),
-        SortField::Album => a.album().to_lowercase().cmp(&b.album().to_lowercase()),
-        SortField::Title => a.title().to_lowercase().cmp(&b.title().to_lowercase()),
-        SortField::Year => a.year().cmp(&b.year()),
-        SortField::TrackNumber => a.track_number().cmp(&b.track_number()),
-        SortField::DiscNumber => a.disc_number().cmp(&b.disc_number()),
-        SortField::Genre => a.genre().to_lowercase().cmp(&b.genre().to_lowercase()),
-        SortField::Duration => a.duration_secs().cmp(&b.duration_secs()),
-        SortField::Bitrate => a.bitrate_kbps().cmp(&b.bitrate_kbps()),
-        SortField::PlayCount => a.play_count().cmp(&b.play_count()),
-        SortField::DateAdded => a.date_added().cmp(b.date_added()),
-        SortField::DateModified => a.date_modified().cmp(b.date_modified()),
+        SortField::Artist => SortKey::Text(track.artist().to_lowercase()),
+        SortField::AlbumArtist => SortKey::Text(track.album_artist().to_lowercase()),
+        SortField::Album => SortKey::Text(track.album().to_lowercase()),
+        SortField::Title => SortKey::Text(track.title().to_lowercase()),
+        SortField::Genre => SortKey::Text(track.genre().to_lowercase()),
+        SortField::Year => SortKey::Int(track.year().map(i64::from)),
+        SortField::TrackNumber => SortKey::Int(track.track_number().map(i64::from)),
+        SortField::DiscNumber => SortKey::Int(track.disc_number().map(i64::from)),
+        SortField::Duration => SortKey::Int(track.duration_secs()),
+        SortField::Bitrate => SortKey::Int(track.bitrate_kbps().map(i64::from)),
+        SortField::PlayCount => SortKey::Int(Some(i64::from(track.play_count()))),
+        SortField::DateAdded => SortKey::Text(track.date_added().to_string()),
+        SortField::DateModified => SortKey::Text(track.date_modified().to_string()),
     }
 }
 
@@ -503,23 +533,25 @@ fn apply_limit<T: SmartTrack>(results: &mut Vec<T>, limit: &SmartLimit) {
     // Sort by the selected criteria.
     match limit.selected_by {
         LimitSort::Random => {
-            // Simple pseudo-random shuffle using track metadata hash.
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            results.sort_by(|a, b| {
-                let mut ha = DefaultHasher::new();
-                a.title().hash(&mut ha);
-                a.artist().hash(&mut ha);
-                let mut hb = DefaultHasher::new();
-                b.title().hash(&mut hb);
-                b.artist().hash(&mut hb);
-                ha.finish().cmp(&hb.finish())
-            });
+            // Genuinely random shuffle, re-seeded per evaluation. (A
+            // `DefaultHasher`-based ordering would be fully deterministic
+            // across runs and biased by the title/artist hash.)
+            fastrand::shuffle(results);
         }
-        LimitSort::Title => results.sort_by(|a, b| a.title().cmp(b.title())),
-        LimitSort::Album => results.sort_by(|a, b| a.album().cmp(b.album())),
-        LimitSort::Artist => results.sort_by(|a, b| a.artist().cmp(b.artist())),
-        LimitSort::Genre => results.sort_by(|a, b| a.genre().cmp(b.genre())),
+        // Text sorts are case-insensitive, consistent with the compound
+        // sort path (`sort_key`).
+        LimitSort::Title => {
+            results.sort_by_cached_key(|t| t.title().to_lowercase());
+        }
+        LimitSort::Album => {
+            results.sort_by_cached_key(|t| t.album().to_lowercase());
+        }
+        LimitSort::Artist => {
+            results.sort_by_cached_key(|t| t.artist().to_lowercase());
+        }
+        LimitSort::Genre => {
+            results.sort_by_cached_key(|t| t.genre().to_lowercase());
+        }
         LimitSort::Year => results.sort_by_key(|t| t.year()),
         LimitSort::Bitrate => {
             results.sort_by_key(|t| std::cmp::Reverse(t.bitrate_kbps()));
@@ -564,6 +596,10 @@ fn apply_limit<T: SmartTrack>(results: &mut Vec<T>, limit: &SmartLimit) {
 }
 
 /// Keep tracks until total duration exceeds `max_secs`.
+///
+/// The `keep > 0` guard guarantees at least one track is retained even when
+/// the first track alone exceeds the cap, so a 0-minute/0-hour limit still
+/// yields one track (unlike `LimitUnit::Items`, where a 0 limit yields none).
 fn truncate_by_duration<T: SmartTrack>(results: &mut Vec<T>, max_secs: i64) {
     let mut total = 0i64;
     let mut keep = 0;
@@ -579,6 +615,9 @@ fn truncate_by_duration<T: SmartTrack>(results: &mut Vec<T>, max_secs: i64) {
 }
 
 /// Keep tracks until total file size exceeds `max_bytes`.
+///
+/// As with `truncate_by_duration`, the `keep > 0` guard always retains at
+/// least one track, so a 0-MB/0-GB limit still yields one track.
 fn truncate_by_size<T: SmartTrack>(results: &mut Vec<T>, max_bytes: i64) {
     let mut total = 0i64;
     let mut keep = 0;

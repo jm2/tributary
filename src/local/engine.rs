@@ -3,7 +3,7 @@
 //! Runs entirely on the tokio runtime. Sends `LibraryEvent` messages
 //! to the GTK main thread via `async_channel`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -122,7 +122,12 @@ async fn initial_scan(
         dirs.iter()
             .flat_map(|dir| {
                 WalkDir::new(dir)
-                    .follow_links(true)
+                    // Do NOT follow symlinks: the notify watcher does not
+                    // follow them either, so following here would index files
+                    // (via symlinked subtrees) that are never watched for
+                    // changes, and could index one physical file under
+                    // multiple paths as duplicate rows.
+                    .follow_links(false)
                     .into_iter()
                     .filter_map(|e| e.ok())
                     .filter(|e| e.file_type().is_file())
@@ -136,6 +141,29 @@ async fn initial_scan(
     let total = audio_files.len() as u64;
     info!(total, "Found audio files to scan");
 
+    // Determine which configured roots were actually scanned. A root that is
+    // missing or yielded zero files (e.g. an unmounted external/network drive
+    // whose mountpoint still exists as an empty directory) must NOT trigger
+    // stale-removal of its tracks below — otherwise a temporarily-unavailable
+    // library would be silently purged from the DB, destroying play counts,
+    // date_added and stable track identity.
+    let mut unavailable_roots: Vec<&Path> = Vec::new();
+    for dir in music_dirs {
+        let has_files = audio_files.iter().any(|p| p.starts_with(dir));
+        if !dir.is_dir() || !has_files {
+            unavailable_roots.push(dir.as_path());
+        }
+    }
+
+    // Preload existing rows once so the per-file loop can decide needs_update
+    // from memory instead of issuing one SELECT per file. The same snapshot is
+    // reused for the stale-removal pass below.
+    let existing_tracks = track::Entity::find().all(db).await?;
+    let existing_by_path: HashMap<&str, &track::Model> = existing_tracks
+        .iter()
+        .map(|m| (m.file_path.as_str(), m))
+        .collect();
+
     let mut scanned: u64 = 0;
     let mut on_disk_paths = HashSet::new();
 
@@ -143,19 +171,12 @@ async fn initial_scan(
         let path_str = path.to_string_lossy().to_string();
         on_disk_paths.insert(path_str.clone());
 
-        // Check if already in DB with matching mtime
-        let existing = track::Entity::find()
-            .filter(track::Column::FilePath.eq(&path_str))
-            .one(db)
-            .await?;
+        // Look up the existing row (if any) in the preloaded map.
+        let existing = existing_by_path.get(path_str.as_str()).copied();
 
-        let needs_update = match &existing {
-            Some(row) => {
-                // Compare FS mtime with stored date_modified
-                let fs_mtime = get_mtime(path);
-                let db_mtime = row.date_modified.clone();
-                fs_mtime != db_mtime
-            }
+        let needs_update = match existing {
+            // Compare FS mtime with stored date_modified.
+            Some(row) => get_mtime(path) != row.date_modified,
             None => true,
         };
 
@@ -165,17 +186,16 @@ async fn initial_scan(
                 tokio::task::spawn_blocking(move || tag_parser::parse_audio_file(&p)).await;
 
             match parse_result {
-                Ok(Ok(parsed)) => match upsert_track(db, &parsed, existing.as_ref()).await {
-                    Ok(track_model) => {
-                        let arch_track = db_model_to_track(&track_model);
-                        let _ = tx
-                            .send(LibraryEvent::TrackUpserted(Box::new(arch_track)))
-                            .await;
-                    }
-                    Err(e) => {
+                Ok(Ok(parsed)) => {
+                    // During the initial scan we do NOT emit a TrackUpserted
+                    // per file: the single FullSync below delivers the complete
+                    // snapshot, avoiding O(n^2) UI work plus a full track-list
+                    // clone per event. The watcher still emits TrackUpserted for
+                    // incremental changes, where it is cheap.
+                    if let Err(e) = upsert_track(db, &parsed, existing).await {
                         warn!(path = %path_str, error = %e, "Failed to upsert track");
                     }
-                },
+                }
                 Ok(Err(e)) => {
                     warn!(path = %path_str, error = %e, "Skipping unparseable file");
                 }
@@ -191,27 +211,43 @@ async fn initial_scan(
         }
     }
 
-    // Remove DB entries for files no longer on disk
-    let all_db_tracks = track::Entity::find().all(db).await?;
-    for row in &all_db_tracks {
-        if !on_disk_paths.contains(&row.file_path) {
-            info!(path = %row.file_path, "Removing stale track from database");
-            track::Entity::delete_by_id(&row.id).exec(db).await?;
-            let _ = tx
-                .send(LibraryEvent::TrackRemoved(row.file_path.clone()))
-                .await;
+    // Remove DB entries for files no longer on disk. Reuse the preloaded
+    // snapshot instead of re-querying. A failed individual delete is logged and
+    // skipped rather than aborting the whole scan, so a transient DB hiccup
+    // can't discard the FullSync/ScanComplete that follow.
+    for row in &existing_tracks {
+        if on_disk_paths.contains(&row.file_path) {
+            continue;
         }
+        // Skip rows under a root that wasn't successfully scanned, so a
+        // temporarily-unavailable directory doesn't wipe its tracks.
+        let row_path = Path::new(&row.file_path);
+        if unavailable_roots
+            .iter()
+            .any(|&root| row_path.starts_with(root))
+        {
+            continue;
+        }
+        info!(path = %row.file_path, "Removing stale track from database");
+        if let Err(e) = track::Entity::delete_by_id(&row.id).exec(db).await {
+            warn!(path = %row.file_path, error = %e, "Failed to remove stale track");
+            continue;
+        }
+        let _ = tx
+            .send(LibraryEvent::TrackRemoved(row.file_path.clone()))
+            .await;
     }
 
-    // Send full sync
-    let all_tracks: Vec<Track> = track::Entity::find()
-        .all(db)
-        .await?
-        .iter()
-        .map(db_model_to_track)
-        .collect();
-
-    let _ = tx.send(LibraryEvent::FullSync(all_tracks)).await;
+    // Send full sync. A transient failure here is logged but still lets the
+    // scan finish (reconcile + ScanComplete) so the UI settles into a synced
+    // state instead of hanging on the spinner with no completion signal.
+    match track::Entity::find().all(db).await {
+        Ok(rows) => {
+            let all_tracks: Vec<Track> = rows.iter().map(db_model_to_track).collect();
+            let _ = tx.send(LibraryEvent::FullSync(all_tracks)).await;
+        }
+        Err(e) => warn!(error = %e, "Failed to load tracks for full sync"),
+    }
 
     // Reconcile orphaned playlist entries with newly-discovered tracks.
     let playlist_mgr = super::playlist_manager::PlaylistManager::new(db.clone());
@@ -313,22 +349,52 @@ async fn watch_directories(
         let mut remove_paths: HashSet<PathBuf> = HashSet::new();
 
         let mut collect_event = |event: notify::Event| {
+            use notify::event::{ModifyKind, RenameMode};
             use notify::EventKind;
-            for path in event.paths {
-                if !tag_parser::is_audio_file(&path) {
-                    continue;
-                }
-                match event.kind {
-                    EventKind::Create(_) | EventKind::Modify(_) => {
-                        remove_paths.remove(&path);
-                        upsert_paths.insert(path);
-                    }
-                    EventKind::Remove(_) => {
+
+            // Classify each path as a removal or an upsert. A rename is
+            // delivered as Modify(Name(...)) rather than Remove: the "from"
+            // side must be treated as a removal (the file is gone at the old
+            // path) and the "to" side as an upsert. Routing a rename through
+            // the generic Modify upsert arm would re-add the new path while
+            // leaving the old path orphaned as a stale DB row.
+            match event.kind {
+                EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                    for path in event.paths {
+                        if !tag_parser::is_audio_file(&path) {
+                            continue;
+                        }
                         upsert_paths.remove(&path);
                         remove_paths.insert(path);
                     }
-                    _ => {}
                 }
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+                    // RenameMode::Both packs [from, to] into event.paths.
+                    let mut iter = event.paths.into_iter();
+                    if let Some(from) = iter.next() {
+                        if tag_parser::is_audio_file(&from) {
+                            upsert_paths.remove(&from);
+                            remove_paths.insert(from);
+                        }
+                    }
+                    for to in iter {
+                        if !tag_parser::is_audio_file(&to) {
+                            continue;
+                        }
+                        remove_paths.remove(&to);
+                        upsert_paths.insert(to);
+                    }
+                }
+                EventKind::Create(_) | EventKind::Modify(_) => {
+                    for path in event.paths {
+                        if !tag_parser::is_audio_file(&path) {
+                            continue;
+                        }
+                        remove_paths.remove(&path);
+                        upsert_paths.insert(path);
+                    }
+                }
+                _ => {}
             }
         };
 
@@ -369,6 +435,20 @@ async fn watch_directories(
 
             for path in paths {
                 if !path.exists() {
+                    // Backstop: a debounced "upsert" whose file no longer
+                    // exists is really a move/rename away (or a delete the
+                    // watcher reported as an ambiguous Modify). Remove the
+                    // stale DB row instead of leaving an orphan that fails to
+                    // play.
+                    let path_str = path.to_string_lossy().to_string();
+                    if let Ok(Some(row)) = track::Entity::find()
+                        .filter(track::Column::FilePath.eq(&path_str))
+                        .one(db.as_ref())
+                        .await
+                    {
+                        let _ = track::Entity::delete_by_id(&row.id).exec(db.as_ref()).await;
+                        let _ = tx.send(LibraryEvent::TrackRemoved(path_str)).await;
+                    }
                     continue;
                 }
                 let p = path.clone();

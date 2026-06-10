@@ -42,6 +42,12 @@ pub struct ParsedTrack {
 }
 
 /// Parse an audio file at `path` using lofty + filesystem metadata.
+///
+/// This delegates parsing of untrusted file bytes to `lofty`, whose
+/// contract is to return `Err` on malformed input rather than panic, so no
+/// `catch_unwind` isolation is added here. Callers that invoke this directly
+/// on the GTK main thread rely on that contract; the scan paths additionally
+/// run it inside `spawn_blocking`, which already isolates any panic.
 pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
     // Read tags via lofty
     let tagged_file = lofty::read_from_path(path)

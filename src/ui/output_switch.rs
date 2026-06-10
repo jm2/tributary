@@ -138,7 +138,16 @@ fn handle_chromecast_switch(
 
     park_local_if_needed(active_output, parked_local, event_sender);
 
-    let chromecast = ChromecastOutput::new(&cast_name, &host, port, event_sender.clone());
+    // Seed the new output with the current slider value so selecting a device
+    // doesn't reset its effective volume to maximum (the slider stays
+    // authoritative and the device starts at the user's chosen level).
+    let chromecast = ChromecastOutput::new(
+        &cast_name,
+        &host,
+        port,
+        event_sender.clone(),
+        volume_scale.value(),
+    );
     *active_output.borrow_mut() = Box::new(chromecast);
     info!(
         name = %cast_name,
@@ -176,7 +185,15 @@ fn handle_airplay_switch(
 
     park_local_if_needed(active_output, parked_local, event_sender);
 
-    let airplay = AirPlayOutput::new(&airplay_name, &host, port, event_sender.clone());
+    // Seed the new output with the current slider value so selecting a device
+    // doesn't reset its effective volume to maximum (0 dB) on first playback.
+    let airplay = AirPlayOutput::new(
+        &airplay_name,
+        &host,
+        port,
+        event_sender.clone(),
+        volume_scale.value(),
+    );
     let supports_volume = airplay.supports_volume();
     *active_output.borrow_mut() = Box::new(airplay);
     info!(
@@ -199,15 +216,19 @@ fn handle_mpd_switch(
     volume_scale: &gtk::Scale,
 ) {
     let saved = load_saved_outputs();
-    // Count non-AirPlay rows before this one (excluding
-    // index 0 = "My Computer") to get the saved_idx.
+    // Count only MPD rows (network-server-symbolic) before this one,
+    // excluding index 0 = "My Computer", to get the saved_idx. AirPlay
+    // (network-wireless-symbolic) and Chromecast (video-display-symbolic)
+    // rows must NOT be counted: load_saved_outputs() contains MPD entries
+    // only, so counting any discovered cast/AirPlay row would inflate
+    // mpd_idx and select the wrong server (or silently fail to switch).
     let mut mpd_idx = 0usize;
     let mut child = list_box.first_child();
     let mut row_count = 0i32;
     while let Some(c) = child {
         if row_count > 0 && row_count < idx {
-            // Check if this row is NOT an AirPlay row.
-            let is_ap = c
+            // Check if this row is an MPD row.
+            let is_mpd = c
                 .first_child()
                 .and_then(|inner| inner.downcast::<gtk::Box>().ok())
                 .and_then(|rb| {
@@ -215,8 +236,8 @@ fn handle_mpd_switch(
                         .and_then(|i| i.downcast::<gtk::Image>().ok())
                 })
                 .and_then(|icon| icon.icon_name())
-                .is_some_and(|n| n == "network-wireless-symbolic");
-            if !is_ap {
+                .is_some_and(|n| n == "network-server-symbolic");
+            if is_mpd {
                 mpd_idx += 1;
             }
         }

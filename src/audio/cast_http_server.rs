@@ -111,6 +111,12 @@ impl CastHttpServer {
     ///
     /// Returns the full HTTP URL that a Chromecast can load to stream
     /// the file, e.g. `http://192.168.1.42:54321/cast/<uuid>.flac`.
+    ///
+    /// Note: the registry is insert-only — entries are not expired and remain
+    /// servable for the lifetime of the server (the app session). This is
+    /// acceptable here because access is gated by an unguessable random v4
+    /// UUID, the listener is LAN-only, and the map is bounded by the number of
+    /// distinct local files cast in a session (a tiny `String`+`PathBuf` each).
     pub fn register_file(&self, path: &std::path::Path) -> String {
         let id = Uuid::new_v4().to_string();
 

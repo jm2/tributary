@@ -1,7 +1,7 @@
 //! `LocalBackend` — `MediaBackend` implementation for the local SQLite library.
 
 use async_trait::async_trait;
-use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 use url::Url;
 use uuid::Uuid;
 
@@ -54,11 +54,13 @@ impl MediaBackend for LocalBackend {
                     .add(track::Column::ArtistName.contains(query))
                     .add(track::Column::AlbumTitle.contains(query)),
             )
+            // Bound the result set in SQL rather than materialising every
+            // matching row and truncating in Rust.
+            .limit(limit as u64)
             .all(&self.db)
             .await
             .map_err(|e| BackendError::Internal(e.into()))?
             .iter()
-            .take(limit)
             .map(db_model_to_track)
             .collect();
 
@@ -183,8 +185,15 @@ impl MediaBackend for LocalBackend {
                 id: *track_id,
             })?;
 
-        Url::parse(&format!("file://{}", row.file_path))
-            .map_err(|e| BackendError::Internal(e.into()))
+        // Build the file URL via from_file_path so reserved characters in
+        // the path ('#', '?', spaces, …) are percent-encoded correctly,
+        // rather than string-concatenating a "file://…" URL that mis-parses.
+        Url::from_file_path(&row.file_path).map_err(|()| {
+            BackendError::Internal(anyhow::anyhow!(
+                "Invalid file path for stream URL: {}",
+                row.file_path
+            ))
+        })
     }
 
     async fn get_cover_art(&self, _album_id: &Uuid) -> BackendResult<Option<Url>> {

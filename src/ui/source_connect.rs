@@ -126,8 +126,10 @@ pub fn setup_source_connect(state: &WindowState) {
 
             // Restore music column layout (not radio).
             apply_radio_columns(&column_view, false);
-            // Restore browser visibility from config.
+            // Restore column + browser visibility from config (issue #38:
+            // opening a playlist must not reset hidden columns to default).
             let cfg = app_config.borrow();
+            preferences::apply_column_visibility(&column_view, &cfg.visible_columns);
             preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
             drop(cfg);
 
@@ -435,8 +437,11 @@ pub fn setup_source_connect(state: &WindowState) {
 
             // Restore music column layout if coming from radio.
             apply_radio_columns(&column_view, false);
-            // Restore browser visibility from config.
+            // Restore column + browser visibility from config (issue #38:
+            // connecting a remote source must not reset hidden columns to
+            // default).
             let cfg = app_config.borrow();
+            preferences::apply_column_visibility(&column_view, &cfg.visible_columns);
             preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
             drop(cfg);
 

@@ -49,8 +49,18 @@ fn volume_name(path: &Path) -> String {
 
 #[cfg(target_os = "linux")]
 fn detect_linux(devices: &mut Vec<DeviceInfo>) {
-    // Standard mount points for removable media.
-    let user = std::env::var("USER").unwrap_or_default();
+    // Standard mount points for removable media. Resolve the login name from
+    // USER (falling back to LOGNAME). If neither is set, bail out rather than
+    // scanning the bare `/media` and `/run/media` roots — doing so would
+    // enumerate *other* users' per-user mount directories and surface them as
+    // bogus "devices" pointing at someone else's media root.
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default();
+    if user.is_empty() {
+        debug!("USER/LOGNAME not set — skipping per-user removable media scan");
+        return;
+    }
     let mount_dirs = [format!("/media/{user}"), format!("/run/media/{user}")];
 
     for mount_dir in &mount_dirs {

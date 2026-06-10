@@ -132,7 +132,16 @@ fn write_tags_to(temp_path: &Path, edits: &TagEdits) -> Result<()> {
     let mut tagged_file = lofty::read_from_path(temp_path)
         .with_context(|| format!("Failed to read tags from {}", temp_path.display()))?;
 
-    // Get or create the primary tag for this file type.
+    // Get or create the primary tag for this file type. Files with no
+    // existing primary tag (e.g. a stripped MP3, or a FLAC without a Vorbis
+    // comment block) need a fresh tag of the file's primary type so new
+    // metadata can be authored on them — primary_tag_mut() alone never
+    // creates one.
+    if tagged_file.primary_tag_mut().is_none() {
+        let tag_type = tagged_file.primary_tag_type();
+        tagged_file.insert_tag(lofty::tag::Tag::new(tag_type));
+    }
+
     let tag = tagged_file.primary_tag_mut().ok_or_else(|| {
         anyhow::anyhow!(
             "No primary tag found and cannot create one for {}",

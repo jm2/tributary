@@ -155,12 +155,62 @@ impl PlexBackend {
         for lib in &self.music_libraries {
             let section_endpoint = format!("library/sections/{}/all", lib.key);
 
-            // ── Fetch tracks (type=10) ──────────────────────────────
-            let tracks_resp: PlexTracksResponse = self
+            // Fetch tracks, albums and artists for this section.  A failure
+            // in any single call is logged and skips ONLY this section, so
+            // other music libraries still load — one flaky/transient section
+            // must not discard the entire multi-library catalogue (the
+            // Subsonic backend already tolerates per-item failures this way).
+            // Fetch all three before accumulating so a mid-section failure
+            // never leaves the section half-populated.
+            let tracks_resp: PlexTracksResponse = match self
                 .client
                 .get_with_params(&section_endpoint, &[("type", "10")])
-                .await?;
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::warn!(
+                        section = %lib.name,
+                        error = %e,
+                        "Failed to fetch Plex tracks, skipping section"
+                    );
+                    continue;
+                }
+            };
 
+            let albums_resp: PlexAlbumsResponse = match self
+                .client
+                .get_with_params(&section_endpoint, &[("type", "9")])
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::warn!(
+                        section = %lib.name,
+                        error = %e,
+                        "Failed to fetch Plex albums, skipping section"
+                    );
+                    continue;
+                }
+            };
+
+            let artists_resp: PlexArtistsResponse = match self
+                .client
+                .get_with_params(&section_endpoint, &[("type", "8")])
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::warn!(
+                        section = %lib.name,
+                        error = %e,
+                        "Failed to fetch Plex artists, skipping section"
+                    );
+                    continue;
+                }
+            };
+
+            // ── Accumulate tracks (type=10) ─────────────────────────
             for plex_track in &tracks_resp.media_container.metadata {
                 let track_uuid = deterministic_uuid(&plex_track.rating_key);
                 let artist_id = plex_track
@@ -181,12 +231,7 @@ impl PlexBackend {
                 all_tracks.push(track);
             }
 
-            // ── Fetch albums (type=9) ───────────────────────────────
-            let albums_resp: PlexAlbumsResponse = self
-                .client
-                .get_with_params(&section_endpoint, &[("type", "9")])
-                .await?;
-
+            // ── Accumulate albums (type=9) ──────────────────────────
             for plex_album in &albums_resp.media_container.metadata {
                 let album_uuid = deterministic_uuid(&plex_album.rating_key);
                 let artist_id = plex_album
@@ -214,12 +259,7 @@ impl PlexBackend {
                 });
             }
 
-            // ── Fetch artists (type=8) ──────────────────────────────
-            let artists_resp: PlexArtistsResponse = self
-                .client
-                .get_with_params(&section_endpoint, &[("type", "8")])
-                .await?;
-
+            // ── Accumulate artists (type=8) ─────────────────────────
             for plex_artist in &artists_resp.media_container.metadata {
                 let artist_uuid = deterministic_uuid(&plex_artist.rating_key);
 

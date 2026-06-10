@@ -4,9 +4,11 @@
 //! references with fingerprint data for rediscovery after library rebuilds.
 //! Smart playlists store rule configurations and evaluate dynamically.
 
+use std::collections::HashMap;
+
 use sea_orm::prelude::*;
-use sea_orm::{ActiveValue::Set, Condition, QueryOrder};
-use tracing::{debug, info};
+use sea_orm::{ActiveValue::Set, QueryOrder, TransactionTrait};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::smart_rules::{self, SmartRules};
@@ -96,11 +98,17 @@ impl PlaylistManager {
     /// Stores fingerprint data (title, artist, album, duration) for
     /// rediscovery after a library rebuild.
     pub async fn add_track(&self, playlist_id: &str, track: &track::Model) -> Result<(), DbErr> {
+        // Wrap the next-position read and the insert in a transaction so the
+        // two statements form a single atomic unit. (Fully preventing two
+        // concurrent adds from claiming the same position would additionally
+        // require a UNIQUE(playlist_id, position) index — see migrations.)
+        let txn = self.db.begin().await?;
+
         // Get next position.
         let max_pos = playlist_entry::Entity::find()
             .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
             .order_by_desc(playlist_entry::Column::Position)
-            .one(&self.db)
+            .one(&txn)
             .await?
             .map(|e| e.position)
             .unwrap_or(-1);
@@ -115,7 +123,8 @@ impl PlaylistManager {
             match_album: Set(track.album_title.to_lowercase().trim().to_string()),
             match_duration_secs: Set(track.duration_secs.map(|d| d as i32)),
         };
-        entry.insert(&self.db).await?;
+        entry.insert(&txn).await?;
+        txn.commit().await?;
         debug!(playlist = %playlist_id, track = %track.title, "Track added to playlist");
         Ok(())
     }
@@ -134,18 +143,23 @@ impl PlaylistManager {
         playlist_id: &str,
         entry_ids: &[String],
     ) -> Result<(), DbErr> {
+        // Apply all position updates inside a transaction so a mid-loop
+        // failure rolls back cleanly instead of leaving a mix of old and new
+        // positions (duplicate/gapped ordering).
+        let txn = self.db.begin().await?;
         for (pos, entry_id) in entry_ids.iter().enumerate() {
             let mut entry: playlist_entry::ActiveModel =
                 playlist_entry::Entity::find_by_id(entry_id.clone())
                     .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
-                    .one(&self.db)
+                    .one(&txn)
                     .await?
                     .ok_or(DbErr::RecordNotFound(format!("Entry {entry_id} not found")))?
                     .into();
 
             entry.position = Set(pos as i32);
-            entry.update(&self.db).await?;
+            entry.update(&txn).await?;
         }
+        txn.commit().await?;
         Ok(())
     }
 
@@ -161,17 +175,27 @@ impl PlaylistManager {
             .all(&self.db)
             .await?;
 
-        let mut tracks = Vec::new();
-        for entry in entries {
-            if let Some(track_id) = &entry.track_id {
-                if let Some(t) = track::Entity::find_by_id(track_id.clone())
-                    .one(&self.db)
-                    .await?
-                {
-                    tracks.push(t);
-                }
-            }
+        // Collect the linked track IDs in playlist order.
+        let track_ids: Vec<String> = entries.iter().filter_map(|e| e.track_id.clone()).collect();
+        if track_ids.is_empty() {
+            return Ok(Vec::new());
         }
+
+        // Fetch all referenced tracks in a single query (instead of N+1
+        // `find_by_id` round-trips), then re-order them to match entry
+        // positions. Duplicate entries for the same track are preserved.
+        let by_id: HashMap<String, track::Model> = track::Entity::find()
+            .filter(track::Column::Id.is_in(track_ids.iter().map(String::as_str)))
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|t| (t.id.clone(), t))
+            .collect();
+
+        let tracks = track_ids
+            .iter()
+            .filter_map(|id| by_id.get(id).cloned())
+            .collect();
         Ok(tracks)
     }
 
@@ -234,15 +258,37 @@ impl PlaylistManager {
                 "Playlist {playlist_id} not found"
             )))?;
 
-        let rules_json = playlist.smart_rules_json.as_deref().unwrap_or("{}");
-        let rules: SmartRules = serde_json::from_str(rules_json).unwrap_or(SmartRules {
-            match_mode: smart_rules::MatchMode::All,
-            rules: Vec::new(),
-            limit: None,
-            live_updating: true,
-            sort_order: Vec::new(),
-        });
+        // A playlist with no rules configured yet (`smart_rules_json` is None)
+        // defaults to "match all". But a *parse failure* of stored JSON
+        // (corruption or schema drift) must NOT silently become match-all —
+        // that would dump the whole library — so it is logged and yields no
+        // tracks instead.
+        let rules: SmartRules = match playlist.smart_rules_json.as_deref() {
+            Some(json) => match serde_json::from_str(json) {
+                Ok(rules) => rules,
+                Err(e) => {
+                    warn!(
+                        id = %playlist_id,
+                        error = %e,
+                        "Failed to parse smart_rules_json; returning no tracks instead of matching all"
+                    );
+                    return Ok(Vec::new());
+                }
+            },
+            None => SmartRules {
+                match_mode: smart_rules::MatchMode::All,
+                rules: Vec::new(),
+                limit: None,
+                live_updating: true,
+                sort_order: Vec::new(),
+            },
+        };
 
+        // The whole table is loaded and evaluated in Rust because the rule
+        // engine is generic over the `SmartTrack` trait (it also drives UI
+        // `TrackObject`s), so the predicates can't all be expressed in SQL.
+        // The per-comparison allocation cost of the compound sort is mitigated
+        // in `smart_rules::apply_compound_sort` (decorate-sort-undecorate).
         let all_tracks = track::Entity::find().all(&self.db).await?;
         let results = smart_rules::evaluate(&rules, &all_tracks);
         Ok(results)
@@ -273,45 +319,55 @@ impl PlaylistManager {
             "Reconciling orphaned playlist entries"
         );
 
+        // Load the track table once and index it by normalized
+        // (title, artist, album) fingerprint, so each orphan is resolved with
+        // an in-memory lookup instead of a full-table-scan SQL query per
+        // orphan (the SQL `lower(col)` predicate couldn't use the column
+        // indexes). The keys are lowercased AND trimmed to match how the
+        // `match_*` fields are stored in `add_track`.
+        let all_tracks = track::Entity::find().all(&self.db).await?;
+        let mut index: HashMap<(String, String, String), Vec<&track::Model>> = HashMap::new();
+        for t in &all_tracks {
+            let key = (
+                t.title.to_lowercase().trim().to_string(),
+                t.artist_name.to_lowercase().trim().to_string(),
+                t.album_title.to_lowercase().trim().to_string(),
+            );
+            index.entry(key).or_default().push(t);
+        }
+
         let mut relinked = 0u32;
 
         for orphan in orphans {
-            // Find candidate tracks matching the fingerprint.
-            let mut condition = Condition::all()
-                .add(
-                    sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
-                        sea_orm::sea_query::Expr::col(track::Column::Title),
-                    ))
-                    .eq(&orphan.match_title),
-                )
-                .add(
-                    sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
-                        sea_orm::sea_query::Expr::col(track::Column::ArtistName),
-                    ))
-                    .eq(&orphan.match_artist),
-                )
-                .add(
-                    sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
-                        sea_orm::sea_query::Expr::col(track::Column::AlbumTitle),
-                    ))
-                    .eq(&orphan.match_album),
-                );
+            // `match_*` are already lowercased + trimmed at insert time.
+            let key = (
+                orphan.match_title.clone(),
+                orphan.match_artist.clone(),
+                orphan.match_album.clone(),
+            );
+            let Some(candidates) = index.get(&key) else {
+                continue;
+            };
 
-            // If duration is available, allow ±2 second tolerance.
-            if let Some(dur) = orphan.match_duration_secs {
-                condition = condition
-                    .add(track::Column::DurationSecs.gte((dur - 2) as i64))
-                    .add(track::Column::DurationSecs.lte((dur + 2) as i64));
-            }
+            // If duration was recorded, require a candidate within ±2s
+            // (preserving the previous matching semantics); otherwise take
+            // the first fingerprint match.
+            let best = if let Some(dur) = orphan.match_duration_secs {
+                candidates
+                    .iter()
+                    .find(|t| {
+                        t.duration_secs
+                            .is_some_and(|d| (d - i64::from(dur)).abs() <= 2)
+                    })
+                    .copied()
+            } else {
+                candidates.first().copied()
+            };
 
-            let candidates = track::Entity::find()
-                .filter(condition)
-                .all(&self.db)
-                .await?;
-
-            if let Some(best) = candidates.first() {
+            if let Some(best) = best {
+                let track_id = best.id.clone();
                 let mut entry: playlist_entry::ActiveModel = orphan.into();
-                entry.track_id = Set(Some(best.id.clone()));
+                entry.track_id = Set(Some(track_id));
                 entry.update(&self.db).await?;
                 relinked += 1;
             }

@@ -19,6 +19,15 @@ use nom::Parser;
 
 use crate::architecture::error::BackendError;
 
+/// Maximum container nesting depth accepted by the parser.
+///
+/// DMAP containers can nest (`mlcl` → `mlit` → …), and the parser recurses
+/// once per level.  A crafted DAAP response can request arbitrarily deep
+/// nesting with only ~8 bytes per level, which would otherwise overflow the
+/// worker-thread stack — an uncatchable abort that crashes the whole app.
+/// Real DAAP responses nest only a handful of levels, so 32 is generous.
+const MAX_DEPTH: usize = 32;
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -131,7 +140,7 @@ pub fn parse_dmap(input: &[u8]) -> Result<Vec<DmapNode>, BackendError> {
         return Ok(Vec::new());
     }
 
-    match parse_nodes(input) {
+    match parse_nodes(input, 0) {
         Ok((remaining, nodes)) => {
             if !remaining.is_empty() {
                 return Err(BackendError::ParseError {
@@ -152,12 +161,23 @@ pub fn parse_dmap(input: &[u8]) -> Result<Vec<DmapNode>, BackendError> {
 }
 
 /// Parse zero or more consecutive DMAP nodes from the input.
-fn parse_nodes(input: &[u8]) -> IResult<&[u8], Vec<DmapNode>> {
-    many0(parse_single_node).parse(input)
+fn parse_nodes(input: &[u8], depth: usize) -> IResult<&[u8], Vec<DmapNode>> {
+    many0(move |i| parse_single_node(i, depth)).parse(input)
 }
 
 /// Parse a single DMAP TLV node.
-fn parse_single_node(input: &[u8]) -> IResult<&[u8], DmapNode> {
+fn parse_single_node(input: &[u8], depth: usize) -> IResult<&[u8], DmapNode> {
+    // Bound recursion depth.  Surface an unrecoverable `Failure` (not a
+    // recoverable `Error`, which `many0` would silently swallow) so the
+    // whole parse aborts with a clean `ParseError` instead of recursing
+    // until the thread stack overflows.
+    if depth > MAX_DEPTH {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
+
     // 4-byte tag
     let (input, tag_bytes) = take(4usize)(input)?;
     let mut tag = [0u8; 4];
@@ -169,18 +189,29 @@ fn parse_single_node(input: &[u8]) -> IResult<&[u8], DmapNode> {
     // Take exactly `length` bytes of content
     let (input, content) = take(length as usize)(input)?;
 
-    let data = decode_value(&tag, content);
+    let data = decode_value(&tag, content, depth)?;
 
     Ok((input, DmapNode { tag, data }))
 }
 
 /// Decode the content bytes of a node according to its tag type.
-fn decode_value(tag: &[u8; 4], content: &[u8]) -> DmapValue {
-    match tag_type(tag) {
+///
+/// Returns `Err` only to propagate an unrecoverable depth-limit `Failure`
+/// from a nested container; all other (recoverable) decode problems fall
+/// back to [`DmapValue::Raw`].
+fn decode_value<'a>(
+    tag: &[u8; 4],
+    content: &'a [u8],
+    depth: usize,
+) -> Result<DmapValue, nom::Err<nom::error::Error<&'a [u8]>>> {
+    let value = match tag_type(tag) {
         DmapType::Container => {
-            match parse_nodes(content) {
+            match parse_nodes(content, depth + 1) {
                 Ok((_, children)) => DmapValue::Container(children),
-                // If container parsing fails, store as raw.
+                // A depth-limit breach is an unrecoverable `Failure` — pass
+                // it up so the whole parse aborts instead of stack-overflowing.
+                Err(e @ nom::Err::Failure(_)) => return Err(e),
+                // Any other (recoverable) error: store the raw bytes.
                 Err(_) => DmapValue::Raw(content.to_vec()),
             }
         }
@@ -218,7 +249,8 @@ fn decode_value(tag: &[u8; 4], content: &[u8]) -> DmapValue {
             Err(_) => DmapValue::Raw(content.to_vec()),
         },
         DmapType::Raw => DmapValue::Raw(content.to_vec()),
-    }
+    };
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -518,5 +550,32 @@ mod tests {
             find_string(&nodes, b"minm"),
             Some("日本語テスト".to_string())
         );
+    }
+
+    #[test]
+    fn test_deeply_nested_containers_rejected() {
+        // Build many nested `mlit` containers — far deeper than MAX_DEPTH.
+        // Without the depth guard this would recurse until the worker-thread
+        // stack overflows (an uncatchable abort); with it, parsing must
+        // return a clean `ParseError`.
+        let mut blob = make_tlv(b"mlit", b"");
+        for _ in 0..(MAX_DEPTH + 5) {
+            blob = make_tlv(b"mlit", &blob);
+        }
+
+        let result = parse_dmap(&blob);
+        assert!(result.is_err(), "deep nesting should be rejected");
+    }
+
+    #[test]
+    fn test_nesting_within_limit_accepted() {
+        // A handful of nested containers (well under MAX_DEPTH) still parses.
+        let mut blob = make_tlv(b"minm", b"OK");
+        for _ in 0..5 {
+            blob = make_tlv(b"mlit", &blob);
+        }
+        let nodes = parse_dmap(&blob).expect("shallow nesting should parse");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(&nodes[0].tag, b"mlit");
     }
 }

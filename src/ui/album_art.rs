@@ -60,7 +60,12 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
                             tracing::debug!(status = %resp.status(), "Remote album art HTTP error");
                         }
                         Err(e) => {
-                            tracing::debug!(error = %e, "Failed to fetch remote album art");
+                            // Strip the URL: cover-art URLs embed per-backend
+                            // credentials (Subsonic t/s/p, Jellyfin api_key,
+                            // Plex X-Plex-Token, DAAP session-id) in the query
+                            // string, and reqwest's Display would otherwise
+                            // print the full credential-bearing URL.
+                            tracing::debug!(error = %e.without_url(), "Failed to fetch remote album art");
                         }
                     }
                 }

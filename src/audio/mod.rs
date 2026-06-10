@@ -29,6 +29,8 @@ pub mod local_output;
 pub mod mpd_output;
 pub mod output;
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gst::prelude::*;
@@ -71,6 +73,10 @@ pub struct Player {
     playbin: gst::Element,
     volume: f64,
     event_tx: async_channel::Sender<PlayerEvent>,
+    /// Holds the latest volume awaiting a debounced disk write, or `None`
+    /// when no write is scheduled.  Keeps slider-drag volume changes off
+    /// the main-thread hot path (see [`Player::save_volume_debounced`]).
+    volume_save_pending: Rc<Cell<Option<f64>>>,
     /// Dropping this guard removes the bus watch — must stay alive.
     _bus_watch: gst::bus::BusWatchGuard,
 }
@@ -146,6 +152,7 @@ impl Player {
             playbin,
             volume,
             event_tx,
+            volume_save_pending: Rc::new(Cell::new(None)),
             _bus_watch: bus_watch,
         };
 
@@ -231,8 +238,30 @@ impl Player {
         self.volume = level.clamp(0.0, 1.0);
         self.playbin
             .set_property("volume", slider_to_pipeline(self.volume));
-        save_volume(self.volume);
+        self.save_volume_debounced();
         debug!(volume = self.volume, "Volume set");
+    }
+
+    /// Persist the current volume off the GTK main-thread hot path.
+    ///
+    /// The volume adjustment fires `set_volume` on every tick of a slider
+    /// drag; writing the volume file synchronously on each tick would do
+    /// many redundant blocking disk writes on the main thread.  Instead we
+    /// coalesce them: record the latest value and, if no write is already
+    /// scheduled, queue a single delayed flush that persists whatever value
+    /// the slider has settled on.
+    fn save_volume_debounced(&self) {
+        let already_scheduled = self.volume_save_pending.get().is_some();
+        self.volume_save_pending.set(Some(self.volume));
+        if already_scheduled {
+            return;
+        }
+        let pending = Rc::clone(&self.volume_save_pending);
+        glib::timeout_add_local_once(Duration::from_millis(750), move || {
+            if let Some(level) = pending.take() {
+                save_volume(level);
+            }
+        });
     }
 
     /// Current pipeline volume (0.0 – 1.0).
@@ -567,13 +596,16 @@ fn save_volume(level: f64) {
 
 /// Mask sensitive query parameters in URLs for safe logging.
 ///
-/// Redacts `X-Plex-Token`, `api_key`, `t` (Subsonic token), and `s`
-/// (Subsonic salt) to prevent auth credentials from appearing in logs.
+/// Redacts `X-Plex-Token`, `api_key`, `session-id` (DAAP session bearer
+/// credential), `t` (Subsonic token), and `s` (Subsonic salt) to prevent
+/// auth credentials from appearing in logs.
 pub fn redact_url_secrets(uri: &str) -> String {
     // Note: "s" is only redacted when "t" is also present (Subsonic salt+token pair).
     // This avoids false positives on unrelated URLs that happen to have an "s" param.
     // "p" is the legacy plaintext password parameter (used by Nextcloud Music etc.).
-    const SENSITIVE_PARAMS: &[&str] = &["X-Plex-Token", "api_key"];
+    // "session-id" is the DAAP session credential that authorizes every request
+    // to a DAAP session (stream/cover URLs carry it in cleartext on the wire).
+    const SENSITIVE_PARAMS: &[&str] = &["X-Plex-Token", "api_key", "session-id"];
     const SUBSONIC_TOKEN_PARAMS: &[&str] = &["t", "s"];
     const SUBSONIC_PASSWORD_PARAMS: &[&str] = &["p"];
 
@@ -667,6 +699,15 @@ mod tests {
         let redacted = redact_url_secrets(url);
         assert!(redacted.contains("api_key=REDACTED"));
         assert!(!redacted.contains("secret123"));
+    }
+
+    #[test]
+    fn test_redact_daap_session_id() {
+        let url = "http://192.168.1.50:3689/databases/1/items/42.flac?session-id=1234567890&other=value";
+        let redacted = redact_url_secrets(url);
+        assert!(redacted.contains("session-id=REDACTED"));
+        assert!(redacted.contains("other=value"));
+        assert!(!redacted.contains("1234567890"));
     }
 
     #[test]
