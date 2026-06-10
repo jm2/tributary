@@ -703,7 +703,8 @@ mod tests {
 
     #[test]
     fn test_redact_daap_session_id() {
-        let url = "http://192.168.1.50:3689/databases/1/items/42.flac?session-id=1234567890&other=value";
+        let url =
+            "http://192.168.1.50:3689/databases/1/items/42.flac?session-id=1234567890&other=value";
         let redacted = redact_url_secrets(url);
         assert!(redacted.contains("session-id=REDACTED"));
         assert!(redacted.contains("other=value"));
