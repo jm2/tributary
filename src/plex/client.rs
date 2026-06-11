@@ -31,6 +31,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (the timeout resets after each successful read).
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum response body we are willing to buffer into memory.  A generous
+/// cap that still rules out a malicious or misbehaving server trying to
+/// exhaust memory with an unbounded body.  Enforced from the
+/// `Content-Length` header before the body is read (see [`check_body_size`]).
+const MAX_BODY_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Holds credentials and a reusable `reqwest::Client` with the
 /// `X-Plex-Token` header pre-configured on every request.
 pub struct PlexClient {
@@ -267,6 +273,9 @@ impl PlexClient {
             });
         }
 
+        // Refuse to buffer an oversized body (DoS guard) before reading it.
+        check_body_size(&resp)?;
+
         let body = resp
             .json::<T>()
             .await
@@ -351,6 +360,26 @@ fn validate_base_url(server_url: &str, base_url: &Url) -> BackendResult<()> {
             ),
             source: None,
         });
+    }
+    Ok(())
+}
+
+/// Reject a response whose declared body exceeds [`MAX_BODY_BYTES`].
+///
+/// A lightweight, best-effort DoS guard: it inspects only the
+/// `Content-Length` header, so a chunked response sent without a length is
+/// not covered here — the client's `read_timeout` still bounds a stalled or
+/// slow-trickling transfer in that case.
+fn check_body_size(resp: &reqwest::Response) -> BackendResult<()> {
+    if let Some(len) = resp.content_length() {
+        if len > MAX_BODY_BYTES {
+            return Err(BackendError::ConnectionFailed {
+                message: format!(
+                    "Response body too large: {len} bytes exceeds the {MAX_BODY_BYTES}-byte cap"
+                ),
+                source: None,
+            });
+        }
     }
     Ok(())
 }

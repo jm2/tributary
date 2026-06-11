@@ -118,16 +118,24 @@ impl ChromecastOutput {
             volume: initial_volume.clamp(0.0, 1.0),
             current_state: Arc::new(Mutex::new(PlayerState::Stopped)),
             cast_server: Arc::new(Mutex::new(None)),
-            // Constructed on the GTK main thread, which is not a tokio runtime
-            // context, so this is `None` in practice — local-file casting via
-            // the embedded `CastHttpServer` is therefore inactive (the UI also
-            // routes `file://` tracks to the local output before they reach
-            // here; see `play_track_at`).  Wiring this up requires threading a
-            // real runtime handle from `build_window` and starting the server
-            // via `Handle::spawn` rather than `block_on` on the main thread.
+            // Set via `with_runtime()` when built from the output selector. The
+            // GTK main thread is not a tokio runtime context, so `try_current()`
+            // alone yields `None`; with a real handle, `file://` tracks are
+            // served by the embedded `CastHttpServer`. Without one (e.g. tests),
+            // local-file casting resolves to an error rather than casting.
             rt_handle: tokio::runtime::Handle::try_current().ok(),
             session_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Attach the tokio runtime handle used to start the embedded
+    /// [`CastHttpServer`] for local-file casting. Called from the output
+    /// selector with the application's real runtime handle (the GTK main
+    /// thread has no ambient runtime).
+    #[must_use]
+    pub fn with_runtime(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.rt_handle = Some(handle);
+        self
     }
 
     /// Resolve a URI for Chromecast playback.
@@ -140,18 +148,13 @@ impl ChromecastOutput {
             return Ok(uri.to_string());
         }
 
-        // Extract the file path from the URI.
-        let path_str = uri
-            .strip_prefix("file://")
-            .unwrap_or(uri)
-            .trim_start_matches('/');
-
-        // On Windows, file:///C:/path → C:/path
-        // On Unix, file:///path → /path
-        #[cfg(target_os = "windows")]
-        let file_path = std::path::PathBuf::from(path_str);
-        #[cfg(not(target_os = "windows"))]
-        let file_path = std::path::PathBuf::from(format!("/{path_str}"));
+        // Decode the file path from the URI via the URL parser so reserved
+        // characters (spaces → %20, '#', '?', …) round-trip correctly on both
+        // Unix and Windows, rather than naive string-stripping.
+        let file_path = url::Url::parse(uri)
+            .ok()
+            .and_then(|u| u.to_file_path().ok())
+            .ok_or_else(|| format!("Invalid file URI: {uri}"))?;
 
         if !file_path.exists() {
             return Err(format!("File not found: {}", file_path.display()));

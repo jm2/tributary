@@ -94,6 +94,15 @@ pub struct PlexTracksContainer {
     #[serde(default)]
     pub size: u32,
 
+    /// Total number of items across all pages.  Plex reports this on a
+    /// paginated container; absent when the endpoint does not paginate.
+    #[serde(rename = "totalSize", default)]
+    pub total_size: Option<u32>,
+
+    /// Zero-based offset of the first item in this page.
+    #[serde(default)]
+    pub offset: Option<u32>,
+
     #[serde(rename = "Metadata", default)]
     pub metadata: Vec<PlexTrack>,
 }
@@ -213,6 +222,15 @@ pub struct PlexAlbumsContainer {
     #[serde(default)]
     pub size: u32,
 
+    /// Total number of items across all pages.  Plex reports this on a
+    /// paginated container; absent when the endpoint does not paginate.
+    #[serde(rename = "totalSize", default)]
+    pub total_size: Option<u32>,
+
+    /// Zero-based offset of the first item in this page.
+    #[serde(default)]
+    pub offset: Option<u32>,
+
     #[serde(rename = "Metadata", default)]
     pub metadata: Vec<PlexAlbum>,
 }
@@ -278,6 +296,15 @@ pub struct PlexArtistsResponse {
 pub struct PlexArtistsContainer {
     #[serde(default)]
     pub size: u32,
+
+    /// Total number of items across all pages.  Plex reports this on a
+    /// paginated container; absent when the endpoint does not paginate.
+    #[serde(rename = "totalSize", default)]
+    pub total_size: Option<u32>,
+
+    /// Zero-based offset of the first item in this page.
+    #[serde(default)]
+    pub offset: Option<u32>,
 
     #[serde(rename = "Metadata", default)]
     pub metadata: Vec<PlexArtist>,

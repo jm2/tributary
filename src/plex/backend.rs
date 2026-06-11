@@ -17,10 +17,21 @@ use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
 
 use super::api::{
-    PlexAlbumsResponse, PlexArtistsResponse, PlexIdentityResponse, PlexSectionsResponse, PlexTrack,
-    PlexTracksResponse,
+    PlexAlbum, PlexAlbumsResponse, PlexArtist, PlexArtistsResponse, PlexIdentityResponse,
+    PlexSectionsResponse, PlexTrack, PlexTracksResponse,
 };
 use super::client::PlexClient;
+
+/// Page size requested via `X-Plex-Container-Size`.  Plex caps the number
+/// of items returned per request, so a full `library/sections/{key}/all`
+/// listing must be paged through with `X-Plex-Container-Start`.
+const PLEX_PAGE_SIZE: u32 = 1000;
+
+/// Safety cap on the number of pages fetched per section/type.  Guards
+/// against a server that never signals completion (e.g. a `totalSize` that
+/// keeps shifting); at [`PLEX_PAGE_SIZE`] items per page this still covers
+/// libraries of up to a million items per type.
+const PLEX_MAX_PAGES: usize = 1000;
 
 // ── Discovery result ────────────────────────────────────────────────────
 
@@ -155,19 +166,24 @@ impl PlexBackend {
         for lib in &self.music_libraries {
             let section_endpoint = format!("library/sections/{}/all", lib.key);
 
-            // Fetch tracks, albums and artists for this section.  A failure
-            // in any single call is logged and skips ONLY this section, so
-            // other music libraries still load — one flaky/transient section
-            // must not discard the entire multi-library catalogue (the
-            // Subsonic backend already tolerates per-item failures this way).
-            // Fetch all three before accumulating so a mid-section failure
-            // never leaves the section half-populated.
-            let tracks_resp: PlexTracksResponse = match self
-                .client
-                .get_with_params(&section_endpoint, &[("type", "10")])
+            // Fetch tracks, albums and artists for this section, paging
+            // through each listing with `X-Plex-Container-Start` /
+            // `X-Plex-Container-Size` (Plex caps the items returned per
+            // request).  A failure in any single call is logged and skips
+            // ONLY this section, so other music libraries still load — one
+            // flaky/transient section must not discard the entire
+            // multi-library catalogue (the Subsonic backend already
+            // tolerates per-item failures this way).  Fetch all three before
+            // accumulating so a mid-section failure never leaves the section
+            // half-populated.
+            let tracks: Vec<PlexTrack> = match self
+                .fetch_all_pages::<PlexTracksResponse, _>(&section_endpoint, "10", &lib.name, |r| {
+                    let c = r.media_container;
+                    (c.metadata, c.total_size)
+                })
                 .await
             {
-                Ok(resp) => resp,
+                Ok(items) => items,
                 Err(e) => {
                     tracing::warn!(
                         section = %lib.name,
@@ -178,12 +194,14 @@ impl PlexBackend {
                 }
             };
 
-            let albums_resp: PlexAlbumsResponse = match self
-                .client
-                .get_with_params(&section_endpoint, &[("type", "9")])
+            let albums: Vec<PlexAlbum> = match self
+                .fetch_all_pages::<PlexAlbumsResponse, _>(&section_endpoint, "9", &lib.name, |r| {
+                    let c = r.media_container;
+                    (c.metadata, c.total_size)
+                })
                 .await
             {
-                Ok(resp) => resp,
+                Ok(items) => items,
                 Err(e) => {
                     tracing::warn!(
                         section = %lib.name,
@@ -194,12 +212,14 @@ impl PlexBackend {
                 }
             };
 
-            let artists_resp: PlexArtistsResponse = match self
-                .client
-                .get_with_params(&section_endpoint, &[("type", "8")])
+            let artists: Vec<PlexArtist> = match self
+                .fetch_all_pages::<PlexArtistsResponse, _>(&section_endpoint, "8", &lib.name, |r| {
+                    let c = r.media_container;
+                    (c.metadata, c.total_size)
+                })
                 .await
             {
-                Ok(resp) => resp,
+                Ok(items) => items,
                 Err(e) => {
                     tracing::warn!(
                         section = %lib.name,
@@ -211,7 +231,7 @@ impl PlexBackend {
             };
 
             // ── Accumulate tracks (type=10) ─────────────────────────
-            for plex_track in &tracks_resp.media_container.metadata {
+            for plex_track in &tracks {
                 let track_uuid = deterministic_uuid(&plex_track.rating_key);
                 let artist_id = plex_track
                     .grandparent_rating_key
@@ -232,7 +252,7 @@ impl PlexBackend {
             }
 
             // ── Accumulate albums (type=9) ──────────────────────────
-            for plex_album in &albums_resp.media_container.metadata {
+            for plex_album in &albums {
                 let album_uuid = deterministic_uuid(&plex_album.rating_key);
                 let artist_id = plex_album
                     .parent_rating_key
@@ -260,7 +280,7 @@ impl PlexBackend {
             }
 
             // ── Accumulate artists (type=8) ─────────────────────────
-            for plex_artist in &artists_resp.media_container.metadata {
+            for plex_artist in &artists {
                 let artist_uuid = deterministic_uuid(&plex_artist.rating_key);
 
                 let cover_art_url = plex_artist
@@ -305,6 +325,78 @@ impl PlexBackend {
         };
 
         Ok(())
+    }
+
+    /// Fetch every page of a paginated Plex listing endpoint.
+    ///
+    /// Plex returns at most a server-defined number of items per request,
+    /// so a full `library/sections/{key}/all?type=N` listing must be paged
+    /// through with `X-Plex-Container-Start` / `X-Plex-Container-Size`.  The
+    /// loop reads `totalSize` from the `MediaContainer` (falling back to a
+    /// short-/empty-page check when the server omits it) and stops once
+    /// everything has been retrieved, bounded by [`PLEX_MAX_PAGES`].
+    ///
+    /// A request failure propagates as `Err`, letting the caller keep the
+    /// existing per-section log-and-continue behaviour.
+    async fn fetch_all_pages<R, T>(
+        &self,
+        endpoint: &str,
+        item_type: &str,
+        section_name: &str,
+        into_page: impl Fn(R) -> (Vec<T>, Option<u32>),
+    ) -> BackendResult<Vec<T>>
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        let mut items: Vec<T> = Vec::new();
+        let mut start: u32 = 0;
+
+        for page in 0..PLEX_MAX_PAGES {
+            let start_str = start.to_string();
+            let size_str = PLEX_PAGE_SIZE.to_string();
+
+            let resp: R = self
+                .client
+                .get_with_params(
+                    endpoint,
+                    &[
+                        ("type", item_type),
+                        ("X-Plex-Container-Start", &start_str),
+                        ("X-Plex-Container-Size", &size_str),
+                    ],
+                )
+                .await?;
+
+            let (page_items, total_size) = into_page(resp);
+            let page_len = page_items.len() as u32;
+            items.extend(page_items);
+
+            // Done once we've collected everything the server promised, or
+            // when an empty / short page signals there is nothing more.
+            let collected = items.len() as u32;
+            let reached_total = total_size.is_some_and(|total| collected >= total);
+            let exhausted = page_len == 0
+                || reached_total
+                || (total_size.is_none() && page_len < PLEX_PAGE_SIZE);
+            if exhausted {
+                break;
+            }
+
+            if page + 1 == PLEX_MAX_PAGES {
+                tracing::warn!(
+                    section = %section_name,
+                    item_type = %item_type,
+                    collected,
+                    total = ?total_size,
+                    "Plex pagination hit the MAX_PAGES cap; some items may be missing"
+                );
+                break;
+            }
+
+            start += page_len;
+        }
+
+        Ok(items)
     }
 
     /// Return all tracks from the cache (for UI integration layer).

@@ -28,6 +28,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Async trait support
 async-trait = "0.1"
 
+# Bounded-concurrency stream combinators (buffer_unordered) for backend fetches
+futures = "0.3"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 

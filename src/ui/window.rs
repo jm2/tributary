@@ -991,24 +991,65 @@ pub fn build_window(
         &parked_local,
         &event_sender,
         &hb.volume_scale,
+        &rt_handle,
     );
 
     // ── Wire volume scale ───────────────────────────────────────────
+    // Throttled (trailing): a slider drag emits a burst of value-changed
+    // signals, and for MPD/Chromecast outputs each set_volume spawns a
+    // worker thread + connection. Collapse the burst to ~one command per
+    // window; the final value always lands within the window.
     {
         let active_output = active_output.clone();
+        let pending: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
+        let scheduled = Rc::new(Cell::new(false));
         hb.volume_adj.connect_value_changed(move |adj| {
-            active_output.borrow_mut().set_volume(adj.value());
+            pending.set(Some(adj.value()));
+            if scheduled.replace(true) {
+                return;
+            }
+            let active_output = active_output.clone();
+            let pending = pending.clone();
+            let scheduled = scheduled.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
+                scheduled.set(false);
+                if let Some(v) = pending.take() {
+                    active_output.borrow_mut().set_volume(v);
+                }
+            });
         });
     }
 
     // ── Wire progress scrubber (seek on user interaction) ───────────
+    // Same trailing-throttle as the volume slider, and skip programmatic
+    // position-poll updates (guarded by `seeking`) so they never seek.
     {
         let active_output = active_output.clone();
         let seeking = seeking.clone();
+        let pending: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let scheduled = Rc::new(Cell::new(false));
         hb.progress_adj.connect_value_changed(move |adj| {
-            if !seeking.get() {
-                active_output.borrow().seek_to(adj.value() as u64);
+            if seeking.get() {
+                return;
             }
+            pending.set(Some(adj.value() as u64));
+            if scheduled.replace(true) {
+                return;
+            }
+            let active_output = active_output.clone();
+            let pending = pending.clone();
+            let seeking = seeking.clone();
+            let scheduled = scheduled.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
+                scheduled.set(false);
+                // Re-check the guard: don't fire a stale seek if a
+                // programmatic update is in progress when the timer lands.
+                if !seeking.get() {
+                    if let Some(p) = pending.take() {
+                        active_output.borrow().seek_to(p);
+                    }
+                }
+            });
         });
     }
 
@@ -1911,6 +1952,9 @@ pub fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObje
     if let Some(ref aa) = t.album_artist_name {
         obj.set_album_artist(aa);
     }
+
+    // Propagate disc number (shown in the Properties dialog).
+    obj.set_disc_number(t.disc_number.unwrap_or(0));
 
     obj
 }

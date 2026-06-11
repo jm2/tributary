@@ -57,27 +57,10 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         return false;
     }
 
-    // ── Chromecast file:// guard ─────────────────────────────────
-    // Chromecast can only play HTTP(S) URLs.  If the active output is
-    // Chromecast and the track is a local file, automatically fall back
-    // to the local output so playback "just works" without an error.
-    //
-    // NOTE: this means casting a *local* library track currently plays on
-    // the computer rather than the cast device. The embedded
-    // `CastHttpServer` that would serve local files to the device is
-    // inactive because `ChromecastOutput`'s tokio runtime handle is None on
-    // the GTK main thread (see `ChromecastOutput::new`); until that handle is
-    // threaded through and the server is started off the main thread, this
-    // fallback is the intended behaviour rather than a hard error.
-    let is_chromecast = ctx.active_output.borrow().output_type() == OutputType::Chromecast;
-    if is_chromecast && uri.starts_with("file://") {
-        tracing::info!("Chromecast cannot play local files — auto-switching to local output");
-        // Restore the parked local output.
-        if let Some(local) = ctx.parked_local.borrow_mut().take() {
-            *ctx.active_output.borrow_mut() = local;
-        }
-        // Now the active output is local — proceed to play on it.
-    }
+    // Local (`file://`) library tracks are cast to the device by the
+    // Chromecast output itself, which serves them over its embedded LAN
+    // `CastHttpServer` (see `ChromecastOutput::resolve_uri`); local, MPD and
+    // AirPlay outputs play them directly. No output swap is needed here.
 
     tracing::debug!("Playing track");
 

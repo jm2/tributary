@@ -33,6 +33,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// library transfer (the timeout resets after each successful read).
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum response body we are willing to buffer into memory.  A generous
+/// cap that still rules out a malicious or misbehaving server trying to
+/// exhaust memory with an unbounded body.  Enforced from the
+/// `Content-Length` header before the body is read (see [`check_body_size`]).
+const MAX_BODY_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Client version advertised to the DAAP server.
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -88,6 +94,9 @@ impl DaapClient {
                 source: None,
             });
         }
+
+        // Refuse to buffer an oversized body (DoS guard) before reading it.
+        check_body_size(&resp)?;
 
         let bytes = resp
             .bytes()
@@ -147,6 +156,9 @@ impl DaapClient {
             });
         }
 
+        // Refuse to buffer an oversized body (DoS guard) before reading it.
+        check_body_size(&resp)?;
+
         let bytes = resp
             .bytes()
             .await
@@ -190,6 +202,9 @@ impl DaapClient {
             });
         }
 
+        // Refuse to buffer an oversized body (DoS guard) before reading it.
+        check_body_size(&resp)?;
+
         let bytes = resp
             .bytes()
             .await
@@ -228,6 +243,9 @@ impl DaapClient {
                 source: None,
             });
         }
+
+        // Refuse to buffer an oversized body (DoS guard) before reading it.
+        check_body_size(&resp)?;
 
         let bytes = resp
             .bytes()
@@ -310,6 +328,9 @@ impl DaapClient {
                 source: None,
             });
         }
+
+        // Refuse to buffer an oversized body (DoS guard) before reading it.
+        check_body_size(&resp)?;
 
         let bytes = resp
             .bytes()
@@ -403,6 +424,8 @@ impl DaapClient {
         if !resp.status().is_success() {
             return None;
         }
+        // Refuse to buffer an oversized body (DoS guard) before reading it.
+        check_body_size(&resp).ok()?;
         let bytes = resp.bytes().await.ok()?;
         let nodes = dmap::parse_dmap(&bytes).ok()?;
         let children = match dmap::find_node(&nodes, b"msrv") {
@@ -494,4 +517,24 @@ fn unwrap_nested_container<'a>(
     tag: &[u8; 4],
 ) -> BackendResult<&'a [DmapNode]> {
     unwrap_container(parent_children, tag)
+}
+
+/// Reject a response whose declared body exceeds [`MAX_BODY_BYTES`].
+///
+/// A lightweight, best-effort DoS guard: it inspects only the
+/// `Content-Length` header, so a chunked response sent without a length is
+/// not covered here — the client's `read_timeout` still bounds a stalled or
+/// slow-trickling transfer in that case.
+fn check_body_size(resp: &reqwest::Response) -> BackendResult<()> {
+    if let Some(len) = resp.content_length() {
+        if len > MAX_BODY_BYTES {
+            return Err(BackendError::ConnectionFailed {
+                message: format!(
+                    "Response body too large: {len} bytes exceeds the {MAX_BODY_BYTES}-byte cap"
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(())
 }

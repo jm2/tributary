@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use tokio::sync::RwLock;
 use tracing::info;
 use url::Url;
@@ -19,6 +20,13 @@ use crate::architecture::models::*;
 
 use super::api::{AlbumEntry, ArtistEntry, SongEntry};
 use super::client::SubsonicClient;
+
+/// Maximum number of per-artist / per-album metadata fetches kept in
+/// flight at once while loading the full library.  Bounds concurrency so a
+/// large library does not open hundreds of simultaneous connections, while
+/// still overlapping request latency for a large speed-up over the old
+/// fully-sequential walk.
+const FETCH_CONCURRENCY: usize = 8;
 
 /// In-memory library cache populated from the Subsonic API.
 #[allow(dead_code)]
@@ -124,57 +132,136 @@ impl SubsonicBackend {
             .unwrap_or_default();
 
         // ── Walk each artist → albums → songs ───────────────────────
+        //
+        // The library is fetched with *bounded concurrency* instead of a
+        // fully serialized N+1 walk: per-artist `getArtist` calls run in
+        // one bounded stream, then every album's `getAlbum` call runs in a
+        // second bounded stream (at most `FETCH_CONCURRENCY` requests in
+        // flight per phase).  Results come back unordered, are restored to
+        // the original artist/album order, then assembled deterministically
+        // so the resulting cache is identical to the old sequential walk.
+        // Per-item failures keep the original log-and-skip semantics: a
+        // failed `getArtist` drops that artist entirely, a failed `getAlbum`
+        // drops just that album (the artist's `album_count` still counts it).
+
+        // Phase 1 — fetch each artist's album list concurrently. Each future
+        // owns a cheap `SubsonicClient` clone (reqwest's `Client` is
+        // `Arc`-backed) and the artist id/name, so it borrows neither `self`
+        // nor `api_artists` — keeping the spawned `refresh_library` future
+        // `Send + 'static`.
+        let client = self.client.clone();
+        let artist_reqs: Vec<(usize, String, String)> = api_artists
+            .iter()
+            .enumerate()
+            .map(|(idx, a)| (idx, a.id.clone(), a.name.clone()))
+            .collect();
+        let mut artist_albums: Vec<(usize, Option<Vec<AlbumEntry>>)> =
+            futures::stream::iter(artist_reqs)
+                .map(|(idx, id, name)| {
+                    let client = client.clone();
+                    async move {
+                        let albums = match client
+                            .get_with_params("getArtist.view", &[("id", &id)])
+                            .await
+                        {
+                            Ok(env) => {
+                                Some(env.response.artist.map(|a| a.album).unwrap_or_default())
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    artist = %name,
+                                    error = %e,
+                                    "Failed to fetch artist detail, skipping"
+                                );
+                                None
+                            }
+                        };
+                        (idx, albums)
+                    }
+                })
+                .buffer_unordered(FETCH_CONCURRENCY)
+                .collect()
+                .await;
+        // Restore the original artist order — `buffer_unordered` yields as
+        // each fetch completes, so positions now line up with `api_artists`.
+        artist_albums.sort_by_key(|(idx, _)| *idx);
+
+        // Phase 2 — fetch the songs for every album concurrently. Build an
+        // owned (artist-pos, album-pos, id, name) descriptor list first so the
+        // futures own their data (same `Send + 'static` reasoning as phase 1).
+        let album_reqs: Vec<(usize, usize, String, String)> = artist_albums
+            .iter()
+            .enumerate()
+            .filter_map(|(ai, (_, albums))| albums.as_ref().map(|al| (ai, al)))
+            .flat_map(|(ai, albums)| {
+                albums
+                    .iter()
+                    .enumerate()
+                    .map(move |(bi, album)| (ai, bi, album.id.clone(), album.name.clone()))
+            })
+            .collect();
+        let album_songs: Vec<(usize, usize, Option<Vec<SongEntry>>)> =
+            futures::stream::iter(album_reqs)
+                .map(|(ai, bi, id, name)| {
+                    let client = client.clone();
+                    async move {
+                        let songs = match client
+                            .get_with_params("getAlbum.view", &[("id", &id)])
+                            .await
+                        {
+                            Ok(env) => Some(env.response.album.map(|a| a.song).unwrap_or_default()),
+                            Err(e) => {
+                                tracing::warn!(
+                                    album = %name,
+                                    error = %e,
+                                    "Failed to fetch album detail, skipping"
+                                );
+                                None
+                            }
+                        };
+                        (ai, bi, songs)
+                    }
+                })
+                .buffer_unordered(FETCH_CONCURRENCY)
+                .collect()
+                .await;
+
+        // Index the fetched songs by (artist position, album position).
+        // Albums whose `getAlbum` failed are absent here and so are skipped
+        // during assembly below.
+        let mut songs_by_album: HashMap<(usize, usize), Vec<SongEntry>> = HashMap::new();
+        for (ai, bi, songs) in album_songs {
+            if let Some(songs) = songs {
+                songs_by_album.insert((ai, bi), songs);
+            }
+        }
+
+        // Phase 3 — assemble the cache deterministically in artist/album
+        // order, mirroring the original sequential walk exactly.
         let mut all_tracks = Vec::new();
         let mut all_albums = Vec::new();
         let mut all_artists = Vec::new();
         let mut track_by_uuid = HashMap::new();
         let mut subsonic_id_to_uuid = HashMap::new();
 
-        for api_artist in &api_artists {
-            let artist_uuid = deterministic_uuid(&api_artist.id);
-
-            // getArtist gives us albums for this artist.
-            let artist_resp = self
-                .client
-                .get_with_params("getArtist.view", &[("id", &api_artist.id)])
-                .await;
-
-            let api_albums = match artist_resp {
-                Ok(env) => env.response.artist.map(|a| a.album).unwrap_or_default(),
-                Err(e) => {
-                    tracing::warn!(
-                        artist = %api_artist.name,
-                        error = %e,
-                        "Failed to fetch artist detail, skipping"
-                    );
-                    continue;
-                }
+        for (ai, (_, albums)) in artist_albums.iter().enumerate() {
+            // A failed `getArtist` drops the artist entirely.
+            let Some(api_albums) = albums.as_ref() else {
+                continue;
             };
+            let api_artist = &api_artists[ai];
+            let artist_uuid = deterministic_uuid(&api_artist.id);
 
             let mut artist_track_count = 0u32;
 
-            for api_album in &api_albums {
+            for (bi, api_album) in api_albums.iter().enumerate() {
+                // A failed `getAlbum` drops just this album.
+                let Some(songs) = songs_by_album.get(&(ai, bi)) else {
+                    continue;
+                };
                 let album_uuid = deterministic_uuid(&api_album.id);
 
-                // getAlbum gives us songs.
-                let album_resp = self
-                    .client
-                    .get_with_params("getAlbum.view", &[("id", &api_album.id)])
-                    .await;
-
-                let songs = match album_resp {
-                    Ok(env) => env.response.album.map(|a| a.song).unwrap_or_default(),
-                    Err(e) => {
-                        tracing::warn!(
-                            album = %api_album.name,
-                            error = %e,
-                            "Failed to fetch album detail, skipping"
-                        );
-                        continue;
-                    }
-                };
-
-                for song in &songs {
+                for song in songs {
                     let track_uuid = deterministic_uuid(&song.id);
                     let stream_url = self.client.stream_url(&song.id);
 

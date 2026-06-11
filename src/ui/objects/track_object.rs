@@ -14,6 +14,8 @@ mod imp {
     #[derive(Debug, Default)]
     pub struct TrackObject {
         pub track_number: Cell<u32>,
+        /// Disc number (0 = unset, mirrors `Track::disc_number == None`).
+        pub disc_number: Cell<u32>,
         pub title: RefCell<String>,
         pub duration_secs: Cell<u64>,
         pub artist: RefCell<String>,
@@ -86,6 +88,9 @@ impl TrackObject {
     pub fn track_number(&self) -> u32 {
         self.imp().track_number.get()
     }
+    pub fn disc_number(&self) -> u32 {
+        self.imp().disc_number.get()
+    }
     pub fn title(&self) -> String {
         self.imp().title.borrow().clone()
     }
@@ -135,6 +140,10 @@ impl TrackObject {
 
     pub fn set_album_artist(&self, name: &str) {
         self.imp().album_artist.replace(name.to_string());
+    }
+
+    pub fn set_disc_number(&self, disc: u32) {
+        self.imp().disc_number.set(disc);
     }
 
     pub fn duration_display(&self) -> String {

@@ -1,7 +1,11 @@
 //! `LocalBackend` — `MediaBackend` implementation for the local SQLite library.
 
 use async_trait::async_trait;
-use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
+use sea_orm::sea_query::{Expr, Func};
+use sea_orm::{
+    ColumnTrait, Condition, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
+    QueryOrder, QuerySelect,
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -22,6 +26,38 @@ impl LocalBackend {
     pub fn new(db: DatabaseConnection) -> Self {
         Self { db }
     }
+}
+
+/// One row of the `list_albums` GROUP BY aggregate.
+///
+/// The bare `artist_name`/`year`/`genre` columns take a representative value
+/// from each `album_title` group (SQLite's documented "bare column" behaviour),
+/// matching the previous Rust fold which kept the first row encountered.
+#[derive(FromQueryResult)]
+struct AlbumAgg {
+    album_title: String,
+    artist_name: String,
+    year: Option<i32>,
+    genre: Option<String>,
+    track_count: i64,
+    total_duration_secs: Option<i64>,
+}
+
+/// One row of the `list_artists` GROUP BY aggregate.
+#[derive(FromQueryResult)]
+struct ArtistAgg {
+    artist_name: String,
+    track_count: i64,
+    album_count: i64,
+}
+
+/// The single row produced by the `get_stats` aggregate query.
+#[derive(FromQueryResult, Default)]
+struct StatsAgg {
+    total_tracks: i64,
+    total_duration_secs: Option<i64>,
+    total_albums: i64,
+    total_artists: i64,
 }
 
 #[async_trait]
@@ -72,34 +108,42 @@ impl MediaBackend for LocalBackend {
     }
 
     async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
-        // Derive albums from track data using GROUP BY equivalent
-        let all_tracks = track::Entity::find()
+        // Derive albums by letting SQLite GROUP BY album_title and aggregate,
+        // rather than loading the whole tracks table and folding in Rust.
+        let rows = track::Entity::find()
+            .select_only()
+            .column(track::Column::AlbumTitle)
+            .column(track::Column::ArtistName)
+            .column(track::Column::Year)
+            .column(track::Column::Genre)
+            .column_as(track::Column::Id.count(), "track_count")
+            .column_as(track::Column::DurationSecs.sum(), "total_duration_secs")
+            .group_by(track::Column::AlbumTitle)
+            // Reproduce the previous BTreeMap<album_title, _> iteration order so
+            // the stable sort below breaks ties identically.
+            .order_by_asc(track::Column::AlbumTitle)
+            .into_model::<AlbumAgg>()
             .all(&self.db)
             .await
             .map_err(|e| BackendError::Internal(e.into()))?;
 
-        let mut album_map = std::collections::BTreeMap::<String, Album>::new();
-        for row in &all_tracks {
-            let entry = album_map
-                .entry(row.album_title.clone())
-                .or_insert_with(|| Album {
-                    id: Uuid::new_v4(),
-                    title: row.album_title.clone(),
-                    artist_name: row.artist_name.clone(),
-                    artist_id: None,
-                    year: row.year,
-                    genre: row.genre.clone(),
-                    cover_art_url: None,
-                    track_count: 0,
-                    total_duration_secs: Some(0),
-                });
-            entry.track_count += 1;
-            if let Some(dur) = row.duration_secs {
-                *entry.total_duration_secs.as_mut().unwrap() += dur as u64;
-            }
-        }
-
-        let mut albums: Vec<Album> = album_map.into_values().collect();
+        let mut albums: Vec<Album> = rows
+            .into_iter()
+            .map(|r| Album {
+                id: Uuid::new_v4(),
+                title: r.album_title,
+                artist_name: r.artist_name,
+                artist_id: None,
+                year: r.year,
+                genre: r.genre,
+                cover_art_url: None,
+                track_count: r.track_count as u32,
+                // The previous fold seeded the total at Some(0) and added each
+                // non-null duration; SQL SUM is NULL for an all-null album, so
+                // coalesce back to 0 to keep the Some(0) semantics.
+                total_duration_secs: Some(r.total_duration_secs.unwrap_or(0) as u64),
+            })
+            .collect();
 
         // Sort
         match sort {
@@ -117,41 +161,35 @@ impl MediaBackend for LocalBackend {
     }
 
     async fn list_artists(&self) -> BackendResult<Vec<Artist>> {
-        let all_tracks = track::Entity::find()
+        // Aggregate per-artist tallies in SQLite: COUNT(*) tracks and
+        // COUNT(DISTINCT album_title) albums, replicating the previous two-pass
+        // Rust fold (track tally + per-artist album HashSet) exactly.
+        let rows = track::Entity::find()
+            .select_only()
+            .column(track::Column::ArtistName)
+            .column_as(track::Column::Id.count(), "track_count")
+            .column_as(
+                Expr::expr(Func::count_distinct(Expr::col(track::Column::AlbumTitle))),
+                "album_count",
+            )
+            .group_by(track::Column::ArtistName)
+            // Preserve the previous BTreeMap<artist_name, _> ascending order.
+            .order_by_asc(track::Column::ArtistName)
+            .into_model::<ArtistAgg>()
             .all(&self.db)
             .await
             .map_err(|e| BackendError::Internal(e.into()))?;
 
-        let mut artist_map = std::collections::BTreeMap::<String, Artist>::new();
-        for row in &all_tracks {
-            let entry = artist_map
-                .entry(row.artist_name.clone())
-                .or_insert_with(|| Artist {
-                    id: Uuid::new_v4(),
-                    name: row.artist_name.clone(),
-                    album_count: 0,
-                    track_count: 0,
-                    cover_art_url: None,
-                });
-            entry.track_count += 1;
-        }
-
-        // Compute album counts
-        let mut album_sets: std::collections::HashMap<String, std::collections::HashSet<String>> =
-            std::collections::HashMap::new();
-        for row in &all_tracks {
-            album_sets
-                .entry(row.artist_name.clone())
-                .or_default()
-                .insert(row.album_title.clone());
-        }
-        for (name, artist) in &mut artist_map {
-            if let Some(albums) = album_sets.get(name) {
-                artist.album_count = albums.len() as u32;
-            }
-        }
-
-        Ok(artist_map.into_values().collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| Artist {
+                id: Uuid::new_v4(),
+                name: r.artist_name,
+                album_count: r.album_count as u32,
+                track_count: r.track_count as u32,
+                cover_art_url: None,
+            })
+            .collect())
     }
 
     async fn get_album_tracks(&self, _album_id: &Uuid) -> BackendResult<Vec<Track>> {
@@ -204,28 +242,34 @@ impl MediaBackend for LocalBackend {
     }
 
     async fn get_stats(&self) -> BackendResult<LibraryStats> {
-        let all = track::Entity::find()
-            .all(&self.db)
+        // Compute every statistic in a single aggregate query instead of
+        // materialising the whole tracks table and folding/HashSet-ing in Rust.
+        // An aggregate query with no GROUP BY always yields exactly one row;
+        // `unwrap_or_default` is purely defensive.
+        let stats = track::Entity::find()
+            .select_only()
+            .column_as(track::Column::Id.count(), "total_tracks")
+            .column_as(track::Column::DurationSecs.sum(), "total_duration_secs")
+            .column_as(
+                Expr::expr(Func::count_distinct(Expr::col(track::Column::AlbumTitle))),
+                "total_albums",
+            )
+            .column_as(
+                Expr::expr(Func::count_distinct(Expr::col(track::Column::ArtistName))),
+                "total_artists",
+            )
+            .into_model::<StatsAgg>()
+            .one(&self.db)
             .await
-            .map_err(|e| BackendError::Internal(e.into()))?;
-
-        let total_tracks = all.len() as u64;
-        let total_duration_secs: u64 = all
-            .iter()
-            .filter_map(|t| t.duration_secs)
-            .map(|d| d as u64)
-            .sum();
-
-        let albums: std::collections::HashSet<&str> =
-            all.iter().map(|t| t.album_title.as_str()).collect();
-        let artists: std::collections::HashSet<&str> =
-            all.iter().map(|t| t.artist_name.as_str()).collect();
+            .map_err(|e| BackendError::Internal(e.into()))?
+            .unwrap_or_default();
 
         Ok(LibraryStats {
-            total_tracks,
-            total_albums: albums.len() as u64,
-            total_artists: artists.len() as u64,
-            total_duration_secs,
+            total_tracks: stats.total_tracks as u64,
+            total_albums: stats.total_albums as u64,
+            total_artists: stats.total_artists as u64,
+            // SUM is NULL on an empty table; the previous fold summed to 0.
+            total_duration_secs: stats.total_duration_secs.unwrap_or(0) as u64,
         })
     }
 }

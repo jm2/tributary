@@ -402,7 +402,11 @@ fn build_properties_action(
                                 } else {
                                     String::new()
                                 },
-                                disc_number: String::new(),
+                                disc_number: if track.disc_number() > 0 {
+                                    track.disc_number().to_string()
+                                } else {
+                                    String::new()
+                                },
                                 format: track.format(),
                                 bitrate: track.bitrate_display(),
                                 sample_rate: track.sample_rate_display(),

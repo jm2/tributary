@@ -29,12 +29,15 @@ pub fn setup_output_selector(
     parked_local: &Rc<RefCell<Option<Box<dyn AudioOutput>>>>,
     event_sender: &async_channel::Sender<PlayerEvent>,
     volume_scale: &gtk::Scale,
+    rt_handle: &tokio::runtime::Handle,
 ) {
     let active_output = active_output.clone();
     let parked_local = parked_local.clone();
     let event_sender = event_sender.clone();
     let volume_scale = volume_scale.clone();
     let output_button = output_button.clone();
+    // Real runtime handle for the Chromecast output's embedded file server.
+    let rt_handle = rt_handle.clone();
 
     output_list.connect_row_activated(move |list_box, activated_row| {
         let idx = activated_row.index();
@@ -78,6 +81,7 @@ pub fn setup_output_selector(
                     &parked_local,
                     &event_sender,
                     &volume_scale,
+                    &rt_handle,
                 );
             } else if is_airplay {
                 handle_airplay_switch(
@@ -120,6 +124,7 @@ fn handle_chromecast_switch(
     parked_local: &Rc<RefCell<Option<Box<dyn AudioOutput>>>>,
     event_sender: &async_channel::Sender<PlayerEvent>,
     volume_scale: &gtk::Scale,
+    rt_handle: &tokio::runtime::Handle,
 ) {
     let cast_name = activated_row
         .first_child()
@@ -147,7 +152,8 @@ fn handle_chromecast_switch(
         port,
         event_sender.clone(),
         volume_scale.value(),
-    );
+    )
+    .with_runtime(rt_handle.clone());
     *active_output.borrow_mut() = Box::new(chromecast);
     info!(
         name = %cast_name,

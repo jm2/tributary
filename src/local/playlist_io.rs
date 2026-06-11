@@ -130,17 +130,19 @@ pub fn import_xspf(path: &Path) -> anyhow::Result<Vec<ImportedTrack>> {
             duration_secs: None,
         };
 
+        // `extract_xml_value` already resolves the value (entity-unescaping
+        // normal text, CDATA verbatim), so callers must not unescape again.
         if let Some(val) = extract_xml_value(block, "location") {
-            current.file_path = uri_to_file_path(&xml_unescape(&val));
+            current.file_path = uri_to_file_path(&val);
         }
         if let Some(val) = extract_xml_value(block, "title") {
-            current.title = xml_unescape(&val);
+            current.title = val;
         }
         if let Some(val) = extract_xml_value(block, "creator") {
-            current.artist = xml_unescape(&val);
+            current.artist = val;
         }
         if let Some(val) = extract_xml_value(block, "album") {
-            current.album = xml_unescape(&val);
+            current.album = val;
         }
         if let Some(val) = extract_xml_value(block, "duration") {
             if let Ok(ms) = val.trim().parse::<u64>() {
@@ -286,10 +288,18 @@ fn uri_to_file_path(uri: &str) -> String {
         )
 }
 
-/// Extract the text content of an XML element like `<tag>value</tag>`.
+/// Extract the resolved text content of an XML element like `<tag>value</tag>`.
 ///
 /// Scans `content` (which may span multiple lines) for an opening `<tag>` or
-/// `<tag …>` (attributes ignored) and reads up to the matching `</tag>`.
+/// `<tag …>` (attributes ignored) and reads up to the matching `</tag>`. The
+/// returned string is the final value: normal character data is
+/// entity-unescaped, whereas a `<![CDATA[ … ]]>` section is returned verbatim
+/// (CDATA is, by definition, unparsed character data and must NOT be
+/// entity-unescaped).
+///
+/// Namespace-prefixed tags (e.g. `<xspf:title>`) are out of scope: matching
+/// them correctly needs a real XML parser, so they are intentionally not
+/// recognised here.
 fn extract_xml_value(content: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
@@ -316,8 +326,18 @@ fn extract_xml_value(content: &str, tag: &str) -> Option<String> {
             continue;
         }
 
+        // CDATA section: the value is wrapped in `<![CDATA[ … ]]>`. Take the
+        // inner text verbatim, up to the first `]]>`, without entity
+        // unescaping. Leading whitespace before the marker is ignored, but the
+        // inner content itself is preserved exactly.
+        let rest = &content[value_start..];
+        if let Some(cdata) = rest.trim_start().strip_prefix("<![CDATA[") {
+            let end_rel = cdata.find("]]>")?;
+            return Some(cdata[..end_rel].to_string());
+        }
+
         let close_rel = content[value_start..].find(&close)?;
-        return Some(content[value_start..value_start + close_rel].to_string());
+        return Some(xml_unescape(&content[value_start..value_start + close_rel]));
     }
     None
 }
@@ -342,4 +362,42 @@ fn xml_unescape(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_xml_value;
+
+    #[test]
+    fn plain_text_is_entity_unescaped() {
+        let block = "<title>Tom &amp; Jerry</title>";
+        assert_eq!(
+            extract_xml_value(block, "title").as_deref(),
+            Some("Tom & Jerry")
+        );
+    }
+
+    #[test]
+    fn cdata_is_returned_verbatim() {
+        // Entities and markup inside a CDATA section must survive untouched,
+        // and a `</title>` inside it must not be mistaken for the real close.
+        let block = "<title><![CDATA[Tom &amp; <b>Jerry</b> </title>?]]></title>";
+        assert_eq!(
+            extract_xml_value(block, "title").as_deref(),
+            Some("Tom &amp; <b>Jerry</b> </title>?")
+        );
+    }
+
+    #[test]
+    fn empty_cdata_yields_empty_string() {
+        assert_eq!(
+            extract_xml_value("<album><![CDATA[]]></album>", "album").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn missing_tag_yields_none() {
+        assert_eq!(extract_xml_value("<album>x</album>", "title"), None);
+    }
 }

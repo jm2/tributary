@@ -143,10 +143,35 @@ impl PlaylistManager {
         playlist_id: &str,
         entry_ids: &[String],
     ) -> Result<(), DbErr> {
-        // Apply all position updates inside a transaction so a mid-loop
-        // failure rolls back cleanly instead of leaving a mix of old and new
-        // positions (duplicate/gapped ordering).
+        // The `UNIQUE(playlist_id, position)` index makes naive sequential
+        // updates collide: assigning an entry its final position while another
+        // entry still holds it is a transient duplicate the index rejects.
+        //
+        // Two phases inside one transaction avoid that. Phase 1 parks every
+        // affected entry in a high, non-overlapping range; phase 2 assigns the
+        // final `0..N` positions. Phase-1 values (>= `TEMP_OFFSET`) never
+        // overlap phase-2 targets, so no statement ever produces a duplicate.
+        // The whole thing is transactional, so a mid-way failure rolls back
+        // cleanly instead of leaving a mix of old and new positions.
+        const TEMP_OFFSET: i32 = 1_000_000;
+
         let txn = self.db.begin().await?;
+
+        // Phase 1: park each entry at `index + TEMP_OFFSET`.
+        for (pos, entry_id) in entry_ids.iter().enumerate() {
+            let mut entry: playlist_entry::ActiveModel =
+                playlist_entry::Entity::find_by_id(entry_id.clone())
+                    .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
+                    .one(&txn)
+                    .await?
+                    .ok_or(DbErr::RecordNotFound(format!("Entry {entry_id} not found")))?
+                    .into();
+
+            entry.position = Set(pos as i32 + TEMP_OFFSET);
+            entry.update(&txn).await?;
+        }
+
+        // Phase 2: assign the final 0..N positions.
         for (pos, entry_id) in entry_ids.iter().enumerate() {
             let mut entry: playlist_entry::ActiveModel =
                 playlist_entry::Entity::find_by_id(entry_id.clone())
@@ -159,6 +184,7 @@ impl PlaylistManager {
             entry.position = Set(pos as i32);
             entry.update(&txn).await?;
         }
+
         txn.commit().await?;
         Ok(())
     }
@@ -471,4 +497,92 @@ impl PlaylistManager {
 /// Get current time as RFC3339 string.
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::{
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait,
+        QueryFilter, QueryOrder,
+    };
+    use sea_orm_migration::MigratorTrait;
+
+    use super::PlaylistManager;
+    use crate::db::entities::playlist_entry;
+    use crate::db::migration::Migrator;
+
+    /// Open a fresh in-memory SQLite database with all migrations applied.
+    ///
+    /// SeaORM forces `max_connections(1)` for SQLite, so the single pooled
+    /// connection keeps the in-memory schema alive for the whole test.
+    async fn in_memory_db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db
+    }
+
+    async fn insert_entry(db: &DatabaseConnection, playlist_id: &str, id: &str, position: i32) {
+        playlist_entry::ActiveModel {
+            id: Set(id.to_string()),
+            playlist_id: Set(playlist_id.to_string()),
+            position: Set(position),
+            track_id: Set(None),
+            match_title: Set(String::new()),
+            match_artist: Set(String::new()),
+            match_album: Set(String::new()),
+            match_duration_secs: Set(None),
+        }
+        .insert(db)
+        .await
+        .expect("insert entry");
+    }
+
+    #[tokio::test]
+    async fn reorder_yields_unique_contiguous_positions() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+
+        let playlist = manager
+            .create_playlist("Test", false)
+            .await
+            .expect("create playlist");
+
+        // Five entries at the natural 0..4 positions.
+        let ids: Vec<String> = (0..5).map(|i| format!("entry-{i}")).collect();
+        for (pos, id) in ids.iter().enumerate() {
+            insert_entry(&db, &playlist.id, id, pos as i32).await;
+        }
+
+        // Moving the last entry to the front would, under a naive sequential
+        // update, immediately collide with position 0 against the new UNIQUE
+        // index — exercising the two-phase reorder path.
+        let new_order = vec![
+            ids[4].clone(),
+            ids[2].clone(),
+            ids[0].clone(),
+            ids[3].clone(),
+            ids[1].clone(),
+        ];
+        manager
+            .reorder_entries(&playlist.id, &new_order)
+            .await
+            .expect("reorder must not violate UNIQUE(playlist_id, position)");
+
+        let entries = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(&playlist.id))
+            .order_by_asc(playlist_entry::Column::Position)
+            .all(&db)
+            .await
+            .expect("load entries");
+
+        // Positions must be exactly the 0..N permutation: no gaps, no dupes.
+        let positions: Vec<i32> = entries.iter().map(|e| e.position).collect();
+        assert_eq!(positions, (0..5).collect::<Vec<i32>>());
+
+        // ...and the entries must follow the requested order.
+        let ordered_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ordered_ids, new_order);
+    }
 }
