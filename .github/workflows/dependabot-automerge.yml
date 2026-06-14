@@ -1,0 +1,49 @@
+name: Dependabot auto-merge
+
+# Auto-merge clean (patch + minor) Dependabot PRs once CI is green.
+#
+# How the pieces fit together:
+#   * This workflow only ENABLES GitHub's native auto-merge on the PR.
+#   * The actual gate ("wait for green CI") is enforced by the branch ruleset
+#     on `main` that requires the CI status checks. Auto-merge engages because
+#     that ruleset makes the PR non-immediately-mergeable, then lands it once
+#     the required checks pass. Without that ruleset, `--auto` would either
+#     error or merge immediately without waiting — so the ruleset is required.
+#   * Majors are NOT auto-merged: they fall through the update-type guard below
+#     and wait for a human.
+#
+# Security: uses `pull_request` (NOT `pull_request_target`) and never checks out
+# the PR head, so untrusted code never runs here.
+on: pull_request
+
+# Least privilege — just enough to enable auto-merge. GitHub grants these write
+# scopes to Dependabot-triggered runs for the pull_request event.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot-automerge:
+    runs-on: ubuntu-latest
+    # Belt-and-suspenders: only ever act on Dependabot's own PRs.
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      # Enable auto-merge ONLY for patch + minor bumps. Major bumps
+      # (version-update:semver-major) are left for a human. For GROUPED PRs,
+      # fetch-metadata reports the HIGHEST semver bump in the group; the groups
+      # in dependabot.yml only contain minor+patch, so grouped PRs always report
+      # semver-minor / semver-patch.
+      - name: Enable auto-merge for patch & minor updates
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

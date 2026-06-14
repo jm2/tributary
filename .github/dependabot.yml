@@ -1,17 +1,52 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
+# Dependabot configuration
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# NOTE: dependabot.yml itself CANNOT auto-merge anything. The `groups:` blocks
+# below only control how updates are BATCHED into pull requests. Auto-merge of
+# clean (patch/minor) bumps is handled separately by
+# .github/workflows/dependabot-automerge.yml together with a status-check
+# ruleset on `main` (see that workflow's header).
+#
+# `cooldown` delays opening update PRs until a few days after a release, giving
+# bad/yanked releases time to be pulled before they can be auto-merged.
 
 version: 2
 updates:
-  # Update Rust dependencies (Cargo.toml)
+  # ── Rust crates (Cargo.toml / Cargo.lock) ─────────────────────────────────
   - package-ecosystem: "cargo"
-    directory: "/" 
+    directory: "/"
     schedule:
       interval: "weekly"
-  # Update GitHub Actions (e.g., CodeQL, ClusterFuzzLite actions)
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 5
+    groups:
+      # One PR for ALL non-breaking crate bumps (patch + minor). Majors are
+      # deliberately EXCLUDED so each major arrives as its own PR for human
+      # review. This also keeps the grouped PR's update-type at
+      # semver-minor/semver-patch, which is exactly what the auto-merge
+      # workflow is allowed to merge.
+      cargo-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ── GitHub Actions (the `uses:` pins in .github/workflows/*) ───────────────
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 5
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
