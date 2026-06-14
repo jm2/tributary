@@ -184,6 +184,9 @@ jobs:
   build-windows:
     name: Windows (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    # Cap the job so a hung MSYS2 mirror fails fast and re-runs instead of
+    # stalling to the 6-hour ceiling (as one CLANGARM64 run did).
+    timeout-minutes: 45
     strategy:
       matrix:
         include:
@@ -207,6 +210,12 @@ jobs:
 
       - name: Set up MSYS2 (${{ matrix.msystem }})
         uses: msys2/setup-msys2@v2
+        env:
+          # Pin pacman to the canonical Cloudflare CDN (repo.msys2.org) instead of
+          # the flaky secondary mirrors (ftp2.osuosl.org, mirror.msys2.org) that
+          # stall on the slow windows-11-arm runner and trip pacman's "Operation
+          # too slow" abort, failing the whole transaction. setup-msys2 #571/#577.
+          __SETUP_MSYS2_USE_MAIN_MIRROR_ONLY: 'true'
         with:
           msystem: ${{ matrix.msystem }}
           path-type: inherit
