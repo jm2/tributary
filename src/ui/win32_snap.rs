@@ -201,8 +201,8 @@ unsafe extern "system" fn subclass_proc(
             let mut pt = Point::default();
             // SAFETY: GetCursorPos and ScreenToClient are standard Win32.
             unsafe {
-                GetCursorPos(&mut pt);
-                ScreenToClient(hwnd, &mut pt);
+                GetCursorPos(&raw mut pt);
+                ScreenToClient(hwnd, &raw mut pt);
             }
 
             // Check if cursor is within the maximize button rect.
@@ -252,7 +252,7 @@ unsafe extern "system" fn subclass_proc(
                         rc_work: Rect::default(),
                         dw_flags: 0,
                     };
-                    if GetMonitorInfoW(monitor, &mut mi) != 0 {
+                    if GetMonitorInfoW(monitor, &raw mut mi) != 0 {
                         let mmi = lparam as *mut MinMaxInfo;
                         if !mmi.is_null() {
                             // ptMaxPosition is expressed relative to the
