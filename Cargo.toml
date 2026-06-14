@@ -2,7 +2,7 @@
 name = "tributary"
 version = "0.5.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 description = "A high-performance, Rhythmbox-style media manager with unified local and remote backends"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/jm2/tributary"
