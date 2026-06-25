@@ -93,7 +93,7 @@ rust_cast = "0.21"
 axum = "0.8"
 local-ip-address = "0.6"
 dashmap = "6"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 
 # TLS — explicit dependency to ensure the ring crypto provider is available
 # for rust_cast's TLS connections (rustls 0.23+ requires manual provider setup)
