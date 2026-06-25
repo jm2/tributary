@@ -28,7 +28,7 @@ jobs:
             pkgconf-pkg-config git curl
       - uses: actions/checkout@v6
       - name: Cache Cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v5.0.5
         with:
           path: |
             ~/.cargo/registry/index
@@ -37,7 +37,7 @@ jobs:
           key: fuzz-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: fuzz-cargo-
       - name: Cache fuzz corpus
-        uses: actions/cache@v5
+        uses: actions/cache@v5.0.5
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
