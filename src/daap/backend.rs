@@ -2,13 +2,15 @@
 //!
 //! All metadata is held in memory — nothing touches the local SQLite DB.
 //! The full library is fetched during [`DaapBackend::connect`] and
-//! cached for fast browsing.  Streaming URLs include the DAAP session-id
-//! so GStreamer can fetch audio directly.
+//! cached for fast browsing. Cached tracks contain credential-free
+//! `daap://` references; the live retained session resolves those to
+//! authenticated HTTP URLs immediately before media is consumed.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::info;
 use url::Url;
 use uuid::Uuid;
@@ -31,9 +33,8 @@ struct LibraryCache {
     artists: Vec<Artist>,
     /// Tributary UUID → index in `tracks`.
     track_by_uuid: HashMap<Uuid, usize>,
-    /// DAAP item ID → Tributary UUID.
-    #[allow(dead_code)]
-    daap_id_to_uuid: HashMap<u32, Uuid>,
+    /// Tributary UUID → DAAP item ID.
+    track_to_daap_id: HashMap<Uuid, u32>,
 }
 
 impl LibraryCache {
@@ -43,7 +44,7 @@ impl LibraryCache {
             albums: Vec::new(),
             artists: Vec::new(),
             track_by_uuid: HashMap::new(),
-            daap_id_to_uuid: HashMap::new(),
+            track_to_daap_id: HashMap::new(),
         }
     }
 }
@@ -60,6 +61,20 @@ pub struct DaapBackend {
     display_name: String,
     client: DaapClient,
     cache: RwLock<LibraryCache>,
+    /// Opaque identifier embedded in UI-facing `daap://` media references.
+    /// It identifies this live session without exposing the bearer session ID.
+    session_key: Uuid,
+    /// Shared exactly-once state for explicit disconnect and controlled shutdown.
+    disconnect: std::sync::Arc<DisconnectLifecycle>,
+}
+
+const SESSION_CONNECTED: u8 = 0;
+const SESSION_DISCONNECTING: u8 = 1;
+const SESSION_DISCONNECTED: u8 = 2;
+
+struct DisconnectLifecycle {
+    state: AtomicU8,
+    complete: Notify,
 }
 
 impl DaapBackend {
@@ -81,9 +96,19 @@ impl DaapBackend {
             display_name: name.to_string(),
             client,
             cache: RwLock::new(LibraryCache::empty()),
+            session_key: Uuid::new_v4(),
+            disconnect: std::sync::Arc::new(DisconnectLifecycle {
+                state: AtomicU8::new(SESSION_CONNECTED),
+                complete: Notify::new(),
+            }),
         };
 
-        backend.refresh_library().await?;
+        if let Err(error) = backend.refresh_library().await {
+            // The handshake already created a server-side session. A failed
+            // initial sync has no owner to close it later, so do that here.
+            backend.disconnect().await;
+            return Err(error);
+        }
 
         Ok(backend)
     }
@@ -96,7 +121,7 @@ impl DaapBackend {
 
         let mut all_tracks = Vec::new();
         let mut track_by_uuid = HashMap::new();
-        let mut daap_id_to_uuid = HashMap::new();
+        let mut track_to_daap_id = HashMap::new();
 
         // Aggregation maps for artists and albums.
         // Key: name (lowercased for dedup), Value: (display_name, metadata).
@@ -132,8 +157,11 @@ impl DaapBackend {
             let artist_uuid = deterministic_uuid_from_name(&artist_name);
             let album_uuid = deterministic_uuid_from_name(&album_title);
 
-            let stream_url = self.client.stream_url(daap_id, &format);
-            let cover_art_url = self.client.cover_art_url(daap_id);
+            // Keep the session bearer credential out of long-lived UI model
+            // values. These opaque references are resolved through the live
+            // retained backend immediately before playback/artwork fetch.
+            let stream_url = self.media_reference_url("stream", daap_id, Some(&format));
+            let cover_art_url = self.media_reference_url("artwork", daap_id, None);
 
             let duration_secs = duration_ms.map(|ms| u64::from(ms) / 1000);
 
@@ -163,7 +191,7 @@ impl DaapBackend {
 
             let idx = all_tracks.len();
             track_by_uuid.insert(track_uuid, idx);
-            daap_id_to_uuid.insert(daap_id, track_uuid);
+            track_to_daap_id.insert(track_uuid, daap_id);
             all_tracks.push(track);
 
             // ── Aggregate artist ────────────────────────────────────
@@ -236,30 +264,95 @@ impl DaapBackend {
             albums: all_albums,
             artists: all_artists,
             track_by_uuid,
-            daap_id_to_uuid,
+            track_to_daap_id,
         };
 
         Ok(())
     }
 
     /// Return all tracks from the cache as Tributary `Track` models.
-    /// Used by the integration layer to send a RemoteSync to the UI.
+    /// Used by the integration layer to send a generation-scoped sync to the UI.
     pub async fn all_tracks(&self) -> Vec<Track> {
         self.cache.read().await.tracks.clone()
     }
 
-    /// Send a best-effort logout to the DAAP server.
-    pub async fn disconnect(&self) {
-        self.client.logout().await;
+    /// Send one best-effort logout request to the DAAP server.
+    ///
+    /// Returns `true` only for the owner that initiated shutdown. Repeated
+    /// explicit disconnects and shutdown races wait for that owner and then
+    /// return `false` without issuing another request.
+    pub async fn disconnect(&self) -> bool {
+        let owns_logout = self
+            .disconnect
+            .state
+            .compare_exchange(
+                SESSION_CONNECTED,
+                SESSION_DISCONNECTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+
+        if owns_logout {
+            // Detach the request from this caller so cancellation cannot leave
+            // the session permanently stuck in DISCONNECTING. The shared
+            // lifecycle remains owned by the task and all waiters.
+            let client = self.client.clone();
+            let disconnect = std::sync::Arc::clone(&self.disconnect);
+            tokio::spawn(async move {
+                client.logout().await;
+                disconnect
+                    .state
+                    .store(SESSION_DISCONNECTED, Ordering::Release);
+                disconnect.complete.notify_waiters();
+            });
+        }
+
+        loop {
+            let completion = self.disconnect.complete.notified();
+            tokio::pin!(completion);
+            completion.as_mut().enable();
+            if self.disconnect.state.load(Ordering::Acquire) == SESSION_DISCONNECTED {
+                return owns_logout;
+            }
+            completion.await;
+        }
     }
 
-    /// Build the logout URL for this session (used by the eject button).
-    pub fn logout_url(&self) -> String {
-        format!(
-            "{}/logout?session-id={}",
-            self.client.base_url().as_str().trim_end_matches('/'),
-            self.client.session_id()
-        )
+    /// Opaque key identifying this particular live session.
+    pub(super) fn session_key(&self) -> Uuid {
+        self.session_key
+    }
+
+    /// Resolve one stream URL from the current live session.
+    pub(super) fn stream_url_for_item(&self, song_id: u32, format: &str) -> BackendResult<Url> {
+        self.ensure_connected()?;
+        Ok(self.client.stream_url(song_id, format))
+    }
+
+    /// Resolve one artwork URL from the current live session.
+    pub(super) fn artwork_url_for_item(&self, song_id: u32) -> BackendResult<Url> {
+        self.ensure_connected()?;
+        Ok(self.client.cover_art_url(song_id))
+    }
+
+    fn ensure_connected(&self) -> BackendResult<()> {
+        if self.disconnect.state.load(Ordering::Acquire) != SESSION_CONNECTED {
+            return Err(BackendError::ConnectionFailed {
+                message: "DAAP source is disconnected".to_string(),
+                source: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn media_reference_url(&self, kind: &str, song_id: u32, format: Option<&str>) -> Url {
+        let mut url = Url::parse(&format!("daap://{}/{kind}/{song_id}", self.session_key))
+            .expect("DAAP media reference components are always valid");
+        if let Some(format) = format {
+            url.query_pairs_mut().append_pair("format", format);
+        }
+        url
     }
 }
 
@@ -392,21 +485,22 @@ impl crate::architecture::MediaBackend for DaapBackend {
 
     async fn get_stream_url(&self, track_id: &Uuid) -> BackendResult<Url> {
         let cache = self.cache.read().await;
-        let idx = cache
-            .track_by_uuid
-            .get(track_id)
-            .ok_or_else(|| BackendError::NotFound {
-                entity_type: "track".into(),
-                id: *track_id,
-            })?;
-        let track = &cache.tracks[*idx];
-        track.stream_url.clone().ok_or_else(|| {
-            BackendError::Internal(anyhow::anyhow!("Track {} has no stream URL", track_id))
-        })
+        let song_id =
+            cache
+                .track_to_daap_id
+                .get(track_id)
+                .ok_or_else(|| BackendError::NotFound {
+                    entity_type: "track".into(),
+                    id: *track_id,
+                })?;
+        let idx = cache.track_by_uuid[track_id];
+        let format = cache.tracks[idx].format.as_deref().unwrap_or("mp3");
+        self.stream_url_for_item(*song_id, format)
     }
 
     async fn get_cover_art(&self, _album_id: &Uuid) -> BackendResult<Option<Url>> {
-        // DAAP cover art requires a separate endpoint; deferred to a future phase.
+        // DAAP artwork is item-scoped rather than album-scoped. Track models
+        // carry an opaque item reference that playback resolves live.
         Ok(None)
     }
 
@@ -420,26 +514,6 @@ impl crate::architecture::MediaBackend for DaapBackend {
             total_artists: cache.artists.len() as u64,
             total_duration_secs: total_duration,
         })
-    }
-}
-
-// ── Drop: best-effort logout ────────────────────────────────────────────
-
-impl Drop for DaapBackend {
-    fn drop(&mut self) {
-        let url = format!(
-            "{}/logout?session-id={}",
-            self.client.base_url().as_str().trim_end_matches('/'),
-            self.client.session_id()
-        );
-        let http = self.client.http_clone();
-        // Guard against missing runtime — during process shutdown the
-        // tokio runtime may already be dropped.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _ = http.get(&url).send().await;
-            });
-        }
     }
 }
 

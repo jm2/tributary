@@ -28,6 +28,7 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
     let browser_state = state.browser_state.clone();
     let status_label = state.status_label.clone();
     let column_view = state.column_view.clone();
+    let pending_connection = state.pending_connection.clone();
     let output_list = output_list.clone();
 
     glib::MainContext::default().spawn_local(async move {
@@ -101,6 +102,10 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                 }
 
                 crate::discovery::DiscoveryEvent::Lost { url, service_type } => {
+                    if pending_connection.borrow().as_deref() == Some(url.as_str()) {
+                        *pending_connection.borrow_mut() = None;
+                    }
+
                     // ── Chromecast devices: remove from output selector ──
                     if service_type == "chromecast" {
                         handle_chromecast_lost(&output_list, &url);
@@ -119,10 +124,22 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                         continue;
                     }
 
+                    // mDNS disappearance invalidates a DAAP session even for
+                    // manually saved rows. Transfer ownership immediately so
+                    // queued sync work is generation-rejected and logout is
+                    // tracked by controlled shutdown.
+                    if service_type == "daap" {
+                        if let Some(session) = crate::daap::release_source(&url) {
+                            rt_handle.spawn(async move {
+                                session.disconnect().await;
+                            });
+                        }
+                    }
+
                     info!(
                         url = %url,
                         backend = %service_type,
-                        "Removing lost server from sidebar"
+                        "Handling lost server discovery event"
                     );
 
                     // Find the sidebar entry for this URL.
@@ -131,6 +148,33 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                             if src.server_url() == url {
                                 // Never auto-remove manually-added servers.
                                 if src.manually_added() {
+                                    if service_type == "daap" {
+                                        let was_active = *active_source_key.borrow() == url;
+                                        source_tracks.borrow_mut().remove(&url);
+                                        src.set_connected(false);
+                                        src.set_connecting(false);
+                                        src.set_icon_name("network-server-symbolic");
+                                        let src = src.clone();
+                                        store.remove(i);
+                                        store.insert(i, &src);
+
+                                        if was_active {
+                                            *active_source_key.borrow_mut() = "local".to_string();
+                                            sidebar_selection.set_selected(1);
+                                            let st = source_tracks.borrow();
+                                            let local_tracks =
+                                                st.get("local").cloned().unwrap_or_default();
+                                            window::display_tracks(
+                                                &local_tracks,
+                                                &track_store,
+                                                &master_tracks,
+                                                &browser_widget,
+                                                &browser_state,
+                                                &status_label,
+                                                &column_view,
+                                            );
+                                        }
+                                    }
                                     break;
                                 }
                                 // If connected and still the active source,

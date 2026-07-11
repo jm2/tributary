@@ -19,6 +19,15 @@ use super::tracklist;
 use super::window::{arch_track_to_object, display_tracks};
 use super::window_state::WindowState;
 
+enum RemoteLibrarySnapshot {
+    Standard(Vec<crate::architecture::models::Track>),
+    Daap {
+        tracks: Vec<crate::architecture::models::Track>,
+        generation: u64,
+        session_key: uuid::Uuid,
+    },
+}
+
 /// Wire the sidebar selection-changed signal.
 ///
 /// This function owns all the logic for switching between sources when
@@ -38,7 +47,6 @@ pub fn setup_source_connect(state: &WindowState) {
     let browser_state = state.browser_state.clone();
     let status_label = state.status_label.clone();
     let column_view = state.column_view.clone();
-    let current_pos = state.current_pos.clone();
     let app_config = state.app_config.clone();
     let sidebar_store = state.sidebar_store.clone();
     let pending_connection = state.pending_connection.clone();
@@ -111,7 +119,6 @@ pub fn setup_source_connect(state: &WindowState) {
                 &status_label,
                 &column_view,
             );
-            current_pos.set(None);
             return;
         }
 
@@ -141,7 +148,6 @@ pub fn setup_source_connect(state: &WindowState) {
             let browser_state = browser_state.clone();
             let status_label = status_label.clone();
             let column_view = column_view.clone();
-            let current_pos = current_pos.clone();
             let pid = playlist_id.clone();
 
             let (tracks_tx, tracks_rx) = async_channel::bounded::<String>(1);
@@ -192,7 +198,6 @@ pub fn setup_source_connect(state: &WindowState) {
                         &status_label,
                         &column_view,
                     );
-                    current_pos.set(None);
                 }
             });
             return;
@@ -228,7 +233,6 @@ pub fn setup_source_connect(state: &WindowState) {
                     &status_label,
                     &column_view,
                 );
-                current_pos.set(None);
             } else {
                 // Scan on a background thread to avoid blocking UI.
                 let mount = mount_point.clone();
@@ -241,7 +245,6 @@ pub fn setup_source_connect(state: &WindowState) {
                 let status_label = status_label.clone();
                 let column_view = column_view.clone();
                 let active_source_key = active_source_key.clone();
-                let current_pos = current_pos.clone();
 
                 // Serialisable track data for cross-thread transfer.
                 // TrackObject is a GObject (not Send), so we send
@@ -330,7 +333,6 @@ pub fn setup_source_connect(state: &WindowState) {
                             &status_label,
                             &column_view,
                         );
-                        current_pos.set(None);
                     }
                 });
             }
@@ -351,7 +353,6 @@ pub fn setup_source_connect(state: &WindowState) {
             track_store.remove_all();
             tracklist::update_status(&status_label, &[]);
             *master_tracks.borrow_mut() = Vec::new();
-            current_pos.set(None);
 
             // Handle "Stations Near Me" with geo consent.
             if backend_type == "radio-nearme" {
@@ -365,7 +366,6 @@ pub fn setup_source_connect(state: &WindowState) {
                 let column_view = column_view.clone();
                 let active_source_key = active_source_key.clone();
                 let sidebar_selection = sel.clone();
-                let current_pos = current_pos.clone();
                 let source_tracks = source_tracks.clone();
                 let win = win.clone();
 
@@ -381,7 +381,6 @@ pub fn setup_source_connect(state: &WindowState) {
                     column_view,
                     active_source_key,
                     sidebar_selection,
-                    current_pos,
                     source_tracks,
                 );
             } else {
@@ -394,7 +393,6 @@ pub fn setup_source_connect(state: &WindowState) {
                 let browser_state = browser_state.clone();
                 let status_label = status_label.clone();
                 let column_view = column_view.clone();
-                let current_pos = current_pos.clone();
 
                 let (stations_tx, stations_rx) = async_channel::bounded::<String>(1);
 
@@ -424,7 +422,6 @@ pub fn setup_source_connect(state: &WindowState) {
                             &status_label,
                             &column_view,
                         );
-                        current_pos.set(None);
                     }
                 });
             }
@@ -456,7 +453,6 @@ pub fn setup_source_connect(state: &WindowState) {
                 &status_label,
                 &column_view,
             );
-            current_pos.set(None);
             return;
         }
 
@@ -551,13 +547,27 @@ pub fn setup_source_connect(state: &WindowState) {
             let server_name = name_for_closure.clone();
             rt_handle.spawn(async move {
                 info!(server = %server_url, "Connecting to passwordless DAAP server...");
+                let Some(attempt) = crate::daap::begin_connect(server_url.clone()) else {
+                    tracing::debug!(server = %server_url, "Skipping DAAP connect during shutdown");
+                    return;
+                };
                 match crate::daap::DaapBackend::connect(&server_name, &server_url, None).await {
                     Ok(backend) => {
-                        let tracks = backend.all_tracks().await;
+                        let Some(session) = attempt.retain(backend).await else {
+                            tracing::debug!(server = %server_url, "DAAP connect was superseded");
+                            return;
+                        };
+                        let tracks = session.all_tracks().await;
+                        if !session.is_current() {
+                            tracing::debug!(server = %server_url, "DAAP sync was superseded");
+                            return;
+                        }
                         info!(count = tracks.len(), "DAAP library fetched (no password)");
                         let _ = engine_tx
-                            .send(LibraryEvent::RemoteSync {
+                            .send(LibraryEvent::DaapSync {
                                 source_key: server_url,
+                                generation: session.generation(),
+                                session_key: session.session_key(),
                                 tracks,
                             })
                             .await;
@@ -565,6 +575,10 @@ pub fn setup_source_connect(state: &WindowState) {
                     Err(crate::architecture::error::BackendError::AuthenticationFailed {
                         ..
                     }) => {
+                        if !attempt.is_latest() {
+                            tracing::debug!(server = %server_url, "Ignoring superseded DAAP authentication failure");
+                            return;
+                        }
                         info!(
                             server = %server_url,
                             "DAAP server requires a password — re-prompting via auth dialog"
@@ -572,6 +586,10 @@ pub fn setup_source_connect(state: &WindowState) {
                         let _ = auth_needed_tx.send(()).await;
                     }
                     Err(e) => {
+                        if !attempt.is_latest() {
+                            tracing::debug!(server = %server_url, "Ignoring superseded DAAP connection failure");
+                            return;
+                        }
                         tracing::error!(error = %e, "DAAP connection failed");
                         let _ = engine_tx
                             .send(LibraryEvent::Error(format!("DAAP auth failed: {e}")))
@@ -657,7 +675,7 @@ pub fn setup_source_connect(state: &WindowState) {
 
                 rt_handle.spawn(async move {
                     let result: Result<
-                        Vec<crate::architecture::models::Track>,
+                        Option<RemoteLibrarySnapshot>,
                         crate::architecture::error::BackendError,
                     > = match backend_type.as_str() {
                         "jellyfin" => {
@@ -676,7 +694,9 @@ pub fn setup_source_connect(state: &WindowState) {
                                     )
                                     .await
                                     {
-                                        Ok(backend) => Ok(backend.all_tracks().await),
+                                        Ok(backend) => Ok(Some(RemoteLibrarySnapshot::Standard(
+                                            backend.all_tracks().await,
+                                        ))),
                                         Err(e) => Err(e),
                                     }
                                 }
@@ -699,7 +719,9 @@ pub fn setup_source_connect(state: &WindowState) {
                                     )
                                     .await
                                     {
-                                        Ok(backend) => Ok(backend.all_tracks().await),
+                                        Ok(backend) => Ok(Some(RemoteLibrarySnapshot::Standard(
+                                            backend.all_tracks().await,
+                                        ))),
                                         Err(e) => Err(e),
                                     }
                                 }
@@ -713,15 +735,33 @@ pub fn setup_source_connect(state: &WindowState) {
                             } else {
                                 Some(pass.as_str())
                             };
-                            match crate::daap::DaapBackend::connect(
-                                &server_name,
-                                &server_url,
-                                password,
-                            )
-                            .await
-                            {
-                                Ok(backend) => Ok(backend.all_tracks().await),
-                                Err(e) => Err(e),
+                            match crate::daap::begin_connect(server_url.clone()) {
+                                None => Ok(None),
+                                Some(attempt) => match crate::daap::DaapBackend::connect(
+                                    &server_name,
+                                    &server_url,
+                                    password,
+                                )
+                                .await
+                                {
+                                    Ok(backend) => match attempt.retain(backend).await {
+                                        Some(session) => {
+                                            let tracks = session.all_tracks().await;
+                                            if session.is_current() {
+                                                Ok(Some(RemoteLibrarySnapshot::Daap {
+                                                    tracks,
+                                                    generation: session.generation(),
+                                                    session_key: session.session_key(),
+                                                }))
+                                            } else {
+                                                Ok(None)
+                                            }
+                                        }
+                                        None => Ok(None),
+                                    },
+                                    Err(_) if !attempt.is_latest() => Ok(None),
+                                    Err(error) => Err(error),
+                                }
                             }
                         }
                         _ => {
@@ -735,26 +775,56 @@ pub fn setup_source_connect(state: &WindowState) {
                             )
                             .await
                             {
-                                Ok(backend) => Ok(backend.all_tracks().await),
+                                Ok(backend) => Ok(Some(RemoteLibrarySnapshot::Standard(
+                                    backend.all_tracks().await,
+                                ))),
                                 Err(e) => Err(e),
                             }
                         }
                     };
 
                     match result {
-                        Ok(tracks) => {
+                        Ok(Some(snapshot)) => {
+                            let (count, event) = match snapshot {
+                                RemoteLibrarySnapshot::Standard(tracks) => {
+                                    let count = tracks.len();
+                                    (
+                                        count,
+                                        LibraryEvent::RemoteSync {
+                                            source_key: server_url,
+                                            tracks,
+                                        },
+                                    )
+                                }
+                                RemoteLibrarySnapshot::Daap {
+                                    tracks,
+                                    generation,
+                                    session_key,
+                                } => {
+                                    let count = tracks.len();
+                                    (
+                                        count,
+                                        LibraryEvent::DaapSync {
+                                            source_key: server_url,
+                                            generation,
+                                            session_key,
+                                            tracks,
+                                        },
+                                    )
+                                }
+                            };
                             info!(
                                 backend = %backend_type,
-                                count = tracks.len(),
+                                count,
                                 "Remote library fetched"
                             );
-                            let _ = engine_tx
-                                .send(LibraryEvent::RemoteSync {
-                                    source_key: server_url,
-                                    tracks,
-                                })
-                                .await;
+                            let _ = engine_tx.send(event).await;
                         }
+                        Ok(None) => tracing::debug!(
+                            backend = %backend_type,
+                            server = %server_url,
+                            "Remote connection was superseded or shutdown-gated"
+                        ),
                         Err(e) => {
                             tracing::error!(
                                 backend = %backend_type,

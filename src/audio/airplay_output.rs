@@ -37,10 +37,11 @@
 //! - **Seeking is not supported** for live RAOP streams.
 
 use std::process::Child;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::output::{AudioOutput, OutputType};
-use super::{PlayerEvent, PlayerState};
+use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
 
 use gst::prelude::*;
 use gstreamer as gst;
@@ -75,6 +76,7 @@ pub struct AirPlayOutput {
     port: u16,
     /// Event sender for relaying state changes to the GTK main thread.
     event_tx: async_channel::Sender<PlayerEvent>,
+    event_generation: AtomicU64,
     /// Cached volume level (0.0–1.0).
     volume: f64,
     /// Active session, if any.  `Mutex` (not `RefCell`) because the
@@ -105,6 +107,7 @@ impl AirPlayOutput {
             host: host.to_string(),
             port,
             event_tx,
+            event_generation: AtomicU64::new(0),
             // Seed from the current slider value so switching to this device
             // doesn't reset the effective volume to maximum (0 dB) on the
             // first track load.
@@ -126,6 +129,10 @@ impl AirPlayOutput {
         self.session.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    fn event_generation(&self) -> PlayerEventGeneration {
+        PlayerEventGeneration::from_raw(self.event_generation.load(Ordering::SeqCst))
+    }
+
     /// Linear 0.0–1.0 volume → RAOP dB scale (-30.0 = quiet, 0.0 = max).
     fn volume_to_db(linear: f64) -> f64 {
         if linear <= 0.0 {
@@ -143,11 +150,12 @@ impl AirPlayOutput {
         let host = &self.host;
         let port = self.port;
         let volume = self.volume;
+        let generation = self.event_generation();
 
         // Try GStreamer raopsink first.
         match Self::build_raop_pipeline(host, port, uri, volume) {
             Ok(pipeline) => {
-                let bus_watch = self.attach_bus_watch(&pipeline)?;
+                let bus_watch = self.attach_bus_watch(&pipeline, generation)?;
                 pipeline
                     .set_state(gst::State::Paused)
                     .map_err(|e| format!("RAOP pipeline preroll failed: {e}"))?;
@@ -165,7 +173,7 @@ impl AirPlayOutput {
                 let (pipeline, sps_child, stdin_file) =
                     Self::build_shairport_pipeline(host, port, uri)
                         .map_err(|e2| format!("Both AirPlay paths failed: {e1}; {e2}"))?;
-                let bus_watch = self.attach_bus_watch(&pipeline)?;
+                let bus_watch = self.attach_bus_watch(&pipeline, generation)?;
                 pipeline
                     .set_state(gst::State::Paused)
                     .map_err(|e| format!("shairport-sync pipeline preroll failed: {e}"))?;
@@ -198,6 +206,7 @@ impl AirPlayOutput {
     fn attach_bus_watch(
         &self,
         pipeline: &gst::Pipeline,
+        generation: PlayerEventGeneration,
     ) -> Result<gst::bus::BusWatchGuard, String> {
         let bus = pipeline
             .bus()
@@ -208,7 +217,7 @@ impl AirPlayOutput {
             use gst::MessageView;
             match msg.view() {
                 MessageView::Eos(..) => {
-                    let _ = tx.try_send(PlayerEvent::TrackEnded);
+                    let _ = tx.try_send(PlayerEvent::ended(generation));
                 }
                 MessageView::Error(err) => {
                     error!(
@@ -216,7 +225,10 @@ impl AirPlayOutput {
                         debug = ?err.debug(),
                         "AirPlay pipeline error"
                     );
-                    let _ = tx.try_send(PlayerEvent::Error(format!("AirPlay: {}", err.error())));
+                    let _ = tx.try_send(PlayerEvent::error(
+                        generation,
+                        format!("AirPlay: {}", err.error()),
+                    ));
                 }
                 MessageView::StateChanged(s) => {
                     if let Some(pipeline) = pipeline_weak.upgrade() {
@@ -231,7 +243,7 @@ impl AirPlayOutput {
                                 gst::State::VoidPending => None,
                             };
                             if let Some(state) = mapped {
-                                let _ = tx.try_send(PlayerEvent::StateChanged(state));
+                                let _ = tx.try_send(PlayerEvent::state(generation, state));
                             }
                         }
                     }
@@ -396,22 +408,28 @@ impl AudioOutput for AirPlayOutput {
 
     fn load_uri(&self, uri: &str) {
         info!("AirPlay: loading URI");
+        let generation = self.event_generation();
         let _ = self
             .event_tx
-            .try_send(PlayerEvent::StateChanged(PlayerState::Buffering));
+            .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
 
         if let Err(e) = self.open_session(uri) {
             error!(error = %e, "AirPlay: failed to open session");
-            let _ = self.event_tx.try_send(PlayerEvent::Error(e));
+            let _ = self.event_tx.try_send(PlayerEvent::error(generation, e));
             let _ = self
                 .event_tx
-                .try_send(PlayerEvent::StateChanged(PlayerState::Stopped));
+                .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
         } else {
             // `open_session` only prerolls the pipeline to Paused; like every
             // other output, `load_uri` must actually start playback, so drive
             // it to Playing now that buffers are prerolled.
             self.set_pipeline_state(gst::State::Playing);
         }
+    }
+
+    fn set_event_generation(&self, generation: PlayerEventGeneration) {
+        self.event_generation
+            .store(generation.as_raw(), Ordering::SeqCst);
     }
 
     fn play(&self) {
@@ -427,9 +445,10 @@ impl AudioOutput for AirPlayOutput {
     fn stop(&self) {
         debug!("AirPlay: stop");
         self.close_session();
-        let _ = self
-            .event_tx
-            .try_send(PlayerEvent::StateChanged(PlayerState::Stopped));
+        let _ = self.event_tx.try_send(PlayerEvent::state(
+            self.event_generation(),
+            PlayerState::Stopped,
+        ));
     }
 
     fn toggle_play_pause(&self) {

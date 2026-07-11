@@ -1,0 +1,395 @@
+# Tributary remediation tracker
+
+Source review: [`CODE_REVIEW_2026-07-10.md`](../CODE_REVIEW_2026-07-10.md)
+
+Reviewed commit: `598b332d31c6206aea620aa951b78335e4d659ed`
+Created: 2026-07-10
+
+## How to use this file
+
+- Keep tasks unchecked until their acceptance criteria and listed verification are complete.
+- Add the implementing commit or PR beside a completed task.
+- If scope changes, update the review document or record the decision under **Decisions**.
+- Run the global validation gate after every milestone.
+- Do not combine the architecture milestone with unrelated bug fixes.
+
+Status summary:
+
+- [ ] P0 release blockers complete
+- [ ] P1 correctness and security complete
+- [ ] P2 resilience and packaging complete
+- [ ] P3 architecture and integration coverage complete
+
+## P0 — Release blockers
+
+### P0.1 Fix playlist-position migration
+
+- [x] Replace the self-referential rank update with a materialized snapshot.
+- [x] Wrap rank normalization and unique-index creation in an explicit transaction.
+- [x] Preserve existing playlist order when row insertion order differs.
+- [x] Add migration fixtures for gaps, duplicates, reordered rows, multiple playlists, and
+  an empty table.
+- [x] Verify a failed migration cannot leave partially updated positions.
+- [x] Record implementation: current worktree (commit pending); 10 focused migration tests.
+
+Acceptance criteria: upgrading a v0.5.0-style database always yields a unique contiguous
+`0..N` position sequence per playlist without changing the intended order.
+
+### P0.2 Make initial reconciliation non-destructive
+
+- [x] Collect traversal errors and completion state per configured root.
+- [x] Skip stale deletion for any root whose traversal was incomplete.
+- [x] Correctly reconcile a healthy root containing zero audio files.
+- [x] Define and persist availability/mount identity for removable or network roots.
+- [x] Add tests for missing, empty, permission-denied, partially unreadable, and overlapping
+  roots.
+- [ ] Add an explicit trust/re-enrollment flow for roots inherited from a pre-identity database;
+  content similarity is not accepted as proof of physical volume identity.
+- [ ] Pin reconciliation and watcher mutations to a root handle or equivalent mount generation
+  on every supported platform; Linux has mount-instance guards, while portable Unix ABA
+  resistance remains incomplete.
+- [ ] Record implementation: safety core is in the current worktree with 32 focused tests;
+  explicit legacy trust and portable root pinning remain open.
+
+Acceptance criteria: Tributary never deletes persisted track metadata based on an incomplete
+view of a library root, while intentional offline deletion is eventually reflected.
+
+### P0.3 Preserve DAAP session lifetime
+
+- [x] Retain the connected backend/session for as long as the source is connected.
+- [x] Remove logout network activity from `DaapBackend::drop`.
+- [x] Populate and/or replace the explicit disconnect path with owned backend shutdown.
+- [x] Resolve stream/artwork URLs from the live session at playback time.
+- [x] Add a mock DAAP lifecycle test covering connect, sync, play, and disconnect.
+- [x] Record implementation: current worktree (commit pending); 7 focused lifecycle and
+  replacement-race tests.
+
+Acceptance criteria: a DAAP session remains valid after library synchronization and is
+logged out exactly once on explicit disconnect or controlled shutdown.
+
+### P0.4 Introduce stable playback-session identity
+
+- [x] Replace the raw visible-row `current_pos` identity with stable source and track IDs.
+- [x] Store a playback queue snapshot independent of sorting/filtering/navigation.
+- [x] Define Next, Previous, shuffle, repeat-one, and repeat-all semantics after view changes.
+- [x] Make reselecting the current output a no-op.
+- [x] Explicitly transfer or clear playback when the output target changes.
+- [x] Add tests for sort, filter, source change, output change, EOS, and external-file playback.
+- [x] Record implementation: current worktree (commit pending); 25 focused UI/output tests.
+
+Acceptance criteria: view mutations never change the identity of the playing track or the
+meaning of queue navigation.
+
+### P0.5 Fix recycled sidebar action handlers
+
+- [x] Connect the action button once or disconnect handlers on every unbind.
+- [x] Ensure each click resolves only the currently bound `SourceObject`.
+- [x] Cover delete, DAAP eject, playlist creation, and forced remove/reinsert rebinds.
+- [x] Add a GTK test or focused harness that repeatedly recycles the same list item.
+- [x] Record implementation: current worktree (commit pending); focused recycling harness.
+
+Acceptance criteria: one click emits exactly one action for the currently displayed row.
+
+### P0.6 Lock down release build inputs and credentials
+
+- [x] Vendor or immutably pin the Flatpak Cargo generator and verify its checksum.
+- [x] Pin Python build dependencies or run them from a reviewed lock/environment.
+- [x] Set `persist-credentials: false` on build-job checkouts.
+- [x] Move `contents: write` to a minimal publication job.
+- [x] Give all build jobs `contents: read`.
+- [x] Record implementation: current worktree (commit pending); YAML, checksum, and contract
+  checks passed locally.
+
+Acceptance criteria: release build jobs execute only repository or immutable verified code
+and cannot access a repository write credential.
+
+### P0.7 Honor the manual release tag
+
+- [x] Compute a single validated build ref for release and manual-dispatch events.
+- [x] Pass the ref to every checkout in the release workflow.
+- [x] Derive every package version from the checked-out source/tag.
+- [x] Reject a missing or malformed requested tag.
+- [ ] Add a dry-run/manual workflow test demonstrating that tag X builds tag X.
+- [ ] Record implementation: workflow contract implemented in the current worktree; live
+  manual-dispatch verification pending after push.
+
+Acceptance criteria: all artifacts in a run are built from the same requested immutable ref
+and carry the same version.
+
+### P0.8 Clear the dependency audit failure
+
+- [x] Update `crossbeam-epoch` to `>= 0.9.20` through its dependency chain.
+- [x] Update the locked `quinn-proto` to `>= 0.11.15` or remove the unused optional graph.
+- [x] Review the `anyhow`, `paste`, and `proc-macro-error2` warnings and document upstream
+  disposition.
+- [x] Run `cargo audit` successfully.
+- [x] Record implementation: current worktree (commit pending); `cargo audit` passes with two
+  documented informational warnings.
+
+Audit disposition recorded 2026-07-10:
+
+| Advisory | Dependency path | Disposition | Revisit by |
+|---|---|---|---|
+| [`RUSTSEC-2026-0190`](https://rustsec.org/advisories/RUSTSEC-2026-0190) (`anyhow`) | direct and transitive | Fixed by locking and requiring `anyhow >= 1.0.103`. | Closed |
+| [`RUSTSEC-2024-0436`](https://rustsec.org/advisories/RUSTSEC-2024-0436) (`paste`) | `lofty 0.24.0 -> paste 1.0.15` | Informational/unmaintained, with no patched `paste` release. Track Lofty migration to a maintained replacement; no direct Tributary use. | 2026-10-10 or next release, whichever comes first |
+| [`RUSTSEC-2026-0173`](https://rustsec.org/advisories/RUSTSEC-2026-0173) (`proc-macro-error2`) | `sea-orm 1.1.20 -> sea-bae 0.2.1` | Informational/unmaintained compile-time macro dependency. Track SeaORM's removal or evaluate the SeaORM 2 migration. | 2026-10-10 or next release, whichever comes first |
+
+Acceptance criteria: the CI security-audit job passes with every remaining ignored advisory
+explicitly justified and time-bounded.
+
+## P1 — Correctness and security
+
+### P1.1 Add the real playlist-entry track foreign key
+
+- [ ] Rebuild `playlist_entries` with `track_id -> tracks(id) ON DELETE SET NULL`.
+- [ ] Null existing dangling IDs before enabling the constraint.
+- [ ] Reconcile newly orphaned entries after scans and watcher insertions.
+- [ ] Test delete, rename, re-add, and full rebuild behavior.
+- [ ] Record implementation: _pending_
+
+### P1.2 Preserve identity across filesystem renames
+
+- [ ] Treat paired file renames as transactional path updates.
+- [ ] Preserve UUID, `date_added`, play count, and playlist linkage.
+- [ ] Handle directory rename/removal by rescanning the affected subtree.
+- [ ] Define fallback behavior when rename pairing is unavailable.
+- [ ] Record implementation: _pending_
+
+### P1.3 Close the scan/watcher handoff gap
+
+- [ ] Install the watcher before initial enumeration.
+- [ ] Buffer and replay events generated during the scan.
+- [ ] Reconcile after watcher errors or overflow.
+- [ ] Use bounded/coalescing event delivery where appropriate.
+- [ ] Add race-oriented tests.
+- [ ] Record implementation: _pending_
+
+### P1.4 Enforce exact-origin authenticated redirects
+
+- [ ] Disable automatic `Referer` for every credential-bearing client.
+- [ ] Compare scheme, hostname, and effective port.
+- [ ] Forbid HTTPS-to-HTTP downgrade.
+- [ ] Apply the policy to API, stream, artwork, and DAAP clients.
+- [ ] Strip credential-bearing URLs from every retained/formatted error.
+- [ ] Stop logging raw DAAP session IDs and authenticated MPD commands.
+- [ ] Add redirect matrix tests using mock servers.
+- [ ] Record implementation: _pending_
+
+### P1.5 Enforce response limits while streaming
+
+- [ ] Replace `Content-Length`-only checks with counted streaming reads.
+- [ ] Apply caps to API JSON, DAAP, authentication, radio, and album-art responses.
+- [ ] Add overall deadlines in addition to idle timeouts.
+- [ ] Test missing, false, and oversized `Content-Length`, plus endless chunked bodies.
+- [ ] Record implementation: _pending_
+
+### P1.6 Stop exposing broad bearer tokens to receivers
+
+- [ ] Define an opaque short-lived media proxy/ticket design.
+- [ ] Keep backend credentials outside generic `Track` values.
+- [ ] Proxy or mint least-privilege URLs for Chromecast and MPD.
+- [ ] Expire/revoke proxy registrations when playback/session ends.
+- [ ] Threat-model spoofed and compromised LAN receivers.
+- [ ] Record implementation: _pending_
+
+### P1.7 Serialize Chromecast lifecycle and commands
+
+- [ ] Use one ordered worker/session for load, play, pause, seek, volume, and stop.
+- [ ] Check cancellation before each external side effect and emitted event.
+- [ ] Prevent stale loads from launching or replacing newer media.
+- [ ] Ensure every failure terminates in a coherent state, never Error then Buffering.
+- [ ] Add delayed-device and supersession tests.
+- [ ] Record implementation: _pending_
+
+### P1.8 Implement authoritative MPD state
+
+- [ ] Serialize MPD commands through one worker or persistent connection.
+- [ ] Emit Playing, Paused, Stopped, position, duration, and completion events.
+- [ ] Clear buffering timers on success and error.
+- [ ] Redact authenticated URLs from command logs.
+- [ ] Add fake-server tests including slow and reordered commands.
+- [ ] Record implementation: _pending_
+
+### P1.9 Prevent stale async source rendering
+
+- [ ] Attach a source key/generation to playlist, radio, and remote loads.
+- [ ] Cache completed results even when no longer active.
+- [ ] Render only if the requested source remains selected.
+- [ ] Reuse the active-key guard pattern already present in USB loading.
+- [ ] Add navigation-race tests.
+- [ ] Record implementation: _pending_
+
+## P2 — Resilience, data semantics, and packaging
+
+### P2.1 Correct smart-playlist semantics
+
+- [ ] Parse dates/timestamps instead of comparing strings.
+- [ ] Define date-only versus instant behavior and timezone rules.
+- [ ] Validate relative-date amounts and use checked arithmetic.
+- [ ] Select/truncate by limit criteria before applying final compound sort.
+- [ ] Implement snapshot behavior for `live_updating = false` or remove the option.
+- [ ] Add combined rule/limit/sort/date tests.
+- [ ] Record implementation: _pending_
+
+### P2.2 Make playlist import/export transactional and deterministic
+
+- [ ] Export through a sibling temporary file and atomic replacement.
+- [ ] Prefer an exact existing file path before metadata matching.
+- [ ] Enforce the documented duration tolerance and deterministic tie-breaking.
+- [ ] Return database errors rather than treating them as no-match.
+- [ ] Import playlist and entries in one transaction.
+- [ ] Preserve unmatched entries for later reconciliation.
+- [ ] Surface matched, unmatched, and failed counts.
+- [ ] Record implementation: _pending_
+
+### P2.3 Harden tag writes
+
+- [ ] Validate all numeric edits before copying or modifying a file.
+- [ ] Apply or remove the declared album-artist edit.
+- [ ] Use an exclusively created random sibling temp path.
+- [ ] Guarantee cleanup on every failure path.
+- [ ] Preserve permissions and define durability/fsync behavior accurately.
+- [ ] Add concurrent-write and injected-failure tests.
+- [ ] Record implementation: _pending_
+
+### P2.4 Make removable-media browsing safe and asynchronous
+
+- [ ] Disable symlink following during device scans.
+- [ ] Verify canonical descendants remain on the selected mount/device.
+- [ ] Move mount discovery and traversal off the GTK thread.
+- [ ] Use platform mount/volume APIs rather than directory heuristics.
+- [ ] Add malicious symlink, stale mount, and duplicate-device tests.
+- [ ] Record implementation: _pending_
+
+### P2.5 Repair Flatpak behavior and local build path
+
+- [ ] Put the pinned generator where local and CI builds both use it.
+- [ ] Generate `build-aux/flatpak/cargo-sources.json` consistently.
+- [ ] Define narrow USB/removable-media permissions or a portal workflow.
+- [ ] Define writable custom-library behavior for tag editing.
+- [ ] Run a local Flatpak build and smoke-test USB/custom-library behavior.
+- [ ] Record implementation: _pending_
+
+### P2.6 Synchronize packaging metadata
+
+- [ ] Fix RPM `Version`, `Source0`, and `%autosetup` naming.
+- [ ] Raise GTK runtime minimum to 4.16.
+- [ ] Raise libadwaita runtime minimum to 1.6.
+- [ ] Add `%U` or `%F` to the desktop `Exec` line.
+- [ ] Add the required `AudioVideo` desktop category.
+- [ ] Add the 0.5.0 AppStream release entry.
+- [ ] Update README Rust requirement from 1.80 to 1.85.
+- [ ] Add CI on the declared Rust 1.85 MSRV.
+- [ ] Record implementation: _pending_
+
+### P2.7 Fix platform cache paths
+
+- [ ] Store GStreamer registries in a per-user cache directory.
+- [ ] Avoid writes inside `/Applications` and Program Files.
+- [ ] Generate or patch the macOS pixbuf loader cache for the installed absolute bundle path.
+- [ ] Verify macOS signature integrity after first launch.
+- [ ] Record implementation: _pending_
+
+## P3 — Architecture and integration coverage
+
+### P3.1 Introduce a source/session registry
+
+- [ ] Define stable source IDs and backend-native track IDs.
+- [ ] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source.
+- [ ] Remove long-lived authenticated URLs from the generic `Track` model.
+- [ ] Resolve playable URLs/tickets at playback time.
+- [ ] Centralize source refresh, cancellation, disconnect, and failure state.
+- [ ] Decide how local, radio, and external-file sources fit the same lifecycle.
+- [ ] Record architecture decision: _pending_
+- [ ] Record implementation: _pending_
+
+### P3.2 Make the backend abstraction real and stable
+
+- [ ] Construct and use `LocalBackend` through the same integration boundary.
+- [ ] Replace ephemeral album/artist UUIDs with stable identities.
+- [ ] Group local albums by a disambiguating key, not title alone.
+- [ ] Implement or remove unsupported trait methods.
+- [ ] Align README architecture claims with actual code.
+- [ ] Record implementation: _pending_
+
+### P3.3 Add network integration harnesses
+
+- [ ] Mock Subsonic, Jellyfin, Plex, DAAP, Radio-Browser, and geolocation services.
+- [ ] Cover auth, redirect, timeout, body cap, pagination, partial failure, and reverse-proxy
+  prefix behavior.
+- [ ] Cover DAAP malformed nested containers and session expiration.
+- [ ] Record implementation: _pending_
+
+### P3.4 Add UI/output integration harnesses
+
+- [ ] Cover GTK list-item recycling and stale callback prevention.
+- [ ] Cover playback-session behavior across sorting/filtering/navigation.
+- [ ] Cover output transfer and reselect semantics.
+- [ ] Cover fake MPD and delayed Chromecast state machines.
+- [ ] Cover stale album-art and source-result generations.
+- [ ] Add keyboard context-menu and slider accessibility checks.
+- [ ] Record implementation: _pending_
+
+### P3.5 Make coverage reporting representative
+
+- [ ] Stop excluding all UI, remote backends, migrations, desktop integration, and `main.rs`
+  from the only coverage report.
+- [ ] Split pure unit and integration coverage if platform constraints require it.
+- [ ] Establish a documented baseline and ratchet policy.
+- [ ] Record implementation: _pending_
+
+## Global validation gate
+
+Run before marking any milestone complete:
+
+- [x] `cargo fmt --all -- --check`
+- [x] `cargo clippy --all-targets -- -D warnings`
+- [x] `cargo clippy --release -- -D warnings`
+- [x] `cargo test --all-targets`
+- [x] `cargo test --release`
+- [x] `cargo audit`
+- [ ] `desktop-file-validate data/io.github.tributary.Tributary.desktop`
+- [x] `appstreamcli validate --no-net data/io.github.tributary.Tributary.metainfo.xml`
+- [x] Targeted migration upgrade tests
+- [x] Targeted mock-network tests
+- [x] Targeted GTK/output lifecycle tests
+- [ ] Packaging dry runs for affected targets
+- [x] Confirm `git diff --check` is clean
+
+`desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
+by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
+
+## Decisions
+
+Record scope or design decisions here so deferred work is explicit.
+
+- 2026-07-10 — Implemented P0.1, P0.3-P0.6, and P0.8 in the current worktree. P0.7's
+  workflow contract is implemented, but its live manual-dispatch acceptance test requires a
+  pushed ref and remains open.
+- 2026-07-10 — P0.2 now fails closed for incomplete traversal, unavailable/replaced roots,
+  nested mounts, mount-table failures, and ambiguous legacy databases. Legacy roots with
+  existing metadata are intentionally not made deletion-authoritative from content heuristics;
+  explicit trust UX and portable root-handle pinning keep P0.2 open.
+- 2026-07-10 — Linux mount IDs are treated as ephemeral traversal generations, never durable
+  volume identity. Stable root identity is persisted separately so a normal reboot or remount
+  does not silently replace the intended root.
+- 2026-07-10 — Output changes clear the active playback session; they do not attempt a
+  best-effort transfer between unlike output implementations.
+- 2026-07-10 — Generation filtering prevents stale receiver events from mutating Tributary.
+  Ordered Chromecast command side effects and authoritative MPD state remain P1.7 and P1.8.
+- 2026-07-10 — The remaining `cargo audit` warnings are unmaintained transitive dependencies,
+  not known vulnerabilities; their owners and 2026-10-10 review deadline are recorded under
+  P0.8.
+
+## Completed work log
+
+Add one line per completed task:
+
+| Date | Task | Commit/PR | Notes |
+|---|---|---|---|
+| 2026-07-10 | P0.1 | Current worktree | Transactional, deterministic, retry-safe migration with focused upgrade fixtures. |
+| 2026-07-10 | P0.3 | Current worktree | Owned DAAP registry, generation-safe sync, live URL resolution, and exactly-once shutdown. |
+| 2026-07-10 | P0.4 | Current worktree | Stable queue/session identity, generation-filtered events, and deterministic output reset. |
+| 2026-07-10 | P0.5 | Current worktree | One setup-time sidebar handler with current-item resolution and recycling tests. |
+| 2026-07-10 | P0.6 | Current worktree | Immutable release inputs and publication-only repository credentials. |
+| 2026-07-10 | P0.8 | Current worktree | Patched dependency graph and time-bounded informational advisory dispositions. |

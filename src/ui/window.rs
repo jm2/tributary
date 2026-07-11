@@ -26,7 +26,10 @@ use super::persistence::{
     extract_hwnd, load_css, load_repeat_mode, load_shuffle, load_window_geometry,
     restore_sort_state, save_repeat_mode, save_shuffle, save_sort_state, save_window_geometry,
 };
-use super::playback::{advance_track, format_ms, play_track_at, previous_track, PlaybackContext};
+use super::playback::{
+    advance_track, format_ms, play_or_start, play_track_at, previous_track, replay_current,
+    stop_playback, toggle_or_start, BufferingTracker, PlaybackContext, PlaybackSession,
+};
 use super::preferences;
 use super::server_dialogs::{load_saved_servers, remove_saved_server, show_add_server_dialog};
 use super::sidebar;
@@ -138,7 +141,10 @@ pub fn build_window(
 
     if let Ok(url) = std::env::var("DAAP_URL") {
         ensure_category_header_vec(&mut sources, "daap");
-        let src = SourceObject::source("DAAP (env)", "daap", "network-server-symbolic");
+        // Keep the configured URL as the source identity so the retained
+        // session, generation-scoped sync event, sidebar row, and disconnect action all
+        // address the same owner.
+        let src = SourceObject::discovered("DAAP (env)", "daap", &url);
         sources.push(src);
         info!(url = %url, "DAAP server configured via env vars");
     }
@@ -205,13 +211,14 @@ pub fn build_window(
 
     // ── Shared playback state ────────────────────────────────────────
     let master_tracks: Rc<RefCell<Vec<TrackObject>>> = Rc::new(RefCell::new(Vec::new()));
-    let current_pos: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
+    let playback_session = Rc::new(RefCell::new(PlaybackSession::default()));
     let seeking = Rc::new(Cell::new(false));
+    let buffering_tracker = Rc::new(BufferingTracker::default());
 
     // ── Connection guard ─────────────────────────────────────────────
     // Tracks which server URL is currently being connected to, and the
     // sidebar position that was active before the connection attempt.
-    // Used to (a) only auto-select on RemoteSync if the source matches
+    // Used to (a) only auto-select on a remote sync if the source matches
     // the pending connection, and (b) revert the sidebar on failure.
     let pending_connection: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let pre_connect_selection: Rc<Cell<u32>> = Rc::new(Cell::new(1)); // default: local (index 1)
@@ -226,9 +233,6 @@ pub fn build_window(
     let track_store_for_filter = track_store.clone();
     let status_label_for_filter = status_label.clone();
     let master_for_filter = master_tracks.clone();
-    let current_pos_for_filter = current_pos.clone();
-    let sort_model_for_filter = sort_model.clone();
-
     let app_config_for_filter = app_config.clone();
     let on_filter = Box::new(
         move |genre: Option<String>,
@@ -284,35 +288,12 @@ pub fn build_window(
                 .cloned()
                 .collect();
 
-            // Capture the currently-playing track's URI (if any) from the
-            // sorted model BEFORE rebuilding the store, so we can restore
-            // the playback position afterwards (see below).
-            let playing_uri = current_pos_for_filter.get().and_then(|pos| {
-                sort_model_for_filter
-                    .item(pos)
-                    .and_downcast::<TrackObject>()
-                    .map(|t| t.uri())
-            });
-
             // Replace the whole store in a single splice. This emits one
             // `items-changed` signal instead of N appends and keeps the rows'
-            // identity so the now-playing row can still be matched.
+            // identity. Playback navigation uses its own immutable queue and
+            // is deliberately unaffected by this view mutation.
             track_store_for_filter.splice(0, track_store_for_filter.n_items(), &filtered);
             tracklist::update_status(&status_label_for_filter, &filtered);
-
-            // Preserve the playback position across the filter: if the
-            // playing track is still visible, re-point `current_pos` at its
-            // new sorted index so sequential auto-advance keeps working;
-            // only clear it when the playing track was filtered out.
-            let new_pos = playing_uri.and_then(|uri| {
-                (0..sort_model_for_filter.n_items()).find(|&i| {
-                    sort_model_for_filter
-                        .item(i)
-                        .and_downcast::<TrackObject>()
-                        .is_some_and(|t| t.uri() == uri)
-                })
-            });
-            current_pos_for_filter.set(new_pos);
         },
     );
 
@@ -369,10 +350,39 @@ pub fn build_window(
         window.maximize();
     }
 
-    // Save window geometry on close.
-    window.connect_close_request(|w| {
+    // Save window geometry and explicitly close every retained DAAP session.
+    // Gate new connections synchronously, then let Tokio perform network I/O
+    // while GTK remains responsive. Once shutdown completes, close() re-enters
+    // this handler with `shutdown_complete` set and is allowed to proceed.
+    let shutdown_handle = rt_handle.clone();
+    let shutdown_started = Rc::new(Cell::new(false));
+    let shutdown_complete = Rc::new(Cell::new(false));
+    window.connect_close_request(move |w| {
         save_window_geometry(w);
-        glib::Propagation::Proceed
+        if shutdown_complete.get() {
+            return glib::Propagation::Proceed;
+        }
+
+        if !shutdown_started.replace(true) {
+            crate::daap::begin_shutdown();
+            let (done_tx, done_rx) = async_channel::bounded::<()>(1);
+            shutdown_handle.spawn(async move {
+                crate::daap::shutdown_all().await;
+                let _ = done_tx.send(()).await;
+            });
+
+            let window = w.clone();
+            let shutdown_complete = shutdown_complete.clone();
+            glib::MainContext::default().spawn_local(async move {
+                // A closed channel also unblocks the window if the runtime
+                // task unexpectedly terminates.
+                let _ = done_rx.recv().await;
+                shutdown_complete.set(true);
+                window.close();
+            });
+        }
+
+        glib::Propagation::Stop
     });
 
     // ── Start the library engine on tokio ────────────────────────────
@@ -493,19 +503,36 @@ pub fn build_window(
         let tx = engine_tx.clone();
         rt_handle.spawn(async move {
             info!(server = %url, "Connecting to DAAP server...");
+            let Some(attempt) = crate::daap::begin_connect(url.clone()) else {
+                tracing::debug!(server = %url, "Skipping DAAP connect during shutdown");
+                return;
+            };
             match crate::daap::DaapBackend::connect("DAAP", &url, password.as_deref()).await {
                 Ok(backend) => {
-                    let tracks: Vec<crate::architecture::models::Track> =
-                        backend.all_tracks().await;
+                    let Some(session) = attempt.retain(backend).await else {
+                        tracing::debug!(server = %url, "DAAP connect was superseded");
+                        return;
+                    };
+                    let tracks: Vec<crate::architecture::models::Track> = session.all_tracks().await;
+                    if !session.is_current() {
+                        tracing::debug!(server = %url, "DAAP sync was superseded");
+                        return;
+                    }
                     info!(count = tracks.len(), "DAAP library fetched");
                     let _ = tx
-                        .send(LibraryEvent::RemoteSync {
+                        .send(LibraryEvent::DaapSync {
                             source_key: url.clone(),
+                            generation: session.generation(),
+                            session_key: session.session_key(),
                             tracks,
                         })
                         .await;
                 }
                 Err(e) => {
+                    if !attempt.is_latest() {
+                        tracing::debug!(server = %url, "Ignoring superseded DAAP connection failure");
+                        return;
+                    }
                     tracing::error!(error = %e, "DAAP connection failed");
                     let _ = tx.send(LibraryEvent::Error(format!("DAAP: {e}"))).await;
                 }
@@ -523,7 +550,6 @@ pub fn build_window(
             master_tracks: master_tracks.clone(),
             source_tracks: source_tracks.clone(),
             active_source_key: active_source_key.clone(),
-            current_pos: current_pos.clone(),
             sidebar_store: sidebar_store.clone(),
             sidebar_selection: sidebar_selection.clone(),
             browser_widget: browser_widget.clone(),
@@ -579,10 +605,20 @@ pub fn build_window(
         let browser_state = browser_state.clone();
         let status_label = status_label.clone();
         let column_view = column_view.clone();
+        let rt_handle = rt_handle.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = delete_rx.recv().await {
                 info!(source = %source_key, "Manual server delete requested");
+
+                // A connected DAAP source normally uses the eject action,
+                // but deletion must still transfer and close ownership if a
+                // stale/rebound row emits delete instead.
+                if let Some(backend) = crate::daap::release_source(&source_key) {
+                    rt_handle.spawn(async move {
+                        backend.disconnect().await;
+                    });
+                }
 
                 // Remove from servers.json.
                 remove_saved_server(&source_key);
@@ -642,24 +678,15 @@ pub fn build_window(
             while let Ok(source_key) = disconnect_rx.recv().await {
                 info!(source = %source_key, "DAAP disconnect requested");
 
-                // Best-effort logout: find the logout URL on the SourceObject.
-                for i in 0..sidebar_store.n_items() {
-                    if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-                        if src.server_url() == source_key {
-                            let logout_url = src.logout_url();
-                            if !logout_url.is_empty() {
-                                let rt = rt_handle.clone();
-                                rt.spawn(async move {
-                                    let client = reqwest::Client::builder()
-                                        .timeout(std::time::Duration::from_secs(5))
-                                        .build()
-                                        .unwrap_or_default();
-                                    let _ = client.get(&logout_url).send().await;
-                                });
-                            }
-                            break;
-                        }
-                    }
+                // Transfer ownership out of the live-session registry before
+                // updating the UI. This makes a subsequent fast reconnect
+                // independent of the old session's asynchronous logout.
+                if let Some(backend) = crate::daap::release_source(&source_key) {
+                    rt_handle.spawn(async move {
+                        backend.disconnect().await;
+                    });
+                } else {
+                    tracing::warn!(source = %source_key, "DAAP source had no retained session");
                 }
 
                 // 1. Remove from source_tracks map.
@@ -672,7 +699,6 @@ pub fn build_window(
                         if src.server_url() == source_key {
                             src.set_connected(false);
                             src.set_connecting(false);
-                            src.set_logout_url("");
                             src.set_icon_name("network-server-symbolic");
                             // Force rebind by remove + re-insert.
                             let src = src.clone();
@@ -720,7 +746,6 @@ pub fn build_window(
         master_tracks: master_tracks.clone(),
         source_tracks: source_tracks.clone(),
         active_source_key: active_source_key.clone(),
-        current_pos: current_pos.clone(),
         sidebar_store: sidebar_store.clone(),
         sidebar_selection: sidebar_selection.clone(),
         browser_widget: browser_widget.clone(),
@@ -775,6 +800,7 @@ pub fn build_window(
     let local_output = LocalOutput::new(player);
     let active_output: Rc<RefCell<Box<dyn AudioOutput>>> =
         Rc::new(RefCell::new(Box::new(local_output)));
+    let active_output_target = Rc::new(RefCell::new(super::output_switch::OutputTarget::Local));
 
     // Parking slot for the local output when an MPD output is active.
     // When switching to MPD we move the LocalOutput out of active_output
@@ -840,135 +866,154 @@ pub fn build_window(
     // into the spawn_local closure (cloned each iteration so the
     // PlaybackContext can be built fresh per event without moving the
     // captured Rc's out of the closure).
-    let media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>> = {
-        // The PlaybackContext takes a `media_ctrl` field that needs to
-        // be the same Rc the rest of the UI uses, so we declare the
-        // outer `Rc` first as `None`, build the controller, then store
-        // it inside.
-        let ctrl_slot: Rc<RefCell<Option<crate::desktop_integration::MediaController>>> =
-            Rc::new(RefCell::new(None));
+    let media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>> =
+        Rc::new(RefCell::new(None));
 
-        match crate::desktop_integration::MediaController::new(hwnd) {
-            Ok((ctrl, media_rx)) => {
-                *ctrl_slot.borrow_mut() = Some(ctrl);
+    // Every terminal/reset path uses this one operation. Besides resetting the
+    // visible controls it invalidates delayed spinner callbacks and both local
+    // and remote artwork workers before installing the idle placeholder.
+    let clear_playback_ui: Rc<dyn Fn()> = {
+        let play_button = hb.play_button.clone();
+        let title_label = hb.title_label.clone();
+        let artist_label = hb.artist_label.clone();
+        let album_art = hb.album_art.clone();
+        let progress_adj = hb.progress_adj.clone();
+        let position_label = hb.position_label.clone();
+        let duration_label = hb.duration_label.clone();
+        let seeking = seeking.clone();
+        let media_ctrl = media_ctrl.clone();
+        let buffering_tracker = buffering_tracker.clone();
+        Rc::new(move || {
+            buffering_tracker.invalidate();
+            play_button.set_child(Option::<&gtk::Widget>::None);
+            play_button.set_icon_name("media-playback-start-symbolic");
+            title_label.set_label("Not Playing");
+            title_label.set_tooltip_text(Option::<&str>::None);
+            artist_label.set_label("");
+            artist_label.set_tooltip_text(Option::<&str>::None);
+            super::album_art::invalidate();
+            album_art.set_icon_name(Some("audio-x-generic-symbolic"));
+            seeking.set(true);
+            progress_adj.set_value(0.0);
+            progress_adj.set_upper(1.0);
+            seeking.set(false);
+            position_label.set_label("0:00");
+            duration_label.set_label("0:00");
+            if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                ctrl.set_stopped();
+            }
+        })
+    };
 
-                let active_output = active_output.clone();
-                let parked_local = parked_local.clone();
-                let album_art = hb.album_art.clone();
-                let title_label = hb.title_label.clone();
-                let artist_label = hb.artist_label.clone();
-                let sm = sort_model.clone();
-                let current_pos = current_pos.clone();
-                let repeat_mode = hb.repeat_mode.clone();
-                let shuffle = hb.shuffle_button.clone();
-                let ctrl_for_ctx = ctrl_slot.clone();
-                let column_view_for_keys = column_view.clone();
+    match crate::desktop_integration::MediaController::new(hwnd) {
+        Ok((ctrl, media_rx)) => {
+            *media_ctrl.borrow_mut() = Some(ctrl);
 
-                glib::MainContext::default().spawn_local(async move {
-                    while let Ok(action) = media_rx.recv().await {
-                        info!(?action, "OS media key");
-                        match action {
-                            MediaAction::Play => active_output.borrow().play(),
-                            MediaAction::Pause => active_output.borrow().pause(),
-                            MediaAction::Toggle => active_output.borrow().toggle_play_pause(),
-                            MediaAction::Stop => active_output.borrow().stop(),
-                            MediaAction::Next => {
-                                advance_track(
-                                    &PlaybackContext {
-                                        model: sm.clone(),
-                                        active_output: active_output.clone(),
-                                        parked_local: parked_local.clone(),
-                                        album_art: album_art.clone(),
-                                        title_label: title_label.clone(),
-                                        artist_label: artist_label.clone(),
-                                        media_ctrl: ctrl_for_ctx.clone(),
-                                        current_pos: current_pos.clone(),
-                                        column_view: column_view_for_keys.clone(),
-                                    },
-                                    repeat_mode.get(),
-                                    shuffle.is_active(),
-                                );
+            let active_output = active_output.clone();
+            let album_art = hb.album_art.clone();
+            let title_label = hb.title_label.clone();
+            let artist_label = hb.artist_label.clone();
+            let sm = sort_model.clone();
+            let active_source_key = active_source_key.clone();
+            let playback_session = playback_session.clone();
+            let repeat_mode = hb.repeat_mode.clone();
+            let shuffle = hb.shuffle_button.clone();
+            let ctrl_for_ctx = media_ctrl.clone();
+            let column_view_for_keys = column_view.clone();
+            let clear_playback_ui = clear_playback_ui.clone();
+
+            glib::MainContext::default().spawn_local(async move {
+                while let Ok(action) = media_rx.recv().await {
+                    info!(?action, "OS media key");
+                    let ctx = PlaybackContext {
+                        model: sm.clone(),
+                        active_source_key: active_source_key.clone(),
+                        active_output: active_output.clone(),
+                        album_art: album_art.clone(),
+                        title_label: title_label.clone(),
+                        artist_label: artist_label.clone(),
+                        media_ctrl: ctrl_for_ctx.clone(),
+                        session: playback_session.clone(),
+                        column_view: column_view_for_keys.clone(),
+                    };
+                    match action {
+                        MediaAction::Play => {
+                            if play_or_start(&ctx, shuffle.is_active()) {
+                                if let Some(ref mut ctrl) = *ctrl_for_ctx.borrow_mut() {
+                                    ctrl.update_playback(true);
+                                }
                             }
-                            MediaAction::Previous => {
-                                // Mirror the header-bar heuristic: if
-                                // we're past the restart threshold,
-                                // restart the current track; otherwise
-                                // step back.
-                                let position_ms = active_output.borrow().position_ms().unwrap_or(0);
-                                if position_ms > PREV_RESTART_THRESHOLD_MS {
+                        }
+                        MediaAction::Pause => {
+                            if playback_session.borrow().has_current() {
+                                active_output.borrow().pause();
+                                if let Some(ref mut ctrl) = *ctrl_for_ctx.borrow_mut() {
+                                    ctrl.update_playback(false);
+                                }
+                            }
+                        }
+                        MediaAction::Toggle => {
+                            toggle_or_start(&ctx, shuffle.is_active());
+                        }
+                        MediaAction::Stop => {
+                            stop_playback(&ctx);
+                            clear_playback_ui();
+                        }
+                        MediaAction::Next => {
+                            advance_track(&ctx, repeat_mode.get(), shuffle.is_active());
+                        }
+                        MediaAction::Previous => {
+                            // Mirror the header-bar heuristic: if we're past
+                            // the restart threshold, restart the current track.
+                            let position_ms = active_output.borrow().position_ms().unwrap_or(0);
+                            if position_ms > PREV_RESTART_THRESHOLD_MS {
+                                active_output.borrow().seek_to(0);
+                            } else {
+                                let stepped =
+                                    previous_track(&ctx, repeat_mode.get(), shuffle.is_active());
+                                if !stepped {
                                     active_output.borrow().seek_to(0);
-                                } else {
-                                    let stepped = previous_track(
-                                        &PlaybackContext {
-                                            model: sm.clone(),
-                                            active_output: active_output.clone(),
-                                            parked_local: parked_local.clone(),
-                                            album_art: album_art.clone(),
-                                            title_label: title_label.clone(),
-                                            artist_label: artist_label.clone(),
-                                            media_ctrl: ctrl_for_ctx.clone(),
-                                            current_pos: current_pos.clone(),
-                                            column_view: column_view_for_keys.clone(),
-                                        },
-                                        repeat_mode.get(),
-                                    );
-                                    if !stepped {
-                                        active_output.borrow().seek_to(0);
-                                    }
                                 }
                             }
                         }
                     }
-                });
-            }
-            Err(e) => {
-                warn!(error = %e, "Media controls unavailable — media keys disabled");
-            }
+                }
+            });
         }
-
-        ctrl_slot
-    };
+        Err(e) => {
+            warn!(error = %e, "Media controls unavailable — media keys disabled");
+        }
+    }
 
     // ── Wire play/pause button ──────────────────────────────────────
     // If nothing is playing, start from track 0 (or random if shuffle).
     {
         let active_output = active_output.clone();
-        let parked_local = parked_local.clone();
         let media_ctrl = media_ctrl.clone();
         let album_art = hb.album_art.clone();
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
         let sort_model = sort_model.clone();
-        let current_pos = current_pos.clone();
+        let active_source_key = active_source_key.clone();
+        let playback_session = playback_session.clone();
         let shuffle = hb.shuffle_button.clone();
         let column_view_c = column_view.clone();
 
         hb.play_button.connect_clicked(move |_| {
-            if current_pos.get().is_some() {
-                // Already have a track loaded — just toggle.
-                active_output.borrow().toggle_play_pause();
-            } else if sort_model.n_items() > 0 {
-                // Nothing playing — start from the list.
-                let pos = if shuffle.is_active() {
-                    fastrand::u32(..sort_model.n_items())
-                } else {
-                    0
-                };
-                play_track_at(
-                    pos,
-                    &PlaybackContext {
-                        model: sort_model.clone(),
-                        active_output: active_output.clone(),
-                        parked_local: parked_local.clone(),
-                        album_art: album_art.clone(),
-                        title_label: title_label.clone(),
-                        artist_label: artist_label.clone(),
-                        media_ctrl: media_ctrl.clone(),
-                        current_pos: current_pos.clone(),
-                        column_view: column_view_c.clone(),
-                    },
-                );
-            }
+            toggle_or_start(
+                &PlaybackContext {
+                    model: sort_model.clone(),
+                    active_source_key: active_source_key.clone(),
+                    active_output: active_output.clone(),
+                    album_art: album_art.clone(),
+                    title_label: title_label.clone(),
+                    artist_label: artist_label.clone(),
+                    media_ctrl: media_ctrl.clone(),
+                    session: playback_session.clone(),
+                    column_view: column_view_c.clone(),
+                },
+                shuffle.is_active(),
+            );
         });
     }
 
@@ -984,15 +1029,20 @@ pub fn build_window(
     });
 
     // ── Wire output selector row-click handler ──────────────────────
-    super::output_switch::setup_output_selector(
-        &hb.output_list,
-        &hb.output_button,
-        &active_output,
-        &parked_local,
-        &event_sender,
-        &hb.volume_scale,
-        &rt_handle,
-    );
+    {
+        super::output_switch::setup_output_selector(
+            &hb.output_list,
+            &hb.output_button,
+            &active_output,
+            &parked_local,
+            &active_output_target,
+            &playback_session,
+            clear_playback_ui.clone(),
+            &event_sender,
+            &hb.volume_scale,
+            &rt_handle,
+        );
+    }
 
     // ── Wire volume scale ───────────────────────────────────────────
     // Throttled (trailing): a slider drag emits a burst of value-changed
@@ -1079,22 +1129,22 @@ pub fn build_window(
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
         let sm = sort_model.clone();
-        let current_pos = current_pos.clone();
+        let active_source_key = active_source_key.clone();
+        let playback_session = playback_session.clone();
         let cv = column_view.clone();
 
-        let parked_local = parked_local.clone();
         column_view.connect_activate(move |_view, position| {
             play_track_at(
                 position,
                 &PlaybackContext {
                     model: sm.clone(),
+                    active_source_key: active_source_key.clone(),
                     active_output: active_output.clone(),
-                    parked_local: parked_local.clone(),
                     album_art: album_art.clone(),
                     title_label: title_label.clone(),
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
-                    current_pos: current_pos.clone(),
+                    session: playback_session.clone(),
                     column_view: cv.clone(),
                 },
             );
@@ -1110,7 +1160,6 @@ pub fn build_window(
         master_tracks: master_tracks.clone(),
         source_tracks: source_tracks.clone(),
         active_source_key: active_source_key.clone(),
-        current_pos: current_pos.clone(),
         sidebar_store: sidebar_store_for_events.clone(),
         sidebar_selection: sidebar_sel_for_events.clone(),
         browser_widget: browser_widget.clone(),
@@ -1131,23 +1180,23 @@ pub fn build_window(
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
         let sm = sort_model.clone();
-        let current_pos = current_pos.clone();
+        let active_source_key = active_source_key.clone();
+        let playback_session = playback_session.clone();
         let repeat_mode = hb.repeat_mode.clone();
         let shuffle = hb.shuffle_button.clone();
-        let parked_local = parked_local.clone();
         let cv = column_view.clone();
 
         hb.next_button.connect_clicked(move |_| {
             advance_track(
                 &PlaybackContext {
                     model: sm.clone(),
+                    active_source_key: active_source_key.clone(),
                     active_output: active_output.clone(),
-                    parked_local: parked_local.clone(),
                     album_art: album_art.clone(),
                     title_label: title_label.clone(),
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
-                    current_pos: current_pos.clone(),
+                    session: playback_session.clone(),
                     column_view: cv.clone(),
                 },
                 repeat_mode.get(),
@@ -1164,9 +1213,10 @@ pub fn build_window(
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
         let sm = sort_model.clone();
-        let current_pos = current_pos.clone();
-        let parked_local = parked_local.clone();
+        let active_source_key = active_source_key.clone();
+        let playback_session = playback_session.clone();
         let repeat_mode = hb.repeat_mode.clone();
+        let shuffle = hb.shuffle_button.clone();
         let cv = column_view.clone();
 
         hb.prev_button.connect_clicked(move |_| {
@@ -1180,16 +1230,17 @@ pub fn build_window(
             let stepped = previous_track(
                 &PlaybackContext {
                     model: sm.clone(),
+                    active_source_key: active_source_key.clone(),
                     active_output: active_output.clone(),
-                    parked_local: parked_local.clone(),
                     album_art: album_art.clone(),
                     title_label: title_label.clone(),
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
-                    current_pos: current_pos.clone(),
+                    session: playback_session.clone(),
                     column_view: cv.clone(),
                 },
                 repeat_mode.get(),
+                shuffle.is_active(),
             );
 
             // If we couldn't step back (track 0 with repeat off, or no
@@ -1214,10 +1265,12 @@ pub fn build_window(
         let seeking = seeking.clone();
         let media_ctrl = media_ctrl.clone();
         let active_output = active_output.clone();
-        let parked_local = parked_local.clone();
         let sm = sort_model.clone();
-        let current_pos = current_pos.clone();
+        let active_source_key = active_source_key.clone();
+        let playback_session = playback_session.clone();
         let cv = column_view.clone();
+        let buffering_tracker = buffering_tracker.clone();
+        let clear_playback_ui = clear_playback_ui.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -1230,49 +1283,50 @@ pub fn build_window(
         // longer than this threshold.  Increased from 100 ms to 300 ms
         // to prevent sub-100 ms blinking on fast-loading local files.
         const BUFFERING_DELAY_MS: u32 = 300;
-        // Generation counter — incremented on every state change so
-        // a stale timeout callback can detect it was superseded.
-        let buffering_gen: Rc<Cell<u32>> = Rc::new(Cell::new(0));
-        // Track whether we are in a buffering state so that
-        // PositionChanged can clear the spinner definitively.
-        let is_buffering: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = player_rx.recv().await {
+                let event_generation = event.generation();
+                if !playback_session
+                    .borrow()
+                    .accepts_event_generation(event_generation)
+                {
+                    tracing::debug!(?event_generation, "Ignoring stale player event");
+                    continue;
+                }
                 match event {
-                    PlayerEvent::StateChanged(state) => {
-                        // Bump generation on every state change to
-                        // invalidate any pending buffering timer.
-                        let gen = buffering_gen.get().wrapping_add(1);
-                        buffering_gen.set(gen);
-
+                    PlayerEvent::StateChanged { state, .. } => {
                         match state {
                             PlayerState::Buffering => {
-                                is_buffering.set(true);
+                                let generation = buffering_tracker.begin();
                                 // Schedule the spinner after a short
                                 // delay — if Playing arrives first the
                                 // generation will have changed and the
                                 // callback becomes a no-op.
                                 let btn = play_btn.clone();
                                 let spinner = buffering_spinner.clone();
-                                let gen_rc = buffering_gen.clone();
+                                let tracker = buffering_tracker.clone();
+                                let session = playback_session.clone();
                                 glib::timeout_add_local_once(
                                     Duration::from_millis(BUFFERING_DELAY_MS as u64),
                                     move || {
-                                        if gen_rc.get() == gen {
+                                        if tracker.is_current(generation)
+                                            && session
+                                                .borrow()
+                                                .accepts_event_generation(event_generation)
+                                        {
                                             btn.set_child(Some(&spinner));
                                         }
                                     },
                                 );
                             }
                             PlayerState::Playing => {
-                                is_buffering.set(false);
+                                buffering_tracker.invalidate();
                                 // Restore icon: show pause.
                                 play_btn.set_child(Option::<&gtk::Widget>::None);
                                 play_btn.set_icon_name("media-playback-pause-symbolic");
                             }
                             _ => {
-                                is_buffering.set(false);
+                                buffering_tracker.invalidate();
                                 // Stopped or Paused: show play.
                                 play_btn.set_child(Option::<&gtk::Widget>::None);
                                 play_btn.set_icon_name("media-playback-start-symbolic");
@@ -1280,13 +1334,23 @@ pub fn build_window(
                         }
 
                         if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
-                            ctrl.update_playback(state == PlayerState::Playing);
+                            match state {
+                                PlayerState::Playing => ctrl.update_playback(true),
+                                PlayerState::Paused | PlayerState::Stopped => {
+                                    ctrl.update_playback(false);
+                                }
+                                // OS media APIs do not expose Buffering. Keep
+                                // the optimistic Playing state published when
+                                // the session load was accepted.
+                                PlayerState::Buffering => {}
+                            }
                         }
                     }
 
                     PlayerEvent::PositionChanged {
                         position_ms,
                         duration_ms,
+                        ..
                     } => {
                         // If we receive a position tick while still in
                         // the buffering state, audio is actually playing
@@ -1294,10 +1358,8 @@ pub fn build_window(
                         // sure-fire fix for remote streams where GStreamer
                         // never sends a clean Playing state change after
                         // buffering completes.
-                        if is_buffering.get() {
-                            is_buffering.set(false);
-                            let gen = buffering_gen.get().wrapping_add(1);
-                            buffering_gen.set(gen);
+                        if buffering_tracker.is_buffering() {
+                            buffering_tracker.invalidate();
                             play_btn.set_child(Option::<&gtk::Widget>::None);
                             play_btn.set_icon_name("media-playback-pause-symbolic");
 
@@ -1328,41 +1390,39 @@ pub fn build_window(
                         }
                     }
 
-                    PlayerEvent::TrackEnded => {
+                    PlayerEvent::TrackEnded { .. } => {
+                        buffering_tracker.invalidate();
+                        play_btn.set_child(Option::<&gtk::Widget>::None);
                         let mode = repeat_mode.get();
 
                         // Repeat-one: replay the same track.
-                        if mode == RepeatMode::One {
-                            if let Some(pos) = current_pos.get() {
-                                play_track_at(
-                                    pos,
-                                    &PlaybackContext {
-                                        model: sm.clone(),
-                                        active_output: active_output.clone(),
-                                        parked_local: parked_local.clone(),
-                                        album_art: album_art.clone(),
-                                        title_label: title_label.clone(),
-                                        artist_label: artist_label.clone(),
-                                        media_ctrl: media_ctrl.clone(),
-                                        current_pos: current_pos.clone(),
-                                        column_view: cv.clone(),
-                                    },
-                                );
-                                continue;
-                            }
+                        if mode == RepeatMode::One
+                            && replay_current(&PlaybackContext {
+                                model: sm.clone(),
+                                active_source_key: active_source_key.clone(),
+                                active_output: active_output.clone(),
+                                album_art: album_art.clone(),
+                                title_label: title_label.clone(),
+                                artist_label: artist_label.clone(),
+                                media_ctrl: media_ctrl.clone(),
+                                session: playback_session.clone(),
+                                column_view: cv.clone(),
+                            })
+                        {
+                            continue;
                         }
 
                         // Auto-advance (shuffle-aware).
                         let advanced = advance_track(
                             &PlaybackContext {
                                 model: sm.clone(),
+                                active_source_key: active_source_key.clone(),
                                 active_output: active_output.clone(),
-                                parked_local: parked_local.clone(),
                                 album_art: album_art.clone(),
                                 title_label: title_label.clone(),
                                 artist_label: artist_label.clone(),
                                 media_ctrl: media_ctrl.clone(),
-                                current_pos: current_pos.clone(),
+                                session: playback_session.clone(),
                                 column_view: cv.clone(),
                             },
                             mode,
@@ -1370,33 +1430,23 @@ pub fn build_window(
                         );
 
                         if !advanced {
-                            // End of playlist — reset to idle.
-                            play_btn.set_icon_name("media-playback-start-symbolic");
-                            title_label.set_label("Not Playing");
-                            artist_label.set_label("");
-                            album_art.set_icon_name(Some("audio-x-generic-symbolic"));
-                            current_pos.set(None);
-
-                            seeking.set(true);
-                            progress_adj.set_value(0.0);
-                            progress_adj.set_upper(1.0);
-                            seeking.set(false);
-
-                            position_label.set_label("0:00");
-                            duration_label.set_label("0:00");
-
-                            if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
-                                ctrl.set_stopped();
-                            }
+                            // End of playlist — invalidate the event generation
+                            // before resetting every async/visible UI surface.
+                            playback_session.borrow_mut().clear();
+                            clear_playback_ui();
                         }
                     }
 
-                    PlayerEvent::Error(msg) => {
-                        tracing::error!(error = %msg, "Player error");
+                    PlayerEvent::Error { message, .. } => {
+                        tracing::error!(error = %message, "Player error");
                         // On error, restore the play icon (stop the spinner
                         // if we were buffering).
+                        buffering_tracker.invalidate();
                         play_btn.set_child(Option::<&gtk::Widget>::None);
                         play_btn.set_icon_name("media-playback-start-symbolic");
+                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                            ctrl.update_playback(false);
+                        }
                     }
                 }
             }
@@ -1444,13 +1494,13 @@ pub fn build_window(
     // look it up via `app.lookup_action`.
     {
         let active_output = active_output.clone();
-        let parked_local = parked_local.clone();
         let media_ctrl = media_ctrl.clone();
         let album_art = hb.album_art.clone();
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
         let sm = sort_model.clone();
-        let current_pos = current_pos.clone();
+        let active_source_key = active_source_key.clone();
+        let playback_session = playback_session.clone();
         let cv = column_view.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
@@ -1464,13 +1514,13 @@ pub fn build_window(
             // a temp playlist is a separate feature.
             let ctx = super::playback::PlaybackContext {
                 model: sm.clone(),
+                active_source_key: active_source_key.clone(),
                 active_output: active_output.clone(),
-                parked_local: parked_local.clone(),
                 album_art: album_art.clone(),
                 title_label: title_label.clone(),
                 artist_label: artist_label.clone(),
                 media_ctrl: media_ctrl.clone(),
-                current_pos: current_pos.clone(),
+                session: playback_session.clone(),
                 column_view: cv.clone(),
             };
             for path in paths {
@@ -1541,7 +1591,6 @@ pub fn build_window(
             master_tracks: master_tracks.clone(),
             source_tracks: source_tracks.clone(),
             active_source_key: active_source_key.clone(),
-            current_pos: current_pos.clone(),
             sidebar_store: sidebar_store_for_events.clone(),
             sidebar_selection: sidebar_sel_for_events.clone(),
             browser_widget: browser_widget.clone(),
@@ -1630,6 +1679,31 @@ fn setup_library_events(
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(event) = engine_rx.recv().await {
+            // A DAAP connection can be replaced while its track snapshot is
+            // queued for GTK. Validate the generation at the publication
+            // boundary so an older session can never repopulate the source
+            // with references that its replacement already invalidated.
+            let event = match event {
+                LibraryEvent::DaapSync {
+                    source_key,
+                    generation,
+                    session_key,
+                    tracks,
+                } => {
+                    if !crate::daap::is_current_session(&source_key, generation, session_key) {
+                        tracing::debug!(
+                            source = %source_key,
+                            generation,
+                            %session_key,
+                            "Ignoring stale DAAP library sync"
+                        );
+                        continue;
+                    }
+                    LibraryEvent::RemoteSync { source_key, tracks }
+                }
+                event => event,
+            };
+
             match event {
                 LibraryEvent::FullSync(tracks) => {
                     info!(count = tracks.len(), "Received full library sync");
@@ -1906,6 +1980,10 @@ fn setup_library_events(
                     scan_spinner.set_spinning(false);
                     scan_spinner.set_visible(false);
                 }
+
+                LibraryEvent::DaapSync { .. } => {
+                    unreachable!("DAAP syncs are normalized before event dispatch")
+                }
             }
         }
     });
@@ -1942,6 +2020,8 @@ pub fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObje
         t.format.as_deref().unwrap_or(""),
         &uri,
     );
+
+    obj.set_track_id(&t.id.to_string());
 
     // Propagate cover art URL for remote tracks.
     if let Some(ref art_url) = t.cover_art_url {

@@ -55,6 +55,7 @@ daap.songyear,daap.songformat,daap.songbitrate,daap.songsamplerate,\
 daap.songdatemodified";
 
 /// Holds DAAP session state and a reusable `reqwest::Client`.
+#[derive(Clone)]
 pub struct DaapClient {
     base_url: Url,
     session_id: u32,
@@ -396,7 +397,13 @@ impl DaapClient {
             self.base_url.as_str().trim_end_matches('/'),
             self.session_id
         );
-        match self.http.get(&url).send().await {
+        match self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
             // lgtm[rs/cleartext-transmission] DAAP uses plaintext HTTP by design.
             Ok(_) => info!("DAAP logout OK"),
             Err(e) => warn!(error = %e, "DAAP logout failed (best-effort)"),
