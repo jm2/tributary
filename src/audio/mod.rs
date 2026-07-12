@@ -29,7 +29,7 @@ pub mod local_output;
 pub mod mpd_output;
 pub mod output;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -40,17 +40,84 @@ use tracing::{debug, error, info, warn};
 
 // ── Events ──────────────────────────────────────────────────────────────
 
-/// Events emitted by the player, delivered on the GTK main thread.
+/// Monotonic identity of the playback load that owns a [`PlayerEvent`].
+///
+/// Outputs capture this value when a URI is loaded (or an asynchronous command
+/// is started). The UI accepts an event only while the corresponding playback
+/// session generation is still current, so delayed EOS/state/error events from
+/// a superseded track or output cannot mutate the new session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct PlayerEventGeneration(u64);
+
+impl PlayerEventGeneration {
+    pub(crate) fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+
+    pub(crate) fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Events emitted by an output, delivered on the GTK main thread.
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
     /// The pipeline transitioned to a new coarse state.
-    StateChanged(PlayerState),
+    StateChanged {
+        generation: PlayerEventGeneration,
+        state: PlayerState,
+    },
     /// Periodic position tick (values in milliseconds).
-    PositionChanged { position_ms: u64, duration_ms: u64 },
+    PositionChanged {
+        generation: PlayerEventGeneration,
+        position_ms: u64,
+        duration_ms: u64,
+    },
     /// The current stream reached its natural end.
-    TrackEnded,
+    TrackEnded { generation: PlayerEventGeneration },
     /// A pipeline error occurred.
-    Error(String),
+    Error {
+        generation: PlayerEventGeneration,
+        message: String,
+    },
+}
+
+impl PlayerEvent {
+    pub fn state(generation: PlayerEventGeneration, state: PlayerState) -> Self {
+        Self::StateChanged { generation, state }
+    }
+
+    pub fn position(generation: PlayerEventGeneration, position_ms: u64, duration_ms: u64) -> Self {
+        Self::PositionChanged {
+            generation,
+            position_ms,
+            duration_ms,
+        }
+    }
+
+    pub fn ended(generation: PlayerEventGeneration) -> Self {
+        Self::TrackEnded { generation }
+    }
+
+    pub fn error(generation: PlayerEventGeneration, message: impl Into<String>) -> Self {
+        Self::Error {
+            generation,
+            message: message.into(),
+        }
+    }
+
+    pub fn generation(&self) -> PlayerEventGeneration {
+        match self {
+            Self::StateChanged { generation, .. }
+            | Self::PositionChanged { generation, .. }
+            | Self::TrackEnded { generation }
+            | Self::Error { generation, .. } => *generation,
+        }
+    }
 }
 
 /// Coarse playback state visible to the rest of the application.
@@ -73,12 +140,16 @@ pub struct Player {
     playbin: gst::Element,
     volume: f64,
     event_tx: async_channel::Sender<PlayerEvent>,
+    /// Generation assigned by the playback session before each URI load.
+    event_generation: Rc<Cell<PlayerEventGeneration>>,
     /// Holds the latest volume awaiting a debounced disk write, or `None`
     /// when no write is scheduled.  Keeps slider-drag volume changes off
     /// the main-thread hot path (see [`Player::save_volume_debounced`]).
     volume_save_pending: Rc<Cell<Option<f64>>>,
-    /// Dropping this guard removes the bus watch — must stay alive.
-    _bus_watch: gst::bus::BusWatchGuard,
+    /// The watch is replaced on every URI load. Each watch captures that
+    /// load's generation, so even an already-queued message from the previous
+    /// pipeline incarnation remains identifiable as stale.
+    bus_watch: RefCell<Option<gst::bus::BusWatchGuard>>,
 }
 
 impl Player {
@@ -145,15 +216,16 @@ impl Player {
 
         let (event_tx, event_rx) = async_channel::unbounded();
 
-        let bus_watch = Self::attach_bus_watch(&playbin, &event_tx)?;
-        Self::start_position_timer(&playbin, &event_tx);
+        let event_generation = Rc::new(Cell::new(PlayerEventGeneration::default()));
+        Self::start_position_timer(&playbin, &event_tx, Rc::clone(&event_generation));
 
         let player = Self {
             playbin,
             volume,
             event_tx,
+            event_generation,
             volume_save_pending: Rc::new(Cell::new(None)),
-            _bus_watch: bus_watch,
+            bus_watch: RefCell::new(None),
         };
 
         Ok((player, event_rx))
@@ -167,17 +239,40 @@ impl Player {
     /// spinner while the pipeline transitions to `Playing`.
     pub fn load_uri(&self, uri: &str) {
         tracing::debug!("Loading track");
+        // Remove the previous generation's watch before driving that pipeline
+        // to NULL. Flush the bus during teardown as well: otherwise a queued
+        // EOS from the old URI could be consumed by the newly attached watch
+        // and inherit the new generation despite originating from the old
+        // pipeline incarnation.
+        self.bus_watch.borrow_mut().take();
+        if let Some(bus) = self.playbin.bus() {
+            bus.set_flushing(true);
+        }
         let _ = self.playbin.set_state(gst::State::Null);
         self.playbin.set_property("uri", uri);
         // Re-apply volume — the NULL transition resets it to 1.0.
         self.playbin
             .set_property("volume", slider_to_pipeline(self.volume));
+        if let Some(bus) = self.playbin.bus() {
+            bus.set_flushing(false);
+        }
 
         // Signal buffering immediately — the bus watch will send
         // `Playing` once the pipeline actually reaches that state.
+        let generation = self.event_generation.get();
+        match Self::attach_bus_watch(&self.playbin, &self.event_tx, generation) {
+            Ok(watch) => *self.bus_watch.borrow_mut() = Some(watch),
+            Err(error) => {
+                let _ = self
+                    .event_tx
+                    .try_send(PlayerEvent::error(generation, error.to_string()));
+                return;
+            }
+        }
+
         if let Err(e) = self
             .event_tx
-            .try_send(PlayerEvent::StateChanged(PlayerState::Buffering))
+            .try_send(PlayerEvent::state(generation, PlayerState::Buffering))
         {
             warn!(error = %e, "dropped Buffering event — UI consumer may be stalled");
         }
@@ -200,10 +295,17 @@ impl Player {
     /// Stop playback and reset the pipeline to NULL.
     pub fn stop(&self) {
         debug!("stop");
+        self.bus_watch.borrow_mut().take();
+        if let Some(bus) = self.playbin.bus() {
+            // Leave the idle bus flushing until the next load; the explicit
+            // scoped Stopped event below is the only stop notification needed.
+            bus.set_flushing(true);
+        }
         let _ = self.playbin.set_state(gst::State::Null);
+        let generation = self.event_generation.get();
         if let Err(e) = self
             .event_tx
-            .try_send(PlayerEvent::StateChanged(PlayerState::Stopped))
+            .try_send(PlayerEvent::state(generation, PlayerState::Stopped))
         {
             warn!(error = %e, "dropped Stopped event — UI consumer may be stalled");
         }
@@ -227,6 +329,11 @@ impl Player {
             gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
             gst::ClockTime::from_mseconds(position_ms),
         );
+    }
+
+    /// Associate subsequently emitted events with a playback-session load.
+    pub fn set_event_generation(&self, generation: PlayerEventGeneration) {
+        self.event_generation.set(generation);
     }
 
     // ── Volume ──────────────────────────────────────────────────────
@@ -304,6 +411,7 @@ impl Player {
     fn attach_bus_watch(
         playbin: &gst::Element,
         event_tx: &async_channel::Sender<PlayerEvent>,
+        generation: PlayerEventGeneration,
     ) -> anyhow::Result<gst::bus::BusWatchGuard> {
         let bus = playbin
             .bus()
@@ -318,7 +426,7 @@ impl Player {
             match msg.view() {
                 MessageView::Eos(_) => {
                     info!("End of stream");
-                    if let Err(e) = tx.try_send(PlayerEvent::TrackEnded) {
+                    if let Err(e) = tx.try_send(PlayerEvent::ended(generation)) {
                         warn!(error = %e, "dropped TrackEnded event — UI consumer may be stalled");
                     }
                 }
@@ -330,7 +438,9 @@ impl Player {
                         debug = ?err.debug(),
                         "Pipeline error"
                     );
-                    if let Err(e) = tx.try_send(PlayerEvent::Error(err.error().to_string())) {
+                    if let Err(e) =
+                        tx.try_send(PlayerEvent::error(generation, err.error().to_string()))
+                    {
                         warn!(error = %e, "dropped Error event — UI consumer may be stalled");
                     }
                 }
@@ -352,7 +462,7 @@ impl Player {
                             pending = ?sc.pending(),
                             "Pipeline state changed"
                         );
-                        let _ = tx.try_send(PlayerEvent::StateChanged(new_state));
+                        let _ = tx.try_send(PlayerEvent::state(generation, new_state));
                     }
                 }
 
@@ -360,7 +470,7 @@ impl Player {
                     let percent = buffering.percent();
                     debug!(percent, "Buffering");
                     if percent < 100 {
-                        let _ = tx.try_send(PlayerEvent::StateChanged(PlayerState::Buffering));
+                        let _ = tx.try_send(PlayerEvent::state(generation, PlayerState::Buffering));
                     }
                     // When buffering reaches 100%, GStreamer will emit a
                     // StateChanged → Playing message, so we don't need to
@@ -381,7 +491,11 @@ impl Player {
     /// playing and sends [`PlayerEvent::PositionChanged`].
     ///
     /// The timer self-cancels when the playbin is dropped (weak ref).
-    fn start_position_timer(playbin: &gst::Element, event_tx: &async_channel::Sender<PlayerEvent>) {
+    fn start_position_timer(
+        playbin: &gst::Element,
+        event_tx: &async_channel::Sender<PlayerEvent>,
+        event_generation: Rc<Cell<PlayerEventGeneration>>,
+    ) {
         let playbin_weak = playbin.downgrade();
         let tx = event_tx.clone();
 
@@ -401,10 +515,11 @@ impl Player {
                         .query_duration::<gst::ClockTime>()
                         .map(|d| d.mseconds())
                         .unwrap_or(0);
-                    let _ = tx.try_send(PlayerEvent::PositionChanged {
-                        position_ms: pos.mseconds(),
-                        duration_ms: dur,
-                    });
+                    let _ = tx.try_send(PlayerEvent::position(
+                        event_generation.get(),
+                        pos.mseconds(),
+                        dur,
+                    ));
                 }
             }
 

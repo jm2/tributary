@@ -5,7 +5,7 @@
 //! - Fetching remote album art URLs (Subsonic, Jellyfin, Plex cover art)
 //! - A persistent background worker thread with generation-based staleness detection
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use gtk::glib;
@@ -13,12 +13,30 @@ use gtk::glib;
 /// Global generation counter for album art requests.  Incremented on
 /// every track change; the worker checks this before sending results
 /// back to the GTK thread so stale fetches are silently dropped.
-static ART_GENERATION: AtomicU32 = AtomicU32::new(0);
+static ART_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn next_generation() -> u64 {
+    ART_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+}
+
+fn generation_is_current(generation: u64) -> bool {
+    ART_GENERATION.load(Ordering::Relaxed) == generation
+}
+
+/// Invalidate every in-flight local extraction and remote fetch.
+///
+/// Playback resets call this before installing the generic placeholder so a
+/// late worker result cannot restore artwork from the stopped/previous item.
+pub fn invalidate() {
+    next_generation();
+}
 
 /// Request sent to the album art worker thread.
 struct ArtRequest {
     url: String,
-    generation: u32,
+    generation: u64,
     reply_tx: async_channel::Sender<Vec<u8>>,
 }
 
@@ -92,6 +110,7 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
 /// Tag reading is performed on a background thread to avoid blocking
 /// the GTK main loop — large FLAC files can take hundreds of ms to parse.
 pub fn update_album_art(image: &gtk::Image, uri: &str) {
+    let generation = next_generation();
     // Only attempt extraction for local file:// URIs.
     let path = match url::Url::parse(uri) {
         Ok(u) if u.scheme() == "file" => match u.to_file_path() {
@@ -116,13 +135,18 @@ pub fn update_album_art(image: &gtk::Image, uri: &str) {
     // Extract album art bytes on a background thread to avoid blocking GTK.
     std::thread::spawn(move || {
         if let Some(bytes) = extract_album_art_bytes(&path) {
-            let _ = tx.send_blocking(bytes);
+            if generation_is_current(generation) {
+                let _ = tx.send_blocking(bytes);
+            }
         }
     });
 
     // Receive on the GTK main thread and create the texture.
     glib::MainContext::default().spawn_local(async move {
         if let Ok(data) = rx.recv().await {
+            if !generation_is_current(generation) {
+                return;
+            }
             let bytes = glib::Bytes::from(&data);
             if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
                 image.set_paintable(Some(&texture));
@@ -345,9 +369,7 @@ pub fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
 
     // Bump the generation counter so any in-flight fetch for the
     // previous track is discarded when it completes.
-    let generation = ART_GENERATION
-        .fetch_add(1, Ordering::Relaxed)
-        .wrapping_add(1);
+    let generation = next_generation();
 
     let url = cover_art_url.to_string();
     let image = image.clone();
@@ -373,7 +395,7 @@ pub fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
         if let Ok(data) = reply_rx.recv().await {
             // Double-check generation in case another track was selected
             // while we were waiting for the channel.
-            if ART_GENERATION.load(Ordering::Relaxed) == generation {
+            if generation_is_current(generation) {
                 let bytes = glib::Bytes::from(&data);
                 if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
                     image.set_paintable(Some(&texture));
@@ -381,4 +403,19 @@ pub fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    #[test]
+    fn reset_invalidates_local_and_remote_artwork_results() {
+        let stale_generation = next_generation();
+        assert!(generation_is_current(stale_generation));
+
+        invalidate();
+
+        assert!(!generation_is_current(stale_generation));
+    }
 }

@@ -18,7 +18,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 
 # Error handling
-anyhow = "1"
+anyhow = "1.0.103"
 thiserror = "2"
 
 # Logging / Tracing
@@ -105,6 +105,10 @@ souvlaki = "0.8"
 # Windows-only: GDK4 Win32 backend (HWND extraction for souvlaki SMTC)
 [target.'cfg(target_os = "windows")'.dependencies]
 gdk4-win32 = "0.11"
+
+# Stable filesystem IDs for removable/network library-root safety.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"

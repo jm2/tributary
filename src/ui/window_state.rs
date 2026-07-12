@@ -54,11 +54,6 @@ pub struct WindowState {
     /// Used by: discovery_handler, source_connect, context_menu, window.
     pub active_source_key: Rc<RefCell<String>>,
 
-    /// Index of the currently-playing track in the sorted model.
-    /// `None` when nothing is playing.
-    /// Used by: source_connect, window (playback wiring).
-    pub current_pos: Rc<Cell<Option<u32>>>,
-
     // ── Sidebar ─────────────────────────────────────────────────────
     /// Sidebar backing store (list of `SourceObject`s with headers).
     /// Used by: discovery_handler, source_connect, playlist_actions, context_menu, window.

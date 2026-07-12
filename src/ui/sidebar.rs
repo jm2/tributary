@@ -13,7 +13,7 @@ use super::objects::SourceObject;
 use tracing::debug;
 
 /// Playlist action emitted from the sidebar context menu.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaylistAction {
     /// Create a new regular playlist.
     CreateRegular,
@@ -29,6 +29,120 @@ pub enum PlaylistAction {
     ImportPlaylist,
     /// Export a playlist to an XSPF file (id).
     ExportPlaylist(String),
+}
+
+/// Action represented by the recycled row's trailing button.
+#[derive(Debug, PartialEq, Eq)]
+enum SidebarButtonAction {
+    OpenPlaylistMenu,
+    Disconnect(String),
+    Delete(String),
+}
+
+/// Resolve the trailing-button action from the source bound right now.
+///
+/// This intentionally derives no state from an earlier `bind` invocation:
+/// `GtkListItem` widgets are recycled, and several connection flows force a
+/// remove/reinsert to refresh a row.
+fn sidebar_button_action(source: &SourceObject) -> Option<SidebarButtonAction> {
+    if source.is_header() {
+        return (source.name() == "Playlists").then_some(SidebarButtonAction::OpenPlaylistMenu);
+    }
+
+    if source.connecting() {
+        return None;
+    }
+
+    if source.backend_type() == "daap" && source.connected() {
+        return Some(SidebarButtonAction::Disconnect(source.server_url()));
+    }
+
+    if source.manually_added() && (source.connected() || !source.server_url().is_empty()) {
+        return Some(SidebarButtonAction::Delete(source.server_url()));
+    }
+
+    None
+}
+
+fn configure_action_button(button: &gtk::Button, action: Option<&SidebarButtonAction>) {
+    match action {
+        Some(SidebarButtonAction::OpenPlaylistMenu) => {
+            button.set_icon_name("list-add-symbolic");
+            button.set_tooltip_text(Some("New playlist"));
+            button.set_visible(true);
+        }
+        Some(SidebarButtonAction::Disconnect(_)) => {
+            button.set_icon_name("media-eject-symbolic");
+            button.set_tooltip_text(Some("Disconnect"));
+            button.set_visible(true);
+        }
+        Some(SidebarButtonAction::Delete(_)) => {
+            button.set_icon_name("user-trash-symbolic");
+            button.set_tooltip_text(Some("Remove server"));
+            button.set_visible(true);
+        }
+        None => {
+            button.set_tooltip_text(None);
+            button.set_visible(false);
+        }
+    }
+}
+
+/// Emit a non-menu row action. Returns `true` when the playlist menu should
+/// be opened instead.
+fn emit_sidebar_button_action(
+    action: SidebarButtonAction,
+    disconnect_tx: &async_channel::Sender<String>,
+    delete_tx: &async_channel::Sender<String>,
+) -> bool {
+    match action {
+        SidebarButtonAction::OpenPlaylistMenu => true,
+        SidebarButtonAction::Disconnect(source_key) => {
+            let _ = disconnect_tx.try_send(source_key);
+            false
+        }
+        SidebarButtonAction::Delete(source_key) => {
+            let _ = delete_tx.try_send(source_key);
+            false
+        }
+    }
+}
+
+fn playlist_creation_menu() -> gio::Menu {
+    let menu = gio::Menu::new();
+    menu.append(Some("New Playlist"), Some("pl-add.create-regular"));
+    menu.append(Some("New Smart Playlist"), Some("pl-add.create-smart"));
+    menu.append(Some("Import Playlist\u{2026}"), Some("pl-add.import"));
+    menu
+}
+
+fn playlist_creation_action_group(
+    tx: &async_channel::Sender<PlaylistAction>,
+) -> gio::SimpleActionGroup {
+    let action_group = gio::SimpleActionGroup::new();
+
+    let tx_regular = tx.clone();
+    let regular = gio::SimpleAction::new("create-regular", None);
+    regular.connect_activate(move |_, _| {
+        let _ = tx_regular.try_send(PlaylistAction::CreateRegular);
+    });
+    action_group.add_action(&regular);
+
+    let tx_smart = tx.clone();
+    let smart = gio::SimpleAction::new("create-smart", None);
+    smart.connect_activate(move |_, _| {
+        let _ = tx_smart.try_send(PlaylistAction::CreateSmart);
+    });
+    action_group.add_action(&smart);
+
+    let tx_import = tx.clone();
+    let import = gio::SimpleAction::new("import", None);
+    import.connect_activate(move |_, _| {
+        let _ = tx_import.try_send(PlaylistAction::ImportPlaylist);
+    });
+    action_group.add_action(&import);
+
+    action_group
 }
 
 /// Build the source sidebar.
@@ -76,6 +190,8 @@ pub fn build_sidebar(
     {
         let store_for_setup = store.clone();
         let tx_for_setup = playlist_action_tx.clone();
+        let disconnect_tx_for_setup = disconnect_tx.clone();
+        let delete_tx_for_setup = delete_tx.clone();
         factory.connect_setup(move |_, list_item| {
             let list_item = list_item
                 .downcast_ref::<gtk::ListItem>()
@@ -101,7 +217,7 @@ pub fn build_sidebar(
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .build();
-            // Action button: eject (DAAP) or trash (manual) — reused widget.
+            // Action button: playlist add, DAAP eject, or manual trash.
             let action_btn = gtk::Button::builder()
                 .css_classes(["flat", "circular"])
                 .visible(false)
@@ -112,6 +228,35 @@ pub fn build_sidebar(
             row_box.append(&label);
             row_box.append(&action_btn);
             list_item.set_child(Some(&row_box));
+
+            // Connect the recycled button exactly once. Resolve the current
+            // item on every click so a prior binding cannot retain authority
+            // to delete or disconnect its source.
+            let playlist_menu = playlist_creation_menu();
+            let playlist_actions = playlist_creation_action_group(&tx_for_setup);
+            action_btn.insert_action_group("pl-add", Some(&playlist_actions));
+
+            let list_item_for_action = list_item.downgrade();
+            let disconnect_tx = disconnect_tx_for_setup.clone();
+            let delete_tx = delete_tx_for_setup.clone();
+            action_btn.connect_clicked(move |button| {
+                let Some(list_item) = list_item_for_action.upgrade() else {
+                    return;
+                };
+                let Some(source) = list_item.item().and_downcast::<SourceObject>() else {
+                    return;
+                };
+                let Some(action) = sidebar_button_action(&source) else {
+                    return;
+                };
+
+                if emit_sidebar_button_action(action, &disconnect_tx, &delete_tx) {
+                    let popover = gtk::PopoverMenu::from_model(Some(&playlist_menu));
+                    popover.set_parent(button);
+                    popover.connect_closed(|popover| popover.unparent());
+                    popover.popup();
+                }
+            });
 
             // Per-row right-click gesture.
             //
@@ -160,22 +305,8 @@ pub fn build_sidebar(
                     }
                 }
 
-                let action_group = gtk::gio::SimpleActionGroup::new();
+                let action_group = playlist_creation_action_group(&tx_for_gesture);
                 let pid = src.playlist_id();
-
-                let tx = tx_for_gesture.clone();
-                let create_reg = gtk::gio::SimpleAction::new("create-regular", None);
-                create_reg.connect_activate(move |_, _| {
-                    let _ = tx.try_send(PlaylistAction::CreateRegular);
-                });
-                action_group.add_action(&create_reg);
-
-                let tx = tx_for_gesture.clone();
-                let create_smart = gtk::gio::SimpleAction::new("create-smart", None);
-                create_smart.connect_activate(move |_, _| {
-                    let _ = tx.try_send(PlaylistAction::CreateSmart);
-                });
-                action_group.add_action(&create_smart);
 
                 let tx = tx_for_gesture.clone();
                 let pid_clone = pid.clone();
@@ -202,13 +333,6 @@ pub fn build_sidebar(
                 action_group.add_action(&edit_smart);
 
                 let tx = tx_for_gesture.clone();
-                let import = gtk::gio::SimpleAction::new("import", None);
-                import.connect_activate(move |_, _| {
-                    let _ = tx.try_send(PlaylistAction::ImportPlaylist);
-                });
-                action_group.add_action(&import);
-
-                let tx = tx_for_gesture.clone();
                 let pid_clone = pid.clone();
                 let export = gtk::gio::SimpleAction::new("export", None);
                 export.connect_activate(move |_, _| {
@@ -229,9 +353,6 @@ pub fn build_sidebar(
     }
 
     {
-        let disconnect_tx = disconnect_tx.clone();
-        let delete_tx = delete_tx.clone();
-        let playlist_action_tx = playlist_action_tx.clone();
         factory.connect_bind(move |_, list_item| {
             let list_item = list_item
                 .downcast_ref::<gtk::ListItem>()
@@ -272,53 +393,6 @@ pub fn build_sidebar(
                 label.set_ellipsize(gtk::pango::EllipsizeMode::None);
                 list_item.set_activatable(false);
                 list_item.set_selectable(false);
-
-                // Show a "+" button on the Playlists header for creating
-                // new playlists (most discoverable entry point).
-                if obj.name() == "Playlists" {
-                    action_btn.set_icon_name("list-add-symbolic");
-                    action_btn.set_tooltip_text(Some("New playlist"));
-                    action_btn.set_visible(true);
-                    let tx = playlist_action_tx.clone();
-                    action_btn.connect_clicked(move |btn| {
-                        // Build a small popover menu with playlist actions.
-                        let menu = gtk::gio::Menu::new();
-                        menu.append(Some("New Playlist"), Some("pl-add.create-regular"));
-                        menu.append(Some("New Smart Playlist"), Some("pl-add.create-smart"));
-                        menu.append(Some("Import Playlist\u{2026}"), Some("pl-add.import"));
-
-                        let ag = gtk::gio::SimpleActionGroup::new();
-
-                        let tx_reg = tx.clone();
-                        let reg = gtk::gio::SimpleAction::new("create-regular", None);
-                        reg.connect_activate(move |_, _| {
-                            let _ = tx_reg.try_send(PlaylistAction::CreateRegular);
-                        });
-                        ag.add_action(&reg);
-
-                        let tx_smart = tx.clone();
-                        let smart = gtk::gio::SimpleAction::new("create-smart", None);
-                        smart.connect_activate(move |_, _| {
-                            let _ = tx_smart.try_send(PlaylistAction::CreateSmart);
-                        });
-                        ag.add_action(&smart);
-
-                        let tx_import = tx.clone();
-                        let import = gtk::gio::SimpleAction::new("import", None);
-                        import.connect_activate(move |_, _| {
-                            let _ = tx_import.try_send(PlaylistAction::ImportPlaylist);
-                        });
-                        ag.add_action(&import);
-
-                        btn.insert_action_group("pl-add", Some(&ag));
-
-                        let popover = gtk::PopoverMenu::from_model(Some(&menu));
-                        popover.set_parent(btn);
-                        popover.popup();
-                    });
-                } else {
-                    action_btn.set_visible(false);
-                }
             } else {
                 label.remove_css_class("heading");
                 label.set_margin_top(0);
@@ -331,7 +405,6 @@ pub fn build_sidebar(
                     // Auth in progress — show spinner instead of icon.
                     icon.set_visible(false);
                     spinner.set_visible(true);
-                    action_btn.set_visible(false);
                     label.add_css_class("dim-label");
                 } else if !obj.connected() && !obj.server_url().is_empty() {
                     // Discovered/manual but not yet authenticated.
@@ -346,57 +419,22 @@ pub fn build_sidebar(
                         label.remove_css_class("dim-label");
                     }
                     spinner.set_visible(false);
-
-                    // Show trash button for manually-added (disconnected) servers.
-                    if obj.manually_added() {
-                        action_btn.set_icon_name("user-trash-symbolic");
-                        action_btn.set_tooltip_text(Some("Remove server"));
-                        action_btn.set_visible(true);
-                        let tx = delete_tx.clone();
-                        let source_key = obj.server_url();
-                        action_btn.connect_clicked(move |_| {
-                            let _ = tx.try_send(source_key.clone());
-                        });
-                    } else {
-                        action_btn.set_visible(false);
-                    }
                 } else {
                     // Connected or local source — normal icon.
                     icon.set_visible(true);
                     icon.set_icon_name(Some(&obj.icon_name()));
                     spinner.set_visible(false);
                     label.remove_css_class("dim-label");
-
-                    if obj.backend_type() == "daap" && obj.connected() {
-                        // Show eject button for connected DAAP sources.
-                        action_btn.set_icon_name("media-eject-symbolic");
-                        action_btn.set_tooltip_text(Some("Disconnect"));
-                        action_btn.set_visible(true);
-                        let tx = disconnect_tx.clone();
-                        let source_key = obj.server_url();
-                        action_btn.connect_clicked(move |_| {
-                            let _ = tx.try_send(source_key.clone());
-                        });
-                    } else if obj.manually_added() && obj.connected() {
-                        // Show trash button for connected manually-added servers.
-                        action_btn.set_icon_name("user-trash-symbolic");
-                        action_btn.set_tooltip_text(Some("Remove server"));
-                        action_btn.set_visible(true);
-                        let tx = delete_tx.clone();
-                        let source_key = obj.server_url();
-                        action_btn.connect_clicked(move |_| {
-                            let _ = tx.try_send(source_key.clone());
-                        });
-                    } else {
-                        action_btn.set_visible(false);
-                    }
                 }
             }
+
+            let action = sidebar_button_action(&obj);
+            configure_action_button(&action_btn, action.as_ref());
         });
     }
 
-    // Unbind: hide the action button to prevent signal accumulation
-    // when list items are recycled.
+    // Reset presentation on unbind. The click handler itself is row-lifetime
+    // state connected once during setup and needs no bind-time cleanup.
     factory.connect_unbind(|_, list_item| {
         let list_item = list_item
             .downcast_ref::<gtk::ListItem>()
@@ -467,4 +505,102 @@ pub fn build_sidebar(
         add_button,
         playlist_action_rx,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    fn assert_empty<T>(receiver: &async_channel::Receiver<T>) {
+        assert!(
+            receiver.try_recv().is_err(),
+            "one click must not enqueue an additional action"
+        );
+    }
+
+    #[test]
+    fn recycled_item_dispatches_once_for_only_the_current_source() {
+        let (disconnect_tx, disconnect_rx) = async_channel::unbounded();
+        let (delete_tx, delete_rx) = async_channel::unbounded();
+        let current = RefCell::new(None::<SourceObject>);
+
+        // This single closure models the one setup-time click handler. Tests
+        // change only its current binding, including an explicit unbind.
+        let click = || {
+            let source = current.borrow();
+            let Some(action) = source.as_ref().and_then(sidebar_button_action) else {
+                return false;
+            };
+            emit_sidebar_button_action(action, &disconnect_tx, &delete_tx)
+        };
+
+        let manual_a = SourceObject::manual("Manual A", "subsonic", "https://a.example");
+        current.replace(Some(manual_a.clone()));
+        assert!(!click());
+        assert_eq!(delete_rx.try_recv().unwrap(), "https://a.example");
+        assert_empty(&delete_rx);
+        assert_empty(&disconnect_rx);
+
+        // Forced remove/reinsert first unbinds the list item. A click while
+        // unbound cannot invoke the source captured by the previous binding.
+        current.replace(None);
+        assert!(!click());
+        assert_empty(&delete_rx);
+        assert_empty(&disconnect_rx);
+
+        // Reinsert the same object in its transient connecting state. The
+        // stale delete action must still be absent.
+        manual_a.set_connecting(true);
+        current.replace(Some(manual_a.clone()));
+        assert!(!click());
+        assert_empty(&delete_rx);
+        assert_empty(&disconnect_rx);
+
+        // A second forced reinsert of the same actionable source must still
+        // produce one delete, not one per historical bind.
+        current.replace(None);
+        manual_a.set_connecting(false);
+        current.replace(Some(manual_a));
+        assert!(!click());
+        assert_eq!(delete_rx.try_recv().unwrap(), "https://a.example");
+        assert_empty(&delete_rx);
+        assert_empty(&disconnect_rx);
+
+        // Recycle the item for a different connected DAAP source. Only that
+        // source's eject event is emitted; Manual A is never deleted again.
+        let daap_b = SourceObject::discovered("DAAP B", "daap", "http://b.example:3689");
+        daap_b.set_connected(true);
+        current.replace(Some(daap_b));
+        assert!(!click());
+        assert_eq!(disconnect_rx.try_recv().unwrap(), "http://b.example:3689");
+        assert_empty(&disconnect_rx);
+        assert_empty(&delete_rx);
+
+        // Recycle once more for the Playlists header. The click opens its
+        // menu and emits no server action.
+        current.replace(Some(SourceObject::header("Playlists")));
+        assert!(click());
+        assert_empty(&disconnect_rx);
+        assert_empty(&delete_rx);
+    }
+
+    #[test]
+    fn playlist_creation_actions_emit_exactly_once() {
+        let (tx, rx) = async_channel::unbounded();
+        let group = playlist_creation_action_group(&tx);
+
+        group.activate_action("create-regular", None);
+        assert_eq!(rx.try_recv().unwrap(), PlaylistAction::CreateRegular);
+        assert_empty(&rx);
+
+        group.activate_action("create-smart", None);
+        assert_eq!(rx.try_recv().unwrap(), PlaylistAction::CreateSmart);
+        assert_empty(&rx);
+
+        group.activate_action("import", None);
+        assert_eq!(rx.try_recv().unwrap(), PlaylistAction::ImportPlaylist);
+        assert_empty(&rx);
+    }
 }

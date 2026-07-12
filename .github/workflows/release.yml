@@ -6,22 +6,85 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (e.g. v0.1.0). Leave empty for HEAD."
-        required: false
+        description: "Existing release tag to build (for example, v0.5.0)"
+        required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  FLATPAK_CARGO_GENERATOR_COMMIT: 737c0085912f9f7dabf9341d4608e2a77a51a73a
+  FLATPAK_CARGO_GENERATOR_SHA256: b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c
 
 jobs:
+  # Resolve the event tag once, validate it against the tagged source, and
+  # expose an immutable commit SHA to every build job.
+  prepare:
+    name: Resolve release source
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      build_ref: ${{ steps.source.outputs.build_ref }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - name: Validate requested tag
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            TAG="${RELEASE_TAG}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="${DISPATCH_TAG}"
+          else
+            echo "Unsupported release event: ${GITHUB_EVENT_NAME}" >&2
+            exit 1
+          fi
+
+          SEMVER_TAG='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'
+          if [[ ! "${TAG}" =~ ${SEMVER_TAG} ]]; then
+            echo "Release tag must be a v-prefixed semantic version; got '${TAG}'" >&2
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ steps.release.outputs.tag }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve immutable source and version
+        id: source
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          BUILD_REF="$(git rev-parse HEAD)"
+          VERSION="$(awk -F'"' '/^\[package\]/{in_package=1; next} in_package && /^version = /{print $2; exit}' Cargo.toml)"
+          if [[ -z "${VERSION}" ]]; then
+            echo "Could not read package version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [[ "${TAG}" != "v${VERSION}" ]]; then
+            echo "Tag ${TAG} does not match Cargo.toml version ${VERSION}" >&2
+            exit 1
+          fi
+          echo "build_ref=${BUILD_REF}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
   # ── Linux Flatpak (x86_64 + aarch64) ─────────────────────────────────────
   flatpak:
     name: Flatpak (${{ matrix.arch }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -31,13 +94,16 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.build_ref }}
+          persist-credentials: false
 
       # Install Flatpak natively on the runner instead of using an x86_64 container.
       - name: Install Flatpak & Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder elfutils python3-pip
-          
+
           # Fix Polkit permission errors for headless bare-metal Flatpak
           sudo mkdir -p /etc/polkit-1/rules.d
           sudo tee /etc/polkit-1/rules.d/99-flatpak.rules << 'EOF'
@@ -47,18 +113,25 @@ jobs:
               }
           });
           EOF
-          
+
           # Add the Flathub repository
           sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
       - name: Install Python dependencies
-        run: pip3 install tomlkit aiohttp --break-system-packages || pip3 install tomlkit aiohttp
+        run: |
+          pip3 install --requirement build-aux/flatpak/generator-requirements.txt \
+            --break-system-packages \
+            || pip3 install --requirement build-aux/flatpak/generator-requirements.txt
 
       - name: Download flatpak-cargo-generator
         run: |
           mkdir -p build-aux/flatpak
-          curl -o build-aux/flatpak/flatpak-cargo-generator.py \
-            https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+          curl --fail --show-error --silent --location \
+            --proto '=https' --tlsv1.2 \
+            --output build-aux/flatpak/flatpak-cargo-generator.py \
+            "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${FLATPAK_CARGO_GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py"
+          echo "${FLATPAK_CARGO_GENERATOR_SHA256}  build-aux/flatpak/flatpak-cargo-generator.py" \
+            | sha256sum --check --strict
 
       - name: Generate cargo-sources.json
         run: |
@@ -72,12 +145,6 @@ jobs:
           cache-key: flatpak-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
           arch: ${{ matrix.arch }}
 
-      - name: Upload Flatpak to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v3
-        with:
-          files: tributary-linux-${{ matrix.arch }}.flatpak
-
       - name: Upload Flatpak as workflow artifact
         uses: actions/upload-artifact@v7
         with:
@@ -87,7 +154,10 @@ jobs:
   # ── macOS (.dmg) ──────────────────────────────────────────────────────────
   macos:
     name: macOS (${{ matrix.arch }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -96,6 +166,9 @@ jobs:
             rust_target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.build_ref }}
+          persist-credentials: false
 
       - name: Install system dependencies (Homebrew)
         run: |
@@ -126,12 +199,6 @@ jobs:
       - name: Rename DMG for release
         run: mv dist/Tributary.dmg dist/tributary-macos-${{ matrix.arch }}.dmg
 
-      - name: Upload DMG to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v3
-        with:
-          files: dist/tributary-macos-${{ matrix.arch }}.dmg
-
       - name: Upload DMG as workflow artifact
         uses: actions/upload-artifact@v7
         with:
@@ -141,7 +208,10 @@ jobs:
   # ── Windows (.zip + Inno Setup .exe) ──────────────────────────────────────
   windows:
     name: Windows (${{ matrix.arch }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     # Cap the job so a hung MSYS2 mirror fails fast and re-runs instead of
     # stalling to the 6-hour ceiling.
     timeout-minutes: 45
@@ -167,6 +237,9 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.build_ref }}
+          persist-credentials: false
 
       - name: Set up MSYS2 (${{ matrix.msystem }})
         uses: msys2/setup-msys2@v2.32.0
@@ -252,14 +325,6 @@ jobs:
         run: |
           Move-Item dist/tributary-setup.exe dist/tributary-windows-${{ matrix.arch }}-setup.exe
 
-      - name: Upload Windows artifacts to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            dist/tributary-windows-${{ matrix.arch }}.zip
-            dist/tributary-windows-${{ matrix.arch }}-setup.exe
-
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -271,7 +336,10 @@ jobs:
   # ── Linux Native Installers (deb, rpm, arch pkg) ─────────────────────────
   linux-deb:
     name: Debian Package (${{ matrix.arch }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     container:
       image: debian:sid
     strategy:
@@ -293,6 +361,9 @@ jobs:
             libdbus-1-dev
 
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.build_ref }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -314,12 +385,6 @@ jobs:
       - name: Build .deb package
         run: cargo deb -o target/debian/tributary-${{ matrix.deb_arch }}.deb
 
-      - name: Upload .deb to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v3
-        with:
-          files: target/debian/tributary-${{ matrix.deb_arch }}.deb
-
       - name: Upload .deb as workflow artifact
         uses: actions/upload-artifact@v7
         with:
@@ -328,7 +393,10 @@ jobs:
 
   linux-rpm:
     name: RPM Package (${{ matrix.arch }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     container:
       image: fedora:41
     strategy:
@@ -349,6 +417,9 @@ jobs:
             pkgconf-pkg-config git curl
 
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.build_ref }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -378,12 +449,6 @@ jobs:
           RPM_FILE=$(ls target/generate-rpm/*.rpm | head -1)
           mv "$RPM_FILE" "target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm"
 
-      - name: Upload .rpm to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v3
-        with:
-          files: target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
-
       - name: Upload .rpm as workflow artifact
         uses: actions/upload-artifact@v7
         with:
@@ -392,7 +457,10 @@ jobs:
 
   linux-arch:
     name: Arch Linux Package (x86_64)
+    needs: prepare
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     container:
       image: archlinux:base-devel
     steps:
@@ -402,6 +470,9 @@ jobs:
             gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav dbus rust
 
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.build_ref }}
+          persist-credentials: false
 
       - name: Cache Cargo registry
         uses: actions/cache@v5
@@ -424,8 +495,8 @@ jobs:
           # Copy PKGBUILD and build
           cd /home/builder/tributary
           cp build-aux/arch/PKGBUILD .
-          # Set the version from the release tag
-          VERSION="${GITHUB_REF_NAME#v}"
+          # Set the version from the validated, checked-out release source.
+          VERSION="${{ needs.prepare.outputs.version }}"
           sed -i "s/^pkgver=.*/pkgver=${VERSION}/" PKGBUILD
 
           su builder -c "BUILDDIR=/tmp/makepkg makepkg -sf --noconfirm --skipchecksums"
@@ -435,12 +506,6 @@ jobs:
           PKG_FILE=$(ls /home/builder/tributary/*.pkg.tar.zst | head -1)
           mkdir -p dist
           cp "$PKG_FILE" dist/tributary-x86_64.pkg.tar.zst
-
-      - name: Upload Arch package to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v3
-        with:
-          files: dist/tributary-x86_64.pkg.tar.zst
 
       - name: Upload Arch package as workflow artifact
         uses: actions/upload-artifact@v7
@@ -453,7 +518,8 @@ jobs:
     name: SHA256 Checksums
     runs-on: ubuntu-24.04
     needs: [flatpak, macos, windows, linux-deb, linux-rpm, linux-arch]
-    if: always()
+    permissions:
+      contents: read
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -466,19 +532,44 @@ jobs:
           find . -type f \( -name '*.zip' -o -name '*.dmg' -o -name '*.flatpak' \
             -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' \
             -o -name '*-setup.exe' \) \
-            -exec sha256sum {} + | sed 's|  \./|  |' | sort -k2 > ../SHA256SUMS.txt
+            -exec sha256sum {} + | sed 's|  .*/|  |' | sort -k2 > ../SHA256SUMS.txt
           cat ../SHA256SUMS.txt
 
-      - name: Upload SHA256SUMS to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v3
-        with:
-          files: SHA256SUMS.txt
-
-      - name: Upload SHA256SUMS as artifact (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload SHA256SUMS as artifact
         uses: actions/upload-artifact@v7
         with:
           name: SHA256SUMS
           path: SHA256SUMS.txt
-          if-no-files-found: warn
+          if-no-files-found: error
+
+  # The only job with a repository write token. It checks out no project or
+  # build code and uses immutable action revisions only to transfer completed
+  # artifacts to the already-created GitHub release.
+  publish:
+    name: Publish release assets
+    if: github.event_name == 'release'
+    needs: [prepare, checksums]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish assets to the validated release tag
+        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d # v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/*.flatpak
+            release-assets/*.dmg
+            release-assets/*.zip
+            release-assets/*-setup.exe
+            release-assets/*.deb
+            release-assets/*.rpm
+            release-assets/*.pkg.tar.zst
+            release-assets/SHA256SUMS.txt

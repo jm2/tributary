@@ -5,7 +5,7 @@
 //! the system's speakers or headphones via a GStreamer `playbin3` pipeline.
 
 use super::output::{AudioOutput, OutputType};
-use super::{Player, PlayerState};
+use super::{Player, PlayerEventGeneration, PlayerState};
 
 /// Local GStreamer output — delegates to the existing [`Player`].
 pub struct LocalOutput {
@@ -34,6 +34,10 @@ impl AudioOutput for LocalOutput {
 
     fn load_uri(&self, uri: &str) {
         self.player.load_uri(uri);
+    }
+
+    fn set_event_generation(&self, generation: PlayerEventGeneration) {
+        self.player.set_event_generation(generation);
     }
 
     fn play(&self) {

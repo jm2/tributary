@@ -22,5 +22,10 @@
 pub mod backend;
 pub mod client;
 pub mod dmap;
+pub mod session;
 
 pub use backend::DaapBackend;
+pub use session::{
+    begin_connect, begin_shutdown, is_current_session, release_source, resolve_media_url,
+    shutdown_all,
+};

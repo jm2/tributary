@@ -30,12 +30,13 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tracing::{debug, error, info, warn};
 
 use super::output::{AudioOutput, OutputType};
-use super::{PlayerEvent, PlayerState};
+use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
 
 /// Timeout for TCP connect and individual read/write operations.
 const TCP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,6 +53,7 @@ pub struct MpdOutput {
     port: u16,
     /// Event sender for relaying state changes to the GTK main thread.
     event_tx: async_channel::Sender<PlayerEvent>,
+    event_generation: AtomicU64,
     /// Cached volume level (0.0–1.0).  MPD manages its own volume,
     /// so this is only used to satisfy the `AudioOutput::volume()` query.
     volume: f64,
@@ -74,6 +76,7 @@ impl MpdOutput {
             host: host.to_string(),
             port,
             event_tx,
+            event_generation: AtomicU64::new(0),
             volume: 1.0,
         }
     }
@@ -123,13 +126,18 @@ impl MpdOutput {
         let port = self.port;
         let cmds = commands.to_string();
         let tx = self.event_tx.clone();
+        let generation = self.event_generation();
 
         std::thread::spawn(move || {
             if let Err(e) = Self::send_commands_sync(&host, port, &cmds) {
                 error!(error = %e, "MPD command failed");
-                let _ = tx.try_send(PlayerEvent::Error(format!("MPD: {e}")));
+                let _ = tx.try_send(PlayerEvent::error(generation, format!("MPD: {e}")));
             }
         });
+    }
+
+    fn event_generation(&self) -> PlayerEventGeneration {
+        PlayerEventGeneration::from_raw(self.event_generation.load(Ordering::SeqCst))
     }
 
     /// Synchronous command sender (runs on background thread).
@@ -249,9 +257,15 @@ impl AudioOutput for MpdOutput {
 
         // Optimistically signal buffering — the UI will update when
         // position ticks arrive (or an error is reported).
-        let _ = self
-            .event_tx
-            .try_send(PlayerEvent::StateChanged(PlayerState::Buffering));
+        let _ = self.event_tx.try_send(PlayerEvent::state(
+            self.event_generation(),
+            PlayerState::Buffering,
+        ));
+    }
+
+    fn set_event_generation(&self, generation: PlayerEventGeneration) {
+        self.event_generation
+            .store(generation.as_raw(), Ordering::SeqCst);
     }
 
     fn play(&self) {
@@ -264,9 +278,10 @@ impl AudioOutput for MpdOutput {
 
     fn stop(&self) {
         self.send_commands("stop");
-        let _ = self
-            .event_tx
-            .try_send(PlayerEvent::StateChanged(PlayerState::Stopped));
+        let _ = self.event_tx.try_send(PlayerEvent::state(
+            self.event_generation(),
+            PlayerState::Stopped,
+        ));
     }
 
     fn toggle_play_pause(&self) {

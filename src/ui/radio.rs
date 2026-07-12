@@ -2,7 +2,7 @@
 //!
 //! Extracted from `window.rs` to keep radio-specific logic isolated.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -70,7 +70,7 @@ pub fn apply_radio_columns(column_view: &gtk::ColumnView, radio: bool) {
 /// Mapping: name→title, country→artist, tags→genre, codec→format,
 /// bitrate→bitrate, url_resolved→uri.
 pub fn radio_station_to_track_object(station: &crate::radio::RadioStation) -> TrackObject {
-    TrackObject::new(
+    let track = TrackObject::new(
         0,                // track_number (unused for radio)
         &station.name,    // title = station name
         0,                // duration_secs (live stream)
@@ -84,7 +84,9 @@ pub fn radio_station_to_track_object(station: &crate::radio::RadioStation) -> Tr
         0,                // play_count (unused)
         &station.codec,   // format = codec
         &station.url_resolved,
-    )
+    );
+    track.set_track_id(&station.stationuuid);
+    track
 }
 
 /// Handle the "Stations Near Me" radio source with geolocation consent.
@@ -101,7 +103,6 @@ pub fn handle_radio_nearme(
     column_view: gtk::ColumnView,
     active_source_key: Rc<RefCell<String>>,
     sidebar_selection: gtk::SingleSelection,
-    current_pos: Rc<Cell<Option<u32>>>,
     source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
 ) {
     let location_enabled = app_config.borrow().location_enabled;
@@ -117,7 +118,6 @@ pub fn handle_radio_nearme(
                 browser_state,
                 status_label,
                 column_view,
-                current_pos,
             );
         }
         Some(false) => {
@@ -173,7 +173,6 @@ pub fn handle_radio_nearme(
             let column_view = column_view.clone();
             let active_source_key = active_source_key.clone();
             let sidebar_selection = sidebar_selection.clone();
-            let current_pos = current_pos.clone();
             let source_tracks = source_tracks.clone();
 
             dialog.connect_response(None, move |_dialog, response| {
@@ -194,7 +193,6 @@ pub fn handle_radio_nearme(
                         browser_state.clone(),
                         status_label.clone(),
                         column_view.clone(),
-                        current_pos.clone(),
                     );
                 } else {
                     // Save decline.
@@ -253,7 +251,6 @@ fn fetch_and_display_nearme(
     browser_state: browser::BrowserState,
     status_label: gtk::Label,
     column_view: gtk::ColumnView,
-    current_pos: Rc<Cell<Option<u32>>>,
 ) {
     let (stations_tx, stations_rx) = async_channel::bounded::<String>(1);
 
@@ -346,7 +343,6 @@ fn fetch_and_display_nearme(
                 &status_label,
                 &column_view,
             );
-            current_pos.set(None);
         }
     });
 }

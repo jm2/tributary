@@ -28,7 +28,7 @@
 //! (local, Subsonic, Jellyfin, Plex, DAAP, radio) are managed by the
 //! sidebar and are completely independent of the active output.
 
-use super::PlayerState;
+use super::{PlayerEventGeneration, PlayerState};
 
 /// Identifies the type of an audio output for UI purposes (icon, label).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +73,13 @@ pub trait AudioOutput {
     ///
     /// `uri` may be a `file:///…` path or an `http(s)://…` stream URL.
     fn load_uri(&self, uri: &str);
+
+    /// Tag subsequent events with the playback load that owns them.
+    ///
+    /// The UI calls this immediately before `load_uri`. Implementations must
+    /// capture the current value when starting asynchronous work rather than
+    /// reading it only when that work eventually emits an event.
+    fn set_event_generation(&self, generation: PlayerEventGeneration);
 
     /// Resume playback from a paused state.
     fn play(&self);

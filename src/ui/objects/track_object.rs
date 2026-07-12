@@ -1,9 +1,12 @@
 //! `TrackObject` — GObject wrapper for displaying tracks in `GtkColumnView`.
 
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gtk::glib;
 use gtk::subclass::prelude::*;
+
+static NEXT_ROW_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // Inner (private) implementation
@@ -13,6 +16,12 @@ mod imp {
 
     #[derive(Debug, Default)]
     pub struct TrackObject {
+        /// Stable backend-provided track identifier.  Sources without a
+        /// native identifier fall back to the playable URI in `track_id()`.
+        pub track_id: RefCell<String>,
+        /// Identity of this concrete UI row instance. Duplicate playlist
+        /// entries share `track_id` but receive distinct row IDs.
+        pub row_instance_id: Cell<u64>,
         pub track_number: Cell<u32>,
         /// Disc number (0 = unset, mirrors `Track::disc_number == None`).
         pub disc_number: Cell<u32>,
@@ -69,6 +78,8 @@ impl TrackObject {
     ) -> Self {
         let obj: Self = glib::Object::builder().build();
         let imp = obj.imp();
+        imp.row_instance_id
+            .set(NEXT_ROW_INSTANCE_ID.fetch_add(1, Ordering::Relaxed));
         imp.track_number.set(track_number);
         imp.title.replace(title.to_string());
         imp.duration_secs.set(duration_secs);
@@ -87,6 +98,31 @@ impl TrackObject {
 
     pub fn track_number(&self) -> u32 {
         self.imp().track_number.get()
+    }
+    /// Stable identifier used by playback sessions.
+    ///
+    /// Architecture-backed tracks set their backend UUID explicitly.  UI-only
+    /// sources such as USB scans retain stable identity through their URI.
+    pub fn track_id(&self) -> String {
+        let id = self.imp().track_id.borrow().clone();
+        if id.is_empty() {
+            self.uri()
+        } else {
+            id
+        }
+    }
+    /// Identity used only to reselect this concrete queue occurrence in GTK.
+    /// It is deliberately separate from the stable backend track identity.
+    pub fn row_instance_id(&self) -> u64 {
+        let id = self.imp().row_instance_id.get();
+        if id != 0 {
+            return id;
+        }
+        // Be defensive for objects constructed through the raw GObject
+        // builder rather than `TrackObject::new`.
+        let id = NEXT_ROW_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        self.imp().row_instance_id.set(id);
+        id
     }
     pub fn disc_number(&self) -> u32 {
         self.imp().disc_number.get()
@@ -138,6 +174,10 @@ impl TrackObject {
         self.imp().cover_art_url.replace(url.to_string());
     }
 
+    pub fn set_track_id(&self, id: &str) {
+        self.imp().track_id.replace(id.to_string());
+    }
+
     pub fn set_album_artist(&self, name: &str) {
         self.imp().album_artist.replace(name.to_string());
     }
@@ -185,5 +225,28 @@ impl TrackObject {
         } else {
             String::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(uri: &str) -> TrackObject {
+        TrackObject::new(
+            1, "Title", 60, "Artist", "Album", "", 0, "", 0, 0, 0, "", uri,
+        )
+    }
+
+    #[test]
+    fn duplicate_track_rows_have_distinct_instance_identity() {
+        let first = track("file:///same.flac");
+        let duplicate = track("file:///same.flac");
+        first.set_track_id("stable-track-id");
+        duplicate.set_track_id("stable-track-id");
+
+        assert_eq!(first.track_id(), duplicate.track_id());
+        assert_ne!(first.row_instance_id(), duplicate.row_instance_id());
+        assert_eq!(first.row_instance_id(), first.clone().row_instance_id());
     }
 }

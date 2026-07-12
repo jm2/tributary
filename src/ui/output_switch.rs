@@ -16,23 +16,55 @@ use crate::audio::output::AudioOutput;
 use crate::audio::PlayerEvent;
 
 use super::output_dialogs::load_saved_outputs;
+use super::playback::PlaybackSession;
+
+/// Stable identity for a selectable output endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputTarget {
+    Local,
+    Mpd { host: String, port: u16 },
+    AirPlay { host: String, port: u16 },
+    Chromecast { host: String, port: u16 },
+}
+
+fn output_change_required(active: &OutputTarget, requested: &OutputTarget) -> bool {
+    active != requested
+}
+
+fn prepare_output_change(
+    active: &OutputTarget,
+    requested: &OutputTarget,
+    session: &mut PlaybackSession,
+) -> bool {
+    if !output_change_required(active, requested) {
+        return false;
+    }
+    session.clear();
+    true
+}
 
 /// Wire the output selector popover: switching between local, MPD,
 /// AirPlay, and Chromecast outputs.
 ///
 /// This function does not use `WindowState` because it operates on audio
 /// output state only, not track/sidebar state.
+#[allow(clippy::too_many_arguments)]
 pub fn setup_output_selector(
     output_list: &gtk::ListBox,
     output_button: &gtk::MenuButton,
     active_output: &Rc<RefCell<Box<dyn AudioOutput>>>,
     parked_local: &Rc<RefCell<Option<Box<dyn AudioOutput>>>>,
+    active_target: &Rc<RefCell<OutputTarget>>,
+    playback_session: &Rc<RefCell<PlaybackSession>>,
+    clear_playback_ui: Rc<dyn Fn()>,
     event_sender: &async_channel::Sender<PlayerEvent>,
     volume_scale: &gtk::Scale,
     rt_handle: &tokio::runtime::Handle,
 ) {
     let active_output = active_output.clone();
     let parked_local = parked_local.clone();
+    let active_target = active_target.clone();
+    let playback_session = playback_session.clone();
     let event_sender = event_sender.clone();
     let volume_scale = volume_scale.clone();
     let output_button = output_button.clone();
@@ -42,8 +74,36 @@ pub fn setup_output_selector(
     output_list.connect_row_activated(move |list_box, activated_row| {
         let idx = activated_row.index();
 
-        // ── Stop the current output before switching ──────────
+        let Some(requested_target) = target_for_row(list_box, activated_row) else {
+            return;
+        };
+
+        // Selecting the already-active endpoint must not stop or otherwise
+        // perturb playback.
+        let should_change = prepare_output_change(
+            &active_target.borrow(),
+            &requested_target,
+            &mut playback_session.borrow_mut(),
+        );
+        if !should_change {
+            update_checkmarks(list_box, idx);
+            if let Some(popover) = output_button.popover() {
+                popover.popdown();
+            }
+            return;
+        }
+
+        // Output changes deliberately clear rather than implicitly transfer a
+        // session. This avoids leaving a queue cursor attached to an output
+        // that has no media loaded.
+        let previous_output_type = active_output.borrow().output_type();
+        info!(
+            ?previous_output_type,
+            ?requested_target,
+            "Changing audio output"
+        );
         active_output.borrow().stop();
+        clear_playback_ui();
 
         if idx == 0 {
             // ── Switch to "My Computer" (LocalOutput) ─────────
@@ -103,6 +163,8 @@ pub fn setup_output_selector(
             }
         }
 
+        *active_target.borrow_mut() = requested_target;
+
         // ── Update checkmark visibility on all rows ───────────
         update_checkmarks(list_box, idx);
 
@@ -111,6 +173,46 @@ pub fn setup_output_selector(
             popover.popdown();
         }
     });
+}
+
+fn target_for_row(
+    list_box: &gtk::ListBox,
+    activated_row: &gtk::ListBoxRow,
+) -> Option<OutputTarget> {
+    let idx = activated_row.index();
+    if idx == 0 {
+        return Some(OutputTarget::Local);
+    }
+
+    let icon = row_icon_name(activated_row);
+    let host_port = activated_row.widget_name().to_string();
+    if icon == "video-display-symbolic" {
+        let (host, port) = parse_host_port(&host_port, 8009);
+        return Some(OutputTarget::Chromecast { host, port });
+    }
+    if icon == "network-wireless-symbolic" {
+        let (host, port) = parse_host_port(&host_port, 7000);
+        return Some(OutputTarget::AirPlay { host, port });
+    }
+
+    let saved = load_saved_outputs();
+    let mpd_idx = mpd_index_before_row(list_box, idx);
+    saved.get(mpd_idx).map(|entry| OutputTarget::Mpd {
+        host: entry.host.clone(),
+        port: entry.port,
+    })
+}
+
+fn row_icon_name(row: &gtk::ListBoxRow) -> gtk::glib::GString {
+    row.first_child()
+        .and_then(|inner| inner.downcast::<gtk::Box>().ok())
+        .and_then(|row_box| {
+            row_box
+                .first_child()
+                .and_then(|image| image.downcast::<gtk::Image>().ok())
+        })
+        .and_then(|icon| icon.icon_name())
+        .unwrap_or_default()
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -222,12 +324,26 @@ fn handle_mpd_switch(
     volume_scale: &gtk::Scale,
 ) {
     let saved = load_saved_outputs();
-    // Count only MPD rows (network-server-symbolic) before this one,
-    // excluding index 0 = "My Computer", to get the saved_idx. AirPlay
-    // (network-wireless-symbolic) and Chromecast (video-display-symbolic)
-    // rows must NOT be counted: load_saved_outputs() contains MPD entries
-    // only, so counting any discovered cast/AirPlay row would inflate
-    // mpd_idx and select the wrong server (or silently fail to switch).
+    let mpd_idx = mpd_index_before_row(list_box, idx);
+
+    if let Some(entry) = saved.get(mpd_idx) {
+        park_local_if_needed(active_output, parked_local, event_sender);
+
+        let mpd = MpdOutput::new(&entry.name, &entry.host, entry.port, event_sender.clone());
+        *active_output.borrow_mut() = Box::new(mpd);
+        info!(
+            name = %entry.name,
+            host = %entry.host,
+            port = entry.port,
+            "Switched to MPD output"
+        );
+
+        volume_scale.set_sensitive(false);
+    }
+}
+
+/// Count MPD rows before `idx`, excluding local and discovered receiver rows.
+fn mpd_index_before_row(list_box: &gtk::ListBox, idx: i32) -> usize {
     let mut mpd_idx = 0usize;
     let mut child = list_box.first_child();
     let mut row_count = 0i32;
@@ -250,21 +366,7 @@ fn handle_mpd_switch(
         row_count += 1;
         child = c.next_sibling();
     }
-
-    if let Some(entry) = saved.get(mpd_idx) {
-        park_local_if_needed(active_output, parked_local, event_sender);
-
-        let mpd = MpdOutput::new(&entry.name, &entry.host, entry.port, event_sender.clone());
-        *active_output.borrow_mut() = Box::new(mpd);
-        info!(
-            name = %entry.name,
-            host = %entry.host,
-            port = entry.port,
-            "Switched to MPD output"
-        );
-
-        volume_scale.set_sensitive(false);
-    }
+    mpd_idx
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -325,5 +427,69 @@ fn update_checkmarks(list_box: &gtk::ListBox, active_idx: i32) {
         }
         row_idx += 1;
         child = c.next_sibling();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reselecting_current_output_is_a_no_op() {
+        let current = OutputTarget::Local;
+        assert!(!output_change_required(&current, &OutputTarget::Local));
+
+        let current = OutputTarget::Mpd {
+            host: "music.local".to_string(),
+            port: 6600,
+        };
+        assert!(!output_change_required(&current, &current));
+    }
+
+    #[test]
+    fn endpoint_identity_distinguishes_real_output_changes() {
+        let first = OutputTarget::Chromecast {
+            host: "192.0.2.10".to_string(),
+            port: 8009,
+        };
+        let second = OutputTarget::Chromecast {
+            host: "192.0.2.11".to_string(),
+            port: 8009,
+        };
+        assert!(output_change_required(&first, &second));
+        assert!(output_change_required(&first, &OutputTarget::Local));
+    }
+
+    #[test]
+    fn real_output_change_clears_but_reselection_preserves_session() {
+        let queue_item = super::super::playback::QueueItem::external(
+            "file:///tmp/example.flac".to_string(),
+            "Example".to_string(),
+            "Artist".to_string(),
+            "Album".to_string(),
+        );
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![queue_item.clone()], 0));
+        let event_from_current_output =
+            PlayerEvent::ended(crate::audio::PlayerEventGeneration::default());
+        assert!(session.accepts_event_generation(event_from_current_output.generation()));
+
+        assert!(!prepare_output_change(
+            &OutputTarget::Local,
+            &OutputTarget::Local,
+            &mut session,
+        ));
+        assert!(session.has_current());
+
+        assert!(prepare_output_change(
+            &OutputTarget::Local,
+            &OutputTarget::AirPlay {
+                host: "speaker.local".to_string(),
+                port: 7000,
+            },
+            &mut session,
+        ));
+        assert!(!session.has_current());
+        assert!(!session.accepts_event_generation(event_from_current_output.generation()));
     }
 }

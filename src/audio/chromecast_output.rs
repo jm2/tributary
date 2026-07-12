@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex};
 
 use super::cast_http_server::CastHttpServer;
 use super::output::{AudioOutput, OutputType};
-use super::{PlayerEvent, PlayerState};
+use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
 
 use tracing::{debug, error, info, warn};
 
@@ -72,6 +72,8 @@ pub struct ChromecastOutput {
     port: u16,
     /// Event sender for relaying state changes to the GTK main thread.
     event_tx: async_channel::Sender<PlayerEvent>,
+    /// UI playback generation captured by each asynchronous Cast operation.
+    event_generation: AtomicU64,
     /// Cached volume level (0.0–1.0).
     volume: f64,
     /// Shared playback state — updated optimistically on commands and
@@ -113,6 +115,7 @@ impl ChromecastOutput {
             host: host.to_string(),
             port,
             event_tx,
+            event_generation: AtomicU64::new(0),
             // Seed from the current slider value so switching to this device
             // doesn't reset the effective volume to maximum.
             volume: initial_volume.clamp(0.0, 1.0),
@@ -136,6 +139,10 @@ impl ChromecastOutput {
     pub fn with_runtime(mut self, handle: tokio::runtime::Handle) -> Self {
         self.rt_handle = Some(handle);
         self
+    }
+
+    fn event_generation(&self) -> PlayerEventGeneration {
+        PlayerEventGeneration::from_raw(self.event_generation.load(Ordering::SeqCst))
     }
 
     /// Resolve a URI for Chromecast playback.
@@ -199,6 +206,7 @@ impl ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         let tx = self.event_tx.clone();
+        let event_generation = self.event_generation();
         let volume = self.volume;
         let state = Arc::clone(&self.current_state);
 
@@ -213,7 +221,10 @@ impl ChromecastOutput {
             Ok(u) => u,
             Err(e) => {
                 error!(error = %e, "Failed to resolve URI for casting");
-                let _ = tx.try_send(PlayerEvent::Error(format!("Chromecast: {e}")));
+                let _ = tx.try_send(PlayerEvent::error(
+                    event_generation,
+                    format!("Chromecast: {e}"),
+                ));
                 return;
             }
         };
@@ -226,13 +237,17 @@ impl ChromecastOutput {
                 volume,
                 tx.clone(),
                 state.clone(),
+                event_generation,
                 &generation,
                 my_generation,
             ) {
                 Ok(()) => {}
                 Err(e) => {
                     error!(error = %e, "Chromecast: media load failed");
-                    let _ = tx.try_send(PlayerEvent::Error(format!("Chromecast: {e}")));
+                    let _ = tx.try_send(PlayerEvent::error(
+                        event_generation,
+                        format!("Chromecast: {e}"),
+                    ));
                     if let Ok(mut s) = state.lock() {
                         *s = PlayerState::Stopped;
                     }
@@ -251,6 +266,7 @@ impl ChromecastOutput {
         volume: f64,
         tx: async_channel::Sender<PlayerEvent>,
         state: Arc<Mutex<PlayerState>>,
+        event_generation: PlayerEventGeneration,
         generation: &AtomicU64,
         my_generation: u64,
     ) -> Result<(), String> {
@@ -348,7 +364,7 @@ impl ChromecastOutput {
         if let Ok(mut s) = state.lock() {
             *s = PlayerState::Playing;
         }
-        let _ = tx.try_send(PlayerEvent::StateChanged(PlayerState::Playing));
+        let _ = tx.try_send(PlayerEvent::state(event_generation, PlayerState::Playing));
 
         // ── Persistent connection: heartbeat + position polling ──────
         //
@@ -393,10 +409,11 @@ impl ChromecastOutput {
                                     .map(|d| (d as f64 * 1000.0) as u64)
                                     .unwrap_or(0);
 
-                                let _ = tx.try_send(PlayerEvent::PositionChanged {
+                                let _ = tx.try_send(PlayerEvent::position(
+                                    event_generation,
                                     position_ms,
                                     duration_ms,
-                                });
+                                ));
                             }
 
                             // Authoritative state from the device.
@@ -415,7 +432,8 @@ impl ChromecastOutput {
                                     prev
                                 };
                                 if prev != new_state {
-                                    let _ = tx.try_send(PlayerEvent::StateChanged(new_state));
+                                    let _ = tx
+                                        .try_send(PlayerEvent::state(event_generation, new_state));
                                 }
                             }
 
@@ -427,7 +445,7 @@ impl ChromecastOutput {
                                     if let Ok(mut s) = state.lock() {
                                         *s = PlayerState::Stopped;
                                     }
-                                    let _ = tx.try_send(PlayerEvent::TrackEnded);
+                                    let _ = tx.try_send(PlayerEvent::ended(event_generation));
                                     break;
                                 }
                                 Some(
@@ -439,8 +457,10 @@ impl ChromecastOutput {
                                     if let Ok(mut s) = state.lock() {
                                         *s = PlayerState::Stopped;
                                     }
-                                    let _ = tx
-                                        .try_send(PlayerEvent::StateChanged(PlayerState::Stopped));
+                                    let _ = tx.try_send(PlayerEvent::state(
+                                        event_generation,
+                                        PlayerState::Stopped,
+                                    ));
                                     break;
                                 }
                                 None => {
@@ -482,11 +502,12 @@ impl ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         let tx = self.event_tx.clone();
+        let generation = self.event_generation();
 
         std::thread::spawn(move || {
             if let Err(e) = Self::send_cast_command_sync(&host, port, command) {
                 warn!(error = %e, "Chromecast: command failed");
-                let _ = tx.try_send(PlayerEvent::Error(format!("Chromecast: {e}")));
+                let _ = tx.try_send(PlayerEvent::error(generation, format!("Chromecast: {e}")));
             }
         });
     }
@@ -634,9 +655,15 @@ impl AudioOutput for ChromecastOutput {
         self.cast_media(uri);
 
         // Optimistically signal buffering.
-        let _ = self
-            .event_tx
-            .try_send(PlayerEvent::StateChanged(PlayerState::Buffering));
+        let _ = self.event_tx.try_send(PlayerEvent::state(
+            self.event_generation(),
+            PlayerState::Buffering,
+        ));
+    }
+
+    fn set_event_generation(&self, generation: PlayerEventGeneration) {
+        self.event_generation
+            .store(generation.as_raw(), Ordering::SeqCst);
     }
 
     fn play(&self) {
@@ -664,9 +691,10 @@ impl AudioOutput for ChromecastOutput {
             *s = PlayerState::Stopped;
         }
         self.send_cast_command(CastCommand::Stop);
-        let _ = self
-            .event_tx
-            .try_send(PlayerEvent::StateChanged(PlayerState::Stopped));
+        let _ = self.event_tx.try_send(PlayerEvent::state(
+            self.event_generation(),
+            PlayerState::Stopped,
+        ));
     }
 
     fn toggle_play_pause(&self) {
@@ -694,11 +722,15 @@ impl AudioOutput for ChromecastOutput {
         let port = self.port;
         let vol = self.volume;
         let tx = self.event_tx.clone();
+        let generation = self.event_generation();
 
         std::thread::spawn(move || {
             if let Err(e) = Self::send_cast_command_sync(&host, port, CastCommand::Volume(vol)) {
                 warn!(error = %e, "Chromecast: volume command failed");
-                let _ = tx.try_send(PlayerEvent::Error(format!("Chromecast volume: {e}")));
+                let _ = tx.try_send(PlayerEvent::error(
+                    generation,
+                    format!("Chromecast volume: {e}"),
+                ));
             }
         });
     }

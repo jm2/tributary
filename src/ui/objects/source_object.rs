@@ -26,8 +26,6 @@ mod imp {
         pub connected: Cell<bool>,
         /// Whether an authentication attempt is in progress.
         pub connecting: Cell<bool>,
-        /// DAAP logout URL for session cleanup on disconnect.
-        pub logout_url: RefCell<String>,
         /// Whether this server requires a password to connect.
         /// `true` = password required (default), `false` = open/passwordless.
         pub requires_password: Cell<bool>,
@@ -131,14 +129,6 @@ impl SourceObject {
 
     pub fn set_connecting(&self, val: bool) {
         self.imp().connecting.set(val);
-    }
-
-    pub fn logout_url(&self) -> String {
-        self.imp().logout_url.borrow().clone()
-    }
-
-    pub fn set_logout_url(&self, url: &str) {
-        self.imp().logout_url.replace(url.to_string());
     }
 
     pub fn requires_password(&self) -> bool {
