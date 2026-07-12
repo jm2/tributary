@@ -30,7 +30,7 @@ Status summary:
 - [x] Add migration fixtures for gaps, duplicates, reordered rows, multiple playlists, and
   an empty table.
 - [x] Verify a failed migration cannot leave partially updated positions.
-- [x] Record implementation: current worktree (commit pending); 10 focused migration tests.
+- [x] Record implementation: PR #68; 10 focused migration tests.
 
 Acceptance criteria: upgrading a v0.5.0-style database always yields a unique contiguous
 `0..N` position sequence per playlist without changing the intended order.
@@ -66,7 +66,7 @@ view of a library root, while intentional offline deletion is eventually reflect
 - [x] Populate and/or replace the explicit disconnect path with owned backend shutdown.
 - [x] Resolve stream/artwork URLs from the live session at playback time.
 - [x] Add a mock DAAP lifecycle test covering connect, sync, play, and disconnect.
-- [x] Record implementation: current worktree (commit pending); 7 focused lifecycle and
+- [x] Record implementation: PR #68; 7 focused lifecycle and
   replacement-race tests.
 
 Acceptance criteria: a DAAP session remains valid after library synchronization and is
@@ -80,7 +80,7 @@ logged out exactly once on explicit disconnect or controlled shutdown.
 - [x] Make reselecting the current output a no-op.
 - [x] Explicitly transfer or clear playback when the output target changes.
 - [x] Add tests for sort, filter, source change, output change, EOS, and external-file playback.
-- [x] Record implementation: current worktree (commit pending); 25 focused UI/output tests.
+- [x] Record implementation: PR #68; 25 focused UI/output tests.
 
 Acceptance criteria: view mutations never change the identity of the playing track or the
 meaning of queue navigation.
@@ -91,7 +91,7 @@ meaning of queue navigation.
 - [x] Ensure each click resolves only the currently bound `SourceObject`.
 - [x] Cover delete, DAAP eject, playlist creation, and forced remove/reinsert rebinds.
 - [x] Add a GTK test or focused harness that repeatedly recycles the same list item.
-- [x] Record implementation: current worktree (commit pending); focused recycling harness.
+- [x] Record implementation: PR #68; focused recycling harness.
 
 Acceptance criteria: one click emits exactly one action for the currently displayed row.
 
@@ -102,7 +102,7 @@ Acceptance criteria: one click emits exactly one action for the currently displa
 - [x] Set `persist-credentials: false` on build-job checkouts.
 - [x] Move `contents: write` to a minimal publication job.
 - [x] Give all build jobs `contents: read`.
-- [x] Record implementation: current worktree (commit pending); YAML, checksum, and contract
+- [x] Record implementation: PR #68; YAML, checksum, and contract
   checks passed locally.
 
 Acceptance criteria: release build jobs execute only repository or immutable verified code
@@ -115,7 +115,7 @@ and cannot access a repository write credential.
 - [x] Derive every package version from the checked-out source/tag.
 - [x] Reject a missing or malformed requested tag.
 - [ ] Add a dry-run/manual workflow test demonstrating that tag X builds tag X.
-- [ ] Record implementation: workflow contract implemented in the current worktree; live
+- [ ] Record implementation: workflow contract implemented in PR #68; live
   manual-dispatch verification pending after push.
 
 Acceptance criteria: all artifacts in a run are built from the same requested immutable ref
@@ -128,7 +128,7 @@ and carry the same version.
 - [x] Review the `anyhow`, `paste`, and `proc-macro-error2` warnings and document upstream
   disposition.
 - [x] Run `cargo audit` successfully.
-- [x] Record implementation: current worktree (commit pending); `cargo audit` passes with two
+- [x] Record implementation: PR #68; `cargo audit` passes with two
   documented informational warnings.
 
 Audit disposition recorded 2026-07-10:
@@ -146,19 +146,31 @@ explicitly justified and time-bounded.
 
 ### P1.1 Add the real playlist-entry track foreign key
 
-- [ ] Rebuild `playlist_entries` with `track_id -> tracks(id) ON DELETE SET NULL`.
-- [ ] Null existing dangling IDs before enabling the constraint.
-- [ ] Reconcile newly orphaned entries after scans and watcher insertions.
-- [ ] Test delete, rename, re-add, and full rebuild behavior.
-- [ ] Record implementation: _pending_
+- [x] Rebuild `playlist_entries` with `track_id -> tracks(id) ON DELETE SET NULL`.
+- [x] Null existing dangling IDs before enabling the constraint.
+- [x] Reconcile newly orphaned entries after scans and watcher insertions.
+- [x] Test delete, rename, re-add, and full rebuild behavior.
+- [x] Record implementation: commit `8ec84a5`; 12 focused migration,
+  reconciliation, and watcher-batch tests.
 
-### P1.2 Preserve identity across filesystem renames
+### P1.2 Preserve identity for authoritative filesystem renames
 
-- [ ] Treat paired file renames as transactional path updates.
-- [ ] Preserve UUID, `date_added`, play count, and playlist linkage.
-- [ ] Handle directory rename/removal by rescanning the affected subtree.
-- [ ] Define fallback behavior when rename pairing is unavailable.
-- [ ] Record implementation: _pending_
+- [x] Preserve event order and tracker metadata; normalize authoritative Linux and Windows
+  rename pairs without processing duplicate halves.
+- [x] Transactionally update same-root, same-format paired file paths while preserving UUID,
+  `date_added`, play count, playlist linkage, and mutable metadata.
+- [x] Reconcile directory changes, unpaired/unknown renames, cross-root moves, and format changes
+  with one hardened authoritative scan per watcher batch rather than guessing identity.
+- [x] Disable watcher symlink following so incremental indexing matches authoritative scans.
+- [x] Cover cross-platform event shapes, destination replacement, guard rejection, SQL rollback,
+  and playlist-FK preservation with eight focused tests.
+- [x] Preserve descendant IDs for paired directory renames by retargeting every safely mapped
+  indexed descendant in one transaction after a complete scoped traversal.
+- [x] Refresh already-captured local/playlist queue items by stable track ID after an
+  ID-preserving committed rename, so Next/EOS uses the new URI.
+- [x] Record implementation: stacked P1.2 commits; 24 additional focused directory-rename,
+  batch-deferral, no-follow, scoped-scan, playlist-projection, and queue-refresh tests, for 32
+  focused P1.2 tests total.
 
 ### P1.3 Close the scan/watcher handoff gap
 
@@ -218,6 +230,11 @@ explicitly justified and time-bounded.
 ### P1.9 Prevent stale async source rendering
 
 - [ ] Attach a source key/generation to playlist, radio, and remote loads.
+- [x] Refresh already-open playlist URIs after an ID-preserving local rename and overlay committed
+  URIs onto an in-flight result before publication.
+- [ ] Reload an active playlist after watcher reconciliation remints or relinks track IDs.
+- [ ] Reject an in-flight playlist result when its source generation is stale, including when it
+  would render pre-rename rows after the refreshed model or replace a newer source selection.
 - [ ] Cache completed results even when no longer active.
 - [ ] Render only if the requested source remains selected.
 - [ ] Reuse the active-key guard pattern already present in USB loading.
@@ -238,6 +255,8 @@ explicitly justified and time-bounded.
 
 ### P2.2 Make playlist import/export transactional and deterministic
 
+- [ ] Define supported source formats and provide adapters or actionable conversion guidance
+  for Apple Music XML and YouTube Music exports.
 - [ ] Export through a sibling temporary file and atomic replacement.
 - [ ] Prefer an exact existing file path before metadata matching.
 - [ ] Enforce the documented duration tolerance and deterministic tie-breaking.
@@ -303,6 +322,8 @@ explicitly justified and time-bounded.
 - [ ] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source.
 - [ ] Remove long-lived authenticated URLs from the generic `Track` model.
 - [ ] Resolve playable URLs/tickets at playback time.
+- [ ] Resolve local/playlist media by stable track ID at playback, navigation, and receiver-load
+  time so fallback reconciliation and in-flight casts cannot retain dead file paths.
 - [ ] Centralize source refresh, cancellation, disconnect, and failure state.
 - [ ] Decide how local, radio, and external-file sources fit the same lifecycle.
 - [ ] Record architecture decision: _pending_
@@ -368,7 +389,7 @@ by P2.6. Packaging dry runs and the live manual release-workflow run remain outs
 
 Record scope or design decisions here so deferred work is explicit.
 
-- 2026-07-10 — Implemented P0.1, P0.3-P0.6, and P0.8 in the current worktree. P0.7's
+- 2026-07-10 — Implemented P0.1, P0.3-P0.6, and P0.8 in PR #68. P0.7's
   workflow contract is implemented, but its live manual-dispatch acceptance test requires a
   pushed ref and remains open.
 - 2026-07-10 — P0.2 now fails closed for incomplete traversal, unavailable/replaced roots,
@@ -391,6 +412,50 @@ Record scope or design decisions here so deferred work is explicit.
 - 2026-07-10 — The remaining `cargo audit` warnings are unmaintained transitive dependencies,
   not known vulnerabilities; their owners and 2026-10-10 review deadline are recorded under
   P0.8.
+- 2026-07-12 — Track deletion now preserves playlist-entry identity, order, and fingerprint by
+  nulling the real track foreign key. Scan and watcher-batch reconciliation relink only when
+  fingerprint plus optional duration identifies exactly one current track; ambiguous matches
+  remain orphaned. Stable track identity across filesystem renames remains P1.2; safely
+  refreshing an already-open playlist after background reconciliation remains P1.9.
+- 2026-07-12 — P1.2 preserves identity only for authoritative same-root, same-format pairs:
+  tracked Linux events and strictly adjacent Windows rename halves. Unpairable macOS/BSD events,
+  cross-root moves, and format changes use a full hardened scan and never infer identity from
+  tags.
+- 2026-07-12 — A paired directory rename now moves every safely mapped indexed descendant in one
+  transaction. Each descendant is moved only when a completed scoped traversal of the destination
+  observed a real file at its mirrored path. This is a path-based observation, not an inferred
+  metadata match; live filesystem handles retained by the traversal are revalidated before the
+  database transaction commits. A descendant with no such file is left in place for reconciliation
+  rather than followed to a path that may not exist, and destination files no row claims are
+  upserted normally, so an album gaining a file while the app was closed does not defeat identity
+  preservation. Paths are matched component-wise in the database's existing lossy namespace, so
+  already-persisted non-UTF-8 paths remain matchable subject to that namespace's collision limits,
+  and `/music/Album` cannot capture `/music/Album2`. Pairs nested inside a renamed directory, and
+  subtrees owning another persisted root or mount, remain fail-closed: the watcher cannot order
+  them, so they reconcile.
+- 2026-07-12 — Directory-rename halves are deferred, not reconciled on sight. A vanished
+  directory and a deleted cover image are indistinguishable when the path is already gone, so
+  the batch decides only once every event in the debounce window has arrived; anything no
+  authoritative pair claimed still forces the guarded rescan.
+- 2026-07-12 — Directory scans retain cross-platform filesystem-object handles for the
+  destination and every mapped audio file, then reopen and compare them in the transaction's
+  final guard. A removal, replacement, symlink/reparse point, or directory swap therefore rolls
+  the identity update back. Files with their own event in the same watcher batch are excluded from
+  identity mapping and take the normal parse/reconciliation path. The same object comparison also
+  authorizes case-only directory renames on case-insensitive filesystems without accepting a
+  copied or recreated source.
+- 2026-07-12 — Watcher upserts classify paths with no-follow metadata before parsing and again
+  before persistence. Missing audio paths retain the guarded-delete behavior; symlinks, Windows
+  reparse points, unexpected path types, and metadata errors force authoritative reconciliation.
+- 2026-07-12 — A committed bulk rename publishes one library snapshot rather than a per-row
+  event storm, and an already-captured playback queue re-resolves its items from it by stable
+  track ID, in place. Already-open playlist rows are retargeted by the same stable ID, and an
+  in-flight playlist result overlays committed local URIs before it can render. Same-key request
+  generations and post-reconciliation reloads remain P1.9. A rename that falls back to
+  reconciliation still mints new track IDs, so the ID-based refresh cannot repair a queue captured
+  before it; recovery requires rebuilding it from a refreshed source model. Stable-ID resolution
+  at playback, navigation, and receiver-load time remains P3.1 rather than changing queue semantics
+  here.
 
 ## Completed work log
 
@@ -398,9 +463,11 @@ Add one line per completed task:
 
 | Date | Task | Commit/PR | Notes |
 |---|---|---|---|
-| 2026-07-10 | P0.1 | Current worktree | Transactional, deterministic, retry-safe migration with focused upgrade fixtures. |
-| 2026-07-10 | P0.3 | Current worktree | Owned DAAP registry, generation-safe sync, live URL resolution, and exactly-once shutdown. |
-| 2026-07-10 | P0.4 | Current worktree | Stable queue/session identity, generation-filtered events, and deterministic output reset. |
-| 2026-07-10 | P0.5 | Current worktree | One setup-time sidebar handler with current-item resolution and recycling tests. |
-| 2026-07-10 | P0.6 | Current worktree | Immutable release inputs and publication-only repository credentials. |
-| 2026-07-10 | P0.8 | Current worktree | Patched dependency graph and time-bounded informational advisory dispositions. |
+| 2026-07-10 | P0.1 | PR #68 | Transactional, deterministic, retry-safe migration with focused upgrade fixtures. |
+| 2026-07-10 | P0.3 | PR #68 | Owned DAAP registry, generation-safe sync, live URL resolution, and exactly-once shutdown. |
+| 2026-07-10 | P0.4 | PR #68 | Stable queue/session identity, generation-filtered events, and deterministic output reset. |
+| 2026-07-10 | P0.5 | PR #68 | One setup-time sidebar handler with current-item resolution and recycling tests. |
+| 2026-07-10 | P0.6 | PR #68 | Immutable release inputs and publication-only repository credentials. |
+| 2026-07-10 | P0.8 | PR #68 | Patched dependency graph and time-bounded informational advisory dispositions. |
+| 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
+| 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |

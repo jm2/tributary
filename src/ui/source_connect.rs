@@ -10,6 +10,7 @@ use tracing::info;
 use crate::local::engine::LibraryEvent;
 
 use super::objects::{SourceObject, TrackObject};
+use super::playback::refresh_projected_library_uris;
 use super::preferences;
 use super::radio::{
     apply_radio_columns, handle_radio_nearme, is_radio_backend, radio_station_to_track_object,
@@ -129,7 +130,9 @@ pub fn setup_source_connect(state: &WindowState) {
                 return;
             }
 
-            *active_source_key.borrow_mut() = format!("playlist:{playlist_id}");
+            let playlist_source_key =
+                format!("{}{playlist_id}", super::playback::PLAYLIST_SOURCE_PREFIX);
+            *active_source_key.borrow_mut() = playlist_source_key.clone();
 
             // Restore music column layout (not radio).
             apply_radio_columns(&column_view, false);
@@ -149,6 +152,9 @@ pub fn setup_source_connect(state: &WindowState) {
             let status_label = status_label.clone();
             let column_view = column_view.clone();
             let pid = playlist_id.clone();
+            let source_tracks_for_load = source_tracks.clone();
+            let active_source_key_for_load = active_source_key.clone();
+            let requested_source_key = playlist_source_key;
 
             let (tracks_tx, tracks_rx) = async_channel::bounded::<String>(1);
 
@@ -189,6 +195,24 @@ pub fn setup_source_connect(state: &WindowState) {
                         serde_json::from_str(&json).unwrap_or_default();
                     let objects: Vec<TrackObject> =
                         tracks.iter().map(arch_track_to_object).collect();
+
+                    // A paired rename may commit while this database result is
+                    // in flight. Overlay the latest committed local paths at
+                    // the GTK publication boundary so either callback order
+                    // converges on the live URI.
+                    if let Some(local_tracks) = source_tracks_for_load.borrow().get("local") {
+                        refresh_projected_library_uris(&objects, local_tracks);
+                    }
+
+                    // A slow playlist query must never replace a source the
+                    // user selected while it was running.
+                    if *active_source_key_for_load.borrow() != requested_source_key {
+                        tracing::debug!(
+                            source = %requested_source_key,
+                            "Ignoring playlist result for an inactive source"
+                        );
+                        return;
+                    }
                     display_tracks(
                         &objects,
                         &track_store,
