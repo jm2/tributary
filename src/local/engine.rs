@@ -4,6 +4,8 @@
 //! to the GTK main thread via `async_channel`.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -125,6 +127,7 @@ struct RootScan {
     audio_files: Vec<PathBuf>,
     errors: Vec<String>,
     device_id: Option<String>,
+    mount_generation: Option<u64>,
     reconciliation_authoritative: bool,
     content_authorized: bool,
 }
@@ -135,8 +138,187 @@ impl RootScan {
     }
 }
 
+const ROOT_IDENTITY_FILE: &str = ".tributary-root-id";
+const ROOT_IDENTITY_PREFIX: &str = "marker:v1:";
+
+fn root_identity_path(root: &Path) -> PathBuf {
+    root.join(ROOT_IDENTITY_FILE)
+}
+
+fn parse_root_marker(contents: &str) -> std::io::Result<String> {
+    let value = contents.strip_suffix('\n').unwrap_or(contents);
+    if value.is_empty() || value.contains(char::is_whitespace) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "library root marker has invalid whitespace",
+        ));
+    }
+    let Some(uuid) = value.strip_prefix(ROOT_IDENTITY_PREFIX) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "library root marker has an unsupported format",
+        ));
+    };
+    let uuid = Uuid::parse_str(uuid).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("library root marker has an invalid UUID: {error}"),
+        )
+    })?;
+    Ok(format!("{ROOT_IDENTITY_PREFIX}{uuid}"))
+}
+
 #[cfg(unix)]
-fn filesystem_identity(path: &Path) -> std::io::Result<String> {
+fn open_root_marker(path: &Path) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(File::from(descriptor))
+}
+
+#[cfg(windows)]
+fn open_root_marker(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    // Open the reparse point itself instead of following it, then reject every
+    // reparse-point flavor (not only ordinary symlinks) from handle metadata.
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "library root marker must not be a reparse point",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_root_marker(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).open(path)
+}
+
+fn read_root_marker(root: &Path) -> std::io::Result<Option<String>> {
+    let path = root_identity_path(root);
+    let mut file = match open_root_marker(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > 128 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsafe library root marker: {}", path.display()),
+        ));
+    }
+
+    // Bound the read independently of metadata: a concurrent writer cannot
+    // bypass the size check after the handle has been validated.
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    (&mut file).take(129).read_to_end(&mut contents)?;
+    if contents.len() > 128 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "library root marker exceeds 128 bytes",
+        ));
+    }
+    let contents = std::str::from_utf8(&contents).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("library root marker is not UTF-8: {error}"),
+        )
+    })?;
+    parse_root_marker(contents).map(Some)
+}
+
+struct RootMarkerCreation {
+    identity: String,
+    created: bool,
+}
+
+fn create_root_marker(root: &Path) -> std::io::Result<RootMarkerCreation> {
+    if let Some(identity) = read_root_marker(root)? {
+        return Ok(RootMarkerCreation {
+            identity,
+            created: false,
+        });
+    }
+
+    let identity = format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4());
+    let path = root_identity_path(root);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let identity = read_root_marker(root)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "library root marker appeared but could not be read",
+                )
+            })?;
+            return Ok(RootMarkerCreation {
+                identity,
+                created: false,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+
+    let write_result = file
+        .write_all(format!("{identity}\n").as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    // Do not remove by path on failure: another process may have replaced the
+    // entry after this handle was opened. A partial marker safely fails closed.
+    write_result?;
+
+    let observed = read_root_marker(root)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "library root marker disappeared after creation",
+        )
+    })?;
+    if observed != identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "library root marker changed during creation",
+        ));
+    }
+    Ok(RootMarkerCreation {
+        identity,
+        created: true,
+    })
+}
+
+fn is_marker_identity(identity: &str) -> bool {
+    identity.starts_with(ROOT_IDENTITY_PREFIX)
+}
+
+fn is_legacy_identity(identity: &str) -> bool {
+    identity.starts_with("unix:")
+        || identity.starts_with("windows:")
+        || identity.starts_with("path:")
+}
+
+#[cfg(unix)]
+fn legacy_filesystem_identity(path: &Path) -> std::io::Result<String> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = std::fs::metadata(path)?;
@@ -147,6 +329,28 @@ fn filesystem_identity(path: &Path) -> std::io::Result<String> {
         metadata.dev(),
         metadata.ino()
     ))
+}
+
+#[cfg(windows)]
+fn legacy_filesystem_identity(path: &Path) -> std::io::Result<String> {
+    use std::os::windows::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path)?;
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    Ok(format!(
+        "windows:{}:{}",
+        canonical.to_string_lossy(),
+        metadata.creation_time()
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn legacy_filesystem_identity(path: &Path) -> std::io::Result<String> {
+    Ok(format!("path:{}", path.canonicalize()?.to_string_lossy()))
+}
+
+fn filesystem_identity(path: &Path) -> std::io::Result<String> {
+    read_root_marker(path)?.map_or_else(|| legacy_filesystem_identity(path), Ok)
 }
 
 #[cfg(target_os = "linux")]
@@ -165,7 +369,10 @@ fn filesystem_boundary_id(path: &Path) -> std::io::Result<u64> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn filesystem_boundary_id(_path: &Path) -> std::io::Result<u64> {
+    // Keep the fallible signature shared with Unix so callers fail closed when
+    // a platform-specific boundary probe is added here.
     Ok(0)
 }
 
@@ -200,9 +407,11 @@ fn root_mount_generation(path: &Path) -> std::io::Result<u64> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
 fn root_mount_generation(_path: &Path) -> std::io::Result<u64> {
     // Other platforms still use the stable pre/post filesystem identity. A
-    // constant generation keeps the shared traversal implementation portable.
+    // constant generation and shared fallible signature keep the traversal
+    // implementation portable without weakening Linux's generation checks.
     Ok(0)
 }
 
@@ -317,7 +526,10 @@ fn mounted_subroots(configured_roots: &[PathBuf]) -> std::io::Result<Vec<PathBuf
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
 fn mounted_subroots(_configured_roots: &[PathBuf]) -> std::io::Result<Vec<PathBuf>> {
+    // The fallible return type is part of the cross-platform fail-closed scan
+    // contract even though only Linux currently has mount-table discovery.
     Ok(Vec::new())
 }
 
@@ -359,28 +571,6 @@ fn expanded_scan_roots_with_mounts(
     roots.sort_unstable();
     roots.dedup();
     roots
-}
-
-#[cfg(windows)]
-fn filesystem_identity(path: &Path) -> std::io::Result<String> {
-    use std::os::windows::fs::MetadataExt;
-
-    let metadata = std::fs::metadata(path)?;
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    // A mounted volume exposes the mounted root's creation time, while an
-    // absent directory mount exposes the underlying mountpoint's metadata.
-    // Drive-letter and UNC roots become inaccessible when unavailable, which
-    // makes their traversal incomplete before this identity is consulted.
-    Ok(format!(
-        "windows:{}:{}",
-        canonical.to_string_lossy(),
-        metadata.creation_time()
-    ))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn filesystem_identity(path: &Path) -> std::io::Result<String> {
-    Ok(format!("path:{}", path.canonicalize()?.to_string_lossy()))
 }
 
 fn scan_root(root: PathBuf) -> RootScan {
@@ -427,6 +617,7 @@ where
             root,
             audio_files: Vec::new(),
             device_id: None,
+            mount_generation: None,
             reconciliation_authoritative: false,
             content_authorized: false,
         };
@@ -443,6 +634,7 @@ where
                 root,
                 audio_files: Vec::new(),
                 device_id: None,
+                mount_generation: None,
                 reconciliation_authoritative: false,
                 content_authorized: false,
             };
@@ -460,6 +652,7 @@ where
                 root,
                 audio_files: Vec::new(),
                 device_id,
+                mount_generation: None,
                 reconciliation_authoritative: false,
                 content_authorized: false,
             };
@@ -559,6 +752,7 @@ where
         audio_files,
         errors,
         device_id,
+        mount_generation: Some(mount_generation),
         reconciliation_authoritative: false,
         content_authorized: false,
     }
@@ -587,6 +781,39 @@ fn root_scan_for_path<'a>(path: &Path, root_scans: &'a [RootScan]) -> Option<&'a
         .iter()
         .filter(|scan| path.starts_with(&scan.root))
         .max_by_key(|scan| scan.root.components().count())
+}
+
+/// Recheck the most-specific authorized root for one pending initial-scan
+/// write. A failed probe invalidates that root for every later file in this
+/// scan; callers persist the returned root's unavailable state.
+fn revalidate_scan_root_for_path(
+    path: &Path,
+    root_scans: &mut [RootScan],
+) -> (bool, Option<PathBuf>) {
+    let Some(index) = root_scans
+        .iter()
+        .enumerate()
+        .filter(|(_, scan)| path.starts_with(&scan.root))
+        .max_by_key(|(_, scan)| scan.root.components().count())
+        .map(|(index, _)| index)
+    else {
+        return (false, None);
+    };
+    let scan = &mut root_scans[index];
+    if !scan.content_authorized {
+        return (false, None);
+    }
+    let matches = scan.device_id.as_deref().is_some_and(|expected| {
+        is_marker_identity(expected)
+            && filesystem_identity(&scan.root).is_ok_and(|observed| observed == expected)
+    });
+    if matches {
+        return (true, None);
+    }
+
+    scan.content_authorized = false;
+    scan.reconciliation_authoritative = false;
+    (false, Some(scan.root.clone()))
 }
 
 fn most_specific_root_for_path<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a Path> {
@@ -626,6 +853,9 @@ fn reconciliation_is_authoritative(
     let Some(observed_device_id) = scan.device_id.as_deref() else {
         return false;
     };
+    if !is_marker_identity(observed_device_id) {
+        return false;
+    }
 
     previous.is_some_and(|state| {
         state.identity_confirmed && state.device_id.as_deref() == Some(observed_device_id)
@@ -644,7 +874,19 @@ fn scan_confirms_identity(
     previous: Option<&library_root::Model>,
     existing_track_count: usize,
 ) -> bool {
-    if !scan.is_complete() || scan.device_id.is_none() || scan.audio_files.is_empty() {
+    scan_confirms_identity_for_scope(scan, previous, existing_track_count, true)
+}
+
+fn scan_confirms_identity_for_scope(
+    scan: &RootScan,
+    previous: Option<&library_root::Model>,
+    existing_track_count: usize,
+    allow_new_enrollment: bool,
+) -> bool {
+    if !scan.is_complete()
+        || !scan.device_id.as_deref().is_some_and(is_marker_identity)
+        || scan.audio_files.is_empty()
+    {
         return false;
     }
 
@@ -654,7 +896,140 @@ fn scan_confirms_identity(
         }
     }
 
-    existing_track_count == 0
+    allow_new_enrollment && existing_track_count == 0
+}
+
+/// Bind a complete, explicitly configured root to a durable marker.
+///
+/// Existing pre-marker identities are converted only while the legacy probe
+/// still matches the persisted value. The conversion scan is never allowed to
+/// delete rows; the next complete marker-backed scan establishes authority.
+#[derive(Debug, Eq, PartialEq)]
+enum RootIdentityPreparation {
+    Unchanged,
+    MarkerCreated {
+        identity: String,
+        legacy_conversion: bool,
+    },
+}
+
+fn prepare_durable_root_identity(
+    scan: &mut RootScan,
+    previous: Option<&library_root::Model>,
+    existing_track_count: usize,
+    explicitly_configured: bool,
+) -> RootIdentityPreparation {
+    if !scan.is_complete() {
+        return RootIdentityPreparation::Unchanged;
+    }
+
+    let previous_legacy_matches = explicitly_configured
+        && previous.is_some_and(|state| {
+            state.identity_confirmed
+                && state.device_id.as_deref().is_some_and(is_legacy_identity)
+                && legacy_filesystem_identity(&scan.root).ok().as_deref()
+                    == state.device_id.as_deref()
+        });
+    let is_new_enrollment = explicitly_configured
+        && !previous.is_some_and(|state| state.identity_confirmed)
+        && existing_track_count == 0
+        && !scan.audio_files.is_empty();
+    let needs_marker = scan.device_id.as_deref().is_some_and(is_legacy_identity)
+        && (previous_legacy_matches || is_new_enrollment);
+
+    if !needs_marker {
+        return RootIdentityPreparation::Unchanged;
+    }
+
+    // Retain both probes across creation. A marker written to a root that was
+    // replaced after traversal must never bless the replacement volume.
+    let before_legacy = match legacy_filesystem_identity(&scan.root) {
+        Ok(identity) => identity,
+        Err(error) => {
+            scan.errors.push(format!(
+                "failed to re-identify library root before marker creation {}: {error}",
+                scan.root.display()
+            ));
+            return RootIdentityPreparation::Unchanged;
+        }
+    };
+    let before_generation = match root_mount_generation(&scan.root) {
+        Ok(generation) => generation,
+        Err(error) => {
+            scan.errors.push(format!(
+                "failed to identify library root mount before marker creation {}: {error}",
+                scan.root.display()
+            ));
+            return RootIdentityPreparation::Unchanged;
+        }
+    };
+    if scan.device_id.as_deref() != Some(before_legacy.as_str())
+        || scan.mount_generation != Some(before_generation)
+    {
+        scan.errors.push(format!(
+            "library root identity or mount changed before marker creation: {}",
+            scan.root.display()
+        ));
+        return RootIdentityPreparation::Unchanged;
+    }
+
+    let creation = match create_root_marker(&scan.root) {
+        Ok(creation) => creation,
+        Err(error) => {
+            scan.errors.push(format!(
+                "failed to create durable library root identity {}: {error}",
+                scan.root.display()
+            ));
+            return RootIdentityPreparation::Unchanged;
+        }
+    };
+    if !creation.created {
+        scan.errors.push(format!(
+            "library root marker appeared during enrollment: {}",
+            scan.root.display()
+        ));
+        return RootIdentityPreparation::Unchanged;
+    }
+
+    let legacy_stable =
+        legacy_filesystem_identity(&scan.root).is_ok_and(|identity| identity == before_legacy);
+    let generation_stable =
+        root_mount_generation(&scan.root).is_ok_and(|generation| generation == before_generation);
+    if !legacy_stable || !generation_stable {
+        scan.errors.push(format!(
+            "library root changed while creating its durable identity: {}",
+            scan.root.display()
+        ));
+        return RootIdentityPreparation::Unchanged;
+    }
+
+    scan.device_id = Some(creation.identity.clone());
+    RootIdentityPreparation::MarkerCreated {
+        identity: creation.identity,
+        legacy_conversion: previous_legacy_matches,
+    }
+}
+
+fn reject_duplicate_marker_identities(root_scans: &mut [RootScan]) {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for identity in root_scans
+        .iter()
+        .filter_map(|scan| scan.device_id.as_deref())
+        .filter(|identity| is_marker_identity(identity))
+    {
+        *counts.entry(identity.to_string()).or_default() += 1;
+    }
+
+    for scan in root_scans {
+        if scan.device_id.as_ref().is_some_and(|identity| {
+            is_marker_identity(identity) && counts.get(identity).copied().unwrap_or_default() > 1
+        }) {
+            scan.errors.push(format!(
+                "duplicate library root marker detected at {}",
+                scan.root.display()
+            ));
+        }
+    }
 }
 
 async fn persist_root_scan_status(
@@ -733,6 +1108,69 @@ async fn initial_scan(
     })
     .await?;
 
+    // Preload existing rows once so the per-file loop can decide needs_update
+    // from memory instead of issuing one SELECT per file. The same snapshot is
+    // reused for the stale-removal pass below.
+    let existing_by_path: HashMap<&str, &track::Model> = existing_tracks
+        .iter()
+        .map(|model| (model.file_path.as_str(), model))
+        .collect();
+    let persisted_by_path: HashMap<&str, &library_root::Model> = persisted_roots
+        .iter()
+        .map(|state| (state.path.as_str(), state))
+        .collect();
+    let evidence_roots: Vec<PathBuf> = root_scans.iter().map(|scan| scan.root.clone()).collect();
+    let mut conversion_roots = HashSet::new();
+
+    // Marker creation happens only for roots the user explicitly configured.
+    // Always discard the pre-marker traversal and rescan through the newly
+    // created marker before deciding whether any content may be trusted.
+    for scan in &mut root_scans {
+        let root_path = scan.root.to_string_lossy();
+        let previous = persisted_by_path.get(root_path.as_ref()).copied();
+        let existing_track_count = existing_tracks
+            .iter()
+            .filter(|row| {
+                most_specific_root_for_path(Path::new(&row.file_path), &evidence_roots)
+                    == Some(scan.root.as_path())
+            })
+            .count();
+        let explicitly_configured = configured_dirs.binary_search(&scan.root).is_ok();
+
+        let RootIdentityPreparation::MarkerCreated {
+            identity,
+            legacy_conversion,
+        } = prepare_durable_root_identity(
+            scan,
+            previous,
+            existing_track_count,
+            explicitly_configured,
+        )
+        else {
+            continue;
+        };
+
+        let root = scan.root.clone();
+        let exclusions = evidence_roots.clone();
+        let mut marker_scan =
+            tokio::task::spawn_blocking(move || scan_root_with_exclusions(root, &exclusions))
+                .await?;
+        if marker_scan.device_id.as_deref() != Some(identity.as_str()) {
+            marker_scan.errors.push(format!(
+                "library root marker changed before marker-backed rescan completed: {}",
+                marker_scan.root.display()
+            ));
+        }
+        if legacy_conversion && marker_scan.is_complete() {
+            conversion_roots.insert(marker_scan.root.clone());
+        }
+        *scan = marker_scan;
+    }
+
+    // Detect copies only after enrollment/rescans so markers created during
+    // this scan participate in the same fail-closed duplicate check.
+    reject_duplicate_marker_identities(&mut root_scans);
+
     for scan in &root_scans {
         if scan.is_complete() {
             debug!(
@@ -752,19 +1190,6 @@ async fn initial_scan(
         }
     }
 
-    // Preload existing rows once so the per-file loop can decide needs_update
-    // from memory instead of issuing one SELECT per file. The same snapshot is
-    // reused for the stale-removal pass below.
-    let existing_by_path: HashMap<&str, &track::Model> = existing_tracks
-        .iter()
-        .map(|model| (model.file_path.as_str(), model))
-        .collect();
-    let persisted_by_path: HashMap<&str, &library_root::Model> = persisted_roots
-        .iter()
-        .map(|state| (state.path.as_str(), state))
-        .collect();
-    let evidence_roots: Vec<PathBuf> = root_scans.iter().map(|scan| scan.root.clone()).collect();
-
     for scan in &mut root_scans {
         let root_path = scan.root.to_string_lossy();
         let previous = persisted_by_path.get(root_path.as_ref()).copied();
@@ -775,8 +1200,17 @@ async fn initial_scan(
                     == Some(scan.root.as_path())
             })
             .count();
-        let confirms_identity = scan_confirms_identity(scan, previous, existing_track_count);
-        scan.reconciliation_authoritative = reconciliation_is_authoritative(scan, previous);
+        let conversion_scan = conversion_roots.contains(&scan.root) && scan.is_complete();
+        let explicitly_configured = configured_dirs.binary_search(&scan.root).is_ok();
+        let confirms_identity = conversion_scan
+            || scan_confirms_identity_for_scope(
+                scan,
+                previous,
+                existing_track_count,
+                explicitly_configured,
+            );
+        scan.reconciliation_authoritative =
+            !conversion_scan && reconciliation_is_authoritative(scan, previous);
 
         if !scan.reconciliation_authoritative && scan.is_complete() {
             warn!(
@@ -789,13 +1223,17 @@ async fn initial_scan(
         if confirms_identity && !previous.is_some_and(|state| state.identity_confirmed) {
             info!(root = %scan.root.display(), device_id = ?scan.device_id, "Established library root identity for future reconciliation");
         }
+        if conversion_scan {
+            info!(root = %scan.root.display(), device_id = ?scan.device_id, "Converted legacy root identity; deletion deferred until the next complete scan");
+        }
 
         // If availability state cannot be persisted, fail closed for this
         // scan: retaining stale metadata is safer than deleting it without a
         // durable device identity for the next startup.
         match persist_root_scan_status(db, scan, previous, confirms_identity).await {
             Ok(()) => {
-                scan.content_authorized = scan.reconciliation_authoritative || confirms_identity;
+                scan.content_authorized =
+                    scan.reconciliation_authoritative || (confirms_identity && !conversion_scan);
             }
             Err(error) => {
                 warn!(root = %scan.root.display(), %error, "Failed to persist library root state");
@@ -829,12 +1267,32 @@ async fn initial_scan(
         };
 
         if needs_update {
+            let (identity_allows_parse, invalidated_root) =
+                revalidate_scan_root_for_path(path, &mut root_scans);
+            if let Some(root) = invalidated_root {
+                mark_root_path_unavailable(db, &root).await;
+                warn!(root = %root.display(), path = %path.display(), "Library root changed before parsing — remaining initial-scan writes disabled");
+            }
+            if !identity_allows_parse {
+                continue;
+            }
+
             let p = path.clone();
             let parse_result =
                 tokio::task::spawn_blocking(move || tag_parser::parse_audio_file(&p)).await;
 
             match parse_result {
                 Ok(Ok(parsed)) => {
+                    let (identity_allows_upsert, invalidated_root) =
+                        revalidate_scan_root_for_path(path, &mut root_scans);
+                    if let Some(root) = invalidated_root {
+                        mark_root_path_unavailable(db, &root).await;
+                        warn!(root = %root.display(), path = %path.display(), "Library root changed while parsing — remaining initial-scan writes disabled");
+                    }
+                    if !identity_allows_upsert {
+                        continue;
+                    }
+
                     // During the initial scan we do NOT emit a TrackUpserted
                     // per file: the single FullSync below delivers the complete
                     // snapshot, avoiding O(n^2) UI work plus a full track-list
@@ -857,6 +1315,30 @@ async fn initial_scan(
         if scanned % 50 == 0 || scanned == total {
             let _ = tx.send(LibraryEvent::ScanProgress(scanned, total)).await;
         }
+    }
+
+    // Parsing can outlive a removable-media transition. Revalidate each
+    // authoritative marker immediately before the destructive phase; a
+    // changed, removed, or unreadable marker disables every stale deletion
+    // for that root.
+    for scan in &mut root_scans {
+        if !scan.reconciliation_authoritative {
+            continue;
+        }
+        let identity_still_matches = scan.device_id.as_deref().is_some_and(|expected| {
+            filesystem_identity(&scan.root).is_ok_and(|observed| observed == expected)
+        });
+        if identity_still_matches {
+            continue;
+        }
+        scan.reconciliation_authoritative = false;
+        if let Some(state) = persisted_by_path
+            .get(scan.root.to_string_lossy().as_ref())
+            .copied()
+        {
+            mark_root_unavailable(db, state).await;
+        }
+        warn!(root = %scan.root.display(), "Library root marker changed before reconciliation — stale deletion disabled");
     }
 
     // Remove DB entries for files no longer on disk. Reuse the preloaded
@@ -936,22 +1418,59 @@ async fn initial_scan(
 // Filesystem watcher
 // ---------------------------------------------------------------------------
 
-async fn persisted_root_for_path(
-    db: &DatabaseConnection,
-    music_dirs: &[PathBuf],
-    path: &Path,
-) -> anyhow::Result<Option<(PathBuf, library_root::Model)>> {
-    let states = library_root::Entity::find().all(db).await?;
-    Ok(states
-        .into_iter()
-        .filter_map(|state| {
-            let root = PathBuf::from(&state.path);
-            let is_configured_scope = music_dirs
-                .iter()
-                .any(|configured| root.starts_with(configured));
-            (is_configured_scope && path.starts_with(&root)).then_some((root, state))
-        })
-        .max_by_key(|(root, _)| root.components().count()))
+#[derive(Debug)]
+struct WatcherRootEntry {
+    root: PathBuf,
+    state: library_root::Model,
+}
+
+#[derive(Debug)]
+struct WatcherRootCache {
+    entries: Vec<WatcherRootEntry>,
+}
+
+impl WatcherRootCache {
+    fn from_models(states: Vec<library_root::Model>, music_dirs: &[PathBuf]) -> Self {
+        let mut entries: Vec<WatcherRootEntry> = states
+            .into_iter()
+            .filter_map(|state| {
+                let root = PathBuf::from(&state.path);
+                music_dirs
+                    .iter()
+                    .any(|configured| root.starts_with(configured))
+                    .then_some(WatcherRootEntry { root, state })
+            })
+            .collect();
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.root.components().count()));
+        Self { entries }
+    }
+
+    async fn load(db: &DatabaseConnection, music_dirs: &[PathBuf]) -> anyhow::Result<Self> {
+        Ok(Self::from_models(
+            library_root::Entity::find().all(db).await?,
+            music_dirs,
+        ))
+    }
+
+    fn root_for_path(&self, path: &Path) -> Option<(usize, PathBuf, library_root::Model)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| path.starts_with(&entry.root))
+            .map(|(index, entry)| (index, entry.root.clone(), entry.state.clone()))
+    }
+
+    fn exact_root(&self, root: &Path) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.root == root)
+    }
+
+    fn invalidate(&mut self, index: usize) -> Option<library_root::Model> {
+        let entry = self.entries.get_mut(index)?;
+        entry.state.is_available = false;
+        entry.state.last_scan_complete = false;
+        entry.state.last_checked_at = Utc::now().to_rfc3339();
+        Some(entry.state.clone())
+    }
 }
 
 fn crosses_untracked_nested_mount(root: &Path, path: &Path, music_dirs: &[PathBuf]) -> bool {
@@ -978,12 +1497,38 @@ async fn mark_root_unavailable(db: &DatabaseConnection, state: &library_root::Mo
     }
 }
 
+async fn mark_root_path_unavailable(db: &DatabaseConnection, root: &Path) {
+    let root_path = root.to_string_lossy().into_owned();
+    match library_root::Entity::find_by_id(root_path).one(db).await {
+        Ok(Some(state)) => mark_root_unavailable(db, &state).await,
+        Ok(None) => {
+            warn!(root = %root.display(), "Could not find library root state to mark unavailable");
+        }
+        Err(error) => {
+            warn!(root = %root.display(), %error, "Could not load library root state to mark unavailable");
+        }
+    }
+}
+
+async fn mark_cached_root_unavailable(
+    db: &DatabaseConnection,
+    roots: &mut WatcherRootCache,
+    index: usize,
+) {
+    // Invalidate memory before awaiting SQLite. The remainder of this batch
+    // must fail closed even if persisting the status itself fails.
+    if let Some(state) = roots.invalidate(index) {
+        mark_root_unavailable(db, &state).await;
+    }
+}
+
 async fn root_identity_allows_content(
     db: &DatabaseConnection,
+    roots: &mut WatcherRootCache,
     music_dirs: &[PathBuf],
     path: &Path,
 ) -> anyhow::Result<bool> {
-    let Some((root, root_state)) = persisted_root_for_path(db, music_dirs, path).await? else {
+    let Some((root_index, root, root_state)) = roots.root_for_path(path) else {
         return Ok(false);
     };
     if crosses_untracked_nested_mount(&root, path, music_dirs) {
@@ -996,10 +1541,13 @@ async fn root_identity_allows_content(
     let Some(expected_identity) = root_state.device_id.as_deref() else {
         return Ok(false);
     };
+    if !is_marker_identity(expected_identity) {
+        return Ok(false);
+    }
 
     let matches = filesystem_identity(&root).is_ok_and(|identity| identity == expected_identity);
     if !matches {
-        mark_root_unavailable(db, &root_state).await;
+        mark_cached_root_unavailable(db, roots, root_index).await;
     }
     Ok(matches)
 }
@@ -1008,14 +1556,16 @@ async fn root_identity_allows_content(
 /// identity remains stable across the database transaction.
 async fn delete_track_if_root_stable(
     db: &DatabaseConnection,
+    roots: &mut WatcherRootCache,
     music_dirs: &[PathBuf],
     path: &Path,
 ) -> anyhow::Result<bool> {
-    delete_track_if_root_stable_with_probe(db, music_dirs, path, filesystem_identity).await
+    delete_track_if_root_stable_with_probe(db, roots, music_dirs, path, filesystem_identity).await
 }
 
 async fn delete_track_if_root_stable_with_probe<F>(
     db: &DatabaseConnection,
+    roots: &mut WatcherRootCache,
     music_dirs: &[PathBuf],
     path: &Path,
     mut identity_probe: F,
@@ -1030,7 +1580,7 @@ where
         return Ok(false);
     }
 
-    let Some((root, root_state)) = persisted_root_for_path(db, music_dirs, path).await? else {
+    let Some((root_index, root, root_state)) = roots.root_for_path(path) else {
         return Ok(false);
     };
     if crosses_untracked_nested_mount(&root, path, music_dirs) {
@@ -1043,9 +1593,12 @@ where
     let Some(expected_identity) = root_state.device_id.clone() else {
         return Ok(false);
     };
+    if !is_marker_identity(&expected_identity) {
+        return Ok(false);
+    }
 
     if !identity_probe(&root).is_ok_and(|identity| identity == expected_identity) {
-        mark_root_unavailable(db, &root_state).await;
+        mark_cached_root_unavailable(db, roots, root_index).await;
         return Ok(false);
     }
 
@@ -1067,12 +1620,27 @@ where
         || !identity_probe(&root).is_ok_and(|identity| identity == expected_identity)
     {
         transaction.rollback().await?;
-        mark_root_unavailable(db, &root_state).await;
+        mark_cached_root_unavailable(db, roots, root_index).await;
         return Ok(false);
     }
 
     transaction.commit().await?;
     Ok(true)
+}
+
+fn marker_event_invalidates_root(kind: notify::EventKind) -> bool {
+    use notify::event::{MetadataKind, ModifyKind};
+    use notify::EventKind;
+
+    // Reading the marker is part of every authorization probe and some
+    // backends report open/read/close (or the resulting atime update) through
+    // the same watcher. Those observations must not invalidate the identity
+    // they just verified. Every potentially mutating or unknown event remains
+    // fail-closed.
+    !matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
+    )
 }
 
 async fn watch_directories(
@@ -1126,10 +1694,34 @@ async fn watch_directories(
         // debounce window into path sets.
         let mut upsert_paths: HashSet<PathBuf> = HashSet::new();
         let mut remove_paths: HashSet<PathBuf> = HashSet::new();
+        let mut identity_changed_roots: HashSet<PathBuf> = HashSet::new();
 
-        let mut collect_event = |event: notify::Event| {
+        let mut collect_event = |mut event: notify::Event| {
             use notify::event::{ModifyKind, RenameMode};
             use notify::EventKind;
+
+            let marker_invalidates_root = marker_event_invalidates_root(event.kind);
+
+            // The root marker is a control file, not media. Any create,
+            // content/identity change, rename, removal, or unknown event
+            // invalidates cached authorization and requires a future complete
+            // scan before watcher writes resume. Read/access events are
+            // expected from identity probes and are ignored.
+            event.paths.retain(|path| {
+                if path
+                    .file_name()
+                    .is_some_and(|name| name == ROOT_IDENTITY_FILE)
+                {
+                    if marker_invalidates_root {
+                        if let Some(root) = path.parent() {
+                            identity_changed_roots.insert(root.to_path_buf());
+                        }
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
 
             // Classify each path as a removal or an upsert. A rename is
             // delivered as Modify(Name(...)) rather than Remove: the "from"
@@ -1193,11 +1785,34 @@ async fn watch_directories(
             }
         }
 
+        if remove_paths.is_empty() && upsert_paths.is_empty() && identity_changed_roots.is_empty() {
+            continue;
+        }
+
+        // Root state changes only during scans and watcher processing today.
+        // Load one snapshot per debounced batch and mutate it fail-closed as
+        // identities are invalidated, eliminating O(files) root-table reads.
+        let mut root_cache = match WatcherRootCache::load(db.as_ref(), music_dirs).await {
+            Ok(cache) => cache,
+            Err(error) => {
+                warn!(%error, "Could not load library root state; watcher batch rejected");
+                continue;
+            }
+        };
+
+        for root in identity_changed_roots {
+            if let Some(index) = root_cache.exact_root(&root) {
+                mark_cached_root_unavailable(db.as_ref(), &mut root_cache, index).await;
+                warn!(root = %root.display(), "Library root marker changed — watcher writes disabled until rescan");
+            }
+        }
+
         // Process removals.
         for path in &remove_paths {
             let path_str = path.to_string_lossy().to_string();
             debug!(path = %path_str, "File removed (debounced)");
-            match delete_track_if_root_stable(db.as_ref(), music_dirs, path).await {
+            match delete_track_if_root_stable(db.as_ref(), &mut root_cache, music_dirs, path).await
+            {
                 Ok(true) => {
                     let _ = tx.send(LibraryEvent::TrackRemoved(path_str)).await;
                 }
@@ -1210,13 +1825,15 @@ async fn watch_directories(
             }
         }
 
-        // Process upserts concurrently.
+        // Process upserts from the shared, batch-scoped root snapshot.
         if !upsert_paths.is_empty() {
             debug!(count = upsert_paths.len(), "Processing debounced upserts");
             let paths: Vec<PathBuf> = upsert_paths.into_iter().collect();
 
             for path in paths {
-                match root_identity_allows_content(db.as_ref(), music_dirs, &path).await {
+                match root_identity_allows_content(db.as_ref(), &mut root_cache, music_dirs, &path)
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => {
                         warn!(path = %path.display(), "Ignored change from an unconfirmed or changed library root");
@@ -1234,9 +1851,14 @@ async fn watch_directories(
                     // stale DB row instead of leaving an orphan that fails to
                     // play.
                     let path_str = path.to_string_lossy().to_string();
-                    if delete_track_if_root_stable(db.as_ref(), music_dirs, &path)
-                        .await
-                        .unwrap_or_else(|error| {
+                    if delete_track_if_root_stable(
+                        db.as_ref(),
+                        &mut root_cache,
+                        music_dirs,
+                        &path,
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
                             warn!(path = %path.display(), %error, "Failed to process missing watched path safely");
                             false
                         })
@@ -1251,9 +1873,14 @@ async fn watch_directories(
                         // Parsing can take long enough for a removable/network
                         // volume to disappear or be replaced. Revalidate the
                         // root immediately before touching persisted metadata.
-                        if !root_identity_allows_content(db.as_ref(), music_dirs, &path)
-                            .await
-                            .unwrap_or(false)
+                        if !root_identity_allows_content(
+                            db.as_ref(),
+                            &mut root_cache,
+                            music_dirs,
+                            &path,
+                        )
+                        .await
+                        .unwrap_or(false)
                         {
                             warn!(path = %path.display(), "Library root changed while parsing — upsert discarded");
                             continue;
@@ -1424,6 +2051,249 @@ mod tests {
     }
 
     #[test]
+    fn durable_root_marker_is_created_once_and_reused() {
+        let directory = TestDirectory::new("root-marker");
+        let legacy = filesystem_identity(directory.path()).expect("observe legacy identity");
+        assert!(is_legacy_identity(&legacy));
+
+        let created = create_root_marker(directory.path()).expect("create root marker");
+        assert!(created.created);
+        assert!(is_marker_identity(&created.identity));
+        let reused = create_root_marker(directory.path()).expect("reuse root marker");
+        assert!(!reused.created);
+        assert_eq!(reused.identity, created.identity);
+        assert_eq!(
+            filesystem_identity(directory.path()).expect("observe durable identity"),
+            created.identity
+        );
+    }
+
+    #[test]
+    fn malformed_root_marker_fails_closed() {
+        let directory = TestDirectory::new("invalid-root-marker");
+        std::fs::write(root_identity_path(directory.path()), "not-a-root-id\n")
+            .expect("write invalid marker");
+
+        assert!(filesystem_identity(directory.path()).is_err());
+        let scan = scan_root(directory.path().to_path_buf());
+        assert!(!scan.is_complete());
+        assert!(scan.device_id.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_root_marker_fails_closed_without_blocking() {
+        use rustix::fs::{mkfifoat, Mode, CWD};
+
+        let directory = TestDirectory::new("fifo-root-marker");
+        mkfifoat(
+            CWD,
+            root_identity_path(directory.path()),
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("create marker FIFO");
+
+        assert!(read_root_marker(directory.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_root_marker_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("symlink-root-marker");
+        let target = directory.path().join("marker-target");
+        std::fs::write(
+            &target,
+            format!("{ROOT_IDENTITY_PREFIX}{}\n", Uuid::new_v4()),
+        )
+        .expect("write marker target");
+        symlink(&target, root_identity_path(directory.path())).expect("symlink marker");
+
+        assert!(filesystem_identity(directory.path()).is_err());
+    }
+
+    #[test]
+    fn legacy_conversion_creates_marker_but_defers_deletion() {
+        let directory = TestDirectory::new("legacy-marker-conversion");
+        std::fs::write(directory.path().join("song.mp3"), []).expect("create audio fixture");
+        let mut scan = scan_root(directory.path().to_path_buf());
+        let previous = persisted_root_state(&scan, scan.device_id.clone());
+        assert!(scan.device_id.as_deref().is_some_and(is_legacy_identity));
+
+        assert!(matches!(
+            prepare_durable_root_identity(&mut scan, Some(&previous), 1, true),
+            RootIdentityPreparation::MarkerCreated {
+                legacy_conversion: true,
+                ..
+            }
+        ));
+        assert!(scan.device_id.as_deref().is_some_and(is_marker_identity));
+        assert!(!reconciliation_is_authoritative(&scan, Some(&previous)));
+    }
+
+    #[test]
+    fn new_root_enrollment_creates_durable_marker() {
+        let directory = TestDirectory::new("new-marker-enrollment");
+        std::fs::write(directory.path().join("song.mp3"), []).expect("create audio fixture");
+        let mut scan = scan_root(directory.path().to_path_buf());
+
+        assert!(matches!(
+            prepare_durable_root_identity(&mut scan, None, 0, true),
+            RootIdentityPreparation::MarkerCreated {
+                legacy_conversion: false,
+                ..
+            }
+        ));
+        assert!(scan.device_id.as_deref().is_some_and(is_marker_identity));
+        assert!(scan_confirms_identity(&scan, None, 0));
+    }
+
+    #[test]
+    fn discovered_nested_root_is_not_modified_or_auto_enrolled() {
+        let directory = TestDirectory::new("discovered-markerless-root");
+        std::fs::write(directory.path().join("song.mp3"), []).expect("create audio fixture");
+        let mut scan = scan_root(directory.path().to_path_buf());
+
+        assert_eq!(
+            prepare_durable_root_identity(&mut scan, None, 0, false),
+            RootIdentityPreparation::Unchanged
+        );
+        assert!(!root_identity_path(directory.path()).exists());
+        assert!(!scan_confirms_identity_for_scope(&scan, None, 0, false));
+    }
+
+    #[test]
+    fn mount_change_before_marker_creation_aborts_enrollment() {
+        let directory = TestDirectory::new("marker-mount-race");
+        std::fs::write(directory.path().join("song.mp3"), []).expect("create audio fixture");
+        let mut scan = scan_root(directory.path().to_path_buf());
+        scan.mount_generation = scan
+            .mount_generation
+            .map(|generation| generation.wrapping_add(1));
+
+        assert_eq!(
+            prepare_durable_root_identity(&mut scan, None, 0, true),
+            RootIdentityPreparation::Unchanged
+        );
+        assert!(!root_identity_path(directory.path()).exists());
+        assert!(!scan.is_complete());
+    }
+
+    #[test]
+    fn initial_scan_root_revalidation_disables_remaining_writes() {
+        let directory = TestDirectory::new("initial-scan-marker-race");
+        let audio_path = directory.path().join("song.mp3");
+        std::fs::write(&audio_path, []).expect("create audio fixture");
+        create_root_marker(directory.path()).expect("create durable root identity");
+        let mut scans = vec![scan_root(directory.path().to_path_buf())];
+        scans[0].content_authorized = true;
+
+        assert_eq!(
+            revalidate_scan_root_for_path(&audio_path, &mut scans),
+            (true, None)
+        );
+        std::fs::write(
+            root_identity_path(directory.path()),
+            format!("{ROOT_IDENTITY_PREFIX}{}\n", Uuid::new_v4()),
+        )
+        .expect("replace root identity");
+        assert_eq!(
+            revalidate_scan_root_for_path(&audio_path, &mut scans),
+            (false, Some(directory.path().to_path_buf()))
+        );
+        assert!(!scans[0].content_authorized);
+        assert!(!scans[0].reconciliation_authoritative);
+        assert_eq!(
+            revalidate_scan_root_for_path(&audio_path, &mut scans),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn duplicate_root_markers_make_every_copy_incomplete() {
+        let first = TestDirectory::new("duplicate-marker-first");
+        let second = TestDirectory::new("duplicate-marker-second");
+        let identity = create_root_marker(first.path())
+            .expect("create first marker")
+            .identity;
+        std::fs::write(root_identity_path(second.path()), format!("{identity}\n"))
+            .expect("copy marker");
+        let mut scans = vec![
+            scan_root(first.path().to_path_buf()),
+            scan_root(second.path().to_path_buf()),
+        ];
+
+        reject_duplicate_marker_identities(&mut scans);
+
+        assert!(scans.iter().all(|scan| !scan.is_complete()));
+    }
+
+    #[test]
+    fn watcher_root_cache_prefers_specific_roots_and_retains_invalidation() {
+        let parent = PathBuf::from("/music");
+        let child = parent.join("removable");
+        let state = |root: &Path| library_root::Model {
+            path: root.to_string_lossy().into_owned(),
+            device_id: Some(format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4())),
+            identity_confirmed: true,
+            is_available: true,
+            last_scan_complete: true,
+            last_checked_at: "2026-07-10T00:00:00Z".to_string(),
+        };
+        let mut cache = WatcherRootCache::from_models(
+            vec![state(&parent), state(&child), state(Path::new("/other"))],
+            std::slice::from_ref(&parent),
+        );
+
+        let (child_index, selected_root, selected_state) = cache
+            .root_for_path(&child.join("album/song.flac"))
+            .expect("select nested root");
+        assert_eq!(selected_root, child);
+        assert!(selected_state.is_available);
+        assert!(cache.invalidate(child_index).is_some());
+
+        let (_, selected_root, selected_state) = cache
+            .root_for_path(&child.join("album/other.flac"))
+            .expect("retain nested root");
+        assert_eq!(selected_root, child);
+        assert!(!selected_state.is_available);
+        assert!(!selected_state.last_scan_complete);
+        assert!(cache
+            .root_for_path(&parent.join("parent-song.flac"))
+            .is_some_and(|(_, root, state)| root == parent && state.is_available));
+        assert!(cache.root_for_path(Path::new("/other/song.flac")).is_none());
+    }
+
+    #[test]
+    fn marker_access_events_do_not_invalidate_root_identity() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
+        };
+        use notify::EventKind;
+
+        assert!(!marker_event_invalidates_root(EventKind::Access(
+            AccessKind::Open(AccessMode::Read)
+        )));
+        assert!(!marker_event_invalidates_root(EventKind::Access(
+            AccessKind::Read
+        )));
+        assert!(!marker_event_invalidates_root(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::AccessTime)
+        )));
+        assert!(marker_event_invalidates_root(EventKind::Create(
+            CreateKind::File
+        )));
+        assert!(marker_event_invalidates_root(EventKind::Modify(
+            ModifyKind::Data(DataChange::Content)
+        )));
+        assert!(marker_event_invalidates_root(EventKind::Remove(
+            RemoveKind::File
+        )));
+        assert!(marker_event_invalidates_root(EventKind::Any));
+    }
+
+    #[test]
     fn missing_root_is_incomplete_and_never_authoritative() {
         let directory = TestDirectory::new("missing");
         let missing = directory.path().join("not-mounted");
@@ -1442,6 +2312,7 @@ mod tests {
     #[test]
     fn healthy_empty_root_is_authoritative() {
         let directory = TestDirectory::new("empty");
+        create_root_marker(directory.path()).expect("create durable root identity");
         let mut scan = scan_root(directory.path().to_path_buf());
         let previous = persisted_root_state(&scan, scan.device_id.clone());
         scan.reconciliation_authoritative = reconciliation_is_authoritative(&scan, Some(&previous));
@@ -1587,6 +2458,7 @@ mod tests {
             audio_files: Vec::new(),
             errors: vec!["simulated permission error".to_string()],
             device_id: Some("simulated-device".to_string()),
+            mount_generation: Some(0),
             reconciliation_authoritative: false,
             content_authorized: false,
         };
@@ -1606,6 +2478,14 @@ mod tests {
         let directory = TestDirectory::new("permission-denied");
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o000))
             .expect("remove root permissions");
+
+        // Privileged containers can retain directory access despite mode 000.
+        // In that environment no permission-denied traversal can be exercised.
+        if std::fs::read_dir(directory.path()).is_ok() {
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("restore root permissions");
+            return;
+        }
 
         let scan = scan_root(directory.path().to_path_buf());
 
@@ -1631,6 +2511,14 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
             .expect("remove nested permissions");
 
+        // Root and capability-enabled CI containers can bypass Unix mode bits.
+        // Skip the assertion when this fixture cannot induce a read failure.
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+                .expect("restore nested permissions");
+            return;
+        }
+
         let scan = scan_root(directory.path().to_path_buf());
 
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
@@ -1653,6 +2541,7 @@ mod tests {
     #[test]
     fn matching_persisted_device_authorizes_an_empty_root() {
         let directory = TestDirectory::new("matching-device");
+        create_root_marker(directory.path()).expect("create durable root identity");
         let scan = scan_root(directory.path().to_path_buf());
         let previous = persisted_root_state(&scan, scan.device_id.clone());
 
@@ -1744,6 +2633,7 @@ mod tests {
             audio_files: Vec::new(),
             errors: Vec::new(),
             device_id: Some("underlying-mountpoint".to_string()),
+            mount_generation: Some(0),
             reconciliation_authoritative: false,
             content_authorized: false,
         };
@@ -1761,7 +2651,8 @@ mod tests {
             root: root.clone(),
             audio_files: vec![root.join("song.mp3")],
             errors: Vec::new(),
-            device_id: Some("real-volume".to_string()),
+            device_id: Some(format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4())),
+            mount_generation: Some(0),
             reconciliation_authoritative: false,
             content_authorized: false,
         };
@@ -1898,16 +2789,19 @@ mod tests {
     #[test]
     fn mount_generation_change_between_scans_keeps_stable_identity_authoritative() {
         let directory = TestDirectory::new("mount-generation-reboot");
+        let identity = format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4());
+        let first_identity = identity.clone();
         let first_scan = scan_root_with_probes_and_exclusions(
             directory.path().to_path_buf(),
-            |_| Ok("stable-volume".to_string()),
+            move |_| Ok(first_identity.clone()),
             |_| Ok(41),
             &[],
         );
         let previous = persisted_root_state(&first_scan, first_scan.device_id.clone());
+        let second_identity = identity;
         let second_scan = scan_root_with_probes_and_exclusions(
             directory.path().to_path_buf(),
-            |_| Ok("stable-volume".to_string()),
+            move |_| Ok(second_identity.clone()),
             |_| Ok(99),
             &[],
         );
@@ -1979,11 +2873,16 @@ mod tests {
         Migrator::up(&db, None).await.expect("run migrations");
 
         let directory = TestDirectory::new("watcher-identity-race");
+        create_root_marker(directory.path()).expect("create durable root identity");
         let scan = scan_root(directory.path().to_path_buf());
         let expected_identity = scan.device_id.clone().expect("root identity");
         persist_root_scan_status(&db, &scan, None, true)
             .await
             .expect("persist confirmed root");
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let mut root_cache = WatcherRootCache::load(&db, &music_dirs)
+            .await
+            .expect("load watcher root state");
 
         let removed_path = directory.path().join("removed.mp3");
         let model = track::Model {
@@ -2015,7 +2914,8 @@ mod tests {
         let stable_identity = expected_identity.clone();
         assert!(!delete_track_if_root_stable_with_probe(
             &db,
-            &[directory.path().to_path_buf()],
+            &mut root_cache,
+            &music_dirs,
             &removed_path,
             move |_| Ok(stable_identity.clone()),
         )
@@ -2032,7 +2932,8 @@ mod tests {
         let first_identity = expected_identity.clone();
         let removed = delete_track_if_root_stable_with_probe(
             &db,
-            &[directory.path().to_path_buf()],
+            &mut root_cache,
+            &music_dirs,
             &removed_path,
             move |_| {
                 let call = probe_calls.get();

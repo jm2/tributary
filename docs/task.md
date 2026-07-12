@@ -41,15 +41,20 @@ Acceptance criteria: upgrading a v0.5.0-style database always yields a unique co
 - [x] Skip stale deletion for any root whose traversal was incomplete.
 - [x] Correctly reconcile a healthy root containing zero audio files.
 - [x] Define and persist availability/mount identity for removable or network roots.
+- [x] Replace reboot/remount-sensitive legacy device identities with a versioned, root-owned
+  marker; create markers only on explicitly configured roots, convert only a still-matching
+  legacy root, and make the fresh marker-backed conversion scan non-destructive.
+- [x] Load persisted root authorization once per watcher batch, prefer the most-specific root,
+  and retain fail-closed invalidation for the rest of the batch.
 - [x] Add tests for missing, empty, permission-denied, partially unreadable, and overlapping
-  roots.
+  roots, plus marker corruption/duplication/conversion and watcher-cache invalidation.
 - [ ] Add an explicit trust/re-enrollment flow for roots inherited from a pre-identity database;
   content similarity is not accepted as proof of physical volume identity.
 - [ ] Pin reconciliation and watcher mutations to a root handle or equivalent mount generation
   on every supported platform; Linux has mount-instance guards, while portable Unix ABA
   resistance remains incomplete.
-- [ ] Record implementation: safety core is in the current worktree with 32 focused tests;
-  explicit legacy trust and portable root pinning remain open.
+- [x] Record implementation: safety core and review follow-ups are in PR #68 with 44 focused
+  tests; explicit legacy trust and portable root pinning remain open.
 
 Acceptance criteria: Tributary never deletes persisted track metadata based on an incomplete
 view of a library root, while intentional offline deletion is eventually reflected.
@@ -371,8 +376,14 @@ Record scope or design decisions here so deferred work is explicit.
   existing metadata are intentionally not made deletion-authoritative from content heuristics;
   explicit trust UX and portable root-handle pinning keep P0.2 open.
 - 2026-07-10 — Linux mount IDs are treated as ephemeral traversal generations, never durable
-  volume identity. Stable root identity is persisted separately so a normal reboot or remount
-  does not silently replace the intended root.
+  volume identity. Stable root identity is now a versioned marker stored on the library root,
+  so a normal reboot or remount does not silently replace the intended root. Duplicate,
+  malformed, oversized, symlink/reparse-point, and non-regular markers fail closed through a
+  bounded single-handle read; legacy conversion never indexes or deletes rows on its first
+  marker-backed scan.
+- 2026-07-11 — Watcher events share one deepest-root-first persisted authorization snapshot per
+  debounced batch. Root-marker control events and failed identity probes invalidate that
+  snapshot before database I/O, so later events in the batch remain fail closed.
 - 2026-07-10 — Output changes clear the active playback session; they do not attempt a
   best-effort transfer between unlike output implementations.
 - 2026-07-10 — Generation filtering prevents stale receiver events from mutating Tributary.
