@@ -129,7 +129,8 @@ pub fn setup_source_connect(state: &WindowState) {
                 return;
             }
 
-            *active_source_key.borrow_mut() = format!("playlist:{playlist_id}");
+            *active_source_key.borrow_mut() =
+                format!("{}{playlist_id}", super::playback::PLAYLIST_SOURCE_PREFIX);
 
             // Restore music column layout (not radio).
             apply_radio_columns(&column_view, false);

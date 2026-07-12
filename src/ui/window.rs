@@ -29,6 +29,7 @@ use super::persistence::{
 use super::playback::{
     advance_track, format_ms, play_or_start, play_track_at, previous_track, replay_current,
     stop_playback, toggle_or_start, BufferingTracker, PlaybackContext, PlaybackSession,
+    QueueTrackRefresh,
 };
 use super::preferences;
 use super::server_dialogs::{load_saved_servers, remove_saved_server, show_add_server_dialog};
@@ -787,6 +788,7 @@ pub fn build_window(
                 sidebar_sel_for_events,
                 scan_spinner,
                 pending_connection_for_events.clone(),
+                playback_session.clone(),
             );
             return;
         }
@@ -1620,6 +1622,7 @@ pub fn build_window(
         sidebar_sel_for_events,
         scan_spinner,
         pending_connection_for_events,
+        playback_session,
     );
 }
 
@@ -1650,6 +1653,29 @@ pub fn display_tracks(
     column_view.scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
 }
 
+/// Re-resolve queued library items from committed library state.
+///
+/// The playback queue is an immutable snapshot of identities, so it survives
+/// sorting, filtering, and navigation — but a filesystem rename changes where a
+/// track lives without changing which track it is. Only the library can say
+/// where it moved to, and only the queue knows it is still holding it.
+fn refresh_playback_queue(session: &Rc<RefCell<PlaybackSession>>, objects: &[TrackObject]) {
+    let mut session = session.borrow_mut();
+    if !session.has_queue() {
+        return;
+    }
+
+    let updates: HashMap<String, QueueTrackRefresh> =
+        objects.iter().map(QueueTrackRefresh::from_track).collect();
+    let refreshed = session.refresh_library_tracks(&updates);
+    if refreshed > 0 {
+        info!(
+            refreshed,
+            "Re-resolved playback queue items after library change"
+        );
+    }
+}
+
 /// Spawn the library event receiver loop on the GTK main thread.
 #[allow(clippy::too_many_arguments)]
 fn setup_library_events(
@@ -1666,6 +1692,7 @@ fn setup_library_events(
     sidebar_selection: gtk::SingleSelection,
     scan_spinner: gtk::Spinner,
     pending_connection: Rc<RefCell<Option<String>>>,
+    playback_session: Rc<RefCell<PlaybackSession>>,
 ) {
     let browser_widget = browser_widget.clone();
     let column_view = column_view.clone();
@@ -1710,6 +1737,12 @@ fn setup_library_events(
 
                     let objects: Vec<TrackObject> =
                         tracks.iter().map(arch_track_to_object).collect();
+
+                    // A bulk change — a renamed album, a reconciliation — can
+                    // move the files behind tracks the queue is holding. The
+                    // queue owns identities, not rows, so it re-resolves them
+                    // from the snapshot rather than being rebuilt from the view.
+                    refresh_playback_queue(&playback_session, &objects);
 
                     // Store per-source.
                     source_tracks
@@ -1792,6 +1825,11 @@ fn setup_library_events(
                 LibraryEvent::TrackUpserted(track) => {
                     let obj = arch_track_to_object(&track);
                     let uri = obj.uri();
+
+                    // A single-file rename keeps the track's identity and moves
+                    // its path, so a queue holding it must follow the track, not
+                    // the path it was captured at.
+                    refresh_playback_queue(&playback_session, std::slice::from_ref(&obj));
 
                     // Update source_tracks["local"].
                     {

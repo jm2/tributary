@@ -4788,6 +4788,7 @@ dependencies = [
  "rust_cast",
  "rustix 1.1.4",
  "rustls",
+ "same-file",
  "sea-orm",
  "sea-orm-migration",
  "serde",

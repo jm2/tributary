@@ -20,11 +20,57 @@ use crate::ui::objects::TrackObject;
 
 use super::album_art;
 
+/// The source key of the local library.
+pub const LOCAL_SOURCE_KEY: &str = "local";
+
+/// The source-key prefix of every playlist view. Playlists are projections of
+/// the local library, so their queue items carry library track IDs too.
+pub const PLAYLIST_SOURCE_PREFIX: &str = "playlist:";
+
+/// Whether a queue source is backed by the local library database, and its
+/// track IDs are therefore library track IDs.
+///
+/// Remote backends key tracks by their own native IDs, and external files and
+/// USB items fall back to their URI as an ID ([`TrackObject::track_id`]). A
+/// library update must never reinterpret one of those as one of its own.
+fn is_library_source(source_id: &str) -> bool {
+    source_id == LOCAL_SOURCE_KEY || source_id.starts_with(PLAYLIST_SOURCE_PREFIX)
+}
+
 /// Stable identity of a track inside the source that supplied its queue.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PlaybackIdentity {
     pub source_id: String,
     pub track_id: String,
+}
+
+/// A committed library change, addressed to the queue by stable track ID.
+///
+/// A rename moves a track's file without changing what it is, so the queue must
+/// re-resolve where to play it from while keeping the identity, position, and
+/// history it captured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueTrackRefresh {
+    pub uri: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub cover_art_url: String,
+}
+
+impl QueueTrackRefresh {
+    pub fn from_track(track: &TrackObject) -> (String, Self) {
+        (
+            track.track_id(),
+            Self {
+                uri: track.uri(),
+                title: track.title(),
+                artist: track.artist(),
+                album: track.album(),
+                cover_art_url: track.cover_art_url(),
+            },
+        )
+    }
 }
 
 /// Immutable metadata captured when a playback queue is created.
@@ -129,6 +175,65 @@ impl PlaybackSession {
         self.current_index = None;
         self.shuffle = None;
         self.event_generation = self.event_generation.next();
+    }
+
+    pub fn has_queue(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Re-resolve queued library items whose track the library just committed a
+    /// change to, and return how many items moved.
+    ///
+    /// A rename preserves a track's identity but not its path, so a queue that
+    /// captured the old URI would hand a dead path to the output the next time
+    /// it loaded that item — on Next, on Previous, and at end of stream, where
+    /// repeat-one replays the current item from the queue rather than the view.
+    /// The item playing right now is refreshed too. The current output is not
+    /// retargeted here, but a subsequent load or replay resolves the path where
+    /// the track now lives.
+    ///
+    /// Items are rewritten in place. Queue length, order, and the cursor are the
+    /// coordinate system that `current_index` and the shuffle history index
+    /// into, so identity — not position — is what an update may address.
+    pub(crate) fn refresh_library_tracks(
+        &mut self,
+        updates: &HashMap<String, QueueTrackRefresh>,
+    ) -> usize {
+        if updates.is_empty() {
+            return 0;
+        }
+
+        let mut refreshed = 0;
+        for item in &mut self.queue {
+            if !is_library_source(&item.identity.source_id) {
+                continue;
+            }
+            let Some(update) = updates.get(&item.identity.track_id) else {
+                continue;
+            };
+            // A track with no playable URI is unplayable (see `play_current`).
+            // Keep the captured reference rather than strand the queue item.
+            if update.uri.is_empty() {
+                continue;
+            }
+            if item.uri == update.uri
+                && item.title == update.title
+                && item.artist == update.artist
+                && item.album == update.album
+                && item.cover_art_url == update.cover_art_url
+            {
+                continue;
+            }
+
+            item.uri = update.uri.clone();
+            item.title = update.title.clone();
+            item.artist = update.artist.clone();
+            item.album = update.album.clone();
+            item.cover_art_url = update.cover_art_url.clone();
+            refreshed += 1;
+        }
+
+        refreshed
     }
 
     pub fn has_current(&self) -> bool {
@@ -688,6 +793,124 @@ mod tests {
             .iter()
             .map(|entry| entry.identity.track_id.clone())
             .collect()
+    }
+
+    fn renamed(uri: &str) -> QueueTrackRefresh {
+        QueueTrackRefresh {
+            uri: uri.to_string(),
+            title: "Title".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            cover_art_url: String::new(),
+        }
+    }
+
+    fn refresh(session: &mut PlaybackSession, track_id: &str, update: QueueTrackRefresh) -> usize {
+        session.refresh_library_tracks(&HashMap::from([(track_id.to_string(), update)]))
+    }
+
+    #[test]
+    fn a_renamed_track_is_re_resolved_in_place_for_next_and_eos() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![item("local", "a"), item("local", "b"), item("local", "c")],
+            0,
+        ));
+        // Enter shuffle so the cycle's index bookkeeping is live.
+        assert!(session.advance(RepeatMode::Off, true).is_some());
+        let cursor = session.current_index;
+        let shuffle = session.shuffle.clone().expect("shuffle state exists");
+
+        assert_eq!(
+            refresh(&mut session, "b", renamed("file:///music/renamed/b.flac")),
+            1
+        );
+
+        assert_eq!(session.queue[1].uri, "file:///music/renamed/b.flac");
+        assert_eq!(session.queue[0].uri, "https://media.invalid/a");
+        assert_eq!(
+            ids(&session),
+            ["a", "b", "c"],
+            "identity, order, and length are the coordinates the cursor indexes into"
+        );
+        assert_eq!(session.current_index, cursor);
+        assert_eq!(
+            session.shuffle.as_ref().map(|state| &state.remaining),
+            Some(&shuffle.remaining)
+        );
+    }
+
+    #[test]
+    fn a_refresh_reaches_the_item_playing_right_now() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item("local", "a"), item("local", "b")], 1));
+
+        assert_eq!(
+            refresh(&mut session, "b", renamed("file:///music/renamed/b.flac")),
+            1
+        );
+
+        // Repeat-one replays the current item from the queue, not from the view.
+        assert_eq!(
+            session.current().expect("current item").uri(),
+            "file:///music/renamed/b.flac"
+        );
+    }
+
+    #[test]
+    fn a_playlist_queue_follows_the_same_library_track() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![item("playlist:favourites", "a"), item("local", "a")],
+            0,
+        ));
+
+        assert_eq!(
+            refresh(&mut session, "a", renamed("file:///music/renamed/a.flac")),
+            2,
+            "a playlist is a projection of the library, so it holds library track IDs"
+        );
+    }
+
+    #[test]
+    fn a_library_refresh_never_reinterprets_another_source_s_track_id() {
+        let mut session = PlaybackSession::default();
+        let external = QueueItem::external(
+            "file:///downloads/a.flac".to_string(),
+            "External".to_string(),
+            "Artist".to_string(),
+            "Album".to_string(),
+        );
+        assert!(session.replace_queue(
+            vec![
+                external,
+                item("https://subsonic.invalid", "a"),
+                item("local", "a")
+            ],
+            0,
+        ));
+
+        // "a" is a library UUID here, but a remote backend's native ID — and an
+        // external file's URI — are namespaced by their own source.
+        assert_eq!(
+            refresh(&mut session, "a", renamed("file:///music/renamed/a.flac")),
+            1
+        );
+        assert_eq!(session.queue[0].uri, "file:///downloads/a.flac");
+        assert_eq!(session.queue[1].uri, "https://media.invalid/a");
+        assert_eq!(session.queue[2].uri, "file:///music/renamed/a.flac");
+    }
+
+    #[test]
+    fn an_unplayable_update_never_strands_a_queued_track() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item("local", "a")], 0));
+
+        assert_eq!(refresh(&mut session, "a", renamed("")), 0);
+        assert_eq!(
+            session.queue[0].uri, "https://media.invalid/a",
+            "a track with no playable URI keeps the reference the queue captured"
+        );
     }
 
     #[test]
