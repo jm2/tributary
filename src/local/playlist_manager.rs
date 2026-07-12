@@ -375,19 +375,32 @@ impl PlaylistManager {
                 continue;
             };
 
-            // If duration was recorded, require a candidate within ±2s
-            // (preserving the previous matching semantics); otherwise take
-            // the first fingerprint match.
-            let best = if let Some(dur) = orphan.match_duration_secs {
-                candidates
-                    .iter()
-                    .find(|t| {
-                        t.duration_secs
-                            .is_some_and(|d| (d - i64::from(dur)).abs() <= 2)
+            // Never choose arbitrarily among duplicate fingerprint matches.
+            // Duration narrows the eligible set when available; the orphan is
+            // left unresolved unless exactly one candidate remains.
+            let best = {
+                let expected_duration = orphan.match_duration_secs;
+                let mut eligible = candidates.iter().copied().filter(|candidate| {
+                    expected_duration.is_none_or(|duration| {
+                        candidate
+                            .duration_secs
+                            .is_some_and(|value| (value - i64::from(duration)).abs() <= 2)
                     })
-                    .copied()
-            } else {
-                candidates.first().copied()
+                });
+                match (eligible.next(), eligible.next()) {
+                    (Some(candidate), None) => Some(candidate),
+                    (Some(_), Some(_)) => {
+                        warn!(
+                            entry = %orphan.id,
+                            title = %orphan.match_title,
+                            artist = %orphan.match_artist,
+                            album = %orphan.match_album,
+                            "Playlist entry has multiple eligible track matches; leaving it orphaned"
+                        );
+                        None
+                    }
+                    _ => None,
+                }
             };
 
             if let Some(best) = best {
@@ -508,7 +521,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     use super::PlaylistManager;
-    use crate::db::entities::playlist_entry;
+    use crate::db::entities::{playlist_entry, track};
     use crate::db::migration::Migrator;
 
     /// Open a fresh in-memory SQLite database with all migrations applied.
@@ -537,6 +550,51 @@ mod tests {
         .insert(db)
         .await
         .expect("insert entry");
+    }
+
+    async fn insert_track(
+        db: &DatabaseConnection,
+        id: &str,
+        file_path: &str,
+        title: &str,
+        artist: &str,
+        album: &str,
+        duration_secs: Option<i64>,
+    ) -> track::Model {
+        let model = track::Model {
+            id: id.to_string(),
+            file_path: file_path.to_string(),
+            title: title.to_string(),
+            artist_name: artist.to_string(),
+            album_artist_name: None,
+            album_title: album.to_string(),
+            genre: None,
+            year: None,
+            track_number: None,
+            disc_number: None,
+            duration_secs,
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            format: None,
+            play_count: 0,
+            date_added: "2026-07-12T00:00:00Z".to_string(),
+            date_modified: "2026-07-12T00:00:00Z".to_string(),
+            file_size_bytes: None,
+        };
+        let active: track::ActiveModel = model.into();
+        active.insert(db).await.expect("insert track")
+    }
+
+    async fn playlist_entries(
+        db: &DatabaseConnection,
+        playlist_id: &str,
+    ) -> Vec<playlist_entry::Model> {
+        playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
+            .order_by_asc(playlist_entry::Column::Position)
+            .all(db)
+            .await
+            .expect("load playlist entries")
     }
 
     #[tokio::test]
@@ -584,5 +642,280 @@ mod tests {
         // ...and the entries must follow the requested order.
         let ordered_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
         assert_eq!(ordered_ids, new_order);
+    }
+
+    #[tokio::test]
+    async fn rename_fallback_relinks_without_changing_playlist_entry_identity() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Rename fallback", false)
+            .await
+            .expect("create playlist");
+        let original = insert_track(
+            &db,
+            "track-before-rename",
+            "/music/before.flac",
+            "Example Song",
+            "Example Artist",
+            "Example Album",
+            Some(240),
+        )
+        .await;
+        manager
+            .add_track(&playlist.id, &original)
+            .await
+            .expect("add original track to playlist");
+        let before = playlist_entries(&db, &playlist.id)
+            .await
+            .pop()
+            .expect("playlist entry before rename");
+
+        // The current watcher fallback for an unpaired rename is delete plus
+        // insert. The FK preserves the playlist entry by nulling its link.
+        track::Entity::delete_by_id(&original.id)
+            .exec(&db)
+            .await
+            .expect("delete old track path");
+        let orphan = playlist_entries(&db, &playlist.id)
+            .await
+            .pop()
+            .expect("orphaned playlist entry");
+        assert_eq!(orphan.track_id, None);
+
+        let replacement = insert_track(
+            &db,
+            "track-after-rename",
+            "/music/after.flac",
+            "Example Song",
+            "Example Artist",
+            "Example Album",
+            Some(240),
+        )
+        .await;
+        assert_eq!(manager.reconcile_all().await.expect("reconcile rename"), 1);
+
+        let after = playlist_entries(&db, &playlist.id)
+            .await
+            .pop()
+            .expect("relinked playlist entry");
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.playlist_id, before.playlist_id);
+        assert_eq!(after.position, before.position);
+        assert_eq!(after.match_title, before.match_title);
+        assert_eq!(after.match_artist, before.match_artist);
+        assert_eq!(after.match_album, before.match_album);
+        assert_eq!(after.match_duration_secs, before.match_duration_secs);
+        assert_eq!(after.track_id.as_deref(), Some(replacement.id.as_str()));
+        assert_eq!(
+            manager
+                .reconcile_all()
+                .await
+                .expect("repeat reconciliation"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn full_rebuild_relinks_all_unique_tracks_and_preserves_order() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Full rebuild", false)
+            .await
+            .expect("create playlist");
+        let first = insert_track(
+            &db,
+            "track-one-old",
+            "/music/one-old.flac",
+            "Song One",
+            "Artist",
+            "Album",
+            Some(180),
+        )
+        .await;
+        let second = insert_track(
+            &db,
+            "track-two-old",
+            "/music/two-old.flac",
+            "Song Two",
+            "Artist",
+            "Album",
+            Some(200),
+        )
+        .await;
+        manager
+            .add_track(&playlist.id, &first)
+            .await
+            .expect("add first track");
+        manager
+            .add_track(&playlist.id, &second)
+            .await
+            .expect("add second track");
+        let before = playlist_entries(&db, &playlist.id).await;
+
+        track::Entity::delete_many()
+            .exec(&db)
+            .await
+            .expect("clear library for rebuild");
+        assert!(playlist_entries(&db, &playlist.id)
+            .await
+            .iter()
+            .all(|entry| entry.track_id.is_none()));
+
+        // Insert in reverse order to ensure matching is fingerprint-based,
+        // not dependent on table or scan order.
+        let second_new = insert_track(
+            &db,
+            "track-two-new",
+            "/music/two-new.flac",
+            "Song Two",
+            "Artist",
+            "Album",
+            Some(200),
+        )
+        .await;
+        let first_new = insert_track(
+            &db,
+            "track-one-new",
+            "/music/one-new.flac",
+            "Song One",
+            "Artist",
+            "Album",
+            Some(180),
+        )
+        .await;
+
+        assert_eq!(manager.reconcile_all().await.expect("reconcile rebuild"), 2);
+        let after = playlist_entries(&db, &playlist.id).await;
+        assert_eq!(
+            after.iter().map(|entry| &entry.id).collect::<Vec<_>>(),
+            before.iter().map(|entry| &entry.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            after.iter().map(|entry| entry.position).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(after[0].track_id.as_deref(), Some(first_new.id.as_str()));
+        assert_eq!(after[1].track_id.as_deref(), Some(second_new.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_leaves_ambiguous_fingerprint_matches_orphaned() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Ambiguous", false)
+            .await
+            .expect("create playlist");
+        let original = insert_track(
+            &db,
+            "ambiguous-old",
+            "/music/ambiguous-old.flac",
+            "Duplicate",
+            "Artist",
+            "Album",
+            Some(210),
+        )
+        .await;
+        manager
+            .add_track(&playlist.id, &original)
+            .await
+            .expect("add original track");
+        track::Entity::delete_by_id(&original.id)
+            .exec(&db)
+            .await
+            .expect("delete original track");
+        insert_track(
+            &db,
+            "ambiguous-a",
+            "/music/ambiguous-a.flac",
+            "Duplicate",
+            "Artist",
+            "Album",
+            Some(209),
+        )
+        .await;
+        insert_track(
+            &db,
+            "ambiguous-b",
+            "/music/ambiguous-b.flac",
+            "Duplicate",
+            "Artist",
+            "Album",
+            Some(211),
+        )
+        .await;
+
+        assert_eq!(
+            manager
+                .reconcile_all()
+                .await
+                .expect("reconcile ambiguous entry"),
+            0
+        );
+        assert_eq!(playlist_entries(&db, &playlist.id).await[0].track_id, None);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_uses_duration_to_select_the_only_eligible_match() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Duration", false)
+            .await
+            .expect("create playlist");
+        let original = insert_track(
+            &db,
+            "duration-old",
+            "/music/duration-old.flac",
+            "Same Fingerprint",
+            "Artist",
+            "Album",
+            Some(240),
+        )
+        .await;
+        manager
+            .add_track(&playlist.id, &original)
+            .await
+            .expect("add original track");
+        track::Entity::delete_by_id(&original.id)
+            .exec(&db)
+            .await
+            .expect("delete original track");
+        let expected = insert_track(
+            &db,
+            "duration-near",
+            "/music/duration-near.flac",
+            "Same Fingerprint",
+            "Artist",
+            "Album",
+            Some(242),
+        )
+        .await;
+        insert_track(
+            &db,
+            "duration-far",
+            "/music/duration-far.flac",
+            "Same Fingerprint",
+            "Artist",
+            "Album",
+            Some(260),
+        )
+        .await;
+
+        assert_eq!(
+            manager
+                .reconcile_all()
+                .await
+                .expect("reconcile by duration"),
+            1
+        );
+        assert_eq!(
+            playlist_entries(&db, &playlist.id).await[0]
+                .track_id
+                .as_deref(),
+            Some(expected.id.as_str())
+        );
     }
 }

@@ -1643,6 +1643,19 @@ fn marker_event_invalidates_root(kind: notify::EventKind) -> bool {
     )
 }
 
+async fn reconcile_playlists_after_watcher_batch(
+    db: &DatabaseConnection,
+    upsert_committed: bool,
+) -> Result<u32, sea_orm::DbErr> {
+    if !upsert_committed {
+        return Ok(0);
+    }
+
+    super::playlist_manager::PlaylistManager::new(db.clone())
+        .reconcile_all()
+        .await
+}
+
 async fn watch_directories(
     db: &Arc<DatabaseConnection>,
     music_dirs: &[PathBuf],
@@ -1826,6 +1839,7 @@ async fn watch_directories(
         }
 
         // Process upserts from the shared, batch-scoped root snapshot.
+        let mut upsert_committed = false;
         if !upsert_paths.is_empty() {
             debug!(count = upsert_paths.len(), "Processing debounced upserts");
             let paths: Vec<PathBuf> = upsert_paths.into_iter().collect();
@@ -1895,6 +1909,7 @@ async fn watch_directories(
 
                         match upsert_track(db.as_ref(), &parsed, existing.as_ref()).await {
                             Ok(model) => {
+                                upsert_committed = true;
                                 let t = db_model_to_track(&model);
                                 let _ = tx.send(LibraryEvent::TrackUpserted(Box::new(t))).await;
                             }
@@ -1910,6 +1925,20 @@ async fn watch_directories(
                         warn!(error = %e, "spawn_blocking failed");
                     }
                 }
+            }
+        }
+
+        // Deletions null playlist links through the database foreign key.
+        // Reconcile once after all successful upserts in this debounced batch
+        // so a replacement file can restore those links immediately. A
+        // reconciliation error is retryable and must not terminate watching.
+        match reconcile_playlists_after_watcher_batch(db.as_ref(), upsert_committed).await {
+            Ok(relinked) if relinked > 0 => {
+                info!(relinked, "Playlist entries reconciled after watcher batch");
+            }
+            Ok(_) => debug!("No orphaned playlist entries matched watcher upserts"),
+            Err(error) => {
+                warn!(%error, "Failed to reconcile playlists after watcher batch");
             }
         }
     }
@@ -2048,6 +2077,78 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[tokio::test]
+    async fn watcher_batch_reconciles_only_after_a_committed_upsert() {
+        use sea_orm::{ConnectionTrait, Database};
+        use sea_orm_migration::MigratorTrait;
+
+        use crate::db::entities::playlist_entry;
+        use crate::db::migration::Migrator;
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("open in-memory database");
+        Migrator::up(&db, None).await.expect("run migrations");
+        db.execute_unprepared(
+            "INSERT INTO playlists (id, name, created_at, updated_at)
+             VALUES ('watcher-playlist', 'Watcher',
+                     '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z')",
+        )
+        .await
+        .expect("insert playlist");
+        db.execute_unprepared(
+            "INSERT INTO tracks (
+                 id, file_path, title, artist_name, album_title,
+                 duration_secs, date_added, date_modified
+             )
+             VALUES (
+                 'watcher-track', '/music/watcher.flac', 'Watcher Song',
+                 'Watcher Artist', 'Watcher Album', 180,
+                 '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z'
+             )",
+        )
+        .await
+        .expect("insert watcher track");
+        db.execute_unprepared(
+            "INSERT INTO playlist_entries (
+                 id, playlist_id, position, track_id,
+                 match_title, match_artist, match_album, match_duration_secs
+             )
+             VALUES (
+                 'watcher-entry', 'watcher-playlist', 0, NULL,
+                 'watcher song', 'watcher artist', 'watcher album', 180
+             )",
+        )
+        .await
+        .expect("insert orphaned playlist entry");
+
+        assert_eq!(
+            reconcile_playlists_after_watcher_batch(&db, false)
+                .await
+                .expect("skip watcher reconciliation"),
+            0
+        );
+        let still_orphaned = playlist_entry::Entity::find_by_id("watcher-entry")
+            .one(&db)
+            .await
+            .expect("query skipped reconciliation")
+            .expect("playlist entry remains");
+        assert_eq!(still_orphaned.track_id, None);
+
+        assert_eq!(
+            reconcile_playlists_after_watcher_batch(&db, true)
+                .await
+                .expect("run watcher reconciliation"),
+            1
+        );
+        let relinked = playlist_entry::Entity::find_by_id("watcher-entry")
+            .one(&db)
+            .await
+            .expect("query watcher reconciliation")
+            .expect("playlist entry remains");
+        assert_eq!(relinked.track_id.as_deref(), Some("watcher-track"));
     }
 
     #[test]

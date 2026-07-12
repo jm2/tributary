@@ -7,6 +7,7 @@ mod m20250102_000002_create_playlists;
 mod m20250103_000003_add_album_artist;
 mod m20250104_000004_unique_entry_position;
 mod m20250710_000005_create_library_roots;
+mod m20260712_000006_playlist_track_fk;
 
 pub struct Migrator;
 
@@ -19,6 +20,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20250103_000003_add_album_artist::Migration),
             Box::new(m20250104_000004_unique_entry_position::Migration),
             Box::new(m20250710_000005_create_library_roots::Migration),
+            Box::new(m20260712_000006_playlist_track_fk::Migration),
         ]
     }
 }

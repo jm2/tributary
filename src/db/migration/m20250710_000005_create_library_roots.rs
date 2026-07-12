@@ -82,7 +82,9 @@ mod tests {
         let db = Database::connect("sqlite::memory:")
             .await
             .expect("open in-memory database");
-        Migrator::up(&db, None).await.expect("apply all migrations");
+        Migrator::up(&db, Some(5))
+            .await
+            .expect("apply through the library-roots migration");
         db
     }
 
