@@ -168,8 +168,9 @@ explicitly justified and time-bounded.
   indexed descendant in one transaction after a complete scoped traversal.
 - [x] Refresh already-captured local/playlist queue items by stable track ID after an
   ID-preserving committed rename, so Next/EOS uses the new URI.
-- [x] Record implementation: stacked P1.2 commits; 23 additional focused directory-rename,
-  batch-deferral, no-follow, scoped-scan, and queue-refresh tests, for 31 focused P1.2 tests total.
+- [x] Record implementation: stacked P1.2 commits; 24 additional focused directory-rename,
+  batch-deferral, no-follow, scoped-scan, playlist-projection, and queue-refresh tests, for 32
+  focused P1.2 tests total.
 
 ### P1.3 Close the scan/watcher handoff gap
 
@@ -229,8 +230,9 @@ explicitly justified and time-bounded.
 ### P1.9 Prevent stale async source rendering
 
 - [ ] Attach a source key/generation to playlist, radio, and remote loads.
-- [ ] Refresh an active playlist model after watcher reconciliation or an ID-preserving local
-  rename.
+- [x] Refresh already-open playlist URIs after an ID-preserving local rename and overlay committed
+  URIs onto an in-flight result before publication.
+- [ ] Reload an active playlist after watcher reconciliation remints or relinks track IDs.
 - [ ] Reject an in-flight playlist result when its source generation is stale, including when it
   would render pre-rename rows after the refreshed model or replace a newer source selection.
 - [ ] Cache completed results even when no longer active.
@@ -447,8 +449,9 @@ Record scope or design decisions here so deferred work is explicit.
   reparse points, unexpected path types, and metadata errors force authoritative reconciliation.
 - 2026-07-12 — A committed bulk rename publishes one library snapshot rather than a per-row
   event storm, and an already-captured playback queue re-resolves its items from it by stable
-  track ID, in place. An in-flight playlist load can still render a pre-rename model after that
-  event; source generations and active-model refresh remain P1.9. A rename that falls back to
+  track ID, in place. Already-open playlist rows are retargeted by the same stable ID, and an
+  in-flight playlist result overlays committed local URIs before it can render. Same-key request
+  generations and post-reconciliation reloads remain P1.9. A rename that falls back to
   reconciliation still mints new track IDs, so the ID-based refresh cannot repair a queue captured
   before it; recovery requires rebuilding it from a refreshed source model. Stable-ID resolution
   at playback, navigation, and receiver-load time remains P3.1 rather than changing queue semantics
@@ -467,4 +470,4 @@ Add one line per completed task:
 | 2026-07-10 | P0.6 | PR #68 | Immutable release inputs and publication-only repository credentials. |
 | 2026-07-10 | P0.8 | PR #68 | Patched dependency graph and time-bounded informational advisory dispositions. |
 | 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
-| 2026-07-12 | P1.2 | `93d03bf`, `b961b7c` | Identity preserved across authoritative paired file and directory renames; already-captured local/playlist queue snapshots re-resolve ID-preserving committed changes by stable track ID. |
+| 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |
