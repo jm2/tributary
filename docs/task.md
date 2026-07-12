@@ -164,12 +164,12 @@ explicitly justified and time-bounded.
 - [x] Disable watcher symlink following so incremental indexing matches authoritative scans.
 - [x] Cover cross-platform event shapes, destination replacement, guard rejection, SQL rollback,
   and playlist-FK preservation with eight focused tests.
-- [ ] Preserve descendant IDs for paired directory renames with a complete scoped path mapping;
-  the current full-scan fallback converges safely but replaces those track IDs.
-- [ ] Refresh queued local/playlist items by stable track ID so Next/EOS cannot retain the old
-  URI after a committed rename.
-- [ ] Record implementation: stacked P1.2 commit; paired-file core complete,
-  directory identity and playback-queue refresh remain.
+- [x] Preserve descendant IDs for paired directory renames by retargeting every safely mapped
+  indexed descendant in one transaction after a complete scoped traversal.
+- [x] Refresh already-captured local/playlist queue items by stable track ID after an
+  ID-preserving committed rename, so Next/EOS uses the new URI.
+- [x] Record implementation: stacked P1.2 commits; 23 additional focused directory-rename,
+  batch-deferral, no-follow, scoped-scan, and queue-refresh tests, for 31 focused P1.2 tests total.
 
 ### P1.3 Close the scan/watcher handoff gap
 
@@ -229,8 +229,10 @@ explicitly justified and time-bounded.
 ### P1.9 Prevent stale async source rendering
 
 - [ ] Attach a source key/generation to playlist, radio, and remote loads.
-- [ ] Refresh an active playlist after watcher reconciliation without allowing a stale load to
-  replace a newer source selection.
+- [ ] Refresh an active playlist model after watcher reconciliation or an ID-preserving local
+  rename.
+- [ ] Reject an in-flight playlist result when its source generation is stale, including when it
+  would render pre-rename rows after the refreshed model or replace a newer source selection.
 - [ ] Cache completed results even when no longer active.
 - [ ] Render only if the requested source remains selected.
 - [ ] Reuse the active-key guard pattern already present in USB loading.
@@ -318,6 +320,8 @@ explicitly justified and time-bounded.
 - [ ] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source.
 - [ ] Remove long-lived authenticated URLs from the generic `Track` model.
 - [ ] Resolve playable URLs/tickets at playback time.
+- [ ] Resolve local/playlist media by stable track ID at playback, navigation, and receiver-load
+  time so fallback reconciliation and in-flight casts cannot retain dead file paths.
 - [ ] Centralize source refresh, cancellation, disconnect, and failure state.
 - [ ] Decide how local, radio, and external-file sources fit the same lifecycle.
 - [ ] Record architecture decision: _pending_
@@ -413,9 +417,42 @@ Record scope or design decisions here so deferred work is explicit.
   refreshing an already-open playlist after background reconciliation remains P1.9.
 - 2026-07-12 — P1.2 preserves identity only for authoritative same-root, same-format pairs:
   tracked Linux events and strictly adjacent Windows rename halves. Unpairable macOS/BSD events,
-  directory changes, cross-root moves, and format changes use a full hardened scan and never
-  infer identity from tags. Paired-directory descendant IDs and immutable playback-queue URI
-  refresh remain explicit P1.2 follow-ups.
+  cross-root moves, and format changes use a full hardened scan and never infer identity from
+  tags.
+- 2026-07-12 — A paired directory rename now moves every safely mapped indexed descendant in one
+  transaction. Each descendant is moved only when a completed scoped traversal of the destination
+  observed a real file at its mirrored path. This is a path-based observation, not an inferred
+  metadata match; live filesystem handles retained by the traversal are revalidated before the
+  database transaction commits. A descendant with no such file is left in place for reconciliation
+  rather than followed to a path that may not exist, and destination files no row claims are
+  upserted normally, so an album gaining a file while the app was closed does not defeat identity
+  preservation. Paths are matched component-wise in the database's existing lossy namespace, so
+  already-persisted non-UTF-8 paths remain matchable subject to that namespace's collision limits,
+  and `/music/Album` cannot capture `/music/Album2`. Pairs nested inside a renamed directory, and
+  subtrees owning another persisted root or mount, remain fail-closed: the watcher cannot order
+  them, so they reconcile.
+- 2026-07-12 — Directory-rename halves are deferred, not reconciled on sight. A vanished
+  directory and a deleted cover image are indistinguishable when the path is already gone, so
+  the batch decides only once every event in the debounce window has arrived; anything no
+  authoritative pair claimed still forces the guarded rescan.
+- 2026-07-12 — Directory scans retain cross-platform filesystem-object handles for the
+  destination and every mapped audio file, then reopen and compare them in the transaction's
+  final guard. A removal, replacement, symlink/reparse point, or directory swap therefore rolls
+  the identity update back. Files with their own event in the same watcher batch are excluded from
+  identity mapping and take the normal parse/reconciliation path. The same object comparison also
+  authorizes case-only directory renames on case-insensitive filesystems without accepting a
+  copied or recreated source.
+- 2026-07-12 — Watcher upserts classify paths with no-follow metadata before parsing and again
+  before persistence. Missing audio paths retain the guarded-delete behavior; symlinks, Windows
+  reparse points, unexpected path types, and metadata errors force authoritative reconciliation.
+- 2026-07-12 — A committed bulk rename publishes one library snapshot rather than a per-row
+  event storm, and an already-captured playback queue re-resolves its items from it by stable
+  track ID, in place. An in-flight playlist load can still render a pre-rename model after that
+  event; source generations and active-model refresh remain P1.9. A rename that falls back to
+  reconciliation still mints new track IDs, so the ID-based refresh cannot repair a queue captured
+  before it; recovery requires rebuilding it from a refreshed source model. Stable-ID resolution
+  at playback, navigation, and receiver-load time remains P3.1 rather than changing queue semantics
+  here.
 
 ## Completed work log
 
@@ -430,3 +467,4 @@ Add one line per completed task:
 | 2026-07-10 | P0.6 | PR #68 | Immutable release inputs and publication-only repository credentials. |
 | 2026-07-10 | P0.8 | PR #68 | Patched dependency graph and time-bounded informational advisory dispositions. |
 | 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
+| 2026-07-12 | P1.2 | `93d03bf`, `b961b7c` | Identity preserved across authoritative paired file and directory renames; already-captured local/playlist queue snapshots re-resolve ID-preserving committed changes by stable track ID. |
