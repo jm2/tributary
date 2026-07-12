@@ -3874,33 +3874,67 @@ mod tests {
 
     // ── Paired directory renames ────────────────────────────────────────
 
+    /// Build an absolute fixture path with the target platform's separator.
+    /// Production rows come from `Path::to_string_lossy`; keeping synthetic DB
+    /// paths in the same namespace prevents Windows-only slash mismatches.
+    fn directory_fixture_path(path: &str) -> PathBuf {
+        path.split('/')
+            .filter(|component| !component.is_empty())
+            .fold(
+                PathBuf::from(std::path::MAIN_SEPARATOR.to_string()),
+                |mut result, component| {
+                    result.push(component);
+                    result
+                },
+            )
+    }
+
+    fn directory_fixture_key(path: &str) -> String {
+        directory_fixture_path(path).to_string_lossy().into_owned()
+    }
+
+    async fn insert_directory_rename_test_track(
+        db: &DatabaseConnection,
+        id: &str,
+        path: &str,
+        title: &str,
+        play_count: i32,
+    ) -> track::Model {
+        insert_rename_test_track(db, id, &directory_fixture_key(path), title, play_count).await
+    }
+
     fn destination_files(paths: &[&str]) -> HashSet<String> {
-        paths.iter().map(|path| (*path).to_string()).collect()
+        paths
+            .iter()
+            .map(|path| directory_fixture_key(path))
+            .collect()
     }
 
     #[test]
     fn directory_identity_mapping_excludes_dirty_destination_descendants() {
+        let source = directory_fixture_path("/music/Album");
+        let destination = directory_fixture_path("/music/Renamed");
         let audio_files = vec![
-            PathBuf::from("/music/Renamed/clean.flac"),
-            PathBuf::from("/music/Renamed/modified.flac"),
-            PathBuf::from("/music/Renamed/removed.flac"),
-            PathBuf::from("/music/Renamed/Disc 2/changed.flac"),
+            directory_fixture_path("/music/Renamed/clean.flac"),
+            directory_fixture_path("/music/Renamed/modified.flac"),
+            directory_fixture_path("/music/Renamed/removed.flac"),
+            directory_fixture_path("/music/Renamed/Disc 2/changed.flac"),
         ];
         let upserts = HashSet::from([
             // The old spelling is common when a child event was delivered
             // immediately before the parent rename pair.
-            PathBuf::from("/music/Album/modified.flac"),
-            PathBuf::from("/music/Other/unrelated.flac"),
+            directory_fixture_path("/music/Album/modified.flac"),
+            directory_fixture_path("/music/Other/unrelated.flac"),
         ]);
-        let removals = HashSet::from([PathBuf::from("/music/Renamed/removed.flac")]);
-        let deferred = HashSet::from([PathBuf::from("/music/Renamed/Disc 2")]);
+        let removals = HashSet::from([directory_fixture_path("/music/Renamed/removed.flac")]);
+        let deferred = HashSet::from([directory_fixture_path("/music/Renamed/Disc 2")]);
         let dirty_directories = HashSet::new();
 
         assert_eq!(
             directory_identity_destinations(
                 &audio_files,
-                Path::new("/music/Album"),
-                Path::new("/music/Renamed"),
+                &source,
+                &destination,
                 &upserts,
                 &removals,
                 &deferred,
@@ -3913,8 +3947,8 @@ mod tests {
 
     #[test]
     fn directory_identity_mapping_rejects_an_exact_destination_folder_replacement() {
-        let source = PathBuf::from("/music/Album");
-        let destination = PathBuf::from("/music/Renamed");
+        let source = directory_fixture_path("/music/Album");
+        let destination = directory_fixture_path("/music/Renamed");
         let mut batch = WatcherBatch::default();
         batch.record_rename_pair(source.clone(), destination.clone());
         batch.collect(
@@ -4122,11 +4156,20 @@ mod tests {
             .expect("create playlist");
 
         let first =
-            insert_rename_test_track(&db, "track-one", "/music/Album/01.flac", "One", 11).await;
-        insert_rename_test_track(&db, "track-two", "/music/Album/Disc 2/02.flac", "Two", 4).await;
+            insert_directory_rename_test_track(&db, "track-one", "/music/Album/01.flac", "One", 11)
+                .await;
+        insert_directory_rename_test_track(
+            &db,
+            "track-two",
+            "/music/Album/Disc 2/02.flac",
+            "Two",
+            4,
+        )
+        .await;
         // A sibling whose path shares a textual prefix with the renamed
         // directory must not be dragged along with it.
-        insert_rename_test_track(&db, "track-other", "/music/Album2/03.flac", "Three", 2).await;
+        insert_directory_rename_test_track(&db, "track-other", "/music/Album2/03.flac", "Three", 2)
+            .await;
 
         manager
             .add_track(&playlist.id, &first)
@@ -4139,10 +4182,13 @@ mod tests {
             .expect("load playlist entry")
             .expect("playlist entry exists");
 
+        let source_directory = directory_fixture_path("/music/Album");
+        let destination_directory = directory_fixture_path("/music/Renamed");
+
         let outcome = rename_directory_rows(
             &db,
-            Path::new("/music/Album"),
-            Path::new("/music/Renamed"),
+            &source_directory,
+            &destination_directory,
             &destination_files(&["/music/Renamed/01.flac", "/music/Renamed/Disc 2/02.flac"]),
             || true,
         )
@@ -4166,7 +4212,10 @@ mod tests {
             .await
             .expect("load renamed track")
             .expect("renamed track exists");
-        assert_eq!(renamed.file_path, "/music/Renamed/01.flac");
+        assert_eq!(
+            renamed.file_path,
+            directory_fixture_key("/music/Renamed/01.flac")
+        );
         assert_eq!(renamed.play_count, 11, "history survives the move");
         assert_eq!(renamed.date_added, "2025-01-02T03:04:05Z");
         assert_eq!(
@@ -4179,7 +4228,10 @@ mod tests {
             .await
             .expect("load nested track")
             .expect("nested track exists");
-        assert_eq!(nested.file_path, "/music/Renamed/Disc 2/02.flac");
+        assert_eq!(
+            nested.file_path,
+            directory_fixture_key("/music/Renamed/Disc 2/02.flac")
+        );
 
         let sibling = track::Entity::find_by_id("track-other")
             .one(&db)
@@ -4187,7 +4239,8 @@ mod tests {
             .expect("load sibling track")
             .expect("sibling track exists");
         assert_eq!(
-            sibling.file_path, "/music/Album2/03.flac",
+            sibling.file_path,
+            directory_fixture_key("/music/Album2/03.flac"),
             "the prefix must match whole path components"
         );
 
@@ -4205,13 +4258,16 @@ mod tests {
     #[tokio::test]
     async fn directory_rename_reports_descendants_without_a_destination_file() {
         let db = rename_test_database().await;
-        insert_rename_test_track(&db, "moved", "/music/Album/01.flac", "One", 0).await;
-        insert_rename_test_track(&db, "vanished", "/music/Album/02.flac", "Two", 0).await;
+        insert_directory_rename_test_track(&db, "moved", "/music/Album/01.flac", "One", 0).await;
+        insert_directory_rename_test_track(&db, "vanished", "/music/Album/02.flac", "Two", 0).await;
+
+        let source_directory = directory_fixture_path("/music/Album");
+        let destination_directory = directory_fixture_path("/music/Renamed");
 
         let outcome = rename_directory_rows(
             &db,
-            Path::new("/music/Album"),
-            Path::new("/music/Renamed"),
+            &source_directory,
+            &destination_directory,
             // The second file was deleted during the rename window, so nothing
             // observed it at the destination.
             &destination_files(&["/music/Renamed/01.flac"]),
@@ -4238,7 +4294,8 @@ mod tests {
             .expect("load unmapped track")
             .expect("unmapped track exists");
         assert_eq!(
-            vanished.file_path, "/music/Album/02.flac",
+            vanished.file_path,
+            directory_fixture_key("/music/Album/02.flac"),
             "an unproven row keeps its path until a guarded scan can resolve it"
         );
     }
@@ -4246,15 +4303,19 @@ mod tests {
     #[tokio::test]
     async fn directory_rename_displaces_a_stale_row_parked_at_a_destination_path() {
         let db = rename_test_database().await;
-        insert_rename_test_track(&db, "moved", "/music/Album/01.flac", "One", 5).await;
+        insert_directory_rename_test_track(&db, "moved", "/music/Album/01.flac", "One", 5).await;
         // A row a previous scan was never authoritative enough to delete. The
         // unique path index would otherwise abort the move.
-        insert_rename_test_track(&db, "stale", "/music/Renamed/01.flac", "Stale", 0).await;
+        insert_directory_rename_test_track(&db, "stale", "/music/Renamed/01.flac", "Stale", 0)
+            .await;
+
+        let source_directory = directory_fixture_path("/music/Album");
+        let destination_directory = directory_fixture_path("/music/Renamed");
 
         let outcome = rename_directory_rows(
             &db,
-            Path::new("/music/Album"),
-            Path::new("/music/Renamed"),
+            &source_directory,
+            &destination_directory,
             &destination_files(&["/music/Renamed/01.flac"]),
             || true,
         )
@@ -4280,20 +4341,27 @@ mod tests {
             .await
             .expect("load moved track")
             .expect("moved track exists");
-        assert_eq!(survivor.file_path, "/music/Renamed/01.flac");
+        assert_eq!(
+            survivor.file_path,
+            directory_fixture_key("/music/Renamed/01.flac")
+        );
         assert_eq!(survivor.play_count, 5);
     }
 
     #[tokio::test]
     async fn directory_rename_guard_rejection_rolls_back_every_change() {
         let db = rename_test_database().await;
-        insert_rename_test_track(&db, "moved", "/music/Album/01.flac", "One", 5).await;
-        insert_rename_test_track(&db, "stale", "/music/Renamed/01.flac", "Stale", 0).await;
+        insert_directory_rename_test_track(&db, "moved", "/music/Album/01.flac", "One", 5).await;
+        insert_directory_rename_test_track(&db, "stale", "/music/Renamed/01.flac", "Stale", 0)
+            .await;
+
+        let source_directory = directory_fixture_path("/music/Album");
+        let destination_directory = directory_fixture_path("/music/Renamed");
 
         let outcome = rename_directory_rows(
             &db,
-            Path::new("/music/Album"),
-            Path::new("/music/Renamed"),
+            &source_directory,
+            &destination_directory,
             &destination_files(&["/music/Renamed/01.flac"]),
             || false,
         )
@@ -4306,7 +4374,10 @@ mod tests {
             .await
             .expect("load source track")
             .expect("source track exists");
-        assert_eq!(source.file_path, "/music/Album/01.flac");
+        assert_eq!(
+            source.file_path,
+            directory_fixture_key("/music/Album/01.flac")
+        );
         assert!(
             track::Entity::find_by_id("stale")
                 .one(&db)
@@ -4320,12 +4391,15 @@ mod tests {
     #[tokio::test]
     async fn directory_rename_refuses_a_destination_inside_its_own_source() {
         let db = rename_test_database().await;
-        insert_rename_test_track(&db, "moved", "/music/Album/01.flac", "One", 0).await;
+        insert_directory_rename_test_track(&db, "moved", "/music/Album/01.flac", "One", 0).await;
+
+        let source_directory = directory_fixture_path("/music/Album");
+        let nested_destination = directory_fixture_path("/music/Album/Nested");
 
         let error = rename_directory_rows(
             &db,
-            Path::new("/music/Album"),
-            Path::new("/music/Album/Nested"),
+            &source_directory,
+            &nested_destination,
             &destination_files(&["/music/Album/Nested/01.flac"]),
             || true,
         )
@@ -4337,7 +4411,10 @@ mod tests {
             .await
             .expect("load track")
             .expect("track exists");
-        assert_eq!(unchanged.file_path, "/music/Album/01.flac");
+        assert_eq!(
+            unchanged.file_path,
+            directory_fixture_key("/music/Album/01.flac")
+        );
     }
 
     #[test]
@@ -4398,7 +4475,17 @@ mod tests {
         let directory_scan = scan_renamed_directory(library.path(), &album);
         assert!(directory_scan.is_complete());
         let parked_album = library.path().join("Parked");
-        std::fs::rename(&album, &parked_album).expect("park original directory");
+        if let Err(error) = std::fs::rename(&album, &parked_album) {
+            #[cfg(windows)]
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                assert!(
+                    directory_scan.observations_still_current(&album),
+                    "Windows retained handles prevent the directory swap outright"
+                );
+                return;
+            }
+            panic!("park original directory: {error}");
+        }
         std::fs::create_dir_all(&album).expect("create replacement directory");
         std::fs::write(album.join("01.flac"), b"replacement").expect("mirror old file name");
         std::fs::write(album.join("original.flac"), b"replacement")
