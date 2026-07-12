@@ -27,9 +27,9 @@ use super::persistence::{
     restore_sort_state, save_repeat_mode, save_shuffle, save_sort_state, save_window_geometry,
 };
 use super::playback::{
-    advance_track, format_ms, play_or_start, play_track_at, previous_track, replay_current,
-    stop_playback, toggle_or_start, BufferingTracker, PlaybackContext, PlaybackSession,
-    QueueTrackRefresh,
+    advance_track, format_ms, play_or_start, play_track_at, previous_track,
+    refresh_projected_library_uris, replay_current, stop_playback, toggle_or_start,
+    BufferingTracker, PlaybackContext, PlaybackSession, QueueTrackRefresh, PLAYLIST_SOURCE_PREFIX,
 };
 use super::preferences;
 use super::server_dialogs::{load_saved_servers, remove_saved_server, show_add_server_dialog};
@@ -1692,6 +1692,29 @@ fn refresh_playback_queue(session: &Rc<RefCell<PlaybackSession>>, objects: &[Tra
     }
 }
 
+/// Retarget the rows of an already-open playlist after committed local changes.
+/// The visible store and `master_tracks` share these GObject instances, so an
+/// in-place URI overlay is immediately used by the next click without changing
+/// playlist order, duplicates, or selection identity.
+fn refresh_active_playlist_uris(
+    active_source_key: &Rc<RefCell<String>>,
+    master_tracks: &Rc<RefCell<Vec<TrackObject>>>,
+    committed_local_rows: &[TrackObject],
+) {
+    if !active_source_key
+        .borrow()
+        .starts_with(PLAYLIST_SOURCE_PREFIX)
+    {
+        return;
+    }
+
+    let rows = master_tracks.borrow();
+    let refreshed = refresh_projected_library_uris(&rows, committed_local_rows);
+    if refreshed > 0 {
+        info!(refreshed, "Refreshed active playlist paths");
+    }
+}
+
 /// Spawn the library event receiver loop on the GTK main thread.
 #[allow(clippy::too_many_arguments)]
 fn setup_library_events(
@@ -1753,6 +1776,8 @@ fn setup_library_events(
 
                     let objects: Vec<TrackObject> =
                         tracks.iter().map(arch_track_to_object).collect();
+
+                    refresh_active_playlist_uris(&active_source_key, &master_tracks, &objects);
 
                     // A bulk change — a renamed album, a reconciliation — can
                     // move the files behind tracks the queue is holding. The
@@ -1841,6 +1866,12 @@ fn setup_library_events(
                 LibraryEvent::TrackUpserted(track) => {
                     let obj = arch_track_to_object(&track);
                     let uri = obj.uri();
+
+                    refresh_active_playlist_uris(
+                        &active_source_key,
+                        &master_tracks,
+                        std::slice::from_ref(&obj),
+                    );
 
                     // A single-file rename keeps the track's identity and moves
                     // its path, so a queue holding it must follow the track, not

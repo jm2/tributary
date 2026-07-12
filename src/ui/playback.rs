@@ -37,6 +37,47 @@ fn is_library_source(source_id: &str) -> bool {
     source_id == LOCAL_SOURCE_KEY || source_id.starts_with(PLAYLIST_SOURCE_PREFIX)
 }
 
+/// Overlay committed local-library URIs onto an existing playlist projection.
+///
+/// Playlist rows and the local library share stable track IDs, but each
+/// playlist occurrence owns a distinct row identity. Mutating only the URI in
+/// place preserves duplicate ordering and selection while ensuring a later
+/// click builds its queue from the committed path. Empty replacement URIs are
+/// ignored so a transiently unplayable update cannot strand a valid row.
+pub(super) fn refresh_projected_library_uris(
+    projected_rows: &[TrackObject],
+    committed_local_rows: &[TrackObject],
+) -> usize {
+    if projected_rows.is_empty() || committed_local_rows.is_empty() {
+        return 0;
+    }
+
+    let projected_ids: HashSet<String> = projected_rows.iter().map(TrackObject::track_id).collect();
+    let mut committed_uris = HashMap::with_capacity(projected_ids.len());
+    for track in committed_local_rows {
+        let track_id = track.track_id();
+        if !projected_ids.contains(&track_id) {
+            continue;
+        }
+        let uri = track.uri();
+        if !uri.is_empty() {
+            committed_uris.insert(track_id, uri);
+        }
+    }
+
+    let mut refreshed = 0;
+    for row in projected_rows {
+        let Some(uri) = committed_uris.get(&row.track_id()) else {
+            continue;
+        };
+        if row.uri() != *uri {
+            row.set_uri(uri);
+            refreshed += 1;
+        }
+    }
+    refreshed
+}
+
 /// Stable identity of a track inside the source that supplied its queue.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PlaybackIdentity {
@@ -793,6 +834,14 @@ mod tests {
         }
     }
 
+    fn projected_row(id: &str, uri: &str) -> TrackObject {
+        let row = TrackObject::new(
+            1, "Title", 60, "Artist", "Album", "", 0, "", 0, 0, 0, "", uri,
+        );
+        row.set_track_id(id);
+        row
+    }
+
     fn ids(session: &PlaybackSession) -> Vec<String> {
         session
             .queue
@@ -926,6 +975,30 @@ mod tests {
         assert_eq!(
             session.queue[0].uri, "https://media.invalid/a",
             "a track with no playable URI keeps the reference the queue captured"
+        );
+    }
+
+    #[test]
+    fn projected_playlist_rows_follow_committed_uris_without_losing_occurrences() {
+        let first = projected_row("a", "file:///music/old-a.flac");
+        let unrelated = projected_row("b", "file:///music/b.flac");
+        let duplicate = projected_row("a", "file:///music/old-a.flac");
+        let rows = vec![first, unrelated, duplicate];
+        let identities: Vec<u64> = rows.iter().map(TrackObject::row_instance_id).collect();
+
+        let renamed = projected_row("a", "file:///music/renamed-a.flac");
+        let empty = projected_row("b", "");
+        assert_eq!(refresh_projected_library_uris(&rows, &[renamed, empty]), 2);
+
+        assert_eq!(rows[0].uri(), "file:///music/renamed-a.flac");
+        assert_eq!(rows[1].uri(), "file:///music/b.flac");
+        assert_eq!(rows[2].uri(), "file:///music/renamed-a.flac");
+        assert_eq!(
+            rows.iter()
+                .map(TrackObject::row_instance_id)
+                .collect::<Vec<_>>(),
+            identities,
+            "URI refresh must preserve duplicate occurrence identity and order"
         );
     }
 

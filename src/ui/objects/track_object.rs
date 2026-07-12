@@ -174,6 +174,13 @@ impl TrackObject {
         self.imp().cover_art_url.replace(url.to_string());
     }
 
+    /// Retarget an existing UI row without replacing its occurrence identity.
+    /// The URI is not a displayed GObject property, so no notify signal is
+    /// required; future playback reads it directly from this row.
+    pub(crate) fn set_uri(&self, uri: &str) {
+        self.imp().uri.replace(uri.to_string());
+    }
+
     pub fn set_track_id(&self, id: &str) {
         self.imp().track_id.replace(id.to_string());
     }
