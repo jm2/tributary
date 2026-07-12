@@ -13,8 +13,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    Set, TransactionTrait,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -1552,6 +1552,85 @@ async fn root_identity_allows_content(
     Ok(matches)
 }
 
+#[derive(Clone, Debug)]
+struct WatcherRenameGuard {
+    root_index: usize,
+    root: PathBuf,
+    expected_identity: String,
+    mount_generation: u64,
+}
+
+impl WatcherRenameGuard {
+    fn root_is_stable(&self) -> bool {
+        filesystem_identity(&self.root).is_ok_and(|identity| identity == self.expected_identity)
+            && root_mount_generation(&self.root)
+                .is_ok_and(|generation| generation == self.mount_generation)
+    }
+
+    fn commit_allowed(&self, music_dirs: &[PathBuf], from: &Path, to: &Path) -> bool {
+        is_regular_file_without_following_symlinks(to)
+            && !crosses_untracked_nested_mount(&self.root, from, music_dirs)
+            && !crosses_untracked_nested_mount(&self.root, to, music_dirs)
+            && self.root_is_stable()
+    }
+}
+
+fn is_regular_file_without_following_symlinks(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+fn same_audio_extension(from: &Path, to: &Path) -> bool {
+    tag_parser::is_audio_file(from)
+        && tag_parser::is_audio_file(to)
+        && from
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .zip(to.extension().and_then(|extension| extension.to_str()))
+            .is_some_and(|(from, to)| from.eq_ignore_ascii_case(to))
+}
+
+async fn prepare_watcher_rename_guard(
+    db: &DatabaseConnection,
+    roots: &mut WatcherRootCache,
+    music_dirs: &[PathBuf],
+    from: &Path,
+    to: &Path,
+) -> anyhow::Result<Option<WatcherRenameGuard>> {
+    if !root_identity_allows_content(db, roots, music_dirs, from).await?
+        || !root_identity_allows_content(db, roots, music_dirs, to).await?
+    {
+        return Ok(None);
+    }
+
+    let Some((from_index, from_root, from_state)) = roots.root_for_path(from) else {
+        return Ok(None);
+    };
+    let Some((to_index, to_root, _)) = roots.root_for_path(to) else {
+        return Ok(None);
+    };
+    if from_index != to_index || from_root != to_root {
+        return Ok(None);
+    }
+    let Some(expected_identity) = from_state.device_id else {
+        return Ok(None);
+    };
+    let mount_generation = match root_mount_generation(&from_root) {
+        Ok(generation) => generation,
+        Err(error) => {
+            mark_cached_root_unavailable(db, roots, from_index).await;
+            warn!(root = %from_root.display(), %error, "Could not capture rename mount generation");
+            return Ok(None);
+        }
+    };
+
+    Ok(Some(WatcherRenameGuard {
+        root_index: from_index,
+        root: from_root,
+        expected_identity,
+        mount_generation,
+    }))
+}
+
 /// Delete a watcher-reported missing path only while its confirmed root
 /// identity remains stable across the database transaction.
 async fn delete_track_if_root_stable(
@@ -1643,6 +1722,215 @@ fn marker_event_invalidates_root(kind: notify::EventKind) -> bool {
     )
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WatcherRenamePair {
+    from: PathBuf,
+    to: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct WatcherBatch {
+    upsert_paths: HashSet<PathBuf>,
+    remove_paths: HashSet<PathBuf>,
+    rename_pairs: HashSet<WatcherRenamePair>,
+    paired_paths: HashSet<PathBuf>,
+    identity_changed_roots: HashSet<PathBuf>,
+    tracked_rename_from: HashMap<usize, PathBuf>,
+    adjacent_untracked_rename_from: Option<PathBuf>,
+    reconciliation_required: bool,
+}
+
+impl WatcherBatch {
+    fn collect(&mut self, mut event: notify::Event) {
+        use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+        use notify::EventKind;
+
+        let marker_invalidates_root = marker_event_invalidates_root(event.kind);
+        event.paths.retain(|path| {
+            if path
+                .file_name()
+                .is_some_and(|name| name == ROOT_IDENTITY_FILE)
+            {
+                if marker_invalidates_root {
+                    if let Some(root) = path.parent() {
+                        self.identity_changed_roots.insert(root.to_path_buf());
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if event.paths.is_empty() {
+            self.adjacent_untracked_rename_from = None;
+            return;
+        }
+
+        let tracker = event.tracker();
+        let is_adjacent_untracked_to = tracker.is_none()
+            && matches!(
+                event.kind,
+                EventKind::Modify(ModifyKind::Name(RenameMode::To))
+            )
+            && event.paths.len() == 1;
+        if !is_adjacent_untracked_to {
+            self.adjacent_untracked_rename_from = None;
+        }
+
+        match event.kind {
+            EventKind::Remove(kind) => {
+                let folder = matches!(kind, RemoveKind::Folder);
+                for path in event.paths {
+                    if folder {
+                        self.reconciliation_required = true;
+                    } else {
+                        self.record_remove(path);
+                    }
+                }
+            }
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                let candidate = (event.paths.len() == 1).then(|| event.paths[0].clone());
+                for path in event.paths {
+                    self.record_remove(path);
+                }
+                if let Some(path) = candidate {
+                    if let Some(tracker) = tracker {
+                        self.tracked_rename_from.insert(tracker, path);
+                    } else {
+                        self.adjacent_untracked_rename_from = Some(path);
+                    }
+                } else {
+                    self.reconciliation_required = true;
+                }
+            }
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+                let candidate = (event.paths.len() == 1).then(|| event.paths[0].clone());
+                for path in event.paths {
+                    self.record_upsert(path);
+                }
+                if let Some(to) = candidate {
+                    let from = tracker
+                        .and_then(|tracker| self.tracked_rename_from.remove(&tracker))
+                        .or_else(|| {
+                            tracker
+                                .is_none()
+                                .then(|| self.adjacent_untracked_rename_from.take())
+                                .flatten()
+                        });
+                    if let Some(from) = from {
+                        self.record_rename_pair(from, to);
+                    }
+                } else {
+                    self.reconciliation_required = true;
+                }
+            }
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+                if event.paths.len() == 2 {
+                    let from = event.paths[0].clone();
+                    let to = event.paths[1].clone();
+                    if let Some(tracker) = tracker {
+                        self.tracked_rename_from.remove(&tracker);
+                    }
+                    self.record_rename_pair(from, to);
+                } else {
+                    self.reconciliation_required = true;
+                }
+            }
+            EventKind::Modify(ModifyKind::Name(_)) => {
+                // FSEvents and kqueue cannot associate the old and new sides.
+                // Never infer identity from metadata; a guarded scan performs
+                // the conservative delete/upsert fallback.
+                self.reconciliation_required = true;
+            }
+            EventKind::Create(kind) => {
+                let folder = matches!(kind, CreateKind::Folder);
+                for path in event.paths {
+                    if folder {
+                        self.reconciliation_required = true;
+                    } else {
+                        self.record_upsert(path);
+                    }
+                }
+            }
+            EventKind::Modify(_) => {
+                for path in event.paths {
+                    self.record_upsert(path);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_remove(&mut self, path: PathBuf) {
+        if self.paired_paths.contains(&path) {
+            return;
+        }
+        if tag_parser::is_audio_file(&path) {
+            self.upsert_paths.remove(&path);
+            self.remove_paths.insert(path);
+        } else {
+            self.reconciliation_required = true;
+        }
+    }
+
+    fn record_upsert(&mut self, path: PathBuf) {
+        if self.paired_paths.contains(&path) {
+            return;
+        }
+        if path.is_dir() {
+            self.reconciliation_required = true;
+        } else if tag_parser::is_audio_file(&path) {
+            self.remove_paths.remove(&path);
+            self.upsert_paths.insert(path);
+        }
+    }
+
+    fn record_rename_pair(&mut self, from: PathBuf, to: PathBuf) {
+        let pair = WatcherRenamePair { from, to };
+        if pair.from == pair.to {
+            self.record_upsert(pair.to);
+            return;
+        }
+        if self.rename_pairs.contains(&pair) {
+            return;
+        }
+        if self
+            .rename_pairs
+            .iter()
+            .any(|existing| rename_pairs_overlap(existing, &pair))
+        {
+            // Overlapping/chained pairs cannot be applied independently
+            // without ordering and inode guarantees. Reconcile instead.
+            self.reconciliation_required = true;
+            self.rename_pairs
+                .retain(|existing| !rename_pairs_overlap(existing, &pair));
+            return;
+        }
+
+        self.upsert_paths.remove(&pair.from);
+        self.upsert_paths.remove(&pair.to);
+        self.remove_paths.remove(&pair.from);
+        self.remove_paths.remove(&pair.to);
+        self.paired_paths.insert(pair.from.clone());
+        self.paired_paths.insert(pair.to.clone());
+        self.rename_pairs.insert(pair);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.upsert_paths.is_empty()
+            && self.remove_paths.is_empty()
+            && self.rename_pairs.is_empty()
+            && self.identity_changed_roots.is_empty()
+            && !self.reconciliation_required
+    }
+}
+
+fn rename_pairs_overlap(left: &WatcherRenamePair, right: &WatcherRenamePair) -> bool {
+    [&left.from, &left.to]
+        .into_iter()
+        .any(|path| path == &right.from || path == &right.to)
+}
+
 async fn reconcile_playlists_after_watcher_batch(
     db: &DatabaseConnection,
     upsert_committed: bool,
@@ -1667,7 +1955,9 @@ async fn watch_directories(
         move |res| {
             let _ = notify_tx.blocking_send(res);
         },
-        notify::Config::default().with_poll_interval(Duration::from_secs(2)),
+        notify::Config::default()
+            .with_poll_interval(Duration::from_secs(2))
+            .with_follow_symlinks(false),
     )?;
 
     // Watch each directory independently. A missing or unwatchable directory
@@ -1703,94 +1993,20 @@ async fn watch_directories(
         let first = notify_rx.recv().await;
         let Some(first) = first else { break };
 
-        // Collect the first event + any more that arrive within the
-        // debounce window into path sets.
-        let mut upsert_paths: HashSet<PathBuf> = HashSet::new();
-        let mut remove_paths: HashSet<PathBuf> = HashSet::new();
-        let mut identity_changed_roots: HashSet<PathBuf> = HashSet::new();
-
-        let mut collect_event = |mut event: notify::Event| {
-            use notify::event::{ModifyKind, RenameMode};
-            use notify::EventKind;
-
-            let marker_invalidates_root = marker_event_invalidates_root(event.kind);
-
-            // The root marker is a control file, not media. Any create,
-            // content/identity change, rename, removal, or unknown event
-            // invalidates cached authorization and requires a future complete
-            // scan before watcher writes resume. Read/access events are
-            // expected from identity probes and are ignored.
-            event.paths.retain(|path| {
-                if path
-                    .file_name()
-                    .is_some_and(|name| name == ROOT_IDENTITY_FILE)
-                {
-                    if marker_invalidates_root {
-                        if let Some(root) = path.parent() {
-                            identity_changed_roots.insert(root.to_path_buf());
-                        }
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
-
-            // Classify each path as a removal or an upsert. A rename is
-            // delivered as Modify(Name(...)) rather than Remove: the "from"
-            // side must be treated as a removal (the file is gone at the old
-            // path) and the "to" side as an upsert. Routing a rename through
-            // the generic Modify upsert arm would re-add the new path while
-            // leaving the old path orphaned as a stale DB row.
-            match event.kind {
-                EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
-                    for path in event.paths {
-                        if !tag_parser::is_audio_file(&path) {
-                            continue;
-                        }
-                        upsert_paths.remove(&path);
-                        remove_paths.insert(path);
-                    }
-                }
-                EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
-                    // RenameMode::Both packs [from, to] into event.paths.
-                    let mut iter = event.paths.into_iter();
-                    if let Some(from) = iter.next() {
-                        if tag_parser::is_audio_file(&from) {
-                            upsert_paths.remove(&from);
-                            remove_paths.insert(from);
-                        }
-                    }
-                    for to in iter {
-                        if !tag_parser::is_audio_file(&to) {
-                            continue;
-                        }
-                        remove_paths.remove(&to);
-                        upsert_paths.insert(to);
-                    }
-                }
-                EventKind::Create(_) | EventKind::Modify(_) => {
-                    for path in event.paths {
-                        if !tag_parser::is_audio_file(&path) {
-                            continue;
-                        }
-                        remove_paths.remove(&path);
-                        upsert_paths.insert(path);
-                    }
-                }
-                _ => {}
-            }
-        };
+        // Preserve event order and tracker metadata until rename halves have
+        // been normalized. Flattening immediately into unordered path sets
+        // would discard the only authoritative identity association.
+        let mut batch = WatcherBatch::default();
 
         if let Ok(event) = first {
-            collect_event(event);
+            batch.collect(event);
         }
 
         // Drain any additional events that arrive within the debounce window.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(DEBOUNCE_MS);
         loop {
             match tokio::time::timeout_at(deadline, notify_rx.recv()).await {
-                Ok(Some(Ok(event))) => collect_event(event),
+                Ok(Some(Ok(event))) => batch.collect(event),
                 Ok(Some(Err(e))) => {
                     warn!(error = %e, "Filesystem watcher error");
                 }
@@ -1798,7 +2014,7 @@ async fn watch_directories(
             }
         }
 
-        if remove_paths.is_empty() && upsert_paths.is_empty() && identity_changed_roots.is_empty() {
+        if batch.is_empty() {
             continue;
         }
 
@@ -1813,15 +2029,126 @@ async fn watch_directories(
             }
         };
 
-        for root in identity_changed_roots {
-            if let Some(index) = root_cache.exact_root(&root) {
+        for root in &batch.identity_changed_roots {
+            if let Some(index) = root_cache.exact_root(root) {
                 mark_cached_root_unavailable(db.as_ref(), &mut root_cache, index).await;
                 warn!(root = %root.display(), "Library root marker changed — watcher writes disabled until rescan");
             }
         }
 
+        let mut reconciliation_required = batch.reconciliation_required;
+        let mut upsert_committed = false;
+
+        // Apply authoritative same-root file rename pairs before standalone
+        // removals and upserts. This keeps the source row alive, preserving
+        // its stable ID, historical fields, and direct playlist references.
+        for pair in &batch.rename_pairs {
+            if !same_audio_extension(&pair.from, &pair.to)
+                || !is_regular_file_without_following_symlinks(&pair.to)
+            {
+                reconciliation_required = true;
+                continue;
+            }
+
+            let guard = match prepare_watcher_rename_guard(
+                db.as_ref(),
+                &mut root_cache,
+                music_dirs,
+                &pair.from,
+                &pair.to,
+            )
+            .await
+            {
+                Ok(Some(guard)) => guard,
+                Ok(None) => {
+                    reconciliation_required = true;
+                    continue;
+                }
+                Err(error) => {
+                    warn!(from = %pair.from.display(), to = %pair.to.display(), %error, "Failed to authorize paired rename");
+                    reconciliation_required = true;
+                    continue;
+                }
+            };
+
+            let to_parse = pair.to.clone();
+            let parsed = match tokio::task::spawn_blocking(move || {
+                tag_parser::parse_audio_file(&to_parse)
+            })
+            .await
+            {
+                Ok(Ok(parsed)) => Some(parsed),
+                Ok(Err(error)) => {
+                    warn!(to = %pair.to.display(), %error, "Renamed file could not be reparsed; preserving identity and scheduling reconciliation");
+                    reconciliation_required = true;
+                    None
+                }
+                Err(error) => {
+                    warn!(to = %pair.to.display(), %error, "Rename parser task failed; preserving identity and scheduling reconciliation");
+                    reconciliation_required = true;
+                    None
+                }
+            };
+
+            if !guard.commit_allowed(music_dirs, &pair.from, &pair.to) {
+                if !guard.root_is_stable() {
+                    mark_cached_root_unavailable(db.as_ref(), &mut root_cache, guard.root_index)
+                        .await;
+                }
+                reconciliation_required = true;
+                continue;
+            }
+
+            match rename_track_row(db.as_ref(), &pair.from, &pair.to, parsed.as_ref(), || {
+                guard.commit_allowed(music_dirs, &pair.from, &pair.to)
+            })
+            .await
+            {
+                Ok(RenameTrackOutcome::Renamed { model, displaced }) => {
+                    let _ = tx
+                        .send(LibraryEvent::TrackRemoved(
+                            pair.from.to_string_lossy().into_owned(),
+                        ))
+                        .await;
+                    if let Some(displaced) = displaced {
+                        let displaced = *displaced;
+                        let _ = tx
+                            .send(LibraryEvent::TrackRemoved(displaced.file_path))
+                            .await;
+                    }
+                    let _ = tx
+                        .send(LibraryEvent::TrackUpserted(Box::new(db_model_to_track(
+                            &model,
+                        ))))
+                        .await;
+                    upsert_committed = true;
+                    info!(from = %pair.from.display(), to = %pair.to.display(), id = %model.id, "Preserved track identity across filesystem rename");
+                }
+                Ok(RenameTrackOutcome::SourceMissing) => {
+                    debug!(from = %pair.from.display(), to = %pair.to.display(), "Rename source was not indexed; falling back to reconciliation");
+                    reconciliation_required = true;
+                }
+                Ok(RenameTrackOutcome::GuardRejected) => {
+                    if !guard.root_is_stable() {
+                        mark_cached_root_unavailable(
+                            db.as_ref(),
+                            &mut root_cache,
+                            guard.root_index,
+                        )
+                        .await;
+                    }
+                    warn!(from = %pair.from.display(), to = %pair.to.display(), "Filesystem changed before paired rename commit; transaction rolled back");
+                    reconciliation_required = true;
+                }
+                Err(error) => {
+                    warn!(from = %pair.from.display(), to = %pair.to.display(), %error, "Failed to update paired rename transactionally");
+                    reconciliation_required = true;
+                }
+            }
+        }
+
         // Process removals.
-        for path in &remove_paths {
+        for path in &batch.remove_paths {
             let path_str = path.to_string_lossy().to_string();
             debug!(path = %path_str, "File removed (debounced)");
             match delete_track_if_root_stable(db.as_ref(), &mut root_cache, music_dirs, path).await
@@ -1839,10 +2166,12 @@ async fn watch_directories(
         }
 
         // Process upserts from the shared, batch-scoped root snapshot.
-        let mut upsert_committed = false;
-        if !upsert_paths.is_empty() {
-            debug!(count = upsert_paths.len(), "Processing debounced upserts");
-            let paths: Vec<PathBuf> = upsert_paths.into_iter().collect();
+        if !batch.upsert_paths.is_empty() {
+            debug!(
+                count = batch.upsert_paths.len(),
+                "Processing debounced upserts"
+            );
+            let paths: Vec<PathBuf> = batch.upsert_paths.drain().collect();
 
             for path in paths {
                 match root_identity_allows_content(db.as_ref(), &mut root_cache, music_dirs, &path)
@@ -1928,6 +2257,17 @@ async fn watch_directories(
             }
         }
 
+        // Directory changes and unpairable rename shapes deliberately avoid
+        // guessing identity. Reuse the hardened authoritative scan once per
+        // batch as the conservative reconciliation fallback.
+        if reconciliation_required {
+            info!("Reconciling library after unpaired or directory watcher changes");
+            if let Err(error) = initial_scan(db.as_ref(), music_dirs, tx).await {
+                warn!(%error, "Watcher-triggered library reconciliation failed");
+            }
+            continue;
+        }
+
         // Deletions null playlist links through the database foreign key.
         // Reconcile once after all successful upserts in this debounced batch
         // so a replacement file can restore those links immediately. A
@@ -1951,31 +2291,21 @@ async fn watch_directories(
 // ---------------------------------------------------------------------------
 
 /// Insert or update a track in the database, returning the final Model.
-async fn upsert_track(
-    db: &DatabaseConnection,
+async fn upsert_track<C>(
+    db: &C,
     parsed: &ParsedTrack,
     existing: Option<&track::Model>,
-) -> anyhow::Result<track::Model> {
+) -> anyhow::Result<track::Model>
+where
+    C: ConnectionTrait,
+{
     let now = Utc::now().to_rfc3339();
     let mtime = parsed.date_modified.to_rfc3339();
 
     if let Some(row) = existing {
         // Update existing
         let mut active: track::ActiveModel = row.clone().into();
-        active.title = Set(parsed.title.clone());
-        active.artist_name = Set(parsed.artist_name.clone());
-        active.album_artist_name = Set(parsed.album_artist_name.clone());
-        active.album_title = Set(parsed.album_title.clone());
-        active.genre = Set(parsed.genre.clone());
-        active.year = Set(parsed.year);
-        active.track_number = Set(parsed.track_number.map(|n| n as i32));
-        active.disc_number = Set(parsed.disc_number.map(|n| n as i32));
-        active.duration_secs = Set(parsed.duration_secs.map(|d| d as i64));
-        active.bitrate_kbps = Set(parsed.bitrate_kbps.map(|b| b as i32));
-        active.sample_rate_hz = Set(parsed.sample_rate_hz.map(|s| s as i32));
-        active.format = Set(Some(parsed.format.clone()));
-        active.date_modified = Set(mtime);
-        active.file_size_bytes = Set(parsed.file_size_bytes.map(|s| s as i64));
+        apply_parsed_track_fields(&mut active, parsed, mtime);
 
         let model = active.update(db).await?;
         debug!(path = %parsed.file_path, "Updated track in database");
@@ -2007,6 +2337,117 @@ async fn upsert_track(
         let model = active.insert(db).await?;
         debug!(path = %parsed.file_path, "Inserted new track into database");
         Ok(model)
+    }
+}
+
+fn apply_parsed_track_fields(
+    active: &mut track::ActiveModel,
+    parsed: &ParsedTrack,
+    date_modified: String,
+) {
+    active.file_path = Set(parsed.file_path.clone());
+    active.title = Set(parsed.title.clone());
+    active.artist_name = Set(parsed.artist_name.clone());
+    active.album_artist_name = Set(parsed.album_artist_name.clone());
+    active.album_title = Set(parsed.album_title.clone());
+    active.genre = Set(parsed.genre.clone());
+    active.year = Set(parsed.year);
+    active.track_number = Set(parsed.track_number.map(|n| n as i32));
+    active.disc_number = Set(parsed.disc_number.map(|n| n as i32));
+    active.duration_secs = Set(parsed.duration_secs.map(|d| d as i64));
+    active.bitrate_kbps = Set(parsed.bitrate_kbps.map(|b| b as i32));
+    active.sample_rate_hz = Set(parsed.sample_rate_hz.map(|s| s as i32));
+    active.format = Set(Some(parsed.format.clone()));
+    active.date_modified = Set(date_modified);
+    active.file_size_bytes = Set(parsed.file_size_bytes.map(|s| s as i64));
+}
+
+#[derive(Debug)]
+enum RenameTrackOutcome {
+    Renamed {
+        model: Box<track::Model>,
+        displaced: Option<Box<track::Model>>,
+    },
+    SourceMissing,
+    GuardRejected,
+}
+
+/// Atomically retarget one existing track row to an authoritative paired
+/// rename destination. The row ID, date-added timestamp, play count, and
+/// playlist references remain untouched. If the filesystem rename replaced
+/// an already-indexed destination, that displaced row is removed in the same
+/// transaction before the source claims its unique path.
+async fn rename_track_row<F>(
+    db: &DatabaseConnection,
+    from: &Path,
+    to: &Path,
+    parsed: Option<&ParsedTrack>,
+    commit_guard: F,
+) -> anyhow::Result<RenameTrackOutcome>
+where
+    F: FnOnce() -> bool,
+{
+    let from_path = from.to_string_lossy().into_owned();
+    let to_path = to.to_string_lossy().into_owned();
+    if parsed.is_some_and(|parsed| parsed.file_path != to_path) {
+        return Err(anyhow::anyhow!(
+            "parsed rename destination does not match the paired target path"
+        ));
+    }
+    let transaction = db.begin().await?;
+
+    let result: anyhow::Result<RenameTrackOutcome> = async {
+        let Some(source) = track::Entity::find()
+            .filter(track::Column::FilePath.eq(&from_path))
+            .one(&transaction)
+            .await?
+        else {
+            return Ok(RenameTrackOutcome::SourceMissing);
+        };
+
+        let displaced = track::Entity::find()
+            .filter(track::Column::FilePath.eq(&to_path))
+            .one(&transaction)
+            .await?
+            .filter(|destination| destination.id != source.id);
+        if let Some(destination) = &displaced {
+            track::Entity::delete_by_id(&destination.id)
+                .exec(&transaction)
+                .await?;
+        }
+
+        let model = if let Some(parsed) = parsed {
+            upsert_track(&transaction, parsed, Some(&source)).await?
+        } else {
+            let mut active: track::ActiveModel = source.into();
+            active.file_path = Set(to_path);
+            active.update(&transaction).await?
+        };
+
+        if !commit_guard() {
+            return Ok(RenameTrackOutcome::GuardRejected);
+        }
+
+        Ok(RenameTrackOutcome::Renamed {
+            model: Box::new(model),
+            displaced: displaced.map(Box::new),
+        })
+    }
+    .await;
+
+    match result {
+        Ok(outcome @ RenameTrackOutcome::Renamed { .. }) => {
+            transaction.commit().await?;
+            Ok(outcome)
+        }
+        Ok(outcome) => {
+            transaction.rollback().await?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            Err(error)
+        }
     }
 }
 
@@ -2054,6 +2495,8 @@ pub fn db_model_to_track(model: &track::Model) -> Track {
 
 #[cfg(test)]
 mod tests {
+    use sea_orm::QueryOrder;
+
     use super::*;
 
     struct TestDirectory {
@@ -2077,6 +2520,464 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn rename_event(
+        mode: notify::event::RenameMode,
+        paths: &[&str],
+        tracker: Option<usize>,
+    ) -> notify::Event {
+        let mut event = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Name(mode),
+        ));
+        for path in paths {
+            event = event.add_path(PathBuf::from(path));
+        }
+        if let Some(tracker) = tracker {
+            event = event.set_tracker(tracker);
+        }
+        event
+    }
+
+    #[test]
+    fn watcher_batch_normalizes_both_rename_without_fallback_paths() {
+        let mut batch = WatcherBatch::default();
+        batch.collect(rename_event(
+            notify::event::RenameMode::Both,
+            &["/music/old.flac", "/music/new.flac"],
+            Some(7),
+        ));
+
+        assert_eq!(
+            batch.rename_pairs,
+            HashSet::from([WatcherRenamePair {
+                from: PathBuf::from("/music/old.flac"),
+                to: PathBuf::from("/music/new.flac"),
+            }])
+        );
+        assert!(batch.remove_paths.is_empty());
+        assert!(batch.upsert_paths.is_empty());
+        assert!(!batch.reconciliation_required);
+    }
+
+    #[test]
+    fn watcher_batch_deduplicates_linux_from_to_and_both_events() {
+        let mut batch = WatcherBatch::default();
+        batch.collect(rename_event(
+            notify::event::RenameMode::From,
+            &["/music/old.flac"],
+            Some(41),
+        ));
+        batch.collect(rename_event(
+            notify::event::RenameMode::To,
+            &["/music/new.flac"],
+            Some(41),
+        ));
+        batch.collect(rename_event(
+            notify::event::RenameMode::Both,
+            &["/music/old.flac", "/music/new.flac"],
+            Some(41),
+        ));
+
+        assert_eq!(batch.rename_pairs.len(), 1);
+        assert!(batch.remove_paths.is_empty());
+        assert!(batch.upsert_paths.is_empty());
+    }
+
+    #[test]
+    fn watcher_batch_pairs_only_adjacent_untracked_windows_halves() {
+        let mut paired = WatcherBatch::default();
+        paired.collect(rename_event(
+            notify::event::RenameMode::From,
+            &["C:/Music/old.flac"],
+            None,
+        ));
+        paired.collect(rename_event(
+            notify::event::RenameMode::To,
+            &["C:/Music/new.flac"],
+            None,
+        ));
+        assert_eq!(paired.rename_pairs.len(), 1);
+        assert!(paired.remove_paths.is_empty());
+        assert!(paired.upsert_paths.is_empty());
+
+        let mut interleaved = WatcherBatch::default();
+        interleaved.collect(rename_event(
+            notify::event::RenameMode::From,
+            &["C:/Music/old.flac"],
+            None,
+        ));
+        interleaved.collect(
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(PathBuf::from("C:/Music/unrelated.flac")),
+        );
+        interleaved.collect(rename_event(
+            notify::event::RenameMode::To,
+            &["C:/Music/new.flac"],
+            None,
+        ));
+        assert!(interleaved.rename_pairs.is_empty());
+        assert!(interleaved
+            .remove_paths
+            .contains(Path::new("C:/Music/old.flac")));
+        assert!(interleaved
+            .upsert_paths
+            .contains(Path::new("C:/Music/new.flac")));
+    }
+
+    #[test]
+    fn watcher_batch_routes_unpairable_and_directory_events_to_reconciliation() {
+        let mut batch = WatcherBatch::default();
+        batch.collect(rename_event(
+            notify::event::RenameMode::Any,
+            &["/music/unknown"],
+            None,
+        ));
+        batch.collect(
+            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::Folder))
+                .add_path(PathBuf::from("/music/album")),
+        );
+
+        assert!(batch.reconciliation_required);
+        assert!(batch.rename_pairs.is_empty());
+    }
+
+    async fn rename_test_database() -> DatabaseConnection {
+        use sea_orm::Database;
+        use sea_orm_migration::MigratorTrait;
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("open in-memory database");
+        crate::db::migration::Migrator::up(&db, None)
+            .await
+            .expect("run migrations");
+        db
+    }
+
+    async fn insert_rename_test_track(
+        db: &DatabaseConnection,
+        id: &str,
+        path: &str,
+        title: &str,
+        play_count: i32,
+    ) -> track::Model {
+        let model = track::Model {
+            id: id.to_string(),
+            file_path: path.to_string(),
+            title: title.to_string(),
+            artist_name: "Original Artist".to_string(),
+            album_artist_name: Some("Original Album Artist".to_string()),
+            album_title: "Original Album".to_string(),
+            genre: Some("Original Genre".to_string()),
+            year: Some(2001),
+            track_number: Some(1),
+            disc_number: Some(1),
+            duration_secs: Some(180),
+            bitrate_kbps: Some(192),
+            sample_rate_hz: Some(44_100),
+            format: Some("FLAC".to_string()),
+            play_count,
+            date_added: "2025-01-02T03:04:05Z".to_string(),
+            date_modified: "2025-01-02T03:04:05Z".to_string(),
+            file_size_bytes: Some(1_000),
+        };
+        let active: track::ActiveModel = model.into();
+        active.insert(db).await.expect("insert rename test track")
+    }
+
+    fn parsed_rename_track(path: &str, title: &str) -> ParsedTrack {
+        ParsedTrack {
+            file_path: path.to_string(),
+            title: title.to_string(),
+            artist_name: "Updated Artist".to_string(),
+            album_artist_name: Some("Updated Album Artist".to_string()),
+            album_title: "Updated Album".to_string(),
+            genre: Some("Updated Genre".to_string()),
+            year: Some(2026),
+            track_number: Some(2),
+            disc_number: Some(2),
+            duration_secs: Some(240),
+            bitrate_kbps: Some(320),
+            sample_rate_hz: Some(48_000),
+            format: "FLAC".to_string(),
+            date_modified: chrono::DateTime::parse_from_rfc3339("2026-07-12T12:34:56Z")
+                .expect("parse fixture timestamp")
+                .with_timezone(&Utc),
+            file_size_bytes: Some(2_000),
+        }
+    }
+
+    #[tokio::test]
+    async fn paired_rename_preserves_track_history_and_playlist_linkage() {
+        use crate::db::entities::playlist_entry;
+
+        let db = rename_test_database().await;
+        let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Rename", false)
+            .await
+            .expect("create playlist");
+        let source = insert_rename_test_track(
+            &db,
+            "stable-track-id",
+            "/music/old.flac",
+            "Original Title",
+            17,
+        )
+        .await;
+        manager
+            .add_track(&playlist.id, &source)
+            .await
+            .expect("add source to playlist");
+        let entry_before = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(&playlist.id))
+            .one(&db)
+            .await
+            .expect("load playlist entry")
+            .expect("playlist entry exists");
+        let parsed = parsed_rename_track("/music/new.flac", "Updated Title");
+
+        let outcome = rename_track_row(
+            &db,
+            Path::new("/music/old.flac"),
+            Path::new("/music/new.flac"),
+            Some(&parsed),
+            || true,
+        )
+        .await
+        .expect("rename track row");
+        assert!(matches!(
+            outcome,
+            RenameTrackOutcome::Renamed {
+                displaced: None,
+                ..
+            }
+        ));
+
+        let renamed = track::Entity::find_by_id("stable-track-id")
+            .one(&db)
+            .await
+            .expect("load renamed track")
+            .expect("renamed track exists");
+        assert_eq!(renamed.file_path, "/music/new.flac");
+        assert_eq!(renamed.title, "Updated Title");
+        assert_eq!(renamed.artist_name, "Updated Artist");
+        assert_eq!(renamed.play_count, 17);
+        assert_eq!(renamed.date_added, "2025-01-02T03:04:05Z");
+
+        let entry_after = playlist_entry::Entity::find_by_id(&entry_before.id)
+            .one(&db)
+            .await
+            .expect("reload playlist entry")
+            .expect("playlist entry remains");
+        assert_eq!(entry_after, entry_before);
+        assert_eq!(entry_after.track_id.as_deref(), Some("stable-track-id"));
+    }
+
+    #[tokio::test]
+    async fn paired_rename_atomically_replaces_an_occupied_destination() {
+        use crate::db::entities::playlist_entry;
+
+        let db = rename_test_database().await;
+        let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Overwrite", false)
+            .await
+            .expect("create playlist");
+        let source =
+            insert_rename_test_track(&db, "source-track", "/music/source.flac", "Source", 9).await;
+        let destination = insert_rename_test_track(
+            &db,
+            "destination-track",
+            "/music/destination.flac",
+            "Destination",
+            3,
+        )
+        .await;
+        manager
+            .add_track(&playlist.id, &source)
+            .await
+            .expect("add source to playlist");
+        manager
+            .add_track(&playlist.id, &destination)
+            .await
+            .expect("add destination to playlist");
+        let parsed = parsed_rename_track("/music/destination.flac", "Source Renamed");
+
+        let outcome = rename_track_row(
+            &db,
+            Path::new("/music/source.flac"),
+            Path::new("/music/destination.flac"),
+            Some(&parsed),
+            || true,
+        )
+        .await
+        .expect("overwrite destination transactionally");
+        assert!(matches!(
+            outcome,
+            RenameTrackOutcome::Renamed {
+                displaced: Some(ref displaced),
+                ..
+            } if displaced.id == "destination-track"
+        ));
+        assert!(track::Entity::find_by_id("destination-track")
+            .one(&db)
+            .await
+            .expect("query displaced track")
+            .is_none());
+        assert_eq!(
+            track::Entity::find_by_id("source-track")
+                .one(&db)
+                .await
+                .expect("query source track")
+                .expect("source survives")
+                .file_path,
+            "/music/destination.flac"
+        );
+
+        let entries = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(&playlist.id))
+            .order_by_asc(playlist_entry::Column::Position)
+            .all(&db)
+            .await
+            .expect("load overwrite playlist entries");
+        assert_eq!(entries[0].track_id.as_deref(), Some("source-track"));
+        assert_eq!(entries[1].track_id, None);
+    }
+
+    #[tokio::test]
+    async fn paired_rename_guard_rejection_rolls_back_every_database_change() {
+        let db = rename_test_database().await;
+        let source =
+            insert_rename_test_track(&db, "guard-source", "/music/guard-source.flac", "Source", 4)
+                .await;
+        let destination = insert_rename_test_track(
+            &db,
+            "guard-destination",
+            "/music/guard-destination.flac",
+            "Destination",
+            5,
+        )
+        .await;
+        let parsed = parsed_rename_track("/music/guard-destination.flac", "Changed");
+
+        assert!(matches!(
+            rename_track_row(
+                &db,
+                Path::new("/music/guard-source.flac"),
+                Path::new("/music/guard-destination.flac"),
+                Some(&parsed),
+                || false,
+            )
+            .await
+            .expect("reject commit guard"),
+            RenameTrackOutcome::GuardRejected
+        ));
+        assert_eq!(
+            track::Entity::find_by_id(&source.id)
+                .one(&db)
+                .await
+                .expect("reload guard source")
+                .expect("guard source remains"),
+            source
+        );
+        assert_eq!(
+            track::Entity::find_by_id(&destination.id)
+                .one(&db)
+                .await
+                .expect("reload guard destination")
+                .expect("guard destination remains"),
+            destination
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_rename_sql_failure_rolls_back_displacement_and_fk_updates() {
+        use crate::db::entities::playlist_entry;
+
+        let db = rename_test_database().await;
+        let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Rollback", false)
+            .await
+            .expect("create playlist");
+        let source = insert_rename_test_track(
+            &db,
+            "rollback-source",
+            "/music/rollback-source.flac",
+            "Source",
+            4,
+        )
+        .await;
+        let destination = insert_rename_test_track(
+            &db,
+            "rollback-destination",
+            "/music/rollback-destination.flac",
+            "Destination",
+            5,
+        )
+        .await;
+        manager
+            .add_track(&playlist.id, &source)
+            .await
+            .expect("add rollback source");
+        manager
+            .add_track(&playlist.id, &destination)
+            .await
+            .expect("add rollback destination");
+        let entries_before = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(&playlist.id))
+            .order_by_asc(playlist_entry::Column::Position)
+            .all(&db)
+            .await
+            .expect("load entries before rollback");
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_track_rename
+             BEFORE UPDATE OF file_path ON tracks
+             WHEN OLD.id = 'rollback-source'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected rename failure');
+             END",
+        )
+        .await
+        .expect("create failure trigger");
+        let parsed = parsed_rename_track("/music/rollback-destination.flac", "Changed");
+
+        assert!(rename_track_row(
+            &db,
+            Path::new("/music/rollback-source.flac"),
+            Path::new("/music/rollback-destination.flac"),
+            Some(&parsed),
+            || true,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            track::Entity::find_by_id(&source.id)
+                .one(&db)
+                .await
+                .expect("reload rollback source")
+                .expect("rollback source remains"),
+            source
+        );
+        assert_eq!(
+            track::Entity::find_by_id(&destination.id)
+                .one(&db)
+                .await
+                .expect("reload rollback destination")
+                .expect("rollback destination remains"),
+            destination
+        );
+        assert_eq!(
+            playlist_entry::Entity::find()
+                .filter(playlist_entry::Column::PlaylistId.eq(&playlist.id))
+                .order_by_asc(playlist_entry::Column::Position)
+                .all(&db)
+                .await
+                .expect("reload entries after rollback"),
+            entries_before
+        );
     }
 
     #[tokio::test]

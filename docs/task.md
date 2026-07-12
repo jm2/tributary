@@ -150,16 +150,26 @@ explicitly justified and time-bounded.
 - [x] Null existing dangling IDs before enabling the constraint.
 - [x] Reconcile newly orphaned entries after scans and watcher insertions.
 - [x] Test delete, rename, re-add, and full rebuild behavior.
-- [x] Record implementation: current worktree (commit pending); 12 focused migration,
+- [x] Record implementation: commit `8ec84a5`; 12 focused migration,
   reconciliation, and watcher-batch tests.
 
-### P1.2 Preserve identity across filesystem renames
+### P1.2 Preserve identity for authoritative filesystem renames
 
-- [ ] Treat paired file renames as transactional path updates.
-- [ ] Preserve UUID, `date_added`, play count, and playlist linkage.
-- [ ] Handle directory rename/removal by rescanning the affected subtree.
-- [ ] Define fallback behavior when rename pairing is unavailable.
-- [ ] Record implementation: _pending_
+- [x] Preserve event order and tracker metadata; normalize authoritative Linux and Windows
+  rename pairs without processing duplicate halves.
+- [x] Transactionally update same-root, same-format paired file paths while preserving UUID,
+  `date_added`, play count, playlist linkage, and mutable metadata.
+- [x] Reconcile directory changes, unpaired/unknown renames, cross-root moves, and format changes
+  with one hardened authoritative scan per watcher batch rather than guessing identity.
+- [x] Disable watcher symlink following so incremental indexing matches authoritative scans.
+- [x] Cover cross-platform event shapes, destination replacement, guard rejection, SQL rollback,
+  and playlist-FK preservation with eight focused tests.
+- [ ] Preserve descendant IDs for paired directory renames with a complete scoped path mapping;
+  the current full-scan fallback converges safely but replaces those track IDs.
+- [ ] Refresh queued local/playlist items by stable track ID so Next/EOS cannot retain the old
+  URI after a committed rename.
+- [ ] Record implementation: stacked P1.2 commit; paired-file core complete,
+  directory identity and playback-queue refresh remain.
 
 ### P1.3 Close the scan/watcher handoff gap
 
@@ -401,6 +411,11 @@ Record scope or design decisions here so deferred work is explicit.
   fingerprint plus optional duration identifies exactly one current track; ambiguous matches
   remain orphaned. Stable track identity across filesystem renames remains P1.2; safely
   refreshing an already-open playlist after background reconciliation remains P1.9.
+- 2026-07-12 — P1.2 preserves identity only for authoritative same-root, same-format pairs:
+  tracked Linux events and strictly adjacent Windows rename halves. Unpairable macOS/BSD events,
+  directory changes, cross-root moves, and format changes use a full hardened scan and never
+  infer identity from tags. Paired-directory descendant IDs and immutable playback-queue URI
+  refresh remain explicit P1.2 follow-ups.
 
 ## Completed work log
 
@@ -414,4 +429,4 @@ Add one line per completed task:
 | 2026-07-10 | P0.5 | PR #68 | One setup-time sidebar handler with current-item resolution and recycling tests. |
 | 2026-07-10 | P0.6 | PR #68 | Immutable release inputs and publication-only repository credentials. |
 | 2026-07-10 | P0.8 | PR #68 | Patched dependency graph and time-bounded informational advisory dispositions. |
-| 2026-07-12 | P1.1 | Current worktree | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
+| 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
