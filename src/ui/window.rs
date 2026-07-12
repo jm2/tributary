@@ -1660,14 +1660,30 @@ pub fn display_tracks(
 /// track lives without changing which track it is. Only the library can say
 /// where it moved to, and only the queue knows it is still holding it.
 fn refresh_playback_queue(session: &Rc<RefCell<PlaybackSession>>, objects: &[TrackObject]) {
-    let mut session = session.borrow_mut();
-    if !session.has_queue() {
+    let updates = {
+        let session = session.borrow();
+        let queue_ids = session.library_track_ids();
+        if queue_ids.is_empty() {
+            return;
+        }
+
+        // FullSync can contain tens of thousands of tracks. Scan the snapshot,
+        // but clone refresh metadata only for the usually small set the queue
+        // owns.
+        let mut updates = HashMap::with_capacity(queue_ids.len());
+        for track in objects {
+            let track_id = track.track_id();
+            if queue_ids.contains(track_id.as_str()) {
+                updates.insert(track_id, QueueTrackRefresh::from_track(track));
+            }
+        }
+        updates
+    };
+    if updates.is_empty() {
         return;
     }
 
-    let updates: HashMap<String, QueueTrackRefresh> =
-        objects.iter().map(QueueTrackRefresh::from_track).collect();
-    let refreshed = session.refresh_library_tracks(&updates);
+    let refreshed = session.borrow_mut().refresh_library_tracks(&updates);
     if refreshed > 0 {
         info!(
             refreshed,

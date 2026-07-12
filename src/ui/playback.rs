@@ -7,7 +7,7 @@
 //! - [`format_ms`] — format milliseconds as `m:ss` or `h:mm:ss`
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -59,17 +59,14 @@ pub struct QueueTrackRefresh {
 }
 
 impl QueueTrackRefresh {
-    pub fn from_track(track: &TrackObject) -> (String, Self) {
-        (
-            track.track_id(),
-            Self {
-                uri: track.uri(),
-                title: track.title(),
-                artist: track.artist(),
-                album: track.album(),
-                cover_art_url: track.cover_art_url(),
-            },
-        )
+    pub fn from_track(track: &TrackObject) -> Self {
+        Self {
+            uri: track.uri(),
+            title: track.title(),
+            artist: track.artist(),
+            album: track.album(),
+            cover_art_url: track.cover_art_url(),
+        }
     }
 }
 
@@ -177,8 +174,17 @@ impl PlaybackSession {
         self.event_generation = self.event_generation.next();
     }
 
-    pub fn has_queue(&self) -> bool {
-        !self.queue.is_empty()
+    /// Stable local-library IDs currently retained by the queue.
+    ///
+    /// A full library snapshot can be very large. Publishing this small set
+    /// lets the GTK receiver avoid cloning refresh metadata for tracks the
+    /// queue does not own, while preserving source namespacing.
+    pub(crate) fn library_track_ids(&self) -> HashSet<&str> {
+        self.queue
+            .iter()
+            .filter(|item| is_library_source(&item.identity.source_id))
+            .map(|item| item.identity.track_id.as_str())
+            .collect()
     }
 
     /// Re-resolve queued library items whose track the library just committed a
@@ -864,6 +870,11 @@ mod tests {
             vec![item("playlist:favourites", "a"), item("local", "a")],
             0,
         ));
+        assert_eq!(
+            session.library_track_ids(),
+            HashSet::from(["a"]),
+            "duplicate playlist/local occurrences need one snapshot lookup"
+        );
 
         assert_eq!(
             refresh(&mut session, "a", renamed("file:///music/renamed/a.flac")),
@@ -889,6 +900,11 @@ mod tests {
             ],
             0,
         ));
+        assert_eq!(
+            session.library_track_ids(),
+            HashSet::from(["a"]),
+            "only local-library sources participate in snapshot filtering"
+        );
 
         // "a" is a library UUID here, but a remote backend's native ID — and an
         // external file's URI — are namespaced by their own source.
