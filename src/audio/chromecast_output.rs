@@ -1,102 +1,1328 @@
-//! Chromecast audio output — streams audio to Chromecast devices
-//! discovered via `_googlecast._tcp.local.` mDNS browsing.
+//! Chromecast audio output using one ordered Cast V2 worker/session.
 //!
-//! Chromecast devices appear automatically in the output selector
-//! popover alongside AirPlay and MPD outputs — no manual configuration
-//! needed.
-//!
-//! # Implementation strategy
-//!
-//! This module implements `AudioOutput` using the `rust-cast` crate,
-//! a clean-room MIT-licensed implementation of the Cast V2 protocol.
-//! When a Chromecast output is selected, playback commands are sent
-//! over a TLS connection to the device on port 8009.
-//!
-//! The Cast V2 flow:
-//! 1. Connect to the device via TLS (port 8009)
-//! 2. Launch the Default Media Receiver application
-//! 3. Send `media.load()` with the stream URL
-//! 4. Control playback via media namespace commands (play, pause, seek, stop)
-//!
-//! # Discovery
-//!
-//! Chromecast devices are discovered via mDNS browsing for
-//! `_googlecast._tcp.local.` in [`crate::discovery`].  Discovered
-//! devices are surfaced as `DiscoveryEvent::Found` with
-//! `service_type: "chromecast"` and automatically added to the output
-//! selector.  The friendly name is extracted from the mDNS TXT record
-//! `fn` field.
-//!
-//! # Local file support
-//!
-//! Local `file:///` URIs are automatically rewritten to HTTP URLs
-//! served by [`CastHttpServer`](super::cast_http_server::CastHttpServer),
-//! a minimal LAN-only embedded server.  The server is started on-demand
-//! when the first local file is cast and remains running for the
-//! duration of the session.
-//!
-//! # Persistent connection
-//!
-//! A background thread maintains a persistent TLS connection to the
-//! Chromecast device, with a heartbeat PING every 5 seconds.  This
-//! keeps the Cast session alive and enables position polling.
+//! Chromecast devices are discovered via `_googlecast._tcp.local.` and are
+//! controlled with `rust_cast`. The crate's `CastDevice` is deliberately
+//! non-`Send`, so it is constructed, retained, used, and dropped entirely on
+//! one dedicated OS thread. Every load/control/poll enters that worker's FIFO
+//! command stream.
 
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tracing::{error, info};
 
 use super::cast_http_server::CastHttpServer;
 use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
 
-use tracing::{debug, error, info, warn};
-
-/// Default Media Receiver app ID — the built-in Google receiver that
-/// accepts arbitrary media URLs.
-const DEFAULT_MEDIA_RECEIVER_APP_ID: &str = "CC1AD845";
-
-/// Heartbeat interval in seconds.
 const HEARTBEAT_INTERVAL_SECS: u64 = 5;
-
-/// Position polling interval in seconds.
 const POSITION_POLL_INTERVAL_SECS: u64 = 1;
+const CLEANUP_RETRY_INTERVAL_SECS: u64 = 1;
+const MAX_CLEANUP_ATTEMPTS: u8 = 3;
+const WORKER_TICK_MS: u64 = 100;
 
 /// Chromecast audio output — streams to a Cast V2 device.
 pub struct ChromecastOutput {
-    /// Human-readable name from mDNS discovery (e.g. "Living Room Speaker").
-    /// Read by the `AudioOutput::name` trait method.
     #[allow(dead_code)]
     display_name: String,
-    /// Device hostname or IP address.
-    host: String,
-    /// Device port (typically 8009).
-    port: u16,
-    /// Event sender for relaying state changes to the GTK main thread.
     event_tx: async_channel::Sender<PlayerEvent>,
-    /// UI playback generation captured by each asynchronous Cast operation.
     event_generation: AtomicU64,
-    /// Cached volume level (0.0–1.0).
     volume: f64,
-    /// Shared playback state — updated optimistically on commands and
-    /// authoritatively from the polling loop's media status.
     current_state: Arc<Mutex<PlayerState>>,
-    /// Shared reference to the embedded HTTP server for local file casting.
     cast_server: Arc<Mutex<Option<CastHttpServer>>>,
-    /// Tokio runtime handle for spawning async tasks.
     rt_handle: Option<tokio::runtime::Handle>,
-    /// Monotonic session generation.  Bumped on every `cast_media`, `stop`,
-    /// and on `Drop`; each spawned polling thread captures the generation it
-    /// was started with and exits as soon as the shared counter advances past
-    /// it.  This cancels the previous session's thread (and its TLS
-    /// connection) on a manual track change so we don't leak threads or race
-    /// duplicate position/state/TrackEnded events.
-    session_generation: Arc<AtomicU64>,
+    intent_epoch: Arc<AtomicU64>,
+    worker_tx: mpsc::Sender<WorkerCommand>,
+}
+
+#[derive(Clone, Copy)]
+struct CommandOwner {
+    epoch: u64,
+    event_generation: PlayerEventGeneration,
+}
+
+struct WorkerCommand {
+    owner: CommandOwner,
+    kind: CommandKind,
+}
+
+// Deliberately not Debug: Load contains credential-bearing media URLs.
+enum CommandKind {
+    Load {
+        uri: String,
+        volume: f64,
+    },
+    RejectLoad {
+        failure: CastFailure,
+    },
+    Play,
+    Pause,
+    Toggle,
+    Stop,
+    Seek(u64),
+    Volume(f64),
+    Shutdown,
+    #[cfg(test)]
+    PollNow,
+    #[cfg(test)]
+    Fence(mpsc::Sender<()>),
+    #[cfg(test)]
+    Hold {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct WorkerTiming {
+    heartbeat: Duration,
+    poll: Duration,
+    cleanup_retry: Duration,
+    tick: Duration,
+}
+
+impl WorkerTiming {
+    fn production() -> Self {
+        Self {
+            heartbeat: Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
+            poll: Duration::from_secs(POSITION_POLL_INTERVAL_SECS),
+            cleanup_retry: Duration::from_secs(CLEANUP_RETRY_INTERVAL_SECS),
+            tick: Duration::from_millis(WORKER_TICK_MS),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CastFailure {
+    operation: &'static str,
+}
+
+impl CastFailure {
+    const fn new(operation: &'static str) -> Self {
+        Self { operation }
+    }
+}
+
+fn opaque_cast_failure<E>(operation: &'static str, _error: E) -> CastFailure {
+    CastFailure::new(operation)
+}
+
+type CastResult<T> = Result<T, CastFailure>;
+
+#[derive(Clone)]
+struct AppSession {
+    transport_id: String,
+    session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalReason {
+    Finished,
+    Stopped,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CastStatusSnapshot {
+    media_session_id: Option<i32>,
+    state: Option<PlayerState>,
+    position_ms: Option<u64>,
+    duration_ms: u64,
+    terminal: Option<TerminalReason>,
+}
+
+impl CastStatusSnapshot {
+    #[cfg(test)]
+    const fn loaded(media_session_id: i32) -> Self {
+        Self {
+            media_session_id: Some(media_session_id),
+            state: Some(PlayerState::Playing),
+            position_ms: Some(0),
+            duration_ms: 0,
+            terminal: None,
+        }
+    }
+}
+
+/// Factory moved into the worker. Its transport may remain non-`Send` because
+/// it is created and destroyed inside that same worker thread.
+trait CastConnector: Send + 'static {
+    type Transport: CastTransport + 'static;
+
+    fn connect(&mut self) -> CastResult<Self::Transport>;
+}
+
+trait CastTransport {
+    fn connect_receiver(&mut self) -> CastResult<()>;
+    fn set_volume(&mut self, level: f64) -> CastResult<()>;
+    fn launch_receiver(&mut self) -> CastResult<AppSession>;
+    fn connect_app(&mut self, app: &AppSession) -> CastResult<()>;
+    fn disconnect_app(&mut self, app: &AppSession) -> CastResult<()>;
+    fn stop_app(&mut self, app: &AppSession) -> CastResult<()>;
+    fn load(&mut self, app: &AppSession, uri: &str) -> CastResult<CastStatusSnapshot>;
+    fn play(&mut self, app: &AppSession, media_session_id: i32) -> CastResult<()>;
+    fn pause(&mut self, app: &AppSession, media_session_id: i32) -> CastResult<()>;
+    fn seek(&mut self, app: &AppSession, media_session_id: i32, position_ms: u64)
+        -> CastResult<()>;
+    fn stop(&mut self, app: &AppSession, media_session_id: i32) -> CastResult<()>;
+    fn heartbeat(&mut self) -> CastResult<()>;
+    fn status(&mut self, app: &AppSession, media_session_id: i32)
+        -> CastResult<CastStatusSnapshot>;
+}
+
+struct RustCastConnector {
+    host: String,
+    port: u16,
+}
+
+struct RustCastTransport {
+    device: rust_cast::CastDevice<'static>,
+}
+
+impl CastConnector for RustCastConnector {
+    type Transport = RustCastTransport;
+
+    fn connect(&mut self) -> CastResult<Self::Transport> {
+        // Cast devices use self-signed certificates with no verifiable host.
+        // This is inherent to Cast V2 and leaves the control channel exposed
+        // to endpoint impersonation on a hostile LAN (tracked in P1.6).
+        let device: rust_cast::CastDevice<'static> =
+            rust_cast::CastDevice::connect_without_host_verification(self.host.clone(), self.port)
+                .map_err(|error| opaque_cast_failure("TLS connection", error))?;
+        Ok(RustCastTransport { device })
+    }
+}
+
+impl CastTransport for RustCastTransport {
+    fn connect_receiver(&mut self) -> CastResult<()> {
+        self.device
+            .connection
+            .connect("receiver-0")
+            .map_err(|error| opaque_cast_failure("receiver channel connection", error))
+    }
+
+    fn set_volume(&mut self, level: f64) -> CastResult<()> {
+        self.device
+            .receiver
+            .set_volume(level.clamp(0.0, 1.0) as f32)
+            .map(|_| ())
+            .map_err(|error| opaque_cast_failure("volume update", error))
+    }
+
+    fn launch_receiver(&mut self) -> CastResult<AppSession> {
+        use rust_cast::channels::receiver::CastDeviceApp;
+
+        self.device
+            .receiver
+            .launch_app(&CastDeviceApp::DefaultMediaReceiver)
+            .map(|app| AppSession {
+                transport_id: app.transport_id,
+                session_id: app.session_id,
+            })
+            .map_err(|error| opaque_cast_failure("receiver launch", error))
+    }
+
+    fn connect_app(&mut self, app: &AppSession) -> CastResult<()> {
+        self.device
+            .connection
+            .connect(app.transport_id.clone())
+            .map_err(|error| opaque_cast_failure("application channel connection", error))
+    }
+
+    fn disconnect_app(&mut self, app: &AppSession) -> CastResult<()> {
+        self.device
+            .connection
+            .disconnect(app.transport_id.clone())
+            .map_err(|error| opaque_cast_failure("application channel disconnection", error))
+    }
+
+    fn stop_app(&mut self, app: &AppSession) -> CastResult<()> {
+        self.device
+            .receiver
+            .stop_app(app.session_id.clone())
+            .map_err(|error| opaque_cast_failure("receiver application stop", error))
+    }
+
+    fn load(&mut self, app: &AppSession, uri: &str) -> CastResult<CastStatusSnapshot> {
+        use rust_cast::channels::media::{Media, StreamType};
+
+        let stream_type = if is_live_uri(uri) {
+            StreamType::Live
+        } else {
+            StreamType::Buffered
+        };
+        let media = Media {
+            content_id: uri.to_string(),
+            content_type: guess_content_type(uri).to_string(),
+            stream_type,
+            duration: None,
+            metadata: None,
+        };
+        self.device
+            .media
+            .load(app.transport_id.clone(), app.session_id.clone(), &media)
+            .map(snapshot_from_status)
+            .map_err(|error| opaque_cast_failure("media load", error))
+    }
+
+    fn play(&mut self, app: &AppSession, media_session_id: i32) -> CastResult<()> {
+        self.device
+            .media
+            .play(app.transport_id.clone(), media_session_id)
+            .map(|_| ())
+            .map_err(|error| opaque_cast_failure("play command", error))
+    }
+
+    fn pause(&mut self, app: &AppSession, media_session_id: i32) -> CastResult<()> {
+        self.device
+            .media
+            .pause(app.transport_id.clone(), media_session_id)
+            .map(|_| ())
+            .map_err(|error| opaque_cast_failure("pause command", error))
+    }
+
+    fn seek(
+        &mut self,
+        app: &AppSession,
+        media_session_id: i32,
+        position_ms: u64,
+    ) -> CastResult<()> {
+        let seconds = (position_ms as f64 / 1000.0).min(f32::MAX as f64) as f32;
+        self.device
+            .media
+            .seek(
+                app.transport_id.clone(),
+                media_session_id,
+                Some(seconds),
+                None,
+            )
+            .map(|_| ())
+            .map_err(|error| opaque_cast_failure("seek command", error))
+    }
+
+    fn stop(&mut self, app: &AppSession, media_session_id: i32) -> CastResult<()> {
+        self.device
+            .media
+            .stop(app.transport_id.clone(), media_session_id)
+            .map(|_| ())
+            .map_err(|error| opaque_cast_failure("stop command", error))
+    }
+
+    fn heartbeat(&mut self) -> CastResult<()> {
+        self.device
+            .heartbeat
+            .ping()
+            .map_err(|error| opaque_cast_failure("heartbeat", error))
+    }
+
+    fn status(
+        &mut self,
+        app: &AppSession,
+        media_session_id: i32,
+    ) -> CastResult<CastStatusSnapshot> {
+        self.device
+            .media
+            .get_status(app.transport_id.clone(), Some(media_session_id))
+            .map(snapshot_from_status)
+            .map_err(|error| opaque_cast_failure("status poll", error))
+    }
+}
+
+fn snapshot_from_status(status: rust_cast::channels::media::Status) -> CastStatusSnapshot {
+    use rust_cast::channels::media::{IdleReason, PlayerState as CastPlayerState};
+
+    let Some(entry) = status.entries.first() else {
+        return CastStatusSnapshot {
+            media_session_id: None,
+            state: None,
+            position_ms: None,
+            duration_ms: 0,
+            terminal: Some(TerminalReason::Stopped),
+        };
+    };
+
+    let state = match entry.player_state {
+        CastPlayerState::Playing => Some(PlayerState::Playing),
+        CastPlayerState::Paused => Some(PlayerState::Paused),
+        CastPlayerState::Buffering => Some(PlayerState::Buffering),
+        // An IDLE entry without an idle reason is emitted while a receiver is
+        // starting or loading. Treat it as Buffering so a delayed receiver
+        // cannot leave Tributary reporting an earlier Playing state.
+        CastPlayerState::Idle => Some(PlayerState::Buffering),
+    };
+    let terminal = match entry.idle_reason {
+        Some(IdleReason::Finished) => Some(TerminalReason::Finished),
+        Some(IdleReason::Cancelled | IdleReason::Interrupted) => Some(TerminalReason::Stopped),
+        Some(IdleReason::Error) => Some(TerminalReason::Error),
+        None => None,
+    };
+
+    CastStatusSnapshot {
+        media_session_id: Some(entry.media_session_id),
+        state,
+        position_ms: entry.current_time.map(seconds_to_millis),
+        duration_ms: entry
+            .media
+            .as_ref()
+            .and_then(|media| media.duration)
+            .map(seconds_to_millis)
+            .unwrap_or(0),
+        terminal,
+    }
+}
+
+fn seconds_to_millis(seconds: f32) -> u64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return 0;
+    }
+    (f64::from(seconds) * 1000.0).min(u64::MAX as f64) as u64
+}
+
+struct WorkerSession<T> {
+    transport: T,
+    app: AppSession,
+    app_connected: bool,
+    media_session_id: Option<i32>,
+    owner: CommandOwner,
+    state: PlayerState,
+    retired: bool,
+    last_cleanup_attempt: Option<Instant>,
+    cleanup_attempts: u8,
+    last_heartbeat: Instant,
+    last_poll: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CleanupOutcome {
+    Completed,
+    Stale,
+    Failed(CastFailure),
+}
+
+fn spawn_cast_worker<C>(
+    connector: C,
+    intent_epoch: Arc<AtomicU64>,
+    current_state: Arc<Mutex<PlayerState>>,
+    event_tx: async_channel::Sender<PlayerEvent>,
+    timing: WorkerTiming,
+) -> mpsc::Sender<WorkerCommand>
+where
+    C: CastConnector,
+{
+    let (worker_tx, worker_rx) = mpsc::channel();
+    let spawn = std::thread::Builder::new()
+        .name("chromecast-worker".to_string())
+        .spawn(move || {
+            run_cast_worker(
+                connector,
+                worker_rx,
+                intent_epoch,
+                current_state,
+                event_tx,
+                timing,
+            );
+        });
+    if let Err(spawn_error) = spawn {
+        error!(error = %spawn_error, "Failed to spawn Chromecast worker");
+    }
+    worker_tx
+}
+
+fn run_cast_worker<C>(
+    mut connector: C,
+    worker_rx: mpsc::Receiver<WorkerCommand>,
+    intent_epoch: Arc<AtomicU64>,
+    current_state: Arc<Mutex<PlayerState>>,
+    event_tx: async_channel::Sender<PlayerEvent>,
+    timing: WorkerTiming,
+) where
+    C: CastConnector,
+{
+    let mut active: Option<WorkerSession<C::Transport>> = None;
+
+    loop {
+        let wait = match active.as_ref() {
+            Some(session) if session.retired => session
+                .last_cleanup_attempt
+                .map_or(Duration::ZERO, |last_attempt| {
+                    timing.cleanup_retry.saturating_sub(last_attempt.elapsed())
+                }),
+            Some(session) if session.media_session_id.is_some() => timing.tick,
+            _ => Duration::from_secs(3600),
+        };
+        match worker_rx.recv_timeout(wait) {
+            Ok(command) => {
+                let poll_after_command = match command.kind {
+                    CommandKind::Load { uri, volume } => {
+                        handle_load(
+                            &mut connector,
+                            &mut active,
+                            command.owner,
+                            uri,
+                            volume,
+                            &intent_epoch,
+                            &current_state,
+                            &event_tx,
+                        );
+                        true
+                    }
+                    CommandKind::RejectLoad { failure } => {
+                        match cleanup_session(&mut active, command.owner, &intent_epoch) {
+                            CleanupOutcome::Completed => fail_cast(
+                                command.owner,
+                                failure,
+                                &intent_epoch,
+                                &current_state,
+                                &event_tx,
+                            ),
+                            CleanupOutcome::Failed(cleanup_failure) => {
+                                let reported = if active.is_some() {
+                                    cleanup_failure
+                                } else {
+                                    error!(
+                                        operation = cleanup_failure.operation,
+                                        "Previous Chromecast cleanup stage failed after receiver stop"
+                                    );
+                                    failure
+                                };
+                                fail_cast(
+                                    command.owner,
+                                    reported,
+                                    &intent_epoch,
+                                    &current_state,
+                                    &event_tx,
+                                );
+                            }
+                            CleanupOutcome::Stale => {}
+                        }
+                        true
+                    }
+                    CommandKind::Stop => {
+                        match cleanup_session(&mut active, command.owner, &intent_epoch) {
+                            CleanupOutcome::Completed => {
+                                set_state_and_emit(
+                                    command.owner,
+                                    PlayerState::Stopped,
+                                    &intent_epoch,
+                                    &current_state,
+                                    &event_tx,
+                                );
+                            }
+                            CleanupOutcome::Failed(failure) => fail_cast(
+                                command.owner,
+                                failure,
+                                &intent_epoch,
+                                &current_state,
+                                &event_tx,
+                            ),
+                            CleanupOutcome::Stale => {}
+                        }
+                        true
+                    }
+                    CommandKind::Shutdown => {
+                        cleanup_unconditionally(&mut active);
+                        break;
+                    }
+                    #[cfg(test)]
+                    CommandKind::PollNow => {
+                        poll_active(
+                            &mut active,
+                            true,
+                            &intent_epoch,
+                            &current_state,
+                            &event_tx,
+                            timing,
+                        );
+                        false
+                    }
+                    #[cfg(test)]
+                    CommandKind::Fence(done) => {
+                        let _ = done.send(());
+                        false
+                    }
+                    #[cfg(test)]
+                    CommandKind::Hold { entered, release } => {
+                        let _ = entered.send(());
+                        let _ = release.recv_timeout(Duration::from_secs(2));
+                        false
+                    }
+                    kind => {
+                        handle_control(
+                            &mut active,
+                            command.owner,
+                            kind,
+                            &intent_epoch,
+                            &current_state,
+                            &event_tx,
+                        );
+                        true
+                    }
+                };
+                if active.as_ref().is_some_and(|session| session.retired) {
+                    retry_retired_cleanup(&mut active, &intent_epoch, timing);
+                } else if poll_after_command {
+                    poll_active(
+                        &mut active,
+                        false,
+                        &intent_epoch,
+                        &current_state,
+                        &event_tx,
+                        timing,
+                    );
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if active.as_ref().is_some_and(|session| session.retired) {
+                    retry_retired_cleanup(&mut active, &intent_epoch, timing);
+                } else {
+                    poll_active(
+                        &mut active,
+                        false,
+                        &intent_epoch,
+                        &current_state,
+                        &event_tx,
+                        timing,
+                    );
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                cleanup_unconditionally(&mut active);
+                break;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_load<C>(
+    connector: &mut C,
+    active: &mut Option<WorkerSession<C::Transport>>,
+    owner: CommandOwner,
+    uri: String,
+    volume: f64,
+    intent_epoch: &AtomicU64,
+    current_state: &Mutex<PlayerState>,
+    event_tx: &async_channel::Sender<PlayerEvent>,
+) where
+    C: CastConnector,
+{
+    match cleanup_session(active, owner, intent_epoch) {
+        CleanupOutcome::Completed => {}
+        CleanupOutcome::Failed(failure) => {
+            if active.is_some() {
+                fail_cast(owner, failure, intent_epoch, current_state, event_tx);
+                return;
+            }
+            error!(
+                operation = failure.operation,
+                "Previous Chromecast cleanup stage failed after receiver stop"
+            );
+        }
+        CleanupOutcome::Stale => return,
+    }
+    if !set_state_and_emit(
+        owner,
+        PlayerState::Buffering,
+        intent_epoch,
+        current_state,
+        event_tx,
+    ) {
+        return;
+    }
+
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    let transport = connector.connect();
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    let mut transport = match transport {
+        Ok(transport) => transport,
+        Err(failure) => {
+            fail_cast(owner, failure, intent_epoch, current_state, event_tx);
+            return;
+        }
+    };
+
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    let result = transport.connect_receiver();
+    if !finish_stage(result, owner, intent_epoch, current_state, event_tx) {
+        return;
+    }
+
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    let result = transport.set_volume(volume);
+    if !finish_stage(result, owner, intent_epoch, current_state, event_tx) {
+        return;
+    }
+
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    let app = transport.launch_receiver();
+    let app = match app {
+        Ok(app) => app,
+        Err(failure) => {
+            if is_current(owner, intent_epoch) {
+                fail_cast(owner, failure, intent_epoch, current_state, event_tx);
+            }
+            return;
+        }
+    };
+
+    // Record ownership before checking whether launch was superseded. A
+    // successful launch creates a receiver app even if its caller became
+    // stale while waiting, and the next queued intent must be able to stop it.
+    *active = Some(WorkerSession {
+        transport,
+        app,
+        app_connected: false,
+        media_session_id: None,
+        owner,
+        state: PlayerState::Buffering,
+        retired: false,
+        last_cleanup_attempt: None,
+        cleanup_attempts: 0,
+        last_heartbeat: Instant::now(),
+        last_poll: Instant::now(),
+    });
+
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    let result = {
+        let session = active.as_mut().expect("launched session recorded");
+        session.transport.connect_app(&session.app)
+    };
+    if result.is_ok() {
+        active
+            .as_mut()
+            .expect("launched session recorded")
+            .app_connected = true;
+    }
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    if let Err(failure) = result {
+        cleanup_then_fail(
+            active,
+            owner,
+            failure,
+            intent_epoch,
+            current_state,
+            event_tx,
+        );
+        return;
+    }
+
+    info!(
+        content_type = guess_content_type(&uri),
+        "Chromecast: loading media"
+    );
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    let loaded = {
+        let session = active.as_mut().expect("connected session recorded");
+        session.transport.load(&session.app, &uri)
+    };
+    if let Ok(status) = loaded.as_ref() {
+        if let Some(media_session_id) = status.media_session_id {
+            active
+                .as_mut()
+                .expect("connected session recorded")
+                .media_session_id = Some(media_session_id);
+        }
+    }
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    let loaded = match loaded {
+        Ok(loaded) => loaded,
+        Err(failure) => {
+            cleanup_then_fail(
+                active,
+                owner,
+                failure,
+                intent_epoch,
+                current_state,
+                event_tx,
+            );
+            return;
+        }
+    };
+    if loaded.media_session_id.is_none() {
+        cleanup_then_fail(
+            active,
+            owner,
+            CastFailure::new("media session creation"),
+            intent_epoch,
+            current_state,
+            event_tx,
+        );
+        return;
+    }
+
+    let initial_state = loaded.state.unwrap_or(PlayerState::Buffering);
+    active.as_mut().expect("loaded session recorded").state = initial_state;
+
+    match loaded.terminal {
+        Some(TerminalReason::Finished) => {
+            if let Some(session) = active.as_mut() {
+                session.media_session_id = None;
+            }
+            if let CleanupOutcome::Failed(failure) = cleanup_session(active, owner, intent_epoch) {
+                error!(operation = failure.operation, "Chromecast cleanup failed");
+            }
+            if set_state_and_emit(
+                owner,
+                PlayerState::Stopped,
+                intent_epoch,
+                current_state,
+                event_tx,
+            ) {
+                emit_if_current(
+                    owner,
+                    PlayerEvent::ended(owner.event_generation),
+                    intent_epoch,
+                    event_tx,
+                );
+            }
+            return;
+        }
+        Some(TerminalReason::Stopped) => {
+            if let Some(session) = active.as_mut() {
+                session.media_session_id = None;
+            }
+            cleanup_then_fail(
+                active,
+                owner,
+                CastFailure::new("media startup"),
+                intent_epoch,
+                current_state,
+                event_tx,
+            );
+            return;
+        }
+        Some(TerminalReason::Error) => {
+            cleanup_then_fail(
+                active,
+                owner,
+                CastFailure::new("media startup"),
+                intent_epoch,
+                current_state,
+                event_tx,
+            );
+            return;
+        }
+        None => {}
+    }
+
+    if initial_state != PlayerState::Buffering {
+        let _ = set_state_and_emit(owner, initial_state, intent_epoch, current_state, event_tx);
+    }
+    if let Some(position_ms) = loaded.position_ms {
+        emit_if_current(
+            owner,
+            PlayerEvent::position(owner.event_generation, position_ms, loaded.duration_ms),
+            intent_epoch,
+            event_tx,
+        );
+    }
+}
+
+fn finish_stage<T>(
+    result: CastResult<T>,
+    owner: CommandOwner,
+    intent_epoch: &AtomicU64,
+    current_state: &Mutex<PlayerState>,
+    event_tx: &async_channel::Sender<PlayerEvent>,
+) -> bool {
+    if !is_current(owner, intent_epoch) {
+        return false;
+    }
+    match result {
+        Ok(_) => true,
+        Err(failure) => {
+            fail_cast(owner, failure, intent_epoch, current_state, event_tx);
+            false
+        }
+    }
+}
+
+fn cleanup_then_fail<T>(
+    active: &mut Option<WorkerSession<T>>,
+    owner: CommandOwner,
+    failure: CastFailure,
+    intent_epoch: &AtomicU64,
+    current_state: &Mutex<PlayerState>,
+    event_tx: &async_channel::Sender<PlayerEvent>,
+) where
+    T: CastTransport,
+{
+    if let Some(session) = active.as_mut() {
+        session.retired = true;
+    }
+    let _ = cleanup_session(active, owner, intent_epoch);
+    if is_current(owner, intent_epoch) {
+        fail_cast(owner, failure, intent_epoch, current_state, event_tx);
+    }
+}
+
+fn handle_control<T>(
+    active: &mut Option<WorkerSession<T>>,
+    owner: CommandOwner,
+    kind: CommandKind,
+    intent_epoch: &AtomicU64,
+    current_state: &Mutex<PlayerState>,
+    event_tx: &async_channel::Sender<PlayerEvent>,
+) where
+    T: CastTransport,
+{
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    let Some(session) = active.as_mut() else {
+        return;
+    };
+    if session.owner.epoch != owner.epoch {
+        return;
+    }
+    if session.retired {
+        return;
+    }
+    let Some(media_session_id) = session.media_session_id else {
+        return;
+    };
+
+    let (result, new_state) = match kind {
+        CommandKind::Play => (
+            session.transport.play(&session.app, media_session_id),
+            Some(PlayerState::Playing),
+        ),
+        CommandKind::Pause => (
+            session.transport.pause(&session.app, media_session_id),
+            Some(PlayerState::Paused),
+        ),
+        CommandKind::Toggle => {
+            if matches!(session.state, PlayerState::Playing | PlayerState::Buffering) {
+                (
+                    session.transport.pause(&session.app, media_session_id),
+                    Some(PlayerState::Paused),
+                )
+            } else {
+                (
+                    session.transport.play(&session.app, media_session_id),
+                    Some(PlayerState::Playing),
+                )
+            }
+        }
+        CommandKind::Seek(position_ms) => (
+            session
+                .transport
+                .seek(&session.app, media_session_id, position_ms),
+            None,
+        ),
+        CommandKind::Volume(level) => (session.transport.set_volume(level), None),
+        _ => return,
+    };
+
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    if let Err(failure) = result {
+        cleanup_then_fail(
+            active,
+            owner,
+            failure,
+            intent_epoch,
+            current_state,
+            event_tx,
+        );
+        return;
+    }
+
+    if let Some(new_state) = new_state {
+        if let Some(session) = active.as_mut() {
+            session.state = new_state;
+        }
+        let _ = set_state_and_emit(owner, new_state, intent_epoch, current_state, event_tx);
+    }
+}
+
+fn poll_active<T>(
+    active: &mut Option<WorkerSession<T>>,
+    force: bool,
+    intent_epoch: &AtomicU64,
+    current_state: &Mutex<PlayerState>,
+    event_tx: &async_channel::Sender<PlayerEvent>,
+    timing: WorkerTiming,
+) where
+    T: CastTransport,
+{
+    let Some(session) = active.as_ref() else {
+        return;
+    };
+    let owner = session.owner;
+    if session.retired {
+        return;
+    }
+    let Some(media_session_id) = session.media_session_id else {
+        return;
+    };
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+
+    let heartbeat_due = force || session.last_heartbeat.elapsed() >= timing.heartbeat;
+    if heartbeat_due {
+        let result = active
+            .as_mut()
+            .expect("active session checked")
+            .transport
+            .heartbeat();
+        if !is_current(owner, intent_epoch) {
+            return;
+        }
+        if let Err(failure) = result {
+            cleanup_then_fail(
+                active,
+                owner,
+                failure,
+                intent_epoch,
+                current_state,
+                event_tx,
+            );
+            return;
+        }
+        if let Some(session) = active.as_mut() {
+            session.last_heartbeat = Instant::now();
+        }
+    }
+
+    let Some(session) = active.as_ref() else {
+        return;
+    };
+    if !force && session.last_poll.elapsed() < timing.poll {
+        return;
+    }
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    let status = {
+        let session = active.as_mut().expect("active session checked");
+        session.transport.status(&session.app, media_session_id)
+    };
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    let status = match status {
+        Ok(status) => status,
+        Err(failure) => {
+            cleanup_then_fail(
+                active,
+                owner,
+                failure,
+                intent_epoch,
+                current_state,
+                event_tx,
+            );
+            return;
+        }
+    };
+    if let Some(session) = active.as_mut() {
+        session.last_poll = Instant::now();
+        if let Some(media_session_id) = status.media_session_id {
+            session.media_session_id = Some(media_session_id);
+        }
+    }
+
+    match status.terminal {
+        Some(TerminalReason::Finished) => {
+            if let Some(session) = active.as_mut() {
+                session.media_session_id = None;
+            }
+            if let CleanupOutcome::Failed(failure) = cleanup_session(active, owner, intent_epoch) {
+                error!(operation = failure.operation, "Chromecast cleanup failed");
+            }
+            if set_state_and_emit(
+                owner,
+                PlayerState::Stopped,
+                intent_epoch,
+                current_state,
+                event_tx,
+            ) {
+                emit_if_current(
+                    owner,
+                    PlayerEvent::ended(owner.event_generation),
+                    intent_epoch,
+                    event_tx,
+                );
+            }
+            return;
+        }
+        Some(TerminalReason::Stopped) => {
+            if let Some(session) = active.as_mut() {
+                session.media_session_id = None;
+            }
+            if let CleanupOutcome::Failed(failure) = cleanup_session(active, owner, intent_epoch) {
+                error!(operation = failure.operation, "Chromecast cleanup failed");
+            }
+            let _ = set_state_and_emit(
+                owner,
+                PlayerState::Stopped,
+                intent_epoch,
+                current_state,
+                event_tx,
+            );
+            return;
+        }
+        Some(TerminalReason::Error) => {
+            cleanup_then_fail(
+                active,
+                owner,
+                CastFailure::new("remote playback"),
+                intent_epoch,
+                current_state,
+                event_tx,
+            );
+            return;
+        }
+        None => {}
+    }
+
+    if let Some(position_ms) = status.position_ms {
+        emit_if_current(
+            owner,
+            PlayerEvent::position(owner.event_generation, position_ms, status.duration_ms),
+            intent_epoch,
+            event_tx,
+        );
+    }
+    if let Some(state) = status.state {
+        let changed = active
+            .as_ref()
+            .is_some_and(|session| session.state != state);
+        if changed {
+            if let Some(session) = active.as_mut() {
+                session.state = state;
+            }
+            let _ = set_state_and_emit(owner, state, intent_epoch, current_state, event_tx);
+        }
+    }
+}
+
+fn cleanup_session<T>(
+    active: &mut Option<WorkerSession<T>>,
+    owner: CommandOwner,
+    intent_epoch: &AtomicU64,
+) -> CleanupOutcome
+where
+    T: CastTransport,
+{
+    if !is_current(owner, intent_epoch) {
+        return CleanupOutcome::Stale;
+    }
+    let Some(mut session) = active.take() else {
+        return CleanupOutcome::Completed;
+    };
+    session.retired = true;
+    let mut first_failure = None;
+
+    if !is_current(owner, intent_epoch) {
+        *active = Some(session);
+        return CleanupOutcome::Stale;
+    }
+    if let Some(media_session_id) = session.media_session_id {
+        match session.transport.stop(&session.app, media_session_id) {
+            Ok(()) => session.media_session_id = None,
+            Err(failure) => first_failure = Some(failure),
+        }
+        if !is_current(owner, intent_epoch) {
+            *active = Some(session);
+            return CleanupOutcome::Stale;
+        }
+    }
+
+    if session.app_connected {
+        match session.transport.disconnect_app(&session.app) {
+            Ok(()) => session.app_connected = false,
+            Err(failure) => {
+                first_failure.get_or_insert(failure);
+            }
+        }
+        if !is_current(owner, intent_epoch) {
+            *active = Some(session);
+            return CleanupOutcome::Stale;
+        }
+    }
+
+    let app_stop = session.transport.stop_app(&session.app);
+    if let Err(failure) = app_stop {
+        first_failure.get_or_insert(failure);
+        session.last_cleanup_attempt = Some(Instant::now());
+        session.cleanup_attempts = session.cleanup_attempts.saturating_add(1);
+        if session.cleanup_attempts < MAX_CLEANUP_ATTEMPTS {
+            *active = Some(session);
+        } else {
+            error!(
+                attempts = MAX_CLEANUP_ATTEMPTS,
+                "Abandoning unreachable Chromecast receiver application"
+            );
+        }
+    }
+    if !is_current(owner, intent_epoch) {
+        return CleanupOutcome::Stale;
+    }
+
+    match first_failure {
+        Some(failure) => CleanupOutcome::Failed(failure),
+        None => CleanupOutcome::Completed,
+    }
+}
+
+fn retry_retired_cleanup<T>(
+    active: &mut Option<WorkerSession<T>>,
+    intent_epoch: &AtomicU64,
+    timing: WorkerTiming,
+) where
+    T: CastTransport,
+{
+    let Some(session) = active.as_ref() else {
+        return;
+    };
+    if !session.retired {
+        return;
+    }
+    if session
+        .last_cleanup_attempt
+        .is_some_and(|last_attempt| last_attempt.elapsed() < timing.cleanup_retry)
+    {
+        return;
+    }
+    let owner = CommandOwner {
+        epoch: intent_epoch.load(Ordering::SeqCst),
+        event_generation: session.owner.event_generation,
+    };
+    let _ = cleanup_session(active, owner, intent_epoch);
+}
+
+fn cleanup_unconditionally<T>(active: &mut Option<WorkerSession<T>>)
+where
+    T: CastTransport,
+{
+    if let Some(mut session) = active.take() {
+        if let Some(media_session_id) = session.media_session_id {
+            let _ = session.transport.stop(&session.app, media_session_id);
+        }
+        if session.app_connected {
+            let _ = session.transport.disconnect_app(&session.app);
+        }
+        let _ = session.transport.stop_app(&session.app);
+    }
+}
+
+fn fail_cast(
+    owner: CommandOwner,
+    failure: CastFailure,
+    intent_epoch: &AtomicU64,
+    current_state: &Mutex<PlayerState>,
+    event_tx: &async_channel::Sender<PlayerEvent>,
+) {
+    fail_message(
+        owner,
+        cast_failure_message(failure),
+        intent_epoch,
+        current_state,
+        event_tx,
+    );
+}
+
+fn cast_failure_message(failure: CastFailure) -> String {
+    format!("Chromecast {} failed", failure.operation)
+}
+
+fn fail_message(
+    owner: CommandOwner,
+    message: String,
+    intent_epoch: &AtomicU64,
+    current_state: &Mutex<PlayerState>,
+    event_tx: &async_channel::Sender<PlayerEvent>,
+) {
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    error!(operation = %message, "Chromecast operation failed");
+    if set_state_and_emit(
+        owner,
+        PlayerState::Stopped,
+        intent_epoch,
+        current_state,
+        event_tx,
+    ) {
+        emit_if_current(
+            owner,
+            PlayerEvent::error(owner.event_generation, message),
+            intent_epoch,
+            event_tx,
+        );
+    }
+}
+
+fn set_state_and_emit(
+    owner: CommandOwner,
+    state: PlayerState,
+    intent_epoch: &AtomicU64,
+    current_state: &Mutex<PlayerState>,
+    event_tx: &async_channel::Sender<PlayerEvent>,
+) -> bool {
+    if !is_current(owner, intent_epoch) {
+        return false;
+    }
+    {
+        let mut current = current_state.lock().unwrap_or_else(|p| p.into_inner());
+        if !is_current(owner, intent_epoch) {
+            return false;
+        }
+        *current = state;
+        if !is_current(owner, intent_epoch) {
+            *current = PlayerState::Stopped;
+            return false;
+        }
+    }
+    emit_if_current(
+        owner,
+        PlayerEvent::state(owner.event_generation, state),
+        intent_epoch,
+        event_tx,
+    );
+    true
+}
+
+fn emit_if_current(
+    owner: CommandOwner,
+    event: PlayerEvent,
+    intent_epoch: &AtomicU64,
+    event_tx: &async_channel::Sender<PlayerEvent>,
+) {
+    if is_current(owner, intent_epoch) {
+        let _ = event_tx.try_send(event);
+    }
+}
+
+fn is_current(owner: CommandOwner, intent_epoch: &AtomicU64) -> bool {
+    intent_epoch.load(Ordering::SeqCst) == owner.epoch
 }
 
 impl ChromecastOutput {
-    /// Create a new Chromecast output targeting the given device.
-    ///
-    /// Does **not** establish a connection — that happens lazily on the
-    /// first playback command.
     pub fn new(
         display_name: &str,
         host: &str,
@@ -104,37 +1330,33 @@ impl ChromecastOutput {
         event_tx: async_channel::Sender<PlayerEvent>,
         initial_volume: f64,
     ) -> Self {
-        info!(
-            host = %host,
-            port,
-            name = %display_name,
-            "Chromecast output configured"
+        info!(host = %host, port, name = %display_name, "Chromecast output configured");
+        let current_state = Arc::new(Mutex::new(PlayerState::Stopped));
+        let intent_epoch = Arc::new(AtomicU64::new(0));
+        let worker_tx = spawn_cast_worker(
+            RustCastConnector {
+                host: host.to_string(),
+                port,
+            },
+            Arc::clone(&intent_epoch),
+            Arc::clone(&current_state),
+            event_tx.clone(),
+            WorkerTiming::production(),
         );
+
         Self {
             display_name: display_name.to_string(),
-            host: host.to_string(),
-            port,
             event_tx,
             event_generation: AtomicU64::new(0),
-            // Seed from the current slider value so switching to this device
-            // doesn't reset the effective volume to maximum.
             volume: initial_volume.clamp(0.0, 1.0),
-            current_state: Arc::new(Mutex::new(PlayerState::Stopped)),
+            current_state,
             cast_server: Arc::new(Mutex::new(None)),
-            // Set via `with_runtime()` when built from the output selector. The
-            // GTK main thread is not a tokio runtime context, so `try_current()`
-            // alone yields `None`; with a real handle, `file://` tracks are
-            // served by the embedded `CastHttpServer`. Without one (e.g. tests),
-            // local-file casting resolves to an error rather than casting.
             rt_handle: tokio::runtime::Handle::try_current().ok(),
-            session_generation: Arc::new(AtomicU64::new(0)),
+            intent_epoch,
+            worker_tx,
         }
     }
 
-    /// Attach the tokio runtime handle used to start the embedded
-    /// [`CastHttpServer`] for local-file casting. Called from the output
-    /// selector with the application's real runtime handle (the GTK main
-    /// thread has no ambient runtime).
     #[must_use]
     pub fn with_runtime(mut self, handle: tokio::runtime::Handle) -> Self {
         self.rt_handle = Some(handle);
@@ -145,495 +1367,77 @@ impl ChromecastOutput {
         PlayerEventGeneration::from_raw(self.event_generation.load(Ordering::SeqCst))
     }
 
-    /// Resolve a URI for Chromecast playback.
-    ///
-    /// If the URI is a `file://` path, starts the embedded HTTP server
-    /// (if not already running) and rewrites the URI to an HTTP URL.
-    /// Otherwise returns the URI unchanged.
-    fn resolve_uri(&self, uri: &str) -> Result<String, String> {
+    fn next_owner(&self) -> CommandOwner {
+        CommandOwner {
+            epoch: self.intent_epoch.fetch_add(1, Ordering::SeqCst) + 1,
+            event_generation: self.event_generation(),
+        }
+    }
+
+    fn current_owner(&self) -> CommandOwner {
+        CommandOwner {
+            epoch: self.intent_epoch.load(Ordering::SeqCst),
+            event_generation: self.event_generation(),
+        }
+    }
+
+    fn enqueue(&self, owner: CommandOwner, kind: CommandKind) -> bool {
+        if self.worker_tx.send(WorkerCommand { owner, kind }).is_ok() {
+            return true;
+        }
+        if is_current(owner, &self.intent_epoch) {
+            let _ = set_state_and_emit(
+                owner,
+                PlayerState::Stopped,
+                &self.intent_epoch,
+                &self.current_state,
+                &self.event_tx,
+            );
+            emit_if_current(
+                owner,
+                PlayerEvent::error(owner.event_generation, "Chromecast worker unavailable"),
+                &self.intent_epoch,
+                &self.event_tx,
+            );
+        }
+        false
+    }
+
+    fn resolve_uri(&self, uri: &str) -> CastResult<String> {
         if !uri.starts_with("file://") {
             return Ok(uri.to_string());
         }
 
-        // Decode the file path from the URI via the URL parser so reserved
-        // characters (spaces → %20, '#', '?', …) round-trip correctly on both
-        // Unix and Windows, rather than naive string-stripping.
         let file_path = url::Url::parse(uri)
             .ok()
-            .and_then(|u| u.to_file_path().ok())
-            .ok_or_else(|| format!("Invalid file URI: {uri}"))?;
-
+            .and_then(|url| url.to_file_path().ok())
+            .ok_or_else(|| CastFailure::new("local media URI validation"))?;
         if !file_path.exists() {
-            return Err(format!("File not found: {}", file_path.display()));
+            return Err(CastFailure::new("local media lookup"));
         }
-
-        // Canonicalize to resolve symlinks and prevent path traversal.
         let file_path = file_path
             .canonicalize()
-            .map_err(|e| format!("Failed to canonicalize path: {e}"))?;
+            .map_err(|error| opaque_cast_failure("local media canonicalization", error))?;
 
-        // Start the HTTP server if needed.
         let mut server_guard = self
             .cast_server
             .lock()
-            .map_err(|e| format!("Server lock poisoned: {e}"))?;
-
+            .map_err(|error| opaque_cast_failure("local media server state", error))?;
         if server_guard.is_none() {
-            let rt = self
+            let runtime = self
                 .rt_handle
                 .as_ref()
-                .ok_or("No tokio runtime available")?;
-
-            let server = rt
+                .ok_or_else(|| CastFailure::new("local media server startup"))?;
+            let server = runtime
                 .block_on(CastHttpServer::start())
-                .map_err(|e| format!("Failed to start cast HTTP server: {e}"))?;
-
+                .map_err(|error| opaque_cast_failure("local media server startup", error))?;
             info!(addr = %server.addr(), "Cast HTTP server started for local file casting");
             *server_guard = Some(server);
         }
-
-        let server = server_guard.as_ref().unwrap();
-        let http_url = server.register_file(&file_path);
-        Ok(http_url)
-    }
-
-    /// Connect to the Chromecast device, launch the Default Media
-    /// Receiver, and load the given media URL.
-    ///
-    /// Runs on a background thread to avoid blocking the GTK main thread.
-    /// Starts a heartbeat + position polling loop after successful load.
-    fn cast_media(&self, uri: &str) {
-        let host = self.host.clone();
-        let port = self.port;
-        let tx = self.event_tx.clone();
-        let event_generation = self.event_generation();
-        let volume = self.volume;
-        let state = Arc::clone(&self.current_state);
-
-        // Cancel any previous session's polling thread by advancing the
-        // generation; this thread owns `my_generation` and stops as soon as
-        // the shared counter moves past it.
-        let generation = Arc::clone(&self.session_generation);
-        let my_generation = self.session_generation.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Resolve file:// URIs to HTTP URLs.
-        let resolved_uri = match self.resolve_uri(uri) {
-            Ok(u) => u,
-            Err(e) => {
-                error!(error = %e, "Failed to resolve URI for casting");
-                let _ = tx.try_send(PlayerEvent::error(
-                    event_generation,
-                    format!("Chromecast: {e}"),
-                ));
-                return;
-            }
-        };
-
-        std::thread::spawn(move || {
-            match Self::cast_media_with_session(
-                &host,
-                port,
-                &resolved_uri,
-                volume,
-                tx.clone(),
-                state.clone(),
-                event_generation,
-                &generation,
-                my_generation,
-            ) {
-                Ok(()) => {}
-                Err(e) => {
-                    error!(error = %e, "Chromecast: media load failed");
-                    let _ = tx.try_send(PlayerEvent::error(
-                        event_generation,
-                        format!("Chromecast: {e}"),
-                    ));
-                    if let Ok(mut s) = state.lock() {
-                        *s = PlayerState::Stopped;
-                    }
-                }
-            }
-        });
-    }
-
-    /// Connect, launch app, load media, then maintain a persistent
-    /// connection with heartbeat and position polling.
-    #[allow(clippy::too_many_arguments)]
-    fn cast_media_with_session(
-        host: &str,
-        port: u16,
-        uri: &str,
-        volume: f64,
-        tx: async_channel::Sender<PlayerEvent>,
-        state: Arc<Mutex<PlayerState>>,
-        event_generation: PlayerEventGeneration,
-        generation: &AtomicU64,
-        my_generation: u64,
-    ) -> Result<(), String> {
-        use rust_cast::channels::media::StreamType;
-        use rust_cast::channels::receiver::CastDeviceApp;
-        use rust_cast::CastDevice;
-
-        info!(host = %host, port, "Chromecast: connecting via Cast V2");
-
-        // Host verification is disabled because Cast V2 devices present
-        // self-signed certificates with no verifiable hostname — this is
-        // inherent to the protocol, not a configurable weakness.  As a
-        // consequence the TLS channel is unauthenticated and session/transport
-        // ids and status fields are trusted as supplied by the peer; on a
-        // hostile LAN an IP impersonator could hijack the session.  Numeric
-        // fields from the device are handled with saturating casts below.
-        let device = CastDevice::connect_without_host_verification(host, port)
-            .map_err(|e| format!("TLS connect failed: {e}"))?;
-
-        debug!("Chromecast: connected, launching Default Media Receiver");
-
-        // Establish a connection to the receiver.
-        device
-            .connection
-            .connect("receiver-0")
-            .map_err(|e| format!("Connection channel failed: {e}"))?;
-
-        // Set volume on the device.
-        device
-            .receiver
-            .set_volume(volume as f32)
-            .map_err(|e| format!("Set volume failed: {e}"))?;
-
-        // Launch the Default Media Receiver app.
-        let app = device
-            .receiver
-            .launch_app(&CastDeviceApp::DefaultMediaReceiver)
-            .map_err(|e| format!("Launch app failed: {e}"))?;
-
-        let transport_id = app.transport_id.clone();
-
-        debug!(
-            transport_id = %transport_id,
-            "Chromecast: Default Media Receiver launched"
-        );
-
-        // Connect to the media application's transport.
-        device
-            .connection
-            .connect(&transport_id)
-            .map_err(|e| format!("App connection failed: {e}"))?;
-
-        // Determine content type from URI extension.
-        let content_type = guess_content_type(uri);
-
-        // Determine stream type.
-        let stream_type = if uri.contains("/radio/")
-            || std::path::Path::new(uri)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u8"))
-            || std::path::Path::new(uri)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("pls"))
-        {
-            StreamType::Live
-        } else {
-            StreamType::Buffered
-        };
-
-        info!(
-            uri_redacted = %crate::audio::redact_url_secrets(uri),
-            content_type = %content_type,
-            "Chromecast: loading media"
-        );
-
-        // Load the media URL on the Chromecast.
-        device
-            .media
-            .load(
-                &transport_id,
-                &app.session_id,
-                &rust_cast::channels::media::Media {
-                    content_id: uri.to_string(),
-                    content_type: content_type.to_string(),
-                    stream_type,
-                    duration: None,
-                    metadata: None,
-                },
-            )
-            .map_err(|e| format!("Media load failed: {e}"))?;
-
-        info!(host = %host, "Chromecast: media loaded successfully");
-
-        // Signal playing state.
-        if let Ok(mut s) = state.lock() {
-            *s = PlayerState::Playing;
-        }
-        let _ = tx.try_send(PlayerEvent::state(event_generation, PlayerState::Playing));
-
-        // ── Persistent connection: heartbeat + position polling ──────
-        //
-        // Keep the connection alive by sending PINGs and polling media
-        // status for position updates.
-        let heartbeat_interval = std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
-        let position_interval = std::time::Duration::from_secs(POSITION_POLL_INTERVAL_SECS);
-
-        let mut last_heartbeat = std::time::Instant::now();
-        let mut last_position_poll = std::time::Instant::now();
-
-        loop {
-            // Stop promptly if a newer session (or stop/Drop) superseded us,
-            // so we don't leak this thread + TLS connection or emit stale
-            // position/state events into the shared channel.
-            if generation.load(Ordering::SeqCst) != my_generation {
-                debug!("Chromecast: session superseded, ending poll loop");
-                break;
-            }
-
-            // Send heartbeat PING to keep the connection alive.
-            if last_heartbeat.elapsed() >= heartbeat_interval {
-                if let Err(e) = device.heartbeat.ping() {
-                    debug!(error = %e, "Chromecast: heartbeat failed, session ended");
-                    break;
-                }
-                last_heartbeat = std::time::Instant::now();
-            }
-
-            // Poll media status for position updates.
-            if last_position_poll.elapsed() >= position_interval {
-                match device.media.get_status(&transport_id, None) {
-                    Ok(status) => {
-                        if let Some(entry) = status.entries.first() {
-                            // Report position.
-                            if let Some(current_time) = entry.current_time {
-                                let position_ms = (current_time as f64 * 1000.0) as u64;
-                                let duration_ms = entry
-                                    .media
-                                    .as_ref()
-                                    .and_then(|m| m.duration)
-                                    .map(|d| (d as f64 * 1000.0) as u64)
-                                    .unwrap_or(0);
-
-                                let _ = tx.try_send(PlayerEvent::position(
-                                    event_generation,
-                                    position_ms,
-                                    duration_ms,
-                                ));
-                            }
-
-                            // Authoritative state from the device.
-                            use rust_cast::channels::media::PlayerState as CastPlayerState;
-                            let mapped = match entry.player_state {
-                                CastPlayerState::Playing => Some(PlayerState::Playing),
-                                CastPlayerState::Paused => Some(PlayerState::Paused),
-                                CastPlayerState::Buffering => Some(PlayerState::Buffering),
-                                CastPlayerState::Idle => None,
-                            };
-                            if let Some(new_state) = mapped {
-                                let prev = {
-                                    let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-                                    let prev = *s;
-                                    *s = new_state;
-                                    prev
-                                };
-                                if prev != new_state {
-                                    let _ = tx
-                                        .try_send(PlayerEvent::state(event_generation, new_state));
-                                }
-                            }
-
-                            // Check if playback has ended via idle_reason.
-                            use rust_cast::channels::media::IdleReason;
-                            match entry.idle_reason {
-                                Some(IdleReason::Finished) => {
-                                    info!("Chromecast: track ended");
-                                    if let Ok(mut s) = state.lock() {
-                                        *s = PlayerState::Stopped;
-                                    }
-                                    let _ = tx.try_send(PlayerEvent::ended(event_generation));
-                                    break;
-                                }
-                                Some(
-                                    IdleReason::Cancelled
-                                    | IdleReason::Error
-                                    | IdleReason::Interrupted,
-                                ) => {
-                                    info!(reason = ?entry.idle_reason, "Chromecast: playback ended");
-                                    if let Ok(mut s) = state.lock() {
-                                        *s = PlayerState::Stopped;
-                                    }
-                                    let _ = tx.try_send(PlayerEvent::state(
-                                        event_generation,
-                                        PlayerState::Stopped,
-                                    ));
-                                    break;
-                                }
-                                None => {
-                                    // Still playing — continue polling.
-                                }
-                            }
-                        } else {
-                            // No active media session — playback has ended.
-                            debug!("Chromecast: no active media session, stopping poll");
-                            if let Ok(mut s) = state.lock() {
-                                *s = PlayerState::Stopped;
-                            }
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "Chromecast: media status poll failed");
-                        if let Ok(mut s) = state.lock() {
-                            *s = PlayerState::Stopped;
-                        }
-                        break;
-                    }
-                }
-                last_position_poll = std::time::Instant::now();
-            }
-
-            // Sleep briefly to avoid busy-looping.
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        }
-
-        Ok(())
-    }
-
-    /// Send a simple Cast command (play, pause, stop) on a background thread.
-    ///
-    /// Opens a fresh connection per command (same pattern as MPD output).
-    /// A persistent connection will be added as a future optimisation.
-    fn send_cast_command(&self, command: CastCommand) {
-        let host = self.host.clone();
-        let port = self.port;
-        let tx = self.event_tx.clone();
-        let generation = self.event_generation();
-
-        std::thread::spawn(move || {
-            if let Err(e) = Self::send_cast_command_sync(&host, port, command) {
-                warn!(error = %e, "Chromecast: command failed");
-                let _ = tx.try_send(PlayerEvent::error(generation, format!("Chromecast: {e}")));
-            }
-        });
-    }
-
-    /// Synchronous Cast command sender (runs on background thread).
-    fn send_cast_command_sync(host: &str, port: u16, command: CastCommand) -> Result<(), String> {
-        use rust_cast::CastDevice;
-
-        // Host verification is unavoidably disabled for Cast V2 (self-signed
-        // device certs); see the rationale in `cast_media_with_session`.
-        let device = CastDevice::connect_without_host_verification(host, port)
-            .map_err(|e| format!("TLS connect failed: {e}"))?;
-
-        device
-            .connection
-            .connect("receiver-0")
-            .map_err(|e| format!("Connection channel failed: {e}"))?;
-
-        // Get the current app status to find the active session.
-        let status = device
-            .receiver
-            .get_status()
-            .map_err(|e| format!("Get status failed: {e}"))?;
-
-        let app = status
-            .applications
-            .into_iter()
-            .find(|a| a.app_id == DEFAULT_MEDIA_RECEIVER_APP_ID)
-            .ok_or_else(|| "Default Media Receiver not running".to_string())?;
-
-        let transport_id = app.transport_id.clone();
-
-        device
-            .connection
-            .connect(&transport_id)
-            .map_err(|e| format!("App connection failed: {e}"))?;
-
-        // Get media status to find the active media session ID.
-        let media_status = device
-            .media
-            .get_status(&transport_id, None)
-            .map_err(|e| format!("Get media status failed: {e}"))?;
-
-        let media_session_id = media_status
-            .entries
-            .first()
-            .map(|e| e.media_session_id)
-            .ok_or_else(|| "No active media session".to_string())?;
-
-        match command {
-            CastCommand::Play => {
-                debug!("Chromecast: sending play");
-                device
-                    .media
-                    .play(&transport_id, media_session_id)
-                    .map_err(|e| format!("Play failed: {e}"))?;
-            }
-            CastCommand::Pause => {
-                debug!("Chromecast: sending pause");
-                device
-                    .media
-                    .pause(&transport_id, media_session_id)
-                    .map_err(|e| format!("Pause failed: {e}"))?;
-            }
-            CastCommand::Stop => {
-                debug!("Chromecast: sending stop");
-                device
-                    .media
-                    .stop(&transport_id, media_session_id)
-                    .map_err(|e| format!("Stop failed: {e}"))?;
-            }
-            CastCommand::Seek(position_ms) => {
-                let position_secs = position_ms as f32 / 1000.0;
-                debug!(position_secs, "Chromecast: sending seek");
-                device
-                    .media
-                    .seek(&transport_id, media_session_id, Some(position_secs), None)
-                    .map_err(|e| format!("Seek failed: {e}"))?;
-            }
-            CastCommand::Volume(level) => {
-                debug!(level, "Chromecast: setting volume");
-                device
-                    .receiver
-                    .set_volume(level as f32)
-                    .map_err(|e| format!("Set volume failed: {e}"))?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Internal command enum for background-threaded Cast operations.
-#[derive(Debug, Clone, Copy)]
-enum CastCommand {
-    Play,
-    Pause,
-    Stop,
-    Seek(u64),
-    Volume(f64),
-}
-
-/// Guess a MIME content type from a URI's file extension.
-///
-/// Returns a reasonable default if the extension is not recognised.
-fn guess_content_type(uri: &str) -> &'static str {
-    // Strip query parameters before checking extension.
-    let path = uri.split('?').next().unwrap_or(uri);
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    match ext.as_str() {
-        "mp3" => "audio/mpeg",
-        "flac" => "audio/flac",
-        "ogg" | "oga" => "audio/ogg",
-        "opus" => "audio/opus",
-        "wav" => "audio/wav",
-        "aac" | "m4a" => "audio/mp4",
-        "aiff" | "aif" => "audio/aiff",
-        "m3u8" => "application/x-mpegURL",
-        "pls" => "audio/x-scpls",
-        // Default: let the Chromecast figure it out.
-        _ => "audio/mpeg",
+        Ok(server_guard
+            .as_ref()
+            .expect("server initialized")
+            .register_file(&file_path))
     }
 }
 
@@ -651,14 +1455,15 @@ impl AudioOutput for ChromecastOutput {
     }
 
     fn load_uri(&self, uri: &str) {
-        info!("Chromecast: loading URI");
-        self.cast_media(uri);
-
-        // Optimistically signal buffering.
-        let _ = self.event_tx.try_send(PlayerEvent::state(
-            self.event_generation(),
-            PlayerState::Buffering,
-        ));
+        let owner = self.next_owner();
+        let kind = match self.resolve_uri(uri) {
+            Ok(uri) => CommandKind::Load {
+                uri,
+                volume: self.volume,
+            },
+            Err(failure) => CommandKind::RejectLoad { failure },
+        };
+        let _ = self.enqueue(owner, kind);
     }
 
     fn set_event_generation(&self, generation: PlayerEventGeneration) {
@@ -667,72 +1472,28 @@ impl AudioOutput for ChromecastOutput {
     }
 
     fn play(&self) {
-        debug!("Chromecast: play");
-        if let Ok(mut s) = self.current_state.lock() {
-            *s = PlayerState::Playing;
-        }
-        self.send_cast_command(CastCommand::Play);
+        let _ = self.enqueue(self.current_owner(), CommandKind::Play);
     }
 
     fn pause(&self) {
-        debug!("Chromecast: pause");
-        if let Ok(mut s) = self.current_state.lock() {
-            *s = PlayerState::Paused;
-        }
-        self.send_cast_command(CastCommand::Pause);
+        let _ = self.enqueue(self.current_owner(), CommandKind::Pause);
     }
 
     fn stop(&self) {
-        debug!("Chromecast: stop");
-        // Cancel the active polling thread so it stops emitting events and
-        // releases its TLS connection.
-        self.session_generation.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut s) = self.current_state.lock() {
-            *s = PlayerState::Stopped;
-        }
-        self.send_cast_command(CastCommand::Stop);
-        let _ = self.event_tx.try_send(PlayerEvent::state(
-            self.event_generation(),
-            PlayerState::Stopped,
-        ));
+        let _ = self.enqueue(self.next_owner(), CommandKind::Stop);
     }
 
     fn toggle_play_pause(&self) {
-        debug!("Chromecast: toggle play/pause");
-        let current = self
-            .current_state
-            .lock()
-            .map(|s| *s)
-            .unwrap_or(PlayerState::Stopped);
-        match current {
-            PlayerState::Playing | PlayerState::Buffering => self.pause(),
-            PlayerState::Paused | PlayerState::Stopped => self.play(),
-        }
+        let _ = self.enqueue(self.current_owner(), CommandKind::Toggle);
     }
 
     fn seek_to(&self, position_ms: u64) {
-        debug!(position_ms, "Chromecast: seek");
-        self.send_cast_command(CastCommand::Seek(position_ms));
+        let _ = self.enqueue(self.current_owner(), CommandKind::Seek(position_ms));
     }
 
     fn set_volume(&mut self, level: f64) {
         self.volume = level.clamp(0.0, 1.0);
-        // Send volume command to the Chromecast device.
-        let host = self.host.clone();
-        let port = self.port;
-        let vol = self.volume;
-        let tx = self.event_tx.clone();
-        let generation = self.event_generation();
-
-        std::thread::spawn(move || {
-            if let Err(e) = Self::send_cast_command_sync(&host, port, CastCommand::Volume(vol)) {
-                warn!(error = %e, "Chromecast: volume command failed");
-                let _ = tx.try_send(PlayerEvent::error(
-                    generation,
-                    format!("Chromecast volume: {e}"),
-                ));
-            }
-        });
+        let _ = self.enqueue(self.current_owner(), CommandKind::Volume(self.volume));
     }
 
     fn volume(&self) -> f64 {
@@ -742,26 +1503,61 @@ impl AudioOutput for ChromecastOutput {
     fn state(&self) -> PlayerState {
         self.current_state
             .lock()
-            .map(|s| *s)
+            .map(|state| *state)
             .unwrap_or(PlayerState::Stopped)
     }
 
     fn position_ms(&self) -> Option<u64> {
-        // Position is now reported via the persistent connection's
-        // media status polling loop, which sends PositionChanged events.
-        // This method returns None because the position is delivered
-        // asynchronously via the event channel.
         None
     }
 }
 
 impl Drop for ChromecastOutput {
     fn drop(&mut self) {
-        // Signal any in-flight polling thread to stop so it doesn't keep
-        // emitting events into the shared channel (now driving a different
-        // output) or hold its TLS connection open after this output is
-        // replaced.
-        self.session_generation.fetch_add(1, Ordering::SeqCst);
+        let owner = self.next_owner();
+        let _ = self.worker_tx.send(WorkerCommand {
+            owner,
+            kind: CommandKind::Shutdown,
+        });
+    }
+}
+
+fn is_live_uri(uri: &str) -> bool {
+    uri.contains("/radio/")
+        || uri_path_extension(uri).is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("m3u8") || extension.eq_ignore_ascii_case("pls")
+        })
+}
+
+fn uri_path_extension(uri: &str) -> Option<&str> {
+    let path = uri.split('?').next().unwrap_or(uri);
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+}
+
+fn guess_content_type(uri: &str) -> &'static str {
+    let extension = uri_path_extension(uri).unwrap_or("");
+    if extension.eq_ignore_ascii_case("mp3") {
+        "audio/mpeg"
+    } else if extension.eq_ignore_ascii_case("flac") {
+        "audio/flac"
+    } else if extension.eq_ignore_ascii_case("ogg") || extension.eq_ignore_ascii_case("oga") {
+        "audio/ogg"
+    } else if extension.eq_ignore_ascii_case("opus") {
+        "audio/opus"
+    } else if extension.eq_ignore_ascii_case("wav") {
+        "audio/wav"
+    } else if extension.eq_ignore_ascii_case("aac") || extension.eq_ignore_ascii_case("m4a") {
+        "audio/mp4"
+    } else if extension.eq_ignore_ascii_case("aiff") || extension.eq_ignore_ascii_case("aif") {
+        "audio/aiff"
+    } else if extension.eq_ignore_ascii_case("m3u8") {
+        "application/x-mpegURL"
+    } else if extension.eq_ignore_ascii_case("pls") {
+        "audio/x-scpls"
+    } else {
+        "audio/mpeg"
     }
 }
 
@@ -769,52 +1565,1304 @@ impl Drop for ChromecastOutput {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_chromecast_output_name() {
-        let (tx, _rx) = async_channel::unbounded();
-        let output = ChromecastOutput::new("Living Room Speaker", "192.168.1.50", 8009, tx, 1.0);
-        assert_eq!(output.name(), "Living Room Speaker");
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Point {
+        Connect,
+        ReceiverConnect,
+        Volume,
+        Launch,
+        AppConnect,
+        AppDisconnect,
+        AppStop,
+        Load,
+        Play,
+        Pause,
+        Seek,
+        Stop,
+        Heartbeat,
+        Status,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Action {
+        Point(Point),
+        Seek(u64),
+        Stop(i32),
+        Volume(f64),
+    }
+
+    struct Gate {
+        point: Point,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    struct FakeShared {
+        actions: Mutex<Vec<Action>>,
+        gate: Mutex<Option<Gate>>,
+        fail_at: Mutex<Option<Point>>,
+        fail_once_at: Mutex<Option<Point>>,
+        notification: Mutex<Option<(Point, mpsc::Sender<()>)>>,
+        load_statuses: Mutex<VecDeque<CastStatusSnapshot>>,
+        statuses: Mutex<VecDeque<CastStatusSnapshot>>,
+    }
+
+    impl FakeShared {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                actions: Mutex::new(Vec::new()),
+                gate: Mutex::new(None),
+                fail_at: Mutex::new(None),
+                fail_once_at: Mutex::new(None),
+                notification: Mutex::new(None),
+                load_statuses: Mutex::new(VecDeque::new()),
+                statuses: Mutex::new(VecDeque::new()),
+            })
+        }
+
+        fn install_gate(self: &Arc<Self>, point: Point) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            *self.gate.lock().expect("gate lock") = Some(Gate {
+                point,
+                entered: entered_tx,
+                release: release_rx,
+            });
+            (entered_rx, release_tx)
+        }
+
+        fn record(&self, point: Point, action: Action) -> CastResult<()> {
+            self.actions.lock().expect("actions lock").push(action);
+            if let Some((notify_point, sender)) = self
+                .notification
+                .lock()
+                .expect("notification lock")
+                .as_ref()
+            {
+                if *notify_point == point {
+                    let _ = sender.send(());
+                }
+            }
+            let gate = {
+                let mut gate = self.gate.lock().expect("gate lock");
+                if gate.as_ref().is_some_and(|gate| gate.point == point) {
+                    gate.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(gate) = gate {
+                gate.entered
+                    .send(())
+                    .map_err(|_| CastFailure::new("test gate entry"))?;
+                gate.release
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| CastFailure::new("test gate release"))?;
+            }
+            if self.fail_at.lock().expect("failure lock").as_ref() == Some(&point) {
+                return Err(CastFailure::new(point.operation()));
+            }
+            let fail_once = {
+                let mut fail_once_at = self.fail_once_at.lock().expect("one-shot failure lock");
+                if fail_once_at.as_ref() == Some(&point) {
+                    *fail_once_at = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if fail_once {
+                return Err(CastFailure::new(point.operation()));
+            }
+            Ok(())
+        }
+
+        fn notify_on(&self, point: Point) -> mpsc::Receiver<()> {
+            let (sender, receiver) = mpsc::channel();
+            *self.notification.lock().expect("notification lock") = Some((point, sender));
+            receiver
+        }
+
+        fn actions(&self) -> Vec<Action> {
+            self.actions.lock().expect("actions lock").clone()
+        }
+
+        fn clear_actions(&self) {
+            self.actions.lock().expect("actions lock").clear();
+        }
+    }
+
+    impl Point {
+        const fn operation(self) -> &'static str {
+            match self {
+                Self::Connect => "test connect",
+                Self::ReceiverConnect => "test receiver connection",
+                Self::Volume => "test volume",
+                Self::Launch => "test launch",
+                Self::AppConnect => "test app connection",
+                Self::AppDisconnect => "test app disconnection",
+                Self::AppStop => "test app stop",
+                Self::Load => "test load",
+                Self::Play => "test play",
+                Self::Pause => "test pause",
+                Self::Seek => "test seek",
+                Self::Stop => "test stop",
+                Self::Heartbeat => "test heartbeat",
+                Self::Status => "test status",
+            }
+        }
+    }
+
+    struct FakeConnector {
+        shared: Arc<FakeShared>,
+    }
+
+    struct FakeTransport {
+        shared: Arc<FakeShared>,
+    }
+
+    impl CastConnector for FakeConnector {
+        type Transport = FakeTransport;
+
+        fn connect(&mut self) -> CastResult<Self::Transport> {
+            self.shared
+                .record(Point::Connect, Action::Point(Point::Connect))?;
+            Ok(FakeTransport {
+                shared: Arc::clone(&self.shared),
+            })
+        }
+    }
+
+    impl CastTransport for FakeTransport {
+        fn connect_receiver(&mut self) -> CastResult<()> {
+            self.shared.record(
+                Point::ReceiverConnect,
+                Action::Point(Point::ReceiverConnect),
+            )
+        }
+
+        fn set_volume(&mut self, level: f64) -> CastResult<()> {
+            self.shared.record(Point::Volume, Action::Volume(level))
+        }
+
+        fn launch_receiver(&mut self) -> CastResult<AppSession> {
+            self.shared
+                .record(Point::Launch, Action::Point(Point::Launch))?;
+            Ok(AppSession {
+                transport_id: "transport".to_string(),
+                session_id: "app-session".to_string(),
+            })
+        }
+
+        fn connect_app(&mut self, _app: &AppSession) -> CastResult<()> {
+            self.shared
+                .record(Point::AppConnect, Action::Point(Point::AppConnect))
+        }
+
+        fn disconnect_app(&mut self, _app: &AppSession) -> CastResult<()> {
+            self.shared
+                .record(Point::AppDisconnect, Action::Point(Point::AppDisconnect))
+        }
+
+        fn stop_app(&mut self, _app: &AppSession) -> CastResult<()> {
+            self.shared
+                .record(Point::AppStop, Action::Point(Point::AppStop))
+        }
+
+        fn load(&mut self, _app: &AppSession, _uri: &str) -> CastResult<CastStatusSnapshot> {
+            self.shared
+                .record(Point::Load, Action::Point(Point::Load))?;
+            Ok(self
+                .shared
+                .load_statuses
+                .lock()
+                .expect("load statuses lock")
+                .pop_front()
+                .unwrap_or_else(|| CastStatusSnapshot::loaded(42)))
+        }
+
+        fn play(&mut self, _app: &AppSession, _media_session_id: i32) -> CastResult<()> {
+            self.shared.record(Point::Play, Action::Point(Point::Play))
+        }
+
+        fn pause(&mut self, _app: &AppSession, _media_session_id: i32) -> CastResult<()> {
+            self.shared
+                .record(Point::Pause, Action::Point(Point::Pause))
+        }
+
+        fn seek(
+            &mut self,
+            _app: &AppSession,
+            _media_session_id: i32,
+            position_ms: u64,
+        ) -> CastResult<()> {
+            self.shared.record(Point::Seek, Action::Seek(position_ms))
+        }
+
+        fn stop(&mut self, _app: &AppSession, media_session_id: i32) -> CastResult<()> {
+            self.shared
+                .record(Point::Stop, Action::Stop(media_session_id))
+        }
+
+        fn heartbeat(&mut self) -> CastResult<()> {
+            self.shared
+                .record(Point::Heartbeat, Action::Point(Point::Heartbeat))
+        }
+
+        fn status(
+            &mut self,
+            _app: &AppSession,
+            _media_session_id: i32,
+        ) -> CastResult<CastStatusSnapshot> {
+            self.shared
+                .record(Point::Status, Action::Point(Point::Status))?;
+            Ok(self
+                .shared
+                .statuses
+                .lock()
+                .expect("statuses lock")
+                .pop_front()
+                .unwrap_or_else(|| CastStatusSnapshot::loaded(42)))
+        }
+    }
+
+    struct Harness {
+        tx: mpsc::Sender<WorkerCommand>,
+        epoch: Arc<AtomicU64>,
+        events: async_channel::Receiver<PlayerEvent>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Harness {
+        fn new(shared: Arc<FakeShared>) -> Self {
+            Self::new_with_timing(
+                shared,
+                WorkerTiming {
+                    heartbeat: Duration::from_secs(3600),
+                    poll: Duration::from_secs(3600),
+                    cleanup_retry: Duration::from_millis(10),
+                    tick: Duration::from_millis(10),
+                },
+            )
+        }
+
+        fn new_with_timing(shared: Arc<FakeShared>, timing: WorkerTiming) -> Self {
+            let (tx, rx) = mpsc::channel();
+            let epoch = Arc::new(AtomicU64::new(0));
+            let state = Arc::new(Mutex::new(PlayerState::Stopped));
+            let (event_tx, events) = async_channel::unbounded();
+            let epoch_for_worker = Arc::clone(&epoch);
+            let state_for_worker = Arc::clone(&state);
+            let worker = std::thread::spawn(move || {
+                run_cast_worker(
+                    FakeConnector { shared },
+                    rx,
+                    epoch_for_worker,
+                    state_for_worker,
+                    event_tx,
+                    timing,
+                );
+            });
+            Self {
+                tx,
+                epoch,
+                events,
+                worker: Some(worker),
+            }
+        }
+
+        fn next_owner(&self, generation: u64) -> CommandOwner {
+            CommandOwner {
+                epoch: self.epoch.fetch_add(1, Ordering::SeqCst) + 1,
+                event_generation: PlayerEventGeneration::from_raw(generation),
+            }
+        }
+
+        fn send(&self, owner: CommandOwner, kind: CommandKind) {
+            self.tx
+                .send(WorkerCommand { owner, kind })
+                .expect("worker command accepted");
+        }
+
+        fn fence(&self, owner: CommandOwner) {
+            let (done_tx, done_rx) = mpsc::channel();
+            self.send(owner, CommandKind::Fence(done_tx));
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("worker reached fence");
+        }
+
+        fn events(&self) -> Vec<PlayerEvent> {
+            let mut events = Vec::new();
+            while let Ok(event) = self.events.try_recv() {
+                events.push(event);
+            }
+            events
+        }
+
+        fn shutdown(mut self) {
+            let owner = self.next_owner(999);
+            self.send(owner, CommandKind::Shutdown);
+            self.worker
+                .take()
+                .expect("worker handle")
+                .join()
+                .expect("worker stopped");
+        }
     }
 
     #[test]
-    fn test_chromecast_output_type() {
+    fn delayed_load_is_superseded_before_any_later_side_effect() {
+        let shared = FakeShared::new();
+        let (entered, release) = shared.install_gate(Point::Connect);
+        let harness = Harness::new(Arc::clone(&shared));
+        let first = harness.next_owner(1);
+        harness.send(
+            first,
+            CommandKind::Load {
+                uri: "https://music.test/a?api_key=secret".to_string(),
+                volume: 0.5,
+            },
+        );
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first connect entered");
+        let second = harness.next_owner(2);
+        harness.send(
+            second,
+            CommandKind::Load {
+                uri: "https://music.test/b".to_string(),
+                volume: 0.5,
+            },
+        );
+        release.send(()).expect("release first connect");
+        harness.fence(second);
+
+        let actions = shared.actions();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Point(Point::Connect)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Point(Point::Load)))
+                .count(),
+            1
+        );
+        let events = harness.events();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged { generation, state: PlayerState::Playing }
+                if *generation == PlayerEventGeneration::from_raw(1)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged { generation, state: PlayerState::Playing }
+                if *generation == PlayerEventGeneration::from_raw(2)
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn stop_waiting_behind_load_uses_the_returned_media_id() {
+        let shared = FakeShared::new();
+        let (entered, release) = shared.install_gate(Point::Load);
+        let harness = Harness::new(Arc::clone(&shared));
+        let load = harness.next_owner(1);
+        harness.send(
+            load,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("load entered");
+        let stop = harness.next_owner(2);
+        harness.send(stop, CommandKind::Stop);
+        release.send(()).expect("release load");
+        harness.fence(stop);
+
+        assert!(shared.actions().contains(&Action::Stop(42)));
+        let events = harness.events();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged { generation, state: PlayerState::Playing }
+                if *generation == PlayerEventGeneration::from_raw(1)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged { generation, state: PlayerState::Stopped }
+                if *generation == PlayerEventGeneration::from_raw(2)
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn superseded_app_connect_cleans_the_partial_receiver() {
+        let shared = FakeShared::new();
+        let (entered, release) = shared.install_gate(Point::AppConnect);
+        let harness = Harness::new(Arc::clone(&shared));
+        let load = harness.next_owner(1);
+        harness.send(
+            load,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("app connection entered");
+        let stop = harness.next_owner(2);
+        harness.send(stop, CommandKind::Stop);
+        release.send(()).expect("release app connection");
+        harness.fence(stop);
+
+        let actions = shared.actions();
+        assert!(!actions.contains(&Action::Point(Point::Load)));
+        assert!(actions.ends_with(&[
+            Action::Point(Point::AppDisconnect),
+            Action::Point(Point::AppStop),
+        ]));
+        let events = harness.events();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged { generation, state: PlayerState::Playing }
+                | PlayerEvent::Error { generation, .. }
+                if *generation == PlayerEventGeneration::from_raw(1)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged { generation, state: PlayerState::Stopped }
+                if *generation == PlayerEventGeneration::from_raw(2)
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn superseded_delayed_stop_retains_cleanup_for_the_new_load() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let first = harness.next_owner(1);
+        harness.send(
+            first,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(first);
+        shared.clear_actions();
+        let _ = harness.events();
+
+        let (entered, release) = shared.install_gate(Point::Stop);
+        let stop = harness.next_owner(2);
+        harness.send(stop, CommandKind::Stop);
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stop entered");
+        let next = harness.next_owner(3);
+        harness.send(
+            next,
+            CommandKind::Load {
+                uri: "https://music.test/b".to_string(),
+                volume: 0.5,
+            },
+        );
+        release.send(()).expect("release stop");
+        harness.fence(next);
+
+        let actions = shared.actions();
+        let app_stop = actions
+            .iter()
+            .position(|action| *action == Action::Point(Point::AppStop))
+            .expect("old app stopped");
+        let new_load = actions
+            .iter()
+            .rposition(|action| *action == Action::Point(Point::Load))
+            .expect("new media loaded");
+        assert!(app_stop < new_load);
+        let events = harness.events();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged { generation, state: PlayerState::Stopped }
+                if *generation == PlayerEventGeneration::from_raw(2)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged { generation, state: PlayerState::Playing }
+                if *generation == PlayerEventGeneration::from_raw(3)
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn controls_remain_fifo_behind_a_delayed_command() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+
+        let (entered, release) = shared.install_gate(Point::Pause);
+        harness.send(owner, CommandKind::Pause);
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pause entered");
+        harness.send(owner, CommandKind::Seek(7_000));
+        harness.send(owner, CommandKind::Volume(0.25));
+        harness.send(owner, CommandKind::Play);
+        release.send(()).expect("release pause");
+        harness.fence(owner);
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Pause),
+                Action::Seek(7_000),
+                Action::Volume(0.25),
+                Action::Point(Point::Play),
+            ]
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn current_failure_is_buffering_then_stopped_then_url_free_error() {
+        let shared = FakeShared::new();
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Launch);
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a?api_key=secret-token".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        let events = harness.events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Buffering,
+                    ..
+                },
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+        let rendered = events
+            .iter()
+            .find_map(|event| match event {
+                PlayerEvent::Error { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .expect("error event");
+        assert!(!rendered.contains("api_key"));
+        assert!(!rendered.contains("secret-token"));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn control_failure_cleans_remote_media_before_error() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Pause);
+
+        harness.send(owner, CommandKind::Pause);
+        harness.fence(owner);
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Pause),
+                Action::Stop(42),
+                Action::Point(Point::AppDisconnect),
+                Action::Point(Point::AppStop),
+            ]
+        );
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn explicit_stop_failure_is_reported_after_best_effort_cleanup() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Stop);
+
+        let stop = harness.next_owner(2);
+        harness.send(stop, CommandKind::Stop);
+        harness.fence(stop);
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Stop(42),
+                Action::Point(Point::AppDisconnect),
+                Action::Point(Point::AppStop),
+            ]
+        );
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn failed_app_stop_retries_without_post_error_playback_events() {
+        let shared = FakeShared::new();
+        let harness = Harness::new_with_timing(
+            Arc::clone(&shared),
+            WorkerTiming {
+                heartbeat: Duration::from_secs(3600),
+                poll: Duration::from_secs(3600),
+                cleanup_retry: Duration::ZERO,
+                tick: Duration::from_secs(3600),
+            },
+        );
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+
+        let app_stops = shared.notify_on(Point::AppStop);
+        let (app_stop_entered, app_stop_release) = shared.install_gate(Point::AppStop);
+        *shared.fail_once_at.lock().expect("one-shot failure lock") = Some(Point::AppStop);
+        let stop = harness.next_owner(2);
+        harness.send(stop, CommandKind::Stop);
+        app_stop_entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first app stop entered");
+        app_stops
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first app stop attempted");
+
+        let (hold_entered_tx, hold_entered_rx) = mpsc::channel();
+        let (hold_release_tx, hold_release_rx) = mpsc::channel();
+        harness.send(
+            stop,
+            CommandKind::Hold {
+                entered: hold_entered_tx,
+                release: hold_release_rx,
+            },
+        );
+        app_stop_release.send(()).expect("release first app stop");
+        hold_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("queued command entered");
+        app_stops
+            .try_recv()
+            .expect("cleanup retried before queued command");
+        hold_release_tx.send(()).expect("release queued command");
+        harness.fence(stop);
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Stop(42),
+                Action::Point(Point::AppDisconnect),
+                Action::Point(Point::AppStop),
+                Action::Point(Point::AppStop),
+            ]
+        );
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn permanent_app_stop_failure_does_not_block_a_replacement_load_forever() {
+        let shared = FakeShared::new();
+        let harness = Harness::new_with_timing(
+            Arc::clone(&shared),
+            WorkerTiming {
+                heartbeat: Duration::from_secs(3600),
+                poll: Duration::from_secs(3600),
+                cleanup_retry: Duration::ZERO,
+                tick: Duration::from_secs(3600),
+            },
+        );
+        let first = harness.next_owner(1);
+        harness.send(
+            first,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(first);
+        shared.clear_actions();
+        let _ = harness.events();
+
+        let app_stops = shared.notify_on(Point::AppStop);
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::AppStop);
+        let stop = harness.next_owner(2);
+        harness.send(stop, CommandKind::Stop);
+        for _ in 0..MAX_CLEANUP_ATTEMPTS {
+            app_stops
+                .recv_timeout(Duration::from_secs(2))
+                .expect("bounded app stop attempt");
+        }
+        harness.fence(stop);
+        assert_eq!(
+            shared
+                .actions()
+                .iter()
+                .filter(|action| **action == Action::Point(Point::AppStop))
+                .count(),
+            usize::from(MAX_CLEANUP_ATTEMPTS)
+        );
+        let stop_events = harness.events();
+        assert!(matches!(
+            stop_events.as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+
+        let replacement = harness.next_owner(3);
+        harness.send(
+            replacement,
+            CommandKind::Load {
+                uri: "https://music.test/b".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(replacement);
+        assert!(harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged { generation, state: PlayerState::Playing }
+                if *generation == PlayerEventGeneration::from_raw(3)
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn heartbeat_failure_cleans_remote_media_before_error() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Heartbeat);
+
+        harness.send(owner, CommandKind::PollNow);
+        harness.fence(owner);
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Heartbeat),
+                Action::Stop(42),
+                Action::Point(Point::AppDisconnect),
+                Action::Point(Point::AppStop),
+            ]
+        );
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn status_failure_cleans_remote_media_before_error() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Status);
+
+        harness.send(owner, CommandKind::PollNow);
+        harness.fence(owner);
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Heartbeat),
+                Action::Point(Point::Status),
+                Action::Stop(42),
+                Action::Point(Point::AppDisconnect),
+                Action::Point(Point::AppStop),
+            ]
+        );
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn terminal_error_status_cleans_remote_media_before_error() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(CastStatusSnapshot {
+                terminal: Some(TerminalReason::Error),
+                ..CastStatusSnapshot::loaded(42)
+            });
+
+        harness.send(owner, CommandKind::PollNow);
+        harness.fence(owner);
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Heartbeat),
+                Action::Point(Point::Status),
+                Action::Stop(42),
+                Action::Point(Point::AppDisconnect),
+                Action::Point(Point::AppStop),
+            ]
+        );
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn initial_buffering_result_does_not_publish_playing() {
+        let shared = FakeShared::new();
+        shared
+            .load_statuses
+            .lock()
+            .expect("load statuses lock")
+            .push_back(CastStatusSnapshot {
+                media_session_id: Some(42),
+                state: Some(PlayerState::Buffering),
+                position_ms: Some(250),
+                duration_ms: 1_000,
+                terminal: None,
+            });
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+
+        let events = harness.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Buffering,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged {
+                state: PlayerState::Playing,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::PositionChanged {
+                position_ms: 250,
+                duration_ms: 1_000,
+                ..
+            }
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn terminal_error_load_result_cleans_remote_media() {
+        let shared = FakeShared::new();
+        shared
+            .load_statuses
+            .lock()
+            .expect("load statuses lock")
+            .push_back(CastStatusSnapshot {
+                terminal: Some(TerminalReason::Error),
+                ..CastStatusSnapshot::loaded(42)
+            });
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+
+        assert!(shared
+            .actions()
+            .windows(2)
+            .any(|pair| { pair == [Action::Point(Point::Load), Action::Stop(42)] }));
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Buffering,
+                    ..
+                },
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn queued_commands_do_not_starve_due_status_polls() {
+        let shared = FakeShared::new();
+        let (entered, release) = shared.install_gate(Point::Load);
+        let harness = Harness::new_with_timing(
+            Arc::clone(&shared),
+            WorkerTiming {
+                heartbeat: Duration::from_secs(3600),
+                poll: Duration::ZERO,
+                cleanup_retry: Duration::from_millis(10),
+                tick: Duration::from_secs(3600),
+            },
+        );
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("load entered");
+        harness.send(owner, CommandKind::Pause);
+        harness.send(owner, CommandKind::Seek(7_000));
+        release.send(()).expect("release load");
+        harness.fence(owner);
+
+        let actions = shared.actions();
+        let pause = actions
+            .iter()
+            .position(|action| *action == Action::Point(Point::Pause))
+            .expect("pause action");
+        let seek = actions
+            .iter()
+            .position(|action| *action == Action::Seek(7_000))
+            .expect("seek action");
+        assert!(actions[pause + 1..seek].contains(&Action::Point(Point::Status)));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn raw_cast_error_context_is_discarded() {
+        let failure = opaque_cast_failure(
+            "media load",
+            "request failed for https://music.test/cast/token-secret?api_key=query-secret",
+        );
+        let message = cast_failure_message(failure);
+        assert_eq!(message, "Chromecast media load failed");
+        assert!(!message.contains("token-secret"));
+        assert!(!message.contains("query-secret"));
+    }
+
+    #[test]
+    fn invalid_local_uri_error_is_secret_free() {
+        let (event_tx, events) = async_channel::unbounded();
+        let output = ChromecastOutput::new("Living Room", "127.0.0.1", 8009, event_tx, 1.0);
+        output.load_uri("file://[cast-secret-token");
+        let owner = output.current_owner();
+        let (done_tx, done_rx) = mpsc::channel();
+        assert!(output.enqueue(owner, CommandKind::Fence(done_tx)));
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker reached fence");
+
+        let rendered = std::iter::from_fn(|| events.try_recv().ok())
+            .find_map(|event| match event {
+                PlayerEvent::Error { message, .. } => Some(message),
+                _ => None,
+            })
+            .expect("error event");
+        assert_eq!(rendered, "Chromecast local media URI validation failed");
+        assert!(!rendered.contains("cast-secret-token"));
+        assert!(!rendered.contains("file://"));
+    }
+
+    #[test]
+    fn stale_finished_poll_cannot_end_a_newer_load() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let first = harness.next_owner(1);
+        harness.send(
+            first,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(first);
+        let _ = harness.events();
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(CastStatusSnapshot {
+                terminal: Some(TerminalReason::Finished),
+                ..CastStatusSnapshot::loaded(42)
+            });
+        let (entered, release) = shared.install_gate(Point::Status);
+        harness.send(first, CommandKind::PollNow);
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("status entered");
+        let second = harness.next_owner(2);
+        harness.send(
+            second,
+            CommandKind::Load {
+                uri: "https://music.test/b".to_string(),
+                volume: 0.5,
+            },
+        );
+        release.send(()).expect("release status");
+        harness.fence(second);
+
+        let events = harness.events();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::TrackEnded { generation }
+                if *generation == PlayerEventGeneration::from_raw(1)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged { generation, state: PlayerState::Playing }
+                if *generation == PlayerEventGeneration::from_raw(2)
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn finished_status_emits_track_ended_exactly_once() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        let _ = harness.events();
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(CastStatusSnapshot {
+                terminal: Some(TerminalReason::Finished),
+                ..CastStatusSnapshot::loaded(42)
+            });
+        harness.send(owner, CommandKind::PollNow);
+        harness.send(owner, CommandKind::PollNow);
+        harness.fence(owner);
+        let events = harness.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+                .count(),
+            1
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn shutdown_cleans_active_media_without_emitting_events() {
+        let shared = FakeShared::new();
+        let mut harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        let _ = harness.events();
+        shared.clear_actions();
+        let shutdown = harness.next_owner(2);
+        harness.send(shutdown, CommandKind::Shutdown);
+        harness
+            .worker
+            .take()
+            .expect("worker handle")
+            .join()
+            .expect("worker stopped");
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Stop(42),
+                Action::Point(Point::AppDisconnect),
+                Action::Point(Point::AppStop),
+            ]
+        );
+        assert!(harness.events().is_empty());
+    }
+
+    #[test]
+    fn test_chromecast_output_name_type_volume_and_initial_state() {
         let (tx, _rx) = async_channel::unbounded();
-        let output = ChromecastOutput::new("Test", "127.0.0.1", 8009, tx, 1.0);
+        let mut output = ChromecastOutput::new("Living Room", "127.0.0.1", 8009, tx, 1.0);
+        assert_eq!(output.name(), "Living Room");
         assert_eq!(output.output_type(), OutputType::Chromecast);
-    }
-
-    #[test]
-    fn test_chromecast_supports_volume() {
-        let (tx, _rx) = async_channel::unbounded();
-        let output = ChromecastOutput::new("Test", "127.0.0.1", 8009, tx, 1.0);
         assert!(output.supports_volume());
-    }
-
-    #[test]
-    fn test_chromecast_volume_clamp() {
-        let (tx, _rx) = async_channel::unbounded();
-        // Use a non-routable IP and unusual port to prevent actual connection attempts.
-        let mut output = ChromecastOutput::new("Test", "192.0.2.1", 1, tx, 1.0);
-        // Note: set_volume spawns a thread that will fail to connect,
-        // but the volume field is updated synchronously.
-        output.volume = 1.5_f64.clamp(0.0, 1.0);
-        assert!((output.volume() - 1.0).abs() < f64::EPSILON);
-        output.volume = (-0.5_f64).clamp(0.0, 1.0);
-        assert!((output.volume() - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_chromecast_initial_state() {
-        let (tx, _rx) = async_channel::unbounded();
-        let output = ChromecastOutput::new("Test", "127.0.0.1", 8009, tx, 1.0);
         assert_eq!(output.state(), PlayerState::Stopped);
-    }
-
-    #[test]
-    fn test_chromecast_no_position() {
-        let (tx, _rx) = async_channel::unbounded();
-        let output = ChromecastOutput::new("Test", "127.0.0.1", 8009, tx, 1.0);
         assert!(output.position_ms().is_none());
+        output.set_volume(1.5);
+        assert!((output.volume() - 1.0).abs() < f64::EPSILON);
+        output.set_volume(-0.5);
+        assert!(output.volume().abs() < f64::EPSILON);
     }
 
     #[test]
@@ -847,15 +2895,38 @@ mod tests {
             guess_content_type("http://example.com/stream.m3u8"),
             "application/x-mpegURL"
         );
-        // With query parameters.
         assert_eq!(
             guess_content_type("http://example.com/song.flac?token=abc"),
             "audio/flac"
         );
-        // Unknown extension falls back to audio/mpeg.
         assert_eq!(
             guess_content_type("http://example.com/stream"),
             "audio/mpeg"
         );
+    }
+
+    #[test]
+    fn idle_status_without_reason_maps_to_buffering() {
+        use rust_cast::channels::media::{PlayerState as CastPlayerState, Status, StatusEntry};
+
+        let snapshot = snapshot_from_status(Status {
+            request_id: 1,
+            entries: vec![StatusEntry {
+                media_session_id: 42,
+                media: None,
+                playback_rate: 0.0,
+                player_state: CastPlayerState::Idle,
+                current_item_id: None,
+                loading_item_id: None,
+                preloaded_item_id: None,
+                idle_reason: None,
+                extended_status: None,
+                current_time: None,
+                supported_media_commands: 0,
+            }],
+        });
+
+        assert_eq!(snapshot.state, Some(PlayerState::Buffering));
+        assert_eq!(snapshot.terminal, None);
     }
 }
