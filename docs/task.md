@@ -184,14 +184,17 @@ explicitly justified and time-bounded.
 
 ### P1.4 Enforce exact-origin authenticated redirects
 
-- [ ] Disable automatic `Referer` for every credential-bearing client.
-- [ ] Compare scheme, hostname, and effective port.
-- [ ] Forbid HTTPS-to-HTTP downgrade.
-- [ ] Apply the policy to API, stream, artwork, and DAAP clients.
-- [ ] Strip credential-bearing URLs from every retained/formatted error.
-- [ ] Stop logging raw DAAP session IDs and authenticated MPD commands.
-- [ ] Add redirect matrix tests using mock servers.
-- [ ] Record implementation: _pending_
+- [x] Disable automatic `Referer` for every app-owned credential-bearing HTTP client.
+- [x] Compare scheme, hostname, and effective port.
+- [x] Forbid HTTPS-to-HTTP downgrade.
+- [x] Apply the policy to app-owned API, authentication, artwork, and DAAP clients.
+- [ ] Route credential-bearing playback streams through the P1.6 app-owned proxy so local,
+  AirPlay, MPD, and Chromecast no longer depend on redirect policies Tributary cannot control.
+- [x] Strip credential-bearing URLs from every retained/formatted HTTP or pipeline error.
+- [x] Stop logging raw DAAP session IDs and authenticated MPD commands.
+- [x] Add redirect matrix tests using mock servers.
+- [x] Record implementation: commit `eb5458f`; 17 focused origin, redirect, Referer, header,
+  redaction, userinfo, DAAP, and MPD tests.
 
 ### P1.5 Enforce response limits while streaming
 
@@ -205,7 +208,8 @@ explicitly justified and time-bounded.
 
 - [ ] Define an opaque short-lived media proxy/ticket design.
 - [ ] Keep backend credentials outside generic `Track` values.
-- [ ] Proxy or mint least-privilege URLs for Chromecast and MPD.
+- [ ] Proxy credential-bearing streams for local, AirPlay, MPD, and Chromecast, and apply the
+  shared exact-origin policy to the proxy's upstream client.
 - [ ] Expire/revoke proxy registrations when playback/session ends.
 - [ ] Threat-model spoofed and compromised LAN receivers.
 - [ ] Record implementation: _pending_
@@ -466,6 +470,16 @@ Record scope or design decisions here so deferred work is explicit.
   The resulting filesystem/database state is reconciled, but eliminating that narrow identity
   boundary requires a future two-phase, non-destructive bootstrap scan rather than guessing from
   file metadata.
+- 2026-07-12 — P1.4 centralizes every app-owned credential-bearing reqwest client behind a
+  no-`Referer`, ten-hop, exact-origin policy comparing HTTP(S) scheme, normalized host, and
+  effective port. Request URLs are removed before reqwest errors are formatted or retained;
+  URL userinfo and backend query credentials are rejected or redacted; DAAP session IDs and MPD
+  command arguments are no longer logged; and GStreamer errors use stable URL-free diagnostics.
+  Direct playback remains deliberately open under P1.6: local and AirPlay streams are fetched by
+  GStreamer, while MPD and Chromecast fetch on external receivers, so Tributary cannot enforce an
+  upstream redirect callback on those transports until it owns the stream through a short-lived
+  proxy/ticket. Disabling redirects only for GStreamer would be both incomplete and potentially
+  breaking, so the playback-stream checkbox remains explicit rather than being claimed complete.
 
 ## Completed work log
 
@@ -482,3 +496,4 @@ Add one line per completed task:
 | 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
 | 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |
 | 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
+| 2026-07-12 | P1.4a | `eb5458f` | Exact-origin/no-Referer policy and URL-free errors/logging cover every app-owned credential HTTP fetch; receiver-controlled playback streams remain tied to P1.6. |
