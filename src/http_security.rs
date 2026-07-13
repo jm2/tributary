@@ -1,4 +1,11 @@
-//! Shared hardening for HTTP clients that carry authentication credentials.
+//! Shared hardening for the application's outbound HTTP clients.
+//!
+//! Clients come in two shapes. Credential-bearing clients talk to a server the
+//! user authenticated against and must never carry those credentials anywhere
+//! but that exact origin. Public clients talk to third-party services with no
+//! credential attached; they may legitimately be redirected across hosts, but
+//! they still must not be walked down to plaintext HTTP or leak the requested
+//! URL through a `Referer` header.
 
 use reqwest::Url;
 
@@ -17,6 +24,20 @@ pub fn authenticated_blocking_client_builder() -> reqwest::blocking::ClientBuild
     reqwest::blocking::Client::builder()
         .referer(false)
         .redirect(authenticated_redirect_policy())
+}
+
+/// Start an asynchronous client builder for requests that carry no credentials.
+pub fn public_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .referer(false)
+        .redirect(public_redirect_policy())
+}
+
+/// Start a blocking client builder for requests that carry no credentials.
+pub fn public_blocking_client_builder() -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder()
+        .referer(false)
+        .redirect(public_redirect_policy())
 }
 
 /// Remove a request URL before an HTTP error is retained or displayed.
@@ -120,11 +141,41 @@ fn authenticated_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+/// Redirect policy for requests that carry no credentials.
+///
+/// Radio-Browser mirrors, MusicBrainz, and the geolocation providers all
+/// redirect across hosts as a matter of course, so the exact-origin rule used
+/// for authenticated clients would simply break them. What they must never do
+/// is follow a redirect from HTTPS down to plaintext HTTP, which would expose
+/// the request — including a user's coarse location — to any network observer.
+fn public_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+
+        if attempt
+            .previous()
+            .last()
+            .is_some_and(|previous| downgrades_to_plaintext(previous, attempt.url()))
+        {
+            attempt.stop()
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 fn same_http_origin(left: &Url, right: &Url) -> bool {
     matches!(left.scheme(), "http" | "https")
         && left.scheme() == right.scheme()
         && left.host() == right.host()
         && left.port_or_known_default() == right.port_or_known_default()
+}
+
+/// True when a redirect walks an HTTPS request down to plaintext.
+fn downgrades_to_plaintext(from: &Url, to: &Url) -> bool {
+    from.scheme() == "https" && to.scheme() != "https"
 }
 
 #[cfg(test)]
@@ -423,6 +474,45 @@ mod tests {
         assert!(!display.contains("password"));
         assert!(!display.contains("secret"));
         let _ = request_rx.recv().expect("error request");
+    }
+
+    #[test]
+    fn public_policy_rejects_only_plaintext_downgrades() {
+        assert!(downgrades_to_plaintext(
+            &url("https://radio.example/start"),
+            &url("http://radio.example/next")
+        ));
+        // A cross-host hop that stays on HTTPS is how the Radio-Browser and
+        // MusicBrainz mirrors actually work, so it must remain allowed.
+        assert!(!downgrades_to_plaintext(
+            &url("https://radio.example/start"),
+            &url("https://mirror.example/next")
+        ));
+        assert!(!downgrades_to_plaintext(
+            &url("http://radio.example/start"),
+            &url("http://mirror.example/next")
+        ));
+    }
+
+    #[test]
+    fn public_policy_follows_cross_origin_redirects_without_a_referer() {
+        let (destination, destination_rx) = spawn_one_response("200 OK", None);
+        let (origin, origin_rx) = spawn_one_response("302 Found", Some(destination));
+
+        let response = public_blocking_client_builder()
+            .build()
+            .expect("build public client")
+            .get(format!("http://{origin}/start"))
+            .send()
+            .expect("cross-origin redirect must be followed");
+        assert!(response.status().is_success());
+
+        let _ = origin_rx.recv().expect("origin request");
+        let redirected = destination_rx
+            .recv()
+            .expect("redirected request")
+            .to_ascii_lowercase();
+        assert!(!redirected.contains("referer:"));
     }
 
     #[test]

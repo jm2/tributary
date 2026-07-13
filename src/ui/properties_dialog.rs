@@ -524,7 +524,7 @@ fn musicbrainz_lookup(title: &str, artist: &str) -> Option<MusicBrainzResult> {
         urlencoding::encode(&query)
     );
 
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::http_security::public_blocking_client_builder()
         .timeout(MUSICBRAINZ_TIMEOUT)
         .user_agent("Tributary/0.3.0 (https://github.com/jm2/tributary)")
         .build()

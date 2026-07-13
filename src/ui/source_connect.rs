@@ -421,11 +421,13 @@ pub fn setup_source_connect(state: &WindowState) {
                 let (stations_tx, stations_rx) = async_channel::bounded::<String>(1);
 
                 rt_handle.spawn(async move {
-                    let client = crate::radio::RadioBrowserClient::new();
-                    let stations = if bt == "radio-topclick" {
-                        client.fetch_top_click(None).await
-                    } else {
-                        client.fetch_top_vote(None).await
+                    let stations = match crate::radio::RadioBrowserClient::new() {
+                        Ok(client) if bt == "radio-topclick" => client.fetch_top_click(None).await,
+                        Ok(client) => client.fetch_top_vote(None).await,
+                        Err(_) => {
+                            tracing::error!("Could not build the Radio-Browser HTTP client");
+                            Vec::new()
+                        }
                     };
                     let json = serde_json::to_string(&stations).unwrap_or_default();
                     let _ = stations_tx.send(json).await;

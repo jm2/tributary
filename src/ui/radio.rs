@@ -257,7 +257,11 @@ fn fetch_and_display_nearme(
     rt_handle.spawn(async move {
         // First get geolocation (multi-provider cascade).
         if let Some(geo) = crate::radio::client::fetch_geolocation().await {
-            let client = crate::radio::RadioBrowserClient::new();
+            let Ok(client) = crate::radio::RadioBrowserClient::new() else {
+                tracing::error!("Could not build the Radio-Browser HTTP client");
+                let _ = stations_tx.send("[]".to_string()).await;
+                return;
+            };
             let cc = &geo.country_code;
 
             // Tier 1: Geo-distance sorted (stations with real coordinates).
