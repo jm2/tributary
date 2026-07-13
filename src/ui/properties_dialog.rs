@@ -166,11 +166,13 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
         &field_value(|t| &t.year),
         mixed_placeholder(|t| &t.year),
     );
+    year_entry.1.set_input_purpose(gtk::InputPurpose::Digits);
     form.append(&year_entry.0);
     entries.push(("year", year_entry.1));
 
     if !is_batch {
         let track_entry = make_entry("Track #", &field_value(|t| &t.track_number), false);
+        track_entry.1.set_input_purpose(gtk::InputPurpose::Digits);
         form.append(&track_entry.0);
         entries.push(("track_number", track_entry.1));
     }
@@ -180,6 +182,7 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
         &field_value(|t| &t.disc_number),
         mixed_placeholder(|t| &t.disc_number),
     );
+    disc_entry.1.set_input_purpose(gtk::InputPurpose::Digits);
     form.append(&disc_entry.0);
     entries.push(("disc_number", disc_entry.1));
 
@@ -372,6 +375,19 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
 
         if !any_changed {
             dialog_for_save.close();
+            return;
+        }
+
+        // Reject a malformed number here, while the user can still fix it and
+        // before a single file is opened. Letting it through would rewrite
+        // every selected file, discard the bad field, and report success.
+        if let Err(error) = edits.validate() {
+            let alert = adw::AlertDialog::builder()
+                .heading("Check the Highlighted Field")
+                .body(error.to_string())
+                .build();
+            alert.add_response("ok", "OK");
+            alert.present(Some(&parent_for_save));
             return;
         }
 
