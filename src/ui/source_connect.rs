@@ -913,6 +913,10 @@ mod tests {
             &self.path
         }
 
+        /// Only the symlink test needs a bare directory, and that test is Unix
+        /// only — without this gate the helper is dead code on Windows, which
+        /// `-D warnings` rejects.
+        #[cfg(unix)]
         fn directory(&self, name: &str) -> PathBuf {
             let path = self.path.join(name);
             std::fs::create_dir_all(&path).expect("create directory");
