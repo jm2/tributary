@@ -217,12 +217,13 @@ explicitly justified and time-bounded.
 
 ### P1.7 Serialize Chromecast lifecycle and commands
 
-- [ ] Use one ordered worker/session for load, play, pause, seek, volume, and stop.
-- [ ] Check cancellation before each external side effect and emitted event.
-- [ ] Prevent stale loads from launching or replacing newer media.
-- [ ] Ensure every failure terminates in a coherent state, never Error then Buffering.
-- [ ] Add delayed-device and supersession tests.
-- [ ] Record implementation: _pending_
+- [x] Use one ordered worker/session for load, play, pause, seek, volume, and stop.
+- [x] Check cancellation before each external side effect and emitted event.
+- [x] Prevent stale loads from launching or replacing newer media.
+- [x] Ensure every failure terminates in a coherent state, never Error then Buffering.
+- [x] Add delayed-device and supersession tests.
+- [x] Record implementation: commit `60ee2af`; 24 focused FIFO, delayed-device,
+  supersession, cleanup-retry, terminal-state, polling-fairness, and redaction tests.
 
 ### P1.8 Implement authoritative MPD state
 
@@ -318,6 +319,15 @@ explicitly justified and time-bounded.
 - [ ] Avoid writes inside `/Applications` and Program Files.
 - [ ] Generate or patch the macOS pixbuf loader cache for the installed absolute bundle path.
 - [ ] Verify macOS signature integrity after first launch.
+- [ ] Record implementation: _pending_
+
+### P2.8 Bound Chromecast control I/O
+
+- [ ] Adopt an upstream `rust_cast` timeout/custom-stream API or maintain a narrowly audited fork.
+- [ ] Enforce connection, read, and write deadlines without moving a live non-`Send` Cast session
+  between threads.
+- [ ] Add a silent-receiver test proving a no-reply operation cannot pin Stop, replacement Load,
+  or Shutdown forever.
 - [ ] Record implementation: _pending_
 
 ## P3 — Architecture and integration coverage
@@ -489,6 +499,17 @@ Record scope or design decisions here so deferred work is explicit.
   fail cleanly on impossible or unavailable allocations. Audio and live-radio media streams remain
   deliberately uncapped because they are length-unbounded playback transports; credential-bearing
   playback still belongs to the cancellable P1.6 proxy/ticket design.
+- 2026-07-12 — P1.7 places the non-`Send` Cast device, application, media session, controls,
+  heartbeat, status polling, and teardown on one FIFO worker. Epoch checks bracket every Cast
+  effect and event; ownership is recorded immediately after application launch and media load so
+  superseded calls remain cleanable. Failures retire the session before publishing Stopped then
+  Error, clean media/application ownership with fair bounded retries, and abandon an unreachable
+  application after three attempts so a replacement load can reconnect. The legacy local-file
+  resolver remains synchronous until P1.6 replaces it with the shared proxy/ticket path.
+  `rust_cast 0.21` uses blocking `TcpStream` calls, hides the socket, and offers no timeout or
+  custom-stream constructor, so cancellation can be checked only before and after an in-flight
+  call; hard receiver I/O deadlines require an upstream change or audited fork and are tracked as
+  P2.8 rather than overstated as part of P1.7.
 
 ## Completed work log
 
@@ -507,3 +528,4 @@ Add one line per completed task:
 | 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
 | 2026-07-12 | P1.4a | `eb5458f` | Exact-origin/no-Referer policy and URL-free errors/logging cover every app-owned credential HTTP fetch; receiver-controlled playback streams remain tied to P1.6. |
 | 2026-07-12 | P1.5 | `842341b` | Counted finite-response reads enforce endpoint caps and total deadlines across API, authentication, DAAP, radio, artwork, and metadata clients. |
+| 2026-07-12 | P1.7 | `60ee2af` | One worker owns the Cast session and serializes effects, authoritative state, cancellation, cleanup retries, and stale-event suppression. |

@@ -38,8 +38,6 @@ use gstreamer as gst;
 use gtk::glib;
 use tracing::{debug, error, info, warn};
 
-pub use crate::http_security::redact_url_secrets;
-
 // ── Events ──────────────────────────────────────────────────────────────
 
 /// Monotonic identity of the playback load that owns a [`PlayerEvent`].
