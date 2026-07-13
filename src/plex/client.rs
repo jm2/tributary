@@ -380,16 +380,17 @@ mod tests {
 
     #[test]
     fn rejects_embedded_url_credentials_without_echoing_them() {
-        let secret = "userinfo-secret";
+        let secret = uuid::Uuid::new_v4().to_string();
+        let auth_token = uuid::Uuid::new_v4().to_string();
         let error = PlexClient::new(
             &format!("https://embedded-user:{secret}@plex.example.test"),
-            "auth-token",
+            &auth_token,
         )
         .err()
         .expect("embedded URL credentials must be rejected");
 
         let rendered = error.to_string();
         assert!(!rendered.contains("embedded-user"));
-        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains(&secret));
     }
 }

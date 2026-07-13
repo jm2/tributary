@@ -355,17 +355,18 @@ mod tests {
 
     #[test]
     fn rejects_embedded_url_credentials_without_echoing_them() {
-        let secret = "userinfo-secret";
+        let secret = uuid::Uuid::new_v4().to_string();
+        let api_password = uuid::Uuid::new_v4().to_string();
         let error = SubsonicClient::new(
             &format!("https://embedded-user:{secret}@music.example.test"),
             "api-user",
-            "api-password",
+            &api_password,
         )
         .err()
         .expect("embedded URL credentials must be rejected");
 
         let rendered = error.to_string();
         assert!(!rendered.contains("embedded-user"));
-        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains(&secret));
     }
 }

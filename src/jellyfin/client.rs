@@ -433,10 +433,11 @@ mod tests {
 
     #[test]
     fn rejects_embedded_url_credentials_without_echoing_them() {
-        let secret = "userinfo-secret";
+        let secret = uuid::Uuid::new_v4().to_string();
+        let api_key = uuid::Uuid::new_v4().to_string();
         let error = JellyfinClient::new(
             &format!("https://embedded-user:{secret}@media.example.test"),
-            "api-key",
+            &api_key,
             "user-id",
         )
         .err()
@@ -444,6 +445,6 @@ mod tests {
 
         let rendered = error.to_string();
         assert!(!rendered.contains("embedded-user"));
-        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains(&secret));
     }
 }
