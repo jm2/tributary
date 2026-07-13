@@ -38,6 +38,8 @@ use gstreamer as gst;
 use gtk::glib;
 use tracing::{debug, error, info, warn};
 
+pub use crate::http_security::redact_url_secrets;
+
 // ── Events ──────────────────────────────────────────────────────────────
 
 /// Monotonic identity of the playback load that owns a [`PlayerEvent`].
@@ -431,15 +433,13 @@ impl Player {
                     }
                 }
 
-                MessageView::Error(err) => {
-                    error!(
-                        src = ?msg.src().map(|s| s.path_string()),
-                        error = %err.error(),
-                        debug = ?err.debug(),
-                        "Pipeline error"
-                    );
+                MessageView::Error(_) => {
+                    // GStreamer error/debug strings can retain the complete
+                    // authenticated source URI. Emit a stable diagnostic
+                    // instead of leaking backend credentials to logs or UI.
+                    error!("Audio pipeline error");
                     if let Err(e) =
-                        tx.try_send(PlayerEvent::error(generation, err.error().to_string()))
+                        tx.try_send(PlayerEvent::error(generation, "Audio playback failed"))
                     {
                         warn!(error = %e, "dropped Error event — UI consumer may be stalled");
                     }
@@ -707,63 +707,6 @@ fn save_volume(level: f64) {
     }
 }
 
-// ── URL secret redaction ────────────────────────────────────────────────
-
-/// Mask sensitive query parameters in URLs for safe logging.
-///
-/// Redacts `X-Plex-Token`, `api_key`, `session-id` (DAAP session bearer
-/// credential), `t` (Subsonic token), and `s` (Subsonic salt) to prevent
-/// auth credentials from appearing in logs.
-pub fn redact_url_secrets(uri: &str) -> String {
-    // Note: "s" is only redacted when "t" is also present (Subsonic salt+token pair).
-    // This avoids false positives on unrelated URLs that happen to have an "s" param.
-    // "p" is the legacy plaintext password parameter (used by Nextcloud Music etc.).
-    // "session-id" is the DAAP session credential that authorizes every request
-    // to a DAAP session (stream/cover URLs carry it in cleartext on the wire).
-    const SENSITIVE_PARAMS: &[&str] = &["X-Plex-Token", "api_key", "session-id"];
-    const SUBSONIC_TOKEN_PARAMS: &[&str] = &["t", "s"];
-    const SUBSONIC_PASSWORD_PARAMS: &[&str] = &["p"];
-
-    let Ok(mut url) = url::Url::parse(uri) else {
-        return uri.to_string();
-    };
-
-    // Check if this looks like a Subsonic URL.
-    // Token auth: has "t" (token) — we also redact "s" (salt).
-    // Plaintext auth: has "p" AND "u" AND "c" (Subsonic always sends
-    // username and client name alongside "p").  We require all three
-    // to avoid false positives on unrelated URLs with a "p" parameter.
-    let has_subsonic_token = url.query_pairs().any(|(k, _)| k == "t");
-    let has_subsonic_password = url.query_pairs().any(|(k, _)| k == "p")
-        && url.query_pairs().any(|(k, _)| k == "u")
-        && url.query_pairs().any(|(k, _)| k == "c");
-
-    let pairs: Vec<(String, String)> = url
-        .query_pairs()
-        .map(|(k, v)| {
-            let should_redact = SENSITIVE_PARAMS.contains(&k.as_ref())
-                || (has_subsonic_token && SUBSONIC_TOKEN_PARAMS.contains(&k.as_ref()))
-                || (has_subsonic_password && SUBSONIC_PASSWORD_PARAMS.contains(&k.as_ref()));
-            let v = if should_redact {
-                "REDACTED".to_string()
-            } else {
-                v.to_string()
-            };
-            (k.to_string(), v)
-        })
-        .collect();
-
-    if pairs.is_empty() {
-        return uri.to_string();
-    }
-
-    url.query_pairs_mut().clear();
-    for (k, v) in &pairs {
-        url.query_pairs_mut().append_pair(k, v);
-    }
-    url.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,102 +738,6 @@ mod tests {
             assert!(val >= prev, "slider_to_pipeline should be monotonic");
             prev = val;
         }
-    }
-
-    // ── redact_url_secrets tests ────────────────────────────────────
-
-    #[test]
-    fn test_redact_plex_token() {
-        let url = "https://plex.example.com/library?X-Plex-Token=abc123&other=value";
-        let redacted = redact_url_secrets(url);
-        assert!(redacted.contains("X-Plex-Token=REDACTED"));
-        assert!(redacted.contains("other=value"));
-        assert!(!redacted.contains("abc123"));
-    }
-
-    #[test]
-    fn test_redact_api_key() {
-        let url = "https://jellyfin.example.com/Items?api_key=secret123";
-        let redacted = redact_url_secrets(url);
-        assert!(redacted.contains("api_key=REDACTED"));
-        assert!(!redacted.contains("secret123"));
-    }
-
-    #[test]
-    fn test_redact_daap_session_id() {
-        let url =
-            "http://192.168.1.50:3689/databases/1/items/42.flac?session-id=1234567890&other=value";
-        let redacted = redact_url_secrets(url);
-        assert!(redacted.contains("session-id=REDACTED"));
-        assert!(redacted.contains("other=value"));
-        assert!(!redacted.contains("1234567890"));
-    }
-
-    #[test]
-    fn test_redact_subsonic_token_and_salt() {
-        let url = "https://sub.example.com/rest/ping.view?u=admin&t=tokenvalue&s=saltvalue&v=1.16.1&c=tributary";
-        let redacted = redact_url_secrets(url);
-        assert!(redacted.contains("t=REDACTED"));
-        assert!(redacted.contains("s=REDACTED"));
-        assert!(redacted.contains("u=admin")); // username not redacted
-        assert!(redacted.contains("v=1.16.1"));
-        assert!(!redacted.contains("tokenvalue"));
-        assert!(!redacted.contains("saltvalue"));
-    }
-
-    #[test]
-    fn test_redact_no_sensitive_params() {
-        let url = "https://example.com/api?page=1&limit=50";
-        let redacted = redact_url_secrets(url);
-        assert_eq!(redacted, url);
-    }
-
-    #[test]
-    fn test_redact_no_query_params() {
-        let url = "https://example.com/path";
-        let redacted = redact_url_secrets(url);
-        assert_eq!(redacted, url);
-    }
-
-    #[test]
-    fn test_redact_invalid_url() {
-        let url = "not a valid url";
-        let redacted = redact_url_secrets(url);
-        assert_eq!(redacted, url);
-    }
-
-    #[test]
-    fn test_redact_s_param_without_subsonic_token() {
-        // "s" alone (without "t") should NOT be redacted — it could be
-        // an unrelated parameter.
-        let url = "https://example.com/api?s=something&page=1";
-        let redacted = redact_url_secrets(url);
-        assert!(redacted.contains("s=something"));
-    }
-
-    #[test]
-    fn test_redact_subsonic_plaintext_password() {
-        // Nextcloud Music style: p=enc:<hex> with no t= or s= params.
-        let url = "https://nc.example.com/apps/music/subsonic/rest/ping.view?u=admin&p=enc%3A68656c6c6f&v=1.16.1&c=Tributary&f=json";
-        let redacted = redact_url_secrets(url);
-        assert!(
-            redacted.contains("p=REDACTED"),
-            "p= param should be redacted: {redacted}"
-        );
-        assert!(redacted.contains("u=admin")); // username not redacted
-        assert!(redacted.contains("v=1.16.1"));
-        assert!(!redacted.contains("68656c6c6f")); // hex password must not appear
-    }
-
-    #[test]
-    fn test_redact_p_param_without_subsonic_context() {
-        // A "p" parameter on a non-Subsonic URL should NOT be redacted.
-        let url = "https://example.com/api?p=page1&limit=50";
-        let redacted = redact_url_secrets(url);
-        assert!(
-            redacted.contains("p=page1"),
-            "unrelated p= should not be redacted: {redacted}"
-        );
     }
 
     // ── Volume persistence helpers ──────────────────────────────────

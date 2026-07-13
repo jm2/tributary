@@ -219,16 +219,11 @@ impl AirPlayOutput {
                 MessageView::Eos(..) => {
                     let _ = tx.try_send(PlayerEvent::ended(generation));
                 }
-                MessageView::Error(err) => {
-                    error!(
-                        error = %err.error(),
-                        debug = ?err.debug(),
-                        "AirPlay pipeline error"
-                    );
-                    let _ = tx.try_send(PlayerEvent::error(
-                        generation,
-                        format!("AirPlay: {}", err.error()),
-                    ));
+                MessageView::Error(_) => {
+                    // GStreamer error/debug strings can embed the authenticated
+                    // source URI. Keep the diagnostic stable and URL-free.
+                    error!("AirPlay pipeline error");
+                    let _ = tx.try_send(PlayerEvent::error(generation, "AirPlay playback failed"));
                 }
                 MessageView::StateChanged(s) => {
                     if let Some(pipeline) = pipeline_weak.upgrade() {

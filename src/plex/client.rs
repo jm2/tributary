@@ -10,6 +10,9 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::http_security::{
+    authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
+};
 
 use super::api::PlexSignInResponse;
 
@@ -61,11 +64,17 @@ impl PlexClient {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
         })?;
-        validate_base_url(server_url, &base_url)?;
+        validate_base_url(&base_url).map_err(|message| BackendError::ConnectionFailed {
+            message: message.to_string(),
+            source: None,
+        })?;
 
         let http = build_http_client(auth_token)?;
 
-        info!(server = %base_url, "Plex client created (token)");
+        info!(
+            server = %redact_url_secrets(base_url.as_str()),
+            "Plex client created (token)"
+        );
 
         Ok(Self {
             base_url,
@@ -88,7 +97,10 @@ impl PlexClient {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
         })?;
-        validate_base_url(server_url, &base_url)?;
+        validate_base_url(&base_url).map_err(|message| BackendError::ConnectionFailed {
+            message: message.to_string(),
+            source: None,
+        })?;
 
         // Build Plex identification headers (no token yet).
         let mut headers = HeaderMap::new();
@@ -108,7 +120,7 @@ impl PlexClient {
             HeaderValue::from_static("application/x-www-form-urlencoded"),
         );
 
-        let pre_auth_http = Client::builder()
+        let pre_auth_http = authenticated_client_builder()
             .user_agent(CLIENT_NAME)
             .default_headers(headers)
             .connect_timeout(CONNECT_TIMEOUT)
@@ -132,9 +144,12 @@ impl PlexClient {
             .body(form_body)
             .send()
             .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                message: format!("Plex sign-in request failed: {e}"),
-                source: Some(Box::new(e)),
+            .map_err(|e| {
+                let e = strip_request_url(e);
+                BackendError::ConnectionFailed {
+                    message: format!("Plex sign-in request failed: {e}"),
+                    source: Some(Box::new(e)),
+                }
             })?;
 
         let status = resp.status();
@@ -155,16 +170,18 @@ impl PlexClient {
             });
         }
 
-        let sign_in: PlexSignInResponse =
-            resp.json().await.map_err(|e| BackendError::ParseError {
+        let sign_in: PlexSignInResponse = resp.json().await.map_err(|e| {
+            let e = strip_request_url(e);
+            BackendError::ParseError {
                 message: format!("Failed to parse Plex sign-in response: {e}"),
                 source: Some(Box::new(e)),
-            })?;
+            }
+        })?;
 
         let auth_token = sign_in.user.auth_token;
 
         info!(
-            server = %base_url,
+            server = %redact_url_secrets(base_url.as_str()),
             user = ?sign_in.user.username,
             "Plex authentication successful"
         );
@@ -249,9 +266,10 @@ impl PlexClient {
             }
         }
 
-        debug!(url = %crate::audio::redact_url_secrets(url.as_str()), "Plex request");
+        debug!(url = %redact_url_secrets(url.as_str()), "Plex request");
 
         let resp = self.http.get(url.as_str()).send().await.map_err(|e| {
+            let e = strip_request_url(e);
             BackendError::ConnectionFailed {
                 message: format!("HTTP request failed: {e}"),
                 source: Some(Box::new(e)),
@@ -276,13 +294,13 @@ impl PlexClient {
         // Refuse to buffer an oversized body (DoS guard) before reading it.
         check_body_size(&resp)?;
 
-        let body = resp
-            .json::<T>()
-            .await
-            .map_err(|e| BackendError::ParseError {
+        let body = resp.json::<T>().await.map_err(|e| {
+            let e = strip_request_url(e);
+            BackendError::ParseError {
                 message: format!("Failed to parse Plex JSON: {e}"),
                 source: Some(Box::new(e)),
-            })?;
+            }
+        })?;
 
         Ok(body)
     }
@@ -309,59 +327,16 @@ fn build_http_client(auth_token: &str) -> BackendResult<Client> {
     );
     default_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
-    Client::builder()
+    authenticated_client_builder()
         .user_agent(CLIENT_NAME)
         .default_headers(default_headers)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
-        .redirect(redirect_policy())
         .build()
         .map_err(|e| BackendError::ConnectionFailed {
             message: format!("Failed to build HTTP client: {e}"),
             source: Some(Box::new(e)),
         })
-}
-
-/// Redirect policy for API requests.
-///
-/// The account-wide `X-Plex-Token` rides on every request as a default
-/// header, and reqwest does NOT strip custom auth headers on cross-host
-/// redirects (only the standard `Authorization`/`Cookie` set).  Follow
-/// only same-host redirects so a compromised or MITM'd server cannot
-/// bounce the client to an attacker host and harvest the token.
-fn redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() > 10 {
-            return attempt.error("too many redirects");
-        }
-        let same_host = {
-            let prev_host = attempt.previous().last().and_then(Url::host_str);
-            prev_host == attempt.url().host_str()
-        };
-        if same_host {
-            attempt.follow()
-        } else {
-            attempt.stop()
-        }
-    })
-}
-
-/// Reject server URLs that would later panic during request building.
-///
-/// `Url::parse` accepts opaque, cannot-be-a-base inputs such as a
-/// scheme-less `host:port` (e.g. `nas:32400`), but `api_url` builds paths
-/// via `path_segments_mut`, which panics on such URLs.  Surface a clean
-/// error instead.
-fn validate_base_url(server_url: &str, base_url: &Url) -> BackendResult<()> {
-    if base_url.cannot_be_a_base() || !matches!(base_url.scheme(), "http" | "https") {
-        return Err(BackendError::ConnectionFailed {
-            message: format!(
-                "Invalid server URL '{server_url}': must start with http:// or https://"
-            ),
-            source: None,
-        });
-    }
-    Ok(())
 }
 
 /// Reject a response whose declared body exceeds [`MAX_BODY_BYTES`].
@@ -382,4 +357,25 @@ fn check_body_size(resp: &reqwest::Response) -> BackendResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_embedded_url_credentials_without_echoing_them() {
+        let secret = uuid::Uuid::new_v4().to_string();
+        let auth_token = uuid::Uuid::new_v4().to_string();
+        let error = PlexClient::new(
+            &format!("https://embedded-user:{secret}@plex.example.test"),
+            &auth_token,
+        )
+        .err()
+        .expect("embedded URL credentials must be rejected");
+
+        let rendered = error.to_string();
+        assert!(!rendered.contains("embedded-user"));
+        assert!(!rendered.contains(&secret));
+    }
 }

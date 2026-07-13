@@ -178,7 +178,8 @@ impl MpdOutput {
             if line.is_empty() {
                 continue;
             }
-            debug!(cmd = %line, "MPD ←");
+            let command = mpd_command_verb(line);
+            debug!(command, "MPD command send");
             stream
                 .write_all(format!("{line}\n").as_bytes())
                 .map_err(|e| format!("Write: {e}"))?;
@@ -195,12 +196,13 @@ impl MpdOutput {
                     .read_line(&mut resp)
                     .map_err(|e| format!("Read: {e}"))?;
                 let resp = resp.trim();
-                debug!(resp = %resp, "MPD →");
                 if resp.starts_with("OK") {
                     break;
                 }
                 if resp.starts_with("ACK") {
-                    warn!(response = %resp, "MPD error");
+                    // MPD can echo the rejected command argument, including a
+                    // credential-bearing stream URL. Keep only the verb.
+                    warn!(command, "MPD command rejected");
                     // Don't fail the whole batch — log and continue.
                     break;
                 }
@@ -209,6 +211,23 @@ impl MpdOutput {
         }
 
         Ok(())
+    }
+}
+
+/// Return the only command detail safe to retain in logs.
+///
+/// Arguments can contain backend bearer URLs, so even sanitised protocol text
+/// must never be used as diagnostic output.
+fn mpd_command_verb(line: &str) -> &'static str {
+    match line.split_ascii_whitespace().next() {
+        Some("clear") => "clear",
+        Some("add") => "add",
+        Some("play") => "play",
+        Some("pause") => "pause",
+        Some("stop") => "stop",
+        Some("seekcur") => "seekcur",
+        Some("status") => "status",
+        _ => "unknown",
     }
 }
 
@@ -369,5 +388,13 @@ mod tests {
         // early — every `"` is escaped.
         assert!(!safe.contains('\n'));
         assert!(!safe.replace("\\\"", "").contains('"'));
+    }
+
+    #[test]
+    fn loggable_mpd_command_never_contains_authenticated_arguments() {
+        let line = r#"add "https://music.test/song.flac?api_key=secret""#;
+        assert_eq!(mpd_command_verb(line), "add");
+        assert!(!mpd_command_verb(line).contains("secret"));
+        assert_eq!(mpd_command_verb("password hunter2"), "unknown");
     }
 }

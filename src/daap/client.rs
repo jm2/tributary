@@ -18,6 +18,9 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::http_security::{
+    authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
+};
 
 use super::dmap::{self, DmapNode, DmapValue};
 
@@ -75,19 +78,22 @@ impl DaapClient {
             message: format!("Invalid DAAP server URL: {e}"),
             source: Some(Box::new(e)),
         })?;
+        validate_base_url(&base_url).map_err(|message| BackendError::ConnectionFailed {
+            message: message.replace("server URL", "DAAP server URL"),
+            source: None,
+        })?;
 
         let http = build_http_client()?;
 
         // ── Step A: Server Info ─────────────────────────────────────
         let server_info_url = format!("{}/server-info", base_url.as_str().trim_end_matches('/'));
-        debug!(url = %server_info_url, "DAAP: requesting server-info");
+        debug!(url = %redact_url_secrets(&server_info_url), "DAAP: requesting server-info");
 
-        let resp = http.get(&server_info_url).send().await.map_err(|e| {
-            BackendError::ConnectionFailed {
-                message: format!("DAAP server-info request failed: {e}"),
-                source: Some(Box::new(e)),
-            }
-        })?;
+        let resp = http
+            .get(&server_info_url)
+            .send()
+            .await
+            .map_err(|error| daap_request_error("DAAP server-info request failed", error))?;
 
         if !resp.status().is_success() {
             return Err(BackendError::ConnectionFailed {
@@ -102,10 +108,7 @@ impl DaapClient {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                message: format!("Failed to read server-info body: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+            .map_err(|error| daap_request_error("Failed to read server-info body", error))?;
 
         let nodes = dmap::parse_dmap(&bytes)?;
         // The top-level node is typically `msrv` (server-info container).
@@ -125,7 +128,7 @@ impl DaapClient {
 
         // ── Step B: Login ───────────────────────────────────────────
         let login_url = format!("{}/login", base_url.as_str().trim_end_matches('/'));
-        debug!(url = %login_url, "DAAP: requesting login");
+        debug!(url = %redact_url_secrets(&login_url), "DAAP: requesting login");
 
         let mut login_req = http.get(&login_url);
         if let Some(pw) = password {
@@ -137,10 +140,7 @@ impl DaapClient {
         let resp = login_req
             .send()
             .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                message: format!("DAAP login request failed: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+            .map_err(|error| daap_request_error("DAAP login request failed", error))?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED
             || resp.status() == reqwest::StatusCode::FORBIDDEN
@@ -163,10 +163,7 @@ impl DaapClient {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                message: format!("Failed to read login body: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+            .map_err(|error| daap_request_error("Failed to read login body", error))?;
 
         let nodes = dmap::parse_dmap(&bytes)?;
         let login_children = unwrap_container(&nodes, b"mlog")?;
@@ -177,7 +174,7 @@ impl DaapClient {
             }
         })?;
 
-        info!(session_id, "DAAP login OK");
+        info!("DAAP login OK");
 
         // ── Step C: Update ──────────────────────────────────────────
         let update_url = format!(
@@ -185,16 +182,13 @@ impl DaapClient {
             base_url.as_str().trim_end_matches('/'),
             session_id
         );
-        debug!(url = %crate::audio::redact_url_secrets(&update_url), "DAAP: requesting update");
+        debug!(url = %redact_url_secrets(&update_url), "DAAP: requesting update");
 
         let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
             http.get(&update_url)
                 .send()
                 .await
-                .map_err(|e| BackendError::ConnectionFailed {
-                    message: format!("DAAP update request failed: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
+                .map_err(|error| daap_request_error("DAAP update request failed", error))?;
 
         if !resp.status().is_success() {
             return Err(BackendError::ConnectionFailed {
@@ -209,10 +203,7 @@ impl DaapClient {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                message: format!("Failed to read update body: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+            .map_err(|error| daap_request_error("Failed to read update body", error))?;
 
         let nodes = dmap::parse_dmap(&bytes)?;
         let update_children = unwrap_container(&nodes, b"mupd")?;
@@ -227,16 +218,13 @@ impl DaapClient {
             session_id,
             revision
         );
-        debug!(url = %crate::audio::redact_url_secrets(&databases_url), "DAAP: requesting databases");
+        debug!(url = %redact_url_secrets(&databases_url), "DAAP: requesting databases");
 
         let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
             http.get(&databases_url)
                 .send()
                 .await
-                .map_err(|e| BackendError::ConnectionFailed {
-                    message: format!("DAAP databases request failed: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
+                .map_err(|error| daap_request_error("DAAP databases request failed", error))?;
 
         if !resp.status().is_success() {
             return Err(BackendError::ConnectionFailed {
@@ -251,10 +239,7 @@ impl DaapClient {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                message: format!("Failed to read databases body: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+            .map_err(|error| daap_request_error("Failed to read databases body", error))?;
 
         let nodes = dmap::parse_dmap(&bytes)?;
         let avdb_children = unwrap_container(&nodes, b"avdb")?;
@@ -279,10 +264,7 @@ impl DaapClient {
         info!(database_id, name = %db_name, "DAAP database discovered");
 
         // ── Step E: Done ────────────────────────────────────────────
-        info!(
-            session_id,
-            database_id, revision, "DAAP session established"
-        );
+        info!(database_id, revision, "DAAP session established");
 
         Ok(Self {
             base_url,
@@ -305,17 +287,14 @@ impl DaapClient {
             self.revision,
             TRACK_META,
         );
-        debug!(url = %crate::audio::redact_url_secrets(&url), "DAAP: fetching tracks");
+        debug!(url = %redact_url_secrets(&url), "DAAP: fetching tracks");
 
         let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
             self.http
                 .get(&url)
                 .send()
                 .await
-                .map_err(|e| BackendError::ConnectionFailed {
-                    message: format!("DAAP items request failed: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
+                .map_err(|error| daap_request_error("DAAP items request failed", error))?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(BackendError::AuthenticationFailed {
@@ -336,10 +315,7 @@ impl DaapClient {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                message: format!("Failed to read items body: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+            .map_err(|error| daap_request_error("Failed to read items body", error))?;
 
         let nodes = dmap::parse_dmap(&bytes)?;
 
@@ -406,7 +382,10 @@ impl DaapClient {
         {
             // lgtm[rs/cleartext-transmission] DAAP uses plaintext HTTP by design.
             Ok(_) => info!("DAAP logout OK"),
-            Err(e) => warn!(error = %e, "DAAP logout failed (best-effort)"),
+            Err(error) => {
+                let error = strip_request_url(error);
+                warn!(%error, "DAAP logout failed (best-effort)");
+            }
         }
     }
 
@@ -417,7 +396,9 @@ impl DaapClient {
     /// `Some(true)` for password-protected shares, or `None` on error.
     pub async fn probe_requires_password(server_url: &str) -> Option<bool> {
         let http = build_http_client().ok()?;
-        let url = format!("{}/server-info", server_url.trim_end_matches('/'));
+        let base_url = Url::parse(server_url).ok()?;
+        validate_base_url(&base_url).ok()?;
+        let url = format!("{}/server-info", base_url.as_str().trim_end_matches('/'));
         // Cap the probe at 5s — a malicious or hung DAAP server should
         // not be able to stall the discovery flow forever. The shared
         // client already sets connect/read timeouts; this tighter total
@@ -483,16 +464,21 @@ fn build_http_client() -> BackendResult<Client> {
     );
     headers.insert("Client-DAAP-Access-Index", HeaderValue::from_static("2"));
 
-    Client::builder()
+    authenticated_client_builder()
         .user_agent(format!("{CLIENT_NAME}/{CLIENT_VERSION}"))
         .default_headers(headers)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .build()
-        .map_err(|e| BackendError::ConnectionFailed {
-            message: format!("Failed to build DAAP HTTP client: {e}"),
-            source: Some(Box::new(e)),
-        })
+        .map_err(|error| daap_request_error("Failed to build DAAP HTTP client", error))
+}
+
+fn daap_request_error(context: &str, error: reqwest::Error) -> BackendError {
+    let error = strip_request_url(error);
+    BackendError::ConnectionFailed {
+        message: format!("{context}: {error}"),
+        source: Some(Box::new(error)),
+    }
 }
 
 /// Unwrap the first top-level container node with the given tag,
@@ -544,4 +530,27 @@ fn check_body_size(resp: &reqwest::Response) -> BackendResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daap_base_url_rejects_embedded_credentials_and_non_http_schemes() {
+        let safe = Url::parse("http://music.test:3689/share").expect("safe URL");
+        assert!(validate_base_url(&safe).is_ok());
+
+        for unsafe_url in [
+            "http://user:secret@music.test:3689",
+            "ftp://music.test/share",
+            "music.test:3689",
+        ] {
+            let url = Url::parse(unsafe_url).expect("syntactically valid unsafe URL");
+            let error = validate_base_url(&url).expect_err("unsafe URL must be rejected");
+            let rendered = error.to_string();
+            assert!(!rendered.contains("secret"));
+            assert!(!rendered.contains(unsafe_url));
+        }
+    }
 }

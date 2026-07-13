@@ -10,6 +10,9 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::http_security::{
+    authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
+};
 
 use super::api::SubsonicEnvelope;
 
@@ -81,19 +84,18 @@ impl SubsonicClient {
             source: Some(Box::new(e)),
         })?;
 
-        // Reject non-hierarchical / wrong-scheme URLs up front.  `Url::parse`
+        // Reject non-hierarchical, wrong-scheme, and credential-bearing URLs
+        // up front. `Url::parse`
         // happily accepts opaque inputs like `localhost:4533` (a scheme-less
         // host:port the user most likely meant as `http://localhost:4533`),
         // but building request paths from such a URL would panic later in
-        // `api_url` via `path_segments_mut`.  Fail cleanly instead.
-        if base_url.cannot_be_a_base() || !matches!(base_url.scheme(), "http" | "https") {
-            return Err(BackendError::ConnectionFailed {
-                message: format!(
-                    "Invalid server URL '{server_url}': must start with http:// or https://"
-                ),
-                source: None,
-            });
-        }
+        // `api_url` via `path_segments_mut`. Embedded userinfo would also be
+        // copied into every authenticated URL, so fail cleanly without echoing
+        // the rejected URL.
+        validate_base_url(&base_url).map_err(|message| BackendError::ConnectionFailed {
+            message: message.to_string(),
+            source: None,
+        })?;
 
         // Token auth still transmits (username, salt, md5(password+salt)) in
         // the URL query string.  Over plain HTTP those can be captured by an
@@ -102,7 +104,7 @@ impl SubsonicClient {
         // plaintext fallback is already HTTPS-gated, token auth was not.
         if base_url.scheme() != "https" {
             warn!(
-                server = %base_url,
+                server = %redact_url_secrets(base_url.as_str()),
                 "Subsonic token auth over an insecure (non-HTTPS) connection: the username, \
                  salt and token are sent in cleartext and can be captured and brute-forced. \
                  Use HTTPS where possible."
@@ -111,7 +113,7 @@ impl SubsonicClient {
 
         let auth = Self::make_token_auth(password);
 
-        let http = Client::builder()
+        let http = authenticated_client_builder()
             .user_agent(CLIENT_NAME)
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
@@ -121,7 +123,11 @@ impl SubsonicClient {
                 source: Some(Box::new(e)),
             })?;
 
-        info!(server = %base_url, user = %username, "Subsonic client created");
+        info!(
+            server = %redact_url_secrets(base_url.as_str()),
+            user = %username,
+            "Subsonic client created"
+        );
 
         Ok(Self {
             base_url,
@@ -160,7 +166,7 @@ impl SubsonicClient {
             });
 
         warn!(
-            server = %self.base_url,
+            server = %redact_url_secrets(self.base_url.as_str()),
             "Switching to hex-encoded plaintext auth (server does not support token auth)"
         );
 
@@ -233,7 +239,7 @@ impl SubsonicClient {
             }
         }
 
-        debug!(url = %crate::audio::redact_url_secrets(url.as_str()), "Subsonic request");
+        debug!(url = %redact_url_secrets(url.as_str()), "Subsonic request");
 
         let resp = self.http.get(url.as_str()).send().await.map_err(|e| {
             // Strip the request URL from the error before it is formatted or
@@ -241,7 +247,7 @@ impl SubsonicClient {
             // plaintext password) in its query string, and reqwest's Display
             // appends the full URL — which would leak the credential into
             // always-on error-level logs on routine transport failures.
-            let e = e.without_url();
+            let e = strip_request_url(e);
             BackendError::ConnectionFailed {
                 message: format!("HTTP request failed: {e}"),
                 source: Some(Box::new(e)),
@@ -261,7 +267,7 @@ impl SubsonicClient {
         let envelope: SubsonicEnvelope = resp.json().await.map_err(|e| {
             // A body-read failure here can also carry the credential-bearing
             // request URL; strip it before formatting/boxing into the error.
-            let e = e.without_url();
+            let e = strip_request_url(e);
             BackendError::ParseError {
                 message: format!("Failed to parse Subsonic JSON: {e}"),
                 source: Some(Box::new(e)),
@@ -336,4 +342,26 @@ fn check_body_size(resp: &reqwest::Response) -> BackendResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_embedded_url_credentials_without_echoing_them() {
+        let secret = uuid::Uuid::new_v4().to_string();
+        let api_password = uuid::Uuid::new_v4().to_string();
+        let error = SubsonicClient::new(
+            &format!("https://embedded-user:{secret}@music.example.test"),
+            "api-user",
+            &api_password,
+        )
+        .err()
+        .expect("embedded URL credentials must be rejected");
+
+        let rendered = error.to_string();
+        assert!(!rendered.contains("embedded-user"));
+        assert!(!rendered.contains(&secret));
+    }
 }
