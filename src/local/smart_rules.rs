@@ -525,19 +525,13 @@ fn parse_track_instant(field_val: &str) -> Option<chrono::DateTime<chrono::Utc>>
 fn rule_day(
     value: &RuleValue,
 ) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
-    use chrono::TimeZone;
-
     let RuleValue::Date(raw) = value else {
         return None;
     };
     let day = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()?;
 
-    let start = chrono::Utc
-        .from_utc_datetime(&day.and_hms_opt(0, 0, 0)?)
-        .to_utc();
-    let end = chrono::Utc
-        .from_utc_datetime(&day.succ_opt()?.and_hms_opt(0, 0, 0)?)
-        .to_utc();
+    let start = day.and_hms_opt(0, 0, 0)?.and_utc();
+    let end = day.succ_opt()?.and_hms_opt(0, 0, 0)?.and_utc();
     Some((start, end))
 }
 

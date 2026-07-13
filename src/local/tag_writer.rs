@@ -231,21 +231,37 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
 
     write_tags_to(temp.path(), edits)?;
 
+    // Flush the tagged copy before it becomes the user's file. Without this a
+    // crash between rename and writeback can leave a truncated file where the
+    // original used to be.
+    //
+    // This happens *before* the permission copy below: replacing a read-only
+    // file would otherwise make the temp read-only too, and a read-only file
+    // cannot be flushed.
+    flush_to_disk(temp.path())
+        .with_context(|| format!("Failed to flush the tagged copy of {}", path.display()))?;
+
     // Best-effort: match the permissions of the file being replaced.
     if let Ok(metadata) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(temp.path(), metadata.permissions());
     }
 
-    // Flush the tagged copy before it becomes the user's file. Without this a
-    // crash between rename and writeback can leave a truncated file where the
-    // original used to be.
-    std::fs::File::open(temp.path())
-        .and_then(|file| file.sync_all())
-        .with_context(|| format!("Failed to flush the tagged copy of {}", path.display()))?;
-
     temp.persist_to(path)?;
     tracing::debug!("Tags written successfully");
     Ok(())
+}
+
+/// Flush a file's contents to disk.
+///
+/// The handle must be opened for **writing**. Windows implements `sync_all` as
+/// `FlushFileBuffers`, which requires `GENERIC_WRITE`, so syncing through a
+/// read-only handle fails with access-denied and would break every tag write on
+/// that platform.
+fn flush_to_disk(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()
 }
 
 /// Apply `edits` to the tags of the file at `temp_path` in-place.
@@ -496,6 +512,18 @@ mod tests {
 
         write_tags(&track, &year("2026")).expect_err("an unsupported format must be refused");
         assert!(directory.temp_files().is_empty());
+    }
+
+    /// `sync_all` is `FlushFileBuffers` on Windows and needs `GENERIC_WRITE`,
+    /// so flushing through a read-only handle fails there with access-denied.
+    /// Nothing else in this module reaches the flush, so without this test the
+    /// break would only surface on a user's machine.
+    #[test]
+    fn a_tagged_copy_can_be_flushed_to_disk() {
+        let directory = TestDirectory::new("flush");
+        let track = directory.audio_file("song.mp3", b"audio");
+
+        flush_to_disk(&track).expect("a file we just wrote must be flushable");
     }
 
     /// Two concurrent saves to the same track must not share a temp path. The
