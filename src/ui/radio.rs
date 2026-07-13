@@ -22,6 +22,9 @@ pub fn is_radio_backend(backend_type: &str) -> bool {
     backend_type.starts_with("radio-")
 }
 
+/// Source key for the "Stations Near Me" radio source.
+pub const NEARME_SOURCE_KEY: &str = "radio-nearme";
+
 /// Switch column visibility for radio mode or restore music mode.
 ///
 /// When `radio = true`: show only radio-relevant columns.
@@ -118,6 +121,7 @@ pub fn handle_radio_nearme(
                 browser_state,
                 status_label,
                 column_view,
+                active_source_key,
             );
         }
         Some(false) => {
@@ -193,6 +197,7 @@ pub fn handle_radio_nearme(
                         browser_state.clone(),
                         status_label.clone(),
                         column_view.clone(),
+                        active_source_key.clone(),
                     );
                 } else {
                     // Save decline.
@@ -251,6 +256,7 @@ fn fetch_and_display_nearme(
     browser_state: browser::BrowserState,
     status_label: gtk::Label,
     column_view: gtk::ColumnView,
+    active_source_key: Rc<RefCell<String>>,
 ) {
     let (stations_tx, stations_rx) = async_channel::bounded::<String>(1);
 
@@ -334,6 +340,13 @@ fn fetch_and_display_nearme(
 
     glib::MainContext::default().spawn_local(async move {
         if let Ok(json) = stations_rx.recv().await {
+            // Geolocation plus three Radio-Browser tiers takes seconds. If the
+            // user gave up and picked another source in the meantime, this
+            // result is stale: rendering it would replace their library view
+            // with radio stations while the sidebar still highlights Local.
+            if *active_source_key.borrow() != NEARME_SOURCE_KEY {
+                return;
+            }
             let stations: Vec<crate::radio::RadioStation> =
                 serde_json::from_str(&json).unwrap_or_default();
             let objects: Vec<TrackObject> =

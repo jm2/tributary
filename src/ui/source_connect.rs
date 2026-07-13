@@ -293,18 +293,8 @@ pub fn setup_source_connect(state: &WindowState) {
                 // Background thread: walk the device filesystem.
                 std::thread::spawn(move || {
                     let mount_path = std::path::Path::new(&mount);
-                    for entry in walkdir::WalkDir::new(mount_path)
-                        .follow_links(true)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                    {
-                        let path = entry.path();
-                        if !path.is_file() {
-                            continue;
-                        }
-                        if !crate::local::tag_parser::is_audio_file(path) {
-                            continue;
-                        }
+                    for path in enumerate_device_audio_files(mount_path) {
+                        let path = path.as_path();
                         if let Ok(parsed) = crate::local::tag_parser::parse_audio_file(path) {
                             let uri = url::Url::from_file_path(path)
                                 .map(|u| u.to_string())
@@ -379,7 +369,7 @@ pub fn setup_source_connect(state: &WindowState) {
             *master_tracks.borrow_mut() = Vec::new();
 
             // Handle "Stations Near Me" with geo consent.
-            if backend_type == "radio-nearme" {
+            if backend_type == super::radio::NEARME_SOURCE_KEY {
                 let app_config = app_config.clone();
                 let rt_handle = rt_handle.clone();
                 let track_store = track_store.clone();
@@ -417,6 +407,8 @@ pub fn setup_source_connect(state: &WindowState) {
                 let browser_state = browser_state.clone();
                 let status_label = status_label.clone();
                 let column_view = column_view.clone();
+                let active_source_key = active_source_key.clone();
+                let requested_source_key = backend_type.clone();
 
                 let (stations_tx, stations_rx) = async_channel::bounded::<String>(1);
 
@@ -435,6 +427,12 @@ pub fn setup_source_connect(state: &WindowState) {
 
                 glib::MainContext::default().spawn_local(async move {
                     if let Ok(json) = stations_rx.recv().await {
+                        // The fetch takes seconds. If the user has since picked
+                        // another source, this result is stale and must not
+                        // overwrite whatever they are looking at now.
+                        if *active_source_key.borrow() != requested_source_key {
+                            return;
+                        }
                         let stations: Vec<crate::radio::RadioStation> =
                             serde_json::from_str(&json).unwrap_or_default();
                         let objects: Vec<TrackObject> =
@@ -870,4 +868,128 @@ pub fn setup_source_connect(state: &WindowState) {
             on_cancel,
         );
     });
+}
+
+/// Enumerate audio files on a mounted device, never leaving the device.
+///
+/// Symlinks are not followed. A USB stick containing `music -> /home/user`
+/// would otherwise make Tributary walk the user's entire home directory and
+/// index whatever it found there as "on the device". `file_type()` is checked
+/// rather than `Path::is_file()` because the latter follows the link anyway,
+/// which would still pull in an individual file symlinked from off the device.
+///
+/// This matches the policy the library scanner already applies in
+/// `local::engine`.
+fn enumerate_device_audio_files(mount: &std::path::Path) -> Vec<std::path::PathBuf> {
+    walkdir::WalkDir::new(mount)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(walkdir::DirEntry::into_path)
+        .filter(|path| crate::local::tag_parser::is_audio_file(path))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::enumerate_device_audio_files;
+
+    struct TestTree {
+        path: PathBuf,
+    }
+
+    impl TestTree {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("tributary-device-{label}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).expect("create test tree");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn directory(&self, name: &str) -> PathBuf {
+            let path = self.path.join(name);
+            std::fs::create_dir_all(&path).expect("create directory");
+            path
+        }
+
+        fn audio(&self, relative: &str) -> PathBuf {
+            let path = self.path.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create parent");
+            }
+            std::fs::write(&path, b"audio").expect("write audio file");
+            path
+        }
+    }
+
+    impl Drop for TestTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn file_names(paths: &[PathBuf]) -> Vec<String> {
+        let mut names: Vec<String> = paths
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_device_scan_finds_audio_in_nested_directories() {
+        let device = TestTree::new("nested");
+        device.audio("root.mp3");
+        device.audio("Album/track.flac");
+        device.audio("Album/cover.jpg");
+        device.audio("notes.txt");
+
+        let found = enumerate_device_audio_files(device.path());
+        assert_eq!(file_names(&found), vec!["root.mp3", "track.flac"]);
+    }
+
+    /// The P2.4 defect: the walk followed symlinks, so a stick containing
+    /// `music -> /home/user` walked the whole home directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_device_scan_never_follows_a_symlink_off_the_device() {
+        let elsewhere = TestTree::new("elsewhere");
+        elsewhere.audio("private.mp3");
+        elsewhere.audio("Deep/deeper/secret.mp3");
+
+        let device = TestTree::new("device");
+        device.audio("on-device.mp3");
+        let escape = device.directory("Music").join("escape");
+        std::os::unix::fs::symlink(elsewhere.path(), &escape).expect("link a directory off-device");
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("private.mp3"),
+            device.path().join("linked.mp3"),
+        )
+        .expect("link a file off-device");
+
+        let found = enumerate_device_audio_files(device.path());
+
+        assert_eq!(
+            file_names(&found),
+            vec!["on-device.mp3"],
+            "only files physically on the device may be indexed"
+        );
+        assert!(
+            !found.iter().any(|path| path.starts_with(elsewhere.path())),
+            "no result may resolve outside the mount"
+        );
+    }
 }
