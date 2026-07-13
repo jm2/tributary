@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::http_security::{authenticated_client_builder, redact_url_secrets, strip_request_url};
 
 use super::api::{JellyfinAuthRequest, JellyfinAuthResponse};
 
@@ -60,11 +61,15 @@ impl JellyfinClient {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
         })?;
-        validate_base_url(server_url, &base_url)?;
+        validate_base_url(&base_url)?;
 
         let http = build_http_client(api_key)?;
 
-        info!(server = %base_url, user_id = %user_id, "Jellyfin client created (API key)");
+        info!(
+            server = %redact_url_secrets(base_url.as_str()),
+            user_id = %user_id,
+            "Jellyfin client created (API key)"
+        );
 
         Ok(Self {
             base_url,
@@ -88,7 +93,7 @@ impl JellyfinClient {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
         })?;
-        validate_base_url(server_url, &base_url)?;
+        validate_base_url(&base_url)?;
 
         // Build a temporary client WITHOUT a token for the auth request.
         let pre_auth_header = format!(
@@ -107,7 +112,7 @@ impl JellyfinClient {
         );
         pre_auth_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
-        let pre_auth_http = Client::builder()
+        let pre_auth_http = authenticated_client_builder()
             .user_agent(CLIENT_NAME)
             .default_headers(pre_auth_headers)
             .connect_timeout(CONNECT_TIMEOUT)
@@ -133,16 +138,19 @@ impl JellyfinClient {
             pw: password.to_string(),
         };
 
-        debug!(url = %crate::audio::redact_url_secrets(auth_url.as_str()), "Jellyfin auth request");
+        debug!(url = %redact_url_secrets(auth_url.as_str()), "Jellyfin auth request");
 
         let resp = pre_auth_http
             .post(auth_url.as_str())
             .json(&body)
             .send()
             .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                message: format!("Auth request failed: {e}"),
-                source: Some(Box::new(e)),
+            .map_err(|e| {
+                let e = strip_request_url(e);
+                BackendError::ConnectionFailed {
+                    message: format!("Auth request failed: {e}"),
+                    source: Some(Box::new(e)),
+                }
             })?;
 
         let status = resp.status();
@@ -163,17 +171,19 @@ impl JellyfinClient {
             });
         }
 
-        let auth_resp: JellyfinAuthResponse =
-            resp.json().await.map_err(|e| BackendError::ParseError {
+        let auth_resp: JellyfinAuthResponse = resp.json().await.map_err(|e| {
+            let e = strip_request_url(e);
+            BackendError::ParseError {
                 message: format!("Failed to parse auth response: {e}"),
                 source: Some(Box::new(e)),
-            })?;
+            }
+        })?;
 
         let api_key = auth_resp.access_token;
         let user_id = auth_resp.user.id;
 
         info!(
-            server = %base_url,
+            server = %redact_url_secrets(base_url.as_str()),
             user = %auth_resp.user.name,
             user_id = %user_id,
             "Jellyfin authentication successful"
@@ -261,9 +271,10 @@ impl JellyfinClient {
             }
         }
 
-        debug!(url = %crate::audio::redact_url_secrets(url.as_str()), "Jellyfin request");
+        debug!(url = %redact_url_secrets(url.as_str()), "Jellyfin request");
 
         let resp = self.http.get(url.as_str()).send().await.map_err(|e| {
+            let e = strip_request_url(e);
             BackendError::ConnectionFailed {
                 message: format!("HTTP request failed: {e}"),
                 source: Some(Box::new(e)),
@@ -288,13 +299,13 @@ impl JellyfinClient {
         // Refuse to buffer an oversized body (DoS guard) before reading it.
         check_body_size(&resp)?;
 
-        let body = resp
-            .json::<T>()
-            .await
-            .map_err(|e| BackendError::ParseError {
+        let body = resp.json::<T>().await.map_err(|e| {
+            let e = strip_request_url(e);
+            BackendError::ParseError {
                 message: format!("Failed to parse Jellyfin JSON: {e}"),
                 source: Some(Box::new(e)),
-            })?;
+            }
+        })?;
 
         Ok(body)
     }
@@ -304,9 +315,10 @@ impl JellyfinClient {
     /// Used for endpoints that return plain text (e.g. `/System/Ping`).
     pub async fn get_text(&self, endpoint: &str) -> BackendResult<String> {
         let url = self.api_url(endpoint);
-        debug!(url = %crate::audio::redact_url_secrets(url.as_str()), "Jellyfin text request");
+        debug!(url = %redact_url_secrets(url.as_str()), "Jellyfin text request");
 
         let resp = self.http.get(url.as_str()).send().await.map_err(|e| {
+            let e = strip_request_url(e);
             BackendError::ConnectionFailed {
                 message: format!("HTTP request failed: {e}"),
                 source: Some(Box::new(e)),
@@ -331,9 +343,12 @@ impl JellyfinClient {
         // Refuse to buffer an oversized body (DoS guard) before reading it.
         check_body_size(&resp)?;
 
-        let text = resp.text().await.map_err(|e| BackendError::ParseError {
-            message: format!("Failed to read Jellyfin response body: {e}"),
-            source: Some(Box::new(e)),
+        let text = resp.text().await.map_err(|e| {
+            let e = strip_request_url(e);
+            BackendError::ParseError {
+                message: format!("Failed to read Jellyfin response body: {e}"),
+                source: Some(Box::new(e)),
+            }
         })?;
 
         Ok(text)
@@ -356,12 +371,11 @@ fn build_http_client(api_key: &str) -> BackendResult<Client> {
     );
     default_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
-    Client::builder()
+    authenticated_client_builder()
         .user_agent(CLIENT_NAME)
         .default_headers(default_headers)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
-        .redirect(redirect_policy())
         .build()
         .map_err(|e| BackendError::ConnectionFailed {
             message: format!("Failed to build HTTP client: {e}"),
@@ -369,42 +383,24 @@ fn build_http_client(api_key: &str) -> BackendResult<Client> {
         })
 }
 
-/// Redirect policy for API requests.
-///
-/// The `X-Emby-Authorization` token rides on every request as a default
-/// header, and reqwest does NOT strip custom auth headers on cross-host
-/// redirects (only the standard `Authorization`/`Cookie` set).  Follow
-/// only same-host redirects so a compromised or MITM'd server cannot
-/// bounce the client to an attacker host and harvest the token.
-fn redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() > 10 {
-            return attempt.error("too many redirects");
-        }
-        let same_host = {
-            let prev_host = attempt.previous().last().and_then(Url::host_str);
-            prev_host == attempt.url().host_str()
-        };
-        if same_host {
-            attempt.follow()
-        } else {
-            attempt.stop()
-        }
-    })
-}
-
-/// Reject server URLs that would later panic during request building.
+/// Reject server URLs that are unsafe or would panic during request building.
 ///
 /// `Url::parse` accepts opaque, cannot-be-a-base inputs such as a
 /// scheme-less `host:port` (e.g. `myserver:8096`), but `api_url` /
 /// `authenticate` build paths via `path_segments_mut`, which panics on
-/// such URLs.  Surface a clean error instead.
-fn validate_base_url(server_url: &str, base_url: &Url) -> BackendResult<()> {
-    if base_url.cannot_be_a_base() || !matches!(base_url.scheme(), "http" | "https") {
+/// such URLs. Embedded userinfo is also forbidden so credentials cannot be
+/// retained in generated URLs, logs, or request errors. Surface a clean error
+/// without echoing the rejected URL.
+fn validate_base_url(base_url: &Url) -> BackendResult<()> {
+    if base_url.cannot_be_a_base()
+        || !matches!(base_url.scheme(), "http" | "https")
+        || !base_url.username().is_empty()
+        || base_url.password().is_some()
+    {
         return Err(BackendError::ConnectionFailed {
-            message: format!(
-                "Invalid server URL '{server_url}': must start with http:// or https://"
-            ),
+            message:
+                "Invalid server URL: use an http:// or https:// URL without embedded credentials"
+                    .into(),
             source: None,
         });
     }
@@ -429,4 +425,25 @@ fn check_body_size(resp: &reqwest::Response) -> BackendResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_embedded_url_credentials_without_echoing_them() {
+        let secret = "userinfo-secret";
+        let error = JellyfinClient::new(
+            &format!("https://embedded-user:{secret}@media.example.test"),
+            "api-key",
+            "user-id",
+        )
+        .err()
+        .expect("embedded URL credentials must be rejected");
+
+        let rendered = error.to_string();
+        assert!(!rendered.contains("embedded-user"));
+        assert!(!rendered.contains(secret));
+    }
 }

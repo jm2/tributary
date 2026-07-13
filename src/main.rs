@@ -57,6 +57,7 @@ mod desktop_integration;
 #[allow(dead_code)]
 mod device;
 mod discovery;
+pub(crate) mod http_security;
 #[allow(dead_code)]
 mod jellyfin;
 #[allow(dead_code)]

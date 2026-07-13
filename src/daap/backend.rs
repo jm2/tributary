@@ -380,9 +380,12 @@ impl crate::architecture::MediaBackend for DaapBackend {
             .get(&url)
             .send()
             .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                message: format!("DAAP ping failed: {e}"),
-                source: Some(Box::new(e)),
+            .map_err(|error| {
+                let error = crate::http_security::strip_request_url(error);
+                BackendError::ConnectionFailed {
+                    message: format!("DAAP ping failed: {error}"),
+                    source: Some(Box::new(error)),
+                }
             })?;
 
         if !resp.status().is_success() {

@@ -48,16 +48,25 @@ struct ArtRequest {
 fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
     static TX: OnceLock<Option<std::sync::mpsc::Sender<ArtRequest>>> = OnceLock::new();
     TX.get_or_init(|| {
+        // Build before spawning so a policy-construction failure disables
+        // remote artwork instead of silently restoring reqwest's permissive
+        // default redirect and Referer behavior.
+        let client = match crate::http_security::authenticated_blocking_client_builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                let error = crate::http_security::strip_request_url(error);
+                tracing::warn!(%error, "Failed to build secure album art HTTP client");
+                return None;
+            }
+        };
+
         let (tx, rx) = std::sync::mpsc::channel::<ArtRequest>();
         let spawn_result = std::thread::Builder::new()
             .name("art-worker".into())
             .spawn(move || {
-                // Build the HTTP client once for the lifetime of this thread.
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .unwrap_or_default();
-
                 while let Ok(req) = rx.recv() {
                     // Check if this request is still current before fetching.
                     if ART_GENERATION.load(Ordering::Relaxed) != req.generation {
@@ -65,25 +74,25 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
                     }
 
                     match client.get(&req.url).send() {
-                        Ok(resp) if resp.status().is_success() => {
-                            if let Ok(bytes) = resp.bytes() {
+                        Ok(resp) if resp.status().is_success() => match resp.bytes() {
+                            Ok(bytes)
                                 if !bytes.is_empty()
-                                    && ART_GENERATION.load(Ordering::Relaxed) == req.generation
-                                {
-                                    let _ = req.reply_tx.send_blocking(bytes.to_vec());
-                                }
+                                    && ART_GENERATION.load(Ordering::Relaxed) == req.generation =>
+                            {
+                                let _ = req.reply_tx.send_blocking(bytes.to_vec());
                             }
-                        }
+                            Ok(_) => {}
+                            Err(error) => {
+                                let error = crate::http_security::strip_request_url(error);
+                                tracing::debug!(%error, "Failed to read remote album art body");
+                            }
+                        },
                         Ok(resp) => {
                             tracing::debug!(status = %resp.status(), "Remote album art HTTP error");
                         }
-                        Err(e) => {
-                            // Strip the URL: cover-art URLs embed per-backend
-                            // credentials (Subsonic t/s/p, Jellyfin api_key,
-                            // Plex X-Plex-Token, DAAP session-id) in the query
-                            // string, and reqwest's Display would otherwise
-                            // print the full credential-bearing URL.
-                            tracing::debug!(error = %e.without_url(), "Failed to fetch remote album art");
+                        Err(error) => {
+                            let error = crate::http_security::strip_request_url(error);
+                            tracing::debug!(%error, "Failed to fetch remote album art");
                         }
                     }
                 }
