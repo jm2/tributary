@@ -159,6 +159,7 @@ gstreamer1-libav = "*"
 dbus = "*"
 
 [dev-dependencies]
+http = "1"
 proptest = "1"
 
 [profile.release]

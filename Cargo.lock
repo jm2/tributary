@@ -4801,6 +4801,7 @@ dependencies = [
  "gdk4-win32",
  "gstreamer",
  "gtk4",
+ "http",
  "libadwaita",
  "local-ip-address",
  "lofty",

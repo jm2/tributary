@@ -495,6 +495,9 @@ fn add_info_row(container: &gtk::Box, label: &str, value: &str) {
 
 // ── MusicBrainz lookup ──────────────────────────────────────────────────
 
+const MUSICBRAINZ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_MUSICBRAINZ_BODY_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Result from a MusicBrainz recording search.
 #[derive(Debug, Clone, Default)]
 struct MusicBrainzResult {
@@ -522,18 +525,24 @@ fn musicbrainz_lookup(title: &str, artist: &str) -> Option<MusicBrainzResult> {
     );
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(MUSICBRAINZ_TIMEOUT)
         .user_agent("Tributary/0.3.0 (https://github.com/jm2/tributary)")
         .build()
         .ok()?;
 
-    let resp = client.get(&url).send().ok()?;
+    let resp = client.get(&url).timeout(MUSICBRAINZ_TIMEOUT).send().ok()?;
     if !resp.status().is_success() {
         warn!(status = %resp.status(), "MusicBrainz API error");
         return None;
     }
 
-    let json: serde_json::Value = resp.json().ok()?;
+    let body = crate::http_body::read_limited_blocking(
+        resp,
+        MAX_MUSICBRAINZ_BODY_BYTES,
+        MUSICBRAINZ_TIMEOUT,
+    )
+    .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
     let recordings = json.get("recordings")?.as_array()?;
     let recording = recordings.first()?;
 

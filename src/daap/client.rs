@@ -18,6 +18,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
     authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
 };
@@ -36,11 +37,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// library transfer (the timeout resets after each successful read).
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum response body we are willing to buffer into memory.  A generous
-/// cap that still rules out a malicious or misbehaving server trying to
-/// exhaust memory with an unbounded body.  Enforced from the
-/// `Content-Length` header before the body is read (see [`check_body_size`]).
-const MAX_BODY_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum response bodies for handshake/control, database-list, and item-list
+/// requests, respectively.
+const MAX_CONTROL_BODY_BYTES: u64 = 1024 * 1024;
+const MAX_DATABASES_BODY_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ITEMS_BODY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// End-to-end and body-phase deadlines for finite DAAP requests.
+const CONTROL_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
+const ITEMS_RESPONSE_DEADLINE: Duration = Duration::from_secs(120);
+const PROBE_RESPONSE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Client version advertised to the DAAP server.
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -91,6 +97,7 @@ impl DaapClient {
 
         let resp = http
             .get(&server_info_url)
+            .timeout(CONTROL_RESPONSE_DEADLINE)
             .send()
             .await
             .map_err(|error| daap_request_error("DAAP server-info request failed", error))?;
@@ -102,13 +109,9 @@ impl DaapClient {
             });
         }
 
-        // Refuse to buffer an oversized body (DoS guard) before reading it.
-        check_body_size(&resp)?;
-
-        let bytes = resp
-            .bytes()
+        let bytes = read_limited(resp, MAX_CONTROL_BODY_BYTES, CONTROL_RESPONSE_DEADLINE)
             .await
-            .map_err(|error| daap_request_error("Failed to read server-info body", error))?;
+            .map_err(|error| daap_body_error("Failed to read server-info body", error))?;
 
         let nodes = dmap::parse_dmap(&bytes)?;
         // The top-level node is typically `msrv` (server-info container).
@@ -138,6 +141,7 @@ impl DaapClient {
         }
 
         let resp = login_req
+            .timeout(CONTROL_RESPONSE_DEADLINE)
             .send()
             .await
             .map_err(|error| daap_request_error("DAAP login request failed", error))?;
@@ -157,13 +161,9 @@ impl DaapClient {
             });
         }
 
-        // Refuse to buffer an oversized body (DoS guard) before reading it.
-        check_body_size(&resp)?;
-
-        let bytes = resp
-            .bytes()
+        let bytes = read_limited(resp, MAX_CONTROL_BODY_BYTES, CONTROL_RESPONSE_DEADLINE)
             .await
-            .map_err(|error| daap_request_error("Failed to read login body", error))?;
+            .map_err(|error| daap_body_error("Failed to read login body", error))?;
 
         let nodes = dmap::parse_dmap(&bytes)?;
         let login_children = unwrap_container(&nodes, b"mlog")?;
@@ -186,6 +186,7 @@ impl DaapClient {
 
         let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
             http.get(&update_url)
+                .timeout(CONTROL_RESPONSE_DEADLINE)
                 .send()
                 .await
                 .map_err(|error| daap_request_error("DAAP update request failed", error))?;
@@ -197,13 +198,9 @@ impl DaapClient {
             });
         }
 
-        // Refuse to buffer an oversized body (DoS guard) before reading it.
-        check_body_size(&resp)?;
-
-        let bytes = resp
-            .bytes()
+        let bytes = read_limited(resp, MAX_CONTROL_BODY_BYTES, CONTROL_RESPONSE_DEADLINE)
             .await
-            .map_err(|error| daap_request_error("Failed to read update body", error))?;
+            .map_err(|error| daap_body_error("Failed to read update body", error))?;
 
         let nodes = dmap::parse_dmap(&bytes)?;
         let update_children = unwrap_container(&nodes, b"mupd")?;
@@ -222,6 +219,7 @@ impl DaapClient {
 
         let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
             http.get(&databases_url)
+                .timeout(CONTROL_RESPONSE_DEADLINE)
                 .send()
                 .await
                 .map_err(|error| daap_request_error("DAAP databases request failed", error))?;
@@ -233,13 +231,9 @@ impl DaapClient {
             });
         }
 
-        // Refuse to buffer an oversized body (DoS guard) before reading it.
-        check_body_size(&resp)?;
-
-        let bytes = resp
-            .bytes()
+        let bytes = read_limited(resp, MAX_DATABASES_BODY_BYTES, CONTROL_RESPONSE_DEADLINE)
             .await
-            .map_err(|error| daap_request_error("Failed to read databases body", error))?;
+            .map_err(|error| daap_body_error("Failed to read databases body", error))?;
 
         let nodes = dmap::parse_dmap(&bytes)?;
         let avdb_children = unwrap_container(&nodes, b"avdb")?;
@@ -292,6 +286,7 @@ impl DaapClient {
         let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
             self.http
                 .get(&url)
+                .timeout(ITEMS_RESPONSE_DEADLINE)
                 .send()
                 .await
                 .map_err(|error| daap_request_error("DAAP items request failed", error))?;
@@ -309,13 +304,9 @@ impl DaapClient {
             });
         }
 
-        // Refuse to buffer an oversized body (DoS guard) before reading it.
-        check_body_size(&resp)?;
-
-        let bytes = resp
-            .bytes()
+        let bytes = read_limited(resp, MAX_ITEMS_BODY_BYTES, ITEMS_RESPONSE_DEADLINE)
             .await
-            .map_err(|error| daap_request_error("Failed to read items body", error))?;
+            .map_err(|error| daap_body_error("Failed to read items body", error))?;
 
         let nodes = dmap::parse_dmap(&bytes)?;
 
@@ -329,6 +320,34 @@ impl DaapClient {
 
         // Convert from borrowed slices to owned Vecs.
         Ok(mlit_items.into_iter().map(|s| s.to_vec()).collect())
+    }
+
+    /// Issue a bounded server-info request to verify the active server is
+    /// still responsive.
+    pub async fn ping(&self) -> BackendResult<()> {
+        let url = format!(
+            "{}/server-info",
+            self.base_url.as_str().trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(CONTROL_RESPONSE_DEADLINE)
+            .send()
+            .await
+            .map_err(|error| daap_request_error("DAAP ping failed", error))?;
+
+        if !resp.status().is_success() {
+            return Err(BackendError::ConnectionFailed {
+                message: format!("DAAP ping HTTP {}", resp.status()),
+                source: None,
+            });
+        }
+
+        read_limited(resp, MAX_CONTROL_BODY_BYTES, CONTROL_RESPONSE_DEADLINE)
+            .await
+            .map_err(|error| daap_body_error("Failed to read DAAP ping body", error))?;
+        Ok(())
     }
 
     /// Construct a cover art URL for a track.
@@ -405,16 +424,16 @@ impl DaapClient {
         // per-request timeout keeps the discovery probe snappy.
         let resp = http
             .get(&url)
-            .timeout(Duration::from_secs(5))
+            .timeout(PROBE_RESPONSE_DEADLINE)
             .send()
             .await
             .ok()?;
         if !resp.status().is_success() {
             return None;
         }
-        // Refuse to buffer an oversized body (DoS guard) before reading it.
-        check_body_size(&resp).ok()?;
-        let bytes = resp.bytes().await.ok()?;
+        let bytes = read_limited(resp, MAX_CONTROL_BODY_BYTES, PROBE_RESPONSE_DEADLINE)
+            .await
+            .ok()?;
         let nodes = dmap::parse_dmap(&bytes).ok()?;
         let children = match dmap::find_node(&nodes, b"msrv") {
             Some(node) => match &node.data {
@@ -445,11 +464,6 @@ impl DaapClient {
     pub fn database_id(&self) -> u32 {
         self.database_id
     }
-
-    /// Clone the inner HTTP client (cheap — `reqwest::Client` is `Arc`-based).
-    pub fn http_clone(&self) -> Client {
-        self.http.clone()
-    }
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────
@@ -478,6 +492,24 @@ fn daap_request_error(context: &str, error: reqwest::Error) -> BackendError {
     BackendError::ConnectionFailed {
         message: format!("{context}: {error}"),
         source: Some(Box::new(error)),
+    }
+}
+
+fn daap_body_error(context: &str, error: ResponseBodyError) -> BackendError {
+    match error {
+        error @ (ResponseBodyError::TooLarge { .. }
+        | ResponseBodyError::InvalidLimit { .. }
+        | ResponseBodyError::AllocationFailed { .. }) => BackendError::ConnectionFailed {
+            message: error.to_string(),
+            source: None,
+        },
+        ResponseBodyError::DeadlineExceeded { deadline } => BackendError::Timeout {
+            duration_secs: deadline.as_secs(),
+        },
+        error => BackendError::ConnectionFailed {
+            message: format!("{context}: {error}"),
+            source: Some(Box::new(error)),
+        },
     }
 }
 
@@ -512,29 +544,21 @@ fn unwrap_nested_container<'a>(
     unwrap_container(parent_children, tag)
 }
 
-/// Reject a response whose declared body exceeds [`MAX_BODY_BYTES`].
-///
-/// A lightweight, best-effort DoS guard: it inspects only the
-/// `Content-Length` header, so a chunked response sent without a length is
-/// not covered here — the client's `read_timeout` still bounds a stalled or
-/// slow-trickling transfer in that case.
-fn check_body_size(resp: &reqwest::Response) -> BackendResult<()> {
-    if let Some(len) = resp.content_length() {
-        if len > MAX_BODY_BYTES {
-            return Err(BackendError::ConnectionFailed {
-                message: format!(
-                    "Response body too large: {len} bytes exceeds the {MAX_BODY_BYTES}-byte cap"
-                ),
-                source: None,
-            });
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_response_body_deadline_to_timeout() {
+        let error = daap_body_error(
+            "body",
+            ResponseBodyError::DeadlineExceeded {
+                deadline: Duration::from_secs(7),
+            },
+        );
+
+        assert!(matches!(error, BackendError::Timeout { duration_secs: 7 }));
+    }
 
     #[test]
     fn daap_base_url_rejects_embedded_credentials_and_non_http_schemes() {

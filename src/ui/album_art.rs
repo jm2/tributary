@@ -10,6 +10,9 @@ use std::sync::OnceLock;
 
 use gtk::glib;
 
+const REMOTE_ART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_REMOTE_ART_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Global generation counter for album art requests.  Incremented on
 /// every track change; the worker checks this before sending results
 /// back to the GTK thread so stale fetches are silently dropped.
@@ -52,7 +55,7 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
         // remote artwork instead of silently restoring reqwest's permissive
         // default redirect and Referer behavior.
         let client = match crate::http_security::authenticated_blocking_client_builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(REMOTE_ART_TIMEOUT)
             .build()
         {
             Ok(client) => client,
@@ -73,20 +76,26 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
                         continue; // Stale — user already changed tracks.
                     }
 
-                    match client.get(&req.url).send() {
-                        Ok(resp) if resp.status().is_success() => match resp.bytes() {
-                            Ok(bytes)
-                                if !bytes.is_empty()
-                                    && ART_GENERATION.load(Ordering::Relaxed) == req.generation =>
-                            {
-                                let _ = req.reply_tx.send_blocking(bytes.to_vec());
+                    match client.get(&req.url).timeout(REMOTE_ART_TIMEOUT).send() {
+                        Ok(resp) if resp.status().is_success() => {
+                            match crate::http_body::read_limited_blocking(
+                                resp,
+                                MAX_REMOTE_ART_BYTES,
+                                REMOTE_ART_TIMEOUT,
+                            ) {
+                                Ok(bytes)
+                                    if !bytes.is_empty()
+                                        && ART_GENERATION.load(Ordering::Relaxed)
+                                            == req.generation =>
+                                {
+                                    let _ = req.reply_tx.send_blocking(bytes);
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    tracing::debug!(%error, "Failed to read remote album art body");
+                                }
                             }
-                            Ok(_) => {}
-                            Err(error) => {
-                                let error = crate::http_security::strip_request_url(error);
-                                tracing::debug!(%error, "Failed to read remote album art body");
-                            }
-                        },
+                        }
                         Ok(resp) => {
                             tracing::debug!(status = %resp.status(), "Remote album art HTTP error");
                         }
