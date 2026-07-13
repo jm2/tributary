@@ -271,12 +271,14 @@ retires P1.7's synchronous local-file resolver note.
 
 ### P1.8 Implement authoritative MPD state
 
-- [ ] Serialize MPD commands through one worker or persistent connection.
-- [ ] Emit Playing, Paused, Stopped, position, duration, and completion events.
-- [ ] Clear buffering timers on success and error.
-- [ ] Redact authenticated URLs from command logs.
-- [ ] Add fake-server tests including slow and reordered commands.
-- [ ] Record implementation: _pending_
+- [x] Serialize MPD commands through one worker or persistent connection.
+- [x] Emit Playing, Paused, Stopped, position, duration, and completion events.
+- [x] Clear buffering timers on success and error.
+- [x] Redact authenticated URLs from command logs.
+- [x] Add fake-server tests including slow and reordered commands.
+- [x] Record implementation: commit `eb0b9ca`; 37 focused FIFO, supersession,
+  persistent-session, protocol-boundary, authoritative-state, ownership, EOS, timeout,
+  poisoned-stream, IPv6-resolution, and credential-redaction tests.
 
 ### P1.9 Prevent stale async source rendering
 
@@ -528,6 +530,13 @@ cannot transmit to the device that was clicked.
 Acceptance criteria: selecting an AirPlay receiver either plays to that receiver or fails with an
 error that tells the user what to install.
 
+### P2.10 Bound MPD resolution and command ingress
+
+- [ ] Replace blocking `ToSocketAddrs` resolution with a cancellable, deadline-bound resolver.
+- [ ] Bound or deliberately coalesce the non-blocking MPD worker command queue.
+- [ ] Add held-ACK worker FIFO, slow-first-greeting fairness, and real IPv6 loopback coverage.
+- [ ] Record implementation: _pending_
+
 ## P3 — Architecture and integration coverage
 
 ### P3.1 Introduce a source/session registry
@@ -715,6 +724,15 @@ Record scope or design decisions here so deferred work is explicit.
   custom-stream constructor, so cancellation can be checked only before and after an in-flight
   call; hard receiver I/O deadlines require an upstream change or audited fork and are tracked as
   P2.8 rather than overstated as part of P1.7.
+- 2026-07-12 — P1.8 gives MPD one FIFO worker and one persistent TCP session per owned load.
+  Stable `addid`/`playid` identity, authoritative status polling, and atomic `deleteid` cleanup
+  distinguish explicit Stop, natural queue exhaustion, remote errors, and another client's
+  replacement queue without applying global cleanup after ownership is lost. Protocol lines,
+  responses, addresses, URIs, idle I/O, and whole operations are bounded; poisoned streams are
+  dropped rather than reused, and all diagnostics discard server text and authenticated URLs.
+  Standard-library DNS resolution itself remains blocking and the nonblocking command channel is
+  unbounded; those narrower resilience improvements and deeper OS loopback coverage are tracked as
+  P2.10 rather than overstated as part of P1.8.
 
 - 2026-07-13 — Documentation audit against the committed tree. Every `[x]` in P1.1–P1.7 was
   verified against the source and none was overstated. The drift was everywhere else: CHANGELOG
@@ -756,3 +774,4 @@ Add one line per completed task:
 | 2026-07-12 | P1.7 | `60ee2af` | One worker owns the Cast session and serializes effects, authoritative state, cancellation, cleanup retries, and stale-event suppression. |
 | 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
 | 2026-07-13 | P2.6 (partial) | `8368a65` | Radio-Browser, geolocation, and MusicBrainz clients now refuse HTTPS→HTTP redirect downgrades and send no `Referer`; packaging metadata remains open. |
+| 2026-07-12 | P1.8 | `eb0b9ca` | One persistent FIFO MPD worker provides bounded protocol I/O, stable queue ownership, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
