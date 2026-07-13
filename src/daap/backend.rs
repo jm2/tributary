@@ -369,33 +369,7 @@ impl crate::architecture::MediaBackend for DaapBackend {
     }
 
     async fn ping(&self) -> BackendResult<()> {
-        // Issue a lightweight server-info request to check connectivity.
-        let url = format!(
-            "{}/server-info",
-            self.client.base_url().as_str().trim_end_matches('/')
-        );
-        let resp = self
-            .client
-            .http_clone()
-            .get(&url)
-            .send()
-            .await
-            .map_err(|error| {
-                let error = crate::http_security::strip_request_url(error);
-                BackendError::ConnectionFailed {
-                    message: format!("DAAP ping failed: {error}"),
-                    source: Some(Box::new(error)),
-                }
-            })?;
-
-        if !resp.status().is_success() {
-            return Err(BackendError::ConnectionFailed {
-                message: format!("DAAP ping HTTP {}", resp.status()),
-                source: None,
-            });
-        }
-
-        Ok(())
+        self.client.ping().await
     }
 
     async fn search(&self, query: &str, limit: usize) -> BackendResult<SearchResults> {

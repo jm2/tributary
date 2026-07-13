@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
     authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
 };
@@ -34,11 +35,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (the timeout resets after each successful read).
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum response body we are willing to buffer into memory.  A generous
-/// cap that still rules out a malicious or misbehaving server trying to
-/// exhaust memory with an unbounded body.  Enforced from the
-/// `Content-Length` header before the body is read (see [`check_body_size`]).
-const MAX_BODY_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum response bodies for authentication and API JSON, respectively.
+const MAX_AUTH_BODY_BYTES: u64 = 1024 * 1024;
+const MAX_API_BODY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// End-to-end and body-phase deadlines for each finite request class.
+const AUTH_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
+const API_RESPONSE_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Holds credentials and a reusable `reqwest::Client` with the
 /// `X-Plex-Token` header pre-configured on every request.
@@ -142,6 +145,7 @@ impl PlexClient {
         let resp = pre_auth_http
             .post(PLEX_TV_SIGN_IN)
             .body(form_body)
+            .timeout(AUTH_RESPONSE_DEADLINE)
             .send()
             .await
             .map_err(|e| {
@@ -170,13 +174,15 @@ impl PlexClient {
             });
         }
 
-        let sign_in: PlexSignInResponse = resp.json().await.map_err(|e| {
-            let e = strip_request_url(e);
-            BackendError::ParseError {
+        let body = read_limited(resp, MAX_AUTH_BODY_BYTES, AUTH_RESPONSE_DEADLINE)
+            .await
+            .map_err(|error| response_body_error("Failed to parse Plex sign-in response", error))?;
+
+        let sign_in: PlexSignInResponse =
+            serde_json::from_slice(&body).map_err(|e| BackendError::ParseError {
                 message: format!("Failed to parse Plex sign-in response: {e}"),
                 source: Some(Box::new(e)),
-            }
-        })?;
+            })?;
 
         let auth_token = sign_in.user.auth_token;
 
@@ -268,13 +274,19 @@ impl PlexClient {
 
         debug!(url = %redact_url_secrets(url.as_str()), "Plex request");
 
-        let resp = self.http.get(url.as_str()).send().await.map_err(|e| {
-            let e = strip_request_url(e);
-            BackendError::ConnectionFailed {
-                message: format!("HTTP request failed: {e}"),
-                source: Some(Box::new(e)),
-            }
-        })?;
+        let resp = self
+            .http
+            .get(url.as_str())
+            .timeout(API_RESPONSE_DEADLINE)
+            .send()
+            .await
+            .map_err(|e| {
+                let e = strip_request_url(e);
+                BackendError::ConnectionFailed {
+                    message: format!("HTTP request failed: {e}"),
+                    source: Some(Box::new(e)),
+                }
+            })?;
 
         let status = resp.status();
 
@@ -291,15 +303,13 @@ impl PlexClient {
             });
         }
 
-        // Refuse to buffer an oversized body (DoS guard) before reading it.
-        check_body_size(&resp)?;
+        let body = read_limited(resp, MAX_API_BODY_BYTES, API_RESPONSE_DEADLINE)
+            .await
+            .map_err(|error| response_body_error("Failed to parse Plex JSON", error))?;
 
-        let body = resp.json::<T>().await.map_err(|e| {
-            let e = strip_request_url(e);
-            BackendError::ParseError {
-                message: format!("Failed to parse Plex JSON: {e}"),
-                source: Some(Box::new(e)),
-            }
+        let body = serde_json::from_slice::<T>(&body).map_err(|e| BackendError::ParseError {
+            message: format!("Failed to parse Plex JSON: {e}"),
+            source: Some(Box::new(e)),
         })?;
 
         Ok(body)
@@ -339,29 +349,39 @@ fn build_http_client(auth_token: &str) -> BackendResult<Client> {
         })
 }
 
-/// Reject a response whose declared body exceeds [`MAX_BODY_BYTES`].
-///
-/// A lightweight, best-effort DoS guard: it inspects only the
-/// `Content-Length` header, so a chunked response sent without a length is
-/// not covered here — the client's `read_timeout` still bounds a stalled or
-/// slow-trickling transfer in that case.
-fn check_body_size(resp: &reqwest::Response) -> BackendResult<()> {
-    if let Some(len) = resp.content_length() {
-        if len > MAX_BODY_BYTES {
-            return Err(BackendError::ConnectionFailed {
-                message: format!(
-                    "Response body too large: {len} bytes exceeds the {MAX_BODY_BYTES}-byte cap"
-                ),
-                source: None,
-            });
-        }
+fn response_body_error(context: &str, error: ResponseBodyError) -> BackendError {
+    match error {
+        error @ (ResponseBodyError::TooLarge { .. }
+        | ResponseBodyError::InvalidLimit { .. }
+        | ResponseBodyError::AllocationFailed { .. }) => BackendError::ConnectionFailed {
+            message: error.to_string(),
+            source: None,
+        },
+        ResponseBodyError::DeadlineExceeded { deadline } => BackendError::Timeout {
+            duration_secs: deadline.as_secs(),
+        },
+        error => BackendError::ParseError {
+            message: format!("{context}: {error}"),
+            source: Some(Box::new(error)),
+        },
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_response_body_deadline_to_timeout() {
+        let error = response_body_error(
+            "body",
+            ResponseBodyError::DeadlineExceeded {
+                deadline: Duration::from_secs(7),
+            },
+        );
+
+        assert!(matches!(error, BackendError::Timeout { duration_secs: 7 }));
+    }
 
     #[test]
     fn rejects_embedded_url_credentials_without_echoing_them() {

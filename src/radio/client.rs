@@ -20,6 +20,12 @@ const FALLBACK_API_HOST: &str = "de1.api.radio-browser.info";
 /// HTTP request timeout for all Radio-Browser and geolocation requests.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Maximum buffered Radio-Browser station-list response.
+const MAX_STATION_BODY_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Maximum buffered response from an IP geolocation provider.
+const MAX_GEOLOCATION_BODY_BYTES: u64 = 256 * 1024;
+
 /// Radio-Browser API client.
 pub struct RadioBrowserClient {
     /// Base URL for API requests (e.g. `https://de1.api.radio-browser.info`).
@@ -44,7 +50,7 @@ impl RadioBrowserClient {
                 tracing::warn!(
                     error = %e,
                     "Failed to build configured reqwest::Client for Radio-Browser; \
-                     falling back to default (no timeout)"
+                     falling back to the default client with per-request deadlines"
                 );
                 reqwest::Client::default()
             }
@@ -151,28 +157,39 @@ impl RadioBrowserClient {
     /// Filters out stations with non-HTTP(S) stream URLs for safety.
     async fn fetch_stations(&self, url: &str) -> Vec<RadioStation> {
         debug!(url = %url, "Fetching radio stations");
-        match self.client.get(url).send().await {
+        match self.client.get(url).timeout(REQUEST_TIMEOUT).send().await {
             // lgtm[rs/cleartext-transmission] Base URL is always HTTPS; station stream URLs may be HTTP but carry no sensitive data.
-            Ok(resp) => match resp.json::<Vec<RadioStation>>().await {
-                Ok(stations) => {
-                    // Filter out stations with non-HTTP(S) stream URLs
-                    // to prevent file:// or other scheme injection.
-                    let safe: Vec<RadioStation> = stations
-                        .into_iter()
-                        .filter(|s| {
-                            let url = s.url_resolved.to_lowercase();
-                            url.starts_with("http://") || url.starts_with("https://")
-                        })
-                        .collect();
-                    info!(count = safe.len(), "Radio stations fetched (filtered)");
-                    safe
+            Ok(resp) => {
+                match crate::http_body::read_limited(resp, MAX_STATION_BODY_BYTES, REQUEST_TIMEOUT)
+                    .await
+                {
+                    Ok(body) => match serde_json::from_slice::<Vec<RadioStation>>(&body) {
+                        Ok(stations) => {
+                            // Filter out stations with non-HTTP(S) stream URLs
+                            // to prevent file:// or other scheme injection.
+                            let safe: Vec<RadioStation> = stations
+                                .into_iter()
+                                .filter(|s| {
+                                    let url = s.url_resolved.to_lowercase();
+                                    url.starts_with("http://") || url.starts_with("https://")
+                                })
+                                .collect();
+                            info!(count = safe.len(), "Radio stations fetched (filtered)");
+                            safe
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to parse radio station response");
+                            Vec::new()
+                        }
+                    },
+                    Err(e) => {
+                        warn!(error = %e, "Failed to read radio station response");
+                        Vec::new()
+                    }
                 }
-                Err(e) => {
-                    warn!(error = %e, "Failed to parse radio station response");
-                    Vec::new()
-                }
-            },
+            }
             Err(e) => {
+                let e = crate::http_security::strip_request_url(e);
                 warn!(error = %e, "Failed to fetch radio stations");
                 Vec::new()
             }
@@ -238,8 +255,16 @@ pub async fn fetch_geolocation() -> Option<GeoLocation> {
 
 /// Try ipapi.co geolocation.
 async fn try_ipapi_co(client: &reqwest::Client) -> Option<GeoLocation> {
-    let resp = client.get("https://ipapi.co/json/").send().await.ok()?;
-    let data: IpApiCoResponse = resp.json().await.ok()?;
+    let resp = client
+        .get("https://ipapi.co/json/")
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .ok()?;
+    let body = crate::http_body::read_limited(resp, MAX_GEOLOCATION_BODY_BYTES, REQUEST_TIMEOUT)
+        .await
+        .ok()?;
+    let data: IpApiCoResponse = serde_json::from_slice(&body).ok()?;
     if !data.error && (data.latitude != 0.0 || data.longitude != 0.0) {
         Some(GeoLocation {
             latitude: data.latitude,
@@ -254,8 +279,16 @@ async fn try_ipapi_co(client: &reqwest::Client) -> Option<GeoLocation> {
 
 /// Try ipwho.is geolocation.
 async fn try_ipwhois(client: &reqwest::Client) -> Option<GeoLocation> {
-    let resp = client.get("https://ipwho.is/").send().await.ok()?;
-    let data: IpWhoIsResponse = resp.json().await.ok()?;
+    let resp = client
+        .get("https://ipwho.is/")
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .ok()?;
+    let body = crate::http_body::read_limited(resp, MAX_GEOLOCATION_BODY_BYTES, REQUEST_TIMEOUT)
+        .await
+        .ok()?;
+    let data: IpWhoIsResponse = serde_json::from_slice(&body).ok()?;
     if data.success && (data.latitude != 0.0 || data.longitude != 0.0) {
         Some(GeoLocation {
             latitude: data.latitude,
@@ -272,10 +305,14 @@ async fn try_ipwhois(client: &reqwest::Client) -> Option<GeoLocation> {
 async fn try_freeipapi(client: &reqwest::Client) -> Option<GeoLocation> {
     let resp = client
         .get("https://freeipapi.com/api/json")
+        .timeout(REQUEST_TIMEOUT)
         .send()
         .await
         .ok()?;
-    let data: FreeIpApiResponse = resp.json().await.ok()?;
+    let body = crate::http_body::read_limited(resp, MAX_GEOLOCATION_BODY_BYTES, REQUEST_TIMEOUT)
+        .await
+        .ok()?;
+    let data: FreeIpApiResponse = serde_json::from_slice(&body).ok()?;
     if data.latitude != 0.0 || data.longitude != 0.0 {
         Some(GeoLocation {
             latitude: data.latitude,

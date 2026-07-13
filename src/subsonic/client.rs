@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
     authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
 };
@@ -31,11 +32,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (the timeout resets after each successful read).
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum response body we are willing to buffer into memory.  A generous
-/// cap that still rules out a malicious or misbehaving server trying to
-/// exhaust memory with an unbounded body.  Enforced from the
-/// `Content-Length` header before the body is read (see [`check_body_size`]).
-const MAX_BODY_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum response body we are willing to buffer into memory for API JSON.
+const MAX_API_BODY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// End-to-end and body-phase deadline for finite API requests.
+const API_RESPONSE_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Authentication mode used for API requests.
 #[derive(Clone)]
@@ -241,18 +242,24 @@ impl SubsonicClient {
 
         debug!(url = %redact_url_secrets(url.as_str()), "Subsonic request");
 
-        let resp = self.http.get(url.as_str()).send().await.map_err(|e| {
-            // Strip the request URL from the error before it is formatted or
-            // boxed: it carries the auth token + salt (or the hex-encoded
-            // plaintext password) in its query string, and reqwest's Display
-            // appends the full URL — which would leak the credential into
-            // always-on error-level logs on routine transport failures.
-            let e = strip_request_url(e);
-            BackendError::ConnectionFailed {
-                message: format!("HTTP request failed: {e}"),
-                source: Some(Box::new(e)),
-            }
-        })?;
+        let resp = self
+            .http
+            .get(url.as_str())
+            .timeout(API_RESPONSE_DEADLINE)
+            .send()
+            .await
+            .map_err(|e| {
+                // Strip the request URL from the error before it is formatted or
+                // boxed: it carries the auth token + salt (or the hex-encoded
+                // plaintext password) in its query string, and reqwest's Display
+                // appends the full URL — which would leak the credential into
+                // always-on error-level logs on routine transport failures.
+                let e = strip_request_url(e);
+                BackendError::ConnectionFailed {
+                    message: format!("HTTP request failed: {e}"),
+                    source: Some(Box::new(e)),
+                }
+            })?;
 
         if !resp.status().is_success() {
             return Err(BackendError::ConnectionFailed {
@@ -261,18 +268,15 @@ impl SubsonicClient {
             });
         }
 
-        // Refuse to buffer an oversized body (DoS guard) before reading it.
-        check_body_size(&resp)?;
+        let body = read_limited(resp, MAX_API_BODY_BYTES, API_RESPONSE_DEADLINE)
+            .await
+            .map_err(|error| response_body_error("Failed to parse Subsonic JSON", error))?;
 
-        let envelope: SubsonicEnvelope = resp.json().await.map_err(|e| {
-            // A body-read failure here can also carry the credential-bearing
-            // request URL; strip it before formatting/boxing into the error.
-            let e = strip_request_url(e);
-            BackendError::ParseError {
+        let envelope: SubsonicEnvelope =
+            serde_json::from_slice(&body).map_err(|e| BackendError::ParseError {
                 message: format!("Failed to parse Subsonic JSON: {e}"),
                 source: Some(Box::new(e)),
-            }
-        })?;
+            })?;
 
         if envelope.response.status != "ok" {
             let msg = envelope
@@ -324,29 +328,39 @@ impl SubsonicClient {
     }
 }
 
-/// Reject a response whose declared body exceeds [`MAX_BODY_BYTES`].
-///
-/// A lightweight, best-effort DoS guard: it inspects only the
-/// `Content-Length` header, so a chunked response sent without a length is
-/// not covered here — the client's `read_timeout` still bounds a stalled or
-/// slow-trickling transfer in that case.
-fn check_body_size(resp: &reqwest::Response) -> BackendResult<()> {
-    if let Some(len) = resp.content_length() {
-        if len > MAX_BODY_BYTES {
-            return Err(BackendError::ConnectionFailed {
-                message: format!(
-                    "Response body too large: {len} bytes exceeds the {MAX_BODY_BYTES}-byte cap"
-                ),
-                source: None,
-            });
-        }
+fn response_body_error(context: &str, error: ResponseBodyError) -> BackendError {
+    match error {
+        error @ (ResponseBodyError::TooLarge { .. }
+        | ResponseBodyError::InvalidLimit { .. }
+        | ResponseBodyError::AllocationFailed { .. }) => BackendError::ConnectionFailed {
+            message: error.to_string(),
+            source: None,
+        },
+        ResponseBodyError::DeadlineExceeded { deadline } => BackendError::Timeout {
+            duration_secs: deadline.as_secs(),
+        },
+        error => BackendError::ParseError {
+            message: format!("{context}: {error}"),
+            source: Some(Box::new(error)),
+        },
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_response_body_deadline_to_timeout() {
+        let error = response_body_error(
+            "body",
+            ResponseBodyError::DeadlineExceeded {
+                deadline: Duration::from_secs(7),
+            },
+        );
+
+        assert!(matches!(error, BackendError::Timeout { duration_secs: 7 }));
+    }
 
     #[test]
     fn rejects_embedded_url_credentials_without_echoing_them() {
