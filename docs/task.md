@@ -298,8 +298,10 @@ reaches `display_tracks`.
 
 - [x] Refresh already-open playlist URIs after an ID-preserving local rename and overlay committed
   URIs onto an in-flight result before publication.
-- [ ] Guard the two radio loads with the same active-key check the playlist and USB loads already
-  use, passing `active_source_key` into `fetch_and_display_nearme`.
+- [x] Guard the two radio loads with the same active-key check the playlist and USB loads already
+  use. `fetch_and_display_nearme` now takes `active_source_key` and checks it before rendering, and
+  the Top Clicked / Top Voted closure clones and checks it too. Clicking away from a slow radio
+  fetch no longer replaces the library view with stations while the sidebar still says Local.
 - [ ] Promote the guard from a bare source **key** to a key plus **generation**: re-selecting the
   same playlist twice leaves two in-flight loads with identical keys, so the older one can still
   render last. This is the residual recorded in the 2026-07-12 decision note.
@@ -398,20 +400,28 @@ right-click → Properties → Save (`ui/properties_dialog.rs:302`, `:385-400`):
 Re-scoped 2026-07-13. `device/usb.rs` performs **no traversal at all** — it only `read_dir`s the
 mount roots (`:64-87`), so the symlink defect is not there. The traversal lives in the UI.
 
-- [ ] Disable symlink following during device scans. The offending call is
-  `ui/source_connect.rs:296-297` — `WalkDir::new(mount_path).follow_links(true)`. A USB stick
-  containing `music -> /home/user` makes Tributary walk the entire home directory and index it as
-  "on the device". (The library scanner was already hardened under P1.2: `local/engine.rs:772`
-  uses `.follow_links(false)`.)
-- [ ] Verify canonical descendants remain on the selected mount/device.
+- [x] Disable symlink following during device scans. The walk used
+  `WalkDir::new(mount_path).follow_links(true)`, so a USB stick containing `music -> /home/user`
+  made Tributary walk the entire home directory and index it as "on the device". The traversal is
+  now extracted into `enumerate_device_audio_files`, uses `.follow_links(false)`, and tests
+  `entry.file_type()` rather than `Path::is_file()` — the latter follows the link anyway and would
+  still have pulled in an individual file symlinked from off the device. This matches the library
+  scanner's policy (`local/engine.rs:772`).
+- [x] Verify descendants remain on the selected mount/device, for the symlink case: nothing outside
+  the mount can now be reached through a link. (A bind mount or a nested real filesystem under the
+  mount point is still followed; the library scanner's `filesystem_boundary_id` check is the model
+  to copy if that matters here.)
 - [ ] Move mount **discovery** off the GTK thread. `ui/window.rs:71` calls `detect_usb_devices()`
   synchronously inside `build_window`. It is only a shallow `read_dir` + `is_dir()`, but against a
   hung mount (stale NFS, yanked stick) `is_dir()` blocks in the kernel and the app hangs at
-  startup before the window is drawn. The *traversal* is already off-thread
-  (`ui/source_connect.rs:294`), so that half is done.
+  startup before the window is drawn. The *traversal* is already off-thread, so that half is done.
+  Left open deliberately: it reorders sidebar population at startup and wants a live UI review.
 - [ ] Use platform mount/volume APIs rather than directory heuristics.
-- [ ] Add malicious symlink, stale mount, and duplicate-device tests.
-- [ ] Record implementation: _pending_
+- [x] Add malicious symlink tests: a device tree with both a directory symlink and a file symlink
+  pointing off-device yields only the files physically on the device.
+- [ ] Add stale-mount and duplicate-device tests.
+- [ ] Record implementation: symlink containment in commit `1886847`; 2 focused traversal tests. Mount
+  discovery and platform volume APIs remain open.
 
 ### P2.5 Repair Flatpak behavior and local build path
 
