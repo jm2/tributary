@@ -95,7 +95,7 @@ impl LibraryEngine {
         // scan are retained for replay after its snapshot is published.
         // Construction remains best-effort: a watcher backend failure must
         // not suppress the useful one-shot scan.
-        let (watcher, watcher_error) = match install_directory_watcher(&self.music_dirs) {
+        let (mut watcher, watcher_error) = match install_directory_watcher(&self.music_dirs) {
             Ok(watcher) => (Some(watcher), None),
             Err(error) => {
                 error!(%error, "Filesystem watcher could not be installed");
@@ -110,6 +110,14 @@ impl LibraryEngine {
         if let Err(e) = initial_scan(&db, &self.music_dirs, &self.tx).await {
             error!(error = %e, "Initial scan failed");
             let _ = self.tx.send(LibraryEvent::Error(e.to_string())).await;
+        }
+
+        // A missing or temporarily unwatchable root can become available
+        // while another root is being enumerated. Retain every successful
+        // pre-scan registration, then retry only the gaps at the handoff so a
+        // root the scan just indexed is never left unwatched until restart.
+        if let Some(watcher) = watcher.as_mut() {
+            watcher.watch_available_directories(&self.music_dirs);
         }
 
         if let Some(error) = watcher_error {
@@ -2407,9 +2415,30 @@ const WATCHER_DEBOUNCE_MS: u64 = 1500;
 const WATCHER_RECONCILIATION_RETRY_MS: u64 = 1000;
 
 struct DirectoryWatcher {
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
     rx: mpsc::Receiver<notify::Result<notify::Event>>,
     ingress_overflowed: Arc<AtomicBool>,
+    watched_directories: HashSet<PathBuf>,
+}
+
+impl DirectoryWatcher {
+    fn watch_available_directories(&mut self, music_dirs: &[PathBuf]) {
+        for dir in music_dirs {
+            if self.watched_directories.contains(dir) {
+                continue;
+            }
+            if !dir.is_dir() {
+                warn!(dir = %dir.display(), "Library folder does not exist — skipping watch");
+                continue;
+            }
+            if let Err(error) = self.watcher.watch(dir.as_ref(), RecursiveMode::Recursive) {
+                warn!(dir = %dir.display(), %error, "Failed to watch directory — skipping");
+                continue;
+            }
+            self.watched_directories.insert(dir.clone());
+            info!(dir = %dir.display(), "Watching directory");
+        }
+    }
 }
 
 /// Enqueue one backend callback without ever blocking the notify thread.
@@ -2433,7 +2462,7 @@ fn install_directory_watcher(music_dirs: &[PathBuf]) -> notify::Result<Directory
     let ingress_overflowed = Arc::new(AtomicBool::new(false));
     let callback_overflowed = Arc::clone(&ingress_overflowed);
 
-    let mut watcher = RecommendedWatcher::new(
+    let watcher = RecommendedWatcher::new(
         move |result| {
             enqueue_watcher_result(&notify_tx, callback_overflowed.as_ref(), result);
         },
@@ -2442,29 +2471,20 @@ fn install_directory_watcher(music_dirs: &[PathBuf]) -> notify::Result<Directory
             .with_follow_symlinks(false),
     )?;
 
-    // Watch each directory independently. A missing or unwatchable directory
-    // (e.g. a first-launch default that doesn't exist, or a folder that was
-    // removed after being configured) is skipped with a warning rather than
-    // aborting the whole watcher — so one bad path can't stop the others from
-    // being watched, and it never surfaces as a hard scan error to the user.
-    for dir in music_dirs {
-        if !dir.is_dir() {
-            warn!(dir = %dir.display(), "Library folder does not exist — skipping watch");
-            continue;
-        }
-        if let Err(e) = watcher.watch(dir.as_ref(), RecursiveMode::Recursive) {
-            warn!(dir = %dir.display(), error = %e, "Failed to watch directory — skipping");
-            continue;
-        }
-        info!(dir = %dir.display(), "Watching directory");
-    }
-    info!("Filesystem watcher active");
-
-    Ok(DirectoryWatcher {
-        _watcher: watcher,
+    let mut installed = DirectoryWatcher {
+        watcher,
         rx: notify_rx,
         ingress_overflowed,
-    })
+        watched_directories: HashSet::new(),
+    };
+
+    // Watch each directory independently. A missing or unwatchable directory
+    // is retried once after the bootstrap scan rather than aborting the whole
+    // watcher, so one bad path cannot stop healthy roots from being watched.
+    installed.watch_available_directories(music_dirs);
+    info!("Filesystem watcher active");
+
+    Ok(installed)
 }
 
 #[derive(Debug, Default)]
@@ -3492,6 +3512,28 @@ mod tests {
             .expect("queued notify event");
         assert_eq!(queued.paths, [PathBuf::from("/music/first.flac")]);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn watcher_retries_a_root_that_appears_during_bootstrap() {
+        let library = TestDirectory::new("watcher-registration-retry");
+        let ready = library.path().join("ready");
+        let late = library.path().join("late");
+        std::fs::create_dir(&ready).expect("create initially available root");
+
+        let mut watcher = install_directory_watcher(&[ready.clone(), late.clone()])
+            .expect("install directory watcher");
+        assert!(watcher.watched_directories.contains(&ready));
+        assert!(!watcher.watched_directories.contains(&late));
+
+        std::fs::create_dir(&late).expect("make root available during bootstrap");
+        watcher.watch_available_directories(&[ready.clone(), late.clone()]);
+
+        assert_eq!(
+            watcher.watched_directories,
+            HashSet::from([ready, late]),
+            "the handoff retry retains old registrations and closes new gaps"
+        );
     }
 
     #[test]

@@ -179,8 +179,8 @@ explicitly justified and time-bounded.
 - [x] Reconcile after watcher errors or overflow.
 - [x] Use bounded/coalescing event delivery where appropriate.
 - [x] Add race-oriented tests.
-- [x] Record implementation: commit `4eb79d0`; six focused ingress, replay, stream-loss,
-  marker-mutation, and race tests.
+- [x] Record implementation: commit `4eb79d0` plus review follow-ups; seven focused ingress,
+  replay, registration-retry, stream-loss, marker-mutation, and race tests.
 
 ### P1.4 Enforce exact-origin authenticated redirects
 
@@ -457,10 +457,11 @@ Record scope or design decisions here so deferred work is explicit.
   before it; recovery requires rebuilding it from a refreshed source model. Stable-ID resolution
   at playback, navigation, and receiver-load time remains P3.1 rather than changing queue semantics
   here.
-- 2026-07-12 — P1.3 installs each watcher before enumeration and replays its bounded, ordered
-  ingress after the initial snapshot. Notify errors, rescan flags, and queue overflow discard the
-  incomplete incremental batch and retry a hardened scan before any later incremental mutation;
-  marker mutations take the same fail-closed route. A rename can still lose its old UUID if the
+- 2026-07-12 — P1.3 installs each watcher before enumeration, retries roots that become available
+  during enumeration, and replays its bounded, ordered ingress after the initial snapshot. Notify
+  errors, rescan flags, and queue overflow discard the incomplete incremental batch and retry a
+  hardened scan before any later incremental mutation; marker mutations take the same fail-closed
+  route. A rename can still lose its old UUID if the
   initial destructive scan has already deleted the source row before the buffered pair is replayed.
   The resulting filesystem/database state is reconciled, but eliminating that narrow identity
   boundary requires a future two-phase, non-destructive bootstrap scan rather than guessing from
