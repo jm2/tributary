@@ -198,11 +198,12 @@ explicitly justified and time-bounded.
 
 ### P1.5 Enforce response limits while streaming
 
-- [ ] Replace `Content-Length`-only checks with counted streaming reads.
-- [ ] Apply caps to API JSON, DAAP, authentication, radio, and album-art responses.
-- [ ] Add overall deadlines in addition to idle timeouts.
-- [ ] Test missing, false, and oversized `Content-Length`, plus endless chunked bodies.
-- [ ] Record implementation: _pending_
+- [x] Replace `Content-Length`-only checks with counted streaming reads.
+- [x] Apply caps to API JSON, DAAP, authentication, radio, and album-art responses.
+- [x] Add overall deadlines in addition to idle timeouts.
+- [x] Test missing, false, and oversized `Content-Length`, plus endless chunked bodies.
+- [x] Record implementation: commit `842341b`; 14 focused counted-size, deadline,
+  timeout-classification, allocation-boundary, URL-redaction, and backend-mapping tests.
 
 ### P1.6 Stop exposing broad bearer tokens to receivers
 
@@ -480,6 +481,14 @@ Record scope or design decisions here so deferred work is explicit.
   upstream redirect callback on those transports until it owns the stream through a short-lived
   proxy/ticket. Disabling redirects only for GStreamer would be both incomplete and potentially
   breaking, so the playback-stream checkbox remains explicit rather than being claimed complete.
+- 2026-07-12 — P1.5 treats every finite HTTP response as an observed byte stream rather than
+  trusting `Content-Length`: Subsonic, Jellyfin, Plex, DAAP, authentication, radio/geolocation,
+  artwork, and MusicBrainz reads now stop at endpoint-specific caps and carry end-to-end request
+  deadlines in addition to idle-read timeouts. Async and blocking collectors classify request
+  timeouts consistently, discard credential-bearing request URLs from retained body errors, and
+  fail cleanly on impossible or unavailable allocations. Audio and live-radio media streams remain
+  deliberately uncapped because they are length-unbounded playback transports; credential-bearing
+  playback still belongs to the cancellable P1.6 proxy/ticket design.
 
 ## Completed work log
 
@@ -497,3 +506,4 @@ Add one line per completed task:
 | 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |
 | 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
 | 2026-07-12 | P1.4a | `eb5458f` | Exact-origin/no-Referer policy and URL-free errors/logging cover every app-owned credential HTTP fetch; receiver-controlled playback streams remain tied to P1.6. |
+| 2026-07-12 | P1.5 | `842341b` | Counted finite-response reads enforce endpoint caps and total deadlines across API, authentication, DAAP, radio, artwork, and metadata clients. |
