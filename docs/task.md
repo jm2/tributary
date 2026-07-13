@@ -193,8 +193,8 @@ explicitly justified and time-bounded.
 - [x] Strip credential-bearing URLs from every retained/formatted HTTP or pipeline error.
 - [x] Stop logging raw DAAP session IDs and authenticated MPD commands.
 - [x] Add redirect matrix tests using mock servers.
-- [x] Record implementation: commit `eb5458f`; 17 focused origin, redirect, Referer, header,
-  redaction, userinfo, DAAP, and MPD tests.
+- [x] Record implementation: commit `eb5458f` plus review follow-ups; 18 focused origin,
+  redirect, Referer, header, redaction, userinfo, DAAP, and MPD tests.
 
 ### P1.5 Enforce response limits while streaming
 

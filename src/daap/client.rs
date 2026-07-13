@@ -18,7 +18,9 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::http_security::{authenticated_client_builder, redact_url_secrets, strip_request_url};
+use crate::http_security::{
+    authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
+};
 
 use super::dmap::{self, DmapNode, DmapValue};
 
@@ -76,7 +78,10 @@ impl DaapClient {
             message: format!("Invalid DAAP server URL: {e}"),
             source: Some(Box::new(e)),
         })?;
-        validate_base_url(&base_url)?;
+        validate_base_url(&base_url).map_err(|message| BackendError::ConnectionFailed {
+            message: message.replace("server URL", "DAAP server URL"),
+            source: None,
+        })?;
 
         let http = build_http_client()?;
 
@@ -466,22 +471,6 @@ fn build_http_client() -> BackendResult<Client> {
         .read_timeout(READ_TIMEOUT)
         .build()
         .map_err(|error| daap_request_error("Failed to build DAAP HTTP client", error))
-}
-
-fn validate_base_url(base_url: &Url) -> BackendResult<()> {
-    if base_url.cannot_be_a_base()
-        || !matches!(base_url.scheme(), "http" | "https")
-        || !base_url.username().is_empty()
-        || base_url.password().is_some()
-    {
-        return Err(BackendError::ConnectionFailed {
-            message:
-                "Invalid DAAP server URL: expected an HTTP(S) URL without embedded credentials"
-                    .to_string(),
-            source: None,
-        });
-    }
-    Ok(())
 }
 
 fn daap_request_error(context: &str, error: reqwest::Error) -> BackendError {

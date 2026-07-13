@@ -10,7 +10,9 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::http_security::{authenticated_client_builder, redact_url_secrets, strip_request_url};
+use crate::http_security::{
+    authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
+};
 
 use super::api::{JellyfinAuthRequest, JellyfinAuthResponse};
 
@@ -61,7 +63,10 @@ impl JellyfinClient {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
         })?;
-        validate_base_url(&base_url)?;
+        validate_base_url(&base_url).map_err(|message| BackendError::ConnectionFailed {
+            message: message.to_string(),
+            source: None,
+        })?;
 
         let http = build_http_client(api_key)?;
 
@@ -93,7 +98,10 @@ impl JellyfinClient {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
         })?;
-        validate_base_url(&base_url)?;
+        validate_base_url(&base_url).map_err(|message| BackendError::ConnectionFailed {
+            message: message.to_string(),
+            source: None,
+        })?;
 
         // Build a temporary client WITHOUT a token for the auth request.
         let pre_auth_header = format!(
@@ -381,30 +389,6 @@ fn build_http_client(api_key: &str) -> BackendResult<Client> {
             message: format!("Failed to build HTTP client: {e}"),
             source: Some(Box::new(e)),
         })
-}
-
-/// Reject server URLs that are unsafe or would panic during request building.
-///
-/// `Url::parse` accepts opaque, cannot-be-a-base inputs such as a
-/// scheme-less `host:port` (e.g. `myserver:8096`), but `api_url` /
-/// `authenticate` build paths via `path_segments_mut`, which panics on
-/// such URLs. Embedded userinfo is also forbidden so credentials cannot be
-/// retained in generated URLs, logs, or request errors. Surface a clean error
-/// without echoing the rejected URL.
-fn validate_base_url(base_url: &Url) -> BackendResult<()> {
-    if base_url.cannot_be_a_base()
-        || !matches!(base_url.scheme(), "http" | "https")
-        || !base_url.username().is_empty()
-        || base_url.password().is_some()
-    {
-        return Err(BackendError::ConnectionFailed {
-            message:
-                "Invalid server URL: use an http:// or https:// URL without embedded credentials"
-                    .into(),
-            source: None,
-        });
-    }
-    Ok(())
 }
 
 /// Reject a response whose declared body exceeds [`MAX_BODY_BYTES`].

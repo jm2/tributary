@@ -10,7 +10,9 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::http_security::{authenticated_client_builder, redact_url_secrets, strip_request_url};
+use crate::http_security::{
+    authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
+};
 
 use super::api::SubsonicEnvelope;
 
@@ -90,17 +92,10 @@ impl SubsonicClient {
         // `api_url` via `path_segments_mut`. Embedded userinfo would also be
         // copied into every authenticated URL, so fail cleanly without echoing
         // the rejected URL.
-        if base_url.cannot_be_a_base()
-            || !matches!(base_url.scheme(), "http" | "https")
-            || !base_url.username().is_empty()
-            || base_url.password().is_some()
-        {
-            return Err(BackendError::ConnectionFailed {
-                message: "Invalid server URL: use an http:// or https:// URL without embedded credentials"
-                    .into(),
-                source: None,
-            });
-        }
+        validate_base_url(&base_url).map_err(|message| BackendError::ConnectionFailed {
+            message: message.to_string(),
+            source: None,
+        })?;
 
         // Token auth still transmits (username, salt, md5(password+salt)) in
         // the URL query string.  Over plain HTTP those can be captured by an

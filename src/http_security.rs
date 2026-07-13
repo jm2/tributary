@@ -28,6 +28,20 @@ pub fn strip_request_url(error: reqwest::Error) -> reqwest::Error {
     error.without_url()
 }
 
+/// Validate an HTTP base URL before credentials are attached to requests.
+pub fn validate_base_url(url: &Url) -> Result<(), &'static str> {
+    if url.cannot_be_a_base()
+        || !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(
+            "Invalid server URL: use an http:// or https:// URL without embedded credentials",
+        );
+    }
+    Ok(())
+}
+
 /// Mask credentials embedded in a URL before it is written to a log.
 ///
 /// In addition to URL user-info, this covers bearer-like query parameters used
@@ -161,6 +175,20 @@ mod tests {
             &url("file:///tmp/start"),
             &url("file:///tmp/next")
         ));
+    }
+
+    #[test]
+    fn authenticated_base_urls_reject_opaque_non_http_and_userinfo_inputs() {
+        assert!(validate_base_url(&url("https://music.example.test:443/base")).is_ok());
+        for unsafe_url in [
+            "music.example.test:443",
+            "ftp://music.example.test/base",
+            "https://user:secret@music.example.test/base",
+        ] {
+            let error = validate_base_url(&url(unsafe_url)).expect_err("unsafe base URL");
+            assert!(!error.contains("secret"));
+            assert!(!error.contains(unsafe_url));
+        }
     }
 
     #[test]
