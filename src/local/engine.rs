@@ -2603,22 +2603,12 @@ async fn process_directory_events(
         // intentionally left for the next loop iteration.
         let overflowed = watcher.ingress_overflowed.swap(false, Ordering::AcqRel);
         let Some(mut batch) = ingress.finish() else {
-            reconciliation_pending =
-                !reconcile_unreliable_watcher_stream(db.as_ref(), music_dirs, tx, &mut watcher.rx)
-                    .await;
-            if reconciliation_pending {
-                tokio::time::sleep(Duration::from_millis(WATCHER_RECONCILIATION_RETRY_MS)).await;
-            }
+            reconciliation_pending = true;
             continue;
         };
         if overflowed {
             warn!("Filesystem watcher ingress overflowed during debounce");
-            reconciliation_pending =
-                !reconcile_unreliable_watcher_stream(db.as_ref(), music_dirs, tx, &mut watcher.rx)
-                    .await;
-            if reconciliation_pending {
-                tokio::time::sleep(Duration::from_millis(WATCHER_RECONCILIATION_RETRY_MS)).await;
-            }
+            reconciliation_pending = true;
             continue;
         }
 
