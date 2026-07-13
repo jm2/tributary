@@ -182,7 +182,7 @@ fn append_limited(
         });
     }
 
-    body.try_reserve_exact(chunk.len())
+    body.try_reserve(chunk.len())
         .map_err(|_| ResponseBodyError::AllocationFailed {
             requested: new_observed,
         })?;
