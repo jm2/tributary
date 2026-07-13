@@ -35,28 +35,22 @@ pub struct RadioBrowserClient {
 
 impl RadioBrowserClient {
     /// Create a new client, resolving the best API mirror via DNS.
-    pub fn new() -> Self {
+    ///
+    /// Fails only when no HTTP client can be built at all (a TLS backend that
+    /// will not initialise). There is deliberately no degraded fallback: an
+    /// unconfigured client would carry neither the request timeout nor the
+    /// redirect policy that keeps these requests off plaintext HTTP.
+    pub fn new() -> Result<Self, reqwest::Error> {
         let host = resolve_api_host().unwrap_or_else(|| FALLBACK_API_HOST.to_string());
         let base_url = format!("https://{host}");
         info!(base_url = %base_url, "Radio-Browser API client initialized");
 
-        let client = match reqwest::Client::builder()
+        let client = crate::http_security::public_client_builder()
             .user_agent("Tributary/0.2")
             .timeout(REQUEST_TIMEOUT)
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to build configured reqwest::Client for Radio-Browser; \
-                     falling back to the default client with per-request deadlines"
-                );
-                reqwest::Client::default()
-            }
-        };
+            .build()?;
 
-        Self { base_url, client }
+        Ok(Self { base_url, client })
     }
 
     /// Fetch top-clicked stations.
@@ -207,7 +201,7 @@ impl RadioBrowserClient {
 /// Returns the first successful result with valid coordinates.
 /// Returns `None` if all providers fail.
 pub async fn fetch_geolocation() -> Option<GeoLocation> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_security::public_client_builder()
         .user_agent("Tributary/0.2")
         .timeout(REQUEST_TIMEOUT)
         .build()

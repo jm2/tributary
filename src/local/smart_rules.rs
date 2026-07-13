@@ -469,63 +469,92 @@ fn eval_number(field_val: Option<i64>, op: &RuleOperator, value: &RuleValue) -> 
     }
 }
 
-/// Evaluate a date field (RFC3339 string comparison).
+/// Evaluate a date field.
+///
+/// # Semantics
+///
+/// A track's `date_added`/`date_modified` is an **instant** — RFC3339 with an
+/// offset, e.g. `2025-01-15T10:30:00+00:00`. A rule's date is a **calendar
+/// day** picked in the editor, e.g. `2025-01-15`, and is interpreted as the
+/// whole UTC day `[00:00:00, next 00:00:00)`.
+///
+/// These used to be compared as raw strings, which meant an instant was never
+/// equal to a day: `"2025-01-15T10:30:00+00:00" == "2025-01-15"` is false, so
+/// "Date Added **is** 2025-01-15" matched **zero tracks, forever**. `IsAfter`
+/// had the mirror-image bug — the longer string sorted greater than its own
+/// date prefix, so a track added *on* the boundary day counted as "after" it.
+///
+/// Both sides are now parsed. An unparseable instant or rule date makes the
+/// rule fail to match rather than match everything.
 fn eval_date(field_val: &str, op: &RuleOperator, value: &RuleValue) -> bool {
+    let Some(instant) = parse_track_instant(field_val) else {
+        return false;
+    };
+
     match op {
         RuleOperator::Is => {
-            if let RuleValue::Date(d) = value {
-                field_val == d
-            } else {
-                false
-            }
+            rule_day(value).is_some_and(|(start, end)| instant >= start && instant < end)
         }
         RuleOperator::IsNot => {
-            if let RuleValue::Date(d) = value {
-                field_val != d
-            } else {
-                false
-            }
+            rule_day(value).is_some_and(|(start, end)| instant < start || instant >= end)
         }
-        RuleOperator::IsBefore => {
-            if let RuleValue::Date(d) = value {
-                field_val < d.as_str()
-            } else {
-                false
-            }
-        }
-        RuleOperator::IsAfter => {
-            if let RuleValue::Date(d) = value {
-                field_val > d.as_str()
-            } else {
-                false
-            }
-        }
+        RuleOperator::IsBefore => rule_day(value).is_some_and(|(start, _)| instant < start),
+        // "After 15 Jan" means after the whole of 15 Jan, not after its first
+        // instant — a track added at noon that day is not "after" it.
+        RuleOperator::IsAfter => rule_day(value).is_some_and(|(_, end)| instant >= end),
         RuleOperator::IsInTheLast { amount, unit } => {
-            let cutoff = compute_date_cutoff(*amount, *unit);
-            field_val >= cutoff.as_str()
+            // A window too large to represent reaches back past any possible
+            // track, so everything is inside it.
+            date_cutoff(*amount, *unit).is_none_or(|cutoff| instant >= cutoff)
         }
         RuleOperator::IsNotInTheLast { amount, unit } => {
-            let cutoff = compute_date_cutoff(*amount, *unit);
-            field_val < cutoff.as_str()
+            date_cutoff(*amount, *unit).is_some_and(|cutoff| instant < cutoff)
         }
         _ => false,
     }
 }
 
-/// Compute the date string N days/weeks/months ago from now.
+/// Parse a track timestamp, which is stored as RFC3339 with an offset.
+fn parse_track_instant(field_val: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(field_val)
+        .ok()
+        .map(|instant| instant.with_timezone(&chrono::Utc))
+}
+
+/// Resolve a rule's calendar day to the half-open UTC instant range it covers.
+fn rule_day(
+    value: &RuleValue,
+) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    let RuleValue::Date(raw) = value else {
+        return None;
+    };
+    let day = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()?;
+
+    let start = day.and_hms_opt(0, 0, 0)?.and_utc();
+    let end = day.succ_opt()?.and_hms_opt(0, 0, 0)?.and_utc();
+    Some((start, end))
+}
+
+/// The instant N days/weeks/months before now.
 ///
-/// Months are treated as 30-day windows for parity with how the editor
-/// presents the option (a calendar-aware "previous month" subtraction
-/// is not what users expect from "in the last 3 months").
-fn compute_date_cutoff(amount: u32, unit: DateUnit) -> String {
-    let days_ago: i64 = match unit {
-        DateUnit::Days => i64::from(amount),
-        DateUnit::Weeks => i64::from(amount) * 7,
-        DateUnit::Months => i64::from(amount) * 30,
+/// Months are treated as 30-day windows for parity with how the editor presents
+/// the option (a calendar-aware "previous month" subtraction is not what users
+/// expect from "in the last 3 months").
+///
+/// Returns `None` when the window is too large to represent. The arithmetic is
+/// checked throughout: `amount` is a `u32` straight from the editor, and the
+/// old `Duration::days(i64::from(amount) * 30)` could push the subtraction past
+/// chrono's representable range and panic.
+fn date_cutoff(amount: u32, unit: DateUnit) -> Option<chrono::DateTime<chrono::Utc>> {
+    let days_per_unit: i64 = match unit {
+        DateUnit::Days => 1,
+        DateUnit::Weeks => 7,
+        DateUnit::Months => 30,
     };
 
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(days_ago);
-    cutoff.format("%Y-%m-%d").to_string()
+    let days_ago = i64::from(amount).checked_mul(days_per_unit)?;
+    let window = chrono::TimeDelta::try_days(days_ago)?;
+    chrono::Utc::now().checked_sub_signed(window)
 }
 
 /// Apply result limiting: sort then truncate.
@@ -949,46 +978,147 @@ mod tests {
     }
 
     // ── Date operator tests ─────────────────────────────────────────
+    //
+    // Every field value below is RFC3339 with a time component, because that is
+    // what `tracks.date_added` actually holds. The previous tests passed
+    // date-only strings on both sides — a shape production never produces —
+    // which is exactly why the string-comparison bugs survived.
+
+    fn day(value: &str) -> RuleValue {
+        RuleValue::Date(value.into())
+    }
+
+    /// The headline bug: "Date Added is <day>" used to match nothing at all,
+    /// because an instant is never string-equal to a bare date.
+    #[test]
+    fn a_date_is_rule_matches_any_instant_during_that_day() {
+        for instant in [
+            "2025-06-15T00:00:00+00:00",
+            "2025-06-15T10:30:00+00:00",
+            "2025-06-15T23:59:59+00:00",
+        ] {
+            assert!(
+                eval_date(instant, &RuleOperator::Is, &day("2025-06-15")),
+                "{instant} falls on 2025-06-15"
+            );
+        }
+
+        for instant in ["2025-06-14T23:59:59+00:00", "2025-06-16T00:00:00+00:00"] {
+            assert!(!eval_date(instant, &RuleOperator::Is, &day("2025-06-15")));
+        }
+    }
 
     #[test]
-    fn test_eval_date_is() {
-        assert!(eval_date(
-            "2025-06-15",
-            &RuleOperator::Is,
-            &RuleValue::Date("2025-06-15".into())
-        ));
+    fn a_date_is_not_rule_is_the_exact_complement() {
         assert!(!eval_date(
-            "2025-06-14",
-            &RuleOperator::Is,
-            &RuleValue::Date("2025-06-15".into())
+            "2025-06-15T10:30:00+00:00",
+            &RuleOperator::IsNot,
+            &day("2025-06-15")
+        ));
+        assert!(eval_date(
+            "2025-06-16T00:00:00+00:00",
+            &RuleOperator::IsNot,
+            &day("2025-06-15")
         ));
     }
 
     #[test]
-    fn test_eval_date_is_before() {
+    fn a_date_is_before_rule_excludes_the_boundary_day_itself() {
         assert!(eval_date(
-            "2024-01-01",
+            "2024-12-31T23:59:59+00:00",
             &RuleOperator::IsBefore,
-            &RuleValue::Date("2025-01-01".into())
+            &day("2025-01-01")
         ));
+        // Midnight on the day itself is not before the day.
         assert!(!eval_date(
-            "2025-06-01",
+            "2025-01-01T00:00:00+00:00",
             &RuleOperator::IsBefore,
-            &RuleValue::Date("2025-01-01".into())
+            &day("2025-01-01")
+        ));
+    }
+
+    /// The mirror-image bug: `"2025-01-01T00:00:00+00:00" > "2025-01-01"` is
+    /// true as a string, so a track added *on* the boundary day used to count
+    /// as "after" it.
+    #[test]
+    fn a_date_is_after_rule_excludes_the_boundary_day_itself() {
+        assert!(eval_date(
+            "2025-01-02T00:00:00+00:00",
+            &RuleOperator::IsAfter,
+            &day("2025-01-01")
+        ));
+        for instant in ["2025-01-01T00:00:00+00:00", "2025-01-01T23:59:59+00:00"] {
+            assert!(
+                !eval_date(instant, &RuleOperator::IsAfter, &day("2025-01-01")),
+                "{instant} is during 2025-01-01, not after it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_date_rule_offset_is_normalized_before_comparison() {
+        // 2025-06-15T23:00:00-02:00 is 2025-06-16T01:00:00Z — the next UTC day.
+        assert!(eval_date(
+            "2025-06-15T23:00:00-02:00",
+            &RuleOperator::Is,
+            &day("2025-06-16")
         ));
     }
 
     #[test]
-    fn test_eval_date_is_after() {
-        assert!(eval_date(
-            "2025-06-01",
-            &RuleOperator::IsAfter,
-            &RuleValue::Date("2025-01-01".into())
+    fn an_unparseable_instant_or_rule_date_matches_nothing() {
+        assert!(!eval_date(
+            "not a timestamp",
+            &RuleOperator::Is,
+            &day("2025-06-15")
         ));
         assert!(!eval_date(
-            "2024-01-01",
-            &RuleOperator::IsAfter,
-            &RuleValue::Date("2025-01-01".into())
+            "2025-06-15T10:30:00+00:00",
+            &RuleOperator::Is,
+            &day("the fifteenth")
+        ));
+        // A rule holding the wrong value variant must not match either.
+        assert!(!eval_date(
+            "2025-06-15T10:30:00+00:00",
+            &RuleOperator::Is,
+            &RuleValue::Number(2025)
+        ));
+    }
+
+    #[test]
+    fn a_relative_window_includes_recent_tracks_and_excludes_old_ones() {
+        let now = chrono::Utc::now();
+        let recent = (now - chrono::TimeDelta::try_days(3).expect("3 days")).to_rfc3339();
+        let old = (now - chrono::TimeDelta::try_days(90).expect("90 days")).to_rfc3339();
+
+        let last_week = RuleOperator::IsInTheLast {
+            amount: 7,
+            unit: DateUnit::Days,
+        };
+        assert!(eval_date(
+            &recent,
+            &last_week,
+            &RuleValue::Text(String::new())
+        ));
+        assert!(!eval_date(
+            &old,
+            &last_week,
+            &RuleValue::Text(String::new())
+        ));
+
+        let not_last_week = RuleOperator::IsNotInTheLast {
+            amount: 7,
+            unit: DateUnit::Days,
+        };
+        assert!(!eval_date(
+            &recent,
+            &not_last_week,
+            &RuleValue::Text(String::new())
+        ));
+        assert!(eval_date(
+            &old,
+            &not_last_week,
+            &RuleValue::Text(String::new())
         ));
     }
 
@@ -1207,23 +1337,38 @@ mod tests {
     // ── Date cutoff computation ─────────────────────────────────────
 
     #[test]
-    fn test_compute_date_cutoff_format() {
-        let cutoff = compute_date_cutoff(30, DateUnit::Days);
-        // Should be a valid YYYY-MM-DD string.
-        assert_eq!(cutoff.len(), 10);
-        assert_eq!(&cutoff[4..5], "-");
-        assert_eq!(&cutoff[7..8], "-");
-        // Re-parsing the result must succeed.
-        chrono::NaiveDate::parse_from_str(&cutoff, "%Y-%m-%d")
-            .expect("compute_date_cutoff returns a parseable YYYY-MM-DD");
+    fn a_cutoff_window_is_measured_from_now() {
+        let cutoff = date_cutoff(30, DateUnit::Days).expect("30 days is representable");
+        let elapsed = chrono::Utc::now() - cutoff;
+        assert_eq!(elapsed.num_days(), 30);
     }
 
     #[test]
-    fn test_compute_date_cutoff_arithmetic() {
-        // 7 days vs 1 week must produce the same date.
-        let a = compute_date_cutoff(7, DateUnit::Days);
-        let b = compute_date_cutoff(1, DateUnit::Weeks);
-        assert_eq!(a, b);
+    fn equivalent_windows_agree() {
+        // 7 days vs 1 week must land on the same instant, to the second.
+        let days = date_cutoff(7, DateUnit::Days).expect("7 days");
+        let weeks = date_cutoff(1, DateUnit::Weeks).expect("1 week");
+        assert!((days - weeks).num_seconds().abs() <= 1);
+    }
+
+    /// `Duration::days(i64::from(amount) * 30)` used to be able to push the
+    /// subtraction past chrono's representable range and panic. `amount` comes
+    /// straight from the editor as a `u32`.
+    #[test]
+    fn an_absurd_window_saturates_instead_of_panicking() {
+        assert!(date_cutoff(u32::MAX, DateUnit::Months).is_none());
+
+        // And a rule with such a window matches everything rather than blowing
+        // up, because it reaches back past any possible track.
+        let forever = RuleOperator::IsInTheLast {
+            amount: u32::MAX,
+            unit: DateUnit::Months,
+        };
+        assert!(eval_date(
+            "1990-01-01T00:00:00+00:00",
+            &forever,
+            &RuleValue::Text(String::new())
+        ));
     }
 
     // ── Limit sort ordering ─────────────────────────────────────────

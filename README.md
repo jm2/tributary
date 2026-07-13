@@ -85,7 +85,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 └─────────────────────────────────────────────────────┘
 ```
 
-All backends implement a single `MediaBackend` async trait, so the UI layer never knows or cares where the music comes from.
+The diagram above is the **intended** architecture, and the remote backends (Subsonic, Jellyfin, Plex, DAAP) each implement the `MediaBackend` async trait. The trait is not yet the real seam, though: it is never used as a trait object, the UI still branches per backend when connecting a source, and the local library is queried directly through SQLite rather than through `LocalBackend`. Unifying them is tracked as P3.2 in [`docs/task.md`](docs/task.md).
 
 ---
 
@@ -140,10 +140,16 @@ Pre-built packages for Linux (Flatpak, .deb, .rpm), macOS (.dmg), and Windows (.
 
 ### Prerequisites (all platforms)
 
-- [Rust 1.80+](https://rustup.rs) (stable toolchain)
+- [Rust 1.85+](https://rustup.rs) (stable toolchain) — this is the declared MSRV in `Cargo.toml`
+- **GTK 4.16+** and **libadwaita 1.6+** — the crate compiles against these API levels, so older
+  runtimes will fail to build, not merely fail at startup
 - `pkg-config`
 
 ### Linux
+
+> **Check your GTK version first:** `pkg-config --modversion gtk4`. Debian 12 and Ubuntu 24.04
+> ship GTK 4.8/4.14 and libadwaita below 1.6, so the packages below are not sufficient on those
+> releases — you will need a newer distribution, backports, or the Flatpak build.
 
 **Debian / Ubuntu:**
 ```bash
@@ -217,14 +223,36 @@ This produces `dist/tributary-windows.zip` with the executable and all required 
 
 ### Flatpak (Linux)
 
+The manifest builds offline (`CARGO_NET_OFFLINE=true`) from a generated
+`build-aux/flatpak/cargo-sources.json`. That file is not checked in, so it must be generated
+before the first build — `flatpak-builder` will fail immediately without it.
+
 ```bash
 # Install flatpak-builder if needed:
 sudo apt install flatpak-builder
+
+# Fetch the pinned generator (same commit and checksum CI uses) and its dependencies:
+pip3 install --requirement build-aux/flatpak/generator-requirements.txt
+GENERATOR_COMMIT=737c0085912f9f7dabf9341d4608e2a77a51a73a
+GENERATOR_SHA256=b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c
+curl --fail --show-error --silent --location --proto '=https' --tlsv1.2 \
+  --output build-aux/flatpak/flatpak-cargo-generator.py \
+  "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py"
+echo "${GENERATOR_SHA256}  build-aux/flatpak/flatpak-cargo-generator.py" | sha256sum --check --strict
+
+# Generate the offline source manifest *next to the Flatpak manifest*:
+python3 build-aux/flatpak/flatpak-cargo-generator.py Cargo.lock \
+  -o build-aux/flatpak/cargo-sources.json
 
 # Build and install locally:
 flatpak-builder --force-clean --repo=repo --install --user \
   build-dir build-aux/flatpak/io.github.tributary.Tributary.yml
 ```
+
+> `./scripts/build-linux.sh` does not yet perform these steps correctly — it invokes a generator
+> that is not vendored and writes `cargo-sources.json` to the repository root instead of beside
+> the manifest. Vendoring the generator so local and CI builds share one path is tracked as P2.5
+> in [`docs/task.md`](docs/task.md).
 
 ---
 

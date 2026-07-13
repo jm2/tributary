@@ -12,6 +12,10 @@ Created: 2026-07-10
 - If scope changes, update the review document or record the decision under **Decisions**.
 - Run the global validation gate after every milestone.
 - Do not combine the architecture milestone with unrelated bug fixes.
+- Add a `CHANGELOG.md` entry in the same commit as any user-visible fix. The remediation
+  work through P1.7 landed without one, and the changelog silently drifted four months
+  behind the code; a user could not tell that the migration corruption or the destructive
+  reconciliation had ever been fixed.
 
 Status summary:
 
@@ -128,16 +132,22 @@ and carry the same version.
 - [x] Review the `anyhow`, `paste`, and `proc-macro-error2` warnings and document upstream
   disposition.
 - [x] Run `cargo audit` successfully.
-- [x] Record implementation: PR #68; `cargo audit` passes with two
-  documented informational warnings.
+- [x] Record implementation: PR #68; `cargo audit` passes with its remaining warnings
+  documented below.
+- [ ] Re-close the disposition table, which drifted after 2026-07-10 (found 2026-07-13):
+  `cargo audit` now reports **three** allowed warnings, not two — `spin` was yanked and is
+  undocumented — and `.cargo/audit.toml` silently ignores `RUSTSEC-2023-0071` without a
+  justification or a revisit date in this table, which the acceptance criteria below requires.
 
-Audit disposition recorded 2026-07-10:
+Audit disposition recorded 2026-07-10, amended 2026-07-13:
 
 | Advisory | Dependency path | Disposition | Revisit by |
 |---|---|---|---|
 | [`RUSTSEC-2026-0190`](https://rustsec.org/advisories/RUSTSEC-2026-0190) (`anyhow`) | direct and transitive | Fixed by locking and requiring `anyhow >= 1.0.103`. | Closed |
 | [`RUSTSEC-2024-0436`](https://rustsec.org/advisories/RUSTSEC-2024-0436) (`paste`) | `lofty 0.24.0 -> paste 1.0.15` | Informational/unmaintained, with no patched `paste` release. Track Lofty migration to a maintained replacement; no direct Tributary use. | 2026-10-10 or next release, whichever comes first |
 | [`RUSTSEC-2026-0173`](https://rustsec.org/advisories/RUSTSEC-2026-0173) (`proc-macro-error2`) | `sea-orm 1.1.20 -> sea-bae 0.2.1` | Informational/unmaintained compile-time macro dependency. Track SeaORM's removal or evaluate the SeaORM 2 migration. | 2026-10-10 or next release, whichever comes first |
+| `spin 0.9.8` **yanked** (added 2026-07-13) | `flume 0.11.1 -> sqlx-sqlite`, and `flume 0.12.0 -> mdns-sd 0.20.1` | Yanked release, not a vulnerability. Both paths are transitive through `flume`; Tributary cannot bump `spin` directly. Track a `flume` release that moves off the yanked version. | 2026-10-10 or next release, whichever comes first |
+| [`RUSTSEC-2023-0071`](https://rustsec.org/advisories/RUSTSEC-2023-0071) (`rsa`, Marvin Attack) | **not in the dependency graph** | Suppressed by `ignore = [...]` in `.cargo/audit.toml` on the grounds that it arrives via `sqlx-mysql`. Verified 2026-07-13: neither `rsa` nor `sqlx-mysql` is in the graph at all (`cargo tree -i rsa` is empty), so the ignore is vestigial. It is also a *blanket* ignore — if MySQL support were ever enabled it would silently suppress a real key-recovery advisory rather than surface it. Prefer deleting the ignore over documenting it. | Delete at next dependency review |
 
 Acceptance criteria: the CI security-audit job passes with every remaining ignored advisory
 explicitly justified and time-bounded.
@@ -205,15 +215,49 @@ explicitly justified and time-bounded.
 - [x] Record implementation: commit `842341b`; 14 focused counted-size, deadline,
   timeout-classification, allocation-boundary, URL-redaction, and backend-mapping tests.
 
-### P1.6 Stop exposing broad bearer tokens to receivers
+### P1.6 Stop handing backend credentials to receivers
 
-- [ ] Define an opaque short-lived media proxy/ticket design.
-- [ ] Keep backend credentials outside generic `Track` values.
-- [ ] Proxy credential-bearing streams for local, AirPlay, MPD, and Chromecast, and apply the
-  shared exact-origin policy to the proxy's upstream client.
-- [ ] Expire/revoke proxy registrations when playback/session ends.
-- [ ] Threat-model spoofed and compromised LAN receivers.
+**This is the highest live exposure in the tracker.** It is not limited to "broad bearer
+tokens": with Subsonic's plaintext auth mode the URL carries `p=enc:<hex_password>` — the
+user's actual password, hex-encoded and trivially reversible. Unlike a token, a password
+cannot be revoked, and users reuse it. Playing one track to a Chromecast is enough.
+
+Confirmed path, end to end:
+
+| Step | Location |
+|---|---|
+| Credential is baked into the stream URL | `plex/client.rs:236-242` (`X-Plex-Token`, account-wide), `jellyfin/client.rs:256-260` (`api_key`), `subsonic/client.rs:195-198` (`p=enc:<hex_password>`) |
+| Retained in the generic model | `architecture/models.rs:60` — `Track.stream_url` |
+| Copied verbatim into the UI object | `ui/window.rs:2080` |
+| Handed to the receiver untouched | `audio/chromecast_output.rs:1406-1409` — `resolve_uri` proxies **only** `file://`; every `http(s)://` URL is returned as-is and becomes the Cast `content_id`. MPD sends the same URL via `addid` over **plaintext TCP**, so it also lands in the daemon's queue state and `mpd.log`. |
+
+Design — generalize the existing local-file server into a media ticket proxy. The building
+block is already sound: `audio/cast_http_server.rs` binds a LAN-only listener on port 0 and
+routes on an unguessable v4 UUID (`:120-133`). What it lacks is upstream fetching and
+revocation.
+
+- [ ] Give the proxy two registration kinds: `Local(PathBuf)` (today's behavior) and
+  `Upstream { url, headers }`, where the proxy — not the receiver — fetches from the backend
+  using an app-owned client bound by the P1.4 exact-origin policy.
+- [ ] Issue receivers an opaque ticket URL (`http://<lan-ip>:<port>/media/<ticket>`) with a
+  short TTL, bound to one media session. A receiver never sees a credential.
+- [ ] Keep backend credentials outside generic `Track` values: drop the credential from
+  `Track.stream_url` and add a backend `resolve_stream(&track) -> (Url, HeaderMap)` called at
+  playback time, moving `X-Plex-Token` / `api_key` / Subsonic `u,t,s,p` out of the query
+  string and into request headers held only inside the proxy. Build this to serve P3.1's
+  "resolve playable URLs at playback time" as well, rather than twice.
+- [ ] Make the ticket registry insert **and revoke** — it is deliberately insert-only today
+  (`cast_http_server.rs:115-119`) — expiring registrations on stop, EOS, session end, and
+  output change.
+- [ ] Route all four transports through it: local and AirPlay (GStreamer fetches) plus MPD and
+  Chromecast (the receiver fetches).
+- [ ] Threat-model spoofed and compromised LAN receivers: the goal is that a hostile receiver
+  obtains a TTL-bounded, single-media ticket instead of an account credential.
 - [ ] Record implementation: _pending_
+
+Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
+device or daemon Tributary does not own. Closing this also closes P1.4's last checkbox and
+retires P1.7's synchronous local-file resolver note.
 
 ### P1.7 Serialize Chromecast lifecycle and commands
 
@@ -236,29 +280,84 @@ explicitly justified and time-bounded.
 
 ### P1.9 Prevent stale async source rendering
 
-- [ ] Attach a source key/generation to playlist, radio, and remote loads.
+Re-scoped 2026-07-13 after auditing the actual call sites. The original wording implied
+playlist, radio, and remote loads were all unguarded. They are not — most already hold the
+active-key guard, and only the two radio loads are genuinely exposed:
+
+| Load | Location | Guarded? |
+|---|---|---|
+| Playlist / smart playlist | `ui/source_connect.rs:209` | yes |
+| USB device | `ui/source_connect.rs:350` | yes |
+| Remote sync (Subsonic/Jellyfin/Plex/DAAP) | `ui/window.rs:1795`, `:1854` | yes |
+| Disconnect | `ui/discovery_handler.rs:152`, `:182` | yes |
+| Radio Top Clicked / Top Voted | `ui/source_connect.rs:434-448` | **no** — `display_tracks` fires unconditionally; `active_source_key` is not even cloned into the closure |
+| Radio Stations Near Me | `ui/radio.rs:331-345` | **no** — `fetch_and_display_nearme` does not take `active_source_key`, so it structurally cannot guard |
+
+`ui/browser.rs` and `ui/playlist_actions.rs` need no guard: neither performs an async load that
+reaches `display_tracks`.
+
 - [x] Refresh already-open playlist URIs after an ID-preserving local rename and overlay committed
   URIs onto an in-flight result before publication.
+- [x] Guard the two radio loads with the same active-key check the playlist and USB loads already
+  use. `fetch_and_display_nearme` now takes `active_source_key` and checks it before rendering, and
+  the Top Clicked / Top Voted closure clones and checks it too. Clicking away from a slow radio
+  fetch no longer replaces the library view with stations while the sidebar still says Local.
+- [ ] Promote the guard from a bare source **key** to a key plus **generation**: re-selecting the
+  same playlist twice leaves two in-flight loads with identical keys, so the older one can still
+  render last. This is the residual recorded in the 2026-07-12 decision note.
 - [ ] Reload an active playlist after watcher reconciliation remints or relinks track IDs.
-- [ ] Reject an in-flight playlist result when its source generation is stale, including when it
-  would render pre-rename rows after the refreshed model or replace a newer source selection.
 - [ ] Cache completed results even when no longer active.
-- [ ] Render only if the requested source remains selected.
-- [ ] Reuse the active-key guard pattern already present in USB loading.
-- [ ] Add navigation-race tests.
+- [ ] Add navigation-race tests, including same-key re-selection.
 - [ ] Record implementation: _pending_
+
+Acceptance criteria: a late async result never renders into a source the user has already
+navigated away from, and never replaces a newer result for the same source.
+
+### P1.10 Make foreign-key enforcement explicit
+
+Found 2026-07-13 while auditing P1.1. SQLite defaults `foreign_keys` to **off**. Nothing in
+Tributary turned it on: `db/connection.rs` set only `journal_mode` and `busy_timeout`, and
+SeaORM's SQLite connector never touches the pragma (it parses the URL into
+`SqliteConnectOptions` and applies only logging and pool settings). The `ON DELETE SET NULL`
+that all of P1.1 was built to deliver was therefore working purely because sqlx happens to
+default the pragma on. A change to that upstream default would not have failed a test — it
+would have silently reverted P1.1 to dangling `track_id` values.
+
+- [x] Set `foreign_keys`, `journal_mode`, and `busy_timeout` on `SqliteConnectOptions` so they
+  apply to every pooled connection, not just the first one borrowed at startup.
+- [x] Cover it with a test that fails if the pragma is ever lost: assert the pragma on several
+  concurrently-held pooled connections, and assert that deleting a track nulls its playlist
+  entry rather than orphaning a dangling ID.
+- [x] Record implementation: commit `1c31b52`; 2 focused pooled-connection and cascade tests.
+
+Acceptance criteria: playlist-entry integrity does not depend on an upstream default.
 
 ## P2 — Resilience, data semantics, and packaging
 
 ### P2.1 Correct smart-playlist semantics
 
-- [ ] Parse dates/timestamps instead of comparing strings.
-- [ ] Define date-only versus instant behavior and timezone rules.
-- [ ] Validate relative-date amounts and use checked arithmetic.
+- [x] Parse dates/timestamps instead of comparing strings. `eval_date` compared a track's RFC3339
+  instant against a rule's bare `YYYY-MM-DD` as raw strings. `"2025-06-15T10:30:00+00:00"` is never
+  equal to `"2025-06-15"`, so **"Date Added *is* X" matched zero tracks, forever**. `IsAfter` had
+  the mirror-image bug: the longer string sorts greater than its own date prefix, so a track added
+  *on* the boundary day counted as "after" it. Both sides are now parsed.
+- [x] Define date-only versus instant behavior and timezone rules. A track timestamp is an
+  **instant**; a rule date is a **calendar day** interpreted as the half-open UTC range
+  `[00:00, next 00:00)`. `Is` means "falls within that day", `IsAfter` means "after the whole of
+  that day". An unparseable instant or rule date fails to match rather than matching everything.
+- [x] Validate relative-date amounts and use checked arithmetic. `Duration::days(i64::from(amount)
+  * 30)` on an editor-supplied `u32` could push the subtraction past chrono's representable range
+  and panic; the window is now computed with `checked_mul` + `try_days` + `checked_sub_signed`, and
+  a window too large to represent matches everything instead of blowing up.
+- [x] Add date tests that use the shape production actually stores. The old tests passed *date-only*
+  strings on both sides — a shape the database never produces — which is precisely why these bugs
+  survived. 10 focused tests now cover day containment, both boundary days, offset normalization,
+  unparseable input, relative windows, and the overflow case.
 - [ ] Select/truncate by limit criteria before applying final compound sort.
 - [ ] Implement snapshot behavior for `live_updating = false` or remove the option.
-- [ ] Add combined rule/limit/sort/date tests.
-- [ ] Record implementation: _pending_
+- [ ] Add combined rule/limit/sort tests.
+- [ ] Record implementation: date semantics in commit `93f6772`; 10 focused tests. Limit-versus-sort
+  interaction and `live_updating` remain open.
 
 ### P2.2 Make playlist import/export transactional and deterministic
 
@@ -275,22 +374,69 @@ explicitly justified and time-bounded.
 
 ### P2.3 Harden tag writes
 
-- [ ] Validate all numeric edits before copying or modifying a file.
-- [ ] Apply or remove the declared album-artist edit.
-- [ ] Use an exclusively created random sibling temp path.
-- [ ] Guarantee cleanup on every failure path.
-- [ ] Preserve permissions and define durability/fsync behavior accurately.
-- [ ] Add concurrent-write and injected-failure tests.
-- [ ] Record implementation: _pending_
+Re-scoped 2026-07-13. The temp-file-plus-rename path the review implied was missing **already
+exists** (`local/tag_writer.rs:81-106`). The real defects are narrower and all reachable from
+right-click → Properties → Save (`ui/properties_dialog.rs:302`, `:385-400`):
+
+- [x] Validate numeric edits before rewriting the file. Year, track, and disc each used
+  `else if let Ok(n) = …parse::<u32>()` with **no `else` branch**, so an unparseable value was
+  silently discarded: typing `2026a` into Year rewrote the file, bumped its mtime, changed
+  nothing, and reported success. `TagEdits::validate` now rejects the whole edit before any file
+  is opened, the dialog surfaces it while the user can still fix it, and the numeric entries
+  declare `InputPurpose::Digits`.
+- [x] Guarantee cleanup on every failure path. A failed `fs::rename` escaped through `?` from
+  inside the success arm, orphaning `<song>.mp3.tributary-tag-tmp` next to the user's music
+  forever. The temp file is now owned by an RAII guard that removes it unless it is explicitly
+  persisted, so a failed rename cleans up too.
+- [x] Use an exclusively created random sibling temp path. The fixed `.tributary-tag-tmp` suffix
+  created via `fs::copy` had no `O_EXCL` and no randomness, so two concurrent saves to the same
+  file clobbered each other and the copy would follow a symlink planted at the predictable path.
+  Temp files are now created with `create_new` (`O_EXCL`) under a random UUID name.
+- [x] Apply or remove the declared album-artist edit. `TagEdits.album_artist` existed and counted
+  toward `is_empty()`, but `write_tags_to` never read it — the file was rewritten and the field
+  ignored. It is now applied via `ItemKey::AlbumArtist`. (Still no widget sets it; implementing it
+  removes the trap for whoever adds one.)
+- [x] Preserve permissions and define durability/fsync behavior accurately. Permissions are copied
+  from the file being replaced, and the tagged copy is `fsync`ed before the rename, so a crash
+  cannot leave a truncated file where the original was. The module doc now states this rather than
+  implying it.
+- [x] Add injected-failure tests: 6 focused tests cover validation, a malformed number leaving the
+  file byte-for-byte untouched with no temp behind, temp cleanup after a failed tag write,
+  unsupported formats, and temp-path uniqueness plus self-removal. Concurrency is covered by the
+  exclusivity property rather than by racing two threads.
+- [ ] Add a happy-path fixture test. Every test above asserts behavior *before* lofty succeeds or
+  *when* it fails, because they use files that are named like audio but are not decodable. Nothing
+  yet asserts that a valid edit actually lands in a real MP3/FLAC — that needs a committed audio
+  fixture and belongs with P3.5's coverage work.
+- [x] Record implementation: commit `6d0ec95`; 6 focused tests.
 
 ### P2.4 Make removable-media browsing safe and asynchronous
 
-- [ ] Disable symlink following during device scans.
-- [ ] Verify canonical descendants remain on the selected mount/device.
-- [ ] Move mount discovery and traversal off the GTK thread.
+Re-scoped 2026-07-13. `device/usb.rs` performs **no traversal at all** — it only `read_dir`s the
+mount roots (`:64-87`), so the symlink defect is not there. The traversal lives in the UI.
+
+- [x] Disable symlink following during device scans. The walk used
+  `WalkDir::new(mount_path).follow_links(true)`, so a USB stick containing `music -> /home/user`
+  made Tributary walk the entire home directory and index it as "on the device". The traversal is
+  now extracted into `enumerate_device_audio_files`, uses `.follow_links(false)`, and tests
+  `entry.file_type()` rather than `Path::is_file()` — the latter follows the link anyway and would
+  still have pulled in an individual file symlinked from off the device. This matches the library
+  scanner's policy (`local/engine.rs:772`).
+- [x] Verify descendants remain on the selected mount/device, for the symlink case: nothing outside
+  the mount can now be reached through a link. (A bind mount or a nested real filesystem under the
+  mount point is still followed; the library scanner's `filesystem_boundary_id` check is the model
+  to copy if that matters here.)
+- [ ] Move mount **discovery** off the GTK thread. `ui/window.rs:71` calls `detect_usb_devices()`
+  synchronously inside `build_window`. It is only a shallow `read_dir` + `is_dir()`, but against a
+  hung mount (stale NFS, yanked stick) `is_dir()` blocks in the kernel and the app hangs at
+  startup before the window is drawn. The *traversal* is already off-thread, so that half is done.
+  Left open deliberately: it reorders sidebar population at startup and wants a live UI review.
 - [ ] Use platform mount/volume APIs rather than directory heuristics.
-- [ ] Add malicious symlink, stale mount, and duplicate-device tests.
-- [ ] Record implementation: _pending_
+- [x] Add malicious symlink tests: a device tree with both a directory symlink and a file symlink
+  pointing off-device yields only the files physically on the device.
+- [ ] Add stale-mount and duplicate-device tests.
+- [ ] Record implementation: symlink containment in commit `1886847`; 2 focused traversal tests. Mount
+  discovery and platform volume APIs remain open.
 
 ### P2.5 Repair Flatpak behavior and local build path
 
@@ -303,15 +449,41 @@ explicitly justified and time-bounded.
 
 ### P2.6 Synchronize packaging metadata
 
-- [ ] Fix RPM `Version`, `Source0`, and `%autosetup` naming.
+- [ ] Fix RPM `Version`, `Source0`, and `%autosetup` naming. **This spec is live**, not dormant:
+  `.packit.yaml:4` builds it on every release for COPR, which is the install path README
+  recommends first. `build-aux/rpm/tributary.spec:2` says `Version: v0.1.0`, so `Source0` (`:8`)
+  resolves to `vv0.1.0.tar.gz` and `%autosetup` (`:37`) expects `tributary-v0.1.0` while a real
+  tarball unpacks to `tributary-0.5.0`. Its `%changelog` also stops at v0.1.0.
+- [ ] Fix the stale versions in the other two package manifests, which P2.6 previously did not
+  name: `build-aux/arch/PKGBUILD:3` (`pkgver=0.1.0`, and unversioned `gtk4`/`libadwaita` deps) and
+  `build-aux/inno/tributary.iss:11` (`AppVersion "0.1.0"`).
 - [ ] Raise GTK runtime minimum to 4.16.
-- [ ] Raise libadwaita runtime minimum to 1.6.
-- [ ] Add `%U` or `%F` to the desktop `Exec` line.
+- [ ] Raise libadwaita runtime minimum to 1.6. Both minimums are currently under-declared as
+  `>= 4.14` / `>= 1.5` in `build-aux/rpm/tributary.spec:23-24`, in Cargo.toml's
+  `generate-rpm.requires`, and in Cargo.toml's `deb.depends`, against a crate that pins `v4_16`
+  and `v1_6` (`Cargo.toml:12-13`). The shipped `.deb`/`.rpm` therefore install onto systems where
+  the binary cannot start.
+- [ ] Add `%U` or `%F` to the desktop `Exec` line (`data/io.github.tributary.Tributary.desktop:6`
+  is bare `Exec=tributary`). Until this lands, the "Linux file association" feature CHANGELOG
+  advertises for 0.5.0 does not work: the `MimeType` entry is present and the binary handles
+  opens, but the desktop entry never passes the URI.
 - [ ] Add the required `AudioVideo` desktop category.
-- [ ] Add the 0.5.0 AppStream release entry.
+- [ ] Add the 0.5.0 AppStream release entry (newest is 0.4.1).
 - [ ] Update README Rust requirement from 1.80 to 1.85.
-- [ ] Add CI on the declared Rust 1.85 MSRV.
-- [ ] Record implementation: _pending_
+- [ ] Add CI on the declared Rust 1.85 MSRV. Every toolchain in CI is
+  `dtolnay/rust-toolchain@stable`; nothing verifies that 1.85 still compiles.
+- [ ] Enforce the global validation gate in CI. It is currently a *local* gate: CI runs
+  `cargo test --release` only (`ci.yml:83`), never `cargo test --all-targets`, so a break that
+  only appears in debug (`debug_assert!`, overflow checks) ships. Nothing runs `appstreamcli` or
+  `desktop-file-validate` in any workflow, and `fuzz/` is its own workspace so neither `fmt` nor
+  `clippy` ever covers it.
+- [x] Apply a redirect policy to the app's non-credential HTTP clients. Radio-Browser
+  (`radio/client.rs`), IP geolocation, and MusicBrainz (`ui/properties_dialog.rs`) bypassed
+  `http_security` entirely and ran reqwest defaults, so they sent a `Referer` and would follow an
+  HTTPS→HTTP downgrade. They now use a shared public policy that still permits the cross-host
+  mirror redirects those services depend on but refuses to be walked down to plaintext.
+- [ ] Record implementation: non-credential redirect policy in commit `8368a65`; packaging remains
+  open.
 
 ### P2.7 Fix platform cache paths
 
@@ -329,6 +501,32 @@ explicitly justified and time-bounded.
 - [ ] Add a silent-receiver test proving a no-reply operation cannot pin Stop, replacement Load,
   or Shutdown forever.
 - [ ] Record implementation: _pending_
+
+### P2.9 Repair the AirPlay fallback path
+
+Filed 2026-07-13. This is review finding **M3** (`CODE_REVIEW_2026-07-10.md:210-218`), which was
+never given a tracker item — the only AirPlay references in this file are about routing streams
+through the P1.6 proxy, which is a different problem.
+
+The fallback is architecturally backwards, and it is the *default* path on a typical Linux box:
+`raopsink` ships in `gst-plugins-bad` and is absent on most distributions, so
+`airplay_output.rs:172-175` routes to `build_shairport_pipeline` in the common case. That
+function opens by discarding the receiver the user selected —
+`airplay_output.rs:289-295`: `let _ = (host, port); // shairport-sync uses its own discovery.` —
+and then pipes PCM into `shairport-sync`, which is an AirPlay **receiver**, not a sender. It
+cannot transmit to the device that was clicked.
+
+- [ ] Either transmit to the *selected* receiver, or remove the fallback and surface an
+  actionable "install `gst-plugins-bad` for AirPlay support" error instead of silently spawning a
+  subprocess that cannot work.
+- [ ] Move the `which` probe (`airplay_output.rs:298`), the subprocess spawn, and teardown off the
+  GTK main thread; they run synchronously under `load_uri` today.
+- [ ] Add a test proving a missing `raopsink` produces an actionable error rather than a silent
+  no-op stream.
+- [ ] Record implementation: _pending_
+
+Acceptance criteria: selecting an AirPlay receiver either plays to that receiver or fails with an
+error that tells the user what to install.
 
 ## P3 — Architecture and integration coverage
 
@@ -400,6 +598,13 @@ Run before marking any milestone complete:
 
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
+
+**This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
+hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
+runs `cargo fmt --check`, both `clippy -D warnings` invocations, `cargo test --release`, and
+`cargo audit` — but **not** `cargo test --all-targets` (so a debug-only break ships), and no
+workflow runs `appstreamcli` or `desktop-file-validate` at all. `fuzz/` is a separate workspace
+and is covered by neither `fmt` nor `clippy`. Closing that gap is tracked under P2.6.
 
 ## Decisions
 
@@ -511,6 +716,26 @@ Record scope or design decisions here so deferred work is explicit.
   call; hard receiver I/O deadlines require an upstream change or audited fork and are tracked as
   P2.8 rather than overstated as part of P1.7.
 
+- 2026-07-13 — Documentation audit against the committed tree. Every `[x]` in P1.1–P1.7 was
+  verified against the source and none was overstated. The drift was everywhere else: CHANGELOG
+  had recorded none of the remediation, README still advertised Rust 1.80 and a `MediaBackend`
+  abstraction that is never constructed (`grep -rn "dyn MediaBackend" src/` returns nothing), and
+  one review finding (M3, AirPlay) had no tracker item at all. P1.9, P2.3, and P2.4 described
+  defects that were real but lived in different files than the tracker claimed, so each was
+  re-scoped in place with the actual call sites rather than left to mislead an implementer.
+- 2026-07-13 — Foreign-key enforcement is now stated rather than inherited (P1.10). SQLite
+  defaults `foreign_keys` off; sqlx defaults it on; SeaORM never touches it. P1.1's entire
+  `ON DELETE SET NULL` guarantee rested on that middle link. Removing the new pragma makes the
+  added tests fail with a *dangling* `track_id` pointing at a deleted track, which is precisely
+  the corruption P1.1 exists to prevent.
+- 2026-07-13 — Non-credential HTTP clients get their own redirect policy rather than the
+  authenticated one. Radio-Browser, geolocation, and MusicBrainz legitimately redirect across
+  hosts, so exact-origin would break them; they instead refuse HTTPS→HTTP downgrades and send no
+  `Referer`. `RadioBrowserClient::new` now returns `Result` instead of degrading to
+  `reqwest::Client::default()` on a builder failure — that "fallback" carried neither a timeout
+  nor a redirect policy, and `Client::default()` panics on the same TLS-init failure that would
+  have triggered it, so it could never have been a safety net.
+
 ## Completed work log
 
 Add one line per completed task:
@@ -529,3 +754,5 @@ Add one line per completed task:
 | 2026-07-12 | P1.4a | `eb5458f` | Exact-origin/no-Referer policy and URL-free errors/logging cover every app-owned credential HTTP fetch; receiver-controlled playback streams remain tied to P1.6. |
 | 2026-07-12 | P1.5 | `842341b` | Counted finite-response reads enforce endpoint caps and total deadlines across API, authentication, DAAP, radio, artwork, and metadata clients. |
 | 2026-07-12 | P1.7 | `60ee2af` | One worker owns the Cast session and serializes effects, authoritative state, cancellation, cleanup retries, and stale-event suppression. |
+| 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
+| 2026-07-13 | P2.6 (partial) | `8368a65` | Radio-Browser, geolocation, and MusicBrainz clients now refuse HTTPS→HTTP redirect downgrades and send no `Referer`; packaging metadata remains open. |

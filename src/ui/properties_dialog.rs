@@ -166,11 +166,13 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
         &field_value(|t| &t.year),
         mixed_placeholder(|t| &t.year),
     );
+    year_entry.1.set_input_purpose(gtk::InputPurpose::Digits);
     form.append(&year_entry.0);
     entries.push(("year", year_entry.1));
 
     if !is_batch {
         let track_entry = make_entry("Track #", &field_value(|t| &t.track_number), false);
+        track_entry.1.set_input_purpose(gtk::InputPurpose::Digits);
         form.append(&track_entry.0);
         entries.push(("track_number", track_entry.1));
     }
@@ -180,6 +182,7 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
         &field_value(|t| &t.disc_number),
         mixed_placeholder(|t| &t.disc_number),
     );
+    disc_entry.1.set_input_purpose(gtk::InputPurpose::Digits);
     form.append(&disc_entry.0);
     entries.push(("disc_number", disc_entry.1));
 
@@ -375,6 +378,19 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
             return;
         }
 
+        // Reject a malformed number here, while the user can still fix it and
+        // before a single file is opened. Letting it through would rewrite
+        // every selected file, discard the bad field, and report success.
+        if let Err(error) = edits.validate() {
+            let alert = adw::AlertDialog::builder()
+                .heading("Check the Highlighted Field")
+                .body(error.to_string())
+                .build();
+            alert.add_response("ok", "OK");
+            alert.present(Some(&parent_for_save));
+            return;
+        }
+
         let paths = file_paths_for_save.clone();
 
         // Write tags on a background thread, tracking both the files that
@@ -524,7 +540,7 @@ fn musicbrainz_lookup(title: &str, artist: &str) -> Option<MusicBrainzResult> {
         urlencoding::encode(&query)
     );
 
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::http_security::public_blocking_client_builder()
         .timeout(MUSICBRAINZ_TIMEOUT)
         .user_agent("Tributary/0.3.0 (https://github.com/jm2/tributary)")
         .build()
