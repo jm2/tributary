@@ -174,12 +174,13 @@ explicitly justified and time-bounded.
 
 ### P1.3 Close the scan/watcher handoff gap
 
-- [ ] Install the watcher before initial enumeration.
-- [ ] Buffer and replay events generated during the scan.
-- [ ] Reconcile after watcher errors or overflow.
-- [ ] Use bounded/coalescing event delivery where appropriate.
-- [ ] Add race-oriented tests.
-- [ ] Record implementation: _pending_
+- [x] Install the watcher before initial enumeration.
+- [x] Buffer and replay events generated during the scan.
+- [x] Reconcile after watcher errors or overflow.
+- [x] Use bounded/coalescing event delivery where appropriate.
+- [x] Add race-oriented tests.
+- [x] Record implementation: commit `4eb79d0`; six focused ingress, replay, stream-loss,
+  marker-mutation, and race tests.
 
 ### P1.4 Enforce exact-origin authenticated redirects
 
@@ -456,6 +457,14 @@ Record scope or design decisions here so deferred work is explicit.
   before it; recovery requires rebuilding it from a refreshed source model. Stable-ID resolution
   at playback, navigation, and receiver-load time remains P3.1 rather than changing queue semantics
   here.
+- 2026-07-12 — P1.3 installs each watcher before enumeration and replays its bounded, ordered
+  ingress after the initial snapshot. Notify errors, rescan flags, and queue overflow discard the
+  incomplete incremental batch and retry a hardened scan before any later incremental mutation;
+  marker mutations take the same fail-closed route. A rename can still lose its old UUID if the
+  initial destructive scan has already deleted the source row before the buffered pair is replayed.
+  The resulting filesystem/database state is reconciled, but eliminating that narrow identity
+  boundary requires a future two-phase, non-destructive bootstrap scan rather than guessing from
+  file metadata.
 
 ## Completed work log
 
@@ -471,3 +480,4 @@ Add one line per completed task:
 | 2026-07-10 | P0.8 | PR #68 | Patched dependency graph and time-bounded informational advisory dispositions. |
 | 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
 | 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |
+| 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
