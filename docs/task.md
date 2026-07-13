@@ -336,13 +336,28 @@ Acceptance criteria: playlist-entry integrity does not depend on an upstream def
 
 ### P2.1 Correct smart-playlist semantics
 
-- [ ] Parse dates/timestamps instead of comparing strings.
-- [ ] Define date-only versus instant behavior and timezone rules.
-- [ ] Validate relative-date amounts and use checked arithmetic.
+- [x] Parse dates/timestamps instead of comparing strings. `eval_date` compared a track's RFC3339
+  instant against a rule's bare `YYYY-MM-DD` as raw strings. `"2025-06-15T10:30:00+00:00"` is never
+  equal to `"2025-06-15"`, so **"Date Added *is* X" matched zero tracks, forever**. `IsAfter` had
+  the mirror-image bug: the longer string sorts greater than its own date prefix, so a track added
+  *on* the boundary day counted as "after" it. Both sides are now parsed.
+- [x] Define date-only versus instant behavior and timezone rules. A track timestamp is an
+  **instant**; a rule date is a **calendar day** interpreted as the half-open UTC range
+  `[00:00, next 00:00)`. `Is` means "falls within that day", `IsAfter` means "after the whole of
+  that day". An unparseable instant or rule date fails to match rather than matching everything.
+- [x] Validate relative-date amounts and use checked arithmetic. `Duration::days(i64::from(amount)
+  * 30)` on an editor-supplied `u32` could push the subtraction past chrono's representable range
+  and panic; the window is now computed with `checked_mul` + `try_days` + `checked_sub_signed`, and
+  a window too large to represent matches everything instead of blowing up.
+- [x] Add date tests that use the shape production actually stores. The old tests passed *date-only*
+  strings on both sides — a shape the database never produces — which is precisely why these bugs
+  survived. 10 focused tests now cover day containment, both boundary days, offset normalization,
+  unparseable input, relative windows, and the overflow case.
 - [ ] Select/truncate by limit criteria before applying final compound sort.
 - [ ] Implement snapshot behavior for `live_updating = false` or remove the option.
-- [ ] Add combined rule/limit/sort/date tests.
-- [ ] Record implementation: _pending_
+- [ ] Add combined rule/limit/sort tests.
+- [ ] Record implementation: date semantics in commit `93f6772`; 10 focused tests. Limit-versus-sort
+  interaction and `live_updating` remain open.
 
 ### P2.2 Make playlist import/export transactional and deterministic
 
