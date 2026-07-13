@@ -361,28 +361,37 @@ Re-scoped 2026-07-13. The temp-file-plus-rename path the review implied was miss
 exists** (`local/tag_writer.rs:81-106`). The real defects are narrower and all reachable from
 right-click → Properties → Save (`ui/properties_dialog.rs:302`, `:385-400`):
 
-- [ ] Validate numeric edits before rewriting the file. `local/tag_writer.rs:188` (year), `:200`
-  (track number), and `:206` (disc number) each use `else if let Ok(n) = …parse::<u32>()` with
-  **no `else` branch**, so an unparseable value is silently discarded — and the dialog offers
-  plain `gtk::Entry` widgets with no digit filter (`ui/properties_dialog.rs:170`, `:175`, `:184`).
-  Typing `2026a` into Year rewrites the file, bumps its mtime, changes nothing, and reports
-  success.
-- [ ] Guarantee cleanup on every failure path. `local/tag_writer.rs:100` propagates a failed
-  `fs::rename` with `?` from inside the success arm; the `remove_file` at `:111` only covers
-  `write_tags_to` failures, so a rename that fails (read-only directory, ENOSPC) orphans
-  `<song>.mp3.tributary-tag-tmp` permanently.
-- [ ] Use an exclusively created random sibling temp path. `local/tag_writer.rs:119-128` uses a
-  fixed `.tributary-tag-tmp` suffix created via `fs::copy` — no `O_EXCL`, no randomness — so two
-  concurrent saves to the same file clobber each other, and the copy follows a destination
-  symlink.
-- [ ] Apply or remove the declared album-artist edit. `TagEdits.album_artist` exists (`:24`) and
-  counts toward `is_empty()` (`:38`), but `write_tags_to` (`:153-219`) never reads it. It is
-  currently *unreachable* — no widget sets it — so this is not live data loss; it is a loaded gun
-  for whoever adds the widget, since the `_ => {}` arm will swallow it while the file is rewritten
-  anyway.
-- [ ] Preserve permissions and define durability/fsync behavior accurately.
-- [ ] Add concurrent-write and injected-failure tests.
-- [ ] Record implementation: _pending_
+- [x] Validate numeric edits before rewriting the file. Year, track, and disc each used
+  `else if let Ok(n) = …parse::<u32>()` with **no `else` branch**, so an unparseable value was
+  silently discarded: typing `2026a` into Year rewrote the file, bumped its mtime, changed
+  nothing, and reported success. `TagEdits::validate` now rejects the whole edit before any file
+  is opened, the dialog surfaces it while the user can still fix it, and the numeric entries
+  declare `InputPurpose::Digits`.
+- [x] Guarantee cleanup on every failure path. A failed `fs::rename` escaped through `?` from
+  inside the success arm, orphaning `<song>.mp3.tributary-tag-tmp` next to the user's music
+  forever. The temp file is now owned by an RAII guard that removes it unless it is explicitly
+  persisted, so a failed rename cleans up too.
+- [x] Use an exclusively created random sibling temp path. The fixed `.tributary-tag-tmp` suffix
+  created via `fs::copy` had no `O_EXCL` and no randomness, so two concurrent saves to the same
+  file clobbered each other and the copy would follow a symlink planted at the predictable path.
+  Temp files are now created with `create_new` (`O_EXCL`) under a random UUID name.
+- [x] Apply or remove the declared album-artist edit. `TagEdits.album_artist` existed and counted
+  toward `is_empty()`, but `write_tags_to` never read it — the file was rewritten and the field
+  ignored. It is now applied via `ItemKey::AlbumArtist`. (Still no widget sets it; implementing it
+  removes the trap for whoever adds one.)
+- [x] Preserve permissions and define durability/fsync behavior accurately. Permissions are copied
+  from the file being replaced, and the tagged copy is `fsync`ed before the rename, so a crash
+  cannot leave a truncated file where the original was. The module doc now states this rather than
+  implying it.
+- [x] Add injected-failure tests: 6 focused tests cover validation, a malformed number leaving the
+  file byte-for-byte untouched with no temp behind, temp cleanup after a failed tag write,
+  unsupported formats, and temp-path uniqueness plus self-removal. Concurrency is covered by the
+  exclusivity property rather than by racing two threads.
+- [ ] Add a happy-path fixture test. Every test above asserts behavior *before* lofty succeeds or
+  *when* it fails, because they use files that are named like audio but are not decodable. Nothing
+  yet asserts that a valid edit actually lands in a real MP3/FLAC — that needs a committed audio
+  fixture and belongs with P3.5's coverage work.
+- [x] Record implementation: commit `6d0ec95`; 6 focused tests.
 
 ### P2.4 Make removable-media browsing safe and asynchronous
 
