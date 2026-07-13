@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,6 +91,18 @@ impl LibraryEngine {
     pub async fn run(self) {
         let db = Arc::new(self.db);
 
+        // Install before traversing so changes observed during the initial
+        // scan are retained for replay after its snapshot is published.
+        // Construction remains best-effort: a watcher backend failure must
+        // not suppress the useful one-shot scan.
+        let (mut watcher, watcher_error) = match install_directory_watcher(&self.music_dirs) {
+            Ok(watcher) => (Some(watcher), None),
+            Err(error) => {
+                error!(%error, "Filesystem watcher could not be installed");
+                (None, Some(error.to_string()))
+            }
+        };
+
         // ── Initial scan (all directories) ───────────────────────────
         for dir in &self.music_dirs {
             info!(dir = %dir.display(), "Starting initial library scan");
@@ -99,14 +112,25 @@ impl LibraryEngine {
             let _ = self.tx.send(LibraryEvent::Error(e.to_string())).await;
         }
 
+        // A missing or temporarily unwatchable root can become available
+        // while another root is being enumerated. Retain every successful
+        // pre-scan registration, then retry only the gaps at the handoff so a
+        // root the scan just indexed is never left unwatched until restart.
+        if let Some(watcher) = watcher.as_mut() {
+            watcher.watch_available_directories(&self.music_dirs);
+        }
+
+        if let Some(error) = watcher_error {
+            let _ = self.tx.send(LibraryEvent::Error(error)).await;
+        }
+
         // ── Filesystem watcher (all directories) ─────────────────────
-        info!(
-            count = self.music_dirs.len(),
-            "Starting filesystem watchers"
-        );
-        if let Err(e) = watch_directories(&db, &self.music_dirs, &self.tx).await {
-            error!(error = %e, "Filesystem watcher failed");
-            let _ = self.tx.send(LibraryEvent::Error(e.to_string())).await;
+        if let Some(watcher) = watcher {
+            if let Err(e) = process_directory_events(&db, &self.music_dirs, &self.tx, watcher).await
+            {
+                error!(error = %e, "Filesystem watcher failed");
+                let _ = self.tx.send(LibraryEvent::Error(e.to_string())).await;
+            }
         }
     }
 }
@@ -2354,6 +2378,10 @@ impl WatcherBatch {
             && self.identity_changed_roots.is_empty()
             && !self.reconciliation_required
     }
+
+    fn requires_reconciliation_before_incrementals(&self) -> bool {
+        !self.identity_changed_roots.is_empty()
+    }
 }
 
 /// Two pairs overlap when either shares a path with the other, or when one
@@ -2382,81 +2410,247 @@ async fn reconcile_playlists_after_watcher_batch(
         .await
 }
 
-async fn watch_directories(
-    db: &Arc<DatabaseConnection>,
-    music_dirs: &[PathBuf],
-    tx: &async_channel::Sender<LibraryEvent>,
-) -> anyhow::Result<()> {
-    let (notify_tx, mut notify_rx) = mpsc::channel::<notify::Result<notify::Event>>(256);
+const WATCHER_EVENT_CAPACITY: usize = 256;
+const WATCHER_DEBOUNCE_MS: u64 = 1500;
+const WATCHER_RECONCILIATION_RETRY_MS: u64 = 1000;
 
-    let mut watcher = RecommendedWatcher::new(
-        move |res| {
-            let _ = notify_tx.blocking_send(res);
+struct DirectoryWatcher {
+    watcher: RecommendedWatcher,
+    rx: mpsc::Receiver<notify::Result<notify::Event>>,
+    ingress_overflowed: Arc<AtomicBool>,
+    watched_directories: HashSet<PathBuf>,
+}
+
+impl DirectoryWatcher {
+    fn watch_available_directories(&mut self, music_dirs: &[PathBuf]) {
+        for dir in music_dirs {
+            if self.watched_directories.contains(dir) {
+                continue;
+            }
+            if !dir.is_dir() {
+                warn!(dir = %dir.display(), "Library folder does not exist — skipping watch");
+                continue;
+            }
+            if let Err(error) = self.watcher.watch(dir.as_ref(), RecursiveMode::Recursive) {
+                warn!(dir = %dir.display(), %error, "Failed to watch directory — skipping");
+                continue;
+            }
+            self.watched_directories.insert(dir.clone());
+            info!(dir = %dir.display(), "Watching directory");
+        }
+    }
+}
+
+/// Enqueue one backend callback without ever blocking the notify thread.
+/// A full bounded queue means at least one event was lost, so the atomic marks
+/// the whole stream as unreliable even though that event could not be queued.
+fn enqueue_watcher_result(
+    tx: &mpsc::Sender<notify::Result<notify::Event>>,
+    ingress_overflowed: &AtomicBool,
+    result: notify::Result<notify::Event>,
+) {
+    match tx.try_send(result) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            ingress_overflowed.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn install_directory_watcher(music_dirs: &[PathBuf]) -> notify::Result<DirectoryWatcher> {
+    let (notify_tx, notify_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
+    let ingress_overflowed = Arc::new(AtomicBool::new(false));
+    let callback_overflowed = Arc::clone(&ingress_overflowed);
+
+    let watcher = RecommendedWatcher::new(
+        move |result| {
+            enqueue_watcher_result(&notify_tx, callback_overflowed.as_ref(), result);
         },
         notify::Config::default()
             .with_poll_interval(Duration::from_secs(2))
             .with_follow_symlinks(false),
     )?;
 
+    let mut installed = DirectoryWatcher {
+        watcher,
+        rx: notify_rx,
+        ingress_overflowed,
+        watched_directories: HashSet::new(),
+    };
+
     // Watch each directory independently. A missing or unwatchable directory
-    // (e.g. a first-launch default that doesn't exist, or a folder that was
-    // removed after being configured) is skipped with a warning rather than
-    // aborting the whole watcher — so one bad path can't stop the others from
-    // being watched, and it never surfaces as a hard scan error to the user.
-    for dir in music_dirs {
-        if !dir.is_dir() {
-            warn!(dir = %dir.display(), "Library folder does not exist — skipping watch");
-            continue;
-        }
-        if let Err(e) = watcher.watch(dir.as_ref(), RecursiveMode::Recursive) {
-            warn!(dir = %dir.display(), error = %e, "Failed to watch directory — skipping");
-            continue;
-        }
-        info!(dir = %dir.display(), "Watching directory");
-    }
+    // is retried once after the bootstrap scan rather than aborting the whole
+    // watcher, so one bad path cannot stop healthy roots from being watched.
+    installed.watch_available_directories(music_dirs);
     info!("Filesystem watcher active");
 
-    // Keep watcher alive by holding it in scope
-    let _watcher = watcher;
+    Ok(installed)
+}
 
+#[derive(Debug, Default)]
+struct WatcherDebounceBatch {
+    batch: WatcherBatch,
+    stream_unreliable: bool,
+}
+
+impl WatcherDebounceBatch {
+    fn collect(&mut self, result: notify::Result<notify::Event>) {
+        if self.stream_unreliable {
+            return;
+        }
+
+        match result {
+            Ok(event) if event.need_rescan() => {
+                warn!("Filesystem watcher requested an authoritative rescan");
+                self.stream_unreliable = true;
+                self.batch = WatcherBatch::default();
+            }
+            Ok(event) => self.batch.collect(event),
+            Err(error) => {
+                warn!(%error, "Filesystem watcher reported an unreliable stream");
+                self.stream_unreliable = true;
+                self.batch = WatcherBatch::default();
+            }
+        }
+    }
+
+    fn finish(mut self) -> Option<WatcherBatch> {
+        if self.stream_unreliable {
+            return None;
+        }
+        self.batch.finish();
+        Some(self.batch)
+    }
+}
+
+fn discard_watcher_backlog(rx: &mut mpsc::Receiver<notify::Result<notify::Event>>) {
+    while rx.try_recv().is_ok() {}
+}
+
+async fn reconcile_unreliable_watcher_stream(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    rx: &mut mpsc::Receiver<notify::Result<notify::Event>>,
+) -> bool {
+    // The queued backlog belongs to the same stream gap and cannot be applied
+    // incrementally. Events racing with this drain may be discarded too; the
+    // following authoritative scan is what makes that safe. Events arriving
+    // after the drain, including during the scan, remain queued for the next
+    // loop iteration.
+    discard_watcher_backlog(rx);
+    info!("Reconciling library after filesystem watcher stream loss");
+    match initial_scan(db, music_dirs, tx).await {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(%error, "Watcher stream reconciliation failed; retry remains pending");
+            false
+        }
+    }
+}
+
+async fn reconcile_root_marker_mutations(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    roots: &HashSet<PathBuf>,
+) -> bool {
+    // Invalidate persisted authorization before any asynchronous traversal.
+    // A marker created by the bootstrap scan is restored to available by this
+    // immediate marker-backed scan; a replaced marker remains unavailable.
+    for root in roots {
+        mark_root_path_unavailable(db, root).await;
+    }
+    info!("Reconciling library after library root marker mutation");
+    match initial_scan(db, music_dirs, tx).await {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(%error, "Library root marker reconciliation failed; retry remains pending");
+            false
+        }
+    }
+}
+
+async fn process_directory_events(
+    db: &Arc<DatabaseConnection>,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    mut watcher: DirectoryWatcher,
+) -> anyhow::Result<()> {
     // ── Debounced event processing ──────────────────────────────
     // Collect filesystem events for a short window, deduplicate by
     // path, then process the batch. This collapses the 3-5 duplicate
     // Create/Modify events that Windows fires per file copy into a
     // single parse+upsert, and removes the old per-file 500ms sleep.
-    const DEBOUNCE_MS: u64 = 1500;
-
+    let mut reconciliation_pending = false;
     loop {
+        let overflowed = watcher.ingress_overflowed.swap(false, Ordering::AcqRel);
+        if reconciliation_pending || overflowed {
+            if overflowed {
+                warn!("Filesystem watcher ingress overflowed");
+            }
+            reconciliation_pending =
+                !reconcile_unreliable_watcher_stream(db.as_ref(), music_dirs, tx, &mut watcher.rx)
+                    .await;
+            if reconciliation_pending {
+                tokio::time::sleep(Duration::from_millis(WATCHER_RECONCILIATION_RETRY_MS)).await;
+            }
+            continue;
+        }
+
         // Wait for the first event.
-        let first = notify_rx.recv().await;
+        let first = watcher.rx.recv().await;
         let Some(first) = first else { break };
 
         // Preserve event order and tracker metadata until rename halves have
         // been normalized. Flattening immediately into unordered path sets
         // would discard the only authoritative identity association.
-        let mut batch = WatcherBatch::default();
-
-        if let Ok(event) = first {
-            batch.collect(event);
-        }
+        let mut ingress = WatcherDebounceBatch::default();
+        ingress.collect(first);
 
         // Drain any additional events that arrive within the debounce window.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(DEBOUNCE_MS);
-        loop {
-            match tokio::time::timeout_at(deadline, notify_rx.recv()).await {
-                Ok(Some(Ok(event))) => batch.collect(event),
-                Ok(Some(Err(e))) => {
-                    warn!(error = %e, "Filesystem watcher error");
-                }
-                _ => break, // Timeout or channel closed
-            }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(WATCHER_DEBOUNCE_MS);
+        while !ingress.stream_unreliable {
+            let Ok(Some(result)) = tokio::time::timeout_at(deadline, watcher.rx.recv()).await
+            else {
+                break;
+            };
+            ingress.collect(result);
         }
 
-        // Deferred directory observations can only be interpreted once every
-        // half of every rename in this window has arrived.
-        batch.finish();
+        // Consume only overflow known before this recovery decision. A
+        // callback racing with the scan stores a fresh `true` value, which is
+        // intentionally left for the next loop iteration.
+        let overflowed = watcher.ingress_overflowed.swap(false, Ordering::AcqRel);
+        let Some(mut batch) = ingress.finish() else {
+            reconciliation_pending = true;
+            continue;
+        };
+        if overflowed {
+            warn!("Filesystem watcher ingress overflowed during debounce");
+            reconciliation_pending = true;
+            continue;
+        }
 
         if batch.is_empty() {
+            continue;
+        }
+
+        // A marker mutation invalidates the authorization boundary for every
+        // other event in this batch. Discard all incrementals and let the
+        // hardened scan either restore the same identity (including a marker
+        // created during bootstrap) or leave the root unavailable.
+        if batch.requires_reconciliation_before_incrementals() {
+            reconciliation_pending = !reconcile_root_marker_mutations(
+                db.as_ref(),
+                music_dirs,
+                tx,
+                &batch.identity_changed_roots,
+            )
+            .await;
+            if reconciliation_pending {
+                tokio::time::sleep(Duration::from_millis(WATCHER_RECONCILIATION_RETRY_MS)).await;
+            }
             continue;
         }
 
@@ -2470,13 +2664,6 @@ async fn watch_directories(
                 continue;
             }
         };
-
-        for root in &batch.identity_changed_roots {
-            if let Some(index) = root_cache.exact_root(root) {
-                mark_cached_root_unavailable(db.as_ref(), &mut root_cache, index).await;
-                warn!(root = %root.display(), "Library root marker changed — watcher writes disabled until rescan");
-            }
-        }
 
         let mut reconciliation_required = batch.reconciliation_required;
         let mut upsert_committed = false;
@@ -3303,6 +3490,175 @@ mod tests {
             event = event.set_tracker(tracker);
         }
         event
+    }
+
+    #[test]
+    fn watcher_ingress_overflow_is_nonblocking_and_marks_stream_unreliable() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let overflowed = AtomicBool::new(false);
+        let first = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+            .add_path(PathBuf::from("/music/first.flac"));
+        let dropped =
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(PathBuf::from("/music/dropped.flac"));
+
+        enqueue_watcher_result(&tx, &overflowed, Ok(first));
+        enqueue_watcher_result(&tx, &overflowed, Ok(dropped));
+
+        assert!(overflowed.load(Ordering::Acquire));
+        let queued = rx
+            .try_recv()
+            .expect("the event accepted before overflow remains queued")
+            .expect("queued notify event");
+        assert_eq!(queued.paths, [PathBuf::from("/music/first.flac")]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn watcher_retries_a_root_that_appears_during_bootstrap() {
+        let library = TestDirectory::new("watcher-registration-retry");
+        let ready = library.path().join("ready");
+        let late = library.path().join("late");
+        std::fs::create_dir(&ready).expect("create initially available root");
+
+        let mut watcher = install_directory_watcher(&[ready.clone(), late.clone()])
+            .expect("install directory watcher");
+        assert!(watcher.watched_directories.contains(&ready));
+        assert!(!watcher.watched_directories.contains(&late));
+
+        std::fs::create_dir(&late).expect("make root available during bootstrap");
+        watcher.watch_available_directories(&[ready.clone(), late.clone()]);
+
+        assert_eq!(
+            watcher.watched_directories,
+            HashSet::from([ready, late]),
+            "the handoff retry retains old registrations and closes new gaps"
+        );
+    }
+
+    #[test]
+    fn watcher_ingress_replays_buffered_rename_halves_in_order() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let overflowed = AtomicBool::new(false);
+        enqueue_watcher_result(
+            &tx,
+            &overflowed,
+            Ok(rename_event(
+                notify::event::RenameMode::From,
+                &["/music/old.flac"],
+                Some(51),
+            )),
+        );
+        enqueue_watcher_result(
+            &tx,
+            &overflowed,
+            Ok(rename_event(
+                notify::event::RenameMode::To,
+                &["/music/new.flac"],
+                Some(51),
+            )),
+        );
+
+        let mut ingress = WatcherDebounceBatch::default();
+        while let Ok(result) = rx.try_recv() {
+            ingress.collect(result);
+        }
+        let batch = ingress.finish().expect("ordinary event stream is reliable");
+
+        assert!(!overflowed.load(Ordering::Acquire));
+        assert_eq!(
+            batch.rename_pairs,
+            HashSet::from([WatcherRenamePair {
+                from: PathBuf::from("/music/old.flac"),
+                to: PathBuf::from("/music/new.flac"),
+            }])
+        );
+        assert!(batch.remove_paths.is_empty());
+        assert!(batch.upsert_paths.is_empty());
+    }
+
+    #[test]
+    fn watcher_error_and_rescan_notice_make_debounce_unreliable() {
+        let mut failed = WatcherDebounceBatch::default();
+        failed.collect(Err(notify::Error::generic("backend failed")));
+        assert!(failed.finish().is_none());
+
+        let mut requested = WatcherDebounceBatch::default();
+        requested.collect(Ok(
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)
+        ));
+        assert!(requested.finish().is_none());
+    }
+
+    #[test]
+    fn watcher_error_discards_mixed_incremental_batch_and_backlog() {
+        let mut ingress = WatcherDebounceBatch::default();
+        ingress.collect(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File,
+        ))
+        .add_path(PathBuf::from("/music/must-not-upsert.flac"))));
+        ingress.collect(Err(notify::Error::generic("events were lost")));
+        ingress.collect(Ok(notify::Event::new(notify::EventKind::Remove(
+            notify::event::RemoveKind::File,
+        ))
+        .add_path(PathBuf::from("/music/must-not-remove.flac"))));
+
+        assert!(ingress.batch.is_empty());
+        assert!(ingress.finish().is_none());
+
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.try_send(Ok(notify::Event::new(notify::EventKind::Other)))
+            .expect("queue stale backlog");
+        discard_watcher_backlog(&mut rx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn watcher_reconciliation_preserves_racing_overflow_and_new_events() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let overflowed = AtomicBool::new(true);
+
+        assert!(overflowed.swap(false, Ordering::AcqRel));
+        discard_watcher_backlog(&mut rx);
+
+        // Simulate callbacks arriving after recovery began. The runtime must
+        // not clear either signal at the end of the scan.
+        overflowed.store(true, Ordering::Release);
+        tx.try_send(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File,
+        ))
+        .add_path(PathBuf::from("/music/during-scan.flac"))))
+            .expect("queue event arriving during reconciliation");
+
+        assert!(overflowed.load(Ordering::Acquire));
+        assert_eq!(
+            rx.try_recv()
+                .expect("racing event remains queued")
+                .expect("notify event")
+                .paths,
+            [PathBuf::from("/music/during-scan.flac")]
+        );
+    }
+
+    #[test]
+    fn marker_mutation_requires_reconciliation_before_incrementals() {
+        let mut batch = WatcherBatch::default();
+        batch.collect(
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(PathBuf::from(format!("/music/{ROOT_IDENTITY_FILE}"))),
+        );
+        batch.collect(
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(PathBuf::from("/music/mixed.flac")),
+        );
+        batch.finish();
+
+        assert!(batch.requires_reconciliation_before_incrementals());
+        assert_eq!(
+            batch.identity_changed_roots,
+            HashSet::from([PathBuf::from("/music")])
+        );
+        assert!(batch.upsert_paths.contains(Path::new("/music/mixed.flac")));
     }
 
     #[test]
