@@ -165,6 +165,111 @@ pub fn url_carries_credentials(url: &Url) -> bool {
     query_pairs.iter().any(|(key, _)| shape.is_sensitive(key))
 }
 
+/// Whether a media URI may be handed directly to a network playback device.
+///
+/// Deliberately not `Debug`: `Protected` owns the complete credential-bearing
+/// URL. Callers must exchange that URL for an opaque, revocable proxy ticket
+/// before sending anything to MPD, Chromecast, or another receiver.
+pub enum MediaUriSecurity {
+    /// No supported credential shape was found. The caller may retain and use
+    /// the original input unchanged.
+    Direct,
+    /// An HTTP(S) URL carrying a supported credential shape.
+    Protected(Box<Url>),
+    /// A malformed declared HTTP(S) URL, or credentials on a scheme for which
+    /// the exact-origin proxy cannot provide its HTTP-specific guarantees.
+    Reject,
+}
+
+/// Classify a media URI at the boundary before it can reach a network player.
+///
+/// Ordinary radio URLs, local `file:` URLs, and MPD library paths remain
+/// direct. Credential-bearing HTTP(S) URLs must be proxied. A declared but
+/// malformed HTTP(S) URL is rejected rather than being mistaken for an MPD
+/// path, and a credential on an unsupported scheme is rejected rather than
+/// handed to another device.
+pub fn classify_media_uri(uri: &str) -> MediaUriSecurity {
+    let declares_http = declared_url_scheme(uri)
+        .is_some_and(|scheme| matches_ignore_ascii_case(scheme, "http", "https"));
+    if declares_http && !declared_scheme_has_authority(uri) {
+        return MediaUriSecurity::Reject;
+    }
+
+    let parsed = match Url::parse(uri) {
+        Ok(parsed) => parsed,
+        Err(_) if declares_http || malformed_uri_looks_credentialed(uri) => {
+            return MediaUriSecurity::Reject;
+        }
+        Err(_) => return MediaUriSecurity::Direct,
+    };
+
+    if matches!(parsed.scheme(), "http" | "https") {
+        if parsed.cannot_be_a_base() || parsed.host().is_none() {
+            return MediaUriSecurity::Reject;
+        }
+        if url_carries_credentials(&parsed) {
+            MediaUriSecurity::Protected(Box::new(parsed))
+        } else {
+            MediaUriSecurity::Direct
+        }
+    } else if url_carries_credentials(&parsed) {
+        MediaUriSecurity::Reject
+    } else {
+        MediaUriSecurity::Direct
+    }
+}
+
+fn declared_url_scheme(uri: &str) -> Option<&str> {
+    // URL parsers trim surrounding ASCII whitespace. Mirror that behaviour for
+    // the pre-parse declaration check so ` HTTP://[bad` cannot fall through as
+    // an opaque MPD path after parsing fails.
+    let candidate = uri.trim_matches(|character: char| character.is_ascii_whitespace());
+    let (scheme, _) = candidate.split_once(':')?;
+    let mut bytes = scheme.bytes();
+    if !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(scheme)
+}
+
+fn declared_scheme_has_authority(uri: &str) -> bool {
+    uri.trim_matches(|character: char| character.is_ascii_whitespace())
+        .split_once(':')
+        .is_some_and(|(_, remainder)| remainder.starts_with("//"))
+}
+
+fn matches_ignore_ascii_case(value: &str, first: &str, second: &str) -> bool {
+    value.eq_ignore_ascii_case(first) || value.eq_ignore_ascii_case(second)
+}
+
+fn malformed_uri_looks_credentialed(uri: &str) -> bool {
+    // Scheme-relative network references are not absolute upstream URLs and
+    // therefore cannot be proxied safely. Still recognize their user-info so
+    // they fail closed instead of reaching a network player.
+    let candidate = uri.trim_matches(|character: char| character.is_ascii_whitespace());
+    let authority = candidate
+        .strip_prefix("//")
+        .or_else(|| candidate.split_once("://").map(|(_, rest)| rest))
+        .and_then(|rest| rest.split(['/', '?', '#']).next());
+    if authority.is_some_and(|authority| authority.contains('@')) {
+        return true;
+    }
+
+    let Some(query) = candidate
+        .split_once('?')
+        .map(|(_, query)| query.split('#').next().unwrap_or(query))
+    else {
+        return false;
+    };
+    let query_pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let shape = CredentialShape::of(&query_pairs);
+    query_pairs.iter().any(|(key, _)| shape.is_sensitive(key))
+}
+
 fn authenticated_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() > MAX_REDIRECTS {
@@ -556,6 +661,62 @@ mod tests {
             assert!(
                 !url_carries_credentials(&url(plain)),
                 "{plain} carries no credential"
+            );
+        }
+    }
+
+    #[test]
+    fn media_uri_classifier_protects_every_supported_http_credential_shape() {
+        for protected in [
+            "https://user:password@music.test/stream.flac",
+            "https://plex.test/file.flac?X-Plex-Token=secret",
+            "https://jellyfin.test/stream?api_key=secret",
+            "http://daap.test/item?session-id=secret",
+            "https://sub.test/stream?u=me&t=token&s=salt&c=Tributary",
+            "https://sub.test/stream?u=me&p=enc%3Asecret&c=Tributary",
+        ] {
+            match classify_media_uri(protected) {
+                MediaUriSecurity::Protected(url) => {
+                    assert!(url_carries_credentials(&url), "{protected}");
+                    assert!(matches!(url.scheme(), "http" | "https"));
+                }
+                MediaUriSecurity::Direct | MediaUriSecurity::Reject => {
+                    panic!("supported credential URI was not protected")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_uri_classifier_keeps_noncredential_media_and_mpd_paths_direct() {
+        for direct in [
+            "https://radio.test/live.mp3?quality=high",
+            "file:///music/track.flac",
+            "Albums/Artist/track.flac",
+            "//nas/music/track.flac",
+        ] {
+            assert!(matches!(
+                classify_media_uri(direct),
+                MediaUriSecurity::Direct
+            ));
+        }
+    }
+
+    #[test]
+    fn media_uri_classifier_rejects_ambiguous_or_unsupported_credentials() {
+        for rejected in [
+            "HTTP://[malformed",
+            " https://[malformed ",
+            "http:/missing-host",
+            "https://?api_key=secret",
+            "ftp://user:password@music.test/stream.flac",
+            "ftp://music.test/stream?api_key=secret",
+            "//music.test/stream?api_key=secret",
+            "not an absolute URL?X-Plex-Token=secret",
+        ] {
+            assert!(
+                matches!(classify_media_uri(rejected), MediaUriSecurity::Reject),
+                "{rejected}"
             );
         }
     }

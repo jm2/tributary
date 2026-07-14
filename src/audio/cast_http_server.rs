@@ -15,15 +15,17 @@
 //!
 //! # Security
 //!
-//! - **LAN-only**: Binds exclusively to the machine's non-loopback LAN
-//!   IPv4 address (via `local-ip-address`).
+//! - **Explicit-interface binding**: The Chromecast entry point binds to the
+//!   machine's non-loopback LAN IPv4 address (via `local-ip-address`). Other
+//!   in-process outputs may select a specific address, but wildcard addresses
+//!   are rejected and the requested address family is preserved.
 //! - **No directory listing**: Only pre-registered UUIDs are servable.
 //! - **No path traversal**: File paths are stored in a `DashMap` keyed
 //!   by random UUID — there is no URL-to-filesystem path mapping.
 //! - **Not an open relay**: an upstream ticket resolves to a URL fixed at
 //!   registration time. A caller cannot ask the proxy to fetch anything else,
 //!   and only the `Range` header is forwarded upstream.
-//! - **Credential tickets are short-lived**: every new load revokes the
+//! - **Credential tickets are explicitly revocable**: every new load revokes the
 //!   previous credential ticket — including a load that turns out to be a local
 //!   file or unauthenticated radio — and `stop()` revokes them all. At most one
 //!   credential-bearing ticket is live at a time, and it dies when playback
@@ -42,10 +44,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use dashmap::DashMap;
+use futures::TryStreamExt;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 use url::Url;
 use uuid::Uuid;
+
+const OPAQUE_UPSTREAM_BODY_ERROR: &str = "upstream media body stream failed";
 
 /// What a registered ticket resolves to.
 ///
@@ -114,6 +119,30 @@ impl CastHttpServer {
                 })?,
         };
 
+        Self::start_on(SocketAddr::from((ipv4, 0))).await
+    }
+
+    /// Start a cast-compatible media server on the requested local address.
+    ///
+    /// The supplied port is always replaced with `0`, allowing the OS to
+    /// select an unused port. The IP address and address family are preserved
+    /// exactly. Unspecified addresses cannot produce a receiver-usable ticket
+    /// URL. Scoped and link-local IPv6 addresses are also rejected because a
+    /// portable receiver URL cannot carry the required interface scope.
+    pub(crate) async fn start_on(mut bind_addr: SocketAddr) -> anyhow::Result<Self> {
+        if bind_addr.ip().is_unspecified() {
+            anyhow::bail!("Cast HTTP server requires a specific bind address");
+        }
+        if let SocketAddr::V6(addr) = bind_addr {
+            if addr.scope_id() != 0 || addr.ip().is_unicast_link_local() {
+                anyhow::bail!(
+                    "Cast HTTP server cannot form a portable receiver URL for scoped or \
+                     link-local IPv6"
+                );
+            }
+        }
+        bind_addr.set_port(0);
+
         let media = Arc::new(DashMap::new());
         let state = ServerState {
             media: media.clone(),
@@ -128,7 +157,7 @@ impl CastHttpServer {
             .route("/cast/{id}", get(serve_media))
             .with_state(state);
 
-        let listener = TcpListener::bind(SocketAddr::from((ipv4, 0))).await?;
+        let listener = TcpListener::bind(bind_addr).await?;
         let addr = listener.local_addr()?;
 
         info!(addr = %addr, "Cast HTTP server listening");
@@ -316,8 +345,24 @@ async fn proxy_upstream(client: &reqwest::Client, url: &Url, headers: &HeaderMap
     }
 
     response
-        .body(Body::from_stream(upstream.bytes_stream()))
+        .body(Body::from_stream(opaque_upstream_body_errors(
+            upstream.bytes_stream(),
+        )))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Discard a body-stream error before handing it to Axum.
+///
+/// A reqwest body error may retain and display the credential-bearing request
+/// URL. Mapping it to a fresh, fixed error keeps that URL out of Hyper/Axum
+/// diagnostics if the upstream fails after response headers were received.
+fn opaque_upstream_body_errors<S, T, E>(
+    stream: S,
+) -> impl futures::Stream<Item = Result<T, std::io::Error>>
+where
+    S: futures::Stream<Item = Result<T, E>>,
+{
+    stream.map_err(|_| std::io::Error::other(OPAQUE_UPSTREAM_BODY_ERROR))
 }
 
 /// Stream a local file, honoring `Range` requests so the receiver can seek.
@@ -464,6 +509,10 @@ fn parse_range_header(header: &str, file_size: u64) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV6};
+
+    use futures::StreamExt;
+
     use super::*;
 
     #[test]
@@ -553,5 +602,102 @@ mod tests {
                 "{no_extension} must not shape the ticket path"
             );
         }
+    }
+
+    // ── Listener binding and receiver URLs ─────────────────────────────
+
+    #[tokio::test]
+    async fn start_on_ipv4_loopback_preserves_ip_and_ignores_the_supplied_port() {
+        let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("reserve an IPv4 port");
+        let requested = reserved.local_addr().expect("reserved address");
+
+        let server = CastHttpServer::start_on(requested)
+            .await
+            .expect("bind on IPv4 loopback with a fresh ephemeral port");
+
+        assert_eq!(server.addr().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_ne!(server.addr().port(), 0);
+        assert_ne!(
+            server.addr().port(),
+            requested.port(),
+            "the occupied caller-supplied port must be replaced with zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_on_ipv6_loopback_formats_a_bracketed_ticket_when_available() {
+        let Ok(reserved) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await else {
+            // IPv6 can be disabled by the test host or container.
+            return;
+        };
+        let requested = reserved.local_addr().expect("reserved address");
+
+        let server = CastHttpServer::start_on(requested)
+            .await
+            .expect("bind on IPv6 loopback with a fresh ephemeral port");
+        let ticket = server.ticket_url("opaque.flac");
+
+        assert_eq!(server.addr().ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_ne!(server.addr().port(), requested.port());
+        assert_eq!(
+            ticket,
+            format!("http://[::1]:{}/cast/opaque.flac", server.addr().port())
+        );
+        Url::parse(&ticket).expect("the bracketed IPv6 ticket must be a valid URL");
+    }
+
+    #[tokio::test]
+    async fn start_on_rejects_unspecified_addresses() {
+        for requested in [
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 1234)),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 1234)),
+        ] {
+            let error = CastHttpServer::start_on(requested)
+                .await
+                .err()
+                .expect("an unspecified bind address must be rejected");
+            assert!(error.to_string().contains("specific bind address"));
+        }
+    }
+
+    #[tokio::test]
+    async fn start_on_rejects_scoped_and_link_local_ipv6_addresses() {
+        let scoped = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1234, 0, 7));
+        let link_local = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            1234,
+            0,
+            0,
+        ));
+
+        for requested in [scoped, link_local] {
+            let error = CastHttpServer::start_on(requested)
+                .await
+                .err()
+                .expect("a non-portable IPv6 address must be rejected");
+            assert!(error.to_string().contains("portable receiver URL"));
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_body_errors_are_opaque_before_axum_observes_them() {
+        const SECRET: &str = "https://music.test/stream?token=body-stream-secret";
+        let original =
+            futures::stream::once(async { Err::<Vec<u8>, _>(std::io::Error::other(SECRET)) });
+        let mapped = opaque_upstream_body_errors(original);
+        futures::pin_mut!(mapped);
+
+        let error = mapped
+            .next()
+            .await
+            .expect("one stream item")
+            .expect_err("the body item should fail");
+        let rendered = format!("{error:?} {error}");
+
+        assert_eq!(error.to_string(), OPAQUE_UPSTREAM_BODY_ERROR);
+        assert!(!rendered.contains(SECRET));
+        assert!(!rendered.contains("body-stream-secret"));
     }
 }
