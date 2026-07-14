@@ -267,8 +267,9 @@ revocation.
   the credential stop being copied through the UI layer at all. Build it to serve P3.1's
   "resolve playable URLs at playback time" as well, rather than twice.
 - [ ] Give tickets a TTL in addition to revocation, so a ticket cannot outlive a crashed session.
-- [x] Record implementation: Chromecast proxy in commit `c6aa7df`; 6 focused classification,
-  credential-detection, and pass-through tests. MPD and credential-free `Track` values remain open.
+- [x] Record implementation: Chromecast proxy in commit `c6aa7df`, MPD in commit `73e91f4`; 8
+  focused classification, credential-detection, refusal, and pass-through tests. Credential-free
+  `Track` values and ticket TTLs remain open.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
 device or daemon Tributary does not own. **Chromecast and MPD both meet this now.** What remains
