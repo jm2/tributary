@@ -31,6 +31,7 @@ mod imp {
         pub album_artist: RefCell<String>,
         pub album: RefCell<String>,
         pub genre: RefCell<String>,
+        pub composer: RefCell<String>,
         pub year: Cell<i32>,
         pub date_modified: RefCell<String>,
         pub bitrate_kbps: Cell<u32>,
@@ -68,6 +69,7 @@ impl TrackObject {
         artist: &str,
         album: &str,
         genre: &str,
+        composer: &str,
         year: i32,
         date_modified: &str,
         bitrate_kbps: u32,
@@ -86,6 +88,7 @@ impl TrackObject {
         imp.artist.replace(artist.to_string());
         imp.album.replace(album.to_string());
         imp.genre.replace(genre.to_string());
+        imp.composer.replace(composer.to_string());
         imp.year.set(year);
         imp.date_modified.replace(date_modified.to_string());
         imp.bitrate_kbps.set(bitrate_kbps);
@@ -144,6 +147,9 @@ impl TrackObject {
     }
     pub fn genre(&self) -> String {
         self.imp().genre.borrow().clone()
+    }
+    pub fn composer(&self) -> String {
+        self.imp().composer.borrow().clone()
     }
     pub fn year(&self) -> i32 {
         self.imp().year.get()
@@ -241,7 +247,7 @@ mod tests {
 
     fn track(uri: &str) -> TrackObject {
         TrackObject::new(
-            1, "Title", 60, "Artist", "Album", "", 0, "", 0, 0, 0, "", uri,
+            1, "Title", 60, "Artist", "Album", "", "", 0, "", 0, 0, 0, "", uri,
         )
     }
 

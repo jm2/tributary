@@ -18,6 +18,7 @@ pub const ALL_COLUMNS: &[&str] = &[
     "Artist",
     "Album",
     "Genre",
+    "Composer",
     "Year",
     "Date Modified",
     "Bitrate",
@@ -475,7 +476,7 @@ pub fn show_preferences(
         .margin_bottom(8)
         .build();
 
-    const COLUMNS_PER_ROW: usize = 3;
+    const COLUMNS_PER_ROW: usize = 4;
 
     let column_checks: Vec<(&str, gtk::CheckButton)> = ALL_COLUMNS
         .iter()

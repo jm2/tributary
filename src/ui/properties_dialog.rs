@@ -31,6 +31,7 @@ pub struct TrackInfo {
     pub artist: String,
     pub album: String,
     pub genre: String,
+    pub composer: String,
     pub year: String,
     pub track_number: String,
     pub disc_number: String,
@@ -160,6 +161,14 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
     );
     form.append(&genre_entry.0);
     entries.push(("genre", genre_entry.1));
+
+    let composer_entry = make_entry(
+        "Composer",
+        &field_value(|t| &t.composer),
+        mixed_placeholder(|t| &t.composer),
+    );
+    form.append(&composer_entry.0);
+    entries.push(("composer", composer_entry.1));
 
     let year_entry = make_entry(
         "Year",
@@ -366,6 +375,7 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
                 "artist" => edits.artist = value,
                 "album" => edits.album = value,
                 "genre" => edits.genre = value,
+                "composer" => edits.composer = value,
                 "year" => edits.year = value,
                 "track_number" => edits.track_number = value,
                 "disc_number" => edits.disc_number = value,

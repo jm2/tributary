@@ -47,6 +47,9 @@ pub struct Track {
     /// Duration in whole seconds.
     pub duration_secs: Option<u64>,
 
+    /// Composer credit.
+    pub composer: Option<String>,
+
     /// Genre tag.
     pub genre: Option<String>,
 

@@ -176,6 +176,7 @@ impl DaapBackend {
                 track_number: track_number.map(u32::from),
                 disc_number: disc_number.map(u32::from),
                 duration_secs,
+                composer: None,
                 genre: genre.clone(),
                 year: year.map(i32::from),
                 file_path: None,

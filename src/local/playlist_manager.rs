@@ -569,6 +569,7 @@ mod tests {
             album_artist_name: None,
             album_title: album.to_string(),
             genre: None,
+            composer: None,
             year: None,
             track_number: None,
             disc_number: None,

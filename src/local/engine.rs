@@ -3129,6 +3129,7 @@ where
             artist_name: Set(parsed.artist_name.clone()),
             album_artist_name: Set(parsed.album_artist_name.clone()),
             album_title: Set(parsed.album_title.clone()),
+            composer: Set(parsed.composer.clone()),
             genre: Set(parsed.genre.clone()),
             year: Set(parsed.year),
             track_number: Set(parsed.track_number.map(|n| n as i32)),
@@ -3159,6 +3160,7 @@ fn apply_parsed_track_fields(
     active.artist_name = Set(parsed.artist_name.clone());
     active.album_artist_name = Set(parsed.album_artist_name.clone());
     active.album_title = Set(parsed.album_title.clone());
+    active.composer = Set(parsed.composer.clone());
     active.genre = Set(parsed.genre.clone());
     active.year = Set(parsed.year);
     active.track_number = Set(parsed.track_number.map(|n| n as i32));
@@ -3428,6 +3430,7 @@ pub fn db_model_to_track(model: &track::Model) -> Track {
         track_number: model.track_number.map(|n| n as u32),
         disc_number: model.disc_number.map(|n| n as u32),
         duration_secs: model.duration_secs.map(|d| d as u64),
+        composer: model.composer.clone(),
         genre: model.genre.clone(),
         year: model.year,
         file_path: Some(model.file_path.clone()),
@@ -3846,6 +3849,7 @@ mod tests {
             album_artist_name: Some("Original Album Artist".to_string()),
             album_title: "Original Album".to_string(),
             genre: Some("Original Genre".to_string()),
+            composer: None,
             year: Some(2001),
             track_number: Some(1),
             disc_number: Some(1),
@@ -3870,6 +3874,7 @@ mod tests {
             album_artist_name: Some("Updated Album Artist".to_string()),
             album_title: "Updated Album".to_string(),
             genre: Some("Updated Genre".to_string()),
+            composer: None,
             year: Some(2026),
             track_number: Some(2),
             disc_number: Some(2),
@@ -5751,6 +5756,7 @@ mod tests {
             album_artist_name: None,
             album_title: "Album".to_string(),
             genre: None,
+            composer: None,
             year: None,
             track_number: None,
             disc_number: None,
@@ -5837,6 +5843,7 @@ mod tests {
             album_artist_name: Some("Test Album Artist".to_string()),
             album_title: "Test Album".to_string(),
             genre: Some("Rock".to_string()),
+            composer: None,
             year: Some(2020),
             track_number: Some(3),
             disc_number: Some(1),
@@ -5881,6 +5888,7 @@ mod tests {
             album_artist_name: None,
             album_title: "Unknown Album".to_string(),
             genre: None,
+            composer: None,
             year: None,
             track_number: None,
             disc_number: None,
@@ -5917,6 +5925,7 @@ mod tests {
             album_artist_name: None,
             album_title: "Album".to_string(),
             genre: None,
+            composer: None,
             year: None,
             track_number: None,
             disc_number: None,
@@ -5945,6 +5954,7 @@ mod tests {
             album_artist_name: None,
             album_title: "Album".to_string(),
             genre: None,
+            composer: None,
             year: None,
             track_number: None,
             disc_number: None,

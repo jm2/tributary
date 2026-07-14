@@ -80,6 +80,7 @@ pub fn radio_station_to_track_object(station: &crate::radio::RadioStation) -> Tr
         &station.country, // artist = country
         &station.state,   // album = state/province
         &station.tags,    // genre = tags
+        "",               // composer (unused)
         0,                // year (unused)
         "",               // date_modified (unused)
         station.bitrate,  // bitrate

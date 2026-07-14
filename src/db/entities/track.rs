@@ -17,6 +17,7 @@ pub struct Model {
     pub album_artist_name: Option<String>,
     pub album_title: String,
     pub genre: Option<String>,
+    pub composer: Option<String>,
     pub year: Option<i32>,
     pub track_number: Option<i32>,
     pub disc_number: Option<i32>,
