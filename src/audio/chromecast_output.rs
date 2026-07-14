@@ -1358,7 +1358,13 @@ fn classify_cast_uri(uri: &str) -> CastMedia {
     // fail. A malformed `file://` URI must still be rejected as a bad local
     // path — falling through to "pass it to the device" would forward a URI we
     // could not even parse.
-    let declares_local_file = uri.starts_with("file://");
+    //
+    // Compared case-insensitively: URL schemes are case-insensitive, and while
+    // `Url::parse` normalizes them, this check runs *before* parsing and has to
+    // catch `FILE://[bad` too.
+    let declares_local_file = uri
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"));
 
     let Ok(parsed) = url::Url::parse(uri) else {
         return if declares_local_file {
@@ -1482,6 +1488,13 @@ impl ChromecastOutput {
     ///   through untouched. There is no secret to protect, and relaying a live
     ///   radio stream through this process would buy nothing.
     fn resolve_uri(&self, uri: &str) -> CastResult<String> {
+        // Any new load retires the previous credential ticket, whatever the new
+        // track turns out to be. Revoking only inside `register_upstream` would
+        // leave a ticket alive when a credentialed track is followed by an
+        // unauthenticated one (radio, or a local file): the device could keep
+        // replaying the protected stream long after playback moved on.
+        self.revoke_proxy_tickets();
+
         match classify_cast_uri(uri) {
             CastMedia::LocalFile(path) => self.resolve_local_file(&path),
             CastMedia::InvalidLocalUri => Err(CastFailure::new("local media URI validation")),
@@ -3123,7 +3136,10 @@ mod tests {
 
     #[test]
     fn a_local_file_is_still_served_from_disk() {
-        let uri = url::Url::from_file_path("/music/song.flac")
+        // Built from a real absolute path: `Url::from_file_path` rejects a bare
+        // POSIX path on Windows, which needs a drive letter.
+        let path = std::env::temp_dir().join("song.flac");
+        let uri = url::Url::from_file_path(&path)
             .expect("file URL")
             .to_string();
         assert!(matches!(classify(&uri), CastMedia::LocalFile(_)));
@@ -3133,9 +3149,16 @@ mod tests {
     /// Classifying on the parse result alone dropped it into the pass-through
     /// arm, which handed the device a URI we could not even read — caught by
     /// `invalid_local_uri_error_is_secret_free`.
+    ///
+    /// The scheme comparison is case-insensitive, so `FILE://` cannot sneak
+    /// past it into the pass-through arm either.
     #[test]
     fn an_unparseable_local_uri_is_rejected_rather_than_forwarded() {
-        for uri in ["file://[not-a-url", "file://[cast-secret-token"] {
+        for uri in [
+            "file://[not-a-url",
+            "file://[cast-secret-token",
+            "FILE://[not-a-url",
+        ] {
             assert!(
                 matches!(classify(uri), CastMedia::InvalidLocalUri),
                 "{uri} must be rejected, not passed to the device"

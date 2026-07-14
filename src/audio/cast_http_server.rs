@@ -23,8 +23,11 @@
 //! - **Not an open relay**: an upstream ticket resolves to a URL fixed at
 //!   registration time. A caller cannot ask the proxy to fetch anything else,
 //!   and only the `Range` header is forwarded upstream.
-//! - **Credential tickets are short-lived**: registering a new upstream revokes
-//!   the previous one, so at most one credential-bearing ticket is live.
+//! - **Credential tickets are short-lived**: every new load revokes the
+//!   previous credential ticket — including a load that turns out to be a local
+//!   file or unauthenticated radio — and `stop()` revokes them all. At most one
+//!   credential-bearing ticket is live at a time, and it dies when playback
+//!   moves on rather than lingering until the next credentialed track.
 //! - **OS-assigned port**: Uses port 0 for dynamic assignment.
 //! - **Graceful shutdown**: Can be stopped when no longer needed.
 
@@ -46,9 +49,10 @@ use uuid::Uuid;
 
 /// What a registered ticket resolves to.
 ///
-/// Deliberately not `Debug`: an `Upstream` holds a credential-bearing URL, and
-/// the whole point of this type is that the URL never gets printed, logged, or
-/// handed to a receiver.
+/// `Clone` but deliberately **not** `Debug`: an `Upstream` holds a
+/// credential-bearing URL, and the whole point of this type is that the URL
+/// never gets printed, logged, or handed to a receiver.
+#[derive(Clone)]
 enum MediaSource {
     /// A local file, streamed from disk.
     Local(PathBuf),
@@ -181,7 +185,19 @@ impl CastHttpServer {
     pub fn register_upstream(&self, url: &Url) -> String {
         self.revoke_upstreams();
 
-        let ticket = Uuid::new_v4().to_string();
+        // Carry the upstream's media extension onto the ticket. The Cast
+        // `content_type` is guessed from the URL it is handed, so an
+        // extensionless ticket would advertise a proxied FLAC or Opus stream as
+        // the default `audio/mpeg` and the receiver would refuse or misplay it.
+        //
+        // Only a known audio extension is copied: the ticket path must stay
+        // opaque, and nothing from the upstream URL beyond this fixed set is
+        // allowed to shape it.
+        let ticket = match upstream_media_extension(url) {
+            Some(extension) => format!("{}.{extension}", Uuid::new_v4()),
+            None => Uuid::new_v4().to_string(),
+        };
+
         self.media
             .insert(ticket.clone(), MediaSource::Upstream(Box::new(url.clone())));
 
@@ -213,6 +229,27 @@ impl Drop for CastHttpServer {
     }
 }
 
+/// The audio extension of an upstream URL, if it has a recognised one.
+///
+/// A Plex part key ends in `/file.flac`; a Subsonic `stream.view` has no
+/// extension at all, in which case the receiver falls back to its default and
+/// there is nothing more we can say from the URL alone.
+///
+/// The allow-list is deliberate: the ticket path is otherwise a bare UUID, and
+/// only these fixed strings may ever be appended to it.
+fn upstream_media_extension(url: &Url) -> Option<&'static str> {
+    const AUDIO_EXTENSIONS: &[&str] = &[
+        "mp3", "flac", "ogg", "oga", "opus", "wav", "aac", "m4a", "aiff", "aif", "wma",
+    ];
+
+    let last_segment = url.path_segments()?.next_back()?;
+    let (_, extension) = last_segment.rsplit_once('.')?;
+    AUDIO_EXTENSIONS
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(extension))
+        .copied()
+}
+
 /// Axum handler: serve a registered ticket.
 ///
 /// A ticket is either a local file or a remote stream we fetch on the
@@ -229,10 +266,7 @@ async fn serve_media(
 
     // Clone out and release the DashMap ref before doing any I/O — holding it
     // across an await would block every other request on this shard.
-    let source = match entry.value() {
-        MediaSource::Local(path) => MediaSource::Local(path.clone()),
-        MediaSource::Upstream(url) => MediaSource::Upstream(url.clone()),
-    };
+    let source = entry.value().clone();
     drop(entry);
 
     match source {
@@ -474,5 +508,50 @@ mod tests {
         assert_eq!(parse_range_header("bytes=0-0", 0), None);
         assert_eq!(parse_range_header("bytes=0-", 0), None);
         assert_eq!(parse_range_header("bytes=-1", 0), None);
+    }
+
+    // ── Proxy ticket shape ──────────────────────────────────────────
+
+    fn url(value: &str) -> Url {
+        Url::parse(value).expect("test URL")
+    }
+
+    /// The Cast `content_type` is guessed from the URL the device is handed, so
+    /// an extensionless ticket advertises a proxied FLAC as `audio/mpeg` and the
+    /// receiver misplays or refuses it.
+    #[test]
+    fn a_proxy_ticket_carries_the_upstream_media_extension() {
+        assert_eq!(
+            upstream_media_extension(&url(
+                "https://plex.test/library/parts/1/track.flac?X-Plex-Token=secret"
+            )),
+            Some("flac")
+        );
+        assert_eq!(
+            upstream_media_extension(&url("https://music.test/a/b/song.OPUS?api_key=secret")),
+            Some("opus"),
+            "extension matching is case-insensitive and normalizes to the known form"
+        );
+    }
+
+    /// Only the known audio extensions may shape the ticket path. Anything else
+    /// leaves the ticket a bare UUID rather than letting the upstream URL
+    /// dictate what the route looks like.
+    #[test]
+    fn a_proxy_ticket_never_inherits_an_arbitrary_suffix() {
+        for no_extension in [
+            // Subsonic streams have no extension at all.
+            "https://sub.test/rest/stream.view?u=me&t=tok&s=salt&c=Tributary&id=1",
+            // Not an audio extension.
+            "https://music.test/stream.php?api_key=secret",
+            "https://music.test/stream.exe?api_key=secret",
+            "https://music.test/stream?api_key=secret",
+        ] {
+            assert_eq!(
+                upstream_media_extension(&url(no_extension)),
+                None,
+                "{no_extension} must not shape the ticket path"
+            );
+        }
     }
 }
