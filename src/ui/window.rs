@@ -788,7 +788,7 @@ pub fn build_window(
     info!("Main window presented");
 
     // ── Create GStreamer player ──────────────────────────────────────
-    let (player, player_rx) = match crate::audio::Player::new() {
+    let (player, player_rx) = match crate::audio::Player::new(rt_handle.clone()) {
         Ok(pair) => pair,
         Err(e) => {
             tracing::error!(error = %e, "Failed to create audio player — playback disabled");

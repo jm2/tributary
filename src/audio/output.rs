@@ -72,6 +72,9 @@ pub trait AudioOutput {
     /// Load a URI and start playback.
     ///
     /// `uri` may be a `file:///…` path or an `http(s)://…` stream URL.
+    /// Implementations must classify it at this boundary: a supported
+    /// credential-bearing URL may reach only Tributary's app-owned proxy, not
+    /// a playback library, daemon, or receiver.
     fn load_uri(&self, uri: &str);
 
     /// Tag subsequent events with the playback load that owns them.

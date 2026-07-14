@@ -25,18 +25,22 @@
 pub mod airplay_output;
 pub mod cast_http_server;
 pub mod chromecast_output;
+mod gstreamer_media;
 pub mod local_output;
 pub mod mpd_output;
 pub mod output;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gst::prelude::*;
 use gstreamer as gst;
 use gtk::glib;
 use tracing::{debug, error, info, warn};
+
+use self::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket};
 
 // ── Events ──────────────────────────────────────────────────────────────
 
@@ -140,6 +144,10 @@ pub struct Player {
     playbin: gst::Element,
     volume: f64,
     event_tx: async_channel::Sender<PlayerEvent>,
+    /// App-owned exact-origin fetch boundary for authenticated media. The
+    /// pipeline receives only a dedicated loopback ticket, never the backend
+    /// URL carrying the user's credential.
+    media_proxy: Arc<GstreamerMediaProxy>,
     /// Generation assigned by the playback session before each URI load.
     event_generation: Rc<Cell<PlayerEventGeneration>>,
     /// Holds the latest volume awaiting a debounced disk write, or `None`
@@ -175,7 +183,9 @@ impl Player {
     ///     }
     /// });
     /// ```
-    pub fn new() -> anyhow::Result<(Self, async_channel::Receiver<PlayerEvent>)> {
+    pub fn new(
+        rt_handle: tokio::runtime::Handle,
+    ) -> anyhow::Result<(Self, async_channel::Receiver<PlayerEvent>)> {
         // On Windows, point GStreamer at bundled plugins next to the executable
         // before init() scans the plugin registry.
         #[cfg(target_os = "windows")]
@@ -223,6 +233,7 @@ impl Player {
             playbin,
             volume,
             event_tx,
+            media_proxy: Arc::new(GstreamerMediaProxy::new(Some(rt_handle))),
             event_generation,
             volume_save_pending: Rc::new(Cell::new(None)),
             bus_watch: RefCell::new(None),
@@ -249,7 +260,17 @@ impl Player {
             bus.set_flushing(true);
         }
         let _ = self.playbin.set_state(gst::State::Null);
-        self.playbin.set_property("uri", uri);
+
+        let generation = self.event_generation.get();
+        let prepared = match self.media_proxy.prepare(uri) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                error!(error = %failure, "Audio media preparation failed");
+                self.emit_load_failure(generation, failure.to_string());
+                return;
+            }
+        };
+        self.playbin.set_property("uri", prepared.uri());
         // Re-apply volume — the NULL transition resets it to 1.0.
         self.playbin
             .set_property("volume", slider_to_pipeline(self.volume));
@@ -259,13 +280,28 @@ impl Player {
 
         // Signal buffering immediately — the bus watch will send
         // `Playing` once the pipeline actually reaches that state.
-        let generation = self.event_generation.get();
-        match Self::attach_bus_watch(&self.playbin, &self.event_tx, generation) {
+        let ticket = prepared.ticket();
+        match Self::attach_bus_watch(
+            &self.playbin,
+            &self.event_tx,
+            generation,
+            Arc::clone(&self.media_proxy),
+            ticket.clone(),
+        ) {
             Ok(watch) => *self.bus_watch.borrow_mut() = Some(watch),
             Err(error) => {
+                if let Some(ticket) = ticket.as_ref() {
+                    self.media_proxy.revoke_if_current(ticket);
+                }
+                if let Some(bus) = self.playbin.bus() {
+                    bus.set_flushing(true);
+                }
                 let _ = self
                     .event_tx
                     .try_send(PlayerEvent::error(generation, error.to_string()));
+                let _ = self
+                    .event_tx
+                    .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
                 return;
             }
         }
@@ -277,7 +313,24 @@ impl Player {
             warn!(error = %e, "dropped Buffering event — UI consumer may be stalled");
         }
 
-        let _ = self.playbin.set_state(gst::State::Playing);
+        if self.playbin.set_state(gst::State::Playing).is_err() {
+            self.bus_watch.borrow_mut().take();
+            if let Some(bus) = self.playbin.bus() {
+                bus.set_flushing(true);
+            }
+            let _ = self.playbin.set_state(gst::State::Null);
+            if let Some(ticket) = ticket.as_ref() {
+                self.media_proxy.revoke_if_current(ticket);
+            }
+            error!("Audio pipeline failed to start");
+            let _ = self.event_tx.try_send(PlayerEvent::error(
+                generation,
+                "Audio playback failed to start",
+            ));
+            let _ = self
+                .event_tx
+                .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
+        }
     }
 
     /// Resume playback from a paused state.
@@ -302,6 +355,7 @@ impl Player {
             bus.set_flushing(true);
         }
         let _ = self.playbin.set_state(gst::State::Null);
+        self.media_proxy.revoke();
         let generation = self.event_generation.get();
         if let Err(e) = self
             .event_tx
@@ -412,6 +466,8 @@ impl Player {
         playbin: &gst::Element,
         event_tx: &async_channel::Sender<PlayerEvent>,
         generation: PlayerEventGeneration,
+        media_proxy: Arc<GstreamerMediaProxy>,
+        media_ticket: Option<Arc<GstreamerMediaTicket>>,
     ) -> anyhow::Result<gst::bus::BusWatchGuard> {
         let bus = playbin
             .bus()
@@ -425,6 +481,9 @@ impl Player {
 
             match msg.view() {
                 MessageView::Eos(_) => {
+                    if let Some(ticket) = media_ticket.as_ref() {
+                        media_proxy.revoke_if_current(ticket);
+                    }
                     info!("End of stream");
                     if let Err(e) = tx.try_send(PlayerEvent::ended(generation)) {
                         warn!(error = %e, "dropped TrackEnded event — UI consumer may be stalled");
@@ -432,6 +491,9 @@ impl Player {
                 }
 
                 MessageView::Error(_) => {
+                    if let Some(ticket) = media_ticket.as_ref() {
+                        media_proxy.revoke_if_current(ticket);
+                    }
                     // GStreamer error/debug strings can retain the complete
                     // authenticated source URI. Emit a stable diagnostic
                     // instead of leaking backend credentials to logs or UI.
@@ -481,6 +543,20 @@ impl Player {
             glib::ControlFlow::Continue
         })
         .map_err(|e| anyhow::anyhow!("Failed to add bus watch: {e}"))
+    }
+
+    /// Publish one coherent terminal sequence for a URI rejected before it can
+    /// reach GStreamer. The supplied message is already fixed and URL-free.
+    fn emit_load_failure(&self, generation: PlayerEventGeneration, message: String) {
+        let _ = self
+            .event_tx
+            .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
+        let _ = self
+            .event_tx
+            .try_send(PlayerEvent::error(generation, message));
+        let _ = self
+            .event_tx
+            .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
     }
 
     // ── Internal: position polling ──────────────────────────────────
