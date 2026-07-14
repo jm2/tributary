@@ -132,16 +132,15 @@ and carry the same version.
 - [x] Review the `anyhow`, `paste`, and `proc-macro-error2` warnings and document upstream
   disposition.
 - [x] Run `cargo audit` successfully.
-- [x] Record initial implementation: PR #68; dependency updates made `cargo audit` pass with
-  the then-known dispositions.
+- [x] Record implementation: PR #68 supplied the initial dependency fixes and then-known warning
+  dispositions; disposition follow-up is in commit `a35cde8`, with the current branch's final
+  `spin` lockfile commit _pending_.
 - [x] Re-close the disposition table after its post-2026-07-10 drift (found and corrected
-  2026-07-13). `cargo audit --no-fetch` now reports exactly three allowed warnings: two
-  unmaintained dependencies and the yanked `spin` release. The separate
-  `RUSTSEC-2023-0071` ignore is justified and time-bounded below rather than removed based on
-  active-tree output: the affected package remains in `Cargo.lock` even though it is inactive
-  in Tributary's configured feature graph.
-- [x] Record disposition follow-up: commit `a35cde8`; active-feature and lockfile audit behavior
-  revalidated, with three allowed warnings and one explicitly justified, time-bounded ignore.
+  2026-07-13). After updating `spin`, `cargo audit --no-fetch` reports exactly two allowed
+  warnings, both unmaintained dependencies. The separate `RUSTSEC-2023-0071` ignore is
+  justified and time-bounded below rather than removed based on active-tree output: the
+  affected package remains in `Cargo.lock` even though it is inactive in Tributary's
+  configured feature graph.
 
 Audit disposition recorded 2026-07-10, amended and revalidated 2026-07-13:
 
@@ -150,7 +149,6 @@ Audit disposition recorded 2026-07-10, amended and revalidated 2026-07-13:
 | [`RUSTSEC-2026-0190`](https://rustsec.org/advisories/RUSTSEC-2026-0190) (`anyhow`) | direct and transitive | Fixed by locking and requiring `anyhow >= 1.0.103`. | Closed |
 | [`RUSTSEC-2024-0436`](https://rustsec.org/advisories/RUSTSEC-2024-0436) (`paste`) | `lofty 0.24.0 -> paste 1.0.15` | Informational/unmaintained, with no patched `paste` release. Track Lofty migration to a maintained replacement; no direct Tributary use. | 2026-10-10 or next release, whichever comes first |
 | [`RUSTSEC-2026-0173`](https://rustsec.org/advisories/RUSTSEC-2026-0173) (`proc-macro-error2`) | `sea-orm 1.1.20 -> sea-bae 0.2.1` | Informational/unmaintained compile-time macro dependency. Track SeaORM's removal or evaluate the SeaORM 2 migration. | 2026-10-10 or next release, whichever comes first |
-| `spin 0.9.8` **yanked** (added 2026-07-13) | Active graph: `flume 0.11.1 -> sqlx-sqlite` and `flume 0.12.0 -> mdns-sd 0.20.1`; the whole-lockfile audit also reports paths through `lazy_static` and the inactive `rsa` graph below. | Yanked release, not a vulnerability. Tributary cannot bump `spin` directly; track `flume` and the other transitive owners for a non-yanked release. | 2026-10-10 or next release, whichever comes first |
 | [`RUSTSEC-2023-0071`](https://rustsec.org/advisories/RUSTSEC-2023-0071) (`rsa`, Marvin Attack) | Lockfile-only optional graph: `sqlx 0.8.6` and `sqlx-macros-core 0.8.6` retain `sqlx-mysql 0.8.6 -> rsa 0.9.10`; `sqlx-mysql` and `rsa` are inactive under Tributary's `sqlx-sqlite` feature set. | Retain the narrowly documented `.cargo/audit.toml` ignore. `cargo tree --locked -i rsa` and `cargo tree --locked -e features -i sqlx-mysql` are empty, but `cargo-audit` checks every locked package and fails on this advisory without the ignore. No fixed upgrade exists. Re-review immediately before enabling MySQL support. | 2026-10-10 or next release, whichever comes first; immediately if MySQL is enabled |
 
 Acceptance criteria: the CI security-audit job passes with every remaining ignored advisory
@@ -653,8 +651,9 @@ Record scope or design decisions here so deferred work is explicit.
   best-effort transfer between unlike output implementations.
 - 2026-07-10 — Generation filtering prevents stale receiver events from mutating Tributary.
   Ordered Chromecast command side effects and authoritative MPD state remain P1.7 and P1.8.
-- 2026-07-13 — `cargo audit --no-fetch` passes with two unmaintained dependency warnings and one
-  yanked-release warning, each with an upstream disposition and a 2026-10-10-or-next-release
+- 2026-07-13 — `spin 0.9.8` was replaced in `Cargo.lock` by compatible `0.9.9`, resolving the
+  withdrawn-release warning. `cargo audit --no-fetch` now passes with exactly two unmaintained
+  dependency warnings, each with an upstream disposition and a 2026-10-10-or-next-release
   review deadline under P0.8. `RUSTSEC-2023-0071` for `rsa` remains separately ignored because
   `cargo-audit` checks the inactive `sqlx-mysql` package retained in `Cargo.lock`; Tributary
   enables SQLite only, the advisory has no fixed upgrade, and the ignore must be reviewed
@@ -791,8 +790,8 @@ Add one line per completed task:
 | 2026-07-10 | P0.4 | PR #68 | Stable queue/session identity, generation-filtered events, and deterministic output reset. |
 | 2026-07-10 | P0.5 | PR #68 | One setup-time sidebar handler with current-item resolution and recycling tests. |
 | 2026-07-10 | P0.6 | PR #68 | Immutable release inputs and publication-only repository credentials. |
-| 2026-07-10 | P0.8 | PR #68 | Patched dependency graph and time-bounded informational advisory dispositions. |
-| 2026-07-13 | P0.8 follow-up | `a35cde8` | Reconciled two unmaintained and one yanked warning with the lockfile-only ignored RSA advisory; every disposition now has an explicit rationale, deadline, and feature-enable trigger. |
+| 2026-07-10 | P0.8 | PR #68 | Patched the then-failing dependencies and recorded the warnings known at the time. |
+| 2026-07-13 | P0.8 follow-up | `a35cde8`; final lockfile commit _pending_ | Updated `spin` to 0.9.9, leaving exactly two time-bounded unmaintained warnings; the lockfile-only ignored RSA advisory has an explicit rationale, deadline, and feature-enable trigger. |
 | 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
 | 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |
 | 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
