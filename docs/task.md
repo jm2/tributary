@@ -137,12 +137,11 @@ and carry the same version.
 - [x] Re-close the disposition table after its post-2026-07-10 drift (found and corrected
   2026-07-13). `cargo audit --no-fetch` now reports exactly three allowed warnings: two
   unmaintained dependencies and the yanked `spin` release. The separate
-  `RUSTSEC-2023-0071` ignore is justified and time-bounded below rather than treated as
-  vestigial: the affected package remains in `Cargo.lock` even though it is inactive in
-  Tributary's configured feature graph.
-- [x] Record disposition follow-up: final commit/PR _pending publication_; active-feature and
-  lockfile audit behavior revalidated, with three allowed warnings and one explicitly
-  justified, time-bounded ignore.
+  `RUSTSEC-2023-0071` ignore is justified and time-bounded below rather than removed based on
+  active-tree output: the affected package remains in `Cargo.lock` even though it is inactive
+  in Tributary's configured feature graph.
+- [x] Record disposition follow-up: commit `a35cde8`; active-feature and lockfile audit behavior
+  revalidated, with three allowed warnings and one explicitly justified, time-bounded ignore.
 
 Audit disposition recorded 2026-07-10, amended and revalidated 2026-07-13:
 
@@ -793,7 +792,7 @@ Add one line per completed task:
 | 2026-07-10 | P0.5 | PR #68 | One setup-time sidebar handler with current-item resolution and recycling tests. |
 | 2026-07-10 | P0.6 | PR #68 | Immutable release inputs and publication-only repository credentials. |
 | 2026-07-10 | P0.8 | PR #68 | Patched dependency graph and time-bounded informational advisory dispositions. |
-| 2026-07-13 | P0.8 follow-up | _pending commit/PR_ | Reconciled two unmaintained and one yanked warning with the lockfile-only ignored RSA advisory; every disposition now has an explicit rationale, deadline, and feature-enable trigger. |
+| 2026-07-13 | P0.8 follow-up | `a35cde8` | Reconciled two unmaintained and one yanked warning with the lockfile-only ignored RSA advisory; every disposition now has an explicit rationale, deadline, and feature-enable trigger. |
 | 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
 | 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |
 | 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
