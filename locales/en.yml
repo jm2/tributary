@@ -108,6 +108,34 @@ dialogs:
   output_host: "Host"
   output_port: "Port"
 
+# ── Library root trust ──────────────────────────────────────────────
+library_root_trust:
+  legacy_heading: "Trust this library folder?"
+  legacy_body: "Tributary remembers %{count} tracks under %{path}, but this folder predates library identity checks. Trust it only if it is the same library you used before. Until then, Tributary preserves the saved metadata but will not index changes or remove missing tracks from this folder. After trust is established, a later complete reconciliation may remove remembered tracks that are still missing."
+  replacement_heading: "Library folder identity changed"
+  replacement_body: "The folder at %{path} could not be verified as the library Tributary previously trusted, which has %{count} remembered tracks. Use this folder only if you intentionally replaced or moved that library. Tributary preserves the remembered metadata while trust is established; a later complete reconciliation may remove tracks still missing from this folder."
+  empty_new_heading: "Set up this library folder?"
+  empty_new_body: "Tributary found no supported audio files under %{path}. This may be a new empty library, but it can also mean that a removable drive or network share is not mounted. Continue only if this is the intended library location."
+  empty_heading: "No supported audio files found"
+  empty_body: "Tributary found no supported audio files under %{path}, but remembers %{count} tracks there. This can mean that a removable drive or network share is not mounted. Continue only if this is the intended library volume and its supported audio files are intentionally absent."
+  empty_new_final_heading: "Confirm this library location?"
+  empty_new_final_body: "No supported audio files are currently visible under %{path}. Confirm that this is the intended library location rather than an unmounted drive or network share. Future complete scans will reflect files added or removed here; Tributary never deletes the audio files themselves."
+  empty_final_heading: "Trust this library folder anyway?"
+  empty_final_body: "No supported audio files are currently visible under %{path}. This path may be only an unmounted mountpoint, not the intended library. The enrollment scan preserves all %{count} remembered tracks, but a later complete authoritative scan may remove every remembered track still absent from this folder. Tributary never deletes the audio files themselves."
+  not_now: "Not Now"
+  keep_existing: "Keep Existing Library"
+  trust_folder: "Trust Folder"
+  use_folder: "Use This Folder"
+  review_empty_risk: "Review the Risk"
+  trust_empty_anyway: "Trust Folder Anyway"
+  pending_toast: "Checking the library folder before trusting it…"
+  trusted_toast: "Library folder trusted and active."
+  replacement_trusted_toast: "New library folder trusted and active."
+  empty_trusted_toast: "Library folder trusted and active."
+  unavailable_toast: "Trust could not be completed because the folder is unavailable or its scan was incomplete. Remembered metadata remains protected."
+  stale_toast: "The folder changed before trust could finish. It remains unavailable and remembered metadata stays protected."
+  failed_toast: "Tributary could not finish trusting that library folder. It remains unavailable and remembered metadata stays protected."
+
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "Properties…"

@@ -32,6 +32,7 @@ use super::playback::{
     BufferingTracker, PlaybackContext, PlaybackSession, QueueTrackRefresh, PLAYLIST_SOURCE_PREFIX,
 };
 use super::preferences;
+use super::root_trust;
 use super::server_dialogs::{load_saved_servers, remove_saved_server, show_add_server_dialog};
 use super::sidebar;
 use super::tracklist;
@@ -50,6 +51,10 @@ const BROWSER_POS: i32 = 220;
 /// If the user presses Previous when more than this many ms into a track,
 /// restart the current track instead of going back.
 const PREV_RESTART_THRESHOLD_MS: u64 = 3000;
+
+/// User trust decisions are serialized by the engine; this bounded queue
+/// prevents a stalled engine from accumulating unbounded confirmations.
+const LIBRARY_COMMAND_CAPACITY: usize = 16;
 
 /// Build and present the main Tributary window.
 pub fn build_window(
@@ -331,6 +336,11 @@ pub fn build_window(
     content.append(&hb.header);
     content.append(&main_paned);
 
+    // The root-trust flow uses non-modal status feedback after a guarded
+    // confirmation. Tributary previously had no window-level toast host.
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&content));
+
     // Restore persisted window geometry (size + maximized state).
     let saved_geo = load_window_geometry();
     let win_width = saved_geo.as_ref().map(|g| g.width).unwrap_or(DEFAULT_WIDTH);
@@ -344,7 +354,7 @@ pub fn build_window(
         .title("Tributary")
         .default_width(win_width)
         .default_height(win_height)
-        .content(&content)
+        .content(&toast_overlay)
         .build();
 
     if saved_geo.is_some_and(|g| g.is_maximized) {
@@ -386,6 +396,13 @@ pub fn build_window(
         glib::Propagation::Stop
     });
 
+    // Root trust is the only UI-to-library-engine command path. The engine
+    // validates every request against fresh filesystem evidence before it can
+    // change persisted trust; the GTK side only queues an affirmative intent.
+    let (library_command_tx, library_command_rx) = async_channel::bounded(LIBRARY_COMMAND_CAPACITY);
+    let root_trust_prompts =
+        root_trust::RootTrustPromptController::new(&window, &toast_overlay, library_command_tx);
+
     // ── Start the library engine on tokio ────────────────────────────
     // Use the configured library paths from preferences, which default
     // to the XDG / platform music directory (e.g. ~/Musique on French
@@ -401,7 +418,8 @@ pub fn build_window(
     rt_handle.spawn(async move {
         match crate::db::connection::init_db().await {
             Ok(db) => {
-                let engine = LibraryEngine::new(db, music_dirs, engine_tx_clone);
+                let engine =
+                    LibraryEngine::new(db, music_dirs, engine_tx_clone, library_command_rx);
                 engine.run().await;
             }
             Err(e) => {
@@ -789,6 +807,7 @@ pub fn build_window(
                 scan_spinner,
                 pending_connection_for_events.clone(),
                 playback_session.clone(),
+                root_trust_prompts.clone(),
             );
             return;
         }
@@ -1623,6 +1642,7 @@ pub fn build_window(
         scan_spinner,
         pending_connection_for_events,
         playback_session,
+        root_trust_prompts,
     );
 }
 
@@ -1732,6 +1752,7 @@ fn setup_library_events(
     scan_spinner: gtk::Spinner,
     pending_connection: Rc<RefCell<Option<String>>>,
     playback_session: Rc<RefCell<PlaybackSession>>,
+    root_trust_prompts: root_trust::RootTrustPromptController,
 ) {
     let browser_widget = browser_widget.clone();
     let column_view = column_view.clone();
@@ -2058,6 +2079,19 @@ fn setup_library_events(
                             sidebar_store.insert(insert_pos + idx as u32, &src);
                         }
                     }
+                }
+
+                LibraryEvent::RootTrustRequired(requests) => {
+                    root_trust_prompts.enqueue(requests);
+                }
+
+                LibraryEvent::RootTrustFinished {
+                    request_id,
+                    path,
+                    reason,
+                    outcome,
+                } => {
+                    root_trust_prompts.handle_finished(request_id, path, reason, outcome);
                 }
 
                 LibraryEvent::Error(msg) => {
