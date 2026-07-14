@@ -200,8 +200,8 @@ trait MpdConnector: Send + 'static {
 }
 
 trait MpdTransport {
-    fn clear(&mut self, deadline: OperationDeadline) -> MpdResult<()>;
     fn repeat_off(&mut self, deadline: OperationDeadline) -> MpdResult<()>;
+    fn random_off(&mut self, deadline: OperationDeadline) -> MpdResult<()>;
     fn single_off(&mut self, deadline: OperationDeadline) -> MpdResult<()>;
     fn consume_off(&mut self, deadline: OperationDeadline) -> MpdResult<()>;
     fn add_id(&mut self, uri: &str, deadline: OperationDeadline) -> MpdResult<u64>;
@@ -414,12 +414,12 @@ impl MpdConnection {
 }
 
 impl MpdTransport for MpdConnection {
-    fn clear(&mut self, deadline: OperationDeadline) -> MpdResult<()> {
-        self.response_none("clear", deadline, "queue clear")
-    }
-
     fn repeat_off(&mut self, deadline: OperationDeadline) -> MpdResult<()> {
         self.response_none("repeat 0", deadline, "repeat update")
+    }
+
+    fn random_off(&mut self, deadline: OperationDeadline) -> MpdResult<()> {
+        self.response_none("random 0", deadline, "random update")
     }
 
     fn single_off(&mut self, deadline: OperationDeadline) -> MpdResult<()> {
@@ -683,6 +683,15 @@ enum CleanupOutcome {
     Failed(MpdFailure),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupKind {
+    /// Remove only the queue entry whose stable id belongs to Tributary.
+    Targeted,
+    /// Stop playback only after a fresh status proves Tributary is current,
+    /// then remove the same stable queue id.
+    StopOwned,
+}
+
 fn spawn_mpd_worker<C>(
     connector: C,
     intent_epoch: Arc<AtomicU64>,
@@ -739,15 +748,26 @@ fn run_mpd_worker<C>(
                         true
                     }
                     CommandKind::RejectLoad { failure } => {
-                        let cleanup =
-                            cleanup_session(&mut active, command.owner, &intent_epoch, timing);
+                        let cleanup = cleanup_session(
+                            &mut active,
+                            command.owner,
+                            CleanupKind::Targeted,
+                            &intent_epoch,
+                            timing,
+                        );
                         if !matches!(cleanup, CleanupOutcome::Stale) {
                             fail_current(command.owner, failure, &intent_epoch, &cache, &event_tx);
                         }
                         true
                     }
                     CommandKind::Stop => {
-                        match cleanup_session(&mut active, command.owner, &intent_epoch, timing) {
+                        match cleanup_session(
+                            &mut active,
+                            command.owner,
+                            CleanupKind::StopOwned,
+                            &intent_epoch,
+                            timing,
+                        ) {
                             CleanupOutcome::Completed => {
                                 let _ = publish_state(
                                     command.owner,
@@ -824,7 +844,7 @@ fn handle_load<C>(
 ) where
     C: MpdConnector,
 {
-    match cleanup_session(active, owner, intent_epoch, timing) {
+    match cleanup_session(active, owner, CleanupKind::Targeted, intent_epoch, timing) {
         CleanupOutcome::Completed => {}
         CleanupOutcome::Failed(failure) => {
             error!(operation = failure.operation, "Previous MPD cleanup failed");
@@ -870,23 +890,25 @@ fn handle_load<C>(
         return;
     }
 
-    let clear = active
-        .as_mut()
-        .expect("connected MPD session recorded")
-        .connection
-        .clear(deadline);
-    if !finish_load_stage(clear, active, owner, intent_epoch, cache, event_tx, timing) {
-        return;
-    }
-    if !is_current(owner, intent_epoch) {
-        return;
-    }
     let repeat = active
         .as_mut()
         .expect("connected MPD session recorded")
         .connection
         .repeat_off(deadline);
     if !finish_load_stage(repeat, active, owner, intent_epoch, cache, event_tx, timing) {
+        return;
+    }
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
+    // The owned item is appended after the preserved foreign queue. Disable
+    // random order so reaching its end cannot select an earlier foreign item.
+    let random = active
+        .as_mut()
+        .expect("connected MPD session recorded")
+        .connection
+        .random_off(deadline);
+    if !finish_load_stage(random, active, owner, intent_epoch, cache, event_tx, timing) {
         return;
     }
     if !is_current(owner, intent_epoch) {
@@ -1064,7 +1086,7 @@ fn cleanup_then_fail<C>(
     C: MpdTransport,
 {
     if failure.connection_usable {
-        let _ = cleanup_session(active, owner, intent_epoch, timing);
+        let _ = cleanup_session(active, owner, CleanupKind::Targeted, intent_epoch, timing);
     } else {
         // An I/O timeout, partial write, truncated response, or parser failure
         // may leave unread bytes or a half-command on the stream. Drop it
@@ -1147,6 +1169,51 @@ fn handle_control<C>(
     if !is_current(owner, intent_epoch) {
         return;
     }
+    let Some(session) = active.as_ref() else {
+        return;
+    };
+    if session.owner.epoch != owner.epoch {
+        return;
+    }
+    if session.song_id.is_none() {
+        return;
+    }
+    let deadline = timing.deadline();
+
+    // A periodic poll may be almost one interval old. Revalidate the stable
+    // current-song id immediately before every control so a replacement made
+    // by another MPD client is observed before Tributary changes playback.
+    let status = active
+        .as_mut()
+        .expect("active MPD session checked")
+        .connection
+        .status(deadline);
+    if retire_poisoned_if_stale(&status, active, owner, intent_epoch) {
+        return;
+    }
+    match status {
+        Ok(status) => {
+            apply_authoritative_status(
+                active,
+                owner,
+                status,
+                intent_epoch,
+                cache,
+                event_tx,
+                timing,
+            );
+        }
+        Err(failure) => {
+            // A failed ownership query cannot authorize even a global pause.
+            // Drop the session without sending any cleanup command.
+            active.take();
+            fail_current(owner, failure, intent_epoch, cache, event_tx);
+            return;
+        }
+    }
+    if !is_current(owner, intent_epoch) {
+        return;
+    }
     let Some(session) = active.as_mut() else {
         return;
     };
@@ -1156,7 +1223,6 @@ fn handle_control<C>(
     let Some(song_id) = session.song_id else {
         return;
     };
-    let deadline = timing.deadline();
     let result = match kind {
         // `playid` begins the selected queue entry and therefore restarts a
         // paused song. Use MPD's explicit resume operation for Paused, but
@@ -1505,6 +1571,7 @@ fn publish_status<C>(
 fn cleanup_session<C>(
     active: &mut Option<WorkerSession<C>>,
     owner: CommandOwner,
+    kind: CleanupKind,
     intent_epoch: &AtomicU64,
     timing: WorkerTiming,
 ) -> CleanupOutcome
@@ -1517,42 +1584,81 @@ where
     let Some(mut session) = active.take() else {
         return CleanupOutcome::Completed;
     };
-    let deadline = timing.deadline();
     if !is_current(owner, intent_epoch) {
         *active = Some(session);
         return CleanupOutcome::Stale;
     }
-    let stop = session.connection.stop(deadline);
-    if !is_current(owner, intent_epoch) {
-        if stop
-            .as_ref()
-            .err()
-            .is_none_or(|failure| failure.connection_usable)
-        {
-            *active = Some(session);
-        }
-        return CleanupOutcome::Stale;
-    }
-    let mut failure = match stop {
-        Ok(()) => None,
-        Err(failure) if failure.connection_usable => Some(failure),
-        Err(failure) => return CleanupOutcome::Failed(failure),
+    let Some(song_id) = session.song_id else {
+        return CleanupOutcome::Completed;
     };
-    if let Err(clear_failure) = session.connection.clear(deadline) {
-        let clear_usable = clear_failure.connection_usable;
-        failure.get_or_insert(clear_failure);
+
+    let deadline = timing.deadline();
+    let mut failure = None;
+    if kind == CleanupKind::StopOwned {
+        let status = session.connection.status(deadline);
         if !is_current(owner, intent_epoch) {
-            if clear_usable {
+            if status
+                .as_ref()
+                .err()
+                .is_none_or(|failure| failure.connection_usable)
+            {
                 *active = Some(session);
             }
             return CleanupOutcome::Stale;
         }
-    } else if !is_current(owner, intent_epoch) {
+
+        match status {
+            Ok(status) if status.song_id == Some(song_id) => {
+                if status.state != MpdPlaybackState::Stopped {
+                    let stopped = session.connection.stop(deadline);
+                    if !is_current(owner, intent_epoch) {
+                        if stopped
+                            .as_ref()
+                            .err()
+                            .is_none_or(|failure| failure.connection_usable)
+                        {
+                            *active = Some(session);
+                        }
+                        return CleanupOutcome::Stale;
+                    }
+                    match stopped {
+                        Ok(()) => {}
+                        Err(stop_failure) if stop_failure.connection_usable => {
+                            failure = Some(stop_failure);
+                        }
+                        Err(stop_failure) => return CleanupOutcome::Failed(stop_failure),
+                    }
+                }
+            }
+            // A foreign or missing current id does not authorize a global
+            // stop. Targeting our stable queue id below remains safe.
+            Ok(_) => {}
+            Err(status_failure) if status_failure.connection_usable => {
+                // The stream is synchronized, so a targeted delete is safe,
+                // but ownership was indeterminate and the Stop itself failed.
+                failure = Some(status_failure);
+            }
+            Err(status_failure) => return CleanupOutcome::Failed(status_failure),
+        }
+    }
+
+    if !is_current(owner, intent_epoch) {
+        *active = Some(session);
         return CleanupOutcome::Stale;
     }
-    match failure {
-        Some(failure) => CleanupOutcome::Failed(failure),
-        None => CleanupOutcome::Completed,
+    let removed = session.connection.delete_id(song_id, deadline);
+    if !is_current(owner, intent_epoch) {
+        // OK removed the entry and ACK means it was already absent. Either is
+        // terminal for the superseded ownership claim, so never restore it.
+        return CleanupOutcome::Stale;
+    }
+    match removed {
+        Ok(())
+        | Err(MpdFailure {
+            connection_usable: true,
+            ..
+        }) => failure.map_or(CleanupOutcome::Completed, CleanupOutcome::Failed),
+        Err(delete_failure) => CleanupOutcome::Failed(failure.unwrap_or(delete_failure)),
     }
 }
 
@@ -1561,14 +1667,29 @@ where
     C: MpdTransport,
 {
     if let Some(mut session) = active.take() {
+        let Some(song_id) = session.song_id else {
+            return;
+        };
         let deadline = timing.deadline();
-        let stop = session.connection.stop(deadline);
-        if stop
-            .as_ref()
-            .err()
-            .is_none_or(|failure| failure.connection_usable)
-        {
-            let _ = session.connection.clear(deadline);
+        let status = session.connection.status(deadline);
+        let can_delete = match status {
+            Ok(status) if status.song_id == Some(song_id) => {
+                if status.state == MpdPlaybackState::Stopped {
+                    true
+                } else {
+                    session
+                        .connection
+                        .stop(deadline)
+                        .as_ref()
+                        .err()
+                        .is_none_or(|failure| failure.connection_usable)
+                }
+            }
+            Ok(_) => true,
+            Err(failure) => failure.connection_usable,
+        };
+        if can_delete {
+            let _ = session.connection.delete_id(song_id, deadline);
         }
     }
 }
@@ -1832,8 +1953,8 @@ mod tests {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Point {
         Connect,
-        Clear,
         Repeat,
+        Random,
         Single,
         Consume,
         Add,
@@ -1941,8 +2062,8 @@ mod tests {
         const fn operation(self) -> &'static str {
             match self {
                 Self::Connect => "test connection",
-                Self::Clear => "test clear",
                 Self::Repeat => "test repeat",
+                Self::Random => "test random",
                 Self::Single => "test single",
                 Self::Consume => "test consume",
                 Self::Add => "test add",
@@ -1977,14 +2098,14 @@ mod tests {
     }
 
     impl MpdTransport for FakeConnection {
-        fn clear(&mut self, _deadline: OperationDeadline) -> MpdResult<()> {
-            self.shared
-                .record(Point::Clear, Action::Point(Point::Clear))
-        }
-
         fn repeat_off(&mut self, _deadline: OperationDeadline) -> MpdResult<()> {
             self.shared
                 .record(Point::Repeat, Action::Point(Point::Repeat))
+        }
+
+        fn random_off(&mut self, _deadline: OperationDeadline) -> MpdResult<()> {
+            self.shared
+                .record(Point::Random, Action::Point(Point::Random))
         }
 
         fn single_off(&mut self, _deadline: OperationDeadline) -> MpdResult<()> {
@@ -2049,7 +2170,7 @@ mod tests {
             {
                 Ok(())
             } else {
-                Err(MpdFailure::new("queue ownership"))
+                Err(MpdFailure::synchronized("queue ownership"))
             }
         }
     }
@@ -2196,8 +2317,8 @@ mod tests {
             shared.actions(),
             vec![
                 Action::Point(Point::Connect),
-                Action::Point(Point::Clear),
                 Action::Point(Point::Repeat),
+                Action::Point(Point::Random),
                 Action::Point(Point::Single),
                 Action::Point(Point::Consume),
                 Action::Point(Point::Add),
@@ -2286,7 +2407,10 @@ mod tests {
         let _ = harness.events();
         {
             let mut statuses = shared.statuses.lock().expect("statuses lock");
+            statuses.push_back(playing_status(0, 10_000));
             statuses.push_back(paused_status(2_000, 10_000));
+            statuses.push_back(paused_status(2_000, 10_000));
+            statuses.push_back(paused_status(7_000, 10_000));
             statuses.push_back(paused_status(7_000, 10_000));
             statuses.push_back(playing_status(7_000, 10_000));
         }
@@ -2304,22 +2428,25 @@ mod tests {
         assert_eq!(
             shared.actions(),
             vec![
+                Action::Point(Point::Status),
                 Action::Pause(true),
                 Action::Point(Point::Status),
+                Action::Point(Point::Status),
                 Action::Seek(42, 7_000),
+                Action::Point(Point::Status),
                 Action::Point(Point::Status),
                 Action::Pause(false),
                 Action::Point(Point::Status),
             ]
         );
         let events = harness.events();
-        assert!(matches!(
-            events.first(),
-            Some(PlayerEvent::StateChanged {
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged {
                 state: PlayerState::Paused,
                 ..
-            })
-        ));
+            }
+        )));
         assert!(events.iter().any(|event| matches!(
             event,
             PlayerEvent::StateChanged {
@@ -2328,6 +2455,126 @@ mod tests {
             }
         )));
         assert_eq!(harness.cache().position_ms, Some(7_000));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn every_control_revalidates_and_relinquishes_a_foreign_current_song() {
+        for kind in [
+            CommandKind::Play,
+            CommandKind::Pause,
+            CommandKind::Toggle,
+            CommandKind::Seek(7_000),
+        ] {
+            let shared = FakeShared::new();
+            let harness = Harness::new(Arc::clone(&shared));
+            let owner = harness.next_owner(1);
+            harness.send(
+                owner,
+                CommandKind::Load {
+                    uri: "https://music.test/a".to_string(),
+                },
+            );
+            harness.fence(owner);
+            shared.clear_actions();
+            let _ = harness.events();
+
+            let mut foreign = playing_status(1_000, 10_000);
+            foreign.song_id = Some(99);
+            shared
+                .statuses
+                .lock()
+                .expect("statuses lock")
+                .push_back(foreign);
+            harness.send(owner, kind);
+            harness.fence(owner);
+
+            assert_eq!(shared.actions(), vec![Action::Point(Point::Status)]);
+            assert!(matches!(
+                harness.events().as_slice(),
+                [
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    },
+                    PlayerEvent::Error { .. }
+                ]
+            ));
+            harness.shutdown();
+        }
+    }
+
+    #[test]
+    fn failed_control_cleans_only_the_owned_queue_id() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Seek);
+
+        harness.send(owner, CommandKind::Seek(7_000));
+        harness.fence(owner);
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Status),
+                Action::Seek(42, 7_000),
+                Action::Delete(42),
+            ]
+        );
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::PositionChanged { .. },
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn failed_control_preflight_never_sends_cleanup() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Status);
+
+        harness.send(owner, CommandKind::Pause);
+        harness.fence(owner);
+
+        assert_eq!(shared.actions(), vec![Action::Point(Point::Status)]);
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
         harness.shutdown();
     }
 
@@ -2417,7 +2664,7 @@ mod tests {
             .expect("replacement connected");
         assert!(!actions[first_add + 1..replacement_connect]
             .iter()
-            .any(|action| matches!(action, Action::Point(Point::Stop | Point::Clear))));
+            .any(|action| matches!(action, Action::Point(Point::Stop))));
 
         let events = harness.events();
         assert!(!events.iter().any(|event| matches!(
@@ -2459,7 +2706,11 @@ mod tests {
 
         assert_eq!(
             shared.actions(),
-            vec![Action::Point(Point::Stop), Action::Point(Point::Clear)]
+            vec![
+                Action::Point(Point::Status),
+                Action::Point(Point::Stop),
+                Action::Delete(42),
+            ]
         );
         assert!(matches!(
             harness.events().as_slice(),
@@ -2469,6 +2720,109 @@ mod tests {
             }]
         ));
         assert_eq!(harness.cache().position_ms, None);
+        harness.shutdown();
+    }
+
+    #[test]
+    fn explicit_stop_does_not_stop_or_clear_a_foreign_current_song() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let load = harness.next_owner(1);
+        harness.send(
+            load,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+            },
+        );
+        harness.fence(load);
+        shared.clear_actions();
+        let _ = harness.events();
+
+        let mut foreign = playing_status(1_000, 10_000);
+        foreign.song_id = Some(99);
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(foreign);
+        shared
+            .ownership
+            .lock()
+            .expect("ownership lock")
+            .push_back(false);
+
+        let stop = harness.next_owner(2);
+        harness.send(stop, CommandKind::Stop);
+        harness.fence(stop);
+
+        assert_eq!(
+            shared.actions(),
+            vec![Action::Point(Point::Status), Action::Delete(42)]
+        );
+        assert!(matches!(
+            harness.events().as_slice(),
+            [PlayerEvent::StateChanged {
+                state: PlayerState::Stopped,
+                ..
+            }]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn replacement_load_preserves_the_foreign_queue_and_tolerates_a_missing_old_id() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let first = harness.next_owner(1);
+        harness.send(
+            first,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+            },
+        );
+        harness.fence(first);
+        shared.clear_actions();
+        let _ = harness.events();
+        shared
+            .ownership
+            .lock()
+            .expect("ownership lock")
+            .push_back(false);
+
+        let second = harness.next_owner(2);
+        harness.send(
+            second,
+            CommandKind::Load {
+                uri: "https://music.test/b".to_string(),
+            },
+        );
+        harness.fence(second);
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Delete(42),
+                Action::Point(Point::Connect),
+                Action::Point(Point::Repeat),
+                Action::Point(Point::Random),
+                Action::Point(Point::Single),
+                Action::Point(Point::Consume),
+                Action::Point(Point::Add),
+                Action::Play(42),
+                Action::Point(Point::Status),
+            ]
+        );
+        assert!(shared
+            .actions()
+            .iter()
+            .all(|action| { !matches!(action, Action::Point(Point::Stop)) }));
+        assert!(harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged {
+                generation,
+                state: PlayerState::Playing,
+            } if *generation == PlayerEventGeneration::from_raw(2)
+        )));
         harness.shutdown();
     }
 
@@ -2555,13 +2909,22 @@ mod tests {
             .statuses
             .lock()
             .expect("statuses lock")
+            .push_back(stopped_status(1_000, 10_000));
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
             .push_back(playing_status(0, 10_000));
         harness.send(owner, CommandKind::Toggle);
         harness.fence(owner);
 
         assert_eq!(
             shared.actions(),
-            vec![Action::Play(42), Action::Point(Point::Status)]
+            vec![
+                Action::Point(Point::Status),
+                Action::Play(42),
+                Action::Point(Point::Status),
+            ]
         );
         assert!(harness.events().iter().any(|event| matches!(
             event,
@@ -2609,6 +2972,54 @@ mod tests {
                 PlayerEvent::Error { .. }
             ]
         ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn foreign_successor_is_ownership_loss_not_end_of_track() {
+        let shared = FakeShared::new();
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(playing_status(9_500, 10_000));
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+            },
+        );
+        harness.fence(owner);
+        let _ = harness.events();
+        shared.clear_actions();
+
+        let mut foreign = playing_status(0, 20_000);
+        foreign.song_id = Some(99);
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(foreign);
+        harness.send(owner, CommandKind::PollNow);
+        harness.fence(owner);
+
+        assert_eq!(shared.actions(), vec![Action::Point(Point::Status)]);
+        let events = harness.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })));
         harness.shutdown();
     }
 
@@ -2806,7 +3217,7 @@ mod tests {
     }
 
     #[test]
-    fn status_failure_cleans_session_and_emits_one_terminal_error() {
+    fn status_failure_targets_only_owned_entry_and_emits_one_terminal_error() {
         let shared = FakeShared::new();
         let harness = Harness::new(Arc::clone(&shared));
         let owner = harness.next_owner(1);
@@ -2827,11 +3238,7 @@ mod tests {
 
         assert_eq!(
             shared.actions(),
-            vec![
-                Action::Point(Point::Status),
-                Action::Point(Point::Stop),
-                Action::Point(Point::Clear),
-            ]
+            vec![Action::Point(Point::Status), Action::Delete(42)]
         );
         assert!(matches!(
             harness.events().as_slice(),
@@ -2992,7 +3399,11 @@ mod tests {
             .expect("worker stopped");
         assert_eq!(
             shared.actions(),
-            vec![Action::Point(Point::Stop), Action::Point(Point::Clear)]
+            vec![
+                Action::Point(Point::Status),
+                Action::Point(Point::Stop),
+                Action::Delete(42),
+            ]
         );
         assert!(harness.events().is_empty());
     }
@@ -3168,8 +3579,8 @@ mod tests {
     #[test]
     fn tcp_session_reuses_connection_and_parses_typed_responses() {
         let (address, server) = scripted_server(vec![
-            ("clear".to_string(), b"OK\n".to_vec()),
             ("repeat 0".to_string(), b"OK\n".to_vec()),
+            ("random 0".to_string(), b"OK\n".to_vec()),
             ("single 0".to_string(), b"OK\n".to_vec()),
             ("consume 0".to_string(), b"OK\n".to_vec()),
             (
@@ -3185,8 +3596,8 @@ mod tests {
         ]);
         let mut connection = connect_test(address);
         let deadline = OperationDeadline::after(Duration::from_secs(2));
-        connection.clear(deadline).expect("clear succeeds");
         connection.repeat_off(deadline).expect("repeat succeeds");
+        connection.random_off(deadline).expect("random succeeds");
         connection.single_off(deadline).expect("single succeeds");
         connection.consume_off(deadline).expect("consume succeeds");
         let id = connection
@@ -3225,10 +3636,10 @@ mod tests {
 
     #[test]
     fn okay_prefix_is_not_a_success_terminator() {
-        let (address, server) = scripted_server(vec![("clear".to_string(), b"OKAY\n".to_vec())]);
+        let (address, server) = scripted_server(vec![("repeat 0".to_string(), b"OKAY\n".to_vec())]);
         let mut connection = connect_test(address);
         assert!(connection
-            .clear(OperationDeadline::after(Duration::from_secs(2)))
+            .repeat_off(OperationDeadline::after(Duration::from_secs(2)))
             .is_err());
         server.join().expect("fake server stopped");
     }
@@ -3310,7 +3721,7 @@ mod tests {
         let mut connection = connect_test(address);
         let started = Instant::now();
         assert!(connection
-            .clear(OperationDeadline::after(Duration::from_millis(75)))
+            .repeat_off(OperationDeadline::after(Duration::from_millis(75)))
             .is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
         command_seen_rx
