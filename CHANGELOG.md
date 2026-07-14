@@ -23,7 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **HTTP responses are bounded while streaming** — API, authentication, DAAP, radio, artwork, and metadata reads now count bytes as they arrive and stop at an endpoint-specific cap, with an end-to-end deadline in addition to the idle timeout. A hostile or broken server previously could exhaust memory by lying about `Content-Length` or by never ending a chunked body.
 - **Third-party requests refuse plaintext downgrades** — Radio-Browser, IP geolocation, and MusicBrainz requests still follow the cross-host redirects those services depend on, but no longer follow one from HTTPS down to HTTP, and no longer send a `Referer`.
 
-> **Known exposure, not yet fixed:** playing a track from an authenticated remote backend to a Chromecast or MPD receiver still hands that device the stream URL with its credential in the query string. Tracked as P1.6.
+- **Chromecast no longer receives your server credentials** — Casting a track from Subsonic, Jellyfin, or Plex used to hand the Chromecast the stream URL with your credential still in it: your Plex token, your Jellyfin API key, or — with Subsonic's plaintext auth mode — your **actual password**, hex-encoded and trivially reversible. That credential went to a device Tributary does not control, over a LAN it does not control, and was retained in the device's media session. Tributary now fetches the stream itself and gives the device only an opaque, single-use ticket, revoked when playback stops. Internet radio and other unauthenticated streams are unaffected and still play directly.
+
+> **Known exposure, not yet fixed:** the same problem remains for **MPD**, which is still sent the credential-bearing URL over a plaintext connection. Tracked as P1.6.
 
 ### Changed
 - **Minimum supported Rust version raised to 1.85.**
