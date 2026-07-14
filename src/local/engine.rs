@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use super::root_authority::{AbsenceProof, BoundDirectory, BoundFile, RootAuthorityLease};
 use super::tag_parser::{self, ParsedTrack};
 use crate::architecture::models::Track;
 use crate::db::entities::{library_root, track};
@@ -312,6 +313,7 @@ struct RootScan {
     errors: Vec<String>,
     device_id: Option<String>,
     mount_generation: Option<u64>,
+    authority_lease: Option<Arc<RootAuthorityLease>>,
     reconciliation_authoritative: bool,
     content_authorized: bool,
 }
@@ -321,6 +323,28 @@ impl RootScan {
         self.errors.is_empty()
     }
 }
+
+/// Run one retained-authority filesystem probe outside Tokio's async worker
+/// threads. Library roots may live on removable or network filesystems, so
+/// even a small handle validation can block indefinitely at the OS boundary.
+async fn spawn_authority_probe<F, T>(probe: F) -> Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(probe).await
+}
+
+#[derive(Debug)]
+struct AuthorityTaskJoinFailure(String);
+
+impl std::fmt::Display for AuthorityTaskJoinFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "retained-authority task failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for AuthorityTaskJoinFailure {}
 
 const ROOT_IDENTITY_FILE: &str = ".tributary-root-id";
 const ROOT_IDENTITY_PREFIX: &str = "marker:v1:";
@@ -765,14 +789,20 @@ fn expanded_scan_roots_with_mounts(
 }
 
 fn scan_root(root: PathBuf) -> RootScan {
-    scan_root_with_probes_and_exclusions(root, filesystem_identity, root_mount_generation, &[])
+    scan_root_with_probes_and_exclusions(
+        root,
+        filesystem_identity,
+        root_mount_generation,
+        &[],
+        true,
+    )
 }
 
 fn scan_root_with_identity_probe<F>(root: PathBuf, identity_probe: F) -> RootScan
 where
     F: FnMut(&Path) -> std::io::Result<String>,
 {
-    scan_root_with_probes_and_exclusions(root, identity_probe, root_mount_generation, &[])
+    scan_root_with_probes_and_exclusions(root, identity_probe, root_mount_generation, &[], false)
 }
 
 fn scan_root_with_exclusions(root: PathBuf, all_roots: &[PathBuf]) -> RootScan {
@@ -786,6 +816,7 @@ fn scan_root_with_exclusions(root: PathBuf, all_roots: &[PathBuf]) -> RootScan {
         filesystem_identity,
         root_mount_generation,
         &exclusions,
+        true,
     )
 }
 
@@ -794,6 +825,7 @@ fn scan_root_with_probes_and_exclusions<F, G>(
     mut identity_probe: F,
     mut mount_generation_probe: G,
     exclusions: &[PathBuf],
+    retain_authority: bool,
 ) -> RootScan
 where
     F: FnMut(&Path) -> std::io::Result<String>,
@@ -809,6 +841,7 @@ where
             audio_files: Vec::new(),
             device_id: None,
             mount_generation: None,
+            authority_lease: None,
             reconciliation_authoritative: false,
             content_authorized: false,
         };
@@ -826,11 +859,40 @@ where
                 audio_files: Vec::new(),
                 device_id: None,
                 mount_generation: None,
+                authority_lease: None,
                 reconciliation_authoritative: false,
                 content_authorized: false,
             };
         }
     };
+
+    // A marker-backed scan retains the exact root and marker objects before
+    // traversal. Scalar marker text or a path-based mount probe cannot reject
+    // a copied-marker replacement that appears after enumeration begins.
+    let authority_lease =
+        if retain_authority && device_id.as_deref().is_some_and(is_marker_identity) {
+            let expected_marker = device_id.as_deref().expect("checked marker identity");
+            match RootAuthorityLease::acquire(&root, expected_marker) {
+                Ok(lease) => Some(Arc::new(lease)),
+                Err(error) => {
+                    return RootScan {
+                        errors: vec![format!(
+                            "failed to retain library root authority {}: {error}",
+                            root.display()
+                        )],
+                        root,
+                        audio_files: Vec::new(),
+                        device_id,
+                        mount_generation: None,
+                        authority_lease: None,
+                        reconciliation_authoritative: false,
+                        content_authorized: false,
+                    };
+                }
+            }
+        } else {
+            None
+        };
 
     let mount_generation = match mount_generation_probe(&root) {
         Ok(generation) => generation,
@@ -844,11 +906,32 @@ where
                 audio_files: Vec::new(),
                 device_id,
                 mount_generation: None,
+                authority_lease,
                 reconciliation_authoritative: false,
                 content_authorized: false,
             };
         }
     };
+
+    if let Some(lease_generation) = authority_lease
+        .as_ref()
+        .and_then(|lease| lease.mount_generation())
+    {
+        if lease_generation != mount_generation {
+            return RootScan {
+                errors: vec![format!(
+                    "library root mount differs from retained authority (path={mount_generation}, handle={lease_generation})"
+                )],
+                root,
+                audio_files: Vec::new(),
+                device_id,
+                mount_generation: Some(mount_generation),
+                authority_lease,
+                reconciliation_authoritative: false,
+                content_authorized: false,
+            };
+        }
+    }
 
     let mut errors = Vec::new();
     let root_boundary = match filesystem_boundary_id(&root) {
@@ -887,12 +970,22 @@ where
         )),
     }
 
+    if let Some(lease) = &authority_lease {
+        if let Err(error) = lease.validate() {
+            errors.push(format!(
+                "library root authority changed during traversal {}: {error}",
+                root.display()
+            ));
+        }
+    }
+
     RootScan {
         root,
         audio_files,
         errors,
         device_id,
         mount_generation: Some(mount_generation),
+        authority_lease,
         reconciliation_authoritative: false,
         content_authorized: false,
     }
@@ -992,8 +1085,7 @@ where
 #[derive(Debug, Default)]
 struct DirectoryRenameScan {
     audio_files: Vec<PathBuf>,
-    observed_files: HashMap<String, same_file::Handle>,
-    directory_handle: Option<same_file::Handle>,
+    observed_files: HashMap<String, BoundFile>,
     errors: Vec<String>,
 }
 
@@ -1002,7 +1094,6 @@ impl DirectoryRenameScan {
         Self {
             audio_files: Vec::new(),
             observed_files: HashMap::new(),
-            directory_handle: None,
             errors: vec![error],
         }
     }
@@ -1015,16 +1106,15 @@ impl DirectoryRenameScan {
     /// by the scan. This closes the traversal-to-commit window for removals,
     /// replacements, symlinks, and directory swaps without holding a SQLite
     /// write transaction open for a second recursive traversal.
-    fn observations_still_current(&self, directory: &Path) -> bool {
+    fn observations_still_current(
+        &self,
+        lease: &RootAuthorityLease,
+        destination: &BoundDirectory,
+    ) -> bool {
         if !self.is_complete() || self.audio_files.len() != self.observed_files.len() {
             return false;
         }
-        let Some(expected_directory) = &self.directory_handle else {
-            return false;
-        };
-        if !open_real_path_handle(directory, true)
-            .is_ok_and(|current| current == *expected_directory)
-        {
+        if destination.validate(lease).is_err() {
             return false;
         }
 
@@ -1033,49 +1123,15 @@ impl DirectoryRenameScan {
             let Some(expected) = self.observed_files.get(key.as_ref()) else {
                 return false;
             };
-            if !open_real_path_handle(path, false).is_ok_and(|current| current == *expected) {
+            if expected.validate(lease).is_err() {
                 return false;
             }
         }
 
-        // The destination itself must also remain the same object across all
-        // of the per-file probes.
-        open_real_path_handle(directory, true).is_ok_and(|current| current == *expected_directory)
+        // The destination and root must remain authoritative across all of the
+        // per-file probes.
+        destination.validate(lease).is_ok() && lease.validate().is_ok()
     }
-}
-
-/// Open a real file or directory and retain its filesystem object identity.
-/// The metadata checks before and after opening reject symlinks/reparse points
-/// even when they race with the handle acquisition.
-fn open_real_path_handle(
-    path: &Path,
-    expect_directory: bool,
-) -> std::io::Result<same_file::Handle> {
-    let has_expected_shape = |metadata: &std::fs::Metadata| {
-        if metadata_is_reparse_point(metadata) {
-            false
-        } else if expect_directory {
-            metadata.file_type().is_dir()
-        } else {
-            metadata.file_type().is_file()
-        }
-    };
-    let before = std::fs::symlink_metadata(path)?;
-    if !has_expected_shape(&before) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("path is not a real filesystem entry: {}", path.display()),
-        ));
-    }
-    let handle = same_file::Handle::from_path(path)?;
-    let after = std::fs::symlink_metadata(path)?;
-    if !has_expected_shape(&after) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("filesystem entry changed while opening: {}", path.display()),
-        ));
-    }
-    Ok(handle)
 }
 
 /// Enumerate the destination of a paired directory rename under its library
@@ -1085,13 +1141,24 @@ fn open_real_path_handle(
 /// shared per-entry traversal cannot do: it only compares descendants, so a
 /// whole filesystem mounted exactly at `directory` would otherwise look
 /// self-consistent. An incomplete traversal is never used to derive identity.
-fn scan_renamed_directory(root: &Path, directory: &Path) -> DirectoryRenameScan {
-    let boundary = match filesystem_boundary_id(root) {
+fn scan_renamed_directory(
+    lease: &RootAuthorityLease,
+    destination: &BoundDirectory,
+    directory: &Path,
+) -> DirectoryRenameScan {
+    if let Err(error) = destination.validate(lease) {
+        return DirectoryRenameScan::failed(format!(
+            "failed to validate bound renamed directory {}: {error}",
+            directory.display()
+        ));
+    }
+
+    let boundary = match filesystem_boundary_id(lease.root()) {
         Ok(boundary) => boundary,
         Err(error) => {
             return DirectoryRenameScan::failed(format!(
                 "failed to identify library root boundary {}: {error}",
-                root.display()
+                lease.root().display()
             ))
         }
     };
@@ -1111,36 +1178,26 @@ fn scan_renamed_directory(root: &Path, directory: &Path) -> DirectoryRenameScan 
         }
     }
 
-    let directory_handle = match open_real_path_handle(directory, true) {
-        Ok(handle) => handle,
-        Err(error) => {
-            return DirectoryRenameScan::failed(format!(
-                "failed to retain renamed directory identity {}: {error}",
-                directory.display()
-            ))
-        }
-    };
-
     // No exclusions: a pair whose subtree owns another scan scope is rejected
     // before it reaches this traversal (`subtree_owns_another_scope`).
     let mut observed_files = HashMap::new();
     let (audio_files, mut errors) =
         enumerate_audio_files_with_observer(directory, Some(boundary), &[], |path| {
-            let handle = open_real_path_handle(path, false).map_err(|error| {
+            let bound_file = lease.open_regular_file(path).map_err(|error| {
                 format!(
-                    "failed to retain renamed file identity {}: {error}",
+                    "failed to bind renamed file beneath its retained root {}: {error}",
                     path.display()
                 )
             })?;
             let key = path.to_string_lossy().into_owned();
-            if observed_files.insert(key.clone(), handle).is_some() {
+            if observed_files.insert(key.clone(), bound_file).is_some() {
                 return Err(format!(
                     "multiple renamed files collapse to the persisted path key: {key}"
                 ));
             }
             Ok(())
         });
-    if !open_real_path_handle(directory, true).is_ok_and(|after| after == directory_handle) {
+    if destination.validate(lease).is_err() {
         errors.push(format!(
             "renamed directory changed during traversal: {}",
             directory.display()
@@ -1149,7 +1206,6 @@ fn scan_renamed_directory(root: &Path, directory: &Path) -> DirectoryRenameScan 
     DirectoryRenameScan {
         audio_files,
         observed_files,
-        directory_handle: Some(directory_handle),
         errors,
     }
 }
@@ -1218,10 +1274,10 @@ fn root_scan_for_path<'a>(path: &Path, root_scans: &'a [RootScan]) -> Option<&'a
 /// Recheck the most-specific authorized root for one pending initial-scan
 /// write. A failed probe invalidates that root for every later file in this
 /// scan; callers persist the returned root's unavailable state.
-fn revalidate_scan_root_for_path(
+async fn revalidate_scan_root_for_path(
     path: &Path,
     root_scans: &mut [RootScan],
-) -> (bool, Option<PathBuf>) {
+) -> Result<(bool, Option<PathBuf>), tokio::task::JoinError> {
     let Some(index) = root_scans
         .iter()
         .enumerate()
@@ -1229,23 +1285,34 @@ fn revalidate_scan_root_for_path(
         .max_by_key(|(_, scan)| scan.root.components().count())
         .map(|(index, _)| index)
     else {
-        return (false, None);
+        return Ok((false, None));
     };
-    let scan = &mut root_scans[index];
-    if !scan.content_authorized {
-        return (false, None);
+    if !root_scans[index].content_authorized {
+        return Ok((false, None));
     }
-    let matches = scan.device_id.as_deref().is_some_and(|expected| {
-        is_marker_identity(expected)
-            && filesystem_identity(&scan.root).is_ok_and(|observed| observed == expected)
-    });
+    let expected = root_scans[index]
+        .device_id
+        .as_deref()
+        .filter(|expected| is_marker_identity(expected))
+        .map(str::to_owned);
+    let authority_lease = root_scans[index].authority_lease.clone();
+    let matches = match (expected, authority_lease) {
+        (Some(expected), Some(lease)) => {
+            spawn_authority_probe(move || {
+                lease.expected_marker() == expected && lease.validate().is_ok()
+            })
+            .await?
+        }
+        _ => false,
+    };
     if matches {
-        return (true, None);
+        return Ok((true, None));
     }
 
+    let scan = &mut root_scans[index];
     scan.content_authorized = false;
     scan.reconciliation_authoritative = false;
-    (false, Some(scan.root.clone()))
+    Ok((false, Some(scan.root.clone())))
 }
 
 fn most_specific_root_for_path<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a Path> {
@@ -1679,6 +1746,7 @@ async fn persist_root_scan_status(
         && scan.is_complete()
         && (scan.reconciliation_authoritative || confirms_identity);
     let last_checked_at = Utc::now().to_rfc3339();
+    let transaction = db.begin().await?;
 
     let stored = if let Some(state) = previous {
         let mut active: library_root::ActiveModel = state.clone().into();
@@ -1687,7 +1755,7 @@ async fn persist_root_scan_status(
         active.is_available = Set(is_available);
         active.last_scan_complete = Set(scan.is_complete());
         active.last_checked_at = Set(last_checked_at);
-        active.update(db).await?
+        active.update(&transaction).await?
     } else {
         library_root::ActiveModel {
             path: Set(scan.root.to_string_lossy().into_owned()),
@@ -1697,10 +1765,39 @@ async fn persist_root_scan_status(
             last_scan_complete: Set(scan.is_complete()),
             last_checked_at: Set(last_checked_at),
         }
-        .insert(db)
+        .insert(&transaction)
         .await?
     };
 
+    // Revocations must remain writable precisely when storage is unavailable,
+    // but every confirmation or availability promotion is derived from the
+    // retained root object and must keep that lease valid through commit.
+    if confirms_identity || is_available {
+        let expected = scan.device_id.clone();
+        let lease_matches = if let Some(lease) = scan.authority_lease.clone() {
+            match spawn_authority_probe(move || {
+                expected.as_deref() == Some(lease.expected_marker()) && lease.validate().is_ok()
+            })
+            .await
+            {
+                Ok(matches) => matches,
+                Err(error) => {
+                    transaction.rollback().await?;
+                    return Err(AuthorityTaskJoinFailure(error.to_string()).into());
+                }
+            }
+        } else {
+            false
+        };
+        if !lease_matches {
+            transaction.rollback().await?;
+            return Err(anyhow::anyhow!(
+                "library root authority changed before state persistence"
+            ));
+        }
+    }
+
+    transaction.commit().await?;
     Ok(stored)
 }
 
@@ -2535,6 +2632,9 @@ async fn initial_scan_with_root_trust_guards(
                 warn!(root = %scan.root.display(), %error, "Failed to persist library root state");
                 scan.reconciliation_authoritative = false;
                 scan.content_authorized = false;
+                if error.downcast_ref::<AuthorityTaskJoinFailure>().is_none() {
+                    mark_root_path_unavailable_if_active(db, &scan.root).await;
+                }
             }
         }
         if !scan.content_authorized && !scan.audio_files.is_empty() {
@@ -2563,8 +2663,18 @@ async fn initial_scan_with_root_trust_guards(
         };
 
         if needs_update {
-            let (identity_allows_parse, invalidated_root) =
-                revalidate_scan_root_for_path(path, &mut root_scans);
+            let (identity_allows_parse, invalidated_root) = match revalidate_scan_root_for_path(
+                path,
+                &mut root_scans,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "Initial-scan authority validation task failed — upsert discarded");
+                    continue;
+                }
+            };
             if let Some(root) = invalidated_root {
                 mark_root_path_unavailable(db, &root).await;
                 warn!(root = %root.display(), path = %path.display(), "Library root changed before parsing — remaining initial-scan writes disabled");
@@ -2573,14 +2683,48 @@ async fn initial_scan_with_root_trust_guards(
                 continue;
             }
 
+            let Some(authority_lease) =
+                root_scan_for_path(path, &root_scans).and_then(|scan| scan.authority_lease.clone())
+            else {
+                warn!(path = %path.display(), "Authorized audio path has no retained root authority — upsert discarded");
+                continue;
+            };
+            let open_lease = authority_lease.clone();
+            let open_path = path.clone();
+            let (observed_file, parse_file) = match spawn_authority_probe(move || {
+                let observed_file = Arc::new(open_lease.open_regular_file(&open_path)?);
+                let parse_file = observed_file.try_clone_file()?;
+                Ok::<_, std::io::Error>((observed_file, parse_file))
+            })
+            .await
+            {
+                Ok(Ok(opened)) => opened,
+                Ok(Err(error)) => {
+                    warn!(path = %path.display(), %error, "Audio file could not be opened and cloned through retained root authority — upsert discarded");
+                    continue;
+                }
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "Initial-scan audio authority task failed — upsert discarded");
+                    continue;
+                }
+            };
+
             let p = path.clone();
-            let parse_result =
-                tokio::task::spawn_blocking(move || tag_parser::parse_audio_file(&p)).await;
+            let parse_result = tokio::task::spawn_blocking(move || {
+                tag_parser::parse_audio_file_from_file(parse_file, &p)
+            })
+            .await;
 
             match parse_result {
                 Ok(Ok(parsed)) => {
                     let (identity_allows_upsert, invalidated_root) =
-                        revalidate_scan_root_for_path(path, &mut root_scans);
+                        match revalidate_scan_root_for_path(path, &mut root_scans).await {
+                            Ok(result) => result,
+                            Err(error) => {
+                                warn!(path = %path.display(), %error, "Post-parse authority validation task failed — upsert discarded");
+                                continue;
+                            }
+                        };
                     if let Some(root) = invalidated_root {
                         mark_root_path_unavailable(db, &root).await;
                         warn!(root = %root.display(), path = %path.display(), "Library root changed while parsing — remaining initial-scan writes disabled");
@@ -2594,8 +2738,52 @@ async fn initial_scan_with_root_trust_guards(
                     // snapshot, avoiding O(n^2) UI work plus a full track-list
                     // clone per event. The watcher still emits TrackUpserted for
                     // incremental changes, where it is cheap.
-                    if let Err(e) = upsert_track(db, &parsed, existing).await {
-                        warn!(path = %path_str, error = %e, "Failed to upsert track");
+                    let mut invalidated_root = None;
+                    let mut file_still_current = false;
+                    let mut authority_task_failed = false;
+                    match upsert_track_with_commit_guard(db, &parsed, existing, || async {
+                        let guard_file = observed_file.clone();
+                        let guard_lease = authority_lease.clone();
+                        file_still_current = match spawn_authority_probe(move || {
+                            guard_file.validate(&guard_lease).is_ok()
+                        })
+                        .await
+                        {
+                            Ok(still_current) => still_current,
+                            Err(_) => {
+                                authority_task_failed = true;
+                                false
+                            }
+                        };
+                        let root_still_current =
+                            match revalidate_scan_root_for_path(path, &mut root_scans).await {
+                                Ok((still_current, invalidated)) => {
+                                    invalidated_root = invalidated;
+                                    still_current
+                                }
+                                Err(_) => {
+                                    authority_task_failed = true;
+                                    false
+                                }
+                            };
+                        root_still_current && file_still_current
+                    })
+                    .await
+                    {
+                        Ok(GuardedTrackUpsertOutcome::Committed(_)) => {}
+                        Ok(GuardedTrackUpsertOutcome::GuardRejected) => {
+                            if authority_task_failed {
+                                warn!(path = %path.display(), "Initial-upsert authority validation task failed — transaction rolled back");
+                            } else if let Some(root) = invalidated_root {
+                                mark_root_path_unavailable(db, &root).await;
+                                warn!(root = %root.display(), path = %path.display(), "Library root changed before initial upsert commit — remaining writes disabled");
+                            } else if !file_still_current {
+                                warn!(path = %path.display(), "Audio file changed before initial upsert commit — transaction rolled back");
+                            }
+                        }
+                        Err(error) => {
+                            warn!(path = %path_str, %error, "Failed to upsert track transactionally");
+                        }
                     }
                 }
                 Ok(Err(e)) => {
@@ -2614,27 +2802,43 @@ async fn initial_scan_with_root_trust_guards(
     }
 
     // Parsing can outlive a removable-media transition. Revalidate each
-    // authoritative marker immediately before the destructive phase; a
-    // changed, removed, or unreadable marker disables every stale deletion
-    // for that root.
+    // retained root object immediately before the destructive phase; a
+    // changed, removed, copied-marker, or unreadable root disables every stale
+    // deletion for that scope.
     for scan in &mut root_scans {
         if !scan.reconciliation_authoritative {
             continue;
         }
-        let identity_still_matches = scan.device_id.as_deref().is_some_and(|expected| {
-            filesystem_identity(&scan.root).is_ok_and(|observed| observed == expected)
-        });
-        if identity_still_matches {
+        let expected = scan.device_id.clone();
+        let authority_still_matches = if let Some(lease) = scan.authority_lease.clone() {
+            match spawn_authority_probe(move || {
+                expected.as_deref() == Some(lease.expected_marker()) && lease.validate().is_ok()
+            })
+            .await
+            {
+                Ok(matches) => matches,
+                Err(error) => {
+                    // Reject reconciliation for this scan, but a task failure
+                    // is not evidence that the persisted root changed.
+                    scan.reconciliation_authoritative = false;
+                    scan.content_authorized = false;
+                    warn!(root = %scan.root.display(), %error, "Library-root authority validation task failed before reconciliation — stale deletion disabled");
+                    continue;
+                }
+            }
+        } else {
+            false
+        };
+        if authority_still_matches {
             continue;
         }
         scan.reconciliation_authoritative = false;
-        if let Some(state) = persisted_by_path
-            .get(scan.root.to_string_lossy().as_ref())
-            .copied()
-        {
-            mark_root_unavailable(db, state).await;
-        }
-        warn!(root = %scan.root.display(), "Library root marker changed before reconciliation — stale deletion disabled");
+        scan.content_authorized = false;
+        // This root may have been enrolled during the current scan and thus
+        // be absent from the pre-scan snapshot. Reload by exact path so the
+        // just-persisted available row is revoked as well.
+        mark_root_path_unavailable(db, &scan.root).await;
+        warn!(root = %scan.root.display(), "Library root authority changed before reconciliation — stale deletion disabled");
     }
 
     // Remove DB entries for files no longer on disk. Reuse the preloaded
@@ -2647,14 +2851,100 @@ async fn initial_scan_with_root_trust_guards(
             if !should_remove_stale_track(row_path, &on_disk_paths, &root_scans) {
                 continue;
             }
-            info!(path = %row.file_path, "Removing stale track from database");
-            if let Err(e) = track::Entity::delete_by_id(&row.id).exec(db).await {
-                warn!(path = %row.file_path, error = %e, "Failed to remove stale track");
+            let Some(authority_lease) = root_scan_for_path(row_path, &root_scans)
+                .and_then(|scan| scan.authority_lease.clone())
+            else {
+                warn!(path = %row.file_path, "Stale candidate has no retained root authority — preserving metadata");
+                continue;
+            };
+            let proof_lease = authority_lease.clone();
+            let proof_path = row_path.to_path_buf();
+            let absence = match spawn_authority_probe(move || {
+                proof_lease.prove_absent(&proof_path).map(Arc::new)
+            })
+            .await
+            {
+                Ok(Ok(proof)) => proof,
+                Ok(Err(error)) => {
+                    warn!(path = %row.file_path, %error, "Could not prove stale candidate absent through retained root authority — preserving metadata");
+                    continue;
+                }
+                Err(error) => {
+                    warn!(path = %row.file_path, %error, "Stale-candidate authority task failed — preserving metadata");
+                    continue;
+                }
+            };
+            let (root_allows_delete, invalidated_root) = match revalidate_scan_root_for_path(
+                row_path,
+                &mut root_scans,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    warn!(path = %row.file_path, %error, "Stale-delete root validation task failed — preserving metadata");
+                    continue;
+                }
+            };
+            if let Some(root) = invalidated_root {
+                mark_root_path_unavailable(db, &root).await;
+            }
+            if !root_allows_delete {
                 continue;
             }
-            let _ = tx
-                .send(LibraryEvent::TrackRemoved(row.file_path.clone()))
-                .await;
+            info!(path = %row.file_path, "Removing stale track from database");
+            let mut invalidated_root = None;
+            let mut absence_still_current = false;
+            let mut authority_task_failed = false;
+            match delete_track_with_commit_guard(db, &row.id, || async {
+                let guard_absence = absence.clone();
+                let guard_lease = authority_lease.clone();
+                absence_still_current = match spawn_authority_probe(move || {
+                    guard_absence.validate(&guard_lease).is_ok()
+                })
+                .await
+                {
+                    Ok(still_current) => still_current,
+                    Err(_) => {
+                        authority_task_failed = true;
+                        false
+                    }
+                };
+                let root_still_current =
+                    match revalidate_scan_root_for_path(row_path, &mut root_scans).await {
+                        Ok((still_current, invalidated)) => {
+                            invalidated_root = invalidated;
+                            still_current
+                        }
+                        Err(_) => {
+                            authority_task_failed = true;
+                            false
+                        }
+                    };
+                root_still_current && absence_still_current
+            })
+            .await
+            {
+                Ok(GuardedTrackDeleteOutcome::Deleted) => {
+                    let _ = tx
+                        .send(LibraryEvent::TrackRemoved(row.file_path.clone()))
+                        .await;
+                }
+                Ok(GuardedTrackDeleteOutcome::Missing) => {}
+                Ok(GuardedTrackDeleteOutcome::GuardRejected) => {
+                    if authority_task_failed {
+                        warn!(path = %row.file_path, "Stale-delete authority validation task failed — transaction rolled back");
+                    } else if let Some(root) = invalidated_root {
+                        mark_root_path_unavailable(db, &root).await;
+                        warn!(root = %root.display(), path = %row.file_path, "Library root changed before stale deletion commit — remaining deletions disabled");
+                    } else if !absence_still_current {
+                        warn!(path = %row.file_path, "Stale candidate absence proof changed before commit — deletion rolled back");
+                    }
+                }
+                Err(error) => {
+                    warn!(path = %row.file_path, %error, "Failed to remove stale track transactionally");
+                }
+            }
         }
     }
 
@@ -2719,11 +3009,25 @@ async fn initial_scan_with_root_trust_guards(
 struct WatcherRootEntry {
     root: PathBuf,
     state: library_root::Model,
+    authority_lease: Option<Arc<RootAuthorityLease>>,
 }
 
 #[derive(Debug)]
 struct WatcherRootCache {
     entries: Vec<WatcherRootEntry>,
+    authority_lost: bool,
+}
+
+enum WatcherFileBinding {
+    Bound {
+        file: Arc<BoundFile>,
+        parser_file: File,
+    },
+    Absent,
+    Rejected {
+        error: std::io::Error,
+        authority_stable: bool,
+    },
 }
 
 impl WatcherRootCache {
@@ -2735,18 +3039,49 @@ impl WatcherRootCache {
                 music_dirs
                     .iter()
                     .any(|configured| root.starts_with(configured))
-                    .then_some(WatcherRootEntry { root, state })
+                    .then_some(WatcherRootEntry {
+                        root,
+                        state,
+                        authority_lease: None,
+                    })
             })
             .collect();
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.root.components().count()));
-        Self { entries }
+        Self {
+            entries,
+            authority_lost: false,
+        }
     }
 
     async fn load(db: &DatabaseConnection, music_dirs: &[PathBuf]) -> anyhow::Result<Self> {
-        Ok(Self::from_models(
-            library_root::Entity::find().all(db).await?,
-            music_dirs,
-        ))
+        let states = library_root::Entity::find().all(db).await?;
+        let music_dirs = music_dirs.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut cache = Self::from_models(states, &music_dirs);
+            for entry in &mut cache.entries {
+                if !entry.state.identity_confirmed
+                    || !entry.state.is_available
+                    || !entry.state.last_scan_complete
+                {
+                    continue;
+                }
+                let Some(expected_identity) = entry.state.device_id.as_deref() else {
+                    continue;
+                };
+                if !is_marker_identity(expected_identity) {
+                    continue;
+                }
+                match RootAuthorityLease::acquire(&entry.root, expected_identity) {
+                    Ok(lease) => entry.authority_lease = Some(Arc::new(lease)),
+                    Err(error) => {
+                        warn!(root = %entry.root.display(), %error, "Could not retain watcher root authority");
+                    }
+                }
+            }
+            cache
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("watcher root authority task failed: {error}"))
     }
 
     fn root_for_path(&self, path: &Path) -> Option<(usize, PathBuf, library_root::Model)> {
@@ -2761,26 +3096,21 @@ impl WatcherRootCache {
         self.entries.iter().position(|entry| entry.root == root)
     }
 
+    fn authority_lease(&self, index: usize) -> Option<Arc<RootAuthorityLease>> {
+        self.entries.get(index)?.authority_lease.clone()
+    }
+
+    fn authority_was_lost(&self) -> bool {
+        self.authority_lost
+    }
+
     fn invalidate(&mut self, index: usize) -> Option<library_root::Model> {
         let entry = self.entries.get_mut(index)?;
         entry.state.is_available = false;
         entry.state.last_scan_complete = false;
         entry.state.last_checked_at = Utc::now().to_rfc3339();
+        entry.authority_lease = None;
         Some(entry.state.clone())
-    }
-}
-
-fn crosses_untracked_nested_mount(root: &Path, path: &Path, music_dirs: &[PathBuf]) -> bool {
-    match mounted_subroots(music_dirs) {
-        Ok(mountpoints) => mountpoints
-            .into_iter()
-            .filter(|mountpoint| path.starts_with(mountpoint))
-            .max_by_key(|mountpoint| mountpoint.components().count())
-            .is_some_and(|mountpoint| !root.starts_with(mountpoint)),
-        Err(error) => {
-            warn!(%error, "Could not inspect mounted library scopes; watcher event rejected");
-            true
-        }
     }
 }
 
@@ -2828,6 +3158,7 @@ async fn mark_cached_root_unavailable(
 ) {
     // Invalidate memory before awaiting SQLite. The remainder of this batch
     // must fail closed even if persisting the status itself fails.
+    roots.authority_lost = true;
     if let Some(state) = roots.invalidate(index) {
         mark_root_unavailable(db, &state).await;
     }
@@ -2836,27 +3167,37 @@ async fn mark_cached_root_unavailable(
 async fn root_identity_allows_content(
     db: &DatabaseConnection,
     roots: &mut WatcherRootCache,
-    music_dirs: &[PathBuf],
+    _music_dirs: &[PathBuf],
     path: &Path,
 ) -> anyhow::Result<bool> {
     let Some((root_index, root, root_state)) = roots.root_for_path(path) else {
         return Ok(false);
     };
-    if crosses_untracked_nested_mount(&root, path, music_dirs) {
-        return Ok(false);
-    }
+    debug_assert!(path.starts_with(&root));
     if !root_state.identity_confirmed || !root_state.is_available || !root_state.last_scan_complete
     {
         return Ok(false);
     }
     let Some(expected_identity) = root_state.device_id.as_deref() else {
+        mark_cached_root_unavailable(db, roots, root_index).await;
         return Ok(false);
     };
     if !is_marker_identity(expected_identity) {
+        mark_cached_root_unavailable(db, roots, root_index).await;
         return Ok(false);
     }
 
-    let matches = filesystem_identity(&root).is_ok_and(|identity| identity == expected_identity);
+    let Some(lease) = roots.authority_lease(root_index) else {
+        mark_cached_root_unavailable(db, roots, root_index).await;
+        return Ok(false);
+    };
+    if lease.expected_marker() != expected_identity {
+        mark_cached_root_unavailable(db, roots, root_index).await;
+        return Ok(false);
+    }
+    let matches = spawn_authority_probe(move || lease.validate().is_ok())
+        .await
+        .map_err(|error| anyhow::anyhow!("watcher root authority task failed: {error}"))?;
     if !matches {
         mark_cached_root_unavailable(db, roots, root_index).await;
     }
@@ -2875,88 +3216,185 @@ enum WatcherRenameKind {
     Directory,
 }
 
-fn classify_rename_pair(pair: &WatcherRenamePair) -> Option<WatcherRenameKind> {
-    if same_audio_extension(&pair.from, &pair.to)
-        && is_regular_file_without_following_symlinks(&pair.to)
-    {
-        return Some(WatcherRenameKind::File);
+#[derive(Debug)]
+enum FileRenameSourceEvidence {
+    Absent(AbsenceProof),
+    Alias(BoundFile),
+}
+
+#[derive(Debug)]
+enum DirectoryRenameSourceEvidence {
+    Absent(AbsenceProof),
+    Alias(BoundDirectory),
+}
+
+#[derive(Debug)]
+enum WatcherRenameEvidence {
+    File {
+        destination: BoundFile,
+        source: FileRenameSourceEvidence,
+    },
+    Directory {
+        destination: BoundDirectory,
+        source: DirectoryRenameSourceEvidence,
+    },
+}
+
+impl WatcherRenameEvidence {
+    fn kind(&self) -> WatcherRenameKind {
+        match self {
+            Self::File { .. } => WatcherRenameKind::File,
+            Self::Directory { .. } => WatcherRenameKind::Directory,
+        }
     }
-    if is_directory_without_following_symlinks(&pair.to)
-        && directory_rename_source_is_authoritative(&pair.from, &pair.to)
-    {
-        return Some(WatcherRenameKind::Directory);
+
+    fn validate(&self, lease: &RootAuthorityLease) -> std::io::Result<()> {
+        match self {
+            Self::File {
+                destination,
+                source,
+            } => {
+                destination.validate(lease)?;
+                match source {
+                    FileRenameSourceEvidence::Absent(proof) => proof.validate(lease)?,
+                    FileRenameSourceEvidence::Alias(alias) => {
+                        alias.validate(lease)?;
+                        if !alias.is_same_object_as(destination) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "rename source alias no longer matches its destination",
+                            ));
+                        }
+                    }
+                }
+            }
+            Self::Directory {
+                destination,
+                source,
+            } => {
+                destination.validate(lease)?;
+                match source {
+                    DirectoryRenameSourceEvidence::Absent(proof) => proof.validate(lease)?,
+                    DirectoryRenameSourceEvidence::Alias(alias) => {
+                        alias.validate(lease)?;
+                        if !alias.is_same_object_as(destination) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "rename source alias no longer matches its destination",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        lease.validate()
     }
-    None
+
+    fn file(&self) -> Option<&BoundFile> {
+        match self {
+            Self::File { destination, .. } => Some(destination),
+            Self::Directory { .. } => None,
+        }
+    }
+
+    fn directory(&self) -> Option<&BoundDirectory> {
+        match self {
+            Self::Directory { destination, .. } => Some(destination),
+            Self::File { .. } => None,
+        }
+    }
+}
+
+fn bind_file_rename_source(
+    lease: &RootAuthorityLease,
+    source: &Path,
+    destination: &BoundFile,
+) -> std::io::Result<FileRenameSourceEvidence> {
+    match lease.prove_absent(source) {
+        Ok(proof) => Ok(FileRenameSourceEvidence::Absent(proof)),
+        Err(absence_error) => match lease.open_regular_file(source) {
+            Ok(alias) if alias.is_same_object_as(destination) => {
+                Ok(FileRenameSourceEvidence::Alias(alias))
+            }
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "rename source still names a different regular file",
+            )),
+            Err(_) => Err(absence_error),
+        },
+    }
+}
+
+fn bind_directory_rename_source(
+    lease: &RootAuthorityLease,
+    source: &Path,
+    destination: &BoundDirectory,
+) -> std::io::Result<DirectoryRenameSourceEvidence> {
+    match lease.prove_absent(source) {
+        Ok(proof) => Ok(DirectoryRenameSourceEvidence::Absent(proof)),
+        Err(absence_error) => match lease.bind_directory(source) {
+            Ok(alias) if alias.is_same_object_as(destination) => {
+                Ok(DirectoryRenameSourceEvidence::Alias(alias))
+            }
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "rename source still names a different directory",
+            )),
+            Err(_) => Err(absence_error),
+        },
+    }
+}
+
+fn bind_watcher_rename_evidence(
+    lease: &RootAuthorityLease,
+    pair: &WatcherRenamePair,
+) -> std::io::Result<WatcherRenameEvidence> {
+    let file_error = if same_audio_extension(&pair.from, &pair.to) {
+        match lease.open_regular_file(&pair.to) {
+            Ok(destination) => {
+                let source = bind_file_rename_source(lease, &pair.from, &destination)?;
+                return Ok(WatcherRenameEvidence::File {
+                    destination,
+                    source,
+                });
+            }
+            Err(error) => Some(error),
+        }
+    } else {
+        None
+    };
+
+    match lease.bind_directory(&pair.to) {
+        Ok(destination) => {
+            let source = bind_directory_rename_source(lease, &pair.from, &destination)?;
+            Ok(WatcherRenameEvidence::Directory {
+                destination,
+                source,
+            })
+        }
+        Err(directory_error) => Err(file_error.unwrap_or(directory_error)),
+    }
 }
 
 #[derive(Clone, Debug)]
 struct WatcherRenameGuard {
     root_index: usize,
-    root: PathBuf,
-    expected_identity: String,
-    mount_generation: u64,
+    authority_lease: Arc<RootAuthorityLease>,
+    evidence: Arc<WatcherRenameEvidence>,
 }
 
 impl WatcherRenameGuard {
+    fn kind(&self) -> WatcherRenameKind {
+        self.evidence.kind()
+    }
+
     fn root_is_stable(&self) -> bool {
-        filesystem_identity(&self.root).is_ok_and(|identity| identity == self.expected_identity)
-            && root_mount_generation(&self.root)
-                .is_ok_and(|generation| generation == self.mount_generation)
+        self.authority_lease.validate().is_ok()
     }
 
-    fn commit_allowed(
-        &self,
-        music_dirs: &[PathBuf],
-        from: &Path,
-        to: &Path,
-        kind: WatcherRenameKind,
-    ) -> bool {
-        let destination_shape_holds = match kind {
-            WatcherRenameKind::File => is_regular_file_without_following_symlinks(to),
-            // A directory whose source reappeared as a different object was
-            // copied, not renamed, and its descendants then exist under both
-            // paths. Case-only aliases of the destination are still valid.
-            WatcherRenameKind::Directory => {
-                is_directory_without_following_symlinks(to)
-                    && directory_rename_source_is_authoritative(from, to)
-            }
-        };
-
-        destination_shape_holds
-            && !crosses_untracked_nested_mount(&self.root, from, music_dirs)
-            && !crosses_untracked_nested_mount(&self.root, to, music_dirs)
-            && self.root_is_stable()
+    fn evidence_is_stable(&self) -> bool {
+        self.evidence.validate(&self.authority_lease).is_ok()
     }
-}
-
-fn is_regular_file_without_following_symlinks(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-        !metadata_is_reparse_point(&metadata) && metadata.file_type().is_file()
-    })
-}
-
-fn is_directory_without_following_symlinks(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-        !metadata_is_reparse_point(&metadata) && metadata.file_type().is_dir()
-    })
-}
-
-/// A rename source must be provably absent. An existence probe that fails is
-/// not proof, so it is treated as still present.
-fn source_path_is_gone(path: &Path) -> bool {
-    matches!(path.try_exists(), Ok(false))
-}
-
-/// A case-only rename can leave the old spelling resolvable on a
-/// case-insensitive filesystem. Treat it as authoritative only when both
-/// no-follow directory paths open the exact same filesystem object; a copied
-/// or recreated source remains a reconciliation case.
-fn directory_rename_source_is_authoritative(from: &Path, to: &Path) -> bool {
-    source_path_is_gone(from)
-        || open_real_path_handle(from, true)
-            .ok()
-            .zip(open_real_path_handle(to, true).ok())
-            .is_some_and(|(from_handle, to_handle)| from_handle == to_handle)
 }
 
 /// Reject a directory pair whose subtree owns another scan scope.
@@ -3003,41 +3441,55 @@ async fn prepare_watcher_rename_guard(
     db: &DatabaseConnection,
     roots: &mut WatcherRootCache,
     music_dirs: &[PathBuf],
-    from: &Path,
-    to: &Path,
+    pair: &WatcherRenamePair,
 ) -> anyhow::Result<Option<WatcherRenameGuard>> {
-    if !root_identity_allows_content(db, roots, music_dirs, from).await?
-        || !root_identity_allows_content(db, roots, music_dirs, to).await?
+    if !root_identity_allows_content(db, roots, music_dirs, &pair.from).await?
+        || !root_identity_allows_content(db, roots, music_dirs, &pair.to).await?
     {
         return Ok(None);
     }
 
-    let Some((from_index, from_root, from_state)) = roots.root_for_path(from) else {
+    let Some((from_index, from_root, _)) = roots.root_for_path(&pair.from) else {
         return Ok(None);
     };
-    let Some((to_index, to_root, _)) = roots.root_for_path(to) else {
+    let Some((to_index, to_root, _)) = roots.root_for_path(&pair.to) else {
         return Ok(None);
     };
     if from_index != to_index || from_root != to_root {
         return Ok(None);
     }
-    let Some(expected_identity) = from_state.device_id else {
+    let Some(authority_lease) = roots.authority_lease(from_index) else {
+        mark_cached_root_unavailable(db, roots, from_index).await;
         return Ok(None);
     };
-    let mount_generation = match root_mount_generation(&from_root) {
-        Ok(generation) => generation,
-        Err(error) => {
-            mark_cached_root_unavailable(db, roots, from_index).await;
-            warn!(root = %from_root.display(), %error, "Could not capture rename mount generation");
+    let binding_lease = authority_lease.clone();
+    let binding_pair = pair.clone();
+    let binding = spawn_authority_probe(move || {
+        match bind_watcher_rename_evidence(&binding_lease, &binding_pair) {
+            Ok(evidence) => (Ok(Arc::new(evidence)), true),
+            Err(error) => {
+                let authority_stable = binding_lease.validate().is_ok();
+                (Err(error), authority_stable)
+            }
+        }
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("watcher rename authority task failed: {error}"))?;
+    let evidence = match binding {
+        (Ok(evidence), _) => evidence,
+        (Err(error), authority_stable) => {
+            if !authority_stable {
+                mark_cached_root_unavailable(db, roots, from_index).await;
+            }
+            warn!(from = %pair.from.display(), to = %pair.to.display(), %error, "Could not bind paired rename beneath its retained root");
             return Ok(None);
         }
     };
 
     Ok(Some(WatcherRenameGuard {
         root_index: from_index,
-        root: from_root,
-        expected_identity,
-        mount_generation,
+        authority_lease,
+        evidence,
     }))
 }
 
@@ -3049,72 +3501,90 @@ async fn delete_track_if_root_stable(
     music_dirs: &[PathBuf],
     path: &Path,
 ) -> anyhow::Result<bool> {
-    delete_track_if_root_stable_with_probe(db, roots, music_dirs, path, filesystem_identity).await
+    delete_track_if_root_stable_with_guard_hook(db, roots, music_dirs, path, || {}).await
 }
 
-async fn delete_track_if_root_stable_with_probe<F>(
+async fn delete_track_if_root_stable_with_guard_hook<F>(
     db: &DatabaseConnection,
     roots: &mut WatcherRootCache,
     music_dirs: &[PathBuf],
     path: &Path,
-    mut identity_probe: F,
+    before_commit_guard: F,
 ) -> anyhow::Result<bool>
 where
-    F: FnMut(&Path) -> std::io::Result<String>,
+    F: FnOnce(),
 {
-    // Debounced remove events can outlive a quick remount or file recreate.
-    // Never delete metadata when the path is present again, and fail closed
-    // when existence itself cannot be determined.
-    if !matches!(path.try_exists(), Ok(false)) {
+    if !root_identity_allows_content(db, roots, music_dirs, path).await? {
         return Ok(false);
     }
-
-    let Some((root_index, root, root_state)) = roots.root_for_path(path) else {
+    let Some((root_index, _, _)) = roots.root_for_path(path) else {
         return Ok(false);
     };
-    if crosses_untracked_nested_mount(&root, path, music_dirs) {
-        return Ok(false);
-    }
-    if !root_state.identity_confirmed || !root_state.is_available || !root_state.last_scan_complete
-    {
-        return Ok(false);
-    }
-    let Some(expected_identity) = root_state.device_id.clone() else {
-        return Ok(false);
-    };
-    if !is_marker_identity(&expected_identity) {
-        return Ok(false);
-    }
-
-    if !identity_probe(&root).is_ok_and(|identity| identity == expected_identity) {
+    let Some(authority_lease) = roots.authority_lease(root_index) else {
         mark_cached_root_unavailable(db, roots, root_index).await;
         return Ok(false);
-    }
-
-    let transaction = db.begin().await?;
+    };
+    let proof_lease = authority_lease.clone();
+    let proof_path = path.to_path_buf();
+    let proof_result = spawn_authority_probe(move || {
+        let proof = proof_lease.prove_absent(&proof_path).map(Arc::new);
+        let authority_stable = proof_lease.validate().is_ok();
+        (proof, authority_stable)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("watcher absence-proof task failed: {error}"))?;
+    let absence_proof = match proof_result {
+        (Ok(proof), _) => proof,
+        (Err(_), false) => {
+            mark_cached_root_unavailable(db, roots, root_index).await;
+            return Ok(false);
+        }
+        (Err(_), true) => return Ok(false),
+    };
     let path_key = path.to_string_lossy().into_owned();
     let row = track::Entity::find()
         .filter(track::Column::FilePath.eq(&path_key))
-        .one(&transaction)
+        .one(db)
         .await?;
     let Some(row) = row else {
-        transaction.rollback().await?;
         return Ok(false);
     };
-    track::Entity::delete_by_id(&row.id)
-        .exec(&transaction)
-        .await?;
 
-    if !matches!(path.try_exists(), Ok(false))
-        || !identity_probe(&root).is_ok_and(|identity| identity == expected_identity)
-    {
-        transaction.rollback().await?;
-        mark_cached_root_unavailable(db, roots, root_index).await;
-        return Ok(false);
+    let mut authority_stable = true;
+    let mut authority_task_failed = false;
+    let outcome = delete_track_with_commit_guard(db, &row.id, || async {
+        before_commit_guard();
+        let guard_absence = absence_proof.clone();
+        let guard_lease = authority_lease.clone();
+        match spawn_authority_probe(move || {
+            let path_is_still_absent = guard_absence.validate(&guard_lease).is_ok();
+            let authority_stable = guard_lease.validate().is_ok();
+            (path_is_still_absent, authority_stable)
+        })
+        .await
+        {
+            Ok((path_is_still_absent, still_stable)) => {
+                authority_stable = still_stable;
+                path_is_still_absent && authority_stable
+            }
+            Err(_) => {
+                authority_task_failed = true;
+                false
+            }
+        }
+    })
+    .await?;
+
+    match outcome {
+        GuardedTrackDeleteOutcome::Deleted => Ok(true),
+        GuardedTrackDeleteOutcome::Missing => Ok(false),
+        GuardedTrackDeleteOutcome::GuardRejected => {
+            if !authority_task_failed && !authority_stable {
+                mark_cached_root_unavailable(db, roots, root_index).await;
+            }
+            Ok(false)
+        }
     }
-
-    transaction.commit().await?;
-    Ok(true)
 }
 
 fn marker_event_invalidates_root(kind: notify::EventKind) -> bool {
@@ -3777,6 +4247,7 @@ async fn process_directory_events(
             Ok(cache) => cache,
             Err(error) => {
                 warn!(%error, "Could not load library root state; watcher batch rejected");
+                reconciliation_pending = true;
                 continue;
             }
         };
@@ -3796,17 +4267,11 @@ async fn process_directory_events(
         // the renames, and do not make them match by prefix.
         let rename_pairs: Vec<WatcherRenamePair> = batch.rename_pairs.iter().cloned().collect();
         for pair in rename_pairs {
-            let Some(kind) = classify_rename_pair(&pair) else {
-                reconciliation_required = true;
-                continue;
-            };
-
             let guard = match prepare_watcher_rename_guard(
                 db.as_ref(),
                 &mut root_cache,
                 music_dirs,
-                &pair.from,
-                &pair.to,
+                &pair,
             )
             .await
             {
@@ -3821,12 +4286,45 @@ async fn process_directory_events(
                     continue;
                 }
             };
+            let kind = guard.kind();
 
             match kind {
                 WatcherRenameKind::File => {
+                    let clone_guard = guard.clone();
+                    let clone_result = spawn_authority_probe(move || {
+                        let parser_file = clone_guard
+                            .evidence
+                            .file()
+                            .expect("file rename guard must retain a bound file")
+                            .try_clone_file();
+                        let authority_stable = clone_guard.root_is_stable();
+                        (parser_file, authority_stable)
+                    })
+                    .await;
+                    let parser_file = match clone_result {
+                        Ok((Ok(file), _)) => file,
+                        Ok((Err(error), authority_stable)) => {
+                            if !authority_stable {
+                                mark_cached_root_unavailable(
+                                    db.as_ref(),
+                                    &mut root_cache,
+                                    guard.root_index,
+                                )
+                                .await;
+                            }
+                            warn!(to = %pair.to.display(), %error, "Could not clone bound renamed file for parsing");
+                            reconciliation_required = true;
+                            continue;
+                        }
+                        Err(error) => {
+                            warn!(to = %pair.to.display(), %error, "Renamed-file authority task failed");
+                            reconciliation_required = true;
+                            continue;
+                        }
+                    };
                     let to_parse = pair.to.clone();
                     let parsed = match tokio::task::spawn_blocking(move || {
-                        tag_parser::parse_audio_file(&to_parse)
+                        tag_parser::parse_audio_file_from_file(parser_file, &to_parse)
                     })
                     .await
                     {
@@ -3843,8 +4341,26 @@ async fn process_directory_events(
                         }
                     };
 
-                    if !guard.commit_allowed(music_dirs, &pair.from, &pair.to, kind) {
-                        if !guard.root_is_stable() {
+                    let preflight_guard = guard.clone();
+                    let (evidence_is_stable, authority_is_stable) = match spawn_authority_probe(
+                        move || {
+                            (
+                                preflight_guard.evidence_is_stable(),
+                                preflight_guard.root_is_stable(),
+                            )
+                        },
+                    )
+                    .await
+                    {
+                        Ok(stability) => stability,
+                        Err(error) => {
+                            warn!(to = %pair.to.display(), %error, "Renamed-file validation task failed");
+                            reconciliation_required = true;
+                            continue;
+                        }
+                    };
+                    if !evidence_is_stable || !authority_is_stable {
+                        if !authority_is_stable {
                             mark_cached_root_unavailable(
                                 db.as_ref(),
                                 &mut root_cache,
@@ -3856,15 +4372,36 @@ async fn process_directory_events(
                         continue;
                     }
 
-                    match rename_track_row(
+                    let mut authority_stable_at_commit = true;
+                    let mut authority_task_failed = false;
+                    let outcome = rename_track_row(
                         db.as_ref(),
                         &pair.from,
                         &pair.to,
                         parsed.as_ref(),
-                        || guard.commit_allowed(music_dirs, &pair.from, &pair.to, kind),
+                        || async {
+                            let commit_guard = guard.clone();
+                            match spawn_authority_probe(move || {
+                                (
+                                    commit_guard.evidence_is_stable(),
+                                    commit_guard.root_is_stable(),
+                                )
+                            })
+                            .await
+                            {
+                                Ok((evidence_is_stable, authority_stable)) => {
+                                    authority_stable_at_commit = authority_stable;
+                                    evidence_is_stable && authority_stable_at_commit
+                                }
+                                Err(_) => {
+                                    authority_task_failed = true;
+                                    false
+                                }
+                            }
+                        },
                     )
-                    .await
-                    {
+                    .await;
+                    match outcome {
                         Ok(RenameTrackOutcome::Renamed { model, displaced }) => {
                             let _ = tx
                                 .send(LibraryEvent::TrackRemoved(
@@ -3890,7 +4427,7 @@ async fn process_directory_events(
                             reconciliation_required = true;
                         }
                         Ok(RenameTrackOutcome::GuardRejected) => {
-                            if !guard.root_is_stable() {
+                            if !authority_task_failed && !authority_stable_at_commit {
                                 mark_cached_root_unavailable(
                                     db.as_ref(),
                                     &mut root_cache,
@@ -3920,14 +4457,21 @@ async fn process_directory_events(
                     // Enumerate the destination before opening a transaction: a
                     // whole subtree of blocking filesystem probes must not run
                     // with a SQLite write lock held.
-                    let root = guard.root.clone();
                     let destination = pair.to.clone();
+                    let scan_guard = guard.clone();
                     let scan = match tokio::task::spawn_blocking(move || {
-                        scan_renamed_directory(&root, &destination)
+                        scan_renamed_directory(
+                            &scan_guard.authority_lease,
+                            scan_guard
+                                .evidence
+                                .directory()
+                                .expect("directory rename guard must retain a bound directory"),
+                            &destination,
+                        )
                     })
                     .await
                     {
-                        Ok(scan) => scan,
+                        Ok(scan) => Arc::new(scan),
                         Err(error) => {
                             warn!(to = %pair.to.display(), %error, "Renamed directory scan task failed");
                             reconciliation_required = true;
@@ -3957,8 +4501,36 @@ async fn process_directory_events(
                         &batch.dirty_directory_scopes,
                     );
 
-                    if !guard.commit_allowed(music_dirs, &pair.from, &pair.to, kind) {
-                        if !guard.root_is_stable() {
+                    let preflight_guard = guard.clone();
+                    let preflight_scan = scan.clone();
+                    let (evidence_is_stable, observations_are_current, authority_is_stable) =
+                        match spawn_authority_probe(move || {
+                            let evidence_is_stable = preflight_guard.evidence_is_stable();
+                            let observations_are_current = preflight_scan
+                                .observations_still_current(
+                                    &preflight_guard.authority_lease,
+                                    preflight_guard.evidence.directory().expect(
+                                        "directory rename guard must retain a bound directory",
+                                    ),
+                                );
+                            let authority_is_stable = preflight_guard.root_is_stable();
+                            (
+                                evidence_is_stable,
+                                observations_are_current,
+                                authority_is_stable,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(stability) => stability,
+                            Err(error) => {
+                                warn!(to = %pair.to.display(), %error, "Renamed-directory validation task failed");
+                                reconciliation_required = true;
+                                continue;
+                            }
+                        };
+                    if !evidence_is_stable || !observations_are_current || !authority_is_stable {
+                        if !authority_is_stable {
                             mark_cached_root_unavailable(
                                 db.as_ref(),
                                 &mut root_cache,
@@ -3970,18 +4542,53 @@ async fn process_directory_events(
                         continue;
                     }
 
-                    match rename_directory_rows(
+                    let mut authority_stable_at_commit = true;
+                    let mut authority_task_failed = false;
+                    let outcome = rename_directory_rows(
                         db.as_ref(),
                         &pair.from,
                         &pair.to,
                         &destination_files,
-                        || {
-                            guard.commit_allowed(music_dirs, &pair.from, &pair.to, kind)
-                                && scan.observations_still_current(&pair.to)
+                        || async {
+                            let commit_guard = guard.clone();
+                            let commit_scan = scan.clone();
+                            match spawn_authority_probe(move || {
+                                let evidence_is_stable = commit_guard.evidence_is_stable();
+                                let observations_are_current = commit_scan
+                                    .observations_still_current(
+                                        &commit_guard.authority_lease,
+                                        commit_guard.evidence.directory().expect(
+                                            "directory rename guard must retain a bound directory",
+                                        ),
+                                    );
+                                let authority_is_stable = commit_guard.root_is_stable();
+                                (
+                                    evidence_is_stable,
+                                    observations_are_current,
+                                    authority_is_stable,
+                                )
+                            })
+                            .await
+                            {
+                                Ok((
+                                    evidence_is_stable,
+                                    observations_are_current,
+                                    authority_is_stable,
+                                )) => {
+                                    authority_stable_at_commit = authority_is_stable;
+                                    evidence_is_stable
+                                        && observations_are_current
+                                        && authority_stable_at_commit
+                                }
+                                Err(_) => {
+                                    authority_task_failed = true;
+                                    false
+                                }
+                            }
                         },
                     )
-                    .await
-                    {
+                    .await;
+                    match outcome {
                         Ok(RenameDirectoryOutcome::Renamed {
                             moved,
                             displaced,
@@ -4017,7 +4624,7 @@ async fn process_directory_events(
                             info!(from = %pair.from.display(), to = %pair.to.display(), moved = moved.len(), displaced, "Preserved track identity across directory rename");
                         }
                         Ok(RenameDirectoryOutcome::GuardRejected) => {
-                            if !guard.root_is_stable() {
+                            if !authority_task_failed && !authority_stable_at_commit {
                                 mark_cached_root_unavailable(
                                     db.as_ref(),
                                     &mut root_cache,
@@ -4051,6 +4658,7 @@ async fn process_directory_events(
                 }
                 Err(error) => {
                     warn!(path = %path.display(), %error, "Failed to process watched removal safely");
+                    reconciliation_required = true;
                 }
             }
         }
@@ -4070,66 +4678,126 @@ async fn process_directory_events(
                     Ok(true) => {}
                     Ok(false) => {
                         warn!(path = %path.display(), "Ignored change from an unconfirmed or changed library root");
+                        if root_cache.authority_was_lost() {
+                            reconciliation_required = true;
+                        }
                         continue;
                     }
                     Err(error) => {
                         warn!(path = %path.display(), %error, "Failed to verify watched library root");
+                        reconciliation_required = true;
                         continue;
                     }
                 }
-                match watcher_upsert_path_kind(&path) {
-                    Ok(WatcherUpsertPathKind::RegularFile) => {}
-                    Ok(WatcherUpsertPathKind::Missing) => {
+                let Some((root_index, _, _)) = root_cache.root_for_path(&path) else {
+                    continue;
+                };
+                let Some(authority_lease) = root_cache.authority_lease(root_index) else {
+                    mark_cached_root_unavailable(db.as_ref(), &mut root_cache, root_index).await;
+                    reconciliation_required = true;
+                    continue;
+                };
+                let binding_lease = authority_lease.clone();
+                let binding_path = path.clone();
+                let binding = spawn_authority_probe(move || {
+                    match binding_lease.open_regular_file(&binding_path) {
+                        Ok(file) => {
+                            let file = Arc::new(file);
+                            match file.try_clone_file() {
+                                Ok(parser_file) => WatcherFileBinding::Bound { file, parser_file },
+                                Err(error) => WatcherFileBinding::Rejected {
+                                    error,
+                                    authority_stable: binding_lease.validate().is_ok(),
+                                },
+                            }
+                        }
+                        Err(open_error) => match binding_lease.prove_absent(&binding_path) {
+                            Ok(_) => WatcherFileBinding::Absent,
+                            Err(_) => WatcherFileBinding::Rejected {
+                                error: open_error,
+                                authority_stable: binding_lease.validate().is_ok(),
+                            },
+                        },
+                    }
+                })
+                .await;
+                let (bound_file, parser_file) = match binding {
+                    Ok(WatcherFileBinding::Bound { file, parser_file }) => (file, parser_file),
+                    Ok(WatcherFileBinding::Absent) => {
                         // Backstop: a debounced "upsert" whose file no longer
                         // exists is really a move/rename away (or a delete the
                         // watcher reported as an ambiguous Modify). Remove the
                         // stale DB row instead of leaving an orphan that fails
                         // to play.
                         let path_str = path.to_string_lossy().to_string();
-                        if delete_track_if_root_stable(
+                        match delete_track_if_root_stable(
                             db.as_ref(),
                             &mut root_cache,
                             music_dirs,
                             &path,
                         )
                         .await
-                        .unwrap_or_else(|error| {
-                                warn!(path = %path.display(), %error, "Failed to process missing watched path safely");
-                                false
-                            })
                         {
-                            let _ = tx.send(LibraryEvent::TrackRemoved(path_str)).await;
+                            Ok(true) => {
+                                let _ = tx.send(LibraryEvent::TrackRemoved(path_str)).await;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                warn!(path = %path.display(), %error, "Failed to process missing watched path safely");
+                                reconciliation_required = true;
+                            }
                         }
                         continue;
                     }
-                    Ok(kind) => {
-                        warn!(path = %path.display(), ?kind, "Watched audio path is not a regular file; scheduling reconciliation");
+                    Ok(WatcherFileBinding::Rejected {
+                        error,
+                        authority_stable,
+                    }) => {
+                        if !authority_stable {
+                            mark_cached_root_unavailable(db.as_ref(), &mut root_cache, root_index)
+                                .await;
+                        }
+                        warn!(path = %path.display(), %error, "Could not clone bound watched audio file for parsing; scheduling reconciliation");
                         reconciliation_required = true;
                         continue;
                     }
                     Err(error) => {
-                        warn!(path = %path.display(), %error, "Could not inspect watched audio path safely; scheduling reconciliation");
+                        warn!(path = %path.display(), %error, "Watched-file authority task failed; scheduling reconciliation");
                         reconciliation_required = true;
                         continue;
                     }
-                }
+                };
                 let p = path.clone();
-                match tokio::task::spawn_blocking(move || tag_parser::parse_audio_file(&p)).await {
+                match tokio::task::spawn_blocking(move || {
+                    tag_parser::parse_audio_file_from_file(parser_file, &p)
+                })
+                .await
+                {
                     Ok(Ok(parsed)) => {
                         // Parsing can take long enough for a removable/network
                         // volume to disappear or be replaced. Revalidate the
                         // root immediately before touching persisted metadata.
-                        if !root_identity_allows_content(
+                        match root_identity_allows_content(
                             db.as_ref(),
                             &mut root_cache,
                             music_dirs,
                             &path,
                         )
                         .await
-                        .unwrap_or(false)
                         {
-                            warn!(path = %path.display(), "Library root changed while parsing — upsert discarded");
-                            continue;
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(path = %path.display(), "Library root changed while parsing — upsert discarded");
+                                if root_cache.authority_was_lost() {
+                                    reconciliation_required = true;
+                                }
+                                continue;
+                            }
+                            Err(error) => {
+                                warn!(path = %path.display(), %error, "Post-parse root authority task failed — upsert discarded");
+                                reconciliation_required = true;
+                                continue;
+                            }
                         }
                         let path_str = parsed.file_path.clone();
                         let existing = track::Entity::find()
@@ -4139,28 +4807,75 @@ async fn process_directory_events(
                             .ok()
                             .flatten();
 
-                        match watcher_upsert_path_kind(&path) {
-                            Ok(WatcherUpsertPathKind::RegularFile) => {}
-                            Ok(kind) => {
-                                warn!(path = %path.display(), ?kind, "Watched audio path changed after parsing; scheduling reconciliation");
-                                reconciliation_required = true;
-                                continue;
-                            }
+                        let preflight_file = bound_file.clone();
+                        let preflight_lease = authority_lease.clone();
+                        let file_is_stable = match spawn_authority_probe(move || {
+                            preflight_file.validate(&preflight_lease).is_ok()
+                        })
+                        .await
+                        {
+                            Ok(still_stable) => still_stable,
                             Err(error) => {
-                                warn!(path = %path.display(), %error, "Could not re-inspect watched audio path after parsing; scheduling reconciliation");
+                                warn!(path = %path.display(), %error, "Watched-file validation task failed; scheduling reconciliation");
                                 reconciliation_required = true;
                                 continue;
                             }
+                        };
+                        if !file_is_stable {
+                            warn!(path = %path.display(), "Watched audio path changed after parsing; scheduling reconciliation");
+                            reconciliation_required = true;
+                            continue;
                         }
 
-                        match upsert_track(db.as_ref(), &parsed, existing.as_ref()).await {
-                            Ok(model) => {
+                        let mut authority_stable_at_commit = true;
+                        let mut authority_task_failed = false;
+                        let outcome = upsert_track_with_commit_guard(
+                            db.as_ref(),
+                            &parsed,
+                            existing.as_ref(),
+                            || async {
+                                let commit_file = bound_file.clone();
+                                let commit_lease = authority_lease.clone();
+                                match spawn_authority_probe(move || {
+                                    let file_is_stable =
+                                        commit_file.validate(&commit_lease).is_ok();
+                                    let authority_stable = commit_lease.validate().is_ok();
+                                    (file_is_stable, authority_stable)
+                                })
+                                .await
+                                {
+                                    Ok((file_is_stable, authority_stable)) => {
+                                        authority_stable_at_commit = authority_stable;
+                                        file_is_stable && authority_stable_at_commit
+                                    }
+                                    Err(_) => {
+                                        authority_task_failed = true;
+                                        false
+                                    }
+                                }
+                            },
+                        )
+                        .await;
+                        match outcome {
+                            Ok(GuardedTrackUpsertOutcome::Committed(model)) => {
                                 upsert_committed = true;
                                 let t = db_model_to_track(&model);
                                 let _ = tx.send(LibraryEvent::TrackUpserted(Box::new(t))).await;
                             }
-                            Err(e) => {
-                                warn!(error = %e, path = %path.display(), "Failed to upsert track");
+                            Ok(GuardedTrackUpsertOutcome::GuardRejected) => {
+                                if !authority_task_failed && !authority_stable_at_commit {
+                                    mark_cached_root_unavailable(
+                                        db.as_ref(),
+                                        &mut root_cache,
+                                        root_index,
+                                    )
+                                    .await;
+                                }
+                                warn!(path = %path.display(), "Filesystem changed before watched upsert commit; transaction rolled back");
+                                reconciliation_required = true;
+                            }
+                            Err(error) => {
+                                warn!(%error, path = %path.display(), "Failed to upsert track");
                             }
                         }
                     }
@@ -4178,6 +4893,7 @@ async fn process_directory_events(
         // avoid guessing identity. Reuse the hardened authoritative scan once
         // per batch as the conservative reconciliation fallback. It publishes
         // its own snapshot, so no separate one is needed here.
+        reconciliation_required |= root_cache.authority_was_lost();
         if reconciliation_required {
             info!("Reconciling library after unpaired or unclaimed watcher changes");
             if let Err(error) = initial_scan(db.as_ref(), music_dirs, tx).await {
@@ -4265,6 +4981,82 @@ where
     }
 }
 
+#[derive(Debug)]
+enum GuardedTrackUpsertOutcome {
+    Committed(Box<track::Model>),
+    GuardRejected,
+}
+
+/// Apply one parsed-track mutation only if its filesystem evidence still
+/// holds after the SQL write and immediately before commit.
+async fn upsert_track_with_commit_guard<F, Fut>(
+    db: &DatabaseConnection,
+    parsed: &ParsedTrack,
+    existing: Option<&track::Model>,
+    commit_guard: F,
+) -> anyhow::Result<GuardedTrackUpsertOutcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let transaction = db.begin().await?;
+    let result = upsert_track(&transaction, parsed, existing).await;
+    match result {
+        Ok(model) if commit_guard().await => {
+            transaction.commit().await?;
+            Ok(GuardedTrackUpsertOutcome::Committed(Box::new(model)))
+        }
+        Ok(_) => {
+            transaction.rollback().await?;
+            Ok(GuardedTrackUpsertOutcome::GuardRejected)
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum GuardedTrackDeleteOutcome {
+    Deleted,
+    Missing,
+    GuardRejected,
+}
+
+/// Delete one track only if its root and path evidence still hold after the
+/// SQL write and immediately before commit.
+async fn delete_track_with_commit_guard<F, Fut>(
+    db: &DatabaseConnection,
+    id: &str,
+    commit_guard: F,
+) -> anyhow::Result<GuardedTrackDeleteOutcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let transaction = db.begin().await?;
+    let result = track::Entity::delete_by_id(id).exec(&transaction).await;
+    match result {
+        Ok(result) if result.rows_affected == 0 => {
+            transaction.rollback().await?;
+            Ok(GuardedTrackDeleteOutcome::Missing)
+        }
+        Ok(_) if commit_guard().await => {
+            transaction.commit().await?;
+            Ok(GuardedTrackDeleteOutcome::Deleted)
+        }
+        Ok(_) => {
+            transaction.rollback().await?;
+            Ok(GuardedTrackDeleteOutcome::GuardRejected)
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            Err(error.into())
+        }
+    }
+}
+
 fn apply_parsed_track_fields(
     active: &mut track::ActiveModel,
     parsed: &ParsedTrack,
@@ -4302,7 +5094,7 @@ enum RenameTrackOutcome {
 /// playlist references remain untouched. If the filesystem rename replaced
 /// an already-indexed destination, that displaced row is removed in the same
 /// transaction before the source claims its unique path.
-async fn rename_track_row<F>(
+async fn rename_track_row<F, Fut>(
     db: &DatabaseConnection,
     from: &Path,
     to: &Path,
@@ -4310,7 +5102,8 @@ async fn rename_track_row<F>(
     commit_guard: F,
 ) -> anyhow::Result<RenameTrackOutcome>
 where
-    F: FnOnce() -> bool,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
 {
     let from_path = from.to_string_lossy().into_owned();
     let to_path = to.to_string_lossy().into_owned();
@@ -4349,7 +5142,7 @@ where
             active.update(&transaction).await?
         };
 
-        if !commit_guard() {
+        if !commit_guard().await {
             return Ok(RenameTrackOutcome::GuardRejected);
         }
 
@@ -4405,7 +5198,7 @@ enum RenameDirectoryOutcome {
 /// reported as `unmapped` rather than followed to a path that does not exist.
 /// Files under `to` that no row claims are surplus: they were never indexed,
 /// and the caller upserts them normally.
-async fn rename_directory_rows<F>(
+async fn rename_directory_rows<F, Fut>(
     db: &DatabaseConnection,
     from: &Path,
     to: &Path,
@@ -4413,7 +5206,8 @@ async fn rename_directory_rows<F>(
     commit_guard: F,
 ) -> anyhow::Result<RenameDirectoryOutcome>
 where
-    F: FnOnce() -> bool,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
 {
     // Rows are persisted through `to_string_lossy`, so a non-UTF-8 name never
     // round-trips back to its original bytes. Matching in the database's own
@@ -4477,7 +5271,7 @@ where
             moved.push((previous, active.update(&transaction).await?));
         }
 
-        if !commit_guard() {
+        if !commit_guard().await {
             return Ok(RenameDirectoryOutcome::GuardRejected);
         }
 
@@ -4589,6 +5383,13 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn test_root_authority(root: &Path) -> RootAuthorityLease {
+        let identity = create_root_marker(root)
+            .expect("create test root marker")
+            .identity;
+        RootAuthorityLease::acquire(root, &identity).expect("retain test root authority")
     }
 
     fn rename_event(
@@ -5001,6 +5802,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guarded_track_upserts_roll_back_inserts_and_updates() {
+        use std::cell::Cell;
+
+        let db = rename_test_database().await;
+        let inserted = parsed_rename_track("/music/guarded.flac", "Inserted");
+        let insert_guard_calls = Cell::new(0);
+
+        let insert_outcome = upsert_track_with_commit_guard(&db, &inserted, None, || async {
+            insert_guard_calls.set(insert_guard_calls.get() + 1);
+            false
+        })
+        .await
+        .expect("reject guarded insert");
+        assert!(matches!(
+            insert_outcome,
+            GuardedTrackUpsertOutcome::GuardRejected
+        ));
+        assert_eq!(insert_guard_calls.get(), 1);
+        assert!(track::Entity::find()
+            .one(&db)
+            .await
+            .expect("query rolled-back insert")
+            .is_none());
+
+        let existing = insert_rename_test_track(
+            &db,
+            "guarded-update-track",
+            "/music/guarded.flac",
+            "Original",
+            11,
+        )
+        .await;
+        let updated = parsed_rename_track("/music/guarded.flac", "Updated");
+        let update_guard_calls = Cell::new(0);
+
+        let update_outcome =
+            upsert_track_with_commit_guard(&db, &updated, Some(&existing), || async {
+                update_guard_calls.set(update_guard_calls.get() + 1);
+                false
+            })
+            .await
+            .expect("reject guarded update");
+        assert!(matches!(
+            update_outcome,
+            GuardedTrackUpsertOutcome::GuardRejected
+        ));
+        assert_eq!(update_guard_calls.get(), 1);
+
+        let unchanged = track::Entity::find_by_id(&existing.id)
+            .one(&db)
+            .await
+            .expect("query rolled-back update")
+            .expect("original track remains");
+        assert_eq!(unchanged, existing);
+    }
+
+    #[tokio::test]
+    async fn authority_probe_join_failure_rejects_the_pending_transaction() {
+        let db = rename_test_database().await;
+        let parsed = parsed_rename_track("/music/join-failure.flac", "Rejected");
+
+        let outcome = upsert_track_with_commit_guard(&db, &parsed, None, || async {
+            let probe = spawn_authority_probe(|| -> bool {
+                panic!("simulate retained-authority task failure");
+            })
+            .await;
+            assert!(probe.is_err());
+            false
+        })
+        .await
+        .expect("reject transaction after authority task failure");
+
+        assert!(matches!(outcome, GuardedTrackUpsertOutcome::GuardRejected));
+        assert!(track::Entity::find()
+            .one(&db)
+            .await
+            .expect("query rolled-back join-failure insert")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn guarded_track_delete_rollback_preserves_playlist_linkage() {
+        use std::cell::Cell;
+
+        use crate::db::entities::playlist_entry;
+
+        let db = rename_test_database().await;
+        let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Guarded delete", false)
+            .await
+            .expect("create playlist");
+        let existing = insert_rename_test_track(
+            &db,
+            "guarded-delete-track",
+            "/music/missing.flac",
+            "Remembered",
+            7,
+        )
+        .await;
+        manager
+            .add_track(&playlist.id, &existing)
+            .await
+            .expect("link track to playlist");
+        let entry_before = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(&playlist.id))
+            .one(&db)
+            .await
+            .expect("query playlist entry")
+            .expect("playlist entry exists");
+        let guard_calls = Cell::new(0);
+
+        let outcome = delete_track_with_commit_guard(&db, &existing.id, || async {
+            guard_calls.set(guard_calls.get() + 1);
+            false
+        })
+        .await
+        .expect("reject guarded deletion");
+
+        assert_eq!(outcome, GuardedTrackDeleteOutcome::GuardRejected);
+        assert_eq!(guard_calls.get(), 1);
+        assert_eq!(
+            track::Entity::find_by_id(&existing.id)
+                .one(&db)
+                .await
+                .expect("query retained track"),
+            Some(existing)
+        );
+        assert_eq!(
+            playlist_entry::Entity::find_by_id(&entry_before.id)
+                .one(&db)
+                .await
+                .expect("query retained playlist entry"),
+            Some(entry_before)
+        );
+    }
+
+    #[tokio::test]
+    async fn root_state_promotions_roll_back_when_retained_authority_changes() {
+        let db = rename_test_database().await;
+        let replacement_identity = format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4());
+
+        let inserted_root = TestDirectory::new("guarded-root-state-insert");
+        create_root_marker(inserted_root.path()).expect("create insert root marker");
+        let insert_scan = scan_root(inserted_root.path().to_path_buf());
+        std::fs::write(
+            root_identity_path(inserted_root.path()),
+            format!("{replacement_identity}\n"),
+        )
+        .expect("change insert root authority");
+
+        assert!(
+            persist_root_scan_status(&db, &insert_scan, None, true, true, false)
+                .await
+                .is_err()
+        );
+        assert!(library_root::Entity::find_by_id(
+            inserted_root.path().to_string_lossy().into_owned()
+        )
+        .one(&db)
+        .await
+        .expect("query rolled-back root insert")
+        .is_none());
+
+        let updated_root = TestDirectory::new("guarded-root-state-update");
+        create_root_marker(updated_root.path()).expect("create update root marker");
+        let update_scan = scan_root(updated_root.path().to_path_buf());
+        let staged = persist_root_scan_status(&db, &update_scan, None, false, false, false)
+            .await
+            .expect("stage unavailable root state");
+        std::fs::write(
+            root_identity_path(updated_root.path()),
+            format!("{replacement_identity}\n"),
+        )
+        .expect("change update root authority");
+
+        assert!(
+            persist_root_scan_status(&db, &update_scan, Some(&staged), true, true, false)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            library_root::Entity::find_by_id(updated_root.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query rolled-back root promotion"),
+            Some(staged)
+        );
+    }
+
+    #[tokio::test]
     async fn paired_rename_preserves_track_history_and_playlist_linkage() {
         use crate::db::entities::playlist_entry;
 
@@ -5035,7 +6027,7 @@ mod tests {
             Path::new("/music/old.flac"),
             Path::new("/music/new.flac"),
             Some(&parsed),
-            || true,
+            || async { true },
         )
         .await
         .expect("rename track row");
@@ -5102,7 +6094,7 @@ mod tests {
             Path::new("/music/source.flac"),
             Path::new("/music/destination.flac"),
             Some(&parsed),
-            || true,
+            || async { true },
         )
         .await
         .expect("overwrite destination transactionally");
@@ -5160,7 +6152,7 @@ mod tests {
                 Path::new("/music/guard-source.flac"),
                 Path::new("/music/guard-destination.flac"),
                 Some(&parsed),
-                || false,
+                || async { false },
             )
             .await
             .expect("reject commit guard"),
@@ -5241,7 +6233,7 @@ mod tests {
             Path::new("/music/rollback-source.flac"),
             Path::new("/music/rollback-destination.flac"),
             Some(&parsed),
-            || true,
+            || async { true },
         )
         .await
         .is_err());
@@ -5532,47 +6524,62 @@ mod tests {
     }
 
     #[test]
-    fn rename_destination_shape_is_established_without_following_symlinks() {
+    fn rename_destination_is_bound_without_following_symlinks() {
         let library = TestDirectory::new("rename-classification");
         let album = library.path().join("Album");
         std::fs::create_dir_all(&album).expect("create album");
         let track = library.path().join("01.flac");
         std::fs::write(&track, b"audio").expect("create track");
+        let lease = test_root_authority(library.path());
 
         assert_eq!(
-            classify_rename_pair(&WatcherRenamePair {
-                from: library.path().join("00.flac"),
-                to: track,
-            }),
-            Some(WatcherRenameKind::File)
+            bind_watcher_rename_evidence(
+                &lease,
+                &WatcherRenamePair {
+                    from: library.path().join("00.flac"),
+                    to: track,
+                }
+            )
+            .expect("bind file rename")
+            .kind(),
+            WatcherRenameKind::File
         );
         assert_eq!(
-            classify_rename_pair(&WatcherRenamePair {
-                from: library.path().join("Old Album"),
-                to: album.clone(),
-            }),
-            Some(WatcherRenameKind::Directory)
+            bind_watcher_rename_evidence(
+                &lease,
+                &WatcherRenamePair {
+                    from: library.path().join("Old Album"),
+                    to: album.clone(),
+                }
+            )
+            .expect("bind directory rename")
+            .kind(),
+            WatcherRenameKind::Directory
         );
         // A source that still exists was copied, not renamed.
-        assert_eq!(
-            classify_rename_pair(&WatcherRenamePair {
+        assert!(bind_watcher_rename_evidence(
+            &lease,
+            &WatcherRenamePair {
                 from: library.path().to_path_buf(),
                 to: album,
-            }),
-            None
-        );
+            }
+        )
+        .is_err());
 
         #[cfg(unix)]
         {
             let linked = library.path().join("Linked Album");
             std::os::unix::fs::symlink(library.path().join("Album"), &linked)
                 .expect("create symlinked album");
-            assert_eq!(
-                classify_rename_pair(&WatcherRenamePair {
-                    from: library.path().join("Old Album"),
-                    to: linked,
-                }),
-                None,
+            assert!(
+                bind_watcher_rename_evidence(
+                    &lease,
+                    &WatcherRenamePair {
+                        from: library.path().join("Old Album"),
+                        to: linked,
+                    }
+                )
+                .is_err(),
                 "neither the traversal nor the watcher follows symlinks"
             );
         }
@@ -5585,35 +6592,69 @@ mod tests {
         let destination = library.path().join("album");
         std::fs::create_dir_all(&source).expect("create source album");
         std::fs::rename(&source, &destination).expect("apply case-only rename");
+        let lease = test_root_authority(library.path());
 
-        assert!(directory_rename_source_is_authoritative(
-            &source,
-            &destination
-        ));
         assert_eq!(
-            classify_rename_pair(&WatcherRenamePair {
-                from: source.clone(),
-                to: destination.clone(),
-            }),
-            Some(WatcherRenameKind::Directory)
+            bind_watcher_rename_evidence(
+                &lease,
+                &WatcherRenamePair {
+                    from: source.clone(),
+                    to: destination.clone(),
+                }
+            )
+            .expect("bind case-only directory rename")
+            .kind(),
+            WatcherRenameKind::Directory
         );
 
         // On a case-insensitive filesystem the old spelling still resolves;
         // the same-object handle comparison, rather than absence, is what
         // authorizes the pair.
         if source.try_exists().expect("probe old spelling") {
-            let source_handle = open_real_path_handle(&source, true).expect("open old alias");
-            let destination_handle =
-                open_real_path_handle(&destination, true).expect("open new alias");
-            assert_eq!(source_handle, destination_handle);
+            let source_bound = lease.bind_directory(&source).expect("bind old alias");
+            let destination_bound = lease.bind_directory(&destination).expect("bind new alias");
+            assert!(source_bound.is_same_object_as(&destination_bound));
         }
 
         let recreated_source = library.path().join("Other");
         std::fs::create_dir_all(&recreated_source).expect("create distinct source");
-        assert!(!directory_rename_source_is_authoritative(
-            &recreated_source,
-            &destination
-        ));
+        assert!(bind_watcher_rename_evidence(
+            &lease,
+            &WatcherRenamePair {
+                from: recreated_source,
+                to: destination,
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bound_rename_evidence_rejects_a_reappearing_source() {
+        let library = TestDirectory::new("rename-source-reappears");
+        let source = library.path().join("old.flac");
+        let destination = library.path().join("new.flac");
+        std::fs::write(&destination, b"renamed object").expect("create rename destination");
+        let lease = test_root_authority(library.path());
+        let evidence = bind_watcher_rename_evidence(
+            &lease,
+            &WatcherRenamePair {
+                from: source.clone(),
+                to: destination,
+            },
+        )
+        .expect("bind completed file rename");
+        evidence
+            .validate(&lease)
+            .expect("unchanged rename evidence remains valid");
+
+        std::fs::write(&source, b"different object").expect("recreate rename source");
+        assert!(
+            evidence.validate(&lease).is_err(),
+            "a copied or recreated source must reject the pending database rename"
+        );
+        lease
+            .validate()
+            .expect("source reappearance does not invalidate the library root");
     }
 
     #[tokio::test]
@@ -5662,7 +6703,7 @@ mod tests {
             &source_directory,
             &destination_directory,
             &destination_files(&["/music/Renamed/01.flac", "/music/Renamed/Disc 2/02.flac"]),
-            || true,
+            || async { true },
         )
         .await
         .expect("rename directory rows");
@@ -5743,7 +6784,7 @@ mod tests {
             // The second file was deleted during the rename window, so nothing
             // observed it at the destination.
             &destination_files(&["/music/Renamed/01.flac"]),
-            || true,
+            || async { true },
         )
         .await
         .expect("rename directory rows");
@@ -5789,7 +6830,7 @@ mod tests {
             &source_directory,
             &destination_directory,
             &destination_files(&["/music/Renamed/01.flac"]),
-            || true,
+            || async { true },
         )
         .await
         .expect("rename directory rows");
@@ -5835,7 +6876,7 @@ mod tests {
             &source_directory,
             &destination_directory,
             &destination_files(&["/music/Renamed/01.flac"]),
-            || false,
+            || async { false },
         )
         .await
         .expect("rename directory rows");
@@ -5873,7 +6914,7 @@ mod tests {
             &source_directory,
             &nested_destination,
             &destination_files(&["/music/Album/Nested/01.flac"]),
-            || true,
+            || async { true },
         )
         .await;
         assert!(error.is_err());
@@ -5898,7 +6939,9 @@ mod tests {
         std::fs::write(album.join("Disc 2").join("02.flac"), b"audio").expect("write nested track");
         std::fs::write(album.join("cover.jpg"), b"art").expect("write cover");
 
-        let scan = scan_renamed_directory(library.path(), &album);
+        let lease = test_root_authority(library.path());
+        let destination = lease.bind_directory(&album).expect("bind renamed album");
+        let scan = scan_renamed_directory(&lease, &destination, &album);
         assert!(scan.is_complete());
         let mut found = scan.audio_files.clone();
         found.sort_unstable();
@@ -5914,7 +6957,7 @@ mod tests {
             std::os::unix::fs::symlink(&outside, album.join("linked.flac"))
                 .expect("create symlinked track");
 
-            let scan = scan_renamed_directory(library.path(), &album);
+            let scan = scan_renamed_directory(&lease, &destination, &album);
             assert!(scan.is_complete());
             assert_eq!(
                 scan.audio_files.len(),
@@ -5932,26 +6975,54 @@ mod tests {
         let track = album.join("01.flac");
         std::fs::write(&track, b"first object").expect("write original track");
 
-        let file_scan = scan_renamed_directory(library.path(), &album);
+        let lease = test_root_authority(library.path());
+        let destination = lease.bind_directory(&album).expect("bind renamed album");
+        let file_scan = scan_renamed_directory(&lease, &destination, &album);
         assert!(file_scan.is_complete());
-        assert!(file_scan.observations_still_current(&album));
+        assert!(file_scan.observations_still_current(&lease, &destination));
 
         let original_track = album.join("original.flac");
-        std::fs::rename(&track, &original_track).expect("park original track");
-        std::fs::write(&track, b"replacement").expect("write replacement track");
-        assert!(
-            !file_scan.observations_still_current(&album),
-            "a different file at the same path must not inherit the indexed row"
-        );
+        match std::fs::rename(&track, &original_track) {
+            Ok(()) => {
+                std::fs::write(&track, b"replacement").expect("write replacement track");
+                assert!(
+                    !file_scan.observations_still_current(&lease, &destination),
+                    "a different file at the same path must not inherit the indexed row"
+                );
+            }
+            Err(error) => {
+                #[cfg(windows)]
+                {
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(32)
+                    {
+                        assert!(
+                            file_scan.observations_still_current(&lease, &destination),
+                            "Windows retained handles prevent the file swap outright"
+                        );
+                    } else {
+                        panic!("park original track: {error}");
+                    }
+                }
+                #[cfg(not(windows))]
+                panic!("park original track: {error}");
+            }
+        }
+        drop(file_scan);
 
-        let directory_scan = scan_renamed_directory(library.path(), &album);
+        let replacement_destination = lease
+            .bind_directory(&album)
+            .expect("rebind album after file replacement");
+        let directory_scan = scan_renamed_directory(&lease, &replacement_destination, &album);
         assert!(directory_scan.is_complete());
         let parked_album = library.path().join("Parked");
         if let Err(error) = std::fs::rename(&album, &parked_album) {
             #[cfg(windows)]
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(32)
+            {
                 assert!(
-                    directory_scan.observations_still_current(&album),
+                    directory_scan.observations_still_current(&lease, &replacement_destination),
                     "Windows retained handles prevent the directory swap outright"
                 );
                 return;
@@ -5963,7 +7034,7 @@ mod tests {
         std::fs::write(album.join("original.flac"), b"replacement")
             .expect("mirror second file name");
         assert!(
-            !directory_scan.observations_still_current(&album),
+            !directory_scan.observations_still_current(&lease, &replacement_destination),
             "an identical-looking replacement directory must fail the handle guard"
         );
     }
@@ -5988,7 +7059,9 @@ mod tests {
             return;
         }
 
-        let scan = scan_renamed_directory(library.path(), &album);
+        let lease = test_root_authority(library.path());
+        let destination = lease.bind_directory(&album).expect("bind renamed album");
+        let scan = scan_renamed_directory(&lease, &destination, &album);
 
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
             .expect("restore directory permissions");
@@ -7409,8 +8482,8 @@ mod tests {
         assert!(!scan.is_complete());
     }
 
-    #[test]
-    fn initial_scan_root_revalidation_disables_remaining_writes() {
+    #[tokio::test]
+    async fn initial_scan_root_revalidation_disables_remaining_writes() {
         let directory = TestDirectory::new("initial-scan-marker-race");
         let audio_path = directory.path().join("song.mp3");
         std::fs::write(&audio_path, []).expect("create audio fixture");
@@ -7419,7 +8492,9 @@ mod tests {
         scans[0].content_authorized = true;
 
         assert_eq!(
-            revalidate_scan_root_for_path(&audio_path, &mut scans),
+            revalidate_scan_root_for_path(&audio_path, &mut scans)
+                .await
+                .expect("run initial authority task"),
             (true, None)
         );
         std::fs::write(
@@ -7428,13 +8503,17 @@ mod tests {
         )
         .expect("replace root identity");
         assert_eq!(
-            revalidate_scan_root_for_path(&audio_path, &mut scans),
+            revalidate_scan_root_for_path(&audio_path, &mut scans)
+                .await
+                .expect("run changed authority task"),
             (false, Some(directory.path().to_path_buf()))
         );
         assert!(!scans[0].content_authorized);
         assert!(!scans[0].reconciliation_authoritative);
         assert_eq!(
-            revalidate_scan_root_for_path(&audio_path, &mut scans),
+            revalidate_scan_root_for_path(&audio_path, &mut scans)
+                .await
+                .expect("skip disabled authority task"),
             (false, None)
         );
     }
@@ -7688,6 +8767,7 @@ mod tests {
             errors: vec!["simulated permission error".to_string()],
             device_id: Some("simulated-device".to_string()),
             mount_generation: Some(0),
+            authority_lease: None,
             reconciliation_authoritative: false,
             content_authorized: false,
         };
@@ -7863,6 +8943,7 @@ mod tests {
             errors: Vec::new(),
             device_id: Some("underlying-mountpoint".to_string()),
             mount_generation: Some(0),
+            authority_lease: None,
             reconciliation_authoritative: false,
             content_authorized: false,
         };
@@ -7882,6 +8963,7 @@ mod tests {
             errors: Vec::new(),
             device_id: Some(format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4())),
             mount_generation: Some(0),
+            authority_lease: None,
             reconciliation_authoritative: false,
             content_authorized: false,
         };
@@ -8016,6 +9098,7 @@ mod tests {
                 Ok(if call == 0 { 41 } else { 42 })
             },
             &[],
+            false,
         );
 
         assert!(!scan.is_complete());
@@ -8035,6 +9118,7 @@ mod tests {
             move |_| Ok(first_identity.clone()),
             |_| Ok(41),
             &[],
+            false,
         );
         let previous = persisted_root_state(&first_scan, first_scan.device_id.clone());
         let second_identity = identity;
@@ -8043,6 +9127,7 @@ mod tests {
             move |_| Ok(second_identity.clone()),
             |_| Ok(99),
             &[],
+            false,
         );
 
         assert!(first_scan.is_complete());
@@ -8066,6 +9151,7 @@ mod tests {
         Migrator::up(&db, None).await.expect("run migrations");
 
         let directory = TestDirectory::new("persisted-state");
+        create_root_marker(directory.path()).expect("create durable root identity");
         let mut scan = scan_root(directory.path().to_path_buf());
         persist_root_scan_status(&db, &scan, None, true, true, false)
             .await
@@ -8099,8 +9185,6 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_removal_rolls_back_if_root_identity_changes() {
-        use std::cell::Cell;
-
         use sea_orm::Database;
         use sea_orm_migration::MigratorTrait;
 
@@ -8149,14 +9233,15 @@ mod tests {
 
         // A debounced removal that outlives a quick recreate/remount must not
         // delete the now-live path even when the root identity matches.
-        std::fs::write(&removed_path, []).expect("recreate watched path");
-        let stable_identity = expected_identity.clone();
-        assert!(!delete_track_if_root_stable_with_probe(
+        let recreated_path = removed_path.clone();
+        assert!(!delete_track_if_root_stable_with_guard_hook(
             &db,
             &mut root_cache,
             &music_dirs,
             &removed_path,
-            move |_| Ok(stable_identity.clone()),
+            move || {
+                std::fs::write(recreated_path, []).expect("recreate path before commit guard");
+            },
         )
         .await
         .expect("ignore stale removal"));
@@ -8166,22 +9251,25 @@ mod tests {
             .await
             .expect("query recreated track")
             .is_some());
+        let still_available =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query root after path race")
+                .expect("root state exists");
+        assert!(still_available.is_available);
+        assert!(!root_cache.authority_was_lost());
 
-        let probe_calls = Cell::new(0);
-        let first_identity = expected_identity.clone();
-        let removed = delete_track_if_root_stable_with_probe(
+        let marker_path = root_identity_path(directory.path());
+        let replacement_identity = format!("{ROOT_IDENTITY_PREFIX}{}\n", Uuid::new_v4());
+        let removed = delete_track_if_root_stable_with_guard_hook(
             &db,
             &mut root_cache,
             &music_dirs,
             &removed_path,
-            move |_| {
-                let call = probe_calls.get();
-                probe_calls.set(call + 1);
-                Ok(if call == 0 {
-                    first_identity.clone()
-                } else {
-                    "underlying-mountpoint".to_string()
-                })
+            move || {
+                std::fs::write(&marker_path, replacement_identity)
+                    .expect("change root marker before commit guard");
             },
         )
         .await
@@ -8202,6 +9290,7 @@ mod tests {
                 .expect("root state exists");
         assert!(!root_state.is_available);
         assert!(root_state.identity_confirmed);
+        assert!(root_cache.authority_was_lost());
         assert_eq!(
             root_state.device_id.as_deref(),
             Some(expected_identity.as_str())
