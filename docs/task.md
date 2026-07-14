@@ -25,9 +25,12 @@ Status summary:
 - [ ] P2 resilience and packaging complete
 - [ ] P3 architecture and integration coverage complete
 
-Progress snapshot (2026-07-14, excluding the two still-open release-workflow items deferred by
-request):
-**116/213 (54.5%)** non-release checklist items complete; **100/112 (89.3%)** across P0 and P1.
+Progress snapshot (2026-07-14), recounted from the literal P0–P3 task checkboxes to correct the
+earlier numerator/denominator drift. The denominator excludes the two deferred P0.7 live-workflow
+verification boxes and the withdrawn P2.6 false finding; section-summary and global-validation
+gate boxes are not task progress:
+**122/213 (57.3%)** in-scope checklist items complete; **106/114 (93.0%)** across P0 and P1 after
+the same P0.7 exclusion.
 
 ## P0 — Release blockers
 
@@ -293,7 +296,9 @@ credential-bearing upstream stays inside Tributary.
   upstream, and the target URL is fixed at registration, so the proxy cannot be driven to fetch
   anything else.
 - [x] Issue receivers an opaque ticket URL. The device sees
-  `http://<lan-ip>:<port>/cast/<uuid>` and never a credential.
+  `http://<bound-ip>:<port>/cast/<uuid>[.<audio-ext>]` (with IPv6 bracketed) and never a
+  credential. Chromecast uses a LAN IPv4 address; MPD uses the successful connection's local
+  address and family.
 - [x] Make the ticket registry insert **and revoke**. Registering a new upstream revokes the
   previous one, so at most one credential-bearing ticket is live; `stop()` revokes them all.
   Revocation deliberately does **not** happen on pause or seek — a Cast device re-fetches with a
