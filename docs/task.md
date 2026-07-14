@@ -237,28 +237,40 @@ block is already sound: `audio/cast_http_server.rs` binds a LAN-only listener on
 routes on an unguessable v4 UUID (`:120-133`). What it lacks is upstream fetching and
 revocation.
 
-- [ ] Give the proxy two registration kinds: `Local(PathBuf)` (today's behavior) and
-  `Upstream { url, headers }`, where the proxy — not the receiver — fetches from the backend
-  using an app-owned client bound by the P1.4 exact-origin policy.
-- [ ] Issue receivers an opaque ticket URL (`http://<lan-ip>:<port>/media/<ticket>`) with a
-  short TTL, bound to one media session. A receiver never sees a credential.
+- [x] Give the proxy two registration kinds: `MediaSource::Local(PathBuf)` (today's behavior) and
+  `MediaSource::Upstream(Url)`, where the proxy — not the receiver — fetches from the backend
+  using an app-owned client bound by the P1.4 exact-origin policy. Only `Range` is forwarded
+  upstream, and the target URL is fixed at registration, so the proxy cannot be driven to fetch
+  anything else.
+- [x] Issue receivers an opaque ticket URL. The device sees
+  `http://<lan-ip>:<port>/cast/<uuid>` and never a credential.
+- [x] Make the ticket registry insert **and revoke**. Registering a new upstream revokes the
+  previous one, so at most one credential-bearing ticket is live; `stop()` revokes them all.
+  Revocation deliberately does **not** happen on pause or seek — a Cast device re-fetches with a
+  `Range` header when it seeks, so a ticket must outlive those.
+- [x] Route **Chromecast** through it (`classify_cast_uri`). Unauthenticated streams (internet
+  radio) still pass through directly: there is no secret to protect and relaying a live radio
+  stream through this process would buy nothing.
+- [x] Threat-model spoofed and compromised LAN receivers: a hostile receiver now obtains a
+  single-media ticket, revoked on stop and superseded on the next load, instead of an account
+  credential.
+- [ ] Route **MPD** through the same proxy. MPD still sends the credential-bearing URL via `addid`
+  over **plaintext TCP**, so it crosses the LAN in the clear and lands in the daemon's queue state
+  and `mpd.log`. Blocked only by sequencing: `audio/mpd_output.rs` is owned by P1.8 (PR #76). The
+  proxy it needs already exists — this is a small change once that lands.
 - [ ] Keep backend credentials outside generic `Track` values: drop the credential from
   `Track.stream_url` and add a backend `resolve_stream(&track) -> (Url, HeaderMap)` called at
-  playback time, moving `X-Plex-Token` / `api_key` / Subsonic `u,t,s,p` out of the query
-  string and into request headers held only inside the proxy. Build this to serve P3.1's
+  playback time, moving `X-Plex-Token` / `api_key` / Subsonic `u,t,s,p` out of the query string
+  and into request headers held only inside the proxy. The proxy makes the *leak* stop; this makes
+  the credential stop being copied through the UI layer at all. Build it to serve P3.1's
   "resolve playable URLs at playback time" as well, rather than twice.
-- [ ] Make the ticket registry insert **and revoke** — it is deliberately insert-only today
-  (`cast_http_server.rs:115-119`) — expiring registrations on stop, EOS, session end, and
-  output change.
-- [ ] Route all four transports through it: local and AirPlay (GStreamer fetches) plus MPD and
-  Chromecast (the receiver fetches).
-- [ ] Threat-model spoofed and compromised LAN receivers: the goal is that a hostile receiver
-  obtains a TTL-bounded, single-media ticket instead of an account credential.
-- [ ] Record implementation: _pending_
+- [ ] Give tickets a TTL in addition to revocation, so a ticket cannot outlive a crashed session.
+- [x] Record implementation: Chromecast proxy in commit `c6aa7df`; 6 focused classification,
+  credential-detection, and pass-through tests. MPD and credential-free `Track` values remain open.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
-device or daemon Tributary does not own. Closing this also closes P1.4's last checkbox and
-retires P1.7's synchronous local-file resolver note.
+device or daemon Tributary does not own. **Chromecast now meets this; MPD does not yet.** Closing
+the MPD half also closes P1.4's last checkbox.
 
 ### P1.7 Serialize Chromecast lifecycle and commands
 
@@ -453,14 +465,13 @@ mount roots (`:64-87`), so the symlink defect is not there. The traversal lives 
 
 ### P2.6 Synchronize packaging metadata
 
-- [ ] Fix RPM `Version`, `Source0`, and `%autosetup` naming. **This spec is live**, not dormant:
-  `.packit.yaml:4` builds it on every release for COPR, which is the install path README
-  recommends first. `build-aux/rpm/tributary.spec:2` says `Version: v0.1.0`, so `Source0` (`:8`)
-  resolves to `vv0.1.0.tar.gz` and `%autosetup` (`:37`) expects `tributary-v0.1.0` while a real
-  tarball unpacks to `tributary-0.5.0`. Its `%changelog` also stops at v0.1.0.
-- [ ] Fix the stale versions in the other two package manifests, which P2.6 previously did not
-  name: `build-aux/arch/PKGBUILD:3` (`pkgver=0.1.0`, and unversioned `gtk4`/`libadwaita` deps) and
-  `build-aux/inno/tributary.iss:11` (`AppVersion "0.1.0"`).
+- [x] ~~Fix RPM `Version`, `Source0`, and `%autosetup` naming.~~ **Withdrawn 2026-07-14 — this was
+  a false finding.** The in-repo `Version: v0.1.0` is a placeholder that Packit overwrites from the
+  release tag at build time, so COPR ships the correct version; v0.5.0 built and released through
+  this path. `build-aux/arch/PKGBUILD` is likewise rewritten at release time
+  (`release.yml:500` seds `pkgver`). The checked-in literals are stale to a *reader* but never
+  reach a package. Nothing to fix. Recorded rather than deleted, so the same wrong conclusion is
+  not re-derived from reading the spec in isolation.
 - [ ] Raise GTK runtime minimum to 4.16.
 - [ ] Raise libadwaita runtime minimum to 1.6. Both minimums are currently under-declared as
   `>= 4.14` / `>= 1.5` in `build-aux/rpm/tributary.spec:23-24`, in Cargo.toml's

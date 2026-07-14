@@ -70,8 +70,6 @@ pub fn validate_base_url(url: &Url) -> Result<(), &'static str> {
 /// only when the companion parameters identify the URL as Subsonic, avoiding
 /// false positives on ordinary `s` and `p` parameters.
 pub fn redact_url_secrets(uri: &str) -> String {
-    const SENSITIVE_PARAMS: &[&str] = &["X-Plex-Token", "api_key", "session-id"];
-
     let Ok(mut url) = Url::parse(uri) else {
         return uri.to_string();
     };
@@ -89,19 +87,13 @@ pub fn redact_url_secrets(uri: &str) -> String {
         .query_pairs()
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
-    let has_subsonic_token = query_pairs.iter().any(|(key, _)| key == "t");
-    let has_subsonic_password = ["p", "u", "c"]
-        .into_iter()
-        .all(|required| query_pairs.iter().any(|(key, _)| key == required));
+    let shape = CredentialShape::of(&query_pairs);
 
     let mut redacted_query = false;
     let query_pairs: Vec<(String, String)> = query_pairs
         .into_iter()
         .map(|(key, value)| {
-            let sensitive = SENSITIVE_PARAMS.contains(&key.as_str())
-                || (has_subsonic_token && matches!(key.as_str(), "t" | "s"))
-                || (has_subsonic_password && key == "p");
-            if sensitive {
+            if shape.is_sensitive(&key) {
                 redacted_query = true;
                 (key, REDACTED.to_string())
             } else {
@@ -121,6 +113,56 @@ pub fn redact_url_secrets(uri: &str) -> String {
         }
     }
     url.to_string()
+}
+
+/// Which credential-bearing query parameters a URL actually carries.
+///
+/// The short Subsonic keys are only treated as credentials when their companion
+/// parameters identify the URL as Subsonic, so an ordinary `s` or `p` parameter
+/// on some other service is not mistaken for a secret.
+struct CredentialShape {
+    subsonic_token: bool,
+    subsonic_password: bool,
+}
+
+impl CredentialShape {
+    /// Parameters that are a credential wherever they appear.
+    const ALWAYS_SENSITIVE: &'static [&'static str] = &["X-Plex-Token", "api_key", "session-id"];
+
+    fn of(query_pairs: &[(String, String)]) -> Self {
+        Self {
+            subsonic_token: query_pairs.iter().any(|(key, _)| key == "t"),
+            subsonic_password: ["p", "u", "c"]
+                .into_iter()
+                .all(|required| query_pairs.iter().any(|(key, _)| key == required)),
+        }
+    }
+
+    fn is_sensitive(&self, key: &str) -> bool {
+        Self::ALWAYS_SENSITIVE.contains(&key)
+            || (self.subsonic_token && matches!(key, "t" | "s"))
+            || (self.subsonic_password && key == "p")
+    }
+}
+
+/// True when a URL carries a credential that must never reach another device.
+///
+/// This is the test that decides whether a stream has to be proxied before a
+/// Chromecast or an MPD daemon is allowed to fetch it. It recognises URL
+/// user-info, Plex's `X-Plex-Token`, Jellyfin's `api_key`, DAAP's `session-id`,
+/// and Subsonic's token/salt pair — and Subsonic's `p=enc:<hex>`, which is the
+/// user's *password*, not a revocable token.
+pub fn url_carries_credentials(url: &Url) -> bool {
+    if !url.username().is_empty() || url.password().is_some() {
+        return true;
+    }
+
+    let query_pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let shape = CredentialShape::of(&query_pairs);
+    query_pairs.iter().any(|(key, _)| shape.is_sensitive(key))
 }
 
 fn authenticated_redirect_policy() -> reqwest::redirect::Policy {
@@ -474,6 +516,48 @@ mod tests {
         assert!(!display.contains("password"));
         assert!(!display.contains("secret"));
         let _ = request_rx.recv().expect("error request");
+    }
+
+    /// This predicate decides whether a stream is safe to hand to a Chromecast
+    /// or an MPD daemon. A false negative publishes the user's credential to a
+    /// device on the LAN, so the negative cases below matter as much as the
+    /// positive ones.
+    #[test]
+    fn credential_bearing_urls_are_recognized() {
+        for carries in [
+            "https://plex.test/library/parts/1/a.flac?X-Plex-Token=secret",
+            "https://jellyfin.test/Audio/1/stream?api_key=secret",
+            "http://daap.test:3689/databases/1/items/2.mp3?session-id=secret",
+            // Subsonic token auth.
+            "https://sub.test/rest/stream.view?u=me&t=tok&s=salt&c=Tributary&id=1",
+            // Subsonic plaintext auth: `p=enc:<hex>` is the user's password.
+            "https://sub.test/rest/stream.view?u=me&p=enc%3A70617373&c=Tributary&id=1",
+            // Credentials in user-info.
+            "https://me:hunter2@music.test/stream.flac",
+            "https://me@music.test/stream.flac",
+        ] {
+            assert!(
+                url_carries_credentials(&url(carries)),
+                "{carries} carries a credential"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_urls_are_not_mistaken_for_credentials() {
+        for plain in [
+            "http://radio.test/stream.mp3",
+            "https://radio.test/listen?bitrate=128&format=mp3",
+            // `s` and `p` are Subsonic credentials only alongside their
+            // companion parameters; on any other service they are ordinary.
+            "https://radio.test/search?s=jazz&p=2",
+            "https://radio.test/browse?genre=rock",
+        ] {
+            assert!(
+                !url_carries_credentials(&url(plain)),
+                "{plain} carries no credential"
+            );
+        }
     }
 
     #[test]

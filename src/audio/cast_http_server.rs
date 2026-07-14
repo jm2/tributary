@@ -1,9 +1,17 @@
-//! Embedded HTTP server for casting local files to Chromecast devices.
+//! Embedded HTTP server for streaming media to Chromecast devices.
 //!
-//! The Chromecast Default Media Receiver can only play HTTP(S) URLs —
-//! it cannot access `file:///` URIs.  This module provides a minimal,
-//! LAN-only HTTP server that serves pre-registered local files via
-//! UUID-keyed URLs.
+//! The Chromecast Default Media Receiver can only play HTTP(S) URLs — it
+//! cannot access `file:///` URIs — so local files are served through a minimal,
+//! LAN-only HTTP server keyed by random UUID.
+//!
+//! The same server also **proxies credential-bearing remote streams**. A
+//! Subsonic, Jellyfin, or Plex stream URL carries the user's token in its query
+//! string — and with Subsonic's plaintext auth mode, `p=enc:<hex>` is the
+//! user's actual *password*, which unlike a token cannot be revoked. Handing
+//! that URL to a Cast device would publish the credential to a device Tributary
+//! does not control, on a LAN it does not control. Instead the receiver is given
+//! an opaque ticket URL, and Tributary fetches the upstream itself, so the
+//! credential never leaves this process.
 //!
 //! # Security
 //!
@@ -12,6 +20,14 @@
 //! - **No directory listing**: Only pre-registered UUIDs are servable.
 //! - **No path traversal**: File paths are stored in a `DashMap` keyed
 //!   by random UUID — there is no URL-to-filesystem path mapping.
+//! - **Not an open relay**: an upstream ticket resolves to a URL fixed at
+//!   registration time. A caller cannot ask the proxy to fetch anything else,
+//!   and only the `Range` header is forwarded upstream.
+//! - **Credential tickets are short-lived**: every new load revokes the
+//!   previous credential ticket — including a load that turns out to be a local
+//!   file or unauthenticated radio — and `stop()` revokes them all. At most one
+//!   credential-bearing ticket is live at a time, and it dies when playback
+//!   moves on rather than lingering until the next credentialed track.
 //! - **OS-assigned port**: Uses port 0 for dynamic assignment.
 //! - **Graceful shutdown**: Can be stopped when no longer needed.
 
@@ -28,21 +44,39 @@ use axum::Router;
 use dashmap::DashMap;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
+use url::Url;
 use uuid::Uuid;
+
+/// What a registered ticket resolves to.
+///
+/// `Clone` but deliberately **not** `Debug`: an `Upstream` holds a
+/// credential-bearing URL, and the whole point of this type is that the URL
+/// never gets printed, logged, or handed to a receiver.
+#[derive(Clone)]
+enum MediaSource {
+    /// A local file, streamed from disk.
+    Local(PathBuf),
+    /// A remote stream that Tributary fetches on the receiver's behalf.
+    Upstream(Box<Url>),
+}
 
 /// Shared state for the cast HTTP server.
 #[derive(Clone)]
 struct ServerState {
-    /// Map of UUID → absolute file path for registered files.
-    files: Arc<DashMap<String, PathBuf>>,
+    /// Map of ticket → media source.
+    media: Arc<DashMap<String, MediaSource>>,
+    /// Client used for upstream fetches. Carries the shared exact-origin
+    /// redirect policy, so a hostile redirect cannot walk the credential to
+    /// another host or downgrade it to plaintext.
+    upstream: reqwest::Client,
 }
 
 /// A running cast HTTP server instance.
 pub struct CastHttpServer {
     /// The socket address the server is listening on (LAN IP + port).
     addr: SocketAddr,
-    /// Registered file map (shared with the axum handler).
-    files: Arc<DashMap<String, PathBuf>>,
+    /// Registered ticket map (shared with the axum handler).
+    media: Arc<DashMap<String, MediaSource>>,
     /// Handle to abort the server task on shutdown.
     abort_handle: tokio::task::AbortHandle,
 }
@@ -80,13 +114,18 @@ impl CastHttpServer {
                 })?,
         };
 
-        let files = Arc::new(DashMap::new());
+        let media = Arc::new(DashMap::new());
         let state = ServerState {
-            files: files.clone(),
+            media: media.clone(),
+            // No total timeout: a media stream is a length-unbounded playback
+            // transport, the same reason P1.5 leaves audio streams uncapped.
+            upstream: crate::http_security::authenticated_client_builder()
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build the upstream media client: {e}"))?,
         };
 
         let app = Router::new()
-            .route("/cast/{id}", get(serve_file))
+            .route("/cast/{id}", get(serve_media))
             .with_state(state);
 
         let listener = TcpListener::bind(SocketAddr::from((ipv4, 0))).await?;
@@ -102,7 +141,7 @@ impl CastHttpServer {
 
         Ok(Self {
             addr,
-            files,
+            media,
             abort_handle: join_handle.abort_handle(),
         })
     }
@@ -112,24 +151,70 @@ impl CastHttpServer {
     /// Returns the full HTTP URL that a Chromecast can load to stream
     /// the file, e.g. `http://192.168.1.42:54321/cast/<uuid>.flac`.
     ///
-    /// Note: the registry is insert-only — entries are not expired and remain
-    /// servable for the lifetime of the server (the app session). This is
-    /// acceptable here because access is gated by an unguessable random v4
-    /// UUID, the listener is LAN-only, and the map is bounded by the number of
-    /// distinct local files cast in a session (a tiny `String`+`PathBuf` each).
+    /// Local entries are insert-only: they are not expired and remain servable
+    /// for the lifetime of the server (the app session). That is acceptable
+    /// because access is gated by an unguessable random v4 UUID, the listener
+    /// is LAN-only, the entry grants nothing but a file the user chose to cast,
+    /// and the map is bounded by the number of distinct local files cast in a
+    /// session. Credential-bearing entries are *not* treated this way — see
+    /// [`Self::register_upstream`].
     pub fn register_file(&self, path: &std::path::Path) -> String {
-        let id = Uuid::new_v4().to_string();
-
         // Preserve the file extension so the Chromecast can detect
         // the content type from the URL.
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+        let ticket = format!("{}.{ext}", Uuid::new_v4());
 
-        let url_id = format!("{id}.{ext}");
-        self.files.insert(url_id.clone(), path.to_path_buf());
+        self.media
+            .insert(ticket.clone(), MediaSource::Local(path.to_path_buf()));
 
-        let url = format!("http://{}/cast/{}", self.addr, url_id);
+        let url = self.ticket_url(&ticket);
         debug!(url = %url, path = %path.display(), "Registered file for casting");
         url
+    }
+
+    /// Register a remote stream that Tributary will fetch on the receiver's
+    /// behalf, and return an opaque ticket URL to hand to the device.
+    ///
+    /// `url` may carry a credential; it is held only in this process. The
+    /// receiver sees nothing but the ticket.
+    ///
+    /// Registering a new upstream **revokes the previous one**, so at most one
+    /// credential-bearing ticket is live at a time. A ticket that outlived its
+    /// track would be a standing invitation to replay the user's stream, and
+    /// unlike a local file it fronts a credential.
+    pub fn register_upstream(&self, url: &Url) -> String {
+        self.revoke_upstreams();
+
+        // Carry the upstream's media extension onto the ticket. The Cast
+        // `content_type` is guessed from the URL it is handed, so an
+        // extensionless ticket would advertise a proxied FLAC or Opus stream as
+        // the default `audio/mpeg` and the receiver would refuse or misplay it.
+        //
+        // Only a known audio extension is copied: the ticket path must stay
+        // opaque, and nothing from the upstream URL beyond this fixed set is
+        // allowed to shape it.
+        let ticket = match upstream_media_extension(url) {
+            Some(extension) => format!("{}.{extension}", Uuid::new_v4()),
+            None => Uuid::new_v4().to_string(),
+        };
+
+        self.media
+            .insert(ticket.clone(), MediaSource::Upstream(Box::new(url.clone())));
+
+        let ticket_url = self.ticket_url(&ticket);
+        // The upstream URL is deliberately absent from this log line.
+        debug!(url = %ticket_url, "Registered a proxied remote stream for casting");
+        ticket_url
+    }
+
+    /// Drop every credential-bearing ticket, leaving local entries alone.
+    pub fn revoke_upstreams(&self) {
+        self.media
+            .retain(|_, source| !matches!(source, MediaSource::Upstream(_)));
+    }
+
+    fn ticket_url(&self, ticket: &str) -> String {
+        format!("http://{}/cast/{}", self.addr, ticket)
     }
 
     /// The socket address the server is listening on.
@@ -144,21 +229,100 @@ impl Drop for CastHttpServer {
     }
 }
 
-/// Axum handler: serve a registered file by UUID.
+/// The audio extension of an upstream URL, if it has a recognised one.
 ///
-/// Supports HTTP byte-range requests (`Range: bytes=N-M`) for
-/// Chromecast seeking.
-async fn serve_file(
+/// A Plex part key ends in `/file.flac`; a Subsonic `stream.view` has no
+/// extension at all, in which case the receiver falls back to its default and
+/// there is nothing more we can say from the URL alone.
+///
+/// The allow-list is deliberate: the ticket path is otherwise a bare UUID, and
+/// only these fixed strings may ever be appended to it.
+fn upstream_media_extension(url: &Url) -> Option<&'static str> {
+    const AUDIO_EXTENSIONS: &[&str] = &[
+        "mp3", "flac", "ogg", "oga", "opus", "wav", "aac", "m4a", "aiff", "aif", "wma",
+    ];
+
+    let last_segment = url.path_segments()?.next_back()?;
+    let (_, extension) = last_segment.rsplit_once('.')?;
+    AUDIO_EXTENSIONS
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(extension))
+        .copied()
+}
+
+/// Axum handler: serve a registered ticket.
+///
+/// A ticket is either a local file or a remote stream we fetch on the
+/// receiver's behalf. Unregistered tickets are indistinguishable from any other
+/// unknown path: 404.
+async fn serve_media(
     State(state): State<ServerState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    // Look up the UUID in the registry.
-    let Some(entry) = state.files.get(&id) else {
+    let Some(entry) = state.media.get(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let path = entry.value().clone();
-    drop(entry); // Release the DashMap ref before I/O.
+
+    // Clone out and release the DashMap ref before doing any I/O — holding it
+    // across an await would block every other request on this shard.
+    let source = entry.value().clone();
+    drop(entry);
+
+    match source {
+        MediaSource::Local(path) => serve_local_file(&path, &headers).await,
+        MediaSource::Upstream(url) => proxy_upstream(&state.upstream, &url, &headers).await,
+    }
+}
+
+/// Fetch a credential-bearing stream and relay it to the receiver.
+///
+/// The upstream URL is fixed at registration, so this cannot be driven to fetch
+/// an arbitrary target. Only `Range` is forwarded — none of the receiver's other
+/// headers reach the user's music server. Errors never carry the URL, because a
+/// `reqwest` error would otherwise print the credential straight into the log.
+async fn proxy_upstream(client: &reqwest::Client, url: &Url, headers: &HeaderMap) -> Response {
+    let mut request = client.get(url.clone());
+    if let Some(range) = headers.get(header::RANGE) {
+        request = request.header(header::RANGE, range.clone());
+    }
+
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let error = crate::http_security::strip_request_url(error);
+            error!(error = %error, "Upstream media fetch failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !status.is_success() {
+        error!(%status, "Upstream media fetch returned a failure status");
+        return status.into_response();
+    }
+
+    let mut response = Response::builder().status(status);
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_LENGTH,
+        header::CONTENT_RANGE,
+        header::ACCEPT_RANGES,
+    ] {
+        if let Some(value) = upstream.headers().get(&name) {
+            response = response.header(name, value.clone());
+        }
+    }
+
+    response
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Stream a local file, honoring `Range` requests so the receiver can seek.
+async fn serve_local_file(path: &std::path::Path, headers: &HeaderMap) -> Response {
+    let path = path.to_path_buf();
 
     // Open the file.
     let metadata = match tokio::fs::metadata(&path).await {
@@ -344,5 +508,50 @@ mod tests {
         assert_eq!(parse_range_header("bytes=0-0", 0), None);
         assert_eq!(parse_range_header("bytes=0-", 0), None);
         assert_eq!(parse_range_header("bytes=-1", 0), None);
+    }
+
+    // ── Proxy ticket shape ──────────────────────────────────────────
+
+    fn url(value: &str) -> Url {
+        Url::parse(value).expect("test URL")
+    }
+
+    /// The Cast `content_type` is guessed from the URL the device is handed, so
+    /// an extensionless ticket advertises a proxied FLAC as `audio/mpeg` and the
+    /// receiver misplays or refuses it.
+    #[test]
+    fn a_proxy_ticket_carries_the_upstream_media_extension() {
+        assert_eq!(
+            upstream_media_extension(&url(
+                "https://plex.test/library/parts/1/track.flac?X-Plex-Token=secret"
+            )),
+            Some("flac")
+        );
+        assert_eq!(
+            upstream_media_extension(&url("https://music.test/a/b/song.OPUS?api_key=secret")),
+            Some("opus"),
+            "extension matching is case-insensitive and normalizes to the known form"
+        );
+    }
+
+    /// Only the known audio extensions may shape the ticket path. Anything else
+    /// leaves the ticket a bare UUID rather than letting the upstream URL
+    /// dictate what the route looks like.
+    #[test]
+    fn a_proxy_ticket_never_inherits_an_arbitrary_suffix() {
+        for no_extension in [
+            // Subsonic streams have no extension at all.
+            "https://sub.test/rest/stream.view?u=me&t=tok&s=salt&c=Tributary&id=1",
+            // Not an audio extension.
+            "https://music.test/stream.php?api_key=secret",
+            "https://music.test/stream.exe?api_key=secret",
+            "https://music.test/stream?api_key=secret",
+        ] {
+            assert_eq!(
+                upstream_media_extension(&url(no_extension)),
+                None,
+                "{no_extension} must not shape the ticket path"
+            );
+        }
     }
 }

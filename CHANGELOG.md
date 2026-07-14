@@ -24,7 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Third-party requests refuse plaintext downgrades** — Radio-Browser, IP geolocation, and MusicBrainz requests still follow the cross-host redirects those services depend on, but no longer follow one from HTTPS down to HTTP, and no longer send a `Referer`.
 - **Dependency-audit findings are resolved or explicitly time-bounded** — The withdrawn `spin 0.9.8` transitive dependency is updated to compatible `0.9.9`. The two remaining warnings (`paste` and `proc-macro-error2`, both unmaintained) have documented dependency paths, follow-ups, and review deadlines. The sole ignored vulnerability, `RUSTSEC-2023-0071` for `rsa`, exists only in `Cargo.lock` through inactive MySQL support: Tributary enables SQLite, but `cargo-audit` checks locked optional packages. Because no fixed release exists, the ignore remains until 2026-10-10 or the next release, whichever comes first, with immediate review if MySQL support is enabled.
 
-> **Known exposure, not yet fixed:** playing a track from an authenticated remote backend to a Chromecast or MPD receiver still hands that device the stream URL with its credential in the query string. Tracked as P1.6.
+- **Chromecast no longer receives your server credentials** — Casting a track from Subsonic, Jellyfin, or Plex used to hand the Chromecast the stream URL with your credential still in it: your Plex token, your Jellyfin API key, or — with Subsonic's plaintext auth mode — your **actual password**, hex-encoded and trivially reversible. That credential went to a device Tributary does not control, over a LAN it does not control, and was retained in the device's media session. Tributary now fetches the stream itself and gives the device only an opaque, single-use ticket, revoked when playback stops. Internet radio and other unauthenticated streams are unaffected and still play directly.
+
+> **Known exposure, not yet fixed:** the same problem remains for **MPD**, which is still sent the credential-bearing URL over a plaintext connection. Tracked as P1.6.
 
 ### Changed
 - **Minimum supported Rust version raised to 1.85.**

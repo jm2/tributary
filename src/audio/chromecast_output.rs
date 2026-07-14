@@ -1322,6 +1322,75 @@ fn is_current(owner: CommandOwner, intent_epoch: &AtomicU64) -> bool {
     intent_epoch.load(Ordering::SeqCst) == owner.epoch
 }
 
+/// How a track URI must be handed to a Cast device.
+///
+/// Deliberately not `Debug`: `Proxied` holds a credential-bearing URL, and the
+/// entire purpose of this type is that the URL never gets printed or sent to a
+/// receiver.
+#[derive(Clone, PartialEq, Eq)]
+enum CastMedia {
+    /// A local file. The receiver cannot read `file://`, so serve it over the
+    /// LAN HTTP server.
+    LocalFile(std::path::PathBuf),
+    /// A URI that claims to be a local file but is not a usable path. It must
+    /// be rejected, never forwarded — a malformed `file://` URI is not something
+    /// to hand a receiver.
+    InvalidLocalUri,
+    /// A remote stream carrying a credential. Tributary fetches it and hands
+    /// the receiver an opaque ticket instead.
+    Proxied(Box<url::Url>),
+    /// Anything else — internet radio, plain unauthenticated HTTP. There is no
+    /// secret to protect, and relaying a live radio stream through this process
+    /// would buy nothing.
+    Direct(String),
+}
+
+/// Decide how a URI reaches the receiver.
+///
+/// This is the security boundary. A Subsonic, Jellyfin, or Plex stream URL
+/// carries the user's token in its query string — and under Subsonic's
+/// plaintext auth mode it carries `p=enc:<hex>`, the user's actual *password*,
+/// which unlike a token cannot be revoked. Passing such a URL to a Cast device
+/// publishes that credential to hardware Tributary does not control, over a LAN
+/// it does not control, where it also lands in the device's media session.
+fn classify_cast_uri(uri: &str) -> CastMedia {
+    // The *declared* scheme is decided before parsing, because parsing can
+    // fail. A malformed `file://` URI must still be rejected as a bad local
+    // path — falling through to "pass it to the device" would forward a URI we
+    // could not even parse.
+    //
+    // Compared case-insensitively: URL schemes are case-insensitive, and while
+    // `Url::parse` normalizes them, this check runs *before* parsing and has to
+    // catch `FILE://[bad` too.
+    let declares_local_file = uri
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"));
+
+    let Ok(parsed) = url::Url::parse(uri) else {
+        return if declares_local_file {
+            CastMedia::InvalidLocalUri
+        } else {
+            // Nothing we can read a credential out of; pass it through as before.
+            CastMedia::Direct(uri.to_string())
+        };
+    };
+
+    if declares_local_file || parsed.scheme() == "file" {
+        return match parsed.to_file_path() {
+            Ok(path) => CastMedia::LocalFile(path),
+            Err(()) => CastMedia::InvalidLocalUri,
+        };
+    }
+
+    if matches!(parsed.scheme(), "http" | "https")
+        && crate::http_security::url_carries_credentials(&parsed)
+    {
+        return CastMedia::Proxied(Box::new(parsed));
+    }
+
+    CastMedia::Direct(uri.to_string())
+}
+
 impl ChromecastOutput {
     pub fn new(
         display_name: &str,
@@ -1403,41 +1472,94 @@ impl ChromecastOutput {
         false
     }
 
+    /// Resolve a track URI into something it is safe to hand to a Cast device.
+    ///
+    /// Three cases:
+    ///
+    /// - `file://` — the receiver cannot read local files, so serve it over the
+    ///   LAN HTTP server.
+    /// - A credential-bearing `http(s)://` URL — a Subsonic, Jellyfin, or Plex
+    ///   stream URL carries the user's token in its query string, and with
+    ///   Subsonic's plaintext mode it carries the user's *password*. Handing
+    ///   that to the device would publish the credential to hardware we do not
+    ///   control. Proxy it instead, so the device only ever sees an opaque
+    ///   ticket.
+    /// - Anything else (internet radio, plain unauthenticated HTTP) — pass
+    ///   through untouched. There is no secret to protect, and relaying a live
+    ///   radio stream through this process would buy nothing.
     fn resolve_uri(&self, uri: &str) -> CastResult<String> {
-        if !uri.starts_with("file://") {
-            return Ok(uri.to_string());
-        }
+        // Any new load retires the previous credential ticket, whatever the new
+        // track turns out to be. Revoking only inside `register_upstream` would
+        // leave a ticket alive when a credentialed track is followed by an
+        // unauthenticated one (radio, or a local file): the device could keep
+        // replaying the protected stream long after playback moved on.
+        self.revoke_proxy_tickets();
 
-        let file_path = url::Url::parse(uri)
-            .ok()
-            .and_then(|url| url.to_file_path().ok())
-            .ok_or_else(|| CastFailure::new("local media URI validation"))?;
-        if !file_path.exists() {
+        match classify_cast_uri(uri) {
+            CastMedia::LocalFile(path) => self.resolve_local_file(&path),
+            CastMedia::InvalidLocalUri => Err(CastFailure::new("local media URI validation")),
+            CastMedia::Proxied(url) => {
+                let server = self.ensure_cast_server()?;
+                let server = server
+                    .as_ref()
+                    .ok_or_else(|| CastFailure::new("media proxy startup"))?;
+                Ok(server.register_upstream(&url))
+            }
+            CastMedia::Direct(uri) => Ok(uri),
+        }
+    }
+
+    fn resolve_local_file(&self, file_path: &std::path::Path) -> CastResult<String> {
+        let file_path = file_path.to_path_buf();
+        // A regular file, not merely something that exists: `file://` parses to
+        // the filesystem root, and serving a directory to a receiver is never
+        // what the user meant.
+        if !file_path.is_file() {
             return Err(CastFailure::new("local media lookup"));
         }
         let file_path = file_path
             .canonicalize()
             .map_err(|error| opaque_cast_failure("local media canonicalization", error))?;
 
+        let server = self.ensure_cast_server()?;
+        let server = server
+            .as_ref()
+            .ok_or_else(|| CastFailure::new("local media server startup"))?;
+        Ok(server.register_file(&file_path))
+    }
+
+    /// Revoke every credential-bearing ticket the proxy is holding.
+    ///
+    /// Best-effort: a poisoned lock or an unstarted server means there is
+    /// nothing to revoke.
+    fn revoke_proxy_tickets(&self) {
+        if let Ok(guard) = self.cast_server.lock() {
+            if let Some(server) = guard.as_ref() {
+                server.revoke_upstreams();
+            }
+        }
+    }
+
+    /// Start the LAN media server if it is not already running.
+    fn ensure_cast_server(&self) -> CastResult<std::sync::MutexGuard<'_, Option<CastHttpServer>>> {
         let mut server_guard = self
             .cast_server
             .lock()
-            .map_err(|error| opaque_cast_failure("local media server state", error))?;
+            .map_err(|error| opaque_cast_failure("media server state", error))?;
+
         if server_guard.is_none() {
             let runtime = self
                 .rt_handle
                 .as_ref()
-                .ok_or_else(|| CastFailure::new("local media server startup"))?;
+                .ok_or_else(|| CastFailure::new("media server startup"))?;
             let server = runtime
                 .block_on(CastHttpServer::start())
-                .map_err(|error| opaque_cast_failure("local media server startup", error))?;
-            info!(addr = %server.addr(), "Cast HTTP server started for local file casting");
+                .map_err(|error| opaque_cast_failure("media server startup", error))?;
+            info!(addr = %server.addr(), "Cast HTTP server started");
             *server_guard = Some(server);
         }
-        Ok(server_guard
-            .as_ref()
-            .expect("server initialized")
-            .register_file(&file_path))
+
+        Ok(server_guard)
     }
 }
 
@@ -1480,6 +1602,10 @@ impl AudioOutput for ChromecastOutput {
     }
 
     fn stop(&self) {
+        // Kill the credential ticket as soon as playback is meant to end. It is
+        // not revoked on pause or seek: a Cast device re-fetches with a `Range`
+        // header when it seeks, so a ticket has to outlive those.
+        self.revoke_proxy_tickets();
         let _ = self.enqueue(self.next_owner(), CommandKind::Stop);
     }
 
@@ -2928,5 +3054,115 @@ mod tests {
 
         assert_eq!(snapshot.state, Some(PlayerState::Buffering));
         assert_eq!(snapshot.terminal, None);
+    }
+
+    // ── P1.6: credentials must never reach a Cast device ──────────────
+
+    fn classify(uri: &str) -> CastMedia {
+        classify_cast_uri(uri)
+    }
+
+    /// The bug this exists for. Every one of these URLs used to be handed to
+    /// the Chromecast verbatim, credential and all.
+    #[test]
+    fn a_credential_bearing_stream_is_always_proxied() {
+        let leaks = [
+            // Plex: the account-wide token.
+            "https://plex.test/library/parts/1/a.flac?X-Plex-Token=plex-secret",
+            // Jellyfin: the access token.
+            "https://jellyfin.test/Audio/1/stream?api_key=jellyfin-secret",
+            // Subsonic token auth: token + salt.
+            "https://sub.test/rest/stream.view?u=me&t=tok-secret&s=salt&c=Tributary&id=1",
+            // Subsonic PLAINTEXT auth: this is the user's password, hex-encoded
+            // and trivially reversible. It cannot be revoked.
+            "https://sub.test/rest/stream.view?u=me&p=enc%3A70617373&c=Tributary&id=1",
+            // DAAP session id.
+            "http://daap.test:3689/databases/1/items/2.mp3?session-id=daap-secret",
+            // Credentials in user-info rather than the query.
+            "https://me:hunter2@music.test/stream.flac",
+        ];
+
+        for uri in leaks {
+            match classify(uri) {
+                CastMedia::Proxied(_) => {}
+                CastMedia::Direct(passed_through) => panic!(
+                    "credential-bearing URL was handed straight to the device: {passed_through}"
+                ),
+                CastMedia::LocalFile(_) | CastMedia::InvalidLocalUri => {
+                    panic!("remote URL misclassified as local: {uri}")
+                }
+            }
+        }
+    }
+
+    /// The receiver must see an opaque ticket, never the secret.
+    #[test]
+    fn a_proxied_stream_never_exposes_the_secret_to_the_receiver() {
+        let uri = "https://sub.test/rest/stream.view?u=me&p=enc%3A70617373&c=Tributary&id=1";
+        let CastMedia::Proxied(upstream) = classify(uri) else {
+            panic!("must be proxied");
+        };
+
+        // The upstream URL is what *Tributary* fetches, in-process. What the
+        // device is given is a ticket minted by the LAN server, which contains
+        // only a random UUID — asserted here by construction: the ticket is
+        // built from the server address and a fresh v4 UUID, never from `uri`.
+        assert!(upstream.as_str().contains("enc%3A70617373"));
+
+        // And the classification itself must not be Direct, which is the only
+        // path that would ever return `uri` to a caller.
+        assert!(!matches!(classify(uri), CastMedia::Direct(_)));
+    }
+
+    /// Internet radio has no secret, and relaying a live stream through this
+    /// process would buy nothing. It must still pass straight through.
+    #[test]
+    fn an_unauthenticated_stream_is_not_relayed() {
+        for uri in [
+            "http://radio.test/stream.mp3",
+            "https://radio.test/listen?bitrate=128&format=mp3",
+            // An ordinary `s`/`p` pair on a non-Subsonic service is not a
+            // credential and must not trigger the proxy.
+            "https://radio.test/search?s=jazz&p=2",
+        ] {
+            // `CastMedia` has no `Debug` on purpose — a credential must not be
+            // printable — so match rather than `assert_eq!`.
+            match classify(uri) {
+                CastMedia::Direct(passed_through) => assert_eq!(passed_through, uri),
+                _ => panic!("{uri} should be passed through untouched"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_file_is_still_served_from_disk() {
+        // Built from a real absolute path: `Url::from_file_path` rejects a bare
+        // POSIX path on Windows, which needs a drive letter.
+        let path = std::env::temp_dir().join("song.flac");
+        let uri = url::Url::from_file_path(&path)
+            .expect("file URL")
+            .to_string();
+        assert!(matches!(classify(&uri), CastMedia::LocalFile(_)));
+    }
+
+    /// A `file://` URI that does not parse must be rejected, not forwarded.
+    /// Classifying on the parse result alone dropped it into the pass-through
+    /// arm, which handed the device a URI we could not even read — caught by
+    /// `invalid_local_uri_error_is_secret_free`.
+    ///
+    /// The scheme comparison is case-insensitive, so `FILE://` cannot sneak
+    /// past it into the pass-through arm either.
+    #[test]
+    fn an_unparseable_local_uri_is_rejected_rather_than_forwarded() {
+        for uri in [
+            "file://[not-a-url",
+            "file://[cast-secret-token",
+            "FILE://[not-a-url",
+        ] {
+            assert!(
+                matches!(classify(uri), CastMedia::InvalidLocalUri),
+                "{uri} must be rejected, not passed to the device"
+            );
+        }
     }
 }
