@@ -764,6 +764,10 @@ fn open_windows_directory(path: &Path) -> io::Result<File> {
         FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
+    // `FILE_SHARE_DELETE` is intentionally omitted. These are namespace
+    // guards, not ordinary read handles: allowing delete sharing would let a
+    // retained root, ancestor, or bound directory be renamed or unlinked
+    // between final authority validation and the SQLite commit it authorizes.
     let file = OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -789,6 +793,10 @@ fn open_windows_regular(path: &Path, share_writes: bool) -> io::Result<File> {
         FILE_SHARE_WRITE,
     };
 
+    // Keep delete sharing disabled for the same reason as directory handles:
+    // the marker and bound files must pin their namespace entries through the
+    // database commit. `share_writes` is permitted only where an in-place
+    // content update can be detected by marker/evidence revalidation.
     let share_mode = FILE_SHARE_READ | if share_writes { FILE_SHARE_WRITE } else { 0 };
     let file = OpenOptions::new()
         .read(true)
@@ -1297,7 +1305,19 @@ mod tests {
         fs::write(&missing_song, b"appeared").expect("create missing leaf");
         fs::create_dir(directory.path().join("gone-album")).expect("create missing ancestor");
         let displaced_album = directory.path().join("displaced-album");
-        fs::rename(&replace_album, &displaced_album).expect("displace absence-proof parent");
+        if let Err(error) = fs::rename(&replace_album, &displaced_album) {
+            #[cfg(windows)]
+            if error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(32) {
+                assert!(leaf.validate(&lease).is_err());
+                assert!(subtree.validate(&lease).is_err());
+                replaced_parent
+                    .validate(&lease)
+                    .expect("Windows retained parent prevents replacement");
+                assert!(lease.prove_absent(&missing_song).is_err());
+                return;
+            }
+            panic!("displace absence-proof parent: {error}");
+        }
         fs::create_dir(&replace_album).expect("replace absence-proof parent");
         assert!(leaf.validate(&lease).is_err());
         assert!(subtree.validate(&lease).is_err());
@@ -1414,6 +1434,52 @@ mod tests {
             .expect("link the same final object through replacement parent");
 
         assert!(bound_song.validate(&lease).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lease_pins_root_and_marker_namespace_until_drop() {
+        let directory = TestDirectory::new("windows-lease-namespace-pin");
+        directory.write_marker(MARKER);
+        let marker = directory.path().join(ROOT_IDENTITY_FILE);
+        let displaced_marker = directory.path().join("displaced-marker");
+        let displaced_root = directory.path().with_extension("displaced-root");
+        let lease = RootAuthorityLease::acquire(directory.path(), MARKER).expect("acquire lease");
+
+        assert!(fs::remove_file(&marker).is_err());
+        assert!(fs::rename(directory.path(), &displaced_root).is_err());
+
+        drop(lease);
+        fs::rename(&marker, &displaced_marker).expect("rename marker after lease drop");
+        fs::rename(&displaced_marker, &marker).expect("restore marker");
+        fs::rename(directory.path(), &displaced_root).expect("rename root after lease drop");
+        fs::rename(&displaced_root, directory.path()).expect("restore root");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bounds_pin_file_and_directory_namespace_until_drop() {
+        let directory = TestDirectory::new("windows-bound-namespace-pin");
+        directory.write_marker(MARKER);
+        let album = directory.path().join("album");
+        fs::create_dir(&album).expect("create album");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"audio").expect("write song");
+        let moved_song = directory.path().join("moved.flac");
+        let moved_album = directory.path().join("moved-album");
+        let lease = RootAuthorityLease::acquire(directory.path(), MARKER).expect("acquire lease");
+
+        let bound_song = lease.open_regular_file(&song).expect("bind song");
+        assert!(fs::remove_file(&song).is_err());
+        drop(bound_song);
+        fs::rename(&song, &moved_song).expect("rename song after bound handle drop");
+        fs::rename(&moved_song, &song).expect("restore song");
+
+        let bound_album = lease.bind_directory(&album).expect("bind album");
+        assert!(fs::rename(&album, &moved_album).is_err());
+        drop(bound_album);
+        fs::rename(&album, &moved_album).expect("rename album after bound handle drop");
+        fs::rename(&moved_album, &album).expect("restore album");
     }
 
     #[cfg(target_os = "linux")]
