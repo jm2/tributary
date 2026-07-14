@@ -27,7 +27,7 @@ Status summary:
 
 Progress snapshot (2026-07-14, excluding the two still-open release-workflow items deferred by
 request):
-**115/213 (54.0%)** non-release checklist items complete; **99/112 (88.4%)** across P0 and P1.
+**116/213 (54.5%)** non-release checklist items complete; **100/112 (89.3%)** across P0 and P1.
 
 ## P0 — Release blockers
 
@@ -244,8 +244,10 @@ explicitly justified and time-bounded.
 - [x] Compare scheme, hostname, and effective port.
 - [x] Forbid HTTPS-to-HTTP downgrade.
 - [x] Apply the policy to app-owned API, authentication, artwork, and DAAP clients.
-- [ ] Route credential-bearing playback streams through the P1.6 app-owned proxy so local,
-  AirPlay, MPD, and Chromecast no longer depend on redirect policies Tributary cannot control.
+- [ ] Route credential-bearing local and AirPlay playback through an app-owned fetch path
+  protected by the exact-origin policy. Chromecast and MPD now receive opaque proxy tickets;
+  GStreamer `playbin3` and AirPlay `uridecodebin` still fetch the original authenticated URL
+  directly.
 - [x] Strip credential-bearing URLs from every retained/formatted HTTP or pipeline error.
 - [x] Stop logging raw DAAP session IDs and authenticated MPD commands.
 - [x] Add redirect matrix tests using mock servers.
@@ -263,10 +265,12 @@ explicitly justified and time-bounded.
 
 ### P1.6 Stop handing backend credentials to receivers
 
-**This is the highest live exposure in the tracker.** It is not limited to "broad bearer
+This began as the tracker's highest live credential exposure. It is not limited to "broad bearer
 tokens": with Subsonic's plaintext auth mode the URL carries `p=enc:<hex_password>` — the
-user's actual password, hex-encoded and trivially reversible. Unlike a token, a password
-cannot be revoked, and users reuse it. Playing one track to a Chromecast is enough.
+user's actual password, hex-encoded and trivially reversible. Chromecast and MPD no longer
+receive those URLs, but the credentials are still retained in generic track/UI values and handed
+to GStreamer for local and AirPlay decoding until the remaining model and playback-path work is
+complete.
 
 Confirmed path, end to end:
 
@@ -274,13 +278,14 @@ Confirmed path, end to end:
 |---|---|
 | Credential is baked into the stream URL | `plex/client.rs:236-242` (`X-Plex-Token`, account-wide), `jellyfin/client.rs:256-260` (`api_key`), `subsonic/client.rs:195-198` (`p=enc:<hex_password>`) |
 | Retained in the generic model | `architecture/models.rs:60` — `Track.stream_url` |
-| Copied verbatim into the UI object | `ui/window.rs:2080` |
-| Handed to the receiver untouched | `audio/chromecast_output.rs:1406-1409` — `resolve_uri` proxies **only** `file://`; every `http(s)://` URL is returned as-is and becomes the Cast `content_id`. MPD sends the same URL via `addid` over **plaintext TCP**, so it also lands in the daemon's queue state and `mpd.log`. |
+| Copied verbatim into the UI object | `ui/window.rs::arch_track_to_object` (the `stream_url` branch) |
+| Classified at the receiver boundary | `audio/chromecast_output.rs::classify_cast_uri` and `audio/mpd_output.rs::MpdOutput::load_uri` exchange supported credential-bearing HTTP(S) URLs for opaque tickets before Cast `content_id` or MPD `addid`. Plaintext MPD protocol traffic, queue state, and logs therefore see only the ticket. |
+| Still handed to a playback library untouched | `audio/mod.rs::Player::load_uri` (`playbin3`) and `audio/airplay_output.rs::open_session` (`uridecodebin`) still receive the original URL. Those paths do not expose it to the receiver, but they bypass Tributary's app-owned exact-origin redirect policy and may expose it to GStreamer diagnostics. |
 
-Design — generalize the existing local-file server into a media ticket proxy. The building
-block is already sound: `audio/cast_http_server.rs` binds a LAN-only listener on port 0 and
-routes on an unguessable v4 UUID (`:120-133`). What it lacks is upstream fetching and
-revocation.
+Design — the existing local-file server is now also a media ticket proxy. Chromecast keeps its
+LAN IPv4 listener, while MPD binds a dedicated proxy to the local IP and address family of the
+successful MPD TCP connection. Both use OS-assigned ports and unguessable UUID routes; the
+credential-bearing upstream stays inside Tributary.
 
 - [x] Give the proxy two registration kinds: `MediaSource::Local(PathBuf)` (today's behavior) and
   `MediaSource::Upstream(Url)`, where the proxy — not the receiver — fetches from the backend
@@ -299,10 +304,15 @@ revocation.
 - [x] Threat-model spoofed and compromised LAN receivers: a hostile receiver now obtains a
   single-media ticket, revoked on stop and superseded on the next load, instead of an account
   credential.
-- [ ] Route **MPD** through the same proxy. MPD still sends the credential-bearing URL via `addid`
-  over **plaintext TCP**, so it crosses the LAN in the clear and lands in the daemon's queue state
-  and `mpd.log`. Blocked only by sequencing: `audio/mpd_output.rs` is owned by P1.8 (PR #76). The
-  proxy it needs already exists — this is a small change once that lands.
+- [x] Route **MPD** through the same proxy. `MpdOutput::load_uri` classifies media before it can
+  enter the ordered worker; after classification, a protected URL remains app-private and is
+  consumed only by the ordered worker/proxy. The worker starts a dedicated proxy on the successful
+  TCP connection's exact local IPv4/IPv6 route and sends only the opaque ticket via `addid`.
+  Missing runtime/address state, unusable IPv6 scope, proxy startup,
+  registration, and generated-argument failures all fail closed without falling back to the raw
+  URL. A replacing direct, protected, or rejected load, user Stop, output drop, natural end,
+  ownership loss, operation failure, worker shutdown, and stale generation revoke the ticket;
+  pause, seek, and an explicit remote Stop that retains the same song keep it restartable.
 - [ ] Keep backend credentials outside generic `Track` values: drop the credential from
   `Track.stream_url` and add a backend `resolve_stream(&track) -> (Url, HeaderMap)` called at
   playback time, moving `X-Plex-Token` / `api_key` / Subsonic `u,t,s,p` out of the query string
@@ -310,12 +320,16 @@ revocation.
   the credential stop being copied through the UI layer at all. Build it to serve P3.1's
   "resolve playable URLs at playback time" as well, rather than twice.
 - [ ] Give tickets a TTL in addition to revocation, so a ticket cannot outlive a crashed session.
-- [x] Record implementation: Chromecast proxy in commit `c6aa7df`; 6 focused classification,
-  credential-detection, and pass-through tests. MPD and credential-free `Track` values remain open.
+- [x] Record implementation: Chromecast proxy in commit `c6aa7df` with 6 focused classification,
+  credential-detection, and pass-through tests; MPD proxy in commit `e23efd8` with 18 new focused
+  tests (10 worker/ticket lifecycle, 3 media classification, and 5 route/body-error tests).
+  Credential-free `Track` values and ticket TTLs remain open.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
-device or daemon Tributary does not own. **Chromecast now meets this; MPD does not yet.** Closing
-the MPD half also closes P1.4's last checkbox.
+device or daemon Tributary does not own. **Chromecast and MPD now meet the receiver-boundary
+criterion.** P1.6 remains open because generic `Track`/UI values still carry credentials and
+tickets have no TTL. P1.4 also remains open because local and AirPlay GStreamer fetches do not
+use the app-owned exact-origin path.
 
 ### P1.7 Serialize Chromecast lifecycle and commands
 
@@ -823,26 +837,52 @@ Record scope or design decisions here so deferred work is explicit.
   effective port. Request URLs are removed before reqwest errors are formatted or retained;
   URL userinfo and backend query credentials are rejected or redacted; DAAP session IDs and MPD
   command arguments are no longer logged; and GStreamer errors use stable URL-free diagnostics.
-  Direct playback remains deliberately open under P1.6: local and AirPlay streams are fetched by
-  GStreamer, while MPD and Chromecast fetch on external receivers, so Tributary cannot enforce an
-  upstream redirect callback on those transports until it owns the stream through a short-lived
-  proxy/ticket. Disabling redirects only for GStreamer would be both incomplete and potentially
-  breaking, so the playback-stream checkbox remains explicit rather than being claimed complete.
+  Chromecast and MPD now receive opaque app-owned proxy tickets rather than the authenticated
+  upstream. Local and AirPlay decoding still gives the original URL to GStreamer, whose redirect
+  behavior Tributary does not own; disabling redirects only for those pipelines would be both
+  incomplete and potentially breaking. The playback-stream checkbox therefore remains open until
+  those two paths use an app-owned exact-origin fetch rather than being claimed complete from the
+  receiver work alone.
 - 2026-07-12 — P1.5 treats every finite HTTP response as an observed byte stream rather than
   trusting `Content-Length`: Subsonic, Jellyfin, Plex, DAAP, authentication, radio/geolocation,
   artwork, and MusicBrainz reads now stop at endpoint-specific caps and carry end-to-end request
   deadlines in addition to idle-read timeouts. Async and blocking collectors classify request
   timeouts consistently, discard credential-bearing request URLs from retained body errors, and
   fail cleanly on impossible or unavailable allocations. Audio and live-radio media streams remain
-  deliberately uncapped because they are length-unbounded playback transports; credential-bearing
-  playback still belongs to the cancellable P1.6 proxy/ticket design.
+  deliberately uncapped because they are length-unbounded playback transports. The Chromecast and
+  MPD credential boundaries are handled by P1.6's revocable proxy tickets; local/AirPlay fetch
+  ownership, credential-free generic track values, and ticket TTLs remain separate open work.
+- 2026-07-14 — P1.6 classifies every media URI before it can reach MPD. Supported credential
+  shapes (URL userinfo; Plex `X-Plex-Token`; Jellyfin `api_key`; DAAP `session-id`; and Subsonic
+  `t`/`s` or shaped `p`) require a proxy; malformed declared HTTP(S), credentialed unsupported
+  schemes, and scheme-relative or malformed credential shapes fail closed. Non-credential radio
+  URLs, `file:` URLs, and MPD library paths remain direct.
+  A protected load first establishes the MPD TCP connection, reads that socket's local address,
+  and starts one dedicated OS-port-assigned proxy on the same local IP and address family. The
+  full upstream URL remains app-private; only the worker supplies it to the in-process proxy.
+  Plaintext `addid`, daemon queue state, and MPD logs receive only the bracket-correct opaque
+  IPv4/IPv6 ticket. Unspecified addresses and scoped or
+  link-local IPv6 fail closed because they cannot produce a portable receiver URL. Runtime,
+  address, bind, registration, ticket validation, and upstream body-stream errors are reduced to
+  fixed URL-free categories and never fall back to the protected URL.
+  Each ticket fixes one upstream target, uses the no-`Referer` exact-origin client, and forwards
+  only `Range`. It is a replayable single-media bearer until revoked, not a single-use token:
+  pause, seek, and an explicit remote Stop retaining the owned song keep it live. Any replacement
+  load (including direct or rejected media), user Stop, output drop, natural end, ownership loss,
+  operation failure, worker shutdown, or stale generation revokes it when requested, processed,
+  or observed, and a stale session cannot revoke a newer generation. Registry revocation prevents
+  future lookups but does not cancel a response the proxy already admitted. Tickets still have no
+  TTL. Generic
+  `Track.stream_url`/UI values and local/AirPlay GStreamer fetches still hold the original URL, so
+  the remaining P1.6 and P1.4 boxes stay open.
 - 2026-07-12 — P1.7 places the non-`Send` Cast device, application, media session, controls,
   heartbeat, status polling, and teardown on one FIFO worker. Epoch checks bracket every Cast
   effect and event; ownership is recorded immediately after application launch and media load so
   superseded calls remain cleanable. Failures retire the session before publishing Stopped then
   Error, clean media/application ownership with fair bounded retries, and abandon an unreachable
   application after three attempts so a replacement load can reconnect. The legacy local-file
-  resolver remains synchronous until P1.6 replaces it with the shared proxy/ticket path.
+  resolver remains synchronous; P1.6's upstream ticket proxy does not change that local-path
+  lookup behavior.
   `rust_cast 0.21` uses blocking `TcpStream` calls, hides the socket, and offers no timeout or
   custom-stream constructor, so cancellation can be checked only before and after an in-flight
   call; hard receiver I/O deadlines require an upstream change or audited fork and are tracked as
@@ -904,8 +944,9 @@ Add one line per completed task:
 | 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
 | 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |
 | 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
-| 2026-07-12 | P1.4a | `eb5458f` | Exact-origin/no-Referer policy and URL-free errors/logging cover every app-owned credential HTTP fetch; receiver-controlled playback streams remain tied to P1.6. |
+| 2026-07-12 | P1.4a | `eb5458f` | Exact-origin/no-Referer policy and URL-free errors/logging cover every app-owned credential HTTP fetch. Chromecast and MPD are now ticketed by P1.6; local and AirPlay GStreamer fetches remain open. |
 | 2026-07-12 | P1.5 | `842341b` | Counted finite-response reads enforce endpoint caps and total deadlines across API, authentication, DAAP, radio, artwork, and metadata clients. |
+| 2026-07-14 | P1.6 receiver tickets | `c6aa7df`, `e23efd8` | Chromecast and MPD now receive revocable single-media tickets instead of backend credentials. MPD binds a dedicated IPv4/IPv6 proxy to the successful connection route, fails closed without it, and revokes across replacement, Stop, failure, ownership loss, EOS, shutdown, and stale generations; 18 new MPD/classifier/route tests cover the slice. Generic credential-free track values and TTLs remain open. |
 | 2026-07-12 | P1.7 | `60ee2af` | One worker owns the Cast session and serializes effects, authoritative state, cancellation, cleanup retries, and stale-event suppression. |
 | 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
 | 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |
