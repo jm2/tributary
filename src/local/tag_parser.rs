@@ -1,11 +1,13 @@
 //! Audio tag parser — wraps `lofty` to extract metadata from audio files.
 
+use std::fs::File;
 use std::path::Path;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::file::{AudioFile, FileType, TaggedFileExt};
+use lofty::probe::Probe;
 use lofty::tag::Accessor;
 
 /// Supported audio file extensions.
@@ -49,9 +51,25 @@ pub struct ParsedTrack {
 /// on the GTK main thread rely on that contract; the scan paths additionally
 /// run it inside `spawn_blocking`, which already isolates any panic.
 pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
-    // Read tags via lofty
-    let tagged_file = lofty::read_from_path(path)
-        .with_context(|| format!("Failed to read tags from {}", path.display()))?;
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open audio file {}", path.display()))?;
+    parse_audio_file_from_file(file, path)
+}
+
+/// Parse metadata from an already-open audio file.
+///
+/// Filesystem-authority callers use this entry point so tag parsing consumes
+/// the exact object they opened beneath a retained library-root handle instead
+/// of resolving the pathname a second time.
+pub fn parse_audio_file_from_file(mut file: File, path: &Path) -> Result<ParsedTrack> {
+    // Preserve `read_from_path`'s extension-based format selection while
+    // giving lofty the already-authorized descriptor instead of letting it
+    // reopen `path`. Fall back to content probing only for an unknown suffix.
+    let tagged_file = match FileType::from_path(path) {
+        Some(file_type) => Probe::with_file_type(&mut file, file_type).read(),
+        None => lofty::read_from(&mut file),
+    }
+    .with_context(|| format!("Failed to read tags from {}", path.display()))?;
 
     let tag = tagged_file
         .primary_tag()
@@ -103,7 +121,8 @@ pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
         .to_uppercase();
 
     // Filesystem metadata
-    let metadata = std::fs::metadata(path)
+    let metadata = file
+        .metadata()
         .with_context(|| format!("Failed to read metadata for {}", path.display()))?;
 
     let date_modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -134,6 +153,42 @@ pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    fn write_minimal_wav(path: &Path) {
+        let data_size = 1_u32;
+        let mut bytes = Vec::with_capacity(45);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_size).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&8_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_size.to_le_bytes());
+        bytes.push(128);
+        std::fs::write(path, bytes).expect("write minimal WAV fixture");
+    }
+
+    #[test]
+    fn parses_from_the_supplied_file_handle() {
+        let path = std::env::temp_dir().join(format!(
+            "tributary-tag-parser-handle-{}.wav",
+            uuid::Uuid::new_v4()
+        ));
+        write_minimal_wav(&path);
+        let file = File::open(&path).expect("open WAV fixture");
+
+        let parsed = parse_audio_file_from_file(file, &path).expect("parse supplied handle");
+
+        assert_eq!(parsed.file_path, path.to_string_lossy());
+        assert_eq!(parsed.format, "WAV");
+        assert_eq!(parsed.file_size_bytes, Some(45));
+        std::fs::remove_file(path).expect("remove WAV fixture");
+    }
 
     #[test]
     fn test_is_audio_file_supported_extensions() {
