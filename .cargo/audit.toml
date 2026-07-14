@@ -2,24 +2,11 @@
 # https://docs.rs/cargo-audit/latest/cargo_audit/config/
 
 [advisories]
-# RUSTSEC-2023-0071 — rsa 0.9.10, Marvin Attack (timing side-channel key
-# recovery). No fixed release exists upstream.
-#
-# Why this is suppressed, verified 2026-07-13:
-#
-# `rsa` is present in Cargo.lock but is NEVER COMPILED. It is reachable only
-# through sqlx's optional `mysql` feature, which SeaORM does not enable — we
-# build `sqlx-sqlite` only. `cargo tree -i rsa` is empty, and `sqlx-mysql` does
-# not appear in the built dependency graph at all.
-#
-# `cargo audit` resolves against the lockfile rather than the compiled graph, so
-# it reports the advisory anyway. The suppression exists to reflect that gap,
-# not to hide a reachable vulnerability.
-#
-# This is therefore load-bearing, NOT vestigial: removing it fails the CI audit
-# job. If a MySQL feature is ever enabled, this ignore must be deleted first —
-# at that point `rsa` becomes real code and the advisory becomes real.
-#
-# Revisit by 2026-10-10 or the next release, whichever comes first. Tracked as
-# P0.8 in docs/task.md.
+# rsa 0.9.10 — Marvin Attack (RUSTSEC-2023-0071)
+# Cargo.lock retains this advisory through sqlx-mysql even though Tributary enables only
+# sqlx-sqlite. Both `cargo tree --locked -i rsa` and
+# `cargo tree --locked -e features -i sqlx-mysql` are empty for the configured build, but
+# cargo-audit still checks locked optional packages. No fixed rsa release is available.
+# Review by 2026-10-10 or before the next release, whichever comes first, and immediately
+# before enabling MySQL support.
 ignore = ["RUSTSEC-2023-0071"]
