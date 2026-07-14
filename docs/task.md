@@ -276,7 +276,7 @@ retires P1.7's synchronous local-file resolver note.
 - [x] Clear buffering timers on success and error.
 - [x] Redact authenticated URLs from command logs.
 - [x] Add fake-server tests including slow and reordered commands.
-- [x] Record implementation: commit `eb0b9ca`; 37 focused FIFO, supersession,
+- [x] Record implementation: commit `eb0b9ca`; PR #76; 37 focused FIFO, supersession,
   persistent-session, protocol-boundary, authoritative-state, ownership, EOS, timeout,
   poisoned-stream, IPv6-resolution, and credential-redaction tests.
 
