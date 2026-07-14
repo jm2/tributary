@@ -123,12 +123,14 @@ fn revoke_upstreams_in(media: &DashMap<String, MediaSource>) {
 
 /// Resolve one ticket using a caller-supplied monotonic clock.
 ///
-/// The DashMap entry guard makes the live check, clone, and expired-entry
-/// removal one atomic operation with respect to registration and revocation on
-/// the same key. The clock is sampled only after that guard is acquired, so a
-/// lookup delayed across its deadline cannot be admitted with a stale instant.
-/// Once a live source is cloned, that admitted request may finish even if the
-/// deadline passes or the registry entry is revoked afterward.
+/// The borrowed-key lookup avoids allocating a `String` for every media
+/// request. The clock is sampled only after its entry guard is acquired, so a
+/// lookup delayed across the deadline cannot be admitted with a stale instant.
+/// An expired entry is removed conditionally after releasing that guard: if a
+/// replacement somehow wins the gap, it is removed only when it too was
+/// already expired at the sampled instant. Once a live source is cloned, that
+/// admitted request may finish even if the deadline passes or the registry
+/// entry is revoked afterward.
 fn resolve_media_with_clock<F>(
     media: &DashMap<String, MediaSource>,
     ticket: &str,
@@ -137,17 +139,16 @@ fn resolve_media_with_clock<F>(
 where
     F: FnOnce() -> Instant,
 {
-    match media.entry(ticket.to_owned()) {
-        dashmap::mapref::entry::Entry::Occupied(entry) => {
-            if entry.get().is_expired_at(now()) {
-                entry.remove();
-                None
-            } else {
-                Some(entry.get().clone())
-            }
-        }
-        dashmap::mapref::entry::Entry::Vacant(_) => None,
+    let source = media.get(ticket)?;
+    let observed_at = now();
+
+    if !source.is_expired_at(observed_at) {
+        return Some(source.clone());
     }
+
+    drop(source);
+    media.remove_if(ticket, |_, current| current.is_expired_at(observed_at));
+    None
 }
 
 /// Shared state for the cast HTTP server.
