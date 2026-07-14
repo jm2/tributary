@@ -133,8 +133,7 @@ and carry the same version.
   disposition.
 - [x] Run `cargo audit` successfully.
 - [x] Record implementation: PR #68 supplied the initial dependency fixes and then-known warning
-  dispositions; disposition follow-up is in commit `a35cde8`, with the current branch's final
-  `spin` lockfile commit _pending_.
+  dispositions; commits `a35cde8` and `e9a3efc` document the follow-up and update `spin`.
 - [x] Re-close the disposition table after its post-2026-07-10 drift (found and corrected
   2026-07-13). After updating `spin`, `cargo audit --no-fetch` reports exactly two allowed
   warnings, both unmaintained dependencies. The separate `RUSTSEC-2023-0071` ignore is
@@ -791,7 +790,7 @@ Add one line per completed task:
 | 2026-07-10 | P0.5 | PR #68 | One setup-time sidebar handler with current-item resolution and recycling tests. |
 | 2026-07-10 | P0.6 | PR #68 | Immutable release inputs and publication-only repository credentials. |
 | 2026-07-10 | P0.8 | PR #68 | Patched the then-failing dependencies and recorded the warnings known at the time. |
-| 2026-07-13 | P0.8 follow-up | `a35cde8`; final lockfile commit _pending_ | Updated `spin` to 0.9.9, leaving exactly two time-bounded unmaintained warnings; the lockfile-only ignored RSA advisory has an explicit rationale, deadline, and feature-enable trigger. |
+| 2026-07-13 | P0.8 follow-up | `a35cde8`, `e9a3efc` | Updated `spin` to 0.9.9, leaving exactly two time-bounded unmaintained warnings; the lockfile-only ignored RSA advisory has an explicit rationale, deadline, and feature-enable trigger. |
 | 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
 | 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |
 | 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
