@@ -59,8 +59,134 @@ pub enum LibraryEvent {
     /// Playlists loaded from the database.
     /// Vec of (id, name, is_smart).
     PlaylistsLoaded(Vec<(String, String, bool)>),
+    /// Complete, exact-configured roots which require an explicit user trust
+    /// decision before their observed storage may become authoritative.
+    RootTrustRequired(Vec<RootTrustRequest>),
+    /// Result of one engine-validated root-trust command.
+    RootTrustFinished {
+        request_id: Uuid,
+        path: PathBuf,
+        reason: RootTrustReason,
+        outcome: RootTrustOutcome,
+    },
     /// An error occurred.
     Error(String),
+}
+
+/// Why an exact configured library root requires explicit trust.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootTrustReason {
+    /// Persisted tracks predate durable library-root identity.
+    LegacyEnrollment,
+    /// A previously confirmed root now exposes a different identity.
+    Replacement,
+    /// A complete empty root cannot be distinguished from an unmounted
+    /// removable-volume mountpoint without an explicit decision.
+    EmptyRoot,
+}
+
+/// Public result of an explicit root-trust request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootTrustOutcome {
+    /// The enrollment scan and its separate authoritative follow-up completed.
+    Active,
+    /// The marker was staged, but a complete conversion could not finish.
+    TrustedButUnavailable,
+    /// Filesystem or persisted evidence no longer matched the prompt.
+    Stale,
+    /// A marker, database, task, or scan operation failed.
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RootTrustExpectedState {
+    device_id: Option<String>,
+    identity_confirmed: bool,
+    is_available: bool,
+    last_scan_complete: bool,
+}
+
+impl RootTrustExpectedState {
+    fn from_model(state: &library_root::Model) -> Self {
+        Self {
+            device_id: state.device_id.clone(),
+            identity_confirmed: state.identity_confirmed,
+            is_available: state.is_available,
+            last_scan_complete: state.last_scan_complete,
+        }
+    }
+
+    fn matches(&self, state: &library_root::Model) -> bool {
+        self.device_id == state.device_id
+            && self.identity_confirmed == state.identity_confirmed
+            && self.is_available == state.is_available
+            && self.last_scan_complete == state.last_scan_complete
+    }
+}
+
+/// Immutable evidence for one explicit root-trust decision.
+///
+/// GTK may display the path, reason, and remembered-row count, but the
+/// filesystem evidence and expected database state remain private. The only
+/// supported mutation path is cloning this value back into
+/// [`LibraryCommand::ConfirmRootTrust`].
+#[derive(Clone)]
+pub struct RootTrustRequest {
+    request_id: Uuid,
+    path: PathBuf,
+    reason: RootTrustReason,
+    remembered_track_count: usize,
+    requires_empty_acknowledgement: bool,
+    observed_identity: String,
+    observed_mount_generation: u64,
+    expected_state: RootTrustExpectedState,
+}
+
+impl RootTrustRequest {
+    pub fn request_id(&self) -> Uuid {
+        self.request_id
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn reason(&self) -> RootTrustReason {
+        self.reason
+    }
+
+    pub fn remembered_track_count(&self) -> usize {
+        self.remembered_track_count
+    }
+
+    /// Whether the complete observation was empty and therefore requires the
+    /// stronger unmounted-volume/destructive-reconciliation acknowledgement.
+    pub fn requires_empty_acknowledgement(&self) -> bool {
+        self.requires_empty_acknowledgement
+    }
+}
+
+impl std::fmt::Debug for RootTrustRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RootTrustRequest")
+            .field("request_id", &self.request_id)
+            .field("path", &self.path)
+            .field("reason", &self.reason)
+            .field("remembered_track_count", &self.remembered_track_count)
+            .field(
+                "requires_empty_acknowledgement",
+                &self.requires_empty_acknowledgement,
+            )
+            .field("evidence", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Commands accepted by the single owner of local-library mutation state.
+#[derive(Clone, Debug)]
+pub enum LibraryCommand {
+    ConfirmRootTrust(RootTrustRequest),
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +198,7 @@ pub struct LibraryEngine {
     db: DatabaseConnection,
     music_dirs: Vec<PathBuf>,
     tx: async_channel::Sender<LibraryEvent>,
+    command_rx: async_channel::Receiver<LibraryCommand>,
 }
 
 impl LibraryEngine {
@@ -82,20 +209,32 @@ impl LibraryEngine {
         db: DatabaseConnection,
         music_dirs: Vec<PathBuf>,
         tx: async_channel::Sender<LibraryEvent>,
+        command_rx: async_channel::Receiver<LibraryCommand>,
     ) -> Self {
-        Self { db, music_dirs, tx }
+        Self {
+            db,
+            music_dirs,
+            tx,
+            command_rx,
+        }
     }
 
     /// Run the engine: initial scan across all directories, then continuous
     /// FS watching on each.
     pub async fn run(self) {
-        let db = Arc::new(self.db);
+        let Self {
+            db,
+            music_dirs,
+            tx,
+            command_rx,
+        } = self;
+        let db = Arc::new(db);
 
         // Install before traversing so changes observed during the initial
         // scan are retained for replay after its snapshot is published.
         // Construction remains best-effort: a watcher backend failure must
         // not suppress the useful one-shot scan.
-        let (mut watcher, watcher_error) = match install_directory_watcher(&self.music_dirs) {
+        let (mut watcher, watcher_error) = match install_directory_watcher(&music_dirs) {
             Ok(watcher) => (Some(watcher), None),
             Err(error) => {
                 error!(%error, "Filesystem watcher could not be installed");
@@ -104,12 +243,12 @@ impl LibraryEngine {
         };
 
         // ── Initial scan (all directories) ───────────────────────────
-        for dir in &self.music_dirs {
+        for dir in &music_dirs {
             info!(dir = %dir.display(), "Starting initial library scan");
         }
-        if let Err(e) = initial_scan(&db, &self.music_dirs, &self.tx).await {
+        if let Err(e) = initial_scan(&db, &music_dirs, &tx).await {
             error!(error = %e, "Initial scan failed");
-            let _ = self.tx.send(LibraryEvent::Error(e.to_string())).await;
+            let _ = tx.send(LibraryEvent::Error(e.to_string())).await;
         }
 
         // A missing or temporarily unwatchable root can become available
@@ -117,21 +256,42 @@ impl LibraryEngine {
         // pre-scan registration, then retry only the gaps at the handoff so a
         // root the scan just indexed is never left unwatched until restart.
         if let Some(watcher) = watcher.as_mut() {
-            watcher.watch_available_directories(&self.music_dirs);
+            watcher.watch_available_directories(&music_dirs);
         }
 
         if let Some(error) = watcher_error {
-            let _ = self.tx.send(LibraryEvent::Error(error)).await;
+            let _ = tx.send(LibraryEvent::Error(error)).await;
         }
 
         // ── Filesystem watcher (all directories) ─────────────────────
+        let mut completed_commands = HashMap::new();
         if let Some(watcher) = watcher {
-            if let Err(e) = process_directory_events(&db, &self.music_dirs, &self.tx, watcher).await
+            if let Err(e) = process_directory_events(
+                &db,
+                &music_dirs,
+                &tx,
+                &command_rx,
+                &mut completed_commands,
+                watcher,
+            )
+            .await
             {
                 error!(error = %e, "Filesystem watcher failed");
-                let _ = self.tx.send(LibraryEvent::Error(e.to_string())).await;
+                let _ = tx.send(LibraryEvent::Error(e.to_string())).await;
             }
         }
+
+        // Keep trust decisions usable even when watcher installation failed
+        // or a previously installed watcher backend shut down. Commands are
+        // serialized through the same engine owner in both modes.
+        process_library_commands_without_watcher(
+            db.as_ref(),
+            &music_dirs,
+            &tx,
+            &command_rx,
+            &mut completed_commands,
+        )
+        .await;
     }
 }
 
@@ -270,7 +430,11 @@ struct RootMarkerCreation {
     created: bool,
 }
 
-fn create_root_marker(root: &Path) -> std::io::Result<RootMarkerCreation> {
+fn create_root_marker_with_identity(
+    root: &Path,
+    requested_identity: &str,
+) -> std::io::Result<RootMarkerCreation> {
+    let identity = parse_root_marker(requested_identity)?;
     if let Some(identity) = read_root_marker(root)? {
         return Ok(RootMarkerCreation {
             identity,
@@ -278,7 +442,6 @@ fn create_root_marker(root: &Path) -> std::io::Result<RootMarkerCreation> {
         });
     }
 
-    let identity = format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4());
     let path = root_identity_path(root);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -329,6 +492,10 @@ fn create_root_marker(root: &Path) -> std::io::Result<RootMarkerCreation> {
         identity,
         created: true,
     })
+}
+
+fn create_root_marker(root: &Path) -> std::io::Result<RootMarkerCreation> {
+    create_root_marker_with_identity(root, &format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4()))
 }
 
 fn is_marker_identity(identity: &str) -> bool {
@@ -1161,21 +1328,217 @@ fn scan_confirms_identity_for_scope(
         }
     }
 
-    allow_new_enrollment && existing_track_count == 0
+    allow_new_enrollment && previous.is_none() && existing_track_count == 0
 }
 
-/// Bind a complete, explicitly configured root to a durable marker.
+fn root_trust_reason(
+    scan: &RootScan,
+    previous: Option<&library_root::Model>,
+    existing_track_count: usize,
+    explicitly_configured: bool,
+    confirms_identity: bool,
+) -> Option<RootTrustReason> {
+    let observed_identity = scan.device_id.as_deref()?;
+    if !explicitly_configured
+        || !scan.is_complete()
+        || scan.mount_generation.is_none()
+        || confirms_identity
+        || scan.reconciliation_authoritative
+        || !(is_marker_identity(observed_identity) || is_legacy_identity(observed_identity))
+    {
+        return None;
+    }
+
+    if previous.is_some_and(|state| state.identity_confirmed)
+        && previous.and_then(|state| state.device_id.as_deref()) != Some(observed_identity)
+    {
+        return Some(RootTrustReason::Replacement);
+    }
+
+    if scan.audio_files.is_empty() {
+        return Some(RootTrustReason::EmptyRoot);
+    }
+
+    (existing_track_count > 0
+        || previous.is_some_and(|state| !state.identity_confirmed)
+        || (is_legacy_identity(observed_identity)
+            && previous.is_some_and(|state| state.identity_confirmed)))
+    .then_some(RootTrustReason::LegacyEnrollment)
+}
+
+fn root_trust_request_id(
+    path: &Path,
+    reason: RootTrustReason,
+    remembered_track_count: usize,
+    requires_empty_acknowledgement: bool,
+    observed_identity: &str,
+    observed_mount_generation: u64,
+    expected_state: &RootTrustExpectedState,
+) -> Uuid {
+    // This UUID is a stable correlation token, not an authorization secret.
+    // Every security-relevant field is still compared directly when the
+    // command returns. Delimit and tag each value so concatenation cannot make
+    // two different evidence tuples hash to the same namespace input.
+    let mut evidence = b"tributary:root-trust:v1\0path:".to_vec();
+    let path_evidence = root_trust_path_evidence(path);
+    evidence.extend_from_slice(&path_evidence.len().to_le_bytes());
+    evidence.extend_from_slice(&path_evidence);
+    evidence.extend_from_slice(
+        format!(
+        "\0reason:{reason:?}\0count:{remembered_track_count}\0empty-ack:{requires_empty_acknowledgement}\0observed:{observed_identity}\0mount:{observed_mount_generation}\0expected-device:{:?}\0expected-confirmed:{}\0expected-available:{}\0expected-complete:{}",
+        expected_state.device_id,
+        expected_state.identity_confirmed,
+        expected_state.is_available,
+        expected_state.last_scan_complete,
+    )
+        .as_bytes(),
+    );
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, &evidence)
+}
+
+#[cfg(unix)]
+fn root_trust_path_evidence(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn root_trust_path_evidence(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn root_trust_path_evidence(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().as_bytes().to_vec()
+}
+
+fn build_root_trust_request(
+    scan: &RootScan,
+    stored: &library_root::Model,
+    reason: RootTrustReason,
+    remembered_track_count: usize,
+) -> Option<RootTrustRequest> {
+    let observed_identity = scan.device_id.clone()?;
+    let observed_mount_generation = scan.mount_generation?;
+    let requires_empty_acknowledgement = scan.audio_files.is_empty();
+    let expected_state = RootTrustExpectedState::from_model(stored);
+    let request_id = root_trust_request_id(
+        &scan.root,
+        reason,
+        remembered_track_count,
+        requires_empty_acknowledgement,
+        &observed_identity,
+        observed_mount_generation,
+        &expected_state,
+    );
+    Some(RootTrustRequest {
+        request_id,
+        path: scan.root.clone(),
+        reason,
+        remembered_track_count,
+        requires_empty_acknowledgement,
+        observed_identity,
+        observed_mount_generation,
+        expected_state,
+    })
+}
+
+#[derive(Debug)]
+enum RootTrustError {
+    Stale(&'static str),
+    Failed(anyhow::Error),
+}
+
+impl From<std::io::Error> for RootTrustError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Failed(error.into())
+    }
+}
+
+fn establish_explicit_root_marker(request: &RootTrustRequest) -> Result<String, RootTrustError> {
+    if root_mount_generation(&request.path).map_err(RootTrustError::from)?
+        != request.observed_mount_generation
+    {
+        return Err(RootTrustError::Stale(
+            "library root mount generation changed after prompting",
+        ));
+    }
+
+    if is_marker_identity(&request.observed_identity) {
+        let observed = filesystem_identity(&request.path).map_err(RootTrustError::from)?;
+        if observed != request.observed_identity {
+            return Err(RootTrustError::Stale(
+                "library root marker changed after prompting",
+            ));
+        }
+        if root_mount_generation(&request.path).map_err(RootTrustError::from)?
+            != request.observed_mount_generation
+        {
+            return Err(RootTrustError::Stale(
+                "library root mount changed while adopting its marker",
+            ));
+        }
+        return Ok(observed);
+    }
+
+    if !is_legacy_identity(&request.observed_identity) {
+        return Err(RootTrustError::Stale(
+            "library root identity format is no longer supported",
+        ));
+    }
+
+    let observed_legacy =
+        legacy_filesystem_identity(&request.path).map_err(RootTrustError::from)?;
+    if observed_legacy != request.observed_identity {
+        return Err(RootTrustError::Stale(
+            "library root identity changed after prompting",
+        ));
+    }
+
+    match read_root_marker(&request.path).map_err(RootTrustError::from)? {
+        Some(_) => Err(RootTrustError::Stale(
+            "an unexpected library root marker appeared after prompting",
+        )),
+        None => {
+            let creation = create_root_marker(&request.path).map_err(RootTrustError::from)?;
+            if !creation.created {
+                return Err(RootTrustError::Stale(
+                    "a library root marker appeared during confirmation",
+                ));
+            }
+            let requested_marker = creation.identity;
+
+            let legacy_stable = legacy_filesystem_identity(&request.path)
+                .is_ok_and(|identity| identity == request.observed_identity);
+            let generation_stable = root_mount_generation(&request.path)
+                .is_ok_and(|generation| generation == request.observed_mount_generation);
+            let marker_stable = read_root_marker(&request.path)
+                .is_ok_and(|identity| identity.as_deref() == Some(requested_marker.as_str()));
+            if !legacy_stable || !generation_stable || !marker_stable {
+                return Err(RootTrustError::Stale(
+                    "library root changed while creating its durable marker",
+                ));
+            }
+
+            Ok(requested_marker)
+        }
+    }
+}
+
+/// Bind a brand-new, nonempty, explicitly configured root to a durable marker.
 ///
-/// Existing pre-marker identities are converted only while the legacy probe
-/// still matches the persisted value. The conversion scan is never allowed to
-/// delete rows; the next complete marker-backed scan establishes authority.
+/// Roots with inherited metadata or a previously persisted legacy identity
+/// are deliberately excluded: those require an explicit trust request.
 #[derive(Debug, Eq, PartialEq)]
 enum RootIdentityPreparation {
     Unchanged,
-    MarkerCreated {
-        identity: String,
-        legacy_conversion: bool,
-    },
+    MarkerCreated { identity: String },
 }
 
 fn prepare_durable_root_identity(
@@ -1188,19 +1551,12 @@ fn prepare_durable_root_identity(
         return RootIdentityPreparation::Unchanged;
     }
 
-    let previous_legacy_matches = explicitly_configured
-        && previous.is_some_and(|state| {
-            state.identity_confirmed
-                && state.device_id.as_deref().is_some_and(is_legacy_identity)
-                && legacy_filesystem_identity(&scan.root).ok().as_deref()
-                    == state.device_id.as_deref()
-        });
     let is_new_enrollment = explicitly_configured
         && !previous.is_some_and(|state| state.identity_confirmed)
         && existing_track_count == 0
         && !scan.audio_files.is_empty();
-    let needs_marker = scan.device_id.as_deref().is_some_and(is_legacy_identity)
-        && (previous_legacy_matches || is_new_enrollment);
+    let needs_marker =
+        scan.device_id.as_deref().is_some_and(is_legacy_identity) && is_new_enrollment;
 
     if !needs_marker {
         return RootIdentityPreparation::Unchanged;
@@ -1271,7 +1627,6 @@ fn prepare_durable_root_identity(
     scan.device_id = Some(creation.identity.clone());
     RootIdentityPreparation::MarkerCreated {
         identity: creation.identity,
-        legacy_conversion: previous_legacy_matches,
     }
 }
 
@@ -1302,9 +1657,15 @@ async fn persist_root_scan_status(
     scan: &RootScan,
     previous: Option<&library_root::Model>,
     confirms_identity: bool,
-) -> anyhow::Result<()> {
-    let was_confirmed = previous.is_some_and(|state| state.identity_confirmed);
-    let recorded_device_id = if confirms_identity {
+    activation_allowed: bool,
+    demote_identity: bool,
+) -> anyhow::Result<library_root::Model> {
+    let was_confirmed = !demote_identity && previous.is_some_and(|state| state.identity_confirmed);
+    let recorded_device_id = if demote_identity {
+        scan.device_id
+            .clone()
+            .or_else(|| previous.and_then(|state| state.device_id.clone()))
+    } else if confirms_identity {
         scan.device_id.clone()
     } else if was_confirmed || !scan.is_complete() {
         previous.and_then(|state| state.device_id.clone())
@@ -1314,18 +1675,19 @@ async fn persist_root_scan_status(
         scan.device_id.clone()
     };
     let identity_confirmed = was_confirmed || confirms_identity;
-    let is_available =
-        scan.is_complete() && (scan.reconciliation_authoritative || confirms_identity);
+    let is_available = activation_allowed
+        && scan.is_complete()
+        && (scan.reconciliation_authoritative || confirms_identity);
     let last_checked_at = Utc::now().to_rfc3339();
 
-    if let Some(state) = previous {
+    let stored = if let Some(state) = previous {
         let mut active: library_root::ActiveModel = state.clone().into();
         active.device_id = Set(recorded_device_id);
         active.identity_confirmed = Set(identity_confirmed);
         active.is_available = Set(is_available);
         active.last_scan_complete = Set(scan.is_complete());
         active.last_checked_at = Set(last_checked_at);
-        active.update(db).await?;
+        active.update(db).await?
     } else {
         library_root::ActiveModel {
             path: Set(scan.root.to_string_lossy().into_owned()),
@@ -1336,10 +1698,539 @@ async fn persist_root_scan_status(
             last_checked_at: Set(last_checked_at),
         }
         .insert(db)
-        .await?;
+        .await?
+    };
+
+    Ok(stored)
+}
+
+#[derive(Clone, Debug)]
+struct PendingRootTrustScan {
+    request_id: Uuid,
+    path: PathBuf,
+    reason: RootTrustReason,
+    marker_identity: String,
+    expected_mount_generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ForcedRootTrustConversion {
+    marker_identity: String,
+    expected_empty: bool,
+    expected_mount_generation: u64,
+    original_reason: RootTrustReason,
+}
+
+#[derive(Clone, Debug)]
+struct RootTrustAuthorityGuard {
+    marker_identity: String,
+    expected_mount_generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RootTrustEvidenceRefresh {
+    path: PathBuf,
+    marker_identity: String,
+    expected_mount_generation: u64,
+    original_reason: RootTrustReason,
+}
+
+#[derive(Clone, Debug)]
+enum RootTrustCommandStart {
+    Pending(PendingRootTrustScan),
+    Unavailable(RootTrustEvidenceRefresh),
+}
+
+#[derive(Clone, Debug)]
+struct CompletedRootTrustCommand {
+    path: PathBuf,
+    reason: RootTrustReason,
+    outcome: RootTrustOutcome,
+}
+
+async fn emit_root_trust_finished(
+    tx: &async_channel::Sender<LibraryEvent>,
+    request_id: Uuid,
+    path: PathBuf,
+    reason: RootTrustReason,
+    outcome: RootTrustOutcome,
+) {
+    let _ = tx
+        .send(LibraryEvent::RootTrustFinished {
+            request_id,
+            path,
+            reason,
+            outcome,
+        })
+        .await;
+}
+
+async fn stage_root_trust(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    request: &RootTrustRequest,
+) -> Result<String, RootTrustError> {
+    if !music_dirs.iter().any(|root| root == &request.path) {
+        return Err(RootTrustError::Stale(
+            "library root is no longer exactly configured",
+        ));
     }
 
-    Ok(())
+    let state_key = request.path.to_string_lossy().into_owned();
+    let state = library_root::Entity::find_by_id(state_key.clone())
+        .one(db)
+        .await
+        .map_err(|error| RootTrustError::Failed(error.into()))?
+        .ok_or(RootTrustError::Stale(
+            "persisted library root state disappeared",
+        ))?;
+    if !request.expected_state.matches(&state) {
+        return Err(RootTrustError::Stale(
+            "persisted library root authorization changed after prompting",
+        ));
+    }
+
+    let marker_request = request.clone();
+    let marker_identity =
+        tokio::task::spawn_blocking(move || establish_explicit_root_marker(&marker_request))
+            .await
+            .map_err(|error| RootTrustError::Failed(error.into()))??;
+
+    // Marker creation is intentionally outside SQLite. Recheck filesystem
+    // evidence immediately before an atomic compare-and-swap that binds every
+    // security-relevant persisted field from the prompt. Timestamp-only drift
+    // is intentionally excluded from that predicate.
+    let probe_path = request.path.clone();
+    let expected_marker = marker_identity.clone();
+    let expected_generation = request.observed_mount_generation;
+    let (identity_stable, generation_stable) = tokio::task::spawn_blocking(move || {
+        (
+            filesystem_identity(&probe_path).is_ok_and(|identity| identity == expected_marker),
+            root_mount_generation(&probe_path)
+                .is_ok_and(|generation| generation == expected_generation),
+        )
+    })
+    .await
+    .map_err(|error| RootTrustError::Failed(error.into()))?;
+    if !identity_stable || !generation_stable {
+        return Err(RootTrustError::Stale(
+            "library root changed before confirmation could be persisted",
+        ));
+    }
+
+    let active = library_root::ActiveModel {
+        device_id: Set(Some(marker_identity.clone())),
+        identity_confirmed: Set(false),
+        is_available: Set(false),
+        last_scan_complete: Set(false),
+        last_checked_at: Set(Utc::now().to_rfc3339()),
+        ..Default::default()
+    };
+
+    let update = library_root::Entity::update_many()
+        .set(active)
+        .filter(library_root::Column::Path.eq(state_key))
+        .filter(
+            library_root::Column::IdentityConfirmed.eq(request.expected_state.identity_confirmed),
+        )
+        .filter(library_root::Column::IsAvailable.eq(request.expected_state.is_available))
+        .filter(
+            library_root::Column::LastScanComplete.eq(request.expected_state.last_scan_complete),
+        );
+    let update = match request.expected_state.device_id.as_deref() {
+        Some(expected) => update.filter(library_root::Column::DeviceId.eq(expected)),
+        None => update.filter(library_root::Column::DeviceId.is_null()),
+    };
+    let result = update
+        .exec(db)
+        .await
+        .map_err(|error| RootTrustError::Failed(error.into()))?;
+    if result.rows_affected != 1 {
+        return Err(RootTrustError::Stale(
+            "persisted library root authorization changed during confirmation",
+        ));
+    }
+
+    Ok(marker_identity)
+}
+
+async fn root_trust_scan_state_matches(
+    db: &DatabaseConnection,
+    path: &Path,
+    marker_identity: &str,
+    expected_mount_generation: u64,
+    expected_available: bool,
+) -> anyhow::Result<bool> {
+    let state = library_root::Entity::find_by_id(path.to_string_lossy().into_owned())
+        .one(db)
+        .await?;
+    let state_matches = state.is_some_and(|state| {
+        state.device_id.as_deref() == Some(marker_identity)
+            && state.identity_confirmed
+            && state.is_available == expected_available
+            && state.last_scan_complete
+    });
+    if !state_matches {
+        return Ok(false);
+    }
+
+    let path = path.to_path_buf();
+    let marker_identity = marker_identity.to_string();
+    tokio::task::spawn_blocking(move || {
+        filesystem_identity(&path).is_ok_and(|identity| identity == marker_identity)
+            && root_mount_generation(&path)
+                .is_ok_and(|generation| generation == expected_mount_generation)
+    })
+    .await
+    .map_err(Into::into)
+}
+
+async fn gate_root_trust_authoritative_scan(
+    db: &DatabaseConnection,
+    pending: &PendingRootTrustScan,
+) -> Result<bool, sea_orm::DbErr> {
+    let active = library_root::ActiveModel {
+        is_available: Set(false),
+        last_scan_complete: Set(false),
+        last_checked_at: Set(Utc::now().to_rfc3339()),
+        ..Default::default()
+    };
+    let result = library_root::Entity::update_many()
+        .set(active)
+        .filter(library_root::Column::Path.eq(pending.path.to_string_lossy().into_owned()))
+        .filter(library_root::Column::DeviceId.eq(pending.marker_identity.as_str()))
+        .filter(library_root::Column::IdentityConfirmed.eq(true))
+        .filter(library_root::Column::IsAvailable.eq(false))
+        .filter(library_root::Column::LastScanComplete.eq(true))
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected == 1)
+}
+
+async fn begin_root_trust_command(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    request: &RootTrustRequest,
+) -> Result<RootTrustCommandStart, RootTrustError> {
+    let marker_identity = stage_root_trust(db, music_dirs, request).await?;
+    let unavailable_refresh = RootTrustEvidenceRefresh {
+        path: request.path.clone(),
+        marker_identity: marker_identity.clone(),
+        expected_mount_generation: request.observed_mount_generation,
+        original_reason: request.reason,
+    };
+    let forced_conversions = HashMap::from([(
+        request.path.clone(),
+        ForcedRootTrustConversion {
+            marker_identity: marker_identity.clone(),
+            expected_empty: request.requires_empty_acknowledgement,
+            expected_mount_generation: request.observed_mount_generation,
+            original_reason: request.reason,
+        },
+    )]);
+    let authority_guards = HashMap::new();
+    let evidence_refreshes = HashMap::new();
+    if let Err(error) = initial_scan_with_root_trust_guards(
+        db,
+        music_dirs,
+        tx,
+        &forced_conversions,
+        &authority_guards,
+        &evidence_refreshes,
+    )
+    .await
+    {
+        warn!(root = %request.path.display(), %error, "Explicit library root conversion scan failed");
+        // Staging and every forced-conversion persistence path are already
+        // unavailable. Preserve that state rather than risking a stale prompt
+        // by rewriting its completeness token after the scan.
+        return Ok(RootTrustCommandStart::Unavailable(unavailable_refresh));
+    }
+
+    match root_trust_scan_state_matches(
+        db,
+        &request.path,
+        &marker_identity,
+        request.observed_mount_generation,
+        false,
+    )
+    .await
+    {
+        Ok(true) => Ok(RootTrustCommandStart::Pending(PendingRootTrustScan {
+            request_id: request.request_id,
+            path: request.path.clone(),
+            reason: request.reason,
+            marker_identity,
+            expected_mount_generation: request.observed_mount_generation,
+        })),
+        Ok(false) => Ok(RootTrustCommandStart::Unavailable(unavailable_refresh)),
+        Err(error) => {
+            warn!(root = %request.path.display(), %error, "Could not verify converted library root state");
+            Ok(RootTrustCommandStart::Unavailable(unavailable_refresh))
+        }
+    }
+}
+
+async fn complete_root_trust_scan(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    pending: &PendingRootTrustScan,
+) -> RootTrustOutcome {
+    match gate_root_trust_authoritative_scan(db, pending).await {
+        Ok(true) => {}
+        Ok(false) => {
+            mark_root_path_unavailable(db, &pending.path).await;
+            return RootTrustOutcome::TrustedButUnavailable;
+        }
+        Err(error) => {
+            warn!(root = %pending.path.display(), %error, "Could not establish unavailable state before authoritative library scan");
+            mark_root_path_unavailable(db, &pending.path).await;
+            return RootTrustOutcome::TrustedButUnavailable;
+        }
+    }
+
+    let forced_conversions = HashMap::new();
+    let authority_guards = HashMap::from([(
+        pending.path.clone(),
+        RootTrustAuthorityGuard {
+            marker_identity: pending.marker_identity.clone(),
+            expected_mount_generation: pending.expected_mount_generation,
+        },
+    )]);
+    let evidence_refreshes = HashMap::new();
+    if let Err(error) = initial_scan_with_root_trust_guards(
+        db,
+        music_dirs,
+        tx,
+        &forced_conversions,
+        &authority_guards,
+        &evidence_refreshes,
+    )
+    .await
+    {
+        warn!(root = %pending.path.display(), %error, "Post-enrollment authoritative library scan failed");
+        mark_root_path_unavailable(db, &pending.path).await;
+        return RootTrustOutcome::TrustedButUnavailable;
+    }
+
+    match root_trust_scan_state_matches(
+        db,
+        &pending.path,
+        &pending.marker_identity,
+        pending.expected_mount_generation,
+        true,
+    )
+    .await
+    {
+        Ok(true) => RootTrustOutcome::Active,
+        Ok(false) => {
+            mark_root_path_unavailable_if_active(db, &pending.path).await;
+            RootTrustOutcome::TrustedButUnavailable
+        }
+        Err(error) => {
+            warn!(root = %pending.path.display(), %error, "Could not verify post-enrollment library state");
+            mark_root_path_unavailable_if_active(db, &pending.path).await;
+            RootTrustOutcome::TrustedButUnavailable
+        }
+    }
+}
+
+async fn finish_root_trust_command(
+    tx: &async_channel::Sender<LibraryEvent>,
+    completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
+    request_id: Uuid,
+    completion: CompletedRootTrustCommand,
+) {
+    if completion.outcome == RootTrustOutcome::Active {
+        completed_commands.insert(request_id, completion.clone());
+    } else {
+        // A deterministic request ID identifies evidence, not a one-shot
+        // attempt. Transient failures and stale/unavailable outcomes must be
+        // retryable while that evidence remains unchanged.
+        completed_commands.remove(&request_id);
+    }
+    emit_root_trust_finished(
+        tx,
+        request_id,
+        completion.path,
+        completion.reason,
+        completion.outcome,
+    )
+    .await;
+}
+
+async fn refresh_root_trust_evidence(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+) {
+    // A legacy confirmation can create its random marker immediately before
+    // a database failure. The marker is deliberately not treated as proof of
+    // the earlier command: rescan it as new evidence and require a fresh
+    // adoption request instead.
+    if let Err(error) = initial_scan(db, music_dirs, tx).await {
+        warn!(%error, "Could not refresh library root trust evidence after a rejected command");
+    }
+}
+
+async fn refresh_unavailable_root_trust_evidence(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    refresh: RootTrustEvidenceRefresh,
+) {
+    // A staged command can finish unavailable without producing a watcher
+    // event (notably when an existing marker was adopted). Run a fail-closed,
+    // no-content evidence pass so the UI receives a retryable request for the
+    // current observation. The command's mount generation remains pinned
+    // during this refresh; an intervening mount is classified as replacement.
+    let forced_conversions = HashMap::new();
+    let authority_guards = HashMap::new();
+    let evidence_refreshes = HashMap::from([(refresh.path.clone(), refresh)]);
+    if let Err(error) = initial_scan_with_root_trust_guards(
+        db,
+        music_dirs,
+        tx,
+        &forced_conversions,
+        &authority_guards,
+        &evidence_refreshes,
+    )
+    .await
+    {
+        warn!(%error, "Could not refresh library root trust evidence after an unavailable command");
+    }
+}
+
+async fn process_library_command(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
+    command: LibraryCommand,
+) -> Option<PendingRootTrustScan> {
+    let LibraryCommand::ConfirmRootTrust(request) = command;
+
+    if let Some(completion) = completed_commands.get(&request.request_id).cloned() {
+        emit_root_trust_finished(
+            tx,
+            request.request_id,
+            completion.path,
+            completion.reason,
+            completion.outcome,
+        )
+        .await;
+        return None;
+    }
+
+    match begin_root_trust_command(db, music_dirs, tx, &request).await {
+        Ok(RootTrustCommandStart::Pending(pending)) => Some(pending),
+        Ok(RootTrustCommandStart::Unavailable(refresh)) => {
+            finish_root_trust_command(
+                tx,
+                completed_commands,
+                request.request_id,
+                CompletedRootTrustCommand {
+                    path: request.path,
+                    reason: request.reason,
+                    outcome: RootTrustOutcome::TrustedButUnavailable,
+                },
+            )
+            .await;
+            refresh_unavailable_root_trust_evidence(db, music_dirs, tx, refresh).await;
+            None
+        }
+        Err(RootTrustError::Stale(message)) => {
+            warn!(
+                root = %request.path.display(),
+                request_id = %request.request_id,
+                %message,
+                "Rejected stale library root trust command"
+            );
+            finish_root_trust_command(
+                tx,
+                completed_commands,
+                request.request_id,
+                CompletedRootTrustCommand {
+                    path: request.path,
+                    reason: request.reason,
+                    outcome: RootTrustOutcome::Stale,
+                },
+            )
+            .await;
+            refresh_root_trust_evidence(db, music_dirs, tx).await;
+            None
+        }
+        Err(RootTrustError::Failed(error)) => {
+            warn!(
+                root = %request.path.display(),
+                request_id = %request.request_id,
+                %error,
+                "Library root trust command failed"
+            );
+            finish_root_trust_command(
+                tx,
+                completed_commands,
+                request.request_id,
+                CompletedRootTrustCommand {
+                    path: request.path,
+                    reason: request.reason,
+                    outcome: RootTrustOutcome::Failed,
+                },
+            )
+            .await;
+            refresh_root_trust_evidence(db, music_dirs, tx).await;
+            None
+        }
+    }
+}
+
+async fn finish_pending_root_trust_scan(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
+    pending: PendingRootTrustScan,
+) {
+    let outcome = complete_root_trust_scan(db, music_dirs, tx, &pending).await;
+    finish_root_trust_command(
+        tx,
+        completed_commands,
+        pending.request_id,
+        CompletedRootTrustCommand {
+            path: pending.path,
+            reason: pending.reason,
+            outcome,
+        },
+    )
+    .await;
+}
+
+async fn process_library_commands_without_watcher(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    command_rx: &async_channel::Receiver<LibraryCommand>,
+    completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
+) {
+    let mut pending_trust_scan = None;
+    loop {
+        // A successful conversion is deliberately followed by a distinct
+        // ordinary scan at the next engine-loop boundary. This is the first
+        // point where the newly confirmed marker may authorize content writes
+        // and stale deletion.
+        if let Some(pending) = pending_trust_scan.take() {
+            finish_pending_root_trust_scan(db, music_dirs, tx, completed_commands, pending).await;
+            continue;
+        }
+
+        let Ok(command) = command_rx.recv().await else {
+            break;
+        };
+        pending_trust_scan =
+            process_library_command(db, music_dirs, tx, completed_commands, command).await;
+    }
 }
 
 async fn initial_scan(
@@ -1347,6 +2238,32 @@ async fn initial_scan(
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
 ) -> anyhow::Result<()> {
+    let forced_conversions = HashMap::new();
+    let authority_guards = HashMap::new();
+    let evidence_refreshes = HashMap::new();
+    initial_scan_with_root_trust_guards(
+        db,
+        music_dirs,
+        tx,
+        &forced_conversions,
+        &authority_guards,
+        &evidence_refreshes,
+    )
+    .await
+}
+
+async fn initial_scan_with_root_trust_guards(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    forced_conversions: &HashMap<PathBuf, ForcedRootTrustConversion>,
+    authority_guards: &HashMap<PathBuf, RootTrustAuthorityGuard>,
+    evidence_refreshes: &HashMap<PathBuf, RootTrustEvidenceRefresh>,
+) -> anyhow::Result<()> {
+    // The explicit conversion pass establishes only root identity. Track
+    // upserts and deletions are reserved for the separate ordinary scan that
+    // the engine schedules at its next loop boundary.
+    let content_mutations_allowed = forced_conversions.is_empty() && evidence_refreshes.is_empty();
     let mut configured_dirs = music_dirs.to_vec();
     configured_dirs.sort_unstable();
     configured_dirs.dedup();
@@ -1385,7 +2302,7 @@ async fn initial_scan(
         .map(|state| (state.path.as_str(), state))
         .collect();
     let evidence_roots: Vec<PathBuf> = root_scans.iter().map(|scan| scan.root.clone()).collect();
-    let mut conversion_roots = HashSet::new();
+    let mut trust_requests = Vec::new();
 
     // Marker creation happens only for roots the user explicitly configured.
     // Always discard the pre-marker traversal and rescan through the newly
@@ -1402,16 +2319,12 @@ async fn initial_scan(
             .count();
         let explicitly_configured = configured_dirs.binary_search(&scan.root).is_ok();
 
-        let RootIdentityPreparation::MarkerCreated {
-            identity,
-            legacy_conversion,
-        } = prepare_durable_root_identity(
+        let RootIdentityPreparation::MarkerCreated { identity } = prepare_durable_root_identity(
             scan,
             previous,
             existing_track_count,
             explicitly_configured,
-        )
-        else {
+        ) else {
             continue;
         };
 
@@ -1425,9 +2338,6 @@ async fn initial_scan(
                 "library root marker changed before marker-backed rescan completed: {}",
                 marker_scan.root.display()
             ));
-        }
-        if legacy_conversion && marker_scan.is_complete() {
-            conversion_roots.insert(marker_scan.root.clone());
         }
         *scan = marker_scan;
     }
@@ -1465,17 +2375,94 @@ async fn initial_scan(
                     == Some(scan.root.as_path())
             })
             .count();
-        let conversion_scan = conversion_roots.contains(&scan.root) && scan.is_complete();
+        let forced_conversion = forced_conversions.get(&scan.root);
+        let forced_storage_matches = forced_conversion.is_some_and(|expected| {
+            scan.is_complete()
+                && scan.device_id.as_deref() == Some(expected.marker_identity.as_str())
+                && scan.mount_generation == Some(expected.expected_mount_generation)
+        });
+        let forced_evidence_matches = forced_conversion.is_some_and(|expected| {
+            forced_storage_matches && scan.audio_files.is_empty() == expected.expected_empty
+        });
+        // A requested conversion remains a non-authoritative, no-content pass
+        // even when its current evidence no longer matches the prompt.
+        let conversion_scan = forced_conversion.is_some();
+        let authority_guard = authority_guards.get(&scan.root);
+        let authority_storage_matches = authority_guard.is_some_and(|expected| {
+            scan.device_id.as_deref() == Some(expected.marker_identity.as_str())
+                && scan.mount_generation == Some(expected.expected_mount_generation)
+        });
+        let authority_guard_matches = scan.is_complete() && authority_storage_matches;
+        let authority_storage_mismatch =
+            authority_guard.is_some() && scan.is_complete() && !authority_storage_matches;
+        let evidence_refresh = evidence_refreshes.get(&scan.root);
+        let refresh_storage_matches = evidence_refresh.is_some_and(|expected| {
+            scan.device_id.as_deref() == Some(expected.marker_identity.as_str())
+                && scan.mount_generation == Some(expected.expected_mount_generation)
+        });
+        let activation_allowed = !conversion_scan
+            && evidence_refresh.is_none()
+            && (authority_guard.is_none() || authority_guard_matches);
+        // Traversal completeness is not storage evidence. Preserve a durable
+        // confirmation across a transient incomplete walk, but revoke it when
+        // a complete guarded observation proves the marker or mount changed.
+        // An unavailable-command refresh deliberately returns a complete
+        // observation to the explicit-consent state so it can be retried.
+        let demote_identity =
+            authority_storage_mismatch || (evidence_refresh.is_some() && scan.is_complete());
         let explicitly_configured = configured_dirs.binary_search(&scan.root).is_ok();
-        let confirms_identity = conversion_scan
-            || scan_confirms_identity_for_scope(
+        let confirms_identity = if conversion_scan {
+            forced_evidence_matches
+        } else if evidence_refresh.is_some()
+            || (authority_guard.is_some() && !authority_guard_matches)
+        {
+            false
+        } else {
+            scan_confirms_identity_for_scope(
                 scan,
                 previous,
                 existing_track_count,
                 explicitly_configured,
-            );
+            )
+        };
         scan.reconciliation_authoritative =
-            !conversion_scan && reconciliation_is_authoritative(scan, previous);
+            activation_allowed && reconciliation_is_authoritative(scan, previous);
+        let mut trust_reason = root_trust_reason(
+            scan,
+            previous,
+            existing_track_count,
+            explicitly_configured,
+            confirms_identity,
+        );
+        if conversion_scan && scan.is_complete() && !forced_evidence_matches {
+            trust_reason = Some(
+                if !forced_storage_matches
+                    || forced_conversion.is_some_and(|expected| {
+                        expected.original_reason == RootTrustReason::Replacement
+                    })
+                {
+                    RootTrustReason::Replacement
+                } else if scan.audio_files.is_empty() {
+                    RootTrustReason::EmptyRoot
+                } else {
+                    RootTrustReason::LegacyEnrollment
+                },
+            );
+        } else if let Some(refresh) = evidence_refresh.filter(|_| scan.is_complete()) {
+            trust_reason = Some(
+                if !refresh_storage_matches
+                    || refresh.original_reason == RootTrustReason::Replacement
+                {
+                    RootTrustReason::Replacement
+                } else if scan.audio_files.is_empty() {
+                    RootTrustReason::EmptyRoot
+                } else {
+                    RootTrustReason::LegacyEnrollment
+                },
+            );
+        } else if authority_storage_mismatch {
+            trust_reason = Some(RootTrustReason::Replacement);
+        }
 
         if !scan.reconciliation_authoritative && scan.is_complete() {
             warn!(
@@ -1488,17 +2475,61 @@ async fn initial_scan(
         if confirms_identity && !previous.is_some_and(|state| state.identity_confirmed) {
             info!(root = %scan.root.display(), device_id = ?scan.device_id, "Established library root identity for future reconciliation");
         }
-        if conversion_scan {
+        if forced_evidence_matches {
             info!(root = %scan.root.display(), device_id = ?scan.device_id, "Converted legacy root identity; deletion deferred until the next complete scan");
+        } else if let Some(expected) = forced_conversion.filter(|_| scan.is_complete()) {
+            warn!(
+                root = %scan.root.display(),
+                original_reason = ?expected.original_reason,
+                expected_mount_generation = expected.expected_mount_generation,
+                observed_mount_generation = ?scan.mount_generation,
+                expected_empty = expected.expected_empty,
+                observed_empty = scan.audio_files.is_empty(),
+                "Library root evidence changed after confirmation; fresh trust required"
+            );
+        } else if let Some(expected) = evidence_refresh.filter(|_| scan.is_complete()) {
+            warn!(
+                root = %scan.root.display(),
+                original_reason = ?expected.original_reason,
+                expected_mount_generation = expected.expected_mount_generation,
+                observed_mount_generation = ?scan.mount_generation,
+                storage_matches = refresh_storage_matches,
+                "Refreshed evidence after unavailable library root confirmation"
+            );
+        } else if let Some(expected) = authority_guard.filter(|_| authority_storage_mismatch) {
+            warn!(
+                root = %scan.root.display(),
+                expected_mount_generation = expected.expected_mount_generation,
+                observed_mount_generation = ?scan.mount_generation,
+                "Library root mount changed before authoritative reconciliation; fresh trust required"
+            );
         }
 
         // If availability state cannot be persisted, fail closed for this
         // scan: retaining stale metadata is safer than deleting it without a
         // durable device identity for the next startup.
-        match persist_root_scan_status(db, scan, previous, confirms_identity).await {
-            Ok(()) => {
-                scan.content_authorized =
-                    scan.reconciliation_authoritative || (confirms_identity && !conversion_scan);
+        match persist_root_scan_status(
+            db,
+            scan,
+            previous,
+            confirms_identity,
+            activation_allowed,
+            demote_identity,
+        )
+        .await
+        {
+            Ok(stored) => {
+                scan.content_authorized = content_mutations_allowed
+                    && activation_allowed
+                    && (scan.reconciliation_authoritative
+                        || (confirms_identity && !conversion_scan));
+                if let Some(reason) = trust_reason {
+                    if let Some(request) =
+                        build_root_trust_request(scan, &stored, reason, existing_track_count)
+                    {
+                        trust_requests.push(request);
+                    }
+                }
             }
             Err(error) => {
                 warn!(root = %scan.root.display(), %error, "Failed to persist library root state");
@@ -1610,19 +2641,21 @@ async fn initial_scan(
     // snapshot instead of re-querying. A failed individual delete is logged and
     // skipped rather than aborting the whole scan, so a transient DB hiccup
     // can't discard the FullSync/ScanComplete that follow.
-    for row in &existing_tracks {
-        let row_path = Path::new(&row.file_path);
-        if !should_remove_stale_track(row_path, &on_disk_paths, &root_scans) {
-            continue;
+    if content_mutations_allowed {
+        for row in &existing_tracks {
+            let row_path = Path::new(&row.file_path);
+            if !should_remove_stale_track(row_path, &on_disk_paths, &root_scans) {
+                continue;
+            }
+            info!(path = %row.file_path, "Removing stale track from database");
+            if let Err(e) = track::Entity::delete_by_id(&row.id).exec(db).await {
+                warn!(path = %row.file_path, error = %e, "Failed to remove stale track");
+                continue;
+            }
+            let _ = tx
+                .send(LibraryEvent::TrackRemoved(row.file_path.clone()))
+                .await;
         }
-        info!(path = %row.file_path, "Removing stale track from database");
-        if let Err(e) = track::Entity::delete_by_id(&row.id).exec(db).await {
-            warn!(path = %row.file_path, error = %e, "Failed to remove stale track");
-            continue;
-        }
-        let _ = tx
-            .send(LibraryEvent::TrackRemoved(row.file_path.clone()))
-            .await;
     }
 
     // Send full sync. A transient failure here is logged but still lets the
@@ -1667,6 +2700,11 @@ async fn initial_scan(
         Err(e) => warn!(error = %e, "Failed to load playlists"),
     }
 
+    if !trust_requests.is_empty() {
+        let _ = tx
+            .send(LibraryEvent::RootTrustRequired(trust_requests))
+            .await;
+    }
     let _ = tx.send(LibraryEvent::ScanComplete).await;
 
     info!(scanned, "Initial scan complete");
@@ -1765,6 +2803,20 @@ async fn mark_root_path_unavailable(db: &DatabaseConnection, root: &Path) {
         }
         Err(error) => {
             warn!(root = %root.display(), %error, "Could not load library root state to mark unavailable");
+        }
+    }
+}
+
+async fn mark_root_path_unavailable_if_active(db: &DatabaseConnection, root: &Path) {
+    let root_path = root.to_string_lossy().into_owned();
+    match library_root::Entity::find_by_id(root_path).one(db).await {
+        Ok(Some(state)) if state.is_available => mark_root_unavailable(db, &state).await,
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            warn!(root = %root.display(), "Could not find library root state to verify unavailable");
+        }
+        Err(error) => {
+            warn!(root = %root.display(), %error, "Could not load library root state to verify unavailable");
         }
     }
 }
@@ -2575,6 +3627,8 @@ async fn process_directory_events(
     db: &Arc<DatabaseConnection>,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
+    command_rx: &async_channel::Receiver<LibraryCommand>,
+    completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
     mut watcher: DirectoryWatcher,
 ) -> anyhow::Result<()> {
     // ── Debounced event processing ──────────────────────────────
@@ -2583,7 +3637,46 @@ async fn process_directory_events(
     // Create/Modify events that Windows fires per file copy into a
     // single parse+upsert, and removes the old per-file 500ms sleep.
     let mut reconciliation_pending = false;
+    let mut pending_trust_scan: Option<PendingRootTrustScan> = None;
+    let mut commands_open = true;
     loop {
+        if let Some(pending) = pending_trust_scan.take() {
+            // The conversion scan intentionally performed no track writes.
+            // Suppress watcher evidence queued before its distinct ordinary
+            // authority scan, then let events arriving during that scan remain
+            // for the following boundary.
+            discard_watcher_backlog(&mut watcher.rx);
+            finish_pending_root_trust_scan(
+                db.as_ref(),
+                music_dirs,
+                tx,
+                completed_commands,
+                pending,
+            )
+            .await;
+            continue;
+        }
+
+        // A trust decision is one serialized engine command. Drain at most one
+        // per batch boundary so it cannot interleave with a watcher mutation.
+        if commands_open {
+            match command_rx.try_recv() {
+                Ok(command) => {
+                    pending_trust_scan = process_library_command(
+                        db.as_ref(),
+                        music_dirs,
+                        tx,
+                        completed_commands,
+                        command,
+                    )
+                    .await;
+                    continue;
+                }
+                Err(async_channel::TryRecvError::Empty) => {}
+                Err(async_channel::TryRecvError::Closed) => commands_open = false,
+            }
+        }
+
         let overflowed = watcher.ingress_overflowed.swap(false, Ordering::AcqRel);
         if reconciliation_pending || overflowed {
             if overflowed {
@@ -2598,8 +3691,31 @@ async fn process_directory_events(
             continue;
         }
 
-        // Wait for the first event.
-        let first = watcher.rx.recv().await;
+        // Wait for either the next watcher batch or the next serialized UI
+        // command. A closed command channel must not stop filesystem watching.
+        let first = if commands_open {
+            tokio::select! {
+                biased;
+                command = command_rx.recv() => {
+                    match command {
+                        Ok(command) => {
+                            pending_trust_scan = process_library_command(
+                                db.as_ref(),
+                                music_dirs,
+                                tx,
+                                completed_commands,
+                                command,
+                            ).await;
+                        }
+                        Err(_) => commands_open = false,
+                    }
+                    continue;
+                }
+                first = watcher.rx.recv() => first,
+            }
+        } else {
+            watcher.rx.recv().await
+        };
         let Some(first) = first else { break };
 
         // Preserve event order and tracker metadata until rename halves have
@@ -4971,23 +6087,1281 @@ mod tests {
         assert!(filesystem_identity(directory.path()).is_err());
     }
 
+    fn unconfirmed_root_state(scan: &RootScan) -> library_root::Model {
+        library_root::Model {
+            path: scan.root.to_string_lossy().into_owned(),
+            device_id: scan.device_id.clone(),
+            identity_confirmed: false,
+            is_available: false,
+            last_scan_complete: scan.is_complete(),
+            last_checked_at: "2026-07-14T00:00:00Z".to_string(),
+        }
+    }
+
+    fn write_minimal_wav(path: &Path) {
+        let data_size = 1_u32;
+        let mut bytes = Vec::with_capacity(45);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_size).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&8_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_size.to_le_bytes());
+        bytes.push(128);
+        std::fs::write(path, bytes).expect("write minimal WAV fixture");
+    }
+
     #[test]
-    fn legacy_conversion_creates_marker_but_defers_deletion() {
+    fn root_trust_reasons_cover_legacy_replacement_and_empty_evidence() {
+        let legacy = TestDirectory::new("trust-reason-legacy");
+        std::fs::write(legacy.path().join("present.mp3"), []).expect("create legacy audio");
+        let legacy_scan = scan_root(legacy.path().to_path_buf());
+        let legacy_state = unconfirmed_root_state(&legacy_scan);
+        assert_eq!(
+            root_trust_reason(&legacy_scan, Some(&legacy_state), 3, true, false),
+            Some(RootTrustReason::LegacyEnrollment)
+        );
+
+        let empty = TestDirectory::new("trust-reason-empty");
+        let empty_scan = scan_root(empty.path().to_path_buf());
+        let empty_state = unconfirmed_root_state(&empty_scan);
+        assert_eq!(
+            root_trust_reason(&empty_scan, Some(&empty_state), 9, true, false),
+            Some(RootTrustReason::EmptyRoot),
+            "an inherited empty view must not bypass the stronger empty-root warning"
+        );
+        let empty_request =
+            build_root_trust_request(&empty_scan, &empty_state, RootTrustReason::EmptyRoot, 9)
+                .expect("build empty request");
+        assert!(empty_request.requires_empty_acknowledgement());
+
+        let replacement = TestDirectory::new("trust-reason-replacement");
+        create_root_marker(replacement.path()).expect("create replacement marker");
+        let replacement_scan = scan_root(replacement.path().to_path_buf());
+        let mut intended_state = persisted_root_state(
+            &replacement_scan,
+            Some(format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4())),
+        );
+        intended_state.path = replacement.path().to_string_lossy().into_owned();
+        assert_eq!(
+            root_trust_reason(&replacement_scan, Some(&intended_state), 2, true, false,),
+            Some(RootTrustReason::Replacement)
+        );
+        let replacement_request = build_root_trust_request(
+            &replacement_scan,
+            &intended_state,
+            RootTrustReason::Replacement,
+            2,
+        )
+        .expect("build replacement request");
+        assert!(
+            replacement_request.requires_empty_acknowledgement(),
+            "an empty replacement retains replacement semantics and the empty-risk gate"
+        );
+    }
+
+    #[test]
+    fn root_trust_requires_complete_exact_configured_evidence() {
+        let directory = TestDirectory::new("trust-evidence-scope");
+        std::fs::write(directory.path().join("present.mp3"), []).expect("create audio");
+        let scan = scan_root(directory.path().to_path_buf());
+        let state = unconfirmed_root_state(&scan);
+
+        assert_eq!(
+            root_trust_reason(&scan, Some(&state), 1, false, false),
+            None,
+            "a discovered nested root cannot be confirmed"
+        );
+        let mut incomplete = scan;
+        incomplete
+            .errors
+            .push("simulated traversal gap".to_string());
+        assert_eq!(
+            root_trust_reason(&incomplete, Some(&state), 1, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn root_trust_request_id_ignores_timestamps_but_binds_security_state() {
+        let directory = TestDirectory::new("trust-request-id");
+        let scan = scan_root(directory.path().to_path_buf());
+        let first = unconfirmed_root_state(&scan);
+        let mut timestamp_only = first.clone();
+        timestamp_only.last_checked_at = "2099-01-01T00:00:00Z".to_string();
+
+        let first_request = build_root_trust_request(&scan, &first, RootTrustReason::EmptyRoot, 4)
+            .expect("build first request");
+        let timestamp_request =
+            build_root_trust_request(&scan, &timestamp_only, RootTrustReason::EmptyRoot, 4)
+                .expect("build timestamp-only request");
+        assert_eq!(first_request.request_id(), timestamp_request.request_id());
+
+        let mut security_change = first;
+        security_change.is_available = true;
+        let changed_request =
+            build_root_trust_request(&scan, &security_change, RootTrustReason::EmptyRoot, 4)
+                .expect("build changed request");
+        assert_ne!(first_request.request_id(), changed_request.request_id());
+
+        let nonempty_id = root_trust_request_id(
+            first_request.path(),
+            first_request.reason(),
+            first_request.remembered_track_count(),
+            false,
+            &first_request.observed_identity,
+            first_request.observed_mount_generation,
+            &first_request.expected_state,
+        );
+        assert_ne!(
+            first_request.request_id(),
+            nonempty_id,
+            "the stronger empty acknowledgement is part of the immutable evidence"
+        );
+    }
+
+    #[test]
+    fn root_trust_request_debug_redacts_private_evidence() {
+        let request = RootTrustRequest {
+            request_id: Uuid::new_v4(),
+            path: PathBuf::from("/displayed/library"),
+            reason: RootTrustReason::LegacyEnrollment,
+            remembered_track_count: 3,
+            requires_empty_acknowledgement: false,
+            observed_identity: "secret-observed-identity".to_string(),
+            observed_mount_generation: 42,
+            expected_state: RootTrustExpectedState {
+                device_id: Some("secret-persisted-identity".to_string()),
+                identity_confirmed: false,
+                is_available: false,
+                last_scan_complete: true,
+            },
+        };
+
+        let rendered = format!("{request:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("secret-observed-identity"));
+        assert!(!rendered.contains("secret-persisted-identity"));
+    }
+
+    #[test]
+    fn explicit_root_marker_adopts_existing_and_rejects_changed_evidence() {
+        let adopted = TestDirectory::new("trust-adopt-existing-marker");
+        let marker = create_root_marker(adopted.path())
+            .expect("create marker")
+            .identity;
+        let adopted_scan = scan_root(adopted.path().to_path_buf());
+        let adopted_state = unconfirmed_root_state(&adopted_scan);
+        let adopted_request =
+            build_root_trust_request(&adopted_scan, &adopted_state, RootTrustReason::EmptyRoot, 0)
+                .expect("build adoption request");
+        assert_eq!(
+            establish_explicit_root_marker(&adopted_request).expect("adopt existing marker"),
+            marker
+        );
+
+        let stale = TestDirectory::new("trust-unexpected-marker");
+        let stale_scan = scan_root(stale.path().to_path_buf());
+        let stale_state = unconfirmed_root_state(&stale_scan);
+        let stale_request =
+            build_root_trust_request(&stale_scan, &stale_state, RootTrustReason::EmptyRoot, 0)
+                .expect("build markerless request");
+        create_root_marker(stale.path()).expect("marker appears after prompt");
+        assert!(matches!(
+            establish_explicit_root_marker(&stale_request),
+            Err(RootTrustError::Stale(_))
+        ));
+
+        let generation = TestDirectory::new("trust-stale-generation");
+        let generation_scan = scan_root(generation.path().to_path_buf());
+        let generation_state = unconfirmed_root_state(&generation_scan);
+        let mut generation_request = build_root_trust_request(
+            &generation_scan,
+            &generation_state,
+            RootTrustReason::EmptyRoot,
+            0,
+        )
+        .expect("build generation request");
+        generation_request.observed_mount_generation =
+            generation_request.observed_mount_generation.wrapping_add(1);
+        assert!(matches!(
+            establish_explicit_root_marker(&generation_request),
+            Err(RootTrustError::Stale(_))
+        ));
+        assert!(!root_identity_path(generation.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_marker_can_be_adopted_from_a_read_only_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("trust-read-only-adoption");
+        let marker = create_root_marker(directory.path())
+            .expect("create marker before making root read-only")
+            .identity;
+        let scan = scan_root(directory.path().to_path_buf());
+        let state = unconfirmed_root_state(&scan);
+        let request = build_root_trust_request(&scan, &state, RootTrustReason::EmptyRoot, 0)
+            .expect("build adoption request");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("make root read-only");
+
+        let result = establish_explicit_root_marker(&request);
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore root permissions");
+        assert_eq!(result.expect("adopt read-only marker"), marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn markerless_read_only_root_remains_untrusted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("trust-read-only-markerless");
+        let scan = scan_root(directory.path().to_path_buf());
+        let state = unconfirmed_root_state(&scan);
+        let request = build_root_trust_request(&scan, &state, RootTrustReason::EmptyRoot, 0)
+            .expect("build markerless request");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("make root read-only");
+
+        // Capability-enabled test runners can bypass mode bits; skip only the
+        // permission assertion when this fixture cannot model read-only media.
+        let probe = directory.path().join("permission-probe");
+        if OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .is_ok()
+        {
+            let _ = std::fs::remove_file(probe);
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("restore root permissions");
+            return;
+        }
+
+        let result = establish_explicit_root_marker(&request);
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore root permissions");
+        assert!(matches!(result, Err(RootTrustError::Failed(_))));
+        assert!(!root_identity_path(directory.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn root_trust_stage_requires_exact_config_and_security_state() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-stage-guards");
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist unconfirmed root");
+        let request = build_root_trust_request(&scan, &stored, RootTrustReason::EmptyRoot, 0)
+            .expect("build trust request");
+
+        assert!(matches!(
+            stage_root_trust(&db, &[], &request).await,
+            Err(RootTrustError::Stale(_))
+        ));
+        assert!(!root_identity_path(directory.path()).exists());
+
+        let mut changed: library_root::ActiveModel = stored.into();
+        changed.is_available = Set(true);
+        changed
+            .update(&db)
+            .await
+            .expect("change security-relevant state");
+        assert!(matches!(
+            stage_root_trust(&db, &[directory.path().to_path_buf()], &request,).await,
+            Err(RootTrustError::Stale(_))
+        ));
+        assert!(!root_identity_path(directory.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn root_trust_stage_ignores_timestamp_drift_and_stages_unavailable_marker() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-stage-marker");
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist unconfirmed root");
+        let request = build_root_trust_request(&scan, &stored, RootTrustReason::EmptyRoot, 0)
+            .expect("build trust request");
+
+        let mut timestamp_only: library_root::ActiveModel = stored.into();
+        timestamp_only.last_checked_at = Set("2099-01-01T00:00:00Z".to_string());
+        timestamp_only
+            .update(&db)
+            .await
+            .expect("change timestamp only");
+
+        let marker = stage_root_trust(&db, &[directory.path().to_path_buf()], &request)
+            .await
+            .expect("stage root trust");
+        assert!(is_marker_identity(&marker));
+        assert_eq!(
+            read_root_marker(directory.path())
+                .expect("read marker")
+                .as_deref(),
+            Some(marker.as_str())
+        );
+
+        let staged =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query staged root")
+                .expect("staged root exists");
+        assert_eq!(staged.device_id.as_deref(), Some(marker.as_str()));
+        assert!(!staged.identity_confirmed);
+        assert!(!staged.is_available);
+        assert!(!staged.last_scan_complete);
+    }
+
+    #[tokio::test]
+    async fn forced_trust_conversion_preserves_all_tracks_until_ordinary_scan() {
+        let db = rename_test_database().await;
+        let target = TestDirectory::new("trust-conversion-target");
+        let target_scan = scan_root(target.path().to_path_buf());
+        let target_state = persist_root_scan_status(&db, &target_scan, None, false, true, false)
+            .await
+            .expect("persist target root");
+        let request =
+            build_root_trust_request(&target_scan, &target_state, RootTrustReason::EmptyRoot, 1)
+                .expect("build target request");
+
+        let other = TestDirectory::new("trust-conversion-other");
+        create_root_marker(other.path()).expect("create other marker");
+        let new_audio = other.path().join("new.wav");
+        write_minimal_wav(&new_audio);
+        let other_scan = scan_root(other.path().to_path_buf());
+        persist_root_scan_status(&db, &other_scan, None, true, true, false)
+            .await
+            .expect("persist confirmed other root");
+
+        insert_rename_test_track(
+            &db,
+            "conversion-target-track",
+            target
+                .path()
+                .join("remembered.flac")
+                .to_string_lossy()
+                .as_ref(),
+            "Target remembered",
+            0,
+        )
+        .await;
+        insert_rename_test_track(
+            &db,
+            "conversion-other-track",
+            other
+                .path()
+                .join("remembered.flac")
+                .to_string_lossy()
+                .as_ref(),
+            "Other remembered",
+            0,
+        )
+        .await;
+
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let music_dirs = vec![target.path().to_path_buf(), other.path().to_path_buf()];
+        let RootTrustCommandStart::Pending(pending) =
+            begin_root_trust_command(&db, &music_dirs, &event_tx, &request)
+                .await
+                .expect("run forced conversion")
+        else {
+            panic!("queue ordinary follow-up");
+        };
+
+        assert!(track::Entity::find_by_id("conversion-target-track")
+            .one(&db)
+            .await
+            .expect("query target row after conversion")
+            .is_some());
+        assert!(track::Entity::find_by_id("conversion-other-track")
+            .one(&db)
+            .await
+            .expect("query other row after conversion")
+            .is_some());
+        assert!(track::Entity::find()
+            .filter(track::Column::FilePath.eq(new_audio.to_string_lossy().as_ref()))
+            .one(&db)
+            .await
+            .expect("query new row after conversion")
+            .is_none());
+
+        let converted =
+            library_root::Entity::find_by_id(target.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query converted root")
+                .expect("converted root exists");
+        assert!(converted.identity_confirmed);
+        assert!(!converted.is_available);
+        assert!(converted.last_scan_complete);
+
+        assert_eq!(
+            complete_root_trust_scan(&db, &music_dirs, &event_tx, &pending).await,
+            RootTrustOutcome::Active
+        );
+        assert!(track::Entity::find_by_id("conversion-target-track")
+            .one(&db)
+            .await
+            .expect("query target row after ordinary scan")
+            .is_none());
+        assert!(track::Entity::find_by_id("conversion-other-track")
+            .one(&db)
+            .await
+            .expect("query other row after ordinary scan")
+            .is_none());
+        assert!(track::Entity::find()
+            .filter(track::Column::FilePath.eq(new_audio.to_string_lossy().as_ref()))
+            .one(&db)
+            .await
+            .expect("query new row after ordinary scan")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn nonempty_prompt_becoming_empty_requires_fresh_empty_consent() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-nonempty-to-empty");
+        let audio_path = directory.path().join("remembered.wav");
+        write_minimal_wav(&audio_path);
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist nonempty legacy root");
+        insert_rename_test_track(
+            &db,
+            "nonempty-to-empty-track",
+            audio_path.to_string_lossy().as_ref(),
+            "Remembered",
+            0,
+        )
+        .await;
+        let request =
+            build_root_trust_request(&scan, &stored, RootTrustReason::LegacyEnrollment, 1)
+                .expect("build nonempty request");
+        assert!(!request.requires_empty_acknowledgement());
+        let original_id = request.request_id();
+        std::fs::remove_file(&audio_path).expect("root becomes empty after prompt");
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        assert!(matches!(
+            begin_root_trust_command(&db, &[directory.path().to_path_buf()], &event_tx, &request,)
+                .await
+                .expect("run guarded conversion"),
+            RootTrustCommandStart::Unavailable(_)
+        ));
+        assert!(track::Entity::find_by_id("nonempty-to-empty-track")
+            .one(&db)
+            .await
+            .expect("query remembered track")
+            .is_some());
+
+        let persisted =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query drifted root")
+                .expect("drifted root exists");
+        assert!(!persisted.identity_confirmed);
+        assert!(!persisted.is_available);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let fresh = events
+            .iter()
+            .find_map(|event| match event {
+                LibraryEvent::RootTrustRequired(requests) => requests.first(),
+                _ => None,
+            })
+            .expect("empty observation emits fresh consent request");
+        assert_ne!(fresh.request_id(), original_id);
+        assert_eq!(fresh.reason(), RootTrustReason::EmptyRoot);
+        assert!(fresh.requires_empty_acknowledgement());
+        assert!(fresh.expected_state.matches(&persisted));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            LibraryEvent::TrackRemoved(path) if path == audio_path.to_string_lossy().as_ref()
+        )));
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_becoming_nonempty_requires_fresh_nonempty_consent() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-empty-to-nonempty");
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist empty legacy root");
+        let remembered_path = directory.path().join("remembered.flac");
+        insert_rename_test_track(
+            &db,
+            "empty-to-nonempty-track",
+            remembered_path.to_string_lossy().as_ref(),
+            "Remembered",
+            0,
+        )
+        .await;
+        let request = build_root_trust_request(&scan, &stored, RootTrustReason::EmptyRoot, 1)
+            .expect("build empty request");
+        assert!(request.requires_empty_acknowledgement());
+        let original_id = request.request_id();
+        let new_audio = directory.path().join("new.wav");
+        write_minimal_wav(&new_audio);
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        assert!(matches!(
+            begin_root_trust_command(&db, &[directory.path().to_path_buf()], &event_tx, &request,)
+                .await
+                .expect("run guarded conversion"),
+            RootTrustCommandStart::Unavailable(_)
+        ));
+        assert!(track::Entity::find_by_id("empty-to-nonempty-track")
+            .one(&db)
+            .await
+            .expect("query remembered track")
+            .is_some());
+        assert!(track::Entity::find()
+            .filter(track::Column::FilePath.eq(new_audio.to_string_lossy().as_ref()))
+            .one(&db)
+            .await
+            .expect("query newly observed track")
+            .is_none());
+
+        let persisted =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query drifted root")
+                .expect("drifted root exists");
+        assert!(!persisted.identity_confirmed);
+        assert!(!persisted.is_available);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let fresh = events
+            .iter()
+            .find_map(|event| match event {
+                LibraryEvent::RootTrustRequired(requests) => requests.first(),
+                _ => None,
+            })
+            .expect("nonempty observation emits fresh consent request");
+        assert_ne!(fresh.request_id(), original_id);
+        assert_eq!(fresh.reason(), RootTrustReason::LegacyEnrollment);
+        assert!(!fresh.requires_empty_acknowledgement());
+        assert!(fresh.expected_state.matches(&persisted));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            LibraryEvent::TrackUpserted(track)
+                if track.file_path.as_deref() == Some(new_audio.to_string_lossy().as_ref())
+        )));
+    }
+
+    #[tokio::test]
+    async fn forced_identity_change_emits_a_replacement_request() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-forced-identity-change");
+        let audio_path = directory.path().join("present.wav");
+        write_minimal_wav(&audio_path);
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist legacy root");
+        insert_rename_test_track(
+            &db,
+            "forced-identity-track",
+            audio_path.to_string_lossy().as_ref(),
+            "Present",
+            0,
+        )
+        .await;
+        let request =
+            build_root_trust_request(&scan, &stored, RootTrustReason::LegacyEnrollment, 1)
+                .expect("build legacy request");
+        let staged_marker = stage_root_trust(&db, &[directory.path().to_path_buf()], &request)
+            .await
+            .expect("stage original marker");
+        let replacement_marker = format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4());
+        std::fs::write(
+            root_identity_path(directory.path()),
+            format!("{replacement_marker}\n"),
+        )
+        .expect("replace marker before conversion");
+
+        let forced = HashMap::from([(
+            directory.path().to_path_buf(),
+            ForcedRootTrustConversion {
+                marker_identity: staged_marker,
+                expected_empty: false,
+                expected_mount_generation: request.observed_mount_generation,
+                original_reason: request.reason,
+            },
+        )]);
+        let authority_guards = HashMap::new();
+        let evidence_refreshes = HashMap::new();
+        let (event_tx, event_rx) = async_channel::unbounded();
+        initial_scan_with_root_trust_guards(
+            &db,
+            &[directory.path().to_path_buf()],
+            &event_tx,
+            &forced,
+            &authority_guards,
+            &evidence_refreshes,
+        )
+        .await
+        .expect("run guarded conversion");
+
+        assert!(track::Entity::find_by_id("forced-identity-track")
+            .one(&db)
+            .await
+            .expect("query protected track")
+            .is_some());
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let fresh = events
+            .iter()
+            .find_map(|event| match event {
+                LibraryEvent::RootTrustRequired(requests) => requests.first(),
+                _ => None,
+            })
+            .expect("identity change emits a fresh request");
+        assert_eq!(fresh.reason(), RootTrustReason::Replacement);
+        assert_eq!(fresh.observed_identity, replacement_marker);
+        assert!(!fresh.requires_empty_acknowledgement());
+    }
+
+    #[tokio::test]
+    async fn replacement_prompt_content_drift_preserves_replacement_classification() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-replacement-content-drift");
+        create_root_marker(directory.path()).expect("create replacement marker");
+        let audio_path = directory.path().join("present.wav");
+        write_minimal_wav(&audio_path);
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist observed replacement");
+        let old_marker = format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4());
+        let mut previously_confirmed: library_root::ActiveModel = stored.into();
+        previously_confirmed.device_id = Set(Some(old_marker));
+        previously_confirmed.identity_confirmed = Set(true);
+        let previously_confirmed = previously_confirmed
+            .update(&db)
+            .await
+            .expect("persist previous confirmed identity");
+        insert_rename_test_track(
+            &db,
+            "replacement-content-drift-track",
+            audio_path.to_string_lossy().as_ref(),
+            "Remembered",
+            0,
+        )
+        .await;
+        let request = build_root_trust_request(
+            &scan,
+            &previously_confirmed,
+            RootTrustReason::Replacement,
+            1,
+        )
+        .expect("build replacement request");
+        let original_id = request.request_id();
+        std::fs::remove_file(&audio_path).expect("replacement becomes empty after prompt");
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        assert!(matches!(
+            begin_root_trust_command(&db, &[directory.path().to_path_buf()], &event_tx, &request,)
+                .await
+                .expect("run guarded replacement conversion"),
+            RootTrustCommandStart::Unavailable(_)
+        ));
+
+        assert!(track::Entity::find_by_id("replacement-content-drift-track")
+            .one(&db)
+            .await
+            .expect("query protected replacement track")
+            .is_some());
+        let persisted =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query drifted replacement")
+                .expect("replacement state exists");
+        assert!(!persisted.identity_confirmed);
+        assert!(!persisted.is_available);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let fresh = events
+            .iter()
+            .find_map(|event| match event {
+                LibraryEvent::RootTrustRequired(requests) => requests.first(),
+                _ => None,
+            })
+            .expect("content drift emits a fresh replacement request");
+        assert_ne!(fresh.request_id(), original_id);
+        assert_eq!(fresh.reason(), RootTrustReason::Replacement);
+        assert!(fresh.requires_empty_acknowledgement());
+        assert!(fresh.expected_state.matches(&persisted));
+    }
+
+    #[tokio::test]
+    async fn authoritative_follow_up_requires_the_unavailable_state_gate() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-authority-gate");
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist unconfirmed root");
+        let request = build_root_trust_request(&scan, &stored, RootTrustReason::EmptyRoot, 1)
+            .expect("build request");
+        insert_rename_test_track(
+            &db,
+            "authority-gate-track",
+            directory
+                .path()
+                .join("remembered.flac")
+                .to_string_lossy()
+                .as_ref(),
+            "Remembered",
+            0,
+        )
+        .await;
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let RootTrustCommandStart::Pending(pending) =
+            begin_root_trust_command(&db, &music_dirs, &event_tx, &request)
+                .await
+                .expect("convert root")
+        else {
+            panic!("queue follow-up");
+        };
+
+        let converted =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query converted root")
+                .expect("converted root exists");
+        let mut conflicting: library_root::ActiveModel = converted.into();
+        conflicting.is_available = Set(true);
+        conflicting
+            .update(&db)
+            .await
+            .expect("inject conflicting active state");
+
+        assert_eq!(
+            complete_root_trust_scan(&db, &music_dirs, &event_tx, &pending).await,
+            RootTrustOutcome::TrustedButUnavailable
+        );
+        assert!(track::Entity::find_by_id("authority-gate-track")
+            .one(&db)
+            .await
+            .expect("query protected row")
+            .is_some());
+        let guarded =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query guarded root")
+                .expect("guarded root exists");
+        assert!(!guarded.is_available);
+        assert!(!guarded.last_scan_complete);
+    }
+
+    #[tokio::test]
+    async fn authoritative_follow_up_mount_change_demotes_until_fresh_consent() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-authority-mount-change");
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist unconfirmed root");
+        let request = build_root_trust_request(&scan, &stored, RootTrustReason::EmptyRoot, 1)
+            .expect("build request");
+        let remembered_path = directory.path().join("remembered.flac");
+        insert_rename_test_track(
+            &db,
+            "authority-mount-change-track",
+            remembered_path.to_string_lossy().as_ref(),
+            "Remembered",
+            0,
+        )
+        .await;
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let RootTrustCommandStart::Pending(mut pending) =
+            begin_root_trust_command(&db, &music_dirs, &event_tx, &request)
+                .await
+                .expect("convert root")
+        else {
+            panic!("queue guarded follow-up");
+        };
+        pending.expected_mount_generation = pending.expected_mount_generation.wrapping_add(1);
+
+        assert_eq!(
+            complete_root_trust_scan(&db, &music_dirs, &event_tx, &pending).await,
+            RootTrustOutcome::TrustedButUnavailable
+        );
+        assert!(track::Entity::find_by_id("authority-mount-change-track")
+            .one(&db)
+            .await
+            .expect("query protected row after guarded mismatch")
+            .is_some());
+        let demoted =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query demoted root")
+                .expect("demoted root exists");
+        assert!(!demoted.identity_confirmed);
+        assert!(!demoted.is_available);
+        let guarded_events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let fresh = guarded_events
+            .iter()
+            .find_map(|event| match event {
+                LibraryEvent::RootTrustRequired(requests) => requests.first(),
+                _ => None,
+            })
+            .expect("mount change emits fresh replacement consent");
+        assert_eq!(fresh.reason(), RootTrustReason::Replacement);
+        assert!(fresh.requires_empty_acknowledgement());
+        assert!(fresh.expected_state.matches(&demoted));
+        assert!(!guarded_events.iter().any(|event| matches!(
+            event,
+            LibraryEvent::TrackRemoved(path) if path == remembered_path.to_string_lossy().as_ref()
+        )));
+
+        initial_scan(&db, &music_dirs, &event_tx)
+            .await
+            .expect("run later ordinary scan");
+        assert!(track::Entity::find_by_id("authority-mount-change-track")
+            .one(&db)
+            .await
+            .expect("query protected row after ordinary scan")
+            .is_some());
+        let still_unconfirmed =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query root after ordinary scan")
+                .expect("root still exists");
+        assert!(!still_unconfirmed.identity_confirmed);
+        assert!(!still_unconfirmed.is_available);
+    }
+
+    #[tokio::test]
+    async fn incomplete_authoritative_follow_up_preserves_durable_identity() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-authority-incomplete");
+        let audio_path = directory.path().join("present.wav");
+        write_minimal_wav(&audio_path);
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist legacy root");
+        let request =
+            build_root_trust_request(&scan, &stored, RootTrustReason::LegacyEnrollment, 1)
+                .expect("build request");
+        insert_rename_test_track(
+            &db,
+            "authority-incomplete-track",
+            audio_path.to_string_lossy().as_ref(),
+            "Present",
+            0,
+        )
+        .await;
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let RootTrustCommandStart::Pending(pending) =
+            begin_root_trust_command(&db, &music_dirs, &event_tx, &request)
+                .await
+                .expect("convert root")
+        else {
+            panic!("queue guarded follow-up");
+        };
+        let parked = directory.path().with_extension("temporarily-unavailable");
+        std::fs::rename(directory.path(), &parked).expect("hide root before follow-up");
+
+        assert_eq!(
+            complete_root_trust_scan(&db, &music_dirs, &event_tx, &pending).await,
+            RootTrustOutcome::TrustedButUnavailable
+        );
+        let incomplete =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query incomplete root")
+                .expect("incomplete root exists");
+        assert!(incomplete.identity_confirmed);
+        assert!(!incomplete.is_available);
+        assert!(!incomplete.last_scan_complete);
+        assert!(track::Entity::find_by_id("authority-incomplete-track")
+            .one(&db)
+            .await
+            .expect("query row after incomplete scan")
+            .is_some());
+        let incomplete_events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(!incomplete_events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::RootTrustRequired(_))));
+
+        std::fs::rename(&parked, directory.path()).expect("restore root after transient failure");
+        initial_scan(&db, &music_dirs, &event_tx)
+            .await
+            .expect("rescan restored root");
+        let restored =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query restored root")
+                .expect("restored root exists");
+        assert!(restored.identity_confirmed);
+        assert!(restored.is_available);
+        assert!(restored.last_scan_complete);
+    }
+
+    #[tokio::test]
+    async fn unavailable_confirmation_refreshes_retryable_evidence() {
+        use sea_orm::ConnectionTrait;
+
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-unavailable-refresh");
+        create_root_marker(directory.path()).expect("create adoptable marker");
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist unconfirmed marker");
+        let request = build_root_trust_request(&scan, &stored, RootTrustReason::EmptyRoot, 0)
+            .expect("build adoption request");
+        let request_id = request.request_id();
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_conversion_persistence
+             BEFORE UPDATE ON library_roots
+             WHEN OLD.identity_confirmed = 0
+              AND NEW.identity_confirmed = 1
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected conversion persistence failure');
+             END",
+        )
+        .await
+        .expect("create conversion failure trigger");
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let mut completed = HashMap::new();
+        assert!(process_library_command(
+            &db,
+            &[directory.path().to_path_buf()],
+            &event_tx,
+            &mut completed,
+            LibraryCommand::ConfirmRootTrust(request),
+        )
+        .await
+        .is_none());
+        assert!(completed.is_empty());
+
+        let persisted =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query refreshed root")
+                .expect("refreshed root exists");
+        assert!(!persisted.identity_confirmed);
+        assert!(!persisted.is_available);
+        assert!(persisted.last_scan_complete);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let finished_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    LibraryEvent::RootTrustFinished {
+                        request_id: finished_id,
+                        outcome: RootTrustOutcome::TrustedButUnavailable,
+                        ..
+                    } if *finished_id == request_id
+                )
+            })
+            .expect("emit unavailable result");
+        let (required_index, fresh) = events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                LibraryEvent::RootTrustRequired(requests) => {
+                    requests.first().map(|request| (index, request))
+                }
+                _ => None,
+            })
+            .expect("refresh emits retryable evidence");
+        assert!(required_index > finished_index);
+        assert_eq!(fresh.request_id(), request_id);
+        assert_eq!(fresh.reason(), RootTrustReason::EmptyRoot);
+        assert!(fresh.requires_empty_acknowledgement());
+        assert!(fresh.expected_state.matches(&persisted));
+
+        db.execute_unprepared("DROP TRIGGER fail_conversion_persistence")
+            .await
+            .expect("remove conversion failure trigger");
+    }
+
+    #[tokio::test]
+    async fn marker_created_before_db_failure_requires_fresh_adoption() {
+        use sea_orm::ConnectionTrait;
+
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-db-failure-retry");
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist legacy root");
+        let request = build_root_trust_request(&scan, &stored, RootTrustReason::EmptyRoot, 0)
+            .expect("build legacy request");
+        let original_id = request.request_id();
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_root_trust_stage
+             BEFORE UPDATE ON library_roots
+             WHEN OLD.last_scan_complete = 1
+              AND NEW.last_scan_complete = 0
+              AND NEW.device_id != OLD.device_id
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected root trust failure');
+             END",
+        )
+        .await
+        .expect("create root trust failure trigger");
+
+        assert!(matches!(
+            stage_root_trust(&db, &[directory.path().to_path_buf()], &request).await,
+            Err(RootTrustError::Failed(_))
+        ));
+        let orphan_marker = read_root_marker(directory.path())
+            .expect("read orphan marker")
+            .expect("marker remains after DB failure");
+        assert!(is_marker_identity(&orphan_marker));
+        let unchanged =
+            library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query unchanged state")
+                .expect("root state remains");
+        assert_eq!(unchanged.device_id, stored.device_id);
+
+        db.execute_unprepared("DROP TRIGGER fail_root_trust_stage")
+            .await
+            .expect("drop failure trigger");
+        let (event_tx, event_rx) = async_channel::unbounded();
+        initial_scan(&db, &[directory.path().to_path_buf()], &event_tx)
+            .await
+            .expect("rescan orphan marker");
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let fresh = events
+            .iter()
+            .find_map(|event| match event {
+                LibraryEvent::RootTrustRequired(requests) => requests.first(),
+                _ => None,
+            })
+            .expect("orphan marker requires fresh adoption");
+        assert_ne!(fresh.request_id(), original_id);
+        assert_eq!(fresh.observed_identity, orphan_marker);
+    }
+
+    #[tokio::test]
+    async fn stale_legacy_confirmation_emits_a_fresh_marker_adoption_request() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-fresh-adoption");
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist legacy state");
+        let request = build_root_trust_request(&scan, &stored, RootTrustReason::EmptyRoot, 0)
+            .expect("build legacy request");
+        let original_id = request.request_id();
+        create_root_marker(directory.path()).expect("marker appears after prompt");
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let mut completed = HashMap::new();
+        assert!(process_library_command(
+            &db,
+            &[directory.path().to_path_buf()],
+            &event_tx,
+            &mut completed,
+            LibraryCommand::ConfirmRootTrust(request),
+        )
+        .await
+        .is_none());
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LibraryEvent::RootTrustFinished {
+                request_id,
+                outcome: RootTrustOutcome::Stale,
+                ..
+            } if *request_id == original_id
+        )));
+        let fresh = events
+            .iter()
+            .find_map(|event| match event {
+                LibraryEvent::RootTrustRequired(requests) => requests.first(),
+                _ => None,
+            })
+            .expect("refresh emits a new adoption request");
+        assert_ne!(fresh.request_id(), original_id);
+        assert!(is_marker_identity(&fresh.observed_identity));
+    }
+
+    #[tokio::test]
+    async fn command_only_mode_replays_completed_duplicate_without_side_effects() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-command-only");
+        create_root_marker(directory.path()).expect("create adoptable marker");
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist unconfirmed marker");
+        let request = build_root_trust_request(&scan, &stored, RootTrustReason::EmptyRoot, 0)
+            .expect("build adoption request");
+        let request_id = request.request_id();
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::bounded(2);
+        command_tx
+            .send(LibraryCommand::ConfirmRootTrust(request.clone()))
+            .await
+            .expect("send first command");
+        command_tx
+            .send(LibraryCommand::ConfirmRootTrust(request))
+            .await
+            .expect("send duplicate command");
+        drop(command_tx);
+        let mut completed = HashMap::new();
+        process_library_commands_without_watcher(
+            &db,
+            &[directory.path().to_path_buf()],
+            &event_tx,
+            &command_rx,
+            &mut completed,
+        )
+        .await;
+
+        assert_eq!(completed.len(), 1);
+        let outcomes: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                LibraryEvent::RootTrustFinished {
+                    request_id: finished_id,
+                    outcome,
+                    ..
+                } if finished_id == request_id => Some(outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            [RootTrustOutcome::Active, RootTrustOutcome::Active],
+            "the duplicate receives the cached terminal result"
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_request_can_retry_after_a_transient_failure() {
+        use sea_orm::ConnectionTrait;
+
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("trust-retry-same-evidence");
+        create_root_marker(directory.path()).expect("create adoptable marker");
+        let scan = scan_root(directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist unconfirmed marker");
+        let request = build_root_trust_request(&scan, &stored, RootTrustReason::EmptyRoot, 0)
+            .expect("build retryable request");
+        let request_id = request.request_id();
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_first_trust_attempt
+             BEFORE UPDATE ON library_roots
+             WHEN NEW.last_scan_complete = 0
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected transient trust failure');
+             END",
+        )
+        .await
+        .expect("create transient failure trigger");
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let mut completed = HashMap::new();
+        assert!(process_library_command(
+            &db,
+            &[directory.path().to_path_buf()],
+            &event_tx,
+            &mut completed,
+            LibraryCommand::ConfirmRootTrust(request.clone()),
+        )
+        .await
+        .is_none());
+        assert!(
+            completed.is_empty(),
+            "a failed attempt must not poison deterministic request-ID retries"
+        );
+
+        db.execute_unprepared("DROP TRIGGER fail_first_trust_attempt")
+            .await
+            .expect("remove transient failure trigger");
+        let pending = process_library_command(
+            &db,
+            &[directory.path().to_path_buf()],
+            &event_tx,
+            &mut completed,
+            LibraryCommand::ConfirmRootTrust(request),
+        )
+        .await
+        .expect("same evidence is processed again");
+        finish_pending_root_trust_scan(
+            &db,
+            &[directory.path().to_path_buf()],
+            &event_tx,
+            &mut completed,
+            pending,
+        )
+        .await;
+
+        assert_eq!(completed.len(), 1);
+        let outcomes: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                LibraryEvent::RootTrustFinished {
+                    request_id: finished_id,
+                    outcome,
+                    ..
+                } if finished_id == request_id => Some(outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            [RootTrustOutcome::Failed, RootTrustOutcome::Active]
+        );
+    }
+
+    #[test]
+    fn legacy_identity_with_rows_requires_explicit_trust() {
         let directory = TestDirectory::new("legacy-marker-conversion");
         std::fs::write(directory.path().join("song.mp3"), []).expect("create audio fixture");
         let mut scan = scan_root(directory.path().to_path_buf());
         let previous = persisted_root_state(&scan, scan.device_id.clone());
         assert!(scan.device_id.as_deref().is_some_and(is_legacy_identity));
 
-        assert!(matches!(
+        assert_eq!(
             prepare_durable_root_identity(&mut scan, Some(&previous), 1, true),
-            RootIdentityPreparation::MarkerCreated {
-                legacy_conversion: true,
-                ..
-            }
-        ));
-        assert!(scan.device_id.as_deref().is_some_and(is_marker_identity));
+            RootIdentityPreparation::Unchanged
+        );
+        assert!(!root_identity_path(directory.path()).exists());
         assert!(!reconciliation_is_authoritative(&scan, Some(&previous)));
+        assert_eq!(
+            root_trust_reason(&scan, Some(&previous), 1, true, false),
+            Some(RootTrustReason::LegacyEnrollment)
+        );
     }
 
     #[test]
@@ -4998,10 +7372,7 @@ mod tests {
 
         assert!(matches!(
             prepare_durable_root_identity(&mut scan, None, 0, true),
-            RootIdentityPreparation::MarkerCreated {
-                legacy_conversion: false,
-                ..
-            }
+            RootIdentityPreparation::MarkerCreated { .. }
         ));
         assert!(scan.device_id.as_deref().is_some_and(is_marker_identity));
         assert!(scan_confirms_identity(&scan, None, 0));
@@ -5514,11 +7885,21 @@ mod tests {
             reconciliation_authoritative: false,
             content_authorized: false,
         };
-        assert!(scan_confirms_identity(
+        assert!(!scan_confirms_identity(
             &mounted_volume,
             Some(&unconfirmed_mountpoint),
             0
         ));
+        assert_eq!(
+            root_trust_reason(
+                &mounted_volume,
+                Some(&unconfirmed_mountpoint),
+                0,
+                true,
+                false,
+            ),
+            Some(RootTrustReason::LegacyEnrollment)
+        );
         assert!(!reconciliation_is_authoritative(
             &mounted_volume,
             Some(&unconfirmed_mountpoint)
@@ -5686,7 +8067,7 @@ mod tests {
 
         let directory = TestDirectory::new("persisted-state");
         let mut scan = scan_root(directory.path().to_path_buf());
-        persist_root_scan_status(&db, &scan, None, true)
+        persist_root_scan_status(&db, &scan, None, true, true, false)
             .await
             .expect("persist available root");
 
@@ -5702,7 +8083,7 @@ mod tests {
 
         scan.errors.push("simulated traversal error".to_string());
         scan.reconciliation_authoritative = false;
-        persist_root_scan_status(&db, &scan, Some(&stored), false)
+        persist_root_scan_status(&db, &scan, Some(&stored), false, true, false)
             .await
             .expect("persist unavailable root");
 
@@ -5734,7 +8115,7 @@ mod tests {
         create_root_marker(directory.path()).expect("create durable root identity");
         let scan = scan_root(directory.path().to_path_buf());
         let expected_identity = scan.device_id.clone().expect("root identity");
-        persist_root_scan_status(&db, &scan, None, true)
+        persist_root_scan_status(&db, &scan, None, true, true, false)
             .await
             .expect("persist confirmed root");
         let music_dirs = vec![directory.path().to_path_buf()];

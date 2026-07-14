@@ -12,10 +12,11 @@ Created: 2026-07-10
 - If scope changes, update the review document or record the decision under **Decisions**.
 - Run the global validation gate after every milestone.
 - Do not combine the architecture milestone with unrelated bug fixes.
-- Add a `CHANGELOG.md` entry in the same commit as any user-visible fix. The remediation
-  work through P1.7 landed without one, and the changelog silently drifted four months
-  behind the code; a user could not tell that the migration corruption or the destructive
-  reconciliation had ever been fixed.
+- Before opening any remediation PR, update both this tracker and `CHANGELOG.md` on the branch.
+  Every user-visible fix must be described in that PR. The remediation work through P1.7 landed
+  without those updates, and the changelog silently drifted four months behind the code; a user
+  could not tell that the migration corruption or the destructive reconciliation had ever been
+  fixed.
 
 Status summary:
 
@@ -23,6 +24,10 @@ Status summary:
 - [ ] P1 correctness and security complete
 - [ ] P2 resilience and packaging complete
 - [ ] P3 architecture and integration coverage complete
+
+Progress snapshot (2026-07-14, excluding the two still-open release-workflow items deferred by
+request):
+**114/213 (53.5%)** non-release checklist items complete; **98/112 (87.5%)** across P0 and P1.
 
 ## P0 — Release blockers
 
@@ -51,17 +56,41 @@ Acceptance criteria: upgrading a v0.5.0-style database always yields a unique co
 - [x] Load persisted root authorization once per watcher batch, prefer the most-specific root,
   and retain fail-closed invalidation for the rest of the batch.
 - [x] Add tests for missing, empty, permission-denied, partially unreadable, and overlapping
-  roots, plus marker corruption/duplication/conversion and watcher-cache invalidation.
-- [ ] Add an explicit trust/re-enrollment flow for roots inherited from a pre-identity database;
-  content similarity is not accepted as proof of physical volume identity.
+  roots, plus marker corruption/duplication/conversion and watcher-cache invalidation. PR #68's
+  44 safety-core tests are supplemented by 31 focused explicit-trust engine/UI tests covering
+  inherited and replacement roots and trust requests whose complete observation has no supported
+  audio; dismissal and unknown responses; stale evidence, compare-and-swap, marker, and mount
+  drift; read-only marker-create failure and valid-marker adoption; retry/idempotency; a
+  non-destructive conversion followed by a distinct ordinary scan; and command processing without
+  a filesystem watcher. One direct end-to-end watcher-backlog/confirmation ordering harness
+  remains future integration coverage; the current ordering is exercised through engine-loop and
+  control-flow unit components.
+- [x] Add an explicit trust/re-enrollment flow for roots inherited from a pre-identity database,
+  confirmed roots whose identity changed, and unconfirmed trust requests whose complete
+  observation has no supported audio files. Tributary now queues exact configured-root prompts
+  one at a time in the main window, never accepts content similarity as identity proof, presents
+  replacements as destructive, and requires a second acknowledgement for every such
+  no-supported-audio trust request. Filesystem evidence remains private to the engine and is
+  revalidated with persisted-state compare-and-swap and fresh identity/mount checks before consent
+  can change authority. A brand-new writable root whose first complete observation contains
+  supported audio and has no remembered metadata continues to enroll automatically; once an empty
+  observation has been recorded, later content still requires consent because Tributary cannot
+  distinguish newly added files from a removable or network volume appearing at the mountpoint.
 - [ ] Pin reconciliation and watcher mutations to a root handle or equivalent mount generation
   on every supported platform; Linux has mount-instance guards, while portable Unix ABA
   resistance remains incomplete.
-- [x] Record implementation: safety core and review follow-ups are in PR #68 with 44 focused
-  tests; explicit legacy trust and portable root pinning remain open.
+- [x] Record implementation: the safety core and review follow-ups are in PR #68 with 44 focused
+  tests; explicit trust/re-enrollment is in `aecbce6` with 31 additional focused tests. Portable
+  opened-root/mount-generation pinning remains open.
 
 Acceptance criteria: Tributary never deletes persisted track metadata based on an incomplete
-view of a library root, while intentional offline deletion is eventually reflected.
+view of a library root. An inherited or replaced root requires explicit confirmation, as does any
+trust request whose complete observation has no supported audio files. Those requests require a
+complete marker-backed conversion and a distinct complete ordinary scan before becoming
+authoritative. The conversion changes root authorization but performs no track upserts or
+deletions; the ordinary scan may reconcile immediately afterward, with no grace period.
+Declined, stale, failed, and incomplete decisions remain unavailable and preserve remembered
+metadata, while intentional offline deletion is eventually reflected after authority is active.
 
 ### P0.3 Preserve DAAP session lifetime
 
@@ -662,12 +691,38 @@ Record scope or design decisions here so deferred work is explicit.
 - 2026-07-10 — Generation filtering prevents stale receiver events from mutating Tributary.
   Ordered Chromecast command side effects and authoritative MPD state remain P1.7 and P1.8.
 - 2026-07-13 — `spin 0.9.8` was replaced in `Cargo.lock` by compatible `0.9.9`, resolving the
-  withdrawn-release warning. `cargo audit --no-fetch` now passes with exactly two unmaintained
+  yanked-release warning. `cargo audit --no-fetch` now passes with exactly two unmaintained
   dependency warnings, each with an upstream disposition and a 2026-10-10-or-next-release
   review deadline under P0.8. `RUSTSEC-2023-0071` for `rsa` remains separately ignored because
   `cargo-audit` checks the inactive `sqlx-mysql` package retained in `Cargo.lock`; Tributary
   enables SQLite only, the advisory has no fixed upgrade, and the ignore must be reviewed
   immediately if MySQL support is enabled.
+- 2026-07-14 — Root trust is explicit authorization, never content identification. Exact
+  configured roots inherited from a pre-identity database, roots whose confirmed identity no
+  longer matches, and trust requests whose complete observation has no supported audio files enter
+  one FIFO main-window prompt flow. A brand-new writable root auto-enrolls only when its first
+  complete observation contains supported audio and no remembered metadata. Once an empty
+  observation is persisted, later content remains behind consent because it could be a removable
+  or network volume newly appearing at the mountpoint. Replacement actions use destructive
+  presentation, and every prompted no-supported-audio observation requires a separate second
+  acknowledgement. Request correlation exposes only an opaque ID and display facts; the engine
+  retains the filesystem evidence, checks the expected persisted state, creates or adopts the
+  marker, freshly probes identity and mount generation, and atomically compare-and-swaps that
+  expected state before accepting consent.
+  Confirmation creates a random root-owned marker or adopts an already-valid marker, but the
+  conversion scan cannot upsert or delete track rows. A distinct ordinary scan may run
+  immediately afterward and becomes authoritative only if it is complete and still matches the
+  confirmed marker/mount evidence. A deliberate decline remains fail-closed and suppresses the
+  identical request for the rest of the current process; it can be reconsidered after restart or
+  materially new evidence. Stale evidence, incomplete traversal, unavailable storage, and
+  marker/database failure remain fail-closed, release non-active deduplication, and can be retried
+  from refreshed evidence. A markerless read-only root cannot enroll, while a read-only root with
+  an existing valid marker can be adopted.
+  Reconciliation and watcher mutations still are not pinned to one opened root handle or an
+  equivalent generation on every platform: Linux transition checks leave a post-traversal
+  mutation window, portable Unix/Windows ABA resistance remains incomplete, and copied-marker
+  semantics cannot substitute for that pin. Those limits remain under P0.2's unchecked portable
+  root-pinning item.
 - 2026-07-12 — Track deletion now preserves playlist-entry identity, order, and fingerprint by
   nulling the real track foreign key. Scan and watcher-batch reconciliation relink only when
   fingerprint plus optional duration identifies exactly one current track; ambiguous matches
@@ -802,6 +857,7 @@ Add one line per completed task:
 | 2026-07-10 | P0.6 | PR #68 | Immutable release inputs and publication-only repository credentials. |
 | 2026-07-10 | P0.8 | PR #68 | Patched the then-failing dependencies and recorded the warnings known at the time. |
 | 2026-07-13 | P0.8 follow-up | `a35cde8`, `e9a3efc` | Updated `spin` to 0.9.9, leaving exactly two time-bounded unmaintained warnings; the lockfile-only ignored RSA advisory has an explicit rationale, deadline, and feature-enable trigger. |
+| 2026-07-14 | P0.2 explicit root trust | `aecbce6` | Added FIFO main-window enrollment/replacement and no-supported-audio trust-request consent with private engine evidence, guarded marker create/adopt, non-destructive conversion, and 31 focused tests; portable opened-root/mount-generation pinning remains open. |
 | 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
 | 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |
 | 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
