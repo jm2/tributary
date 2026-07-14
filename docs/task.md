@@ -724,12 +724,14 @@ Record scope or design decisions here so deferred work is explicit.
   custom-stream constructor, so cancellation can be checked only before and after an in-flight
   call; hard receiver I/O deadlines require an upstream change or audited fork and are tracked as
   P2.8 rather than overstated as part of P1.7.
-- 2026-07-12 — P1.8 gives MPD one FIFO worker and one persistent TCP session per owned load.
+- 2026-07-13 — P1.8 gives MPD one FIFO worker and one persistent TCP session per owned load.
   Stable `addid`/`playid` identity, authoritative status polling, and atomic `deleteid` cleanup
   distinguish explicit Stop, natural queue exhaustion, remote errors, and another client's
-  replacement queue without applying global cleanup after ownership is lost. Protocol lines,
-  responses, addresses, URIs, idle I/O, and whole operations are bounded; poisoned streams are
-  dropped rather than reused, and all diagnostics discard server text and authenticated URLs.
+  replacement queue without applying global cleanup after ownership is lost. Every owned load
+  explicitly disables MPD `repeat`, `single`, and `consume` modes so queue exhaustion remains
+  attributable to Tributary. Protocol lines, responses, address and URI counts, idle I/O, and
+  post-resolution operations are bounded; poisoned streams are dropped rather than reused, and
+  all diagnostics discard server text and authenticated URLs.
   Standard-library DNS resolution itself remains blocking and the nonblocking command channel is
   unbounded; those narrower resilience improvements and deeper OS loopback coverage are tracked as
   P2.10 rather than overstated as part of P1.8.
@@ -774,4 +776,4 @@ Add one line per completed task:
 | 2026-07-12 | P1.7 | `60ee2af` | One worker owns the Cast session and serializes effects, authoritative state, cancellation, cleanup retries, and stale-event suppression. |
 | 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
 | 2026-07-13 | P2.6 (partial) | `8368a65` | Radio-Browser, geolocation, and MusicBrainz clients now refuse HTTPS→HTTP redirect downgrades and send no `Referer`; packaging metadata remains open. |
-| 2026-07-12 | P1.8 | `eb0b9ca` | One persistent FIFO MPD worker provides bounded protocol I/O, stable queue ownership, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
+| 2026-07-13 | P1.8 | `eb0b9ca` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable queue ownership, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
