@@ -159,6 +159,7 @@ pub fn setup_output_selector(
                     &parked_local,
                     &event_sender,
                     &volume_scale,
+                    &rt_handle,
                 );
             }
         }
@@ -322,6 +323,7 @@ fn handle_mpd_switch(
     parked_local: &Rc<RefCell<Option<Box<dyn AudioOutput>>>>,
     event_sender: &async_channel::Sender<PlayerEvent>,
     volume_scale: &gtk::Scale,
+    rt_handle: &tokio::runtime::Handle,
 ) {
     let saved = load_saved_outputs();
     let mpd_idx = mpd_index_before_row(list_box, idx);
@@ -329,7 +331,10 @@ fn handle_mpd_switch(
     if let Some(entry) = saved.get(mpd_idx) {
         park_local_if_needed(active_output, parked_local, event_sender);
 
-        let mpd = MpdOutput::new(&entry.name, &entry.host, entry.port, event_sender.clone());
+        // The runtime lets MPD start the LAN media proxy, so a credential-bearing
+        // stream is never sent to the daemon over its plaintext connection.
+        let mpd = MpdOutput::new(&entry.name, &entry.host, entry.port, event_sender.clone())
+            .with_runtime(rt_handle.clone());
         *active_output.borrow_mut() = Box::new(mpd);
         info!(
             name = %entry.name,

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{error, info};
 
-use super::cast_http_server::CastHttpServer;
+use super::media_proxy::MediaProxy;
 use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
 
@@ -32,7 +32,7 @@ pub struct ChromecastOutput {
     event_generation: AtomicU64,
     volume: f64,
     current_state: Arc<Mutex<PlayerState>>,
-    cast_server: Arc<Mutex<Option<CastHttpServer>>>,
+    cast_server: Arc<Mutex<Option<MediaProxy>>>,
     rt_handle: Option<tokio::runtime::Handle>,
     intent_epoch: Arc<AtomicU64>,
     worker_tx: mpsc::Sender<WorkerCommand>,
@@ -1541,7 +1541,7 @@ impl ChromecastOutput {
     }
 
     /// Start the LAN media server if it is not already running.
-    fn ensure_cast_server(&self) -> CastResult<std::sync::MutexGuard<'_, Option<CastHttpServer>>> {
+    fn ensure_cast_server(&self) -> CastResult<std::sync::MutexGuard<'_, Option<MediaProxy>>> {
         let mut server_guard = self
             .cast_server
             .lock()
@@ -1553,7 +1553,7 @@ impl ChromecastOutput {
                 .as_ref()
                 .ok_or_else(|| CastFailure::new("media server startup"))?;
             let server = runtime
-                .block_on(CastHttpServer::start())
+                .block_on(MediaProxy::start())
                 .map_err(|error| opaque_cast_failure("media server startup", error))?;
             info!(addr = %server.addr(), "Cast HTTP server started");
             *server_guard = Some(server);
@@ -2822,7 +2822,7 @@ mod tests {
     fn raw_cast_error_context_is_discarded() {
         let failure = opaque_cast_failure(
             "media load",
-            "request failed for https://music.test/cast/token-secret?api_key=query-secret",
+            "request failed for https://music.test/media/token-secret?api_key=query-secret",
         );
         let message = cast_failure_message(failure);
         assert_eq!(message, "Chromecast media load failed");

@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Chromecast no longer receives your server credentials** — Casting a track from Subsonic, Jellyfin, or Plex used to hand the Chromecast the stream URL with your credential still in it: your Plex token, your Jellyfin API key, or — with Subsonic's plaintext auth mode — your **actual password**, hex-encoded and trivially reversible. That credential went to a device Tributary does not control, over a LAN it does not control, and was retained in the device's media session. Tributary now fetches the stream itself and gives the device only an opaque, single-use ticket, revoked when playback stops. Internet radio and other unauthenticated streams are unaffected and still play directly.
 
-> **Known exposure, not yet fixed:** the same problem remains for **MPD**, which is still sent the credential-bearing URL over a plaintext connection. Tracked as P1.6.
+- **MPD no longer receives your server credentials either** — MPD fetches media itself, so the same stream URL was sent to the daemon over its **plaintext** TCP connection, crossing the network in the clear and being retained in the daemon's queue state and `mpd.log`. It now receives the same opaque ticket the Chromecast does. If the proxy cannot be started, the track is refused rather than sent in the clear.
 
 ### Changed
 - **Minimum supported Rust version raised to 1.85.**

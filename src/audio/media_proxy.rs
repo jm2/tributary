@@ -72,7 +72,7 @@ struct ServerState {
 }
 
 /// A running cast HTTP server instance.
-pub struct CastHttpServer {
+pub struct MediaProxy {
     /// The socket address the server is listening on (LAN IP + port).
     addr: SocketAddr,
     /// Registered ticket map (shared with the axum handler).
@@ -81,7 +81,7 @@ pub struct CastHttpServer {
     abort_handle: tokio::task::AbortHandle,
 }
 
-impl CastHttpServer {
+impl MediaProxy {
     /// Start a new cast HTTP server bound to the machine's LAN IP.
     ///
     /// The server binds to port 0 (OS-assigned) on the first
@@ -125,7 +125,7 @@ impl CastHttpServer {
         };
 
         let app = Router::new()
-            .route("/cast/{id}", get(serve_media))
+            .route("/media/{id}", get(serve_media))
             .with_state(state);
 
         let listener = TcpListener::bind(SocketAddr::from((ipv4, 0))).await?;
@@ -149,7 +149,7 @@ impl CastHttpServer {
     /// Register a local file for serving.
     ///
     /// Returns the full HTTP URL that a Chromecast can load to stream
-    /// the file, e.g. `http://192.168.1.42:54321/cast/<uuid>.flac`.
+    /// the file, e.g. `http://192.168.1.42:54321/media/<uuid>.flac`.
     ///
     /// Local entries are insert-only: they are not expired and remain servable
     /// for the lifetime of the server (the app session). That is acceptable
@@ -214,7 +214,7 @@ impl CastHttpServer {
     }
 
     fn ticket_url(&self, ticket: &str) -> String {
-        format!("http://{}/cast/{}", self.addr, ticket)
+        format!("http://{}/media/{}", self.addr, ticket)
     }
 
     /// The socket address the server is listening on.
@@ -223,7 +223,7 @@ impl CastHttpServer {
     }
 }
 
-impl Drop for CastHttpServer {
+impl Drop for MediaProxy {
     fn drop(&mut self) {
         self.abort_handle.abort();
     }

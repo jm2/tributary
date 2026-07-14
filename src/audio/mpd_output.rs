@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info};
 
+use super::media_proxy::MediaProxy;
 use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
 
@@ -41,6 +42,13 @@ pub struct MpdOutput {
     intent_epoch: Arc<AtomicU64>,
     cache: Arc<Mutex<MpdCache>>,
     worker_tx: mpsc::Sender<WorkerCommand>,
+    /// LAN media proxy, started on demand for credential-bearing streams.
+    ///
+    /// MPD fetches media itself, so a credential-bearing URL sent to it would
+    /// cross the network in the clear — the MPD protocol is plaintext TCP — and
+    /// be retained in the daemon's queue state and `mpd.log`.
+    media_proxy: Arc<Mutex<Option<MediaProxy>>>,
+    rt_handle: Option<tokio::runtime::Handle>,
 }
 
 #[derive(Clone, Copy)]
@@ -1794,6 +1802,80 @@ impl MpdOutput {
             intent_epoch,
             cache,
             worker_tx,
+            media_proxy: Arc::new(Mutex::new(None)),
+            rt_handle: tokio::runtime::Handle::try_current().ok(),
+        }
+    }
+
+    /// Supply the tokio runtime used to start the LAN media proxy.
+    ///
+    /// Without it, a credential-bearing stream cannot be proxied — and is then
+    /// refused rather than sent to the daemon in the clear.
+    #[must_use]
+    pub fn with_runtime(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.rt_handle = Some(handle);
+        self
+    }
+
+    /// Replace a credential-bearing stream URL with an opaque proxy ticket.
+    ///
+    /// MPD is a receiver: it fetches the media itself. Sending it a Subsonic,
+    /// Jellyfin, or Plex stream URL would put the user's token — or, under
+    /// Subsonic's plaintext auth mode, the user's *password* — onto a plaintext
+    /// TCP connection, into the daemon's queue state file, and into `mpd.log`.
+    ///
+    /// Anything without a credential (internet radio, a plain HTTP stream, a
+    /// local path the daemon can already reach) is passed through untouched.
+    fn shield_credentials(&self, uri: &str) -> MpdResult<String> {
+        // Any new load retires the previous ticket, whatever the new track is.
+        self.revoke_proxy_tickets();
+
+        let Ok(parsed) = url::Url::parse(uri) else {
+            return Ok(uri.to_string());
+        };
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !crate::http_security::url_carries_credentials(&parsed)
+        {
+            return Ok(uri.to_string());
+        }
+
+        let proxy = self.ensure_media_proxy()?;
+        let proxy = proxy
+            .as_ref()
+            .ok_or_else(|| MpdFailure::new("media proxy startup"))?;
+        Ok(proxy.register_upstream(&parsed))
+    }
+
+    /// Start the LAN media proxy if it is not already running.
+    fn ensure_media_proxy(&self) -> MpdResult<std::sync::MutexGuard<'_, Option<MediaProxy>>> {
+        let mut guard = self
+            .media_proxy
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        if guard.is_none() {
+            let runtime = self
+                .rt_handle
+                .as_ref()
+                .ok_or_else(|| MpdFailure::new("media proxy startup"))?;
+            let proxy = runtime
+                .block_on(MediaProxy::start())
+                .map_err(|error| opaque_mpd_failure("media proxy startup", error))?;
+            info!(addr = %proxy.addr(), "MPD media proxy started");
+            *guard = Some(proxy);
+        }
+
+        Ok(guard)
+    }
+
+    /// Drop every credential-bearing ticket the proxy is holding.
+    fn revoke_proxy_tickets(&self) {
+        let guard = self
+            .media_proxy
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(proxy) = guard.as_ref() {
+            proxy.revoke_upstreams();
         }
     }
 
@@ -1864,10 +1946,14 @@ impl AudioOutput for MpdOutput {
             cache.state = PlayerState::Buffering;
             cache.position_ms = None;
         }
-        let kind = match encode_mpd_arg(uri) {
-            Ok(_) => CommandKind::Load {
-                uri: uri.to_string(),
-            },
+        // Never hand the daemon a credential. If the stream carries one and the
+        // proxy cannot be started, the load is *refused* — sending it in the
+        // clear as a fallback would defeat the whole point.
+        let kind = match self
+            .shield_credentials(uri)
+            .and_then(|safe_uri| encode_mpd_arg(&safe_uri).map(|_| safe_uri))
+        {
+            Ok(safe_uri) => CommandKind::Load { uri: safe_uri },
             Err(failure) => CommandKind::RejectLoad { failure },
         };
         self.enqueue(owner, kind);
@@ -1887,6 +1973,9 @@ impl AudioOutput for MpdOutput {
     }
 
     fn stop(&self) {
+        // Retire the credential ticket as soon as playback is meant to end, so
+        // the daemon cannot re-fetch the protected stream afterwards.
+        self.revoke_proxy_tickets();
         let owner = self.next_owner();
         {
             let mut cache = self
@@ -3439,6 +3528,8 @@ mod tests {
             intent_epoch: Arc::clone(&intent_epoch),
             cache: Arc::clone(&cache),
             worker_tx,
+            media_proxy: Arc::new(Mutex::new(None)),
+            rt_handle: None,
         };
 
         output.load_uri("https://music.test/new");
@@ -3780,5 +3871,78 @@ mod tests {
         .expect("second address connects");
         assert_eq!(connection.version, "OK MPD 0.24.0");
         server.join().expect("fake server stopped");
+    }
+
+    // ── P1.6: credentials must never reach the MPD daemon ─────────────
+
+    fn proxyless_output() -> (MpdOutput, mpsc::Receiver<WorkerCommand>) {
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let output = MpdOutput {
+            display_name: "test".to_string(),
+            event_tx,
+            event_generation: AtomicU64::new(0),
+            volume: 1.0,
+            intent_epoch: Arc::new(AtomicU64::new(0)),
+            cache: Arc::new(Mutex::new(MpdCache::default())),
+            worker_tx,
+            media_proxy: Arc::new(Mutex::new(None)),
+            // No runtime: the proxy cannot start.
+            rt_handle: None,
+        };
+        (output, worker_rx)
+    }
+
+    /// The bug. MPD fetches media itself, so the stream URL went to the daemon
+    /// over a plaintext TCP connection — and into its queue state and mpd.log.
+    ///
+    /// With no runtime the proxy cannot start, so the load must be *refused*.
+    /// Falling back to sending the URL in the clear would defeat the point, and
+    /// this test fails loudly if anyone ever adds that fallback.
+    #[test]
+    fn a_credential_bearing_stream_is_never_sent_to_the_daemon() {
+        let leaks = [
+            "https://plex.test/library/parts/1/a.flac?X-Plex-Token=plex-secret",
+            "https://jellyfin.test/Audio/1/stream?api_key=jellyfin-secret",
+            "https://sub.test/rest/stream.view?u=me&t=tok-secret&s=salt&c=Tributary&id=1",
+            // Subsonic plaintext auth: this is the user's password.
+            "https://sub.test/rest/stream.view?u=me&p=enc%3A70617373&c=Tributary&id=1",
+            "https://me:hunter2@music.test/stream.flac",
+        ];
+
+        for uri in leaks {
+            let (output, worker_rx) = proxyless_output();
+            output.load_uri(uri);
+
+            let command = worker_rx.recv().expect("queued command");
+            match command.kind {
+                CommandKind::RejectLoad { .. } => {}
+                CommandKind::Load { uri: sent } => {
+                    panic!("credential-bearing URL was sent to the MPD daemon: {sent}")
+                }
+                _ => panic!("unexpected command for {uri}"),
+            }
+        }
+    }
+
+    /// Unauthenticated streams still reach the daemon directly. Relaying live
+    /// radio through this process would buy nothing.
+    #[test]
+    fn an_unauthenticated_stream_still_reaches_the_daemon() {
+        for uri in [
+            "http://radio.test/stream.mp3",
+            "https://radio.test/listen?bitrate=128&format=mp3",
+            // Ordinary `s`/`p` on a non-Subsonic service are not credentials.
+            "https://radio.test/search?s=jazz&p=2",
+        ] {
+            let (output, worker_rx) = proxyless_output();
+            output.load_uri(uri);
+
+            let command = worker_rx.recv().expect("queued command");
+            assert!(
+                matches!(command.kind, CommandKind::Load { uri: ref sent } if sent == uri),
+                "{uri} should be passed to the daemon untouched"
+            );
+        }
     }
 }

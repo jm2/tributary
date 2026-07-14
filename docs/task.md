@@ -254,10 +254,12 @@ revocation.
 - [x] Threat-model spoofed and compromised LAN receivers: a hostile receiver now obtains a
   single-media ticket, revoked on stop and superseded on the next load, instead of an account
   credential.
-- [ ] Route **MPD** through the same proxy. MPD still sends the credential-bearing URL via `addid`
-  over **plaintext TCP**, so it crosses the LAN in the clear and lands in the daemon's queue state
-  and `mpd.log`. Blocked only by sequencing: `audio/mpd_output.rs` is owned by P1.8 (PR #76). The
-  proxy it needs already exists — this is a small change once that lands.
+- [x] Route **MPD** through the same proxy. MPD sent the credential-bearing URL via `addid` over
+  **plaintext TCP**, so it crossed the LAN in the clear and landed in the daemon's queue state and
+  `mpd.log`. It now receives an opaque ticket. If the proxy cannot start, the load is **refused**
+  rather than sent in the clear — a fallback would defeat the point, and a test fails loudly if
+  anyone adds one. The server is renamed `MediaProxy` (`audio/media_proxy.rs`), since it is no
+  longer Chromecast-specific.
 - [ ] Keep backend credentials outside generic `Track` values: drop the credential from
   `Track.stream_url` and add a backend `resolve_stream(&track) -> (Url, HeaderMap)` called at
   playback time, moving `X-Plex-Token` / `api_key` / Subsonic `u,t,s,p` out of the query string
@@ -269,8 +271,10 @@ revocation.
   credential-detection, and pass-through tests. MPD and credential-free `Track` values remain open.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
-device or daemon Tributary does not own. **Chromecast now meets this; MPD does not yet.** Closing
-the MPD half also closes P1.4's last checkbox.
+device or daemon Tributary does not own. **Chromecast and MPD both meet this now.** What remains
+under P1.6 is defence in depth rather than an open leak: the credential is still *copied* through
+the UI layer inside `Track.stream_url` (it just no longer leaves the process), and tickets are
+revoked rather than TTL-bounded.
 
 ### P1.7 Serialize Chromecast lifecycle and commands
 

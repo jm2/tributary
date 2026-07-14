@@ -23,9 +23,9 @@
 //! to the pattern used by [`LibraryEngine`](crate::local::engine::LibraryEngine).
 
 pub mod airplay_output;
-pub mod cast_http_server;
 pub mod chromecast_output;
 pub mod local_output;
+pub mod media_proxy;
 pub mod mpd_output;
 pub mod output;
 
