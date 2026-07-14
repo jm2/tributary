@@ -276,9 +276,10 @@ retires P1.7's synchronous local-file resolver note.
 - [x] Clear buffering timers on success and error.
 - [x] Redact authenticated URLs from command logs.
 - [x] Add fake-server tests including slow and reordered commands.
-- [x] Record implementation: commit `eb0b9ca`; PR #76; 37 focused FIFO, supersession,
-  persistent-session, protocol-boundary, authoritative-state, ownership, EOS, timeout,
-  poisoned-stream, IPv6-resolution, and credential-redaction tests.
+- [x] Record implementation: commits `eb0b9ca` and `fbaaa7f`; PR #76; 43 focused FIFO,
+  persistent-session, protocol-boundary, authoritative-state, ownership-preflight,
+  queue-preservation, foreign-successor, EOS, timeout, poisoned-stream, IPv6-resolution,
+  mode-reset, and credential-redaction tests.
 
 ### P1.9 Prevent stale async source rendering
 
@@ -534,6 +535,15 @@ error that tells the user what to install.
 
 - [ ] Replace blocking `ToSocketAddrs` resolution with a cancellable, deadline-bound resolver.
 - [ ] Bound or deliberately coalesce the non-blocking MPD worker command queue.
+- [ ] Eliminate the shared-partition race between ownership revalidation and MPD's global pause or
+  stop commands, and the unguarded global side effects of load-time option resets, or require a
+  detectable exclusive-control configuration.
+- [ ] Retain only redacted ACK error codes so cleanup can distinguish a missing song ID from a
+  permission or argument rejection without keeping server-controlled text.
+- [ ] Define semantics for an external Next/queue edit that yields stopped/no current song; MPD
+  exposes the same completion proof as natural queue exhaustion.
+- [ ] Clean up or deliberately retain Tributary's queued ID after an observed foreign replacement
+  without disturbing foreign playback.
 - [ ] Add held-ACK worker FIFO, slow-first-greeting fairness, and real IPv6 loopback coverage.
 - [ ] Record implementation: _pending_
 
@@ -725,16 +735,23 @@ Record scope or design decisions here so deferred work is explicit.
   call; hard receiver I/O deadlines require an upstream change or audited fork and are tracked as
   P2.8 rather than overstated as part of P1.7.
 - 2026-07-13 — P1.8 gives MPD one FIFO worker and one persistent TCP session per owned load.
-  Stable `addid`/`playid` identity, authoritative status polling, and atomic `deleteid` cleanup
-  distinguish explicit Stop, natural queue exhaustion, remote errors, and another client's
-  replacement queue without applying global cleanup after ownership is lost. Every owned load
-  explicitly disables MPD `repeat`, `single`, and `consume` modes so queue exhaustion remains
-  attributable to Tributary. Protocol lines, responses, address and URI counts, idle I/O, and
-  post-resolution operations are bounded; poisoned streams are dropped rather than reused, and
-  all diagnostics discard server text and authenticated URLs.
+  Stable `addid`/`playid` identity, authoritative status polling, and targeted `deleteid` cleanup
+  distinguish explicit Stop and remote errors, classify stopped/no-current plus a retained owned ID
+  as completion, and detect an observed replacement queue. Loads never clear the shared queue, and
+  controls revalidate the current ID before acting; after ownership loss is observed, Tributary
+  drops its session without mutating the foreign queue. That conservative handoff also leaves its
+  own queued entry untouched; safe orphan cleanup remains P2.10 work. Every owned load explicitly
+  disables MPD `repeat`, `random`, `single`, and `consume` modes so queue exhaustion remains
+  attributable to Tributary. Protocol lines, responses, resolved-address counts, media-URI sizes,
+  idle I/O, and post-resolution operations are bounded; poisoned streams are dropped rather than
+  reused, and all diagnostics discard server text and authenticated URLs.
   Standard-library DNS resolution itself remains blocking and the nonblocking command channel is
-  unbounded; those narrower resilience improvements and deeper OS loopback coverage are tracked as
-  P2.10 rather than overstated as part of P1.8.
+  unbounded. MPD has no ID-scoped pause or conditional compare-and-act, so another client can still
+  race between status revalidation and a global pause or stop; the load-time option resets are
+  global and unguarded. MPD also exposes the same stopped/no-current proof for natural exhaustion
+  and some external queue changes, while opaque synchronized ACKs cannot yet distinguish a missing
+  ID from other rejections. Those narrower resilience and shared-partition improvements, plus
+  deeper OS loopback coverage, are tracked as P2.10 rather than overstated as part of P1.8.
 
 - 2026-07-13 — Documentation audit against the committed tree. Every `[x]` in P1.1–P1.7 was
   verified against the source and none was overstated. The drift was everywhere else: CHANGELOG
@@ -776,4 +793,4 @@ Add one line per completed task:
 | 2026-07-12 | P1.7 | `60ee2af` | One worker owns the Cast session and serializes effects, authoritative state, cancellation, cleanup retries, and stale-event suppression. |
 | 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
 | 2026-07-13 | P2.6 (partial) | `8368a65` | Radio-Browser, geolocation, and MusicBrainz clients now refuse HTTPS→HTTP redirect downgrades and send no `Referer`; packaging metadata remains open. |
-| 2026-07-13 | P1.8 | `eb0b9ca` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable queue ownership, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
+| 2026-07-13 | P1.8 | `eb0b9ca`, `fbaaa7f` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable song identity, shared-queue preservation, ownership preflight, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
