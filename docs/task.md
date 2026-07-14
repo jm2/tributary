@@ -62,13 +62,15 @@ Acceptance criteria: upgrading a v0.5.0-style database always yields a unique co
   audio; dismissal and unknown responses; stale evidence, compare-and-swap, marker, and mount
   drift; read-only marker-create failure and valid-marker adoption; retry/idempotency; a
   non-destructive conversion followed by a distinct ordinary scan; and command processing without
-  a filesystem watcher. A further 23 focused retained-authority tests cover same-content marker
+  a filesystem watcher. A further 26 focused retained-authority tests cover same-content marker
   replacement; same-marker root replacement; bound-file, bound-directory, and bound-absence
   evidence; missing-ancestor recreation and retained-parent replacement; descendant and ancestor
   replacement even when a hard-linked final object keeps the same identity; mount/filesystem
   boundary rejection; path escape and symlink traversal; transactional rollback of root-state
-  promotions,
-  upsert, deletion, and rename changes; playlist-link preservation; and success-event suppression.
+  promotions, upsert, deletion, and rename changes; playlist-link preservation; success-event
+  suppression;
+  Windows namespace pins that block root, marker, file, and directory rename/deletion only while
+  their retained handles live; and blocking-task failure rollback without false root demotion.
   One direct end-to-end watcher-backlog/confirmation ordering harness remains future integration
   coverage; the current ordering is exercised through engine-loop and control-flow unit
   components.
@@ -91,7 +93,8 @@ Acceptance criteria: upgrading a v0.5.0-style database always yields a unique co
   lease and descendant evidence are revalidated after SQL changes and immediately before commit.
 - [x] Record implementation: the safety core and review follow-ups are in PR #68 with 44 focused
   tests; explicit trust/re-enrollment is in `aecbce6` with 31 additional focused tests; retained
-  root authority is in `ed0a300` with 23 additional focused tests.
+  root authority is in `ed0a300`, with review and CI follow-ups in `7704db8`; together they add 26
+  focused tests.
 
 Acceptance criteria: Tributary never deletes persisted track metadata based on an incomplete
 view of a library root. An inherited or replaced root requires explicit confirmation, as does any
@@ -741,6 +744,14 @@ Record scope or design decisions here so deferred work is explicit.
   substitution. The lease and applicable descendant evidence are revalidated after SQL changes
   inside the transaction and immediately before commit; rejection rolls back and publishes no
   success event. Fail-closed authority revocations do not require a lease.
+  Filesystem-touching lease and descendant probes reached from async orchestration run on Tokio's
+  blocking pool, including the final in-transaction guard. The original retained handles remain
+  live in the async frame through commit or rollback. A blocking-task join failure rejects the
+  current work; watcher-side failures also schedule reconciliation. The task failure is not itself
+  evidence that justifies persistently demoting a root. Windows handles intentionally omit delete
+  sharing so the retained namespace cannot be renamed or unlinked through commit; external
+  rename/delete attempts can receive a sharing violation until the relevant scan, batch, or
+  transaction releases them.
   This is an explicit filesystem/SQLite linearization boundary, not an atomic transaction shared
   by both systems: authorization linearizes at the final successful in-transaction validation,
   positive handles remain live through commit, and an absence observation is bracketed by its
@@ -751,6 +762,9 @@ Record scope or design decisions here so deferred work is explicit.
   fail closed. The model protects ordinary local, removable, and network filesystem edits,
   replacement, hotplug, and remount races, but is a consistency boundary rather than a sandbox
   against a malicious same-user process with equivalent filesystem or mount privileges.
+  A final authority probe against a slow or hung network filesystem can keep the SQLite writer
+  transaction open while it waits on the blocking pool, although it no longer stalls a Tokio
+  worker thread.
 - 2026-07-12 — Track deletion now preserves playlist-entry identity, order, and fingerprint by
   nulling the real track foreign key. Scan and watcher-batch reconciliation relink only when
   fingerprint plus optional duration identifies exactly one current track; ambiguous matches
@@ -886,7 +900,7 @@ Add one line per completed task:
 | 2026-07-10 | P0.8 | PR #68 | Patched the then-failing dependencies and recorded the warnings known at the time. |
 | 2026-07-13 | P0.8 follow-up | `a35cde8`, `e9a3efc` | Updated `spin` to 0.9.9, leaving exactly two time-bounded unmaintained warnings; the lockfile-only ignored RSA advisory has an explicit rationale, deadline, and feature-enable trigger. |
 | 2026-07-14 | P0.2 explicit root trust | `aecbce6` | Added FIFO main-window enrollment/replacement and no-supported-audio trust-request consent with private engine evidence, guarded marker create/adopt, non-destructive conversion, and 31 focused tests. |
-| 2026-07-14 | P0.2 retained root authority | `ed0a300` | Retained one exact root/marker lease for each mutation-capable marker-backed root's initial scan or watcher batch, bound descendant and absence evidence beneath it, and revalidated promotions and content mutations after SQL immediately before commit; 23 focused tests cover substitution, boundary/traversal rejection, rollback, and event suppression. |
+| 2026-07-14 | P0.2 retained root authority | `ed0a300`, `7704db8` | Retained one exact root/marker lease for each mutation-capable marker-backed root's initial scan or watcher batch, bound descendant and absence evidence beneath it, and revalidated promotions and content mutations after SQL immediately before commit. Review follow-ups preserve Windows no-delete namespace pins, move async authority I/O to blocking workers without shortening handle lifetimes, and make task failure roll back without false root demotion while watcher failures schedule reconciliation; 26 focused tests cover substitution, boundary/traversal rejection, Windows pin lifetime, rollback, and event suppression. |
 | 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
 | 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |
 | 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
