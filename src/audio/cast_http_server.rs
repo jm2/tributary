@@ -30,12 +30,18 @@
 //!   file or unauthenticated radio — and `stop()` revokes them all. At most one
 //!   credential-bearing ticket is live at a time, and it dies when playback
 //!   moves on rather than lingering until the next credentialed track.
+//! - **Credential tickets expire**: upstream tickets have a hard, non-sliding
+//!   24-hour lifetime from registration. Receiver requests, pause, and seek do
+//!   not renew it. An already-admitted response may finish after expiration,
+//!   but every later lookup receives the same 404 as an unknown or revoked
+//!   ticket. Local-file routes keep their existing server-lifetime contract.
 //! - **OS-assigned port**: Uses port 0 for dynamic assignment.
 //! - **Graceful shutdown**: Can be stopped when no longer needed.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -52,6 +58,14 @@ use uuid::Uuid;
 
 const OPAQUE_UPSTREAM_BODY_ERROR: &str = "upstream media body stream failed";
 
+/// Hard maximum lifetime of a receiver-facing credential ticket.
+///
+/// This is deliberately absolute rather than sliding: receiver GET/Range
+/// requests, pause, and seek must not let a compromised receiver extend a
+/// ticket forever. Explicit playback lifecycle revocation can only shorten
+/// this lifetime.
+const UPSTREAM_TICKET_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// What a registered ticket resolves to.
 ///
 /// `Clone` but deliberately **not** `Debug`: an `Upstream` holds a
@@ -62,7 +76,79 @@ enum MediaSource {
     /// A local file, streamed from disk.
     Local(PathBuf),
     /// A remote stream that Tributary fetches on the receiver's behalf.
-    Upstream(Box<Url>),
+    Upstream {
+        url: Box<Url>,
+        /// Absolute, monotonic deadline. The entry is live only while the
+        /// current instant is strictly before this value.
+        expires_at: Instant,
+    },
+}
+
+impl MediaSource {
+    fn is_expired_at(&self, now: Instant) -> bool {
+        matches!(
+            self,
+            Self::Upstream { expires_at, .. } if now >= *expires_at
+        )
+    }
+}
+
+/// Replace the credential-bearing registry entry with a newly issued ticket.
+///
+/// `registered_at` and `ttl` are injected so boundary behavior can be tested
+/// without sleeping. Production always supplies [`Instant::now`] and
+/// [`UPSTREAM_TICKET_TTL`]. An unrepresentable deadline expires immediately,
+/// which is the fail-closed outcome.
+fn replace_upstream_at(
+    media: &DashMap<String, MediaSource>,
+    ticket: String,
+    url: &Url,
+    registered_at: Instant,
+    ttl: Duration,
+) {
+    revoke_upstreams_in(media);
+    let expires_at = registered_at.checked_add(ttl).unwrap_or(registered_at);
+    media.insert(
+        ticket,
+        MediaSource::Upstream {
+            url: Box::new(url.clone()),
+            expires_at,
+        },
+    );
+}
+
+fn revoke_upstreams_in(media: &DashMap<String, MediaSource>) {
+    media.retain(|_, source| !matches!(source, MediaSource::Upstream { .. }));
+}
+
+/// Resolve one ticket using a caller-supplied monotonic clock.
+///
+/// The borrowed-key lookup avoids allocating a `String` for every media
+/// request. The clock is sampled only after its entry guard is acquired, so a
+/// lookup delayed across the deadline cannot be admitted with a stale instant.
+/// An expired entry is removed conditionally after releasing that guard: if a
+/// replacement somehow wins the gap, it is removed only when it too was
+/// already expired at the sampled instant. Once a live source is cloned, that
+/// admitted request may finish even if the deadline passes or the registry
+/// entry is revoked afterward.
+fn resolve_media_with_clock<F>(
+    media: &DashMap<String, MediaSource>,
+    ticket: &str,
+    now: F,
+) -> Option<MediaSource>
+where
+    F: FnOnce() -> Instant,
+{
+    let source = media.get(ticket)?;
+    let observed_at = now();
+
+    if !source.is_expired_at(observed_at) {
+        return Some(source.clone());
+    }
+
+    drop(source);
+    media.remove_if(ticket, |_, current| current.is_expired_at(observed_at));
+    None
 }
 
 /// Shared state for the cast HTTP server.
@@ -211,9 +297,12 @@ impl CastHttpServer {
     /// credential-bearing ticket is live at a time. A ticket that outlived its
     /// track would be a standing invitation to replay the user's stream, and
     /// unlike a local file it fronts a credential.
+    ///
+    /// The new ticket also receives a hard 24-hour lifetime from this
+    /// registration. GET/Range requests do not slide that deadline, so pause,
+    /// seek, and a restartable remote Stop retain the route only until it
+    /// expires. Explicit revocation may end it sooner.
     pub fn register_upstream(&self, url: &Url) -> String {
-        self.revoke_upstreams();
-
         // Carry the upstream's media extension onto the ticket. The Cast
         // `content_type` is guessed from the URL it is handed, so an
         // extensionless ticket would advertise a proxied FLAC or Opus stream as
@@ -227,8 +316,13 @@ impl CastHttpServer {
             None => Uuid::new_v4().to_string(),
         };
 
-        self.media
-            .insert(ticket.clone(), MediaSource::Upstream(Box::new(url.clone())));
+        replace_upstream_at(
+            &self.media,
+            ticket.clone(),
+            url,
+            Instant::now(),
+            UPSTREAM_TICKET_TTL,
+        );
 
         let ticket_url = self.ticket_url(&ticket);
         // The upstream URL is deliberately absent from this log line.
@@ -238,8 +332,7 @@ impl CastHttpServer {
 
     /// Drop every credential-bearing ticket, leaving local entries alone.
     pub fn revoke_upstreams(&self) {
-        self.media
-            .retain(|_, source| !matches!(source, MediaSource::Upstream(_)));
+        revoke_upstreams_in(&self.media);
     }
 
     fn ticket_url(&self, ticket: &str) -> String {
@@ -282,25 +375,22 @@ fn upstream_media_extension(url: &Url) -> Option<&'static str> {
 /// Axum handler: serve a registered ticket.
 ///
 /// A ticket is either a local file or a remote stream we fetch on the
-/// receiver's behalf. Unregistered tickets are indistinguishable from any other
-/// unknown path: 404.
+/// receiver's behalf. Expired, revoked, and unregistered tickets are
+/// indistinguishable: all return 404. Resolving clones the source before any
+/// I/O, so a response admitted before expiration may finish afterward while
+/// subsequent lookups fail.
 async fn serve_media(
     State(state): State<ServerState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(entry) = state.media.get(&id) else {
+    let Some(source) = resolve_media_with_clock(&state.media, &id, Instant::now) else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    // Clone out and release the DashMap ref before doing any I/O — holding it
-    // across an await would block every other request on this shard.
-    let source = entry.value().clone();
-    drop(entry);
-
     match source {
         MediaSource::Local(path) => serve_local_file(&path, &headers).await,
-        MediaSource::Upstream(url) => proxy_upstream(&state.upstream, &url, &headers).await,
+        MediaSource::Upstream { url, .. } => proxy_upstream(&state.upstream, &url, &headers).await,
     }
 }
 
@@ -601,6 +691,187 @@ mod tests {
                 None,
                 "{no_extension} must not shape the ticket path"
             );
+        }
+    }
+
+    // ── Credential-ticket lifetime ───────────────────────────────────
+
+    #[test]
+    fn upstream_ticket_is_live_strictly_before_but_not_at_its_deadline() {
+        let media = DashMap::new();
+        let registered_at = Instant::now();
+        let ttl = Duration::from_secs(10);
+        let deadline = registered_at.checked_add(ttl).expect("test deadline");
+        replace_upstream_at(
+            &media,
+            "ticket".to_string(),
+            &url("https://music.test/stream?api_key=secret"),
+            registered_at,
+            ttl,
+        );
+
+        assert!(matches!(
+            resolve_media_with_clock(&media, "ticket", || deadline
+                .checked_sub(Duration::from_nanos(1))
+                .expect("instant before deadline")),
+            Some(MediaSource::Upstream { .. })
+        ));
+        assert!(resolve_media_with_clock(&media, "ticket", || deadline).is_none());
+        assert!(
+            !media.contains_key("ticket"),
+            "the equality-boundary lookup must atomically remove the expired entry"
+        );
+    }
+
+    #[test]
+    fn upstream_lookups_do_not_slide_the_absolute_deadline() {
+        let media = DashMap::new();
+        let registered_at = Instant::now();
+        let ttl = Duration::from_secs(12);
+        let halfway = registered_at
+            .checked_add(Duration::from_secs(6))
+            .expect("halfway instant");
+        let deadline = registered_at.checked_add(ttl).expect("test deadline");
+        replace_upstream_at(
+            &media,
+            "ticket".to_string(),
+            &url("https://music.test/stream?X-Plex-Token=secret"),
+            registered_at,
+            ttl,
+        );
+
+        assert!(resolve_media_with_clock(&media, "ticket", || halfway).is_some());
+        assert!(resolve_media_with_clock(&media, "ticket", || deadline).is_none());
+    }
+
+    #[test]
+    fn local_file_routes_keep_their_server_lifetime_contract() {
+        let media = DashMap::new();
+        let now = Instant::now();
+        media.insert(
+            "local.flac".to_string(),
+            MediaSource::Local(PathBuf::from("/music/local.flac")),
+        );
+        let much_later = now
+            .checked_add(Duration::from_secs(365 * 24 * 60 * 60))
+            .expect("one year later");
+
+        assert!(matches!(
+            resolve_media_with_clock(&media, "local.flac", || much_later),
+            Some(MediaSource::Local(_))
+        ));
+        assert!(media.contains_key("local.flac"));
+    }
+
+    #[test]
+    fn explicit_revocation_and_supersession_end_tickets_before_their_ttl() {
+        let media = DashMap::new();
+        let first_registered = Instant::now();
+        let ttl = Duration::from_secs(10);
+        replace_upstream_at(
+            &media,
+            "first".to_string(),
+            &url("https://music.test/first?api_key=secret"),
+            first_registered,
+            ttl,
+        );
+        revoke_upstreams_in(&media);
+        assert!(resolve_media_with_clock(&media, "first", || first_registered).is_none());
+
+        replace_upstream_at(
+            &media,
+            "old".to_string(),
+            &url("https://music.test/old?api_key=secret"),
+            first_registered,
+            ttl,
+        );
+        let replacement_registered = first_registered
+            .checked_add(Duration::from_secs(5))
+            .expect("replacement instant");
+        replace_upstream_at(
+            &media,
+            "new".to_string(),
+            &url("https://music.test/new?api_key=secret"),
+            replacement_registered,
+            ttl,
+        );
+
+        assert!(resolve_media_with_clock(&media, "old", || replacement_registered).is_none());
+        assert!(
+            resolve_media_with_clock(&media, "new", || first_registered
+                .checked_add(ttl)
+                .expect("old deadline"))
+            .is_some(),
+            "replacement registration must receive a fresh deadline"
+        );
+        assert!(
+            resolve_media_with_clock(&media, "new", || replacement_registered
+                .checked_add(ttl)
+                .expect("new deadline"))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn an_admitted_source_may_finish_after_expiry_but_future_lookups_fail() {
+        let media = DashMap::new();
+        let registered_at = Instant::now();
+        let ttl = Duration::from_secs(10);
+        let deadline = registered_at.checked_add(ttl).expect("test deadline");
+        let upstream = url("https://music.test/stream?api_key=admitted-secret");
+        replace_upstream_at(&media, "ticket".to_string(), &upstream, registered_at, ttl);
+
+        let admitted = resolve_media_with_clock(&media, "ticket", || registered_at)
+            .expect("request admitted before expiry");
+        assert!(resolve_media_with_clock(&media, "ticket", || deadline).is_none());
+        match admitted {
+            MediaSource::Upstream { url, .. } => assert_eq!(*url, upstream),
+            MediaSource::Local(_) => panic!("expected admitted upstream source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_revoked_and_unknown_tickets_all_return_not_found() {
+        let media = Arc::new(DashMap::new());
+        let state = ServerState {
+            media: Arc::clone(&media),
+            upstream: crate::http_security::authenticated_client_builder()
+                .build()
+                .expect("test upstream client"),
+        };
+
+        replace_upstream_at(
+            &media,
+            "expired".to_string(),
+            &url("https://music.test/expired?api_key=secret"),
+            Instant::now(),
+            Duration::ZERO,
+        );
+        let expired = serve_media(
+            State(state.clone()),
+            Path("expired".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(expired.status(), StatusCode::NOT_FOUND);
+        assert!(!media.contains_key("expired"));
+
+        replace_upstream_at(
+            &media,
+            "revoked".to_string(),
+            &url("https://music.test/revoked?api_key=secret"),
+            Instant::now(),
+            UPSTREAM_TICKET_TTL,
+        );
+        revoke_upstreams_in(&media);
+        for ticket in ["revoked", "unknown"] {
+            let response = serve_media(
+                State(state.clone()),
+                Path(ticket.to_string()),
+                HeaderMap::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{ticket}");
         }
     }
 

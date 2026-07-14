@@ -29,7 +29,7 @@ Progress snapshot (2026-07-14), recounted from the literal P0–P3 task checkbox
 earlier numerator/denominator drift. The denominator excludes the two deferred P0.7 live-workflow
 verification boxes and the withdrawn P2.6 false finding; section-summary and global-validation
 gate boxes are not task progress:
-**122/213 (57.3%)** in-scope checklist items complete; **106/114 (93.0%)** across P0 and P1 after
+**123/213 (57.7%)** in-scope checklist items complete; **107/114 (93.9%)** across P0 and P1 after
 the same P0.7 exclusion.
 
 ## P0 — Release blockers
@@ -302,13 +302,13 @@ credential-bearing upstream stays inside Tributary.
 - [x] Make the ticket registry insert **and revoke**. Registering a new upstream revokes the
   previous one, so at most one credential-bearing ticket is live; `stop()` revokes them all.
   Revocation deliberately does **not** happen on pause or seek — a Cast device re-fetches with a
-  `Range` header when it seeks, so a ticket must outlive those.
+  `Range` header when it seeks, so a ticket must outlive those within its hard lifetime.
 - [x] Route **Chromecast** through it (`classify_cast_uri`). Unauthenticated streams (internet
   radio) still pass through directly: there is no secret to protect and relaying a live radio
   stream through this process would buy nothing.
 - [x] Threat-model spoofed and compromised LAN receivers: a hostile receiver now obtains a
-  single-media ticket, revoked on stop and superseded on the next load, instead of an account
-  credential.
+  single-media ticket whose route is revoked on stop, superseded on the next load, and denies all
+  new lookups after 24 hours instead of an account credential.
 - [x] Route **MPD** through the same proxy. `MpdOutput::load_uri` classifies media before it can
   enter the ordered worker; after classification, a protected URL remains app-private and is
   consumed only by the ordered worker/proxy. The worker starts a dedicated proxy on the successful
@@ -317,24 +317,33 @@ credential-bearing upstream stays inside Tributary.
   registration, and generated-argument failures all fail closed without falling back to the raw
   URL. A replacing direct, protected, or rejected load, user Stop, output drop, natural end,
   ownership loss, operation failure, worker shutdown, and stale generation revoke the ticket;
-  pause, seek, and an explicit remote Stop that retains the same song keep it restartable.
+  pause, seek, and an explicit remote Stop that retains the same song keep it restartable only
+  within the ticket's hard lifetime.
 - [ ] Keep backend credentials outside generic `Track` values: drop the credential from
   `Track.stream_url` and add a backend `resolve_stream(&track) -> (Url, HeaderMap)` called at
   playback time, moving `X-Plex-Token` / `api_key` / Subsonic `u,t,s,p` out of the query string
   and into request headers held only inside the proxy. The proxy makes the *leak* stop; this makes
   the credential stop being copied through the UI layer at all. Build it to serve P3.1's
   "resolve playable URLs at playback time" as well, rather than twice.
-- [ ] Give tickets a TTL in addition to revocation, so a ticket cannot outlive a crashed session.
+- [x] Give credential-bearing upstream tickets a hard, absolute, non-sliding 24-hour TTL in
+  addition to lifecycle revocation. A ticket is live only before its monotonic deadline; at the
+  deadline an atomic lookup removes it and returns the same 404 as a revoked or unknown route.
+  GET/Range requests, pause, seek, and remote state do not renew it. A request admitted before
+  expiry may finish afterward, while every later lookup fails. This bounds missed cleanup while
+  the app/server remains alive; process/runtime death already closes the listener. Local-file
+  routes retain their existing server-lifetime contract because they front no backend credential.
 - [x] Record implementation: Chromecast proxy in commit `c6aa7df` with 6 focused classification,
   credential-detection, and pass-through tests; MPD proxy in commit `e23efd8` with 18 new focused
-  tests (10 worker/ticket lifecycle, 3 media classification, and 5 route/body-error tests).
-  Credential-free `Track` values and ticket TTLs remain open.
+  tests (10 worker/ticket lifecycle, 3 media classification, and 5 route/body-error tests); hard
+  upstream-ticket expiry in commit `8735862` with 6 deterministic deadline, non-renewal,
+  revocation/supersession, local-route, admitted-response, and 404-equivalence tests.
+  Credential-free `Track` values remain open.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
 device or daemon Tributary does not own. **Chromecast and MPD now meet the receiver-boundary
 criterion.** P1.6 remains open because generic `Track`/UI values still carry credentials and
-tickets have no TTL. P1.4 also remains open because local and AirPlay GStreamer fetches do not
-use the app-owned exact-origin path.
+local and AirPlay still receive those values. P1.4 also remains open because those GStreamer
+fetches do not use the app-owned exact-origin path.
 
 ### P1.7 Serialize Chromecast lifecycle and commands
 
@@ -856,7 +865,9 @@ Record scope or design decisions here so deferred work is explicit.
   fail cleanly on impossible or unavailable allocations. Audio and live-radio media streams remain
   deliberately uncapped because they are length-unbounded playback transports. The Chromecast and
   MPD credential boundaries are handled by P1.6's revocable proxy tickets; local/AirPlay fetch
-  ownership, credential-free generic track values, and ticket TTLs remain separate open work.
+  ownership and credential-free generic track values remain separate open work. Credential-bearing
+  upstream tickets now also carry P1.6's hard absolute lifetime rather than relying on revocation
+  alone.
 - 2026-07-14 — P1.6 classifies every media URI before it can reach MPD. Supported credential
   shapes (URL userinfo; Plex `X-Plex-Token`; Jellyfin `api_key`; DAAP `session-id`; and Subsonic
   `t`/`s` or shaped `p`) require a proxy; malformed declared HTTP(S), credentialed unsupported
@@ -870,14 +881,20 @@ Record scope or design decisions here so deferred work is explicit.
   link-local IPv6 fail closed because they cannot produce a portable receiver URL. Runtime,
   address, bind, registration, ticket validation, and upstream body-stream errors are reduced to
   fixed URL-free categories and never fall back to the protected URL.
-  Each ticket fixes one upstream target, uses the no-`Referer` exact-origin client, and forwards
-  only `Range`. It is a replayable single-media bearer until revoked, not a single-use token:
-  pause, seek, and an explicit remote Stop retaining the owned song keep it live. Any replacement
-  load (including direct or rejected media), user Stop, output drop, natural end, ownership loss,
-  operation failure, worker shutdown, or stale generation revokes it when requested, processed,
-  or observed, and a stale session cannot revoke a newer generation. Registry revocation prevents
-  future lookups but does not cancel a response the proxy already admitted. Tickets still have no
-  TTL. Generic
+  Each credential-bearing ticket fixes one upstream target, uses the no-`Referer` exact-origin
+  client, and forwards only `Range`. It is a replayable single-media bearer until the earlier of
+  explicit revocation or a hard 24-hour expiry, not a single-use token. The deadline is absolute
+  and monotonic: GET/Range requests, pause, seek, and an explicit remote Stop retaining the owned
+  song do not renew it. Any replacement load (including direct or rejected media), user Stop,
+  output drop, natural end, ownership loss, operation failure, worker shutdown, or stale generation
+  revokes it when requested, processed, or observed, and a stale session cannot revoke a newer
+  generation. A route is live only while lookup occurs strictly before its deadline; lookup at or
+  after the boundary atomically removes it and returns the same 404 as an unknown/revoked ticket.
+  An unrepresentable deadline fails closed as immediately expired.
+  Revocation or expiry prevents future lookups but does not cancel a response the proxy already
+  admitted. Local-file routes retain their server-lifetime capability contract because they do not
+  front backend credentials. This TTL bounds a missed/crashed-session cleanup while the app and
+  server remain alive; process/runtime death already closes the listener. Generic
   `Track.stream_url`/UI values and local/AirPlay GStreamer fetches still hold the original URL, so
   the remaining P1.6 and P1.4 boxes stay open.
 - 2026-07-12 — P1.7 places the non-`Send` Cast device, application, media session, controls,
@@ -951,7 +968,8 @@ Add one line per completed task:
 | 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
 | 2026-07-12 | P1.4a | `eb5458f` | Exact-origin/no-Referer policy and URL-free errors/logging cover every app-owned credential HTTP fetch. Chromecast and MPD are now ticketed by P1.6; local and AirPlay GStreamer fetches remain open. |
 | 2026-07-12 | P1.5 | `842341b` | Counted finite-response reads enforce endpoint caps and total deadlines across API, authentication, DAAP, radio, artwork, and metadata clients. |
-| 2026-07-14 | P1.6 receiver tickets | `c6aa7df`, `e23efd8` | Chromecast and MPD now receive revocable single-media tickets instead of backend credentials. MPD binds a dedicated IPv4/IPv6 proxy to the successful connection route, fails closed without it, and revokes across replacement, Stop, failure, ownership loss, EOS, shutdown, and stale generations; 18 new MPD/classifier/route tests cover the slice. Generic credential-free track values and TTLs remain open. |
+| 2026-07-14 | P1.6 receiver tickets | `c6aa7df`, `e23efd8` | Chromecast and MPD now receive revocable single-media tickets instead of backend credentials. MPD binds a dedicated IPv4/IPv6 proxy to the successful connection route, fails closed without it, and revokes across replacement, Stop, failure, ownership loss, EOS, shutdown, and stale generations; 18 new MPD/classifier/route tests cover the slice. Generic credential-free track values remain open. |
+| 2026-07-14 | P1.6 upstream-ticket TTL | `8735862` | Credential-bearing upstream routes now expire at a hard, non-sliding 24-hour monotonic deadline in addition to earlier lifecycle revocation. Boundary lookup atomically removes the route and returns 404; admitted responses may finish, local-file routes remain server-lifetime, and 6 deterministic tests cover the contract. |
 | 2026-07-12 | P1.7 | `60ee2af` | One worker owns the Cast session and serializes effects, authoritative state, cancellation, cleanup retries, and stale-event suppression. |
 | 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
 | 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |
