@@ -15,9 +15,12 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info};
+use url::Url;
 
+use super::cast_http_server::CastHttpServer;
 use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
+use crate::http_security::{classify_media_uri, MediaUriSecurity};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -40,6 +43,7 @@ pub struct MpdOutput {
     volume: f64,
     intent_epoch: Arc<AtomicU64>,
     cache: Arc<Mutex<MpdCache>>,
+    proxy: ProxyServices,
     worker_tx: mpsc::Sender<WorkerCommand>,
 }
 
@@ -58,6 +62,9 @@ struct WorkerCommand {
 enum CommandKind {
     Load {
         uri: String,
+    },
+    ProtectedLoad {
+        upstream: Box<Url>,
     },
     RejectLoad {
         failure: MpdFailure,
@@ -105,6 +112,193 @@ fn mpd_failure_message(failure: MpdFailure) -> String {
 }
 
 type MpdResult<T> = Result<T, MpdFailure>;
+
+/// One credential-safe route from an opaque ticket to its protected upstream.
+///
+/// Deliberately not `Debug`: both implementations and the returned URI are
+/// security-sensitive transport state. The production implementation owns a
+/// dedicated exact-route server, so dropping or revoking this lease cannot
+/// affect a ticket installed for another playback generation.
+trait MpdMediaTicket: Send + Sync {
+    fn uri(&self) -> &str;
+    fn revoke(&self);
+}
+
+trait MpdProxyFactory: Send + Sync + 'static {
+    fn start(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        local_addr: SocketAddr,
+        upstream: &Url,
+    ) -> MpdResult<Arc<dyn MpdMediaTicket>>;
+}
+
+struct CastMpdProxyFactory;
+
+struct CastMpdMediaTicket {
+    server: CastHttpServer,
+    uri: String,
+}
+
+impl MpdMediaTicket for CastMpdMediaTicket {
+    fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    fn revoke(&self) {
+        self.server.revoke_upstreams();
+    }
+}
+
+impl MpdProxyFactory for CastMpdProxyFactory {
+    fn start(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        local_addr: SocketAddr,
+        upstream: &Url,
+    ) -> MpdResult<Arc<dyn MpdMediaTicket>> {
+        let server = runtime
+            .block_on(CastHttpServer::start_on(local_addr))
+            .map_err(|error| opaque_mpd_failure("media proxy startup", error))?;
+        let uri = server.register_upstream(upstream);
+        // Keep the same command and URI bounds for generated tickets as for
+        // direct media. Registration is fail-closed if the route cannot yield
+        // a valid MPD argument.
+        encode_mpd_arg(&uri)?;
+        Ok(Arc::new(CastMpdMediaTicket { server, uri }))
+    }
+}
+
+struct RegisteredTicket {
+    epoch: u64,
+    ticket: Arc<dyn MpdMediaTicket>,
+}
+
+type TicketRegistry = Arc<Mutex<Option<RegisteredTicket>>>;
+
+#[derive(Clone)]
+struct ProxyServices {
+    runtime: Arc<Mutex<Option<tokio::runtime::Handle>>>,
+    factory: Arc<dyn MpdProxyFactory>,
+    current: TicketRegistry,
+}
+
+impl ProxyServices {
+    fn production() -> Self {
+        Self {
+            runtime: Arc::new(Mutex::new(None)),
+            factory: Arc::new(CastMpdProxyFactory),
+            current: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn set_runtime(&self, runtime: tokio::runtime::Handle) {
+        let mut slot = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *slot = Some(runtime);
+    }
+
+    fn start_ticket(
+        &self,
+        owner: CommandOwner,
+        local_addr: SocketAddr,
+        upstream: &Url,
+        intent_epoch: &AtomicU64,
+    ) -> MpdResult<SessionTicket> {
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|error| opaque_mpd_failure("media proxy runtime", error))?
+            .clone()
+            .ok_or_else(|| MpdFailure::new("media proxy runtime"))?;
+        let ticket = self.factory.start(&runtime, local_addr, upstream)?;
+        if let Err(failure) = encode_mpd_arg(ticket.uri()) {
+            ticket.revoke();
+            return Err(failure);
+        }
+
+        let mut current = match self.current.lock() {
+            Ok(current) => current,
+            Err(error) => {
+                ticket.revoke();
+                return Err(opaque_mpd_failure("media proxy registration", error));
+            }
+        };
+        if !is_current(owner, intent_epoch) {
+            drop(current);
+            ticket.revoke();
+            return Err(MpdFailure::new("media proxy registration"));
+        }
+        let previous = current.replace(RegisteredTicket {
+            epoch: owner.epoch,
+            ticket: Arc::clone(&ticket),
+        });
+        drop(current);
+        if let Some(previous) = previous {
+            previous.ticket.revoke();
+        }
+
+        Ok(SessionTicket {
+            epoch: owner.epoch,
+            ticket,
+            registry: Arc::clone(&self.current),
+        })
+    }
+
+    /// Revoke a ticket as soon as a replacing load or Stop is requested.
+    ///
+    /// The epoch comparison and removal happen under one lock. An old worker
+    /// cleanup therefore cannot remove a newer registration, while a worker
+    /// racing this request either installs first and is revoked here, or sees
+    /// the newer intent before it can install.
+    fn revoke_before(&self, epoch: u64) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let ticket = {
+            current
+                .as_ref()
+                .is_some_and(|registered| registered.epoch < epoch)
+                .then(|| current.take())
+                .flatten()
+        };
+        drop(current);
+        if let Some(ticket) = ticket {
+            ticket.ticket.revoke();
+        }
+    }
+}
+
+struct SessionTicket {
+    epoch: u64,
+    ticket: Arc<dyn MpdMediaTicket>,
+    registry: TicketRegistry,
+}
+
+impl SessionTicket {
+    fn uri(&self) -> &str {
+        self.ticket.uri()
+    }
+}
+
+impl Drop for SessionTicket {
+    fn drop(&mut self) {
+        self.ticket.revoke();
+        let mut current = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|registered| registered.epoch == self.epoch)
+        {
+            current.take();
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct OperationDeadline {
@@ -200,6 +394,7 @@ trait MpdConnector: Send + 'static {
 }
 
 trait MpdTransport {
+    fn local_addr(&self) -> MpdResult<SocketAddr>;
     fn repeat_off(&mut self, deadline: OperationDeadline) -> MpdResult<()>;
     fn random_off(&mut self, deadline: OperationDeadline) -> MpdResult<()>;
     fn single_off(&mut self, deadline: OperationDeadline) -> MpdResult<()>;
@@ -414,6 +609,13 @@ impl MpdConnection {
 }
 
 impl MpdTransport for MpdConnection {
+    fn local_addr(&self) -> MpdResult<SocketAddr> {
+        self.reader
+            .get_ref()
+            .local_addr()
+            .map_err(|error| opaque_mpd_failure("connection address", error))
+    }
+
     fn repeat_off(&mut self, deadline: OperationDeadline) -> MpdResult<()> {
         self.response_none("repeat 0", deadline, "repeat update")
     }
@@ -668,6 +870,7 @@ fn encode_mpd_arg(value: &str) -> MpdResult<String> {
 struct WorkerSession<T> {
     connection: T,
     song_id: Option<u64>,
+    ticket: Option<SessionTicket>,
     owner: CommandOwner,
     state: PlayerState,
     observed_active: bool,
@@ -692,12 +895,20 @@ enum CleanupKind {
     StopOwned,
 }
 
+/// Media entering the ordered worker. Deliberately not `Debug`: the protected
+/// variant contains the upstream credential that must never reach MPD.
+enum MpdMedia {
+    Direct(String),
+    Protected(Box<Url>),
+}
+
 fn spawn_mpd_worker<C>(
     connector: C,
     intent_epoch: Arc<AtomicU64>,
     cache: Arc<Mutex<MpdCache>>,
     event_tx: async_channel::Sender<PlayerEvent>,
     timing: WorkerTiming,
+    proxy: ProxyServices,
 ) -> mpsc::Sender<WorkerCommand>
 where
     C: MpdConnector,
@@ -706,7 +917,15 @@ where
     let spawn = std::thread::Builder::new()
         .name("mpd-worker".to_string())
         .spawn(move || {
-            run_mpd_worker(connector, worker_rx, intent_epoch, cache, event_tx, timing);
+            run_mpd_worker(
+                connector,
+                worker_rx,
+                intent_epoch,
+                cache,
+                event_tx,
+                timing,
+                proxy,
+            );
         });
     if let Err(spawn_error) = spawn {
         error!(error = %spawn_error, "Failed to spawn MPD worker");
@@ -721,6 +940,7 @@ fn run_mpd_worker<C>(
     cache: Arc<Mutex<MpdCache>>,
     event_tx: async_channel::Sender<PlayerEvent>,
     timing: WorkerTiming,
+    proxy: ProxyServices,
 ) where
     C: MpdConnector,
 {
@@ -739,7 +959,22 @@ fn run_mpd_worker<C>(
                             &mut connector,
                             &mut active,
                             command.owner,
-                            uri,
+                            MpdMedia::Direct(uri),
+                            &proxy,
+                            &intent_epoch,
+                            &cache,
+                            &event_tx,
+                            timing,
+                        );
+                        true
+                    }
+                    CommandKind::ProtectedLoad { upstream } => {
+                        handle_load(
+                            &mut connector,
+                            &mut active,
+                            command.owner,
+                            MpdMedia::Protected(upstream),
+                            &proxy,
                             &intent_epoch,
                             &cache,
                             &event_tx,
@@ -836,7 +1071,8 @@ fn handle_load<C>(
     connector: &mut C,
     active: &mut Option<WorkerSession<C::Connection>>,
     owner: CommandOwner,
-    uri: String,
+    media: MpdMedia,
+    proxy: &ProxyServices,
     intent_epoch: &AtomicU64,
     cache: &Mutex<MpdCache>,
     event_tx: &async_channel::Sender<PlayerEvent>,
@@ -879,6 +1115,7 @@ fn handle_load<C>(
     *active = Some(WorkerSession {
         connection,
         song_id: None,
+        ticket: None,
         owner,
         state: PlayerState::Buffering,
         observed_active: false,
@@ -946,6 +1183,57 @@ fn handle_load<C>(
         return;
     }
     if !is_current(owner, intent_epoch) {
+        return;
+    }
+    let uri = match media {
+        MpdMedia::Direct(uri) => uri,
+        MpdMedia::Protected(upstream) => {
+            let local_addr = active
+                .as_ref()
+                .expect("connected MPD session recorded")
+                .connection
+                .local_addr();
+            let local_addr = match local_addr {
+                Ok(local_addr) => local_addr,
+                Err(failure) => {
+                    cleanup_then_fail(
+                        active,
+                        owner,
+                        failure,
+                        intent_epoch,
+                        cache,
+                        event_tx,
+                        timing,
+                    );
+                    return;
+                }
+            };
+            let ticket = proxy.start_ticket(owner, local_addr, &upstream, intent_epoch);
+            let ticket = match ticket {
+                Ok(ticket) => ticket,
+                Err(failure) => {
+                    cleanup_then_fail(
+                        active,
+                        owner,
+                        failure,
+                        intent_epoch,
+                        cache,
+                        event_tx,
+                        timing,
+                    );
+                    return;
+                }
+            };
+            let uri = ticket.uri().to_string();
+            active
+                .as_mut()
+                .expect("connected MPD session recorded")
+                .ticket = Some(ticket);
+            uri
+        }
+    };
+    if !is_current(owner, intent_epoch) {
+        active.take();
         return;
     }
     let added = active
@@ -1776,6 +2064,7 @@ impl MpdOutput {
         info!(host = %host, port, name = %display_name, "MPD output configured");
         let intent_epoch = Arc::new(AtomicU64::new(0));
         let cache = Arc::new(Mutex::new(MpdCache::default()));
+        let proxy = ProxyServices::production();
         let worker_tx = spawn_mpd_worker(
             MpdTcpConnector {
                 host: host.to_string(),
@@ -1785,6 +2074,7 @@ impl MpdOutput {
             Arc::clone(&cache),
             event_tx.clone(),
             WorkerTiming::production(),
+            proxy.clone(),
         );
         Self {
             display_name: display_name.to_string(),
@@ -1793,8 +2083,16 @@ impl MpdOutput {
             volume: 1.0,
             intent_epoch,
             cache,
+            proxy,
             worker_tx,
         }
+    }
+
+    /// Supply the application runtime used to host exact-route media tickets.
+    #[must_use]
+    pub fn with_runtime(self, handle: tokio::runtime::Handle) -> Self {
+        self.proxy.set_runtime(handle);
+        self
     }
 
     pub fn probe(host: &str, port: u16) -> Result<String, String> {
@@ -1853,6 +2151,7 @@ impl AudioOutput for MpdOutput {
 
     fn load_uri(&self, uri: &str) {
         let owner = self.next_owner();
+        self.proxy.revoke_before(owner.epoch);
         // Retire the previous track's cached state immediately. The worker may
         // still be finishing bounded cleanup, and callers such as Previous
         // must not apply that old position to the newly selected track.
@@ -1865,10 +2164,16 @@ impl AudioOutput for MpdOutput {
             cache.position_ms = None;
         }
         let kind = match encode_mpd_arg(uri) {
-            Ok(_) => CommandKind::Load {
-                uri: uri.to_string(),
-            },
             Err(failure) => CommandKind::RejectLoad { failure },
+            Ok(_) => match classify_media_uri(uri) {
+                MediaUriSecurity::Direct => CommandKind::Load {
+                    uri: uri.to_string(),
+                },
+                MediaUriSecurity::Protected(upstream) => CommandKind::ProtectedLoad { upstream },
+                MediaUriSecurity::Reject => CommandKind::RejectLoad {
+                    failure: MpdFailure::new("media URI validation"),
+                },
+            },
         };
         self.enqueue(owner, kind);
     }
@@ -1888,6 +2193,7 @@ impl AudioOutput for MpdOutput {
 
     fn stop(&self) {
         let owner = self.next_owner();
+        self.proxy.revoke_before(owner.epoch);
         {
             let mut cache = self
                 .cache
@@ -1933,6 +2239,7 @@ impl AudioOutput for MpdOutput {
 impl Drop for MpdOutput {
     fn drop(&mut self) {
         let owner = self.next_owner();
+        self.proxy.revoke_before(owner.epoch);
         if let Ok(mut cache) = self.cache.lock() {
             cache.state = PlayerState::Stopped;
             cache.position_ms = None;
@@ -1948,7 +2255,8 @@ impl Drop for MpdOutput {
 mod tests {
     use super::*;
     use std::io::Read;
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
+    use std::sync::atomic::AtomicBool;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Point {
@@ -1983,22 +2291,28 @@ mod tests {
 
     struct FakeShared {
         actions: Mutex<Vec<Action>>,
+        added_uris: Mutex<Vec<String>>,
         gate: Mutex<Option<Gate>>,
         fail_at: Mutex<Option<Point>>,
         poison_at: Mutex<Option<Point>>,
         statuses: Mutex<VecDeque<MpdStatus>>,
         ownership: Mutex<VecDeque<bool>>,
+        local_addr: Mutex<SocketAddr>,
+        fail_local_addr: AtomicBool,
     }
 
     impl FakeShared {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 actions: Mutex::new(Vec::new()),
+                added_uris: Mutex::new(Vec::new()),
                 gate: Mutex::new(None),
                 fail_at: Mutex::new(None),
                 poison_at: Mutex::new(None),
                 statuses: Mutex::new(VecDeque::new()),
                 ownership: Mutex::new(VecDeque::new()),
+                local_addr: Mutex::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 45_000))),
+                fail_local_addr: AtomicBool::new(false),
             })
         }
 
@@ -2056,6 +2370,10 @@ mod tests {
         fn clear_actions(&self) {
             self.actions.lock().expect("actions lock").clear();
         }
+
+        fn added_uris(&self) -> Vec<String> {
+            self.added_uris.lock().expect("added URIs lock").clone()
+        }
     }
 
     impl Point {
@@ -2098,6 +2416,13 @@ mod tests {
     }
 
     impl MpdTransport for FakeConnection {
+        fn local_addr(&self) -> MpdResult<SocketAddr> {
+            if self.shared.fail_local_addr.load(Ordering::SeqCst) {
+                return Err(MpdFailure::new("connection address"));
+            }
+            Ok(*self.shared.local_addr.lock().expect("local address lock"))
+        }
+
         fn repeat_off(&mut self, _deadline: OperationDeadline) -> MpdResult<()> {
             self.shared
                 .record(Point::Repeat, Action::Point(Point::Repeat))
@@ -2118,7 +2443,12 @@ mod tests {
                 .record(Point::Consume, Action::Point(Point::Consume))
         }
 
-        fn add_id(&mut self, _uri: &str, _deadline: OperationDeadline) -> MpdResult<u64> {
+        fn add_id(&mut self, uri: &str, _deadline: OperationDeadline) -> MpdResult<u64> {
+            self.shared
+                .added_uris
+                .lock()
+                .expect("added URIs lock")
+                .push(uri.to_string());
             self.shared.record(Point::Add, Action::Point(Point::Add))?;
             Ok(42)
         }
@@ -2175,6 +2505,106 @@ mod tests {
         }
     }
 
+    struct FakeTicketState {
+        active: AtomicBool,
+    }
+
+    struct FakeMediaTicket {
+        uri: String,
+        state: Arc<FakeTicketState>,
+    }
+
+    impl MpdMediaTicket for FakeMediaTicket {
+        fn uri(&self) -> &str {
+            &self.uri
+        }
+
+        fn revoke(&self) {
+            self.state.active.store(false, Ordering::SeqCst);
+        }
+    }
+
+    struct FakeProxyShared {
+        starts: Mutex<Vec<SocketAddr>>,
+        upstreams: Mutex<Vec<String>>,
+        tickets: Mutex<Vec<Arc<FakeTicketState>>>,
+        fail_start: AtomicBool,
+        invalid_ticket: AtomicBool,
+    }
+
+    impl FakeProxyShared {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                starts: Mutex::new(Vec::new()),
+                upstreams: Mutex::new(Vec::new()),
+                tickets: Mutex::new(Vec::new()),
+                fail_start: AtomicBool::new(false),
+                invalid_ticket: AtomicBool::new(false),
+            })
+        }
+
+        fn active(&self, index: usize) -> bool {
+            self.tickets.lock().expect("proxy tickets lock")[index]
+                .active
+                .load(Ordering::SeqCst)
+        }
+    }
+
+    struct FakeProxyFactory {
+        shared: Arc<FakeProxyShared>,
+    }
+
+    impl MpdProxyFactory for FakeProxyFactory {
+        fn start(
+            &self,
+            _runtime: &tokio::runtime::Handle,
+            local_addr: SocketAddr,
+            upstream: &Url,
+        ) -> MpdResult<Arc<dyn MpdMediaTicket>> {
+            self.shared
+                .starts
+                .lock()
+                .expect("proxy starts lock")
+                .push(local_addr);
+            self.shared
+                .upstreams
+                .lock()
+                .expect("proxy upstreams lock")
+                .push(upstream.as_str().to_string());
+            if self.shared.fail_start.load(Ordering::SeqCst) {
+                return Err(MpdFailure::new("media proxy registration"));
+            }
+
+            let state = Arc::new(FakeTicketState {
+                active: AtomicBool::new(true),
+            });
+            let index = {
+                let mut tickets = self.shared.tickets.lock().expect("proxy tickets lock");
+                let index = tickets.len();
+                tickets.push(Arc::clone(&state));
+                index
+            };
+            let ticket_addr = SocketAddr::new(local_addr.ip(), 46_000);
+            let uri = if self.shared.invalid_ticket.load(Ordering::SeqCst) {
+                "http://127.0.0.1/cast/invalid\nroute".to_string()
+            } else {
+                format!("http://{ticket_addr}/cast/opaque-{index}.flac")
+            };
+            Ok(Arc::new(FakeMediaTicket { uri, state }))
+        }
+    }
+
+    fn fake_proxy_services(
+        shared: Arc<FakeProxyShared>,
+        runtime: &tokio::runtime::Runtime,
+    ) -> ProxyServices {
+        ProxyServices {
+            runtime: Arc::new(Mutex::new(Some(runtime.handle().clone()))),
+            factory: Arc::new(FakeProxyFactory { shared }),
+            current: Arc::new(Mutex::new(None)),
+        }
+    }
+
     fn playing_status(position_ms: u64, duration_ms: u64) -> MpdStatus {
         MpdStatus {
             state: MpdPlaybackState::Playing,
@@ -2210,6 +2640,7 @@ mod tests {
         epoch: Arc<AtomicU64>,
         cache: Arc<Mutex<MpdCache>>,
         events: async_channel::Receiver<PlayerEvent>,
+        proxy: ProxyServices,
         worker: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -2226,12 +2657,33 @@ mod tests {
         }
 
         fn new_with_timing(shared: Arc<FakeShared>, timing: WorkerTiming) -> Self {
+            Self::new_with_timing_and_proxy(shared, timing, ProxyServices::production())
+        }
+
+        fn new_with_proxy(shared: Arc<FakeShared>, proxy: ProxyServices) -> Self {
+            Self::new_with_timing_and_proxy(
+                shared,
+                WorkerTiming {
+                    operation: Duration::from_secs(2),
+                    poll: Duration::from_secs(3600),
+                    tick: Duration::from_millis(10),
+                },
+                proxy,
+            )
+        }
+
+        fn new_with_timing_and_proxy(
+            shared: Arc<FakeShared>,
+            timing: WorkerTiming,
+            proxy: ProxyServices,
+        ) -> Self {
             let (tx, rx) = mpsc::channel();
             let epoch = Arc::new(AtomicU64::new(0));
             let cache = Arc::new(Mutex::new(MpdCache::default()));
             let (event_tx, events) = async_channel::unbounded();
             let epoch_for_worker = Arc::clone(&epoch);
             let cache_for_worker = Arc::clone(&cache);
+            let worker_proxy = proxy.clone();
             let worker = std::thread::spawn(move || {
                 run_mpd_worker(
                     FakeConnector { shared },
@@ -2240,6 +2692,7 @@ mod tests {
                     cache_for_worker,
                     event_tx,
                     timing,
+                    worker_proxy,
                 );
             });
             Self {
@@ -2247,6 +2700,7 @@ mod tests {
                 epoch,
                 cache,
                 events,
+                proxy,
                 worker: Some(worker),
             }
         }
@@ -2256,6 +2710,12 @@ mod tests {
                 epoch: self.epoch.fetch_add(1, Ordering::SeqCst) + 1,
                 event_generation: PlayerEventGeneration::from_raw(generation),
             }
+        }
+
+        fn next_replacing_owner(&self, generation: u64) -> CommandOwner {
+            let owner = self.next_owner(generation);
+            self.proxy.revoke_before(owner.epoch);
+            owner
         }
 
         fn send(&self, owner: CommandOwner, kind: CommandKind) {
@@ -2293,6 +2753,351 @@ mod tests {
                 .join()
                 .expect("worker stopped");
         }
+    }
+
+    fn protected_load(uri: &str) -> CommandKind {
+        CommandKind::ProtectedLoad {
+            upstream: Box::new(Url::parse(uri).expect("protected test URL")),
+        }
+    }
+
+    #[test]
+    fn protected_load_adds_only_an_opaque_ticket_bound_to_the_ipv4_mpd_route() {
+        let shared = FakeShared::new();
+        let local_addr = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 44), 51_234));
+        *shared.local_addr.lock().expect("local address lock") = local_addr;
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_with_proxy(Arc::clone(&shared), proxy);
+        let owner = harness.next_replacing_owner(1);
+        const SECRET: &str = "https://music.test/stream.flac?api_key=credential-must-not-reach-mpd";
+
+        harness.send(owner, protected_load(SECRET));
+        harness.fence(owner);
+
+        assert_eq!(
+            *proxy_shared.starts.lock().expect("proxy starts lock"),
+            vec![local_addr]
+        );
+        assert_eq!(
+            proxy_shared
+                .upstreams
+                .lock()
+                .expect("proxy upstreams lock")
+                .as_slice(),
+            [SECRET]
+        );
+        let added = shared.added_uris();
+        assert_eq!(added.len(), 1);
+        assert!(added[0].starts_with("http://192.0.2.44:46000/cast/opaque-"));
+        assert!(!added[0].contains("api_key"));
+        assert!(!added[0].contains("credential-must-not-reach-mpd"));
+        assert!(proxy_shared.active(0));
+
+        harness.shutdown();
+        assert!(!proxy_shared.active(0), "shutdown must revoke the route");
+    }
+
+    #[test]
+    fn protected_load_preserves_the_ipv6_mpd_route_in_the_ticket() {
+        let shared = FakeShared::new();
+        let local_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51_235);
+        *shared.local_addr.lock().expect("local address lock") = local_addr;
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_with_proxy(Arc::clone(&shared), proxy);
+        let owner = harness.next_replacing_owner(1);
+
+        harness.send(
+            owner,
+            protected_load("https://music.test/stream?X-Plex-Token=secret"),
+        );
+        harness.fence(owner);
+
+        assert_eq!(
+            *proxy_shared.starts.lock().expect("proxy starts lock"),
+            vec![local_addr]
+        );
+        assert!(shared
+            .added_uris()
+            .into_iter()
+            .all(|uri| uri.starts_with("http://[::1]:46000/cast/opaque-")));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn protected_load_fails_closed_without_runtime_or_connection_address() {
+        for fail_address in [false, true] {
+            let shared = FakeShared::new();
+            shared.fail_local_addr.store(fail_address, Ordering::SeqCst);
+            let proxy_shared = FakeProxyShared::new();
+            let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+            let proxy = ProxyServices {
+                runtime: Arc::new(Mutex::new(fail_address.then(|| runtime.handle().clone()))),
+                factory: Arc::new(FakeProxyFactory {
+                    shared: Arc::clone(&proxy_shared),
+                }),
+                current: Arc::new(Mutex::new(None)),
+            };
+            let harness = Harness::new_with_proxy(Arc::clone(&shared), proxy);
+            let owner = harness.next_replacing_owner(1);
+            harness.send(
+                owner,
+                protected_load("https://music.test/stream?api_key=secret"),
+            );
+            harness.fence(owner);
+
+            assert!(shared.added_uris().is_empty());
+            assert!(proxy_shared
+                .tickets
+                .lock()
+                .expect("proxy tickets lock")
+                .is_empty());
+            assert!(harness.events().iter().any(|event| matches!(
+                event,
+                PlayerEvent::Error { message, .. }
+                    if !message.contains("secret") && !message.contains("api_key")
+            )));
+            harness.shutdown();
+        }
+    }
+
+    #[test]
+    fn proxy_start_and_ticket_registration_failures_never_reach_addid() {
+        for invalid_ticket in [false, true] {
+            let shared = FakeShared::new();
+            let proxy_shared = FakeProxyShared::new();
+            proxy_shared
+                .fail_start
+                .store(!invalid_ticket, Ordering::SeqCst);
+            proxy_shared
+                .invalid_ticket
+                .store(invalid_ticket, Ordering::SeqCst);
+            let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+            let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+            let harness = Harness::new_with_proxy(Arc::clone(&shared), proxy);
+            let owner = harness.next_replacing_owner(1);
+            harness.send(
+                owner,
+                protected_load("https://music.test/stream?session-id=secret"),
+            );
+            harness.fence(owner);
+
+            assert!(shared.added_uris().is_empty());
+            if invalid_ticket {
+                assert!(!proxy_shared.active(0));
+            } else {
+                assert!(proxy_shared
+                    .tickets
+                    .lock()
+                    .expect("proxy tickets lock")
+                    .is_empty());
+            }
+            harness.shutdown();
+        }
+    }
+
+    #[test]
+    fn ticket_survives_pause_seek_and_restartable_remote_stop_but_not_user_stop() {
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_with_proxy(Arc::clone(&shared), proxy);
+        let owner = harness.next_replacing_owner(1);
+        harness.send(
+            owner,
+            protected_load("https://music.test/stream?api_key=secret"),
+        );
+        harness.fence(owner);
+        assert!(proxy_shared.active(0));
+
+        harness.send(owner, CommandKind::Pause);
+        harness.fence(owner);
+        assert!(proxy_shared.active(0));
+        harness.send(owner, CommandKind::Seek(7_000));
+        harness.fence(owner);
+        assert!(proxy_shared.active(0));
+
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(stopped_status(7_000, 10_000));
+        harness.send(owner, CommandKind::PollNow);
+        harness.fence(owner);
+        assert!(proxy_shared.active(0));
+
+        let stop_owner = harness.next_replacing_owner(2);
+        assert!(
+            !proxy_shared.active(0),
+            "Stop revokes before worker cleanup"
+        );
+        harness.send(stop_owner, CommandKind::Stop);
+        harness.fence(stop_owner);
+        harness.shutdown();
+    }
+
+    #[test]
+    fn protected_ticket_is_revoked_on_add_play_status_and_control_failures() {
+        for failure_point in [Point::Add, Point::Play, Point::Status] {
+            let shared = FakeShared::new();
+            *shared.fail_at.lock().expect("failure lock") = Some(failure_point);
+            let proxy_shared = FakeProxyShared::new();
+            let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+            let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+            let harness = Harness::new_with_proxy(Arc::clone(&shared), proxy);
+            let owner = harness.next_replacing_owner(1);
+            harness.send(
+                owner,
+                protected_load("https://music.test/stream?api_key=secret"),
+            );
+            harness.fence(owner);
+
+            assert!(!proxy_shared.active(0), "failure at {failure_point:?}");
+            harness.shutdown();
+        }
+
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_with_proxy(Arc::clone(&shared), proxy);
+        let owner = harness.next_replacing_owner(1);
+        harness.send(
+            owner,
+            protected_load("https://music.test/stream?api_key=secret"),
+        );
+        harness.fence(owner);
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Seek);
+        harness.send(owner, CommandKind::Seek(5_000));
+        harness.fence(owner);
+
+        assert!(!proxy_shared.active(0));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn replacement_load_revokes_the_old_ticket_before_the_new_command_runs() {
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_with_proxy(Arc::clone(&shared), proxy);
+        let old_owner = harness.next_replacing_owner(1);
+        harness.send(
+            old_owner,
+            protected_load("https://music.test/stream?api_key=old-secret"),
+        );
+        harness.fence(old_owner);
+        assert!(proxy_shared.active(0));
+
+        let new_owner = harness.next_replacing_owner(2);
+        assert!(!proxy_shared.active(0));
+        harness.send(
+            new_owner,
+            CommandKind::Load {
+                uri: "https://radio.test/live.mp3".to_string(),
+            },
+        );
+        harness.fence(new_owner);
+        assert_eq!(
+            proxy_shared
+                .tickets
+                .lock()
+                .expect("proxy tickets lock")
+                .len(),
+            1
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn natural_eos_and_remote_ownership_loss_revoke_protected_tickets() {
+        for ownership_loss in [false, true] {
+            let shared = FakeShared::new();
+            let proxy_shared = FakeProxyShared::new();
+            let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+            let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+            let harness = Harness::new_with_proxy(Arc::clone(&shared), proxy);
+            let owner = harness.next_replacing_owner(1);
+            harness.send(
+                owner,
+                protected_load("https://music.test/stream?api_key=secret"),
+            );
+            harness.fence(owner);
+
+            let terminal = if ownership_loss {
+                let mut foreign = playing_status(1_000, 10_000);
+                foreign.song_id = Some(99);
+                foreign
+            } else {
+                let mut ended = stopped_status(10_000, 10_000);
+                ended.song_id = None;
+                ended
+            };
+            shared
+                .statuses
+                .lock()
+                .expect("statuses lock")
+                .push_back(terminal);
+            harness.send(owner, CommandKind::PollNow);
+            harness.fence(owner);
+
+            assert!(!proxy_shared.active(0));
+            harness.shutdown();
+        }
+    }
+
+    #[test]
+    fn stale_ticket_drop_cannot_revoke_a_newer_generation_ticket() {
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let epoch = AtomicU64::new(1);
+        let old_owner = CommandOwner {
+            epoch: 1,
+            event_generation: PlayerEventGeneration::from_raw(1),
+        };
+        let old = proxy
+            .start_ticket(
+                old_owner,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 50_001)),
+                &Url::parse("https://music.test/old?api_key=secret").expect("old URL"),
+                &epoch,
+            )
+            .expect("old ticket");
+        epoch.store(2, Ordering::SeqCst);
+        let new_owner = CommandOwner {
+            epoch: 2,
+            event_generation: PlayerEventGeneration::from_raw(2),
+        };
+        let new = proxy
+            .start_ticket(
+                new_owner,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 50_002)),
+                &Url::parse("https://music.test/new?api_key=secret").expect("new URL"),
+                &epoch,
+            )
+            .expect("new ticket");
+
+        assert!(!proxy_shared.active(0));
+        assert!(proxy_shared.active(1));
+        drop(old);
+        assert!(proxy_shared.active(1));
+        assert_eq!(
+            proxy
+                .current
+                .lock()
+                .expect("ticket registry lock")
+                .as_ref()
+                .map(|registered| registered.epoch),
+            Some(2)
+        );
+        drop(new);
+        assert!(!proxy_shared.active(1));
     }
 
     #[test]
@@ -3438,6 +4243,7 @@ mod tests {
             volume: 1.0,
             intent_epoch: Arc::clone(&intent_epoch),
             cache: Arc::clone(&cache),
+            proxy: ProxyServices::production(),
             worker_tx,
         };
 
@@ -3452,6 +4258,44 @@ mod tests {
         assert!(matches!(
             command.kind,
             CommandKind::Load { uri } if uri == "https://music.test/new"
+        ));
+    }
+
+    #[test]
+    fn load_uri_separates_protected_rejected_and_direct_media_before_the_worker() {
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let intent_epoch = Arc::new(AtomicU64::new(0));
+        let cache = Arc::new(Mutex::new(MpdCache::default()));
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let output = MpdOutput {
+            display_name: "test".to_string(),
+            event_tx,
+            event_generation: AtomicU64::new(1),
+            volume: 1.0,
+            intent_epoch,
+            cache,
+            proxy: ProxyServices::production(),
+            worker_tx,
+        };
+
+        output.load_uri("https://music.test/stream?api_key=worker-secret");
+        assert!(matches!(
+            worker_rx.recv().expect("protected command").kind,
+            CommandKind::ProtectedLoad { upstream }
+                if upstream.as_str().contains("api_key=worker-secret")
+        ));
+
+        output.load_uri("HTTPS://[malformed");
+        assert!(matches!(
+            worker_rx.recv().expect("rejected command").kind,
+            CommandKind::RejectLoad { failure }
+                if failure.operation == "media URI validation"
+        ));
+
+        output.load_uri("Albums/Artist/track.flac");
+        assert!(matches!(
+            worker_rx.recv().expect("direct command").kind,
+            CommandKind::Load { uri } if uri == "Albums/Artist/track.flac"
         ));
     }
 
