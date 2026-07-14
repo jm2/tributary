@@ -72,8 +72,10 @@ Acceptance criteria: upgrading a v0.5.0-style database always yields a unique co
   replacements as destructive, and requires a second acknowledgement for every such
   no-supported-audio trust request. Filesystem evidence remains private to the engine and is
   revalidated with persisted-state compare-and-swap and fresh identity/mount checks before consent
-  can change authority. A brand-new writable root with supported audio and no remembered metadata
-  continues to enroll automatically.
+  can change authority. A brand-new writable root whose first complete observation contains
+  supported audio and has no remembered metadata continues to enroll automatically; once an empty
+  observation has been recorded, later content still requires consent because Tributary cannot
+  distinguish newly added files from a removable or network volume appearing at the mountpoint.
 - [ ] Pin reconciliation and watcher mutations to a root handle or equivalent mount generation
   on every supported platform; Linux has mount-instance guards, while portable Unix ABA
   resistance remains incomplete.
@@ -687,8 +689,10 @@ Record scope or design decisions here so deferred work is explicit.
 - 2026-07-14 — Root trust is explicit authorization, never content identification. Exact
   configured roots inherited from a pre-identity database, roots whose confirmed identity no
   longer matches, and trust requests whose complete observation has no supported audio files enter
-  one FIFO main-window prompt flow. A brand-new writable root with supported audio and no
-  remembered metadata continues to enroll automatically. Replacement actions use destructive
+  one FIFO main-window prompt flow. A brand-new writable root auto-enrolls only when its first
+  complete observation contains supported audio and no remembered metadata. Once an empty
+  observation is persisted, later content remains behind consent because it could be a removable
+  or network volume newly appearing at the mountpoint. Replacement actions use destructive
   presentation, and every prompted no-supported-audio observation requires a separate second
   acknowledgement. Request correlation exposes only an opaque ID and display facts; the engine
   retains the filesystem evidence, checks the expected persisted state, creates or adopts the
