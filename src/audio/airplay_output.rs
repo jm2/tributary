@@ -39,6 +39,7 @@
 use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use super::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket, PreparedGstreamerMedia};
 use super::output::{AudioOutput, OutputType};
@@ -320,6 +321,7 @@ impl AirPlayOutput {
         let tx = self.event_tx.clone();
         let pipeline_weak = pipeline.downgrade();
         let media_proxy = Arc::clone(&self.media_proxy);
+        let started_at = Instant::now();
         bus.add_watch(move |_, msg| {
             use gst::MessageView;
             match msg.view() {
@@ -329,14 +331,27 @@ impl AirPlayOutput {
                     }
                     let _ = tx.try_send(PlayerEvent::ended(generation));
                 }
-                MessageView::Error(_) => {
+                MessageView::Error(pipeline_error) => {
                     if let Some(ticket) = media_ticket.as_ref() {
                         media_proxy.revoke_if_current(ticket);
                     }
                     // GStreamer error/debug strings can embed the authenticated
-                    // source URI. Keep the diagnostic stable and URL-free.
-                    error!("AirPlay pipeline error");
+                    // source URI. Keep only closed categories and numeric
+                    // codes, consistent with local protected playback.
+                    let error_value = pipeline_error.error();
+                    let source_category = super::pipeline_error_source_category(msg);
+                    let elapsed_ms =
+                        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    error!(
+                        protected = media_ticket.is_some(),
+                        domain = super::pipeline_error_domain(&error_value),
+                        code = error_value.code(),
+                        source_category = source_category.as_str(),
+                        elapsed_ms,
+                        "AirPlay pipeline error"
+                    );
                     let _ = tx.try_send(PlayerEvent::error(generation, "AirPlay playback failed"));
+                    return glib::ControlFlow::Break;
                 }
                 MessageView::StateChanged(s) => {
                     if let Some(pipeline) = pipeline_weak.upgrade() {
@@ -379,7 +394,7 @@ impl AirPlayOutput {
         }
 
         let pipeline_str = format!(
-            "uridecodebin uri=\"{}\" ! audioconvert ! avenc_alac ! raopsink name=raop host={} port={}",
+            "uridecodebin name=decoder uri=\"{}\" ! audioconvert ! avenc_alac ! raopsink name=raop host={} port={}",
             uri.replace('"', "\\\""),
             host,
             port,
@@ -394,6 +409,10 @@ impl AirPlayOutput {
         if let Some(sink) = pipeline.by_name("raop") {
             sink.set_property("volume", Self::volume_to_db(volume));
         }
+        let decoder = pipeline
+            .by_name("decoder")
+            .ok_or_else(|| "RAOP pipeline has no URI decoder".to_string())?;
+        super::Player::install_loopback_http_source_policy(&decoder);
 
         Ok(pipeline)
     }
@@ -448,7 +467,7 @@ impl AirPlayOutput {
         };
 
         let pipeline_str = format!(
-            "uridecodebin uri=\"{}\" ! audioconvert ! audio/x-raw,format=S16LE,rate=44100,channels=2 ! fdsink fd={}",
+            "uridecodebin name=decoder uri=\"{}\" ! audioconvert ! audio/x-raw,format=S16LE,rate=44100,channels=2 ! fdsink fd={}",
             uri.replace('"', "\\\""),
             fd,
         );
@@ -463,6 +482,12 @@ impl AirPlayOutput {
             let _ = child.wait();
             "shairport-sync launch did not yield a Pipeline".to_string()
         })?;
+        let Some(decoder) = pipeline.by_name("decoder") else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("shairport-sync pipeline has no URI decoder".to_string());
+        };
+        super::Player::install_loopback_http_source_policy(&decoder);
 
         Ok((pipeline, child, stdin_file))
     }

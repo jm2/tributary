@@ -234,6 +234,21 @@ smart_playlist:
   remove_rule: "Remove rule"
   limit_to: "Limit to"
 
+# ── User-facing errors ─────────────────────────────────────────────
+errors:
+  remote:
+    authentication_rejected: "%{backend} authentication was rejected"
+    connection_failed: "Could not connect to %{backend}"
+    connection_timed_out: "%{backend} connection timed out"
+    invalid_response: "%{backend} returned an invalid response"
+    authentication_method_unsupported: "%{backend} authentication method is unsupported"
+    source_failed: "%{backend} source failed"
+  playback:
+    network_request_failed: "Audio network request failed"
+    decoder_failed: "Audio decoder failed"
+    audio_output_failed: "Audio output failed"
+    playback_failed: "Audio playback failed"
+
 # ── About dialog ───────────────────────────────────────────────────
 about:
   application_name: "Tributary"
