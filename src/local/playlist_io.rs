@@ -1274,9 +1274,14 @@ mod tests {
         let directory = tempfile::tempdir().expect("create temporary directory");
         let destination = directory.path().join("playlist.xspf");
         fs::write(&destination, "previous contents").expect("write previous export");
+        let track_path = directory
+            .path()
+            .join("negative.flac")
+            .to_string_lossy()
+            .into_owned();
         let negative = vec![library_track(
             "negative",
-            "/negative",
+            &track_path,
             "Song",
             "Artist",
             "Album",
@@ -1287,7 +1292,7 @@ mod tests {
             .expect("an invalid optional duration must not block export");
         let imported = import_xspf(&destination).expect("read replaced XSPF export");
         assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].file_path, "/negative");
+        assert_eq!(imported[0].file_path, track_path);
         assert_eq!(imported[0].title, "Song");
         assert_eq!(imported[0].duration_secs, None);
         assert!(temporary_artifacts(directory.path(), &destination).is_empty());
