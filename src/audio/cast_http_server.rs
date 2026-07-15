@@ -1450,21 +1450,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refused_upstream_connection_returns_bad_gateway() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("reserve refused port");
-        let addr = listener.local_addr().expect("reserved address");
-        drop(listener);
+    async fn immediate_upstream_transport_failure_returns_bad_gateway() {
+        #[derive(Debug)]
+        struct FailingResolver;
 
-        let client = test_upstream_client(
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-        );
-        let request = legacy(&format!(
-            "http://{addr}/stream?token=connection-refused-secret"
-        ));
+        impl reqwest::dns::Resolve for FailingResolver {
+            fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(async {
+                    Err(std::io::Error::other("intentional test resolver failure").into())
+                })
+            }
+        }
+
+        let http = crate::http_security::authenticated_client_builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(FailingResolver))
+            .connect_timeout(Duration::from_secs(1))
+            .build()
+            .expect("test upstream client");
+        let client = UpstreamMediaClient {
+            http,
+            timeouts: UpstreamTimeouts {
+                response_headers: Duration::from_secs(1),
+                body_idle: Duration::from_secs(1),
+            },
+        };
+        let request =
+            legacy("http://transport-failure.invalid/stream?token=transport-failure-secret");
         let response = proxy_upstream(&client, &request, &HeaderMap::new()).await;
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);

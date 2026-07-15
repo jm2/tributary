@@ -931,7 +931,8 @@ without distinct upstream connect/header/body-idle deadlines or useful safe diag
   status/code, protected state, and bounded elapsed time; terminal watches stop after one error.
   Remote connection flows use typed authentication/connection/timeout/response categories and no
   longer log, display, or mislabel raw backend/server error strings.
-- [x] Add focused accepted-without-headers, refused-connect, stalled/failed/active-body,
+- [x] Add focused accepted-without-headers, immediate-transport-failure,
+  stalled/failed/active-body,
   upstream-status, exact-ticket predicate, source-signal, fixed-diagnostic, and typed remote-error
   tests. An isolated child process initializes GStreamer with both proxy environment variables
   poisoned and no bypass list, then proves the loopback fixture receives the ticket while the
@@ -1044,7 +1045,8 @@ outstanding, as does the deliberately deferred live release-workflow run.
 Most recent milestone validation (2026-07-15, P2.11 protected-playback urgent slice): `cargo fmt`,
 `cargo check --all-targets --all-features`, and strict all-target/all-feature Clippy pass in debug
 and release. Both profiles pass 18 library plus 598 application tests (616 per profile). Thirteen
-focused additions cover accepted connections without headers, refused connections, preserved
+focused additions cover accepted connections without headers, deterministic immediate transport
+failure, preserved
 upstream statuses, failed/stalled/active response bodies, exact ticket-shape validation,
 `source-setup` enforcement, secret-free diagnostics, typed remote-error classification, and an
 isolated real-GStreamer child process whose poisoned ambient proxy receives no request while the
