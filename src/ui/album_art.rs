@@ -38,9 +38,27 @@ pub fn invalidate() {
 
 /// Request sent to the album art worker thread.
 struct ArtRequest {
-    url: String,
+    source: ArtSource,
     generation: u64,
     reply_tx: async_channel::Sender<Vec<u8>>,
+}
+
+/// Remote artwork input. Deliberately not `Debug`: the resolved variant owns
+/// authentication material that must remain inside Tributary's fetch worker.
+enum ArtSource {
+    /// Legacy/direct URL path (including DAAP's just-in-time session URL).
+    Url(String),
+    /// Credential-isolated request produced by a retained remote source.
+    Resolved(crate::architecture::media::ResolvedHttpRequest),
+}
+
+impl ArtSource {
+    fn is_active(&self) -> bool {
+        match self {
+            Self::Url(_) => true,
+            Self::Resolved(request) => request.is_active(),
+        }
+    }
 }
 
 /// Get (or lazily create) the sender for the persistent art worker.
@@ -76,7 +94,27 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
                         continue; // Stale — user already changed tracks.
                     }
 
-                    match client.get(&req.url).timeout(REMOTE_ART_TIMEOUT).send() {
+                    if !req.source.is_active() {
+                        continue;
+                    }
+
+                    let request = match &req.source {
+                        ArtSource::Url(url) => client.get(url),
+                        ArtSource::Resolved(resolved) => {
+                            let mut endpoint = resolved.endpoint().clone();
+                            {
+                                let mut query = endpoint.query_pairs_mut();
+                                for (key, value) in resolved.private_query_pairs() {
+                                    query.append_pair(key, value);
+                                }
+                            }
+                            client
+                                .get(endpoint)
+                                .headers(resolved.sensitive_headers().clone())
+                        }
+                    };
+
+                    match request.timeout(REMOTE_ART_TIMEOUT).send() {
                         Ok(resp) if resp.status().is_success() => {
                             match crate::http_body::read_limited_blocking(
                                 resp,
@@ -85,6 +123,7 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
                             ) {
                                 Ok(bytes)
                                     if !bytes.is_empty()
+                                        && req.source.is_active()
                                         && ART_GENERATION.load(Ordering::Relaxed)
                                             == req.generation =>
                                 {
@@ -382,14 +421,32 @@ fn extract_mp4_covr_atom(data: &[u8]) -> Option<Vec<u8>> {
 /// avoid depending on a tokio runtime context (which the GTK main
 /// thread does not have).
 pub fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
-    // Set placeholder immediately while fetching.
+    let generation = begin_remote_album_art(image);
+    enqueue_remote_album_art(image, ArtSource::Url(cover_art_url.to_string()), generation);
+}
+
+/// Begin resolving protected artwork without allowing an older resolver to
+/// supersede a newer track while it awaits its source session.
+pub fn begin_remote_album_art(image: &gtk::Image) -> u64 {
     image.set_icon_name(Some("audio-x-generic-symbolic"));
+    next_generation()
+}
 
-    // Bump the generation counter so any in-flight fetch for the
-    // previous track is discarded when it completes.
-    let generation = next_generation();
+/// Fetch a credential-isolated artwork request for an already-reserved
+/// generation. A stale resolver result is discarded before it reaches the
+/// persistent worker, and the worker repeats both generation and lease checks.
+pub fn fetch_resolved_album_art(
+    image: &gtk::Image,
+    request: crate::architecture::media::ResolvedHttpRequest,
+    generation: u64,
+) {
+    if !generation_is_current(generation) || !request.is_active() {
+        return;
+    }
+    enqueue_remote_album_art(image, ArtSource::Resolved(request), generation);
+}
 
-    let url = cover_art_url.to_string();
+fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, generation: u64) {
     let image = image.clone();
 
     let (reply_tx, reply_rx) = async_channel::bounded::<Vec<u8>>(1);
@@ -402,7 +459,7 @@ pub fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
     // fetch with and the placeholder icon will show instead.
     if let Some(tx) = art_worker_tx() {
         let _ = tx.send(ArtRequest {
-            url,
+            source,
             generation,
             reply_tx,
         });

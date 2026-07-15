@@ -68,7 +68,7 @@ pub fn setup_output_selector(
     let event_sender = event_sender.clone();
     let volume_scale = volume_scale.clone();
     let output_button = output_button.clone();
-    // Real runtime handle for the Chromecast output's embedded file server.
+    // Real runtime handle for embedded media servers used by remote outputs.
     let rt_handle = rt_handle.clone();
 
     output_list.connect_row_activated(move |list_box, activated_row| {
@@ -150,6 +150,7 @@ pub fn setup_output_selector(
                     &parked_local,
                     &event_sender,
                     &volume_scale,
+                    &rt_handle,
                 );
             } else {
                 handle_mpd_switch(
@@ -159,6 +160,7 @@ pub fn setup_output_selector(
                     &parked_local,
                     &event_sender,
                     &volume_scale,
+                    &rt_handle,
                 );
             }
         }
@@ -275,6 +277,7 @@ fn handle_airplay_switch(
     parked_local: &Rc<RefCell<Option<Box<dyn AudioOutput>>>>,
     event_sender: &async_channel::Sender<PlayerEvent>,
     volume_scale: &gtk::Scale,
+    rt_handle: &tokio::runtime::Handle,
 ) {
     let airplay_name = activated_row
         .first_child()
@@ -301,7 +304,8 @@ fn handle_airplay_switch(
         port,
         event_sender.clone(),
         volume_scale.value(),
-    );
+    )
+    .with_runtime(rt_handle.clone());
     let supports_volume = airplay.supports_volume();
     *active_output.borrow_mut() = Box::new(airplay);
     info!(
@@ -322,6 +326,7 @@ fn handle_mpd_switch(
     parked_local: &Rc<RefCell<Option<Box<dyn AudioOutput>>>>,
     event_sender: &async_channel::Sender<PlayerEvent>,
     volume_scale: &gtk::Scale,
+    rt_handle: &tokio::runtime::Handle,
 ) {
     let saved = load_saved_outputs();
     let mpd_idx = mpd_index_before_row(list_box, idx);
@@ -329,7 +334,8 @@ fn handle_mpd_switch(
     if let Some(entry) = saved.get(mpd_idx) {
         park_local_if_needed(active_output, parked_local, event_sender);
 
-        let mpd = MpdOutput::new(&entry.name, &entry.host, entry.port, event_sender.clone());
+        let mpd = MpdOutput::new(&entry.name, &entry.host, entry.port, event_sender.clone())
+            .with_runtime(rt_handle.clone());
         *active_output.borrow_mut() = Box::new(mpd);
         info!(
             name = %entry.name,

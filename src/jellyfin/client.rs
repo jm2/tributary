@@ -3,13 +3,14 @@
 
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT};
 use reqwest::Client;
 use tracing::{debug, info};
 use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::architecture::ResolvedHttpRequest;
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
     authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
@@ -249,23 +250,34 @@ impl JellyfinClient {
         url
     }
 
-    /// Build a direct-stream URL for a track.
-    ///
-    /// Uses `api_key` as a query parameter so GStreamer's `playbin3`
-    /// can fetch the audio without needing custom HTTP headers.
-    pub fn stream_url(&self, item_id: &str) -> Url {
+    /// Resolve a direct-stream request with authentication kept in a
+    /// sensitive header rather than the URL.
+    pub(crate) fn resolved_stream_request(
+        &self,
+        item_id: &str,
+    ) -> BackendResult<ResolvedHttpRequest> {
         let mut url = self.api_url(&format!("Audio/{item_id}/stream"));
-        url.query_pairs_mut()
-            .append_pair("static", "true")
-            .append_pair("api_key", &self.api_key);
-        url
+        url.set_query(None);
+        url.set_fragment(None);
+        url.query_pairs_mut().append_pair("static", "true");
+        ResolvedHttpRequest::new(url)?.with_sensitive_header(
+            HeaderName::from_static("x-emby-authorization"),
+            jellyfin_auth_header(&self.api_key)?,
+        )
     }
 
-    /// Build a cover art URL for an item.
-    pub fn image_url(&self, item_id: &str) -> Url {
+    /// Resolve a cover-art request with authentication isolated likewise.
+    pub(crate) fn resolved_artwork_request(
+        &self,
+        item_id: &str,
+    ) -> BackendResult<ResolvedHttpRequest> {
         let mut url = self.api_url(&format!("Items/{item_id}/Images/Primary"));
-        url.query_pairs_mut().append_pair("api_key", &self.api_key);
-        url
+        url.set_query(None);
+        url.set_fragment(None);
+        ResolvedHttpRequest::new(url)?.with_sensitive_header(
+            HeaderName::from_static("x-emby-authorization"),
+            jellyfin_auth_header(&self.api_key)?,
+        )
     }
 
     /// Issue a GET request to a Jellyfin endpoint and deserialize the
@@ -378,18 +390,8 @@ impl JellyfinClient {
 
 /// Build a `reqwest::Client` with the full `X-Emby-Authorization` header.
 fn build_http_client(api_key: &str) -> BackendResult<Client> {
-    let auth_value = format!(
-        r#"MediaBrowser Client="{CLIENT_NAME}", Device="{CLIENT_NAME}", DeviceId="{CLIENT_NAME}", Version="{CLIENT_VERSION}", Token="{api_key}""#,
-    );
-
     let mut default_headers = HeaderMap::new();
-    default_headers.insert(
-        "X-Emby-Authorization",
-        HeaderValue::from_str(&auth_value).map_err(|e| BackendError::ConnectionFailed {
-            message: format!("Invalid auth header value: {e}"),
-            source: Some(Box::new(e)),
-        })?,
-    );
+    default_headers.insert("X-Emby-Authorization", jellyfin_auth_header(api_key)?);
     default_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
     authenticated_client_builder()
@@ -402,6 +404,19 @@ fn build_http_client(api_key: &str) -> BackendResult<Client> {
             message: format!("Failed to build HTTP client: {e}"),
             source: Some(Box::new(e)),
         })
+}
+
+fn jellyfin_auth_header(api_key: &str) -> BackendResult<HeaderValue> {
+    let auth_value = format!(
+        r#"MediaBrowser Client="{CLIENT_NAME}", Device="{CLIENT_NAME}", DeviceId="{CLIENT_NAME}", Version="{CLIENT_VERSION}", Token="{api_key}""#,
+    );
+    let mut value =
+        HeaderValue::from_str(&auth_value).map_err(|e| BackendError::ConnectionFailed {
+            message: format!("Invalid auth header value: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 fn response_body_error(context: &str, error: ResponseBodyError) -> BackendError {
@@ -453,5 +468,27 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains("embedded-user"));
         assert!(!rendered.contains(&secret));
+    }
+
+    #[test]
+    fn resolved_media_requests_keep_token_out_of_urls() {
+        let api_key = uuid::Uuid::new_v4().to_string();
+        let client =
+            JellyfinClient::new("https://media.example.test", &api_key, "user-id").expect("client");
+
+        let stream = client.resolved_stream_request("track-id").unwrap();
+        let artwork = client.resolved_artwork_request("album-id").unwrap();
+        assert_eq!(stream.endpoint().query(), Some("static=true"));
+        assert!(artwork.endpoint().query().is_none());
+
+        for request in [stream, artwork] {
+            assert!(!request.endpoint().as_str().contains(&api_key));
+            assert!(request.private_query_pairs().is_empty());
+            let value = request
+                .sensitive_headers()
+                .get("x-emby-authorization")
+                .expect("auth header");
+            assert!(value.is_sensitive());
+        }
     }
 }

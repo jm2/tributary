@@ -403,8 +403,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use crate::architecture::backend::MediaBackend;
-
     use super::*;
 
     static REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -512,7 +510,7 @@ mod tests {
         assert!(!stream_reference.as_str().contains("session-id"));
 
         let direct_stream = backend
-            .get_stream_url(&tracks[0].id)
+            .stream_url_for_track(&tracks[0].id)
             .await
             .expect("resolve backend stream URL");
         assert_eq!(direct_stream.scheme(), "http");

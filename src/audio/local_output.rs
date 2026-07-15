@@ -6,6 +6,7 @@
 
 use super::output::{AudioOutput, OutputType};
 use super::{Player, PlayerEventGeneration, PlayerState};
+use crate::architecture::media::ResolvedHttpRequest;
 
 /// Local GStreamer output — delegates to the existing [`Player`].
 pub struct LocalOutput {
@@ -34,6 +35,10 @@ impl AudioOutput for LocalOutput {
 
     fn load_uri(&self, uri: &str) {
         self.player.load_uri(uri);
+    }
+
+    fn load_resolved(&self, request: ResolvedHttpRequest) {
+        self.player.load_resolved(request);
     }
 
     fn set_event_generation(&self, generation: PlayerEventGeneration) {

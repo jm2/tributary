@@ -12,10 +12,11 @@ Created: 2026-07-10
 - If scope changes, update the review document or record the decision under **Decisions**.
 - Run the global validation gate after every milestone.
 - Do not combine the architecture milestone with unrelated bug fixes.
-- Add a `CHANGELOG.md` entry in the same commit as any user-visible fix. The remediation
-  work through P1.7 landed without one, and the changelog silently drifted four months
-  behind the code; a user could not tell that the migration corruption or the destructive
-  reconciliation had ever been fixed.
+- Before opening any remediation PR, update both this tracker and `CHANGELOG.md` on the branch.
+  Every user-visible fix must be described in that PR. The remediation work through P1.7 landed
+  without those updates, and the changelog silently drifted four months behind the code; a user
+  could not tell that the migration corruption or the destructive reconciliation had ever been
+  fixed.
 
 Status summary:
 
@@ -23,6 +24,13 @@ Status summary:
 - [ ] P1 correctness and security complete
 - [ ] P2 resilience and packaging complete
 - [ ] P3 architecture and integration coverage complete
+
+Progress snapshot (2026-07-14), recounted from the literal P0–P3 task checkboxes to correct the
+earlier numerator/denominator drift. The denominator excludes the two deferred P0.7 live-workflow
+verification boxes and the withdrawn P2.6 false finding; section-summary and global-validation
+gate boxes are not task progress:
+**128/213 (60.1%)** in-scope checklist items complete; **109/114 (95.6%)** across P0 and P1 after
+the same P0.7 exclusion.
 
 ## P0 — Release blockers
 
@@ -51,17 +59,57 @@ Acceptance criteria: upgrading a v0.5.0-style database always yields a unique co
 - [x] Load persisted root authorization once per watcher batch, prefer the most-specific root,
   and retain fail-closed invalidation for the rest of the batch.
 - [x] Add tests for missing, empty, permission-denied, partially unreadable, and overlapping
-  roots, plus marker corruption/duplication/conversion and watcher-cache invalidation.
-- [ ] Add an explicit trust/re-enrollment flow for roots inherited from a pre-identity database;
-  content similarity is not accepted as proof of physical volume identity.
-- [ ] Pin reconciliation and watcher mutations to a root handle or equivalent mount generation
-  on every supported platform; Linux has mount-instance guards, while portable Unix ABA
-  resistance remains incomplete.
-- [x] Record implementation: safety core and review follow-ups are in PR #68 with 44 focused
-  tests; explicit legacy trust and portable root pinning remain open.
+  roots, plus marker corruption/duplication/conversion and watcher-cache invalidation. PR #68's
+  44 safety-core tests are supplemented by 31 focused explicit-trust engine/UI tests covering
+  inherited and replacement roots and trust requests whose complete observation has no supported
+  audio; dismissal and unknown responses; stale evidence, compare-and-swap, marker, and mount
+  drift; read-only marker-create failure and valid-marker adoption; retry/idempotency; a
+  non-destructive conversion followed by a distinct ordinary scan; and command processing without
+  a filesystem watcher. A further 26 focused retained-authority tests cover same-content marker
+  replacement; same-marker root replacement; bound-file, bound-directory, and bound-absence
+  evidence; missing-ancestor recreation and retained-parent replacement; descendant and ancestor
+  replacement even when a hard-linked final object keeps the same identity; mount/filesystem
+  boundary rejection; path escape and symlink traversal; transactional rollback of root-state
+  promotions, upsert, deletion, and rename changes; playlist-link preservation; success-event
+  suppression;
+  Windows namespace pins that block root, marker, file, and directory rename/deletion only while
+  their retained handles live; and blocking-task failure rollback without false root demotion.
+  One direct end-to-end watcher-backlog/confirmation ordering harness remains future integration
+  coverage; the current ordering is exercised through engine-loop and control-flow unit
+  components.
+- [x] Add an explicit trust/re-enrollment flow for roots inherited from a pre-identity database,
+  confirmed roots whose identity changed, and unconfirmed trust requests whose complete
+  observation has no supported audio files. Tributary now queues exact configured-root prompts
+  one at a time in the main window, never accepts content similarity as identity proof, presents
+  replacements as destructive, and requires a second acknowledgement for every such
+  no-supported-audio trust request. Filesystem evidence remains private to the engine and is
+  revalidated with persisted-state compare-and-swap and fresh identity/mount checks before consent
+  can change authority. A brand-new writable root whose first complete observation contains
+  supported audio and has no remembered metadata continues to enroll automatically; once an empty
+  observation has been recorded, later content still requires consent because Tributary cannot
+  distinguish newly added files from a removable or network volume appearing at the mountpoint.
+- [x] Pin authority-promoting root-state changes, reconciliation, and watcher mutations to a
+  retained root-and-marker lease on Unix and Windows. Each marker-backed root capable of
+  authorizing mutations retains one lease for its initial scan or watcher batch. Mutation-bearing
+  files, directories, and missing names are resolved beneath that lease without following
+  symlink/reparse-point components or crossing a different mount/filesystem boundary; the same
+  lease and descendant evidence are revalidated after SQL changes and immediately before commit.
+- [x] Record implementation: the safety core and review follow-ups are in PR #68 with 44 focused
+  tests; explicit trust/re-enrollment is in `aecbce6` with 31 additional focused tests; retained
+  root authority is in `ed0a300`, with review and CI follow-ups in `7704db8`; together they add 26
+  focused tests.
 
 Acceptance criteria: Tributary never deletes persisted track metadata based on an incomplete
-view of a library root, while intentional offline deletion is eventually reflected.
+view of a library root. An inherited or replaced root requires explicit confirmation, as does any
+trust request whose complete observation has no supported audio files. Those requests require a
+complete marker-backed conversion and a distinct complete ordinary scan before becoming
+authoritative. The conversion changes root authorization but performs no track upserts or
+deletions; the ordinary scan may reconcile immediately afterward, with no grace period.
+Declined, stale, failed, and incomplete decisions remain unavailable and preserve remembered
+metadata, while intentional offline deletion is eventually reflected after authority is active.
+Every root-state promotion and track upsert, deletion, or rename is justified by one retained
+root/marker lease and descendant evidence opened beneath it. If that lease or evidence changes
+before final in-transaction validation, the mutation rolls back and publishes no success event.
 
 ### P0.3 Preserve DAAP session lifetime
 
@@ -132,22 +180,23 @@ and carry the same version.
 - [x] Review the `anyhow`, `paste`, and `proc-macro-error2` warnings and document upstream
   disposition.
 - [x] Run `cargo audit` successfully.
-- [x] Record implementation: PR #68; `cargo audit` passes with its remaining warnings
-  documented below.
-- [ ] Re-close the disposition table, which drifted after 2026-07-10 (found 2026-07-13):
-  `cargo audit` now reports **three** allowed warnings, not two — `spin` was yanked and is
-  undocumented — and `.cargo/audit.toml` silently ignores `RUSTSEC-2023-0071` without a
-  justification or a revisit date in this table, which the acceptance criteria below requires.
+- [x] Record implementation: PR #68 supplied the initial dependency fixes and then-known warning
+  dispositions; commits `a35cde8` and `e9a3efc` document the follow-up and update `spin`.
+- [x] Re-close the disposition table after its post-2026-07-10 drift (found and corrected
+  2026-07-13). After updating `spin`, `cargo audit --no-fetch` reports exactly two allowed
+  warnings, both unmaintained dependencies. The separate `RUSTSEC-2023-0071` ignore is
+  justified and time-bounded below rather than removed based on active-tree output: the
+  affected package remains in `Cargo.lock` even though it is inactive in Tributary's
+  configured feature graph.
 
-Audit disposition recorded 2026-07-10, amended 2026-07-13:
+Audit disposition recorded 2026-07-10, amended and revalidated 2026-07-13:
 
 | Advisory | Dependency path | Disposition | Revisit by |
 |---|---|---|---|
 | [`RUSTSEC-2026-0190`](https://rustsec.org/advisories/RUSTSEC-2026-0190) (`anyhow`) | direct and transitive | Fixed by locking and requiring `anyhow >= 1.0.103`. | Closed |
 | [`RUSTSEC-2024-0436`](https://rustsec.org/advisories/RUSTSEC-2024-0436) (`paste`) | `lofty 0.24.0 -> paste 1.0.15` | Informational/unmaintained, with no patched `paste` release. Track Lofty migration to a maintained replacement; no direct Tributary use. | 2026-10-10 or next release, whichever comes first |
 | [`RUSTSEC-2026-0173`](https://rustsec.org/advisories/RUSTSEC-2026-0173) (`proc-macro-error2`) | `sea-orm 1.1.20 -> sea-bae 0.2.1` | Informational/unmaintained compile-time macro dependency. Track SeaORM's removal or evaluate the SeaORM 2 migration. | 2026-10-10 or next release, whichever comes first |
-| `spin 0.9.8` **yanked** (added 2026-07-13) | `flume 0.11.1 -> sqlx-sqlite`, and `flume 0.12.0 -> mdns-sd 0.20.1` | Yanked release, not a vulnerability. Both paths are transitive through `flume`; Tributary cannot bump `spin` directly. Track a `flume` release that moves off the yanked version. | 2026-10-10 or next release, whichever comes first |
-| [`RUSTSEC-2023-0071`](https://rustsec.org/advisories/RUSTSEC-2023-0071) (`rsa`, Marvin Attack) | **not in the dependency graph** | Suppressed by `ignore = [...]` in `.cargo/audit.toml` on the grounds that it arrives via `sqlx-mysql`. Verified 2026-07-13: neither `rsa` nor `sqlx-mysql` is in the graph at all (`cargo tree -i rsa` is empty), so the ignore is vestigial. It is also a *blanket* ignore — if MySQL support were ever enabled it would silently suppress a real key-recovery advisory rather than surface it. Prefer deleting the ignore over documenting it. | Delete at next dependency review |
+| [`RUSTSEC-2023-0071`](https://rustsec.org/advisories/RUSTSEC-2023-0071) (`rsa`, Marvin Attack) | Lockfile-only optional graph: `sqlx 0.8.6` and `sqlx-macros-core 0.8.6` retain `sqlx-mysql 0.8.6 -> rsa 0.9.10`; `sqlx-mysql` and `rsa` are inactive under Tributary's `sqlx-sqlite` feature set. | Retain the narrowly documented `.cargo/audit.toml` ignore. `cargo tree --locked -i rsa` and `cargo tree --locked -e features -i sqlx-mysql` are empty, but `cargo-audit` checks every locked package and fails on this advisory without the ignore. No fixed upgrade exists. Re-review immediately before enabling MySQL support. | 2026-10-10 or next release, whichever comes first; immediately if MySQL is enabled |
 
 Acceptance criteria: the CI security-audit job passes with every remaining ignored advisory
 explicitly justified and time-bounded.
@@ -198,13 +247,17 @@ explicitly justified and time-bounded.
 - [x] Compare scheme, hostname, and effective port.
 - [x] Forbid HTTPS-to-HTTP downgrade.
 - [x] Apply the policy to app-owned API, authentication, artwork, and DAAP clients.
-- [ ] Route credential-bearing playback streams through the P1.6 app-owned proxy so local,
-  AirPlay, MPD, and Chromecast no longer depend on redirect policies Tributary cannot control.
+- [x] Route credential-bearing local and AirPlay playback through an app-owned fetch path
+  protected by the exact-origin policy. Each protected load now receives a dedicated opaque
+  loopback ticket; Tributary performs the authenticated exact-origin/no-`Referer` fetch and
+  forwards only `Range`, while credential-free radio, files, and library paths remain direct.
 - [x] Strip credential-bearing URLs from every retained/formatted HTTP or pipeline error.
 - [x] Stop logging raw DAAP session IDs and authenticated MPD commands.
 - [x] Add redirect matrix tests using mock servers.
 - [x] Record implementation: commit `eb5458f` plus review follow-ups; 18 focused origin,
-  redirect, Referer, header, redaction, userinfo, DAAP, and MPD tests.
+  redirect, Referer, header, redaction, userinfo, DAAP, and MPD tests. Local/AirPlay protected
+  playback boundary: commit `2188efb` with concurrency review follow-up `28e3400`; 10 focused proxy,
+  redirect/header-isolation, stale-cleanup, lifecycle, and fail-closed tests.
 
 ### P1.5 Enforce response limits while streaming
 
@@ -217,47 +270,109 @@ explicitly justified and time-bounded.
 
 ### P1.6 Stop handing backend credentials to receivers
 
-**This is the highest live exposure in the tracker.** It is not limited to "broad bearer
-tokens": with Subsonic's plaintext auth mode the URL carries `p=enc:<hex_password>` — the
-user's actual password, hex-encoded and trivially reversible. Unlike a token, a password
-cannot be revoked, and users reuse it. Playing one track to a Chromecast is enough.
+This began as the tracker's highest live credential exposure. It is not limited to broad bearer
+tokens: Subsonic's legacy compatibility mode ultimately needs `p=enc:<hex_password>` on the
+upstream request — the user's password, hex-encoded and trivially reversible. The completed design
+keeps that material, Subsonic token/salt authentication, the Plex token, and the Jellyfin token out
+of generic catalogue and GTK values as well as every receiver. Playback credential material stays
+inside the retained backend client/resolver and is materialized for media only in the app-owned
+proxy's immediate exact-origin upstream request.
 
 Confirmed path, end to end:
 
 | Step | Location |
 |---|---|
-| Credential is baked into the stream URL | `plex/client.rs:236-242` (`X-Plex-Token`, account-wide), `jellyfin/client.rs:256-260` (`api_key`), `subsonic/client.rs:195-198` (`p=enc:<hex_password>`) |
-| Retained in the generic model | `architecture/models.rs:60` — `Track.stream_url` |
-| Copied verbatim into the UI object | `ui/window.rs:2080` |
-| Handed to the receiver untouched | `audio/chromecast_output.rs:1406-1409` — `resolve_uri` proxies **only** `file://`; every `http(s)://` URL is returned as-is and becomes the Cast `content_id`. MPD sends the same URL via `addid` over **plaintext TCP**, so it also lands in the daemon's queue state and `mpd.log`. |
+| Generic catalogue | Subsonic, Jellyfin, and Plex tracks keep `stream_url` and `cover_art_url` empty. Their backend caches retain backend-native stream locators and track-only artwork locators keyed by deterministic app track UUID, so a type-local album/artist ID cannot overwrite track art. DAAP continues to publish its already-credential-free live-session references. |
+| Source ownership | `source_registry.rs` retains an `Arc<dyn RemoteMediaResolver>` behind an exact source generation, random lease UUID, and revocable `MediaLease`. A replacement, release, discovery removal, manual deletion, or shutdown invalidates old references and already-resolved requests. DAAP retains its stateful session in its existing generation-scoped registry. |
+| GTK publication | A current standard-remote sync is converted to `tributary-remote://<lease>/{stream,artwork}/<track-uuid>`. The reference contains no source address, backend-native ID, or credential; a queued sync is rejected unless its generation and lease still own that source. |
+| Playback and artwork | `ui/playback.rs` resolves the exact opaque reference only when the item is consumed. Playback generations reject a result completed after Stop, Next, output replacement, or a newer replay; artwork repeats generation and lease checks before and after its worker fetch. |
+| Credential isolation | `ResolvedHttpRequest` is deliberately non-debuggable and non-serializable. Plex uses a sensitive `X-Plex-Token` header and Jellyfin a sensitive `X-Emby-Authorization` header. Subsonic protocol authentication remains private query material (`u` plus `t`/`s` or HTTPS-only `p`) and is appended only inside the app-owned proxy immediately before the exact-origin fetch. |
+| Output boundary | `AudioOutput::load_resolved` accepts the typed request. Chromecast, MPD, local GStreamer, and AirPlay exchange it for their existing opaque, receiver-reachable tickets; none can fall back to the clean endpoint or serialized credential state. |
 
-Design — generalize the existing local-file server into a media ticket proxy. The building
-block is already sound: `audio/cast_http_server.rs` binds a LAN-only listener on port 0 and
-routes on an unguessable v4 UUID (`:120-133`). What it lacks is upstream fetching and
-revocation.
+The opaque source reference and the output ticket are separate capabilities. The first identifies
+one track through one live app session and is useful only inside Tributary. Resolution produces a
+typed, revocable HTTP request, and only then does the selected output mint a ticket reachable by
+its receiver. Chromecast keeps its LAN IPv4 listener; MPD binds to the successful connection's
+local IP/address family; local `playbin3` and AirPlay `uridecodebin` use dedicated loopback-only
+proxies. All ticket routes use OS-assigned ports and unguessable UUIDs.
 
-- [ ] Give the proxy two registration kinds: `Local(PathBuf)` (today's behavior) and
-  `Upstream { url, headers }`, where the proxy — not the receiver — fetches from the backend
-  using an app-owned client bound by the P1.4 exact-origin policy.
-- [ ] Issue receivers an opaque ticket URL (`http://<lan-ip>:<port>/media/<ticket>`) with a
-  short TTL, bound to one media session. A receiver never sees a credential.
-- [ ] Keep backend credentials outside generic `Track` values: drop the credential from
-  `Track.stream_url` and add a backend `resolve_stream(&track) -> (Url, HeaderMap)` called at
-  playback time, moving `X-Plex-Token` / `api_key` / Subsonic `u,t,s,p` out of the query
-  string and into request headers held only inside the proxy. Build this to serve P3.1's
-  "resolve playable URLs at playback time" as well, rather than twice.
-- [ ] Make the ticket registry insert **and revoke** — it is deliberately insert-only today
-  (`cast_http_server.rs:115-119`) — expiring registrations on stop, EOS, session end, and
-  output change.
-- [ ] Route all four transports through it: local and AirPlay (GStreamer fetches) plus MPD and
-  Chromecast (the receiver fetches).
-- [ ] Threat-model spoofed and compromised LAN receivers: the goal is that a hostile receiver
-  obtains a TTL-bounded, single-media ticket instead of an account credential.
-- [ ] Record implementation: _pending_
+- [x] Give the proxy local and upstream registration kinds. Local routes retain a bound path;
+  upstream routes accept the legacy/direct `Url` or the current typed `ResolvedHttpRequest`, and
+  the proxy — not the receiver — fetches from the backend using an app-owned client bound by the
+  P1.4 exact-origin policy. Only `Range` is forwarded upstream, and the endpoint/auth state is
+  fixed at registration, so the proxy cannot be driven to fetch anything else.
+- [x] Issue receivers an opaque ticket URL. The device sees
+  `http://<bound-ip>:<port>/cast/<uuid>[.<audio-ext>]` (with IPv6 bracketed) and never a
+  credential. Chromecast uses a LAN IPv4 address; MPD uses the successful connection's local
+  address and family.
+- [x] Make the ticket registry insert **and revoke**. Registering a new upstream revokes the
+  previous one, so at most one credential-bearing ticket is live; `stop()` revokes them all.
+  Revocation deliberately does **not** happen on pause or seek — a Cast device re-fetches with a
+  `Range` header when it seeks, so a ticket must outlive those within its hard lifetime.
+- [x] Route **Chromecast** through it. Standard remote media enters through typed
+  `load_resolved`; `classify_cast_uri` remains the fail-closed boundary for direct/legacy inputs.
+  Unauthenticated streams (internet radio) still pass through directly: there is no secret to
+  protect and relaying a live radio stream through this process would buy nothing.
+- [x] Threat-model spoofed and compromised LAN receivers: a hostile receiver now obtains a
+  single-media ticket whose route is revoked on stop, superseded on the next load, and denies all
+  new lookups after 24 hours instead of an account credential.
+- [x] Route **MPD** through the same proxy. Standard remote media uses typed `load_resolved`, while
+  `MpdOutput::load_uri` still classifies every direct/legacy input before it can enter the ordered
+  worker. A protected request remains app-private and is consumed only by the ordered worker/proxy.
+  The worker starts a dedicated proxy on the successful TCP connection's exact local IPv4/IPv6
+  route and sends only the opaque ticket via `addid`.
+  Missing runtime/address state, unusable IPv6 scope, proxy startup,
+  registration, and generated-argument failures all fail closed without falling back to the raw
+  URL. A replacing direct, protected, or rejected load, user Stop, output drop, natural end,
+  ownership loss, operation failure, worker shutdown, and stale generation revoke the ticket;
+  pause, seek, and an explicit remote Stop that retains the same song keep it restartable only
+  within the ticket's hard lifetime.
+- Local and **AirPlay** playback now use the same upstream proxy at their GStreamer boundary.
+  Each protected load owns a dedicated loopback listener and ticket, while direct media is passed
+  through byte-for-byte. Missing runtime, bind/client/ticket validation, malformed declared
+  HTTP(S), and credentialed unsupported schemes fail closed with fixed URL-free events. A
+  replacement (including direct or rejected media), Stop, EOS, pipeline error, setup/preroll/start
+  failure, output drop, or proxy drop revokes the route; pause, play, and seek retain it only
+  within its hard 24-hour lifetime. Dedicated servers plus identity-checked cleanup ensure a
+  delayed callback can retire only its own ticket, never a newer load.
+- [x] Keep backend credentials outside generic `Track` and GTK values. Standard remote tracks no
+  longer retain stream or artwork URLs; `RemoteMediaResolver::resolve_stream` and
+  `resolve_artwork` translate a stable app track UUID through backend-private native locators only
+  when playback/artwork is consumed. `ResolvedHttpRequest` separates the credential-free endpoint
+  from Plex/Jellyfin sensitive headers and Subsonic's protocol-required private query pairs. Only
+  the app-owned exact-origin proxy materializes those fields. The generation/lease registry and
+  opaque UI references implement the corresponding remote portion of P3.1 rather than creating a
+  second resolver later.
+- [x] Give credential-bearing upstream tickets a hard, absolute, non-sliding 24-hour TTL in
+  addition to lifecycle revocation. A ticket is live only before its monotonic deadline; at the
+  deadline an atomic lookup removes it and returns the same 404 as a revoked or unknown route.
+  GET/Range requests, pause, seek, and remote state do not renew it. A request admitted before
+  expiry may finish afterward, while every later lookup fails. This bounds missed cleanup while
+  the app/server remains alive; process/runtime death already closes the listener. Local-file
+  routes retain their existing server-lifetime contract because they front no backend credential.
+- [x] Record implementation: Chromecast proxy in commit `c6aa7df` with 6 focused classification,
+  credential-detection, and pass-through tests; MPD proxy in commit `e23efd8` with 18 new focused
+  tests (10 worker/ticket lifecycle, 3 media classification, and 5 route/body-error tests); hard
+  upstream-ticket expiry in commit `8735862` with 6 deterministic deadline, non-renewal,
+  revocation/supersession, local-route, admitted-response, and 404-equivalence tests; the
+  local/AirPlay GStreamer boundary is in `2188efb` with concurrency review follow-up `28e3400`
+  and 10 focused tests. The playback-time resolver/source-lease slice is in PR #86: typed
+  credential-isolated requests, backend-private native locators, exact generation/lease
+  publication, async playback/artwork resolution, lease-aware output proxying, and 36 newly
+  authored focused tests across request validation, all three standard backends, registry races,
+  stale playback/artwork work, each output boundary, and pre-persistence server-URL rejection. A
+  late review follow-up in PR #87 omits Plex tracks that have no non-empty media part instead of
+  publishing an opaque reference that can only fail, and searches later media/part entries before
+  declaring a track unplayable. Locator, bitrate, and format now come from the same selected media
+  entry; 2 focused tests cover missing, empty, and later valid locators and metadata alignment.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
-device or daemon Tributary does not own. Closing this also closes P1.4's last checkbox and
-retires P1.7's synchronous local-file resolver note.
+device or daemon Tributary does not own, retained in a generic catalogue/UI value, or serialized
+through an output boundary. **Complete:** standard remote tracks and GTK rows contain only stable
+identity plus opaque lease references; DAAP retains its credential-free live-session references;
+all protected playback/artwork requests resolve through the current app-owned session and proxy;
+and Chromecast, MPD, local GStreamer, and AirPlay receive only their scoped tickets. P1.4 and P1.6
+are complete.
 
 ### P1.7 Serialize Chromecast lifecycle and commands
 
@@ -452,14 +567,13 @@ mount roots (`:64-87`), so the symlink defect is not there. The traversal lives 
 
 ### P2.6 Synchronize packaging metadata
 
-- [ ] Fix RPM `Version`, `Source0`, and `%autosetup` naming. **This spec is live**, not dormant:
-  `.packit.yaml:4` builds it on every release for COPR, which is the install path README
-  recommends first. `build-aux/rpm/tributary.spec:2` says `Version: v0.1.0`, so `Source0` (`:8`)
-  resolves to `vv0.1.0.tar.gz` and `%autosetup` (`:37`) expects `tributary-v0.1.0` while a real
-  tarball unpacks to `tributary-0.5.0`. Its `%changelog` also stops at v0.1.0.
-- [ ] Fix the stale versions in the other two package manifests, which P2.6 previously did not
-  name: `build-aux/arch/PKGBUILD:3` (`pkgver=0.1.0`, and unversioned `gtk4`/`libadwaita` deps) and
-  `build-aux/inno/tributary.iss:11` (`AppVersion "0.1.0"`).
+- [x] ~~Fix RPM `Version`, `Source0`, and `%autosetup` naming.~~ **Withdrawn 2026-07-14 — this was
+  a false finding.** The in-repo `Version: v0.1.0` is a placeholder that Packit overwrites from the
+  release tag at build time, so COPR ships the correct version; v0.5.0 built and released through
+  this path. `build-aux/arch/PKGBUILD` is likewise rewritten at release time
+  (`release.yml:500` seds `pkgver`). The checked-in literals are stale to a *reader* but never
+  reach a package. Nothing to fix. Recorded rather than deleted, so the same wrong conclusion is
+  not re-derived from reading the spec in isolation.
 - [ ] Raise GTK runtime minimum to 4.16.
 - [ ] Raise libadwaita runtime minimum to 1.6. Both minimums are currently under-declared as
   `>= 4.14` / `>= 1.5` in `build-aux/rpm/tributary.spec:23-24`, in Cargo.toml's
@@ -472,7 +586,7 @@ mount roots (`:64-87`), so the symlink defect is not there. The traversal lives 
   opens, but the desktop entry never passes the URI.
 - [ ] Add the required `AudioVideo` desktop category.
 - [ ] Add the 0.5.0 AppStream release entry (newest is 0.4.1).
-- [ ] Update README Rust requirement from 1.80 to 1.85.
+- [x] Update README Rust requirement from 1.80 to 1.85. Implemented in commit `e6c68bc`.
 - [ ] Add CI on the declared Rust 1.85 MSRV. Every toolchain in CI is
   `dtolnay/rust-toolchain@stable`; nothing verifies that 1.85 still compiles.
 - [ ] Enforce the global validation gate in CI. It is currently a *local* gate: CI runs
@@ -485,8 +599,8 @@ mount roots (`:64-87`), so the symlink defect is not there. The traversal lives 
   `http_security` entirely and ran reqwest defaults, so they sent a `Referer` and would follow an
   HTTPS→HTTP downgrade. They now use a shared public policy that still permits the cross-host
   mirror redirects those services depend on but refuses to be walked down to plaintext.
-- [ ] Record implementation: non-credential redirect policy in commit `8368a65`; packaging remains
-  open.
+- [ ] Record implementation: README MSRV correction in commit `e6c68bc` and non-credential
+  redirect policy in commit `8368a65`; packaging remains open.
 
 ### P2.7 Fix platform cache paths
 
@@ -551,16 +665,31 @@ error that tells the user what to install.
 
 ### P3.1 Introduce a source/session registry
 
-- [ ] Define stable source IDs and backend-native track IDs.
-- [ ] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source.
-- [ ] Remove long-lived authenticated URLs from the generic `Track` model.
-- [ ] Resolve playable URLs/tickets at playback time.
+- [ ] Define stable source IDs and backend-native track IDs. Standard backends now retain their
+  native stream/artwork locators privately, but the registry and queue still use the configured
+  URL string as source identity; a first-class stable source ID and its migration rules remain.
+- [x] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source. P1.6 now
+  retains an `Arc<dyn RemoteMediaResolver>` behind an exact generation and random revocable lease
+  for each standard remote source; the existing DAAP registry retains its stateful live backend.
+- [x] Remove long-lived authenticated URLs from the generic `Track` model. Standard remote
+  catalogue models retain stable app identity and backend-private locators, not stream/artwork
+  requests; DAAP's generic values remain credential-free session references.
+- [x] Resolve remote playable URLs/tickets at playback time. The GTK/queue value is an opaque
+  exact-lease reference; consuming it yields a typed `ResolvedHttpRequest`, and the selected
+  output then mints its receiver-scoped proxy ticket. Stale playback and artwork completions are
+  generation- and lease-rejected.
 - [ ] Resolve local/playlist media by stable track ID at playback, navigation, and receiver-load
   time so fallback reconciliation and in-flight casts cannot retain dead file paths.
-- [ ] Centralize source refresh, cancellation, disconnect, and failure state.
-- [ ] Decide how local, radio, and external-file sources fit the same lifecycle.
+- [ ] Centralize source refresh, cancellation, disconnect, and failure state. Generation/lease
+  ownership and source-owned playback retirement are centralized, but environment startup,
+  interactive auth, manual add, refresh publication, and UI failure handling remain separate
+  paths, and DAAP still has a sibling registry because it owns an explicit logout lifecycle.
+- [ ] Decide how local, radio, and external-file sources fit the same lifecycle. They deliberately
+  stay on their existing direct paths in this security slice.
 - [ ] Record architecture decision: _pending_
-- [ ] Record implementation: _pending_
+- [ ] Record implementation: P1.6 completed the remote resolver/session ownership subset in this
+  PR. Stable source IDs, local/playlist resolution, unified refresh/failure state, and the
+  local/radio/external lifecycle remain before P3.1 as a whole can be recorded complete.
 
 ### P3.2 Make the backend abstraction real and stable
 
@@ -618,6 +747,11 @@ Run before marking any milestone complete:
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
+Most recent milestone validation (2026-07-15, P1.6 Plex locator follow-up): 18 library plus 490
+application tests passed in debug (508 total), and the release suite passed; strict all-target
+Clippy passed in both profiles; formatting and `git diff --check` were clean; and `cargo audit`
+passed with exactly the two accepted unmaintained warnings recorded under P0.8.
+
 **This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
 hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
 runs `cargo fmt --check`, both `clippy -D warnings` invocations, `cargo test --release`, and
@@ -635,7 +769,8 @@ Record scope or design decisions here so deferred work is explicit.
 - 2026-07-10 — P0.2 now fails closed for incomplete traversal, unavailable/replaced roots,
   nested mounts, mount-table failures, and ambiguous legacy databases. Legacy roots with
   existing metadata are intentionally not made deletion-authoritative from content heuristics;
-  explicit trust UX and portable root-handle pinning keep P0.2 open.
+  explicit trust UX and portable retained-root authority were intentionally separated from the
+  safety core, and both follow-up slices were completed on 2026-07-14.
 - 2026-07-10 — Linux mount IDs are treated as ephemeral traversal generations, never durable
   volume identity. Stable root identity is now a versioned marker stored on the library root,
   so a normal reboot or remount does not silently replace the intended root. Duplicate,
@@ -649,9 +784,64 @@ Record scope or design decisions here so deferred work is explicit.
   best-effort transfer between unlike output implementations.
 - 2026-07-10 — Generation filtering prevents stale receiver events from mutating Tributary.
   Ordered Chromecast command side effects and authoritative MPD state remain P1.7 and P1.8.
-- 2026-07-10 — The remaining `cargo audit` warnings are unmaintained transitive dependencies,
-  not known vulnerabilities; their owners and 2026-10-10 review deadline are recorded under
-  P0.8.
+- 2026-07-13 — `spin 0.9.8` was replaced in `Cargo.lock` by compatible `0.9.9`, resolving the
+  yanked-release warning. `cargo audit --no-fetch` now passes with exactly two unmaintained
+  dependency warnings, each with an upstream disposition and a 2026-10-10-or-next-release
+  review deadline under P0.8. `RUSTSEC-2023-0071` for `rsa` remains separately ignored because
+  `cargo-audit` checks the inactive `sqlx-mysql` package retained in `Cargo.lock`; Tributary
+  enables SQLite only, the advisory has no fixed upgrade, and the ignore must be reviewed
+  immediately if MySQL support is enabled.
+- 2026-07-14 — Root trust is explicit authorization, never content identification. Exact
+  configured roots inherited from a pre-identity database, roots whose confirmed identity no
+  longer matches, and trust requests whose complete observation has no supported audio files enter
+  one FIFO main-window prompt flow. A brand-new writable root auto-enrolls only when its first
+  complete observation contains supported audio and no remembered metadata. Once an empty
+  observation is persisted, later content remains behind consent because it could be a removable
+  or network volume newly appearing at the mountpoint. Replacement actions use destructive
+  presentation, and every prompted no-supported-audio observation requires a separate second
+  acknowledgement. Request correlation exposes only an opaque ID and display facts; the engine
+  retains the filesystem evidence, checks the expected persisted state, creates or adopts the
+  marker, freshly probes identity and mount generation, and atomically compare-and-swaps that
+  expected state before accepting consent.
+  Confirmation creates a random root-owned marker or adopts an already-valid marker, but the
+  conversion scan cannot upsert or delete track rows. A distinct ordinary scan may run
+  immediately afterward and becomes authoritative only if it is complete and still matches the
+  confirmed marker/mount evidence. A deliberate decline remains fail-closed and suppresses the
+  identical request for the rest of the current process; it can be reconsidered after restart or
+  materially new evidence. Stale evidence, incomplete traversal, unavailable storage, and
+  marker/database failure remain fail-closed, release non-active deduplication, and can be retried
+  from refreshed evidence. A markerless read-only root cannot enroll, while a read-only root with
+  an existing valid marker can be adopted.
+  Each marker-backed root capable of authorizing mutations now acquires one retained lease over
+  its exact opened root and marker for its initial scan or watcher batch on Unix and Windows.
+  Authority-promoting root-state changes and mutation-bearing files, directories, and missing
+  names are resolved beneath that lease without following symlink/reparse-point components or
+  crossing its mount/filesystem boundary. Positive descendant handles, full retained ancestor
+  chains, and retained-parent absence proofs detect root, marker, parent, and final-object
+  substitution. The lease and applicable descendant evidence are revalidated after SQL changes
+  inside the transaction and immediately before commit; rejection rolls back and publishes no
+  success event. Fail-closed authority revocations do not require a lease.
+  Filesystem-touching lease and descendant probes reached from async orchestration run on Tokio's
+  blocking pool, including the final in-transaction guard. The original retained handles remain
+  live in the async frame through commit or rollback. A blocking-task join failure rejects the
+  current work; watcher-side failures also schedule reconciliation. The task failure is not itself
+  evidence that justifies persistently demoting a root. Windows handles intentionally omit delete
+  sharing so the retained namespace cannot be renamed or unlinked through commit; external
+  rename/delete attempts can receive a sharing violation until the relevant scan, batch, or
+  transaction releases them.
+  This is an explicit filesystem/SQLite linearization boundary, not an atomic transaction shared
+  by both systems: authorization linearizes at the final successful in-transaction validation,
+  positive handles remain live through commit, and an absence observation is bracketed by its
+  retained parent. A later filesystem change is a subsequent transition handled by watcher or
+  reconciliation. The guarantee begins when the lease is acquired. A clone that already contains
+  the same marker is therefore the same logical library/bearer identity for backup-and-restore
+  purposes, not proof of a unique physical device; simultaneously configured duplicates still
+  fail closed. The model protects ordinary local, removable, and network filesystem edits,
+  replacement, hotplug, and remount races, but is a consistency boundary rather than a sandbox
+  against a malicious same-user process with equivalent filesystem or mount privileges.
+  A final authority probe against a slow or hung network filesystem can keep the SQLite writer
+  transaction open while it waits on the blocking pool, although it no longer stalls a Tokio
+  worker thread.
 - 2026-07-12 — Track deletion now preserves playlist-entry identity, order, and fingerprint by
   nulling the real track foreign key. Scan and watcher-batch reconciliation relink only when
   fingerprint plus optional duration identifies exactly one current track; ambiguous matches
@@ -710,26 +900,103 @@ Record scope or design decisions here so deferred work is explicit.
   effective port. Request URLs are removed before reqwest errors are formatted or retained;
   URL userinfo and backend query credentials are rejected or redacted; DAAP session IDs and MPD
   command arguments are no longer logged; and GStreamer errors use stable URL-free diagnostics.
-  Direct playback remains deliberately open under P1.6: local and AirPlay streams are fetched by
-  GStreamer, while MPD and Chromecast fetch on external receivers, so Tributary cannot enforce an
-  upstream redirect callback on those transports until it owns the stream through a short-lived
-  proxy/ticket. Disabling redirects only for GStreamer would be both incomplete and potentially
-  breaking, so the playback-stream checkbox remains explicit rather than being claimed complete.
+  Chromecast and MPD receive opaque app-owned proxy tickets rather than the authenticated
+  upstream. Local and AirPlay playback now apply the same policy before pipeline construction:
+  each protected load gets a dedicated loopback-only server and ticket, and only Tributary's
+  exact-origin/no-`Referer` client sees the upstream URL. The proxy forwards only `Range`; direct
+  media stays byte-for-byte direct. Malformed or unsupported protected inputs and missing runtime,
+  bind, client, or ticket state fail closed. Replacement, Stop, EOS/error, setup/preroll/start
+  failure, and teardown revoke the ticket, while pause/play/seek retain it only within its hard
+  24-hour lifetime; identity-checked cleanup and per-load servers prevent stale callbacks from
+  revoking a newer load. Server startup and route revocation run outside the proxy-state mutex;
+  an allocation-identity generation lets a newer load, Stop, or runtime replacement supersede an
+  in-flight startup without waiting, and prevents that older startup from installing afterward.
+  This completed P1.4 without changing the generic credential-bearing `Track` representation at
+  that milestone; P1.6 has since removed authenticated URLs from standard remote catalogue/UI
+  values.
 - 2026-07-12 — P1.5 treats every finite HTTP response as an observed byte stream rather than
   trusting `Content-Length`: Subsonic, Jellyfin, Plex, DAAP, authentication, radio/geolocation,
   artwork, and MusicBrainz reads now stop at endpoint-specific caps and carry end-to-end request
   deadlines in addition to idle-read timeouts. Async and blocking collectors classify request
   timeouts consistently, discard credential-bearing request URLs from retained body errors, and
   fail cleanly on impossible or unavailable allocations. Audio and live-radio media streams remain
-  deliberately uncapped because they are length-unbounded playback transports; credential-bearing
-  playback still belongs to the cancellable P1.6 proxy/ticket design.
+  deliberately uncapped because they are length-unbounded playback transports. The Chromecast and
+  MPD credential boundaries are handled by P1.6's revocable proxy tickets, and local/AirPlay fetch
+  ownership is now handled by P1.4's loopback-only tickets. P1.6 subsequently made standard remote
+  catalogue/UI values credential-free. Credential-bearing upstream tickets also carry P1.6's hard
+  absolute lifetime rather than relying on revocation alone.
+- 2026-07-14 — P1.6's receiver-ticket slice classifies every legacy/direct media URI before it can
+  reach MPD. Supported credential shapes (URL userinfo; Plex `X-Plex-Token`; Jellyfin `api_key`;
+  DAAP `session-id`; and Subsonic `t`/`s` or shaped `p`) require a proxy; malformed declared
+  HTTP(S), credentialed unsupported schemes, and scheme-relative or malformed credential shapes
+  fail closed. Non-credential radio URLs, `file:` URLs, and MPD library paths remain direct.
+  A protected load first establishes the MPD TCP connection, reads that socket's local address,
+  and starts one dedicated OS-port-assigned proxy on the same local IP and address family. The
+  full upstream URL remains app-private; only the worker supplies it to the in-process proxy.
+  Plaintext `addid`, daemon queue state, and MPD logs receive only the bracket-correct opaque
+  IPv4/IPv6 ticket. Unspecified addresses and scoped or
+  link-local IPv6 fail closed because they cannot produce a portable receiver URL. Runtime,
+  address, bind, registration, ticket validation, and upstream body-stream errors are reduced to
+  fixed URL-free categories and never fall back to the protected URL.
+  Each credential-bearing ticket fixes one upstream target, uses the no-`Referer` exact-origin
+  client, and forwards only `Range`. It is a replayable single-media bearer until the earlier of
+  explicit revocation or a hard 24-hour expiry, not a single-use token. The deadline is absolute
+  and monotonic: GET/Range requests, pause, seek, and an explicit remote Stop retaining the owned
+  song do not renew it. Any replacement load (including direct or rejected media), user Stop,
+  output drop, natural end, ownership loss, operation failure, worker shutdown, or stale generation
+  revokes it when requested, processed, or observed, and a stale session cannot revoke a newer
+  generation. A route is live only while lookup occurs strictly before its deadline; lookup at or
+  after the boundary atomically removes it and returns the same 404 as an unknown/revoked ticket.
+  An unrepresentable deadline fails closed as immediately expired.
+  Revocation or expiry prevents future lookups but does not cancel a response the proxy already
+  admitted. Local-file routes retain their server-lifetime capability contract because they do not
+  front backend credentials. This TTL bounds a missed/crashed-session cleanup while the app and
+  server remain alive; process/runtime death already closes the listener. Local and AirPlay now
+  exchange protected requests for loopback tickets before GStreamer sees them.
+  The completed resolver slice removes authenticated stream and artwork URLs from standard remote
+  `Track`/album/artist/search results and GTK rows. Subsonic, Jellyfin, and Plex retain only
+  backend-private native locators behind a process-owned `Arc<dyn RemoteMediaResolver>`. Every
+  connection attempt registers before network I/O; only the newest attempt may install, while a
+  failed newer attempt leaves the prior active lease usable. Remote publication carries an exact
+  generation and random lease and synthesizes only
+  `tributary-remote://<lease>/{stream,artwork}/<track-uuid>`; same-source replacement, release,
+  discovery removal, manual delete, and shutdown revoke the old lease. Resolution clones the
+  resolver under the registry mutex, awaits outside it, revalidates exact ownership, and attaches
+  a shared revocation lease to the typed request. Playback and artwork generation checks prevent a
+  stale async result from reaching an output or persistent worker. Retiring a source clears and
+  stops playback only when that source owns the queue; pending resolution is invalidated without
+  disturbing another source. Pause during resolution cancels that completion and leaves Play
+  retryable, while an error from a protected output forces the next Play to resolve through the
+  live lease again instead of replaying a stale resolved request.
+  `ResolvedHttpRequest` separates a credential-free endpoint from secret request state: Plex uses
+  a sensitive `X-Plex-Token` header, Jellyfin uses a sensitive `X-Emby-Authorization` header, and
+  Subsonic keeps its protocol-required `u` plus `t`/`s` or HTTPS-only `p` pairs private until the
+  proxy materializes them for the exact upstream request. The type is neither debuggable nor
+  serializable, rejects embedded endpoint credentials and non-allowlisted auth fields, and every
+  output's typed load path fails closed rather than falling through to its clean endpoint.
+  Manual, saved, environment-configured, and discovered remote-server URLs are also validated as
+  credential-free base URLs before persistence, auth-dialog display, logs, discovery state/UI
+  publication, or ownership. Raw Jellyfin UDP discovery bodies are never logged; malformed URLs,
+  userinfo, query, and fragment state fail with one fixed input-free error. This
+  completes P1.6 and also completes P3.1's remote session-retention, authenticated-URL removal,
+  and playback-time remote-resolution boxes. P3.1 still needs stable source IDs, stable local and
+  playlist resolution, centralized refresh/failure state, and a lifecycle decision for local,
+  radio, and external files.
+- 2026-07-15 — A late PR #86 review found that Plex catalogue publication did not distinguish a
+  track with no `Media`/`Part.key` from a resolvable track: GTK received a non-empty opaque
+  reference that failed only after selection, whereas the old direct-URL path had left that row
+  disabled. The follow-up omits tracks with no non-empty part and searches all media/part entries
+  for a later usable locator, binding bitrate/format to the same selected media entry and
+  preserving the resolver invariant that every published Plex track has a backend-private stream
+  locator.
 - 2026-07-12 — P1.7 places the non-`Send` Cast device, application, media session, controls,
   heartbeat, status polling, and teardown on one FIFO worker. Epoch checks bracket every Cast
   effect and event; ownership is recorded immediately after application launch and media load so
   superseded calls remain cleanable. Failures retire the session before publishing Stopped then
   Error, clean media/application ownership with fair bounded retries, and abandon an unreachable
   application after three attempts so a replacement load can reconnect. The legacy local-file
-  resolver remains synchronous until P1.6 replaces it with the shared proxy/ticket path.
+  resolver remains synchronous; P1.6's upstream ticket proxy does not change that local-path
+  lookup behavior.
   `rust_cast 0.21` uses blocking `TcpStream` calls, hides the socket, and offers no timeout or
   custom-stream constructor, so cancellation can be checked only before and after an in-flight
   call; hard receiver I/O deadlines require an upstream change or audited fork and are tracked as
@@ -784,13 +1051,21 @@ Add one line per completed task:
 | 2026-07-10 | P0.4 | PR #68 | Stable queue/session identity, generation-filtered events, and deterministic output reset. |
 | 2026-07-10 | P0.5 | PR #68 | One setup-time sidebar handler with current-item resolution and recycling tests. |
 | 2026-07-10 | P0.6 | PR #68 | Immutable release inputs and publication-only repository credentials. |
-| 2026-07-10 | P0.8 | PR #68 | Patched dependency graph and time-bounded informational advisory dispositions. |
+| 2026-07-10 | P0.8 | PR #68 | Patched the then-failing dependencies and recorded the warnings known at the time. |
+| 2026-07-13 | P0.8 follow-up | `a35cde8`, `e9a3efc` | Updated `spin` to 0.9.9, leaving exactly two time-bounded unmaintained warnings; the lockfile-only ignored RSA advisory has an explicit rationale, deadline, and feature-enable trigger. |
+| 2026-07-14 | P0.2 explicit root trust | `aecbce6` | Added FIFO main-window enrollment/replacement and no-supported-audio trust-request consent with private engine evidence, guarded marker create/adopt, non-destructive conversion, and 31 focused tests. |
+| 2026-07-14 | P0.2 retained root authority | `ed0a300`, `7704db8` | Retained one exact root/marker lease for each mutation-capable marker-backed root's initial scan or watcher batch, bound descendant and absence evidence beneath it, and revalidated promotions and content mutations after SQL immediately before commit. Review follow-ups preserve Windows no-delete namespace pins, move async authority I/O to blocking workers without shortening handle lifetimes, and make task failure roll back without false root demotion while watcher failures schedule reconciliation; 26 focused tests cover substitution, boundary/traversal rejection, Windows pin lifetime, rollback, and event suppression. |
 | 2026-07-12 | P1.1 | `8ec84a5` | Transactional, retry-safe track-FK rebuild with dangling-link cleanup, index preservation, and scan/watcher reconciliation. |
 | 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |
 | 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
-| 2026-07-12 | P1.4a | `eb5458f` | Exact-origin/no-Referer policy and URL-free errors/logging cover every app-owned credential HTTP fetch; receiver-controlled playback streams remain tied to P1.6. |
+| 2026-07-12 | P1.4a | `eb5458f` | Exact-origin/no-Referer policy and URL-free errors/logging cover every then-app-owned credential HTTP fetch; Chromecast and MPD are ticketed by P1.6. |
+| 2026-07-14 | P1.4b | `2188efb`, `28e3400` | Local playbin3 and AirPlay uridecodebin now receive only dedicated opaque loopback tickets for protected media; app-owned exact-origin/no-Referer fetching, Range-only forwarding, fail-closed setup, lifecycle revocation, and stale-callback isolation complete P1.4. The review follow-up moves server startup/revocation outside the state mutex and uses generation ownership so newer loads and Stop supersede in-flight startup without waiting or stale installation; 10 focused tests cover the slice. |
 | 2026-07-12 | P1.5 | `842341b` | Counted finite-response reads enforce endpoint caps and total deadlines across API, authentication, DAAP, radio, artwork, and metadata clients. |
+| 2026-07-14 | P1.6 receiver tickets | `c6aa7df`, `e23efd8` | Chromecast and MPD now receive revocable single-media tickets instead of backend credentials. MPD binds a dedicated IPv4/IPv6 proxy to the successful connection route, fails closed without it, and revokes across replacement, Stop, failure, ownership loss, EOS, shutdown, and stale generations; 18 new MPD/classifier/route tests cover the slice. |
+| 2026-07-14 | P1.6 upstream-ticket TTL | `8735862` | Credential-bearing upstream routes now expire at a hard, non-sliding 24-hour monotonic deadline in addition to earlier lifecycle revocation. Boundary lookup atomically removes the route and returns 404; admitted responses may finish, local-file routes remain server-lifetime, and 6 deterministic tests cover the contract. |
+| 2026-07-14 | P1.6 playback-time resolver | PR #86 | Standard remote catalogue/UI values carry only stable identity and exact opaque lease references. A generation-owned registry retains backend resolvers; typed playback/artwork requests isolate Plex/Jellyfin headers and Subsonic private query material until the app-owned exact-origin proxy fetch. Lease replacement/release/shutdown revokes old references and already-issued requests; unsafe manual, saved, environment, and discovery base URLs are rejected before persistence, display, logs, discovery publication, or ownership; and 36 focused tests cover request isolation, backends, native-ID collisions, registry races, stale UI work, URL rejection, and output boundaries. |
+| 2026-07-15 | P1.6 Plex locator follow-up | PR #87 | Plex tracks without a non-empty media part are omitted before opaque-reference publication, while later valid media/part entries remain playable and supply their own bitrate/format; 2 focused tests cover the late PR #86 review finding and PR #87 metadata-alignment follow-up. |
 | 2026-07-12 | P1.7 | `60ee2af` | One worker owns the Cast session and serializes effects, authoritative state, cancellation, cleanup retries, and stale-event suppression. |
 | 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
-| 2026-07-13 | P2.6 (partial) | `8368a65` | Radio-Browser, geolocation, and MusicBrainz clients now refuse HTTPS→HTTP redirect downgrades and send no `Referer`; packaging metadata remains open. |
+| 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |
 | 2026-07-13 | P1.8 | `eb0b9ca`, `fbaaa7f` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable song identity, shared-queue preservation, ownership preflight, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |

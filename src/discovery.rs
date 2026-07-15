@@ -431,6 +431,14 @@ fn process_mdns_event(
     }
 }
 
+/// Validate an unauthenticated Jellyfin discovery address before it can enter
+/// discovery state, logs, a sidebar row, or source-connection ownership.
+///
+/// The shared parser returns a fixed error that never includes `address`.
+fn validate_jellyfin_discovery_address(address: &str) -> Result<(), &'static str> {
+    crate::http_security::parse_base_url(address).map(|_| ())
+}
+
 /// Run Jellyfin UDP broadcast discovery with periodic re-broadcasts.
 ///
 /// Sends `"Who is JellyfinServer?"` to `255.255.255.255:7359` every
@@ -479,18 +487,31 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
         // Read responses until the 5-second timeout fires.
         while let Ok((len, _addr)) = socket.recv_from(&mut buf) {
             let response = String::from_utf8_lossy(&buf[..len]);
-            debug!(response = %response, "Jellyfin UDP response");
+            // Discovery responses are unauthenticated network input. Never
+            // format the body into logs: its advertised address may contain
+            // user-info or a bearer-like query value that must be rejected
+            // before publication.
+            debug!(bytes = len, "Jellyfin UDP response received");
 
             match serde_json::from_str::<crate::jellyfin::api::JellyfinDiscoveryResponse>(&response)
             {
                 Ok(discovery) => {
+                    if let Err(error) = validate_jellyfin_discovery_address(&discovery.address) {
+                        // `error` is fixed text and deliberately contains no
+                        // parser diagnostic or rejected address.
+                        warn!(
+                            error,
+                            "Ignoring Jellyfin discovery response with invalid server URL"
+                        );
+                        continue;
+                    }
+
                     responded_this_cycle.insert(discovery.address.clone());
 
                     if !known.contains_key(&discovery.address) {
                         // New server discovered.
                         info!(
                             name = %discovery.name,
-                            url = %discovery.address,
                             "Jellyfin server discovered via UDP"
                         );
 
@@ -519,7 +540,6 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
             } else {
                 *misses += 1;
                 debug!(
-                    url = %address,
                     name = %name,
                     misses = *misses,
                     "Jellyfin server missed a broadcast cycle"
@@ -527,7 +547,6 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
 
                 if *misses >= JELLYFIN_MISS_THRESHOLD {
                     info!(
-                        url = %address,
                         name = %name,
                         "Jellyfin server lost after {JELLYFIN_MISS_THRESHOLD} missed cycles"
                     );
@@ -749,7 +768,40 @@ fn strip_avahi_name_suffix(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_airplay_mac_prefix, strip_avahi_name_suffix, strip_avahi_suffix};
+    use super::{
+        strip_airplay_mac_prefix, strip_avahi_name_suffix, strip_avahi_suffix,
+        validate_jellyfin_discovery_address,
+    };
+
+    #[test]
+    fn jellyfin_discovery_accepts_only_safe_http_base_urls() {
+        for address in [
+            "http://media.example.test:8096",
+            "https://media.example.test/jellyfin",
+        ] {
+            assert!(validate_jellyfin_discovery_address(address).is_ok());
+        }
+
+        for address in [
+            "https://user:password@media.example.test",
+            "https://media.example.test?api_key=discovery-secret",
+            "https://media.example.test/#discovery-secret",
+            "file:///tmp/media",
+        ] {
+            assert!(validate_jellyfin_discovery_address(address).is_err());
+        }
+    }
+
+    #[test]
+    fn jellyfin_discovery_rejection_never_echoes_the_address() {
+        let secret = "discovery-secret-value";
+        let address = format!("https://media.example.test?api_key={secret}");
+        let error = validate_jellyfin_discovery_address(&address)
+            .expect_err("credential-bearing discovery address must be rejected");
+
+        assert!(!error.contains(secret));
+        assert!(!error.contains(&address));
+    }
 
     #[test]
     fn test_strip_avahi_suffix() {

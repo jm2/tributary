@@ -40,6 +40,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket, PreparedGstreamerMedia};
 use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
 
@@ -48,10 +49,15 @@ use gstreamer as gst;
 use gtk::glib;
 use tracing::{debug, error, info, warn};
 
+use crate::architecture::media::ResolvedHttpRequest;
+
 /// Active AirPlay session: the dedicated GStreamer pipeline plus, if we
 /// fell back to it, the `shairport-sync` child process.
 struct Session {
     pipeline: gst::Pipeline,
+    /// Exact protected-media ticket owned by this session. Credential-free
+    /// media has no ticket and retains its existing direct-URI behavior.
+    media_ticket: Option<Arc<GstreamerMediaTicket>>,
     /// Only `Some` when the shairport-sync fallback path is in use —
     /// the child must outlive the pipeline and be killed on `stop()`.
     sps_child: Option<Child>,
@@ -79,6 +85,9 @@ pub struct AirPlayOutput {
     event_generation: AtomicU64,
     /// Cached volume level (0.0–1.0).
     volume: f64,
+    /// App-owned exact-origin fetch boundary for authenticated media. The
+    /// GStreamer pipelines receive only its opaque loopback ticket.
+    media_proxy: Arc<GstreamerMediaProxy>,
     /// Active session, if any.  `Mutex` (not `RefCell`) because the
     /// bus watch may run on a worker thread.
     session: Arc<Mutex<Option<Session>>>,
@@ -112,8 +121,16 @@ impl AirPlayOutput {
             // doesn't reset the effective volume to maximum (0 dB) on the
             // first track load.
             volume: initial_volume.clamp(0.0, 1.0),
+            media_proxy: Arc::new(GstreamerMediaProxy::new(None)),
             session: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Supply the application runtime used to host exact-route media tickets.
+    #[must_use]
+    pub fn with_runtime(self, handle: tokio::runtime::Handle) -> Self {
+        self.media_proxy.set_runtime(handle);
+        self
     }
 
     /// Lock the session, recovering transparently from poisoning.
@@ -147,43 +164,121 @@ impl AirPlayOutput {
         // Tear down any previous session before starting a new one.
         self.close_session();
 
+        // Prepare exactly once so both the preferred and fallback pipelines
+        // receive the same credential-safe URI and own the same ticket.
+        let prepared = self
+            .media_proxy
+            .prepare(uri)
+            .map_err(|_| "AirPlay media preparation failed".to_string())?;
+        self.open_prepared_media(prepared)
+    }
+
+    fn open_resolved_session(&self, request: ResolvedHttpRequest) -> Result<(), String> {
+        self.close_session();
+        let prepared = self
+            .media_proxy
+            .prepare_resolved(request)
+            .map_err(|_| "AirPlay media preparation failed".to_string())?;
+        self.open_prepared_media(prepared)
+    }
+
+    fn open_prepared_media(&self, prepared: PreparedGstreamerMedia) -> Result<(), String> {
+        let media_ticket = prepared.ticket();
+        let result = self.open_prepared_session(prepared.uri(), media_ticket.clone());
+        if result.is_err() {
+            if let Some(ticket) = media_ticket.as_ref() {
+                self.media_proxy.revoke_if_current(ticket);
+            }
+        }
+        result
+    }
+
+    fn finish_load(&self, generation: PlayerEventGeneration, result: Result<(), String>) {
+        if let Err(e) = result {
+            error!(error = %e, "AirPlay: failed to open session");
+            let _ = self.event_tx.try_send(PlayerEvent::error(generation, e));
+            let _ = self
+                .event_tx
+                .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
+        } else if !self.set_pipeline_state(gst::State::Playing) {
+            // `open_session` only prerolls the pipeline to Paused; like every
+            // other output, a load must actually start playback.
+            self.close_session();
+            let _ = self.event_tx.try_send(PlayerEvent::error(
+                generation,
+                "AirPlay playback failed to start",
+            ));
+            let _ = self
+                .event_tx
+                .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
+        }
+    }
+
+    fn open_prepared_session(
+        &self,
+        prepared_uri: &str,
+        media_ticket: Option<Arc<GstreamerMediaTicket>>,
+    ) -> Result<(), String> {
         let host = &self.host;
         let port = self.port;
         let volume = self.volume;
         let generation = self.event_generation();
 
         // Try GStreamer raopsink first.
-        match Self::build_raop_pipeline(host, port, uri, volume) {
+        match Self::build_raop_pipeline(host, port, prepared_uri, volume) {
             Ok(pipeline) => {
-                let bus_watch = self.attach_bus_watch(&pipeline, generation)?;
-                pipeline
-                    .set_state(gst::State::Paused)
-                    .map_err(|e| format!("RAOP pipeline preroll failed: {e}"))?;
-                info!(host = %host, port, "AirPlay: session opened via raopsink");
-                *self.session_lock() = Some(Session {
+                let bus_watch =
+                    match self.attach_bus_watch(&pipeline, generation, media_ticket.clone()) {
+                        Ok(watch) => watch,
+                        Err(failure) => {
+                            let _ = pipeline.set_state(gst::State::Null);
+                            return Err(failure);
+                        }
+                    };
+                let mut session = Session {
                     pipeline,
+                    media_ticket,
                     sps_child: None,
                     _stdin_file: None,
                     _bus_watch: bus_watch,
-                });
+                };
+                if session.pipeline.set_state(gst::State::Paused).is_err() {
+                    Self::shutdown_session(&mut session);
+                    return Err("RAOP pipeline preroll failed".to_string());
+                }
+                info!(host = %host, port, "AirPlay: session opened via raopsink");
+                *self.session_lock() = Some(session);
                 Ok(())
             }
             Err(e1) => {
                 warn!(error = %e1, "raopsink unavailable, trying shairport-sync");
                 let (pipeline, sps_child, stdin_file) =
-                    Self::build_shairport_pipeline(host, port, uri)
+                    Self::build_shairport_pipeline(host, port, prepared_uri)
                         .map_err(|e2| format!("Both AirPlay paths failed: {e1}; {e2}"))?;
-                let bus_watch = self.attach_bus_watch(&pipeline, generation)?;
-                pipeline
-                    .set_state(gst::State::Paused)
-                    .map_err(|e| format!("shairport-sync pipeline preroll failed: {e}"))?;
-                info!(host = %host, port, "AirPlay: session opened via shairport-sync");
-                *self.session_lock() = Some(Session {
+                let bus_watch =
+                    match self.attach_bus_watch(&pipeline, generation, media_ticket.clone()) {
+                        Ok(watch) => watch,
+                        Err(failure) => {
+                            let _ = pipeline.set_state(gst::State::Null);
+                            let mut child = sps_child;
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(failure);
+                        }
+                    };
+                let mut session = Session {
                     pipeline,
+                    media_ticket,
                     sps_child: Some(sps_child),
                     _stdin_file: Some(stdin_file),
                     _bus_watch: bus_watch,
-                });
+                };
+                if session.pipeline.set_state(gst::State::Paused).is_err() {
+                    Self::shutdown_session(&mut session);
+                    return Err("shairport-sync pipeline preroll failed".to_string());
+                }
+                info!(host = %host, port, "AirPlay: session opened via shairport-sync");
+                *self.session_lock() = Some(session);
                 Ok(())
             }
         }
@@ -193,11 +288,21 @@ impl AirPlayOutput {
     fn close_session(&self) {
         let mut guard = self.session_lock();
         if let Some(mut sess) = guard.take() {
-            let _ = sess.pipeline.set_state(gst::State::Null);
-            if let Some(ref mut child) = sess.sps_child {
-                let _ = child.kill();
-                let _ = child.wait();
+            // Stop the pipeline before invalidating its loopback route. Doing
+            // this in the opposite order can turn an intentional close into
+            // a transient fetch error while GStreamer is still winding down.
+            Self::shutdown_session(&mut sess);
+            if let Some(ticket) = sess.media_ticket.as_ref() {
+                self.media_proxy.revoke_if_current(ticket);
             }
+        }
+    }
+
+    fn shutdown_session(session: &mut Session) {
+        let _ = session.pipeline.set_state(gst::State::Null);
+        if let Some(ref mut child) = session.sps_child {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
@@ -207,19 +312,27 @@ impl AirPlayOutput {
         &self,
         pipeline: &gst::Pipeline,
         generation: PlayerEventGeneration,
+        media_ticket: Option<Arc<GstreamerMediaTicket>>,
     ) -> Result<gst::bus::BusWatchGuard, String> {
         let bus = pipeline
             .bus()
             .ok_or_else(|| "Pipeline has no bus".to_string())?;
         let tx = self.event_tx.clone();
         let pipeline_weak = pipeline.downgrade();
+        let media_proxy = Arc::clone(&self.media_proxy);
         bus.add_watch(move |_, msg| {
             use gst::MessageView;
             match msg.view() {
                 MessageView::Eos(..) => {
+                    if let Some(ticket) = media_ticket.as_ref() {
+                        media_proxy.revoke_if_current(ticket);
+                    }
                     let _ = tx.try_send(PlayerEvent::ended(generation));
                 }
                 MessageView::Error(_) => {
+                    if let Some(ticket) = media_ticket.as_ref() {
+                        media_proxy.revoke_if_current(ticket);
+                    }
                     // GStreamer error/debug strings can embed the authenticated
                     // source URI. Keep the diagnostic stable and URL-free.
                     error!("AirPlay pipeline error");
@@ -273,7 +386,7 @@ impl AirPlayOutput {
         );
 
         let element = gst::parse::launch(&pipeline_str)
-            .map_err(|e| format!("Failed to build RAOP pipeline: {e}"))?;
+            .map_err(|_| "Failed to build RAOP pipeline".to_string())?;
         let pipeline = element
             .downcast::<gst::Pipeline>()
             .map_err(|_| "RAOP launch did not yield a Pipeline".to_string())?;
@@ -340,10 +453,10 @@ impl AirPlayOutput {
             fd,
         );
 
-        let element = gst::parse::launch(&pipeline_str).map_err(|e| {
+        let element = gst::parse::launch(&pipeline_str).map_err(|_| {
             let _ = child.kill();
             let _ = child.wait();
-            format!("Failed to build shairport-sync pipeline: {e}")
+            "Failed to build shairport-sync pipeline".to_string()
         })?;
         let pipeline = element.downcast::<gst::Pipeline>().map_err(|_| {
             let _ = child.kill();
@@ -365,14 +478,17 @@ impl AirPlayOutput {
     }
 
     /// Apply a state transition to the active pipeline, if any.
-    fn set_pipeline_state(&self, target: gst::State) {
+    fn set_pipeline_state(&self, target: gst::State) -> bool {
         let guard = self.session_lock();
         if let Some(ref sess) = *guard {
             if let Err(e) = sess.pipeline.set_state(target) {
                 warn!(error = %e, ?target, "AirPlay: state transition failed");
+                return false;
             }
+            true
         } else {
             debug!(?target, "AirPlay: no active session for state change");
+            false
         }
     }
 }
@@ -408,18 +524,16 @@ impl AudioOutput for AirPlayOutput {
             .event_tx
             .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
 
-        if let Err(e) = self.open_session(uri) {
-            error!(error = %e, "AirPlay: failed to open session");
-            let _ = self.event_tx.try_send(PlayerEvent::error(generation, e));
-            let _ = self
-                .event_tx
-                .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
-        } else {
-            // `open_session` only prerolls the pipeline to Paused; like every
-            // other output, `load_uri` must actually start playback, so drive
-            // it to Playing now that buffers are prerolled.
-            self.set_pipeline_state(gst::State::Playing);
-        }
+        self.finish_load(generation, self.open_session(uri));
+    }
+
+    fn load_resolved(&self, request: ResolvedHttpRequest) {
+        info!("AirPlay: loading resolved media");
+        let generation = self.event_generation();
+        let _ = self
+            .event_tx
+            .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
+        self.finish_load(generation, self.open_resolved_session(request));
     }
 
     fn set_event_generation(&self, generation: PlayerEventGeneration) {
@@ -429,12 +543,12 @@ impl AudioOutput for AirPlayOutput {
 
     fn play(&self) {
         debug!("AirPlay: play");
-        self.set_pipeline_state(gst::State::Playing);
+        let _ = self.set_pipeline_state(gst::State::Playing);
     }
 
     fn pause(&self) {
         debug!("AirPlay: pause");
-        self.set_pipeline_state(gst::State::Paused);
+        let _ = self.set_pipeline_state(gst::State::Paused);
     }
 
     fn stop(&self) {
@@ -459,7 +573,7 @@ impl AudioOutput for AirPlayOutput {
             })
         };
         if let Some(state) = target {
-            self.set_pipeline_state(state);
+            let _ = self.set_pipeline_state(state);
         }
     }
 
@@ -558,5 +672,51 @@ mod tests {
         let (tx, _rx) = async_channel::unbounded();
         let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
         assert_eq!(output.state(), PlayerState::Stopped);
+    }
+
+    #[test]
+    fn protected_load_without_runtime_fails_before_gstreamer() {
+        const SECRET: &str = "airplay-secret-must-not-leak";
+
+        let (tx, rx) = async_channel::unbounded();
+        let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
+        let generation = PlayerEventGeneration::from_raw(42);
+        output.set_event_generation(generation);
+
+        // A protected URI requires the app runtime to mint its loopback
+        // ticket. With no runtime configured, preparation must fail before
+        // either AirPlay GStreamer pipeline is inspected or constructed.
+        output.load_uri(&format!("https://music.test/stream?api_key={SECRET}"));
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PlayerEvent::StateChanged {
+                generation: event_generation,
+                state: PlayerState::Buffering,
+            }) if event_generation == generation
+        ));
+
+        match rx.try_recv() {
+            Ok(PlayerEvent::Error {
+                generation: event_generation,
+                message,
+            }) => {
+                assert_eq!(event_generation, generation);
+                assert_eq!(message, "AirPlay media preparation failed");
+                assert!(!message.contains(SECRET));
+                assert!(!message.contains("api_key"));
+                assert!(!message.contains("music.test"));
+            }
+            event => panic!("expected fixed preparation error, got {event:?}"),
+        }
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PlayerEvent::StateChanged {
+                generation: event_generation,
+                state: PlayerState::Stopped,
+            }) if event_generation == generation
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }

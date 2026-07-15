@@ -6,11 +6,29 @@
 use adw::prelude::*;
 use gtk::glib;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::info;
 
 use crate::local::engine::LibraryEvent;
 
 use super::objects::SourceObject;
+
+type RemoteConnectResult = Result<
+    Option<(
+        Vec<crate::architecture::models::Track>,
+        crate::source_registry::RetainedSource,
+    )>,
+    (crate::architecture::error::BackendError, bool),
+>;
+
+/// Validate a standard remote backend URL before it reaches persistence,
+/// logs, an auth dialog, or connection ownership state.
+///
+/// The error is deliberately fixed text: URL parser diagnostics are not
+/// allowed to echo a rejected input that may itself contain credentials.
+pub(super) fn validate_remote_server_url(server_url: &str) -> Result<(), &'static str> {
+    crate::http_security::parse_base_url(server_url).map(|_| ())
+}
 
 // ── SavedServer persistence ─────────────────────────────────────────
 
@@ -33,10 +51,22 @@ fn servers_json_path() -> Option<std::path::PathBuf> {
 
 /// Load saved servers from `servers.json`, returning an empty vec on error.
 pub fn load_saved_servers() -> Vec<SavedServer> {
-    servers_json_path()
+    let mut servers: Vec<SavedServer> = servers_json_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let before = servers.len();
+    servers.retain(|server| validate_remote_server_url(&server.url).is_ok());
+    if servers.len() != before {
+        // Remove legacy unsafe rows from disk without ever formatting their
+        // values into a diagnostic.
+        save_servers(&servers);
+        tracing::warn!(
+            removed = before - servers.len(),
+            "Removed invalid saved server entries"
+        );
+    }
+    servers
 }
 
 /// Save the list of servers to `servers.json`.
@@ -51,18 +81,34 @@ fn save_servers(servers: &[SavedServer]) {
     }
 }
 
-/// Add a server to `servers.json` (dedup by URL).
-pub fn add_saved_server(server_type: &str, name: &str, url: &str) {
-    let mut servers = load_saved_servers();
-    if !servers.iter().any(|s| s.url == url) {
-        servers.push(SavedServer {
-            server_type: server_type.to_string(),
-            name: name.to_string(),
-            url: url.to_string(),
-        });
-        save_servers(&servers);
-        info!(url = %url, "Server added to servers.json");
+fn add_saved_server_to(
+    servers: &mut Vec<SavedServer>,
+    server_type: &str,
+    name: &str,
+    url: &str,
+) -> Result<bool, &'static str> {
+    validate_remote_server_url(url)?;
+    if servers.iter().any(|server| server.url == url) {
+        return Ok(false);
     }
+
+    servers.push(SavedServer {
+        server_type: server_type.to_string(),
+        name: name.to_string(),
+        url: url.to_string(),
+    });
+    Ok(true)
+}
+
+/// Add a validated server to `servers.json` (dedup by URL).
+pub fn add_saved_server(server_type: &str, name: &str, url: &str) -> Result<bool, &'static str> {
+    let mut servers = load_saved_servers();
+    let added = add_saved_server_to(&mut servers, server_type, name, url)?;
+    if added {
+        save_servers(&servers);
+        info!("Server added to servers.json");
+    }
+    Ok(added)
 }
 
 /// Remove a server from `servers.json` by URL.
@@ -72,7 +118,7 @@ pub fn remove_saved_server(url: &str) {
     servers.retain(|s| s.url != url);
     if servers.len() != before {
         save_servers(&servers);
-        info!(url = %url, "Server removed from servers.json");
+        info!("Server removed from servers.json");
     }
 }
 
@@ -266,8 +312,14 @@ pub fn show_add_server_dialog(
             .and_then(|u| u.host_str().map(|h| h.to_string()))
             .unwrap_or_else(|| url.clone());
 
-        // Persist to servers.json (type, name, url — no credentials).
-        add_saved_server(backend_type, &display_name, &url);
+        // Validate before persistence, sidebar publication, connection state,
+        // or URL-bearing logs. Rejected text may itself contain a credential,
+        // so only the fixed validation message may cross this boundary.
+        if let Err(message) = add_saved_server(backend_type, &display_name, &url) {
+            tracing::warn!(error = message, "Manual server URL rejected");
+            let _ = engine_tx.try_send(LibraryEvent::Error(message.to_string()));
+            return;
+        }
 
         // Add to sidebar as a manual server.
         let insert_pos = super::window::ensure_category_header_store(&store, backend_type);
@@ -302,12 +354,13 @@ pub fn show_add_server_dialog(
         let backend_type = backend_type.to_string();
 
         rt_handle.spawn(async move {
-            let result: Result<
-                Vec<crate::architecture::models::Track>,
-                crate::architecture::error::BackendError,
-            > = match backend_type.as_str() {
+            let Some(attempt) = crate::source_registry::begin_connect(server_url.clone()) else {
+                tracing::debug!("Skipping manual remote connect during shutdown");
+                return;
+            };
+            let result: RemoteConnectResult = match backend_type.as_str() {
                 "jellyfin" => {
-                    info!(server = %server_url, "Authenticating with Jellyfin (manual)...");
+                    info!("Authenticating with Jellyfin (manual)...");
                     match crate::jellyfin::client::JellyfinClient::authenticate(
                         &server_url,
                         &user,
@@ -322,30 +375,42 @@ pub fn show_add_server_dialog(
                             )
                             .await
                             {
-                                Ok(backend) => Ok(backend.all_tracks().await),
-                                Err(e) => Err(e),
+                                Ok(backend) => {
+                                    let tracks = backend.all_tracks().await;
+                                    Ok(attempt
+                                        .retain(Arc::new(backend))
+                                        .filter(crate::source_registry::RetainedSource::is_current)
+                                        .map(|source| (tracks, source)))
+                                }
+                                Err(e) => Err((e, attempt.is_latest())),
                             }
                         }
-                        Err(e) => Err(e),
+                        Err(e) => Err((e, attempt.is_latest())),
                     }
                 }
                 "plex" => {
-                    info!(server = %server_url, "Authenticating with Plex (manual)...");
+                    info!("Authenticating with Plex (manual)...");
                     match crate::plex::client::PlexClient::authenticate(&server_url, &user, &pass)
                         .await
                     {
                         Ok(client) => {
                             match crate::plex::PlexBackend::from_client(&server_name, client).await
                             {
-                                Ok(backend) => Ok(backend.all_tracks().await),
-                                Err(e) => Err(e),
+                                Ok(backend) => {
+                                    let tracks = backend.all_tracks().await;
+                                    Ok(attempt
+                                        .retain(Arc::new(backend))
+                                        .filter(crate::source_registry::RetainedSource::is_current)
+                                        .map(|source| (tracks, source)))
+                                }
+                                Err(e) => Err((e, attempt.is_latest())),
                             }
                         }
-                        Err(e) => Err(e),
+                        Err(e) => Err((e, attempt.is_latest())),
                     }
                 }
                 _ => {
-                    info!(server = %server_url, "Authenticating with Subsonic (manual)...");
+                    info!("Authenticating with Subsonic (manual)...");
                     match crate::subsonic::SubsonicBackend::connect(
                         &server_name,
                         &server_url,
@@ -354,14 +419,20 @@ pub fn show_add_server_dialog(
                     )
                     .await
                     {
-                        Ok(backend) => Ok(backend.all_tracks().await),
-                        Err(e) => Err(e),
+                        Ok(backend) => {
+                            let tracks = backend.all_tracks().await;
+                            Ok(attempt
+                                .retain(Arc::new(backend))
+                                .filter(crate::source_registry::RetainedSource::is_current)
+                                .map(|source| (tracks, source)))
+                        }
+                        Err(e) => Err((e, attempt.is_latest())),
                     }
                 }
             };
 
             match result {
-                Ok(tracks) => {
+                Ok(Some((tracks, source))) => {
                     info!(
                         backend = %backend_type,
                         count = tracks.len(),
@@ -370,11 +441,21 @@ pub fn show_add_server_dialog(
                     let _ = engine_tx
                         .send(LibraryEvent::RemoteSync {
                             source_key: server_url,
+                            generation: source.generation(),
+                            lease_key: source.lease_key(),
                             tracks,
                         })
                         .await;
                 }
-                Err(e) => {
+                Ok(None) => tracing::debug!(
+                    backend = %backend_type,
+                    "Manual remote connection was superseded"
+                ),
+                Err((_e, false)) => tracing::debug!(
+                    backend = %backend_type,
+                    "Ignoring superseded manual remote connection failure"
+                ),
+                Err((e, true)) => {
                     tracing::error!(
                         backend = %backend_type,
                         error = %e,
@@ -392,4 +473,55 @@ pub fn show_add_server_dialog(
     });
 
     dialog.present(Some(window));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_server_urls_never_enter_the_persistence_snapshot() {
+        let secret = uuid::Uuid::new_v4().to_string();
+        let mut servers = vec![SavedServer {
+            server_type: "subsonic".to_string(),
+            name: "Existing".to_string(),
+            url: "https://existing.example.test".to_string(),
+        }];
+        let before = serde_json::to_string(&servers).expect("serialize original snapshot");
+
+        for rejected in [
+            format!("https://user:{secret}@music.example.test"),
+            format!("https://music.example.test?api_key={secret}"),
+            format!("https://music.example.test#{secret}"),
+        ] {
+            let result = add_saved_server_to(&mut servers, "subsonic", "Rejected", &rejected);
+            assert!(result.is_err());
+            assert_eq!(
+                serde_json::to_string(&servers).expect("serialize unchanged snapshot"),
+                before
+            );
+        }
+
+        assert!(!before.contains(&secret));
+    }
+
+    #[test]
+    fn server_url_validation_errors_never_echo_rejected_secrets() {
+        let secret = uuid::Uuid::new_v4().to_string();
+        let mut fixed_error = None;
+        for rejected in [
+            format!("https://user:{secret}@music.example.test"),
+            format!("https://music.example.test?token={secret}"),
+            format!("not a URL containing {secret}"),
+        ] {
+            let error = validate_remote_server_url(&rejected)
+                .expect_err("credential-bearing or malformed URL must fail");
+            if let Some(expected) = fixed_error {
+                assert_eq!(error, expected);
+            } else {
+                fixed_error = Some(error);
+            }
+            assert!(!error.contains(&secret));
+        }
+    }
 }

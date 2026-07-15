@@ -5,6 +5,7 @@
 
 use adw::prelude::*;
 use gtk::glib;
+use std::sync::Arc;
 use tracing::info;
 
 use crate::local::engine::LibraryEvent;
@@ -15,13 +16,17 @@ use super::preferences;
 use super::radio::{
     apply_radio_columns, handle_radio_nearme, is_radio_backend, radio_station_to_track_object,
 };
-use super::server_dialogs::show_auth_dialog;
+use super::server_dialogs::{show_auth_dialog, validate_remote_server_url};
 use super::tracklist;
 use super::window::{arch_track_to_object, display_tracks};
 use super::window_state::WindowState;
 
 enum RemoteLibrarySnapshot {
-    Standard(Vec<crate::architecture::models::Track>),
+    Standard {
+        tracks: Vec<crate::architecture::models::Track>,
+        generation: u64,
+        lease_key: uuid::Uuid,
+    },
     Daap {
         tracks: Vec<crate::architecture::models::Track>,
         generation: u64,
@@ -496,6 +501,17 @@ pub fn setup_source_connect(state: &WindowState) {
         let url_for_closure = server_url.clone();
         let requires_password = src.requires_password();
 
+        // Saved rows can predate the current URL policy. Reject an unsafe
+        // standard-backend URL before it is displayed in an auth dialog,
+        // logged by a connection task, or registered as source ownership.
+        // The fixed error text cannot echo user-info or query credentials from
+        // the rejected row.
+        if let Err(message) = validate_remote_server_url(&server_url) {
+            tracing::warn!(error = message, "Remote server URL rejected");
+            let _ = engine_tx.try_send(LibraryEvent::Error(message.to_string()));
+            return;
+        }
+
         // For passwordless DAAP servers, bypass the dialog entirely
         // and connect directly.
         if backend_type == "daap" && !requires_password {
@@ -572,20 +588,20 @@ pub fn setup_source_connect(state: &WindowState) {
             let server_url = url_for_closure.clone();
             let server_name = name_for_closure.clone();
             rt_handle.spawn(async move {
-                info!(server = %server_url, "Connecting to passwordless DAAP server...");
+                info!("Connecting to passwordless DAAP server...");
                 let Some(attempt) = crate::daap::begin_connect(server_url.clone()) else {
-                    tracing::debug!(server = %server_url, "Skipping DAAP connect during shutdown");
+                    tracing::debug!("Skipping DAAP connect during shutdown");
                     return;
                 };
                 match crate::daap::DaapBackend::connect(&server_name, &server_url, None).await {
                     Ok(backend) => {
                         let Some(session) = attempt.retain(backend).await else {
-                            tracing::debug!(server = %server_url, "DAAP connect was superseded");
+                            tracing::debug!("DAAP connect was superseded");
                             return;
                         };
                         let tracks = session.all_tracks().await;
                         if !session.is_current() {
-                            tracing::debug!(server = %server_url, "DAAP sync was superseded");
+                            tracing::debug!("DAAP sync was superseded");
                             return;
                         }
                         info!(count = tracks.len(), "DAAP library fetched (no password)");
@@ -602,18 +618,15 @@ pub fn setup_source_connect(state: &WindowState) {
                         ..
                     }) => {
                         if !attempt.is_latest() {
-                            tracing::debug!(server = %server_url, "Ignoring superseded DAAP authentication failure");
+                            tracing::debug!("Ignoring superseded DAAP authentication failure");
                             return;
                         }
-                        info!(
-                            server = %server_url,
-                            "DAAP server requires a password — re-prompting via auth dialog"
-                        );
+                        info!("DAAP server requires a password — re-prompting via auth dialog");
                         let _ = auth_needed_tx.send(()).await;
                     }
                     Err(e) => {
                         if !attempt.is_latest() {
-                            tracing::debug!(server = %server_url, "Ignoring superseded DAAP connection failure");
+                            tracing::debug!("Ignoring superseded DAAP connection failure");
                             return;
                         }
                         tracing::error!(error = %e, "DAAP connection failed");
@@ -705,7 +718,12 @@ pub fn setup_source_connect(state: &WindowState) {
                         crate::architecture::error::BackendError,
                     > = match backend_type.as_str() {
                         "jellyfin" => {
-                            info!(server = %server_url, "Authenticating with Jellyfin...");
+                            info!("Authenticating with Jellyfin...");
+                            let Some(attempt) =
+                                crate::source_registry::begin_connect(server_url.clone())
+                            else {
+                                return;
+                            };
                             match crate::jellyfin::client::JellyfinClient::authenticate(
                                 &server_url,
                                 &user,
@@ -720,17 +738,35 @@ pub fn setup_source_connect(state: &WindowState) {
                                     )
                                     .await
                                     {
-                                        Ok(backend) => Ok(Some(RemoteLibrarySnapshot::Standard(
-                                            backend.all_tracks().await,
-                                        ))),
+                                        Ok(backend) => {
+                                            let tracks = backend.all_tracks().await;
+                                            Ok(attempt.retain(Arc::new(backend)).and_then(
+                                                |source| {
+                                                    source.is_current().then(|| {
+                                                        RemoteLibrarySnapshot::Standard {
+                                                            tracks,
+                                                            generation: source.generation(),
+                                                            lease_key: source.lease_key(),
+                                                        }
+                                                    })
+                                                },
+                                            ))
+                                        }
+                                        Err(_) if !attempt.is_latest() => Ok(None),
                                         Err(e) => Err(e),
                                     }
                                 }
+                                Err(_) if !attempt.is_latest() => Ok(None),
                                 Err(e) => Err(e),
                             }
                         }
                         "plex" => {
-                            info!(server = %server_url, "Authenticating with Plex...");
+                            info!("Authenticating with Plex...");
+                            let Some(attempt) =
+                                crate::source_registry::begin_connect(server_url.clone())
+                            else {
+                                return;
+                            };
                             match crate::plex::client::PlexClient::authenticate(
                                 &server_url,
                                 &user,
@@ -745,17 +781,30 @@ pub fn setup_source_connect(state: &WindowState) {
                                     )
                                     .await
                                     {
-                                        Ok(backend) => Ok(Some(RemoteLibrarySnapshot::Standard(
-                                            backend.all_tracks().await,
-                                        ))),
+                                        Ok(backend) => {
+                                            let tracks = backend.all_tracks().await;
+                                            Ok(attempt.retain(Arc::new(backend)).and_then(
+                                                |source| {
+                                                    source.is_current().then(|| {
+                                                        RemoteLibrarySnapshot::Standard {
+                                                            tracks,
+                                                            generation: source.generation(),
+                                                            lease_key: source.lease_key(),
+                                                        }
+                                                    })
+                                                },
+                                            ))
+                                        }
+                                        Err(_) if !attempt.is_latest() => Ok(None),
                                         Err(e) => Err(e),
                                     }
                                 }
+                                Err(_) if !attempt.is_latest() => Ok(None),
                                 Err(e) => Err(e),
                             }
                         }
                         "daap" => {
-                            info!(server = %server_url, "Connecting to DAAP server...");
+                            info!("Connecting to DAAP server...");
                             let password = if pass.is_empty() {
                                 None
                             } else {
@@ -787,12 +836,17 @@ pub fn setup_source_connect(state: &WindowState) {
                                     },
                                     Err(_) if !attempt.is_latest() => Ok(None),
                                     Err(error) => Err(error),
-                                }
+                                },
                             }
                         }
                         _ => {
                             // Default: Subsonic
-                            info!(server = %server_url, "Authenticating with Subsonic...");
+                            info!("Authenticating with Subsonic...");
+                            let Some(attempt) =
+                                crate::source_registry::begin_connect(server_url.clone())
+                            else {
+                                return;
+                            };
                             match crate::subsonic::SubsonicBackend::connect(
                                 &server_name,
                                 &server_url,
@@ -801,9 +855,19 @@ pub fn setup_source_connect(state: &WindowState) {
                             )
                             .await
                             {
-                                Ok(backend) => Ok(Some(RemoteLibrarySnapshot::Standard(
-                                    backend.all_tracks().await,
-                                ))),
+                                Ok(backend) => {
+                                    let tracks = backend.all_tracks().await;
+                                    Ok(attempt.retain(Arc::new(backend)).and_then(|source| {
+                                        source.is_current().then(|| {
+                                            RemoteLibrarySnapshot::Standard {
+                                                tracks,
+                                                generation: source.generation(),
+                                                lease_key: source.lease_key(),
+                                            }
+                                        })
+                                    }))
+                                }
+                                Err(_) if !attempt.is_latest() => Ok(None),
                                 Err(e) => Err(e),
                             }
                         }
@@ -812,12 +876,18 @@ pub fn setup_source_connect(state: &WindowState) {
                     match result {
                         Ok(Some(snapshot)) => {
                             let (count, event) = match snapshot {
-                                RemoteLibrarySnapshot::Standard(tracks) => {
+                                RemoteLibrarySnapshot::Standard {
+                                    tracks,
+                                    generation,
+                                    lease_key,
+                                } => {
                                     let count = tracks.len();
                                     (
                                         count,
                                         LibraryEvent::RemoteSync {
                                             source_key: server_url,
+                                            generation,
+                                            lease_key,
                                             tracks,
                                         },
                                     )
@@ -848,7 +918,6 @@ pub fn setup_source_connect(state: &WindowState) {
                         }
                         Ok(None) => tracing::debug!(
                             backend = %backend_type,
-                            server = %server_url,
                             "Remote connection was superseded or shutdown-gated"
                         ),
                         Err(e) => {

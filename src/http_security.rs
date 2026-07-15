@@ -11,6 +11,7 @@ use reqwest::Url;
 
 const MAX_REDIRECTS: usize = 10;
 const REDACTED: &str = "REDACTED";
+const INVALID_BASE_URL: &str = "Invalid server URL: use an http:// or https:// base URL with a host and without embedded credentials, a query, or a fragment";
 
 /// Start an asynchronous client builder with credential-safe redirect defaults.
 pub fn authenticated_client_builder() -> reqwest::ClientBuilder {
@@ -53,14 +54,26 @@ pub fn strip_request_url(error: reqwest::Error) -> reqwest::Error {
 pub fn validate_base_url(url: &Url) -> Result<(), &'static str> {
     if url.cannot_be_a_base()
         || !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
-        return Err(
-            "Invalid server URL: use an http:// or https:// URL without embedded credentials",
-        );
+        return Err(INVALID_BASE_URL);
     }
     Ok(())
+}
+
+/// Parse and validate user/config supplied base-URL text before it is logged,
+/// persisted, or published as a source identity.
+///
+/// The error is deliberately fixed and never includes `input`, because the
+/// rejected value may itself contain a password or bearer token.
+pub fn parse_base_url(input: &str) -> Result<Url, &'static str> {
+    let url = Url::parse(input).map_err(|_| INVALID_BASE_URL)?;
+    validate_base_url(&url)?;
+    Ok(url)
 }
 
 /// Mask credentials embedded in a URL before it is written to a log.
@@ -70,8 +83,6 @@ pub fn validate_base_url(url: &Url) -> Result<(), &'static str> {
 /// only when the companion parameters identify the URL as Subsonic, avoiding
 /// false positives on ordinary `s` and `p` parameters.
 pub fn redact_url_secrets(uri: &str) -> String {
-    const SENSITIVE_PARAMS: &[&str] = &["X-Plex-Token", "api_key", "session-id"];
-
     let Ok(mut url) = Url::parse(uri) else {
         return uri.to_string();
     };
@@ -89,19 +100,13 @@ pub fn redact_url_secrets(uri: &str) -> String {
         .query_pairs()
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
-    let has_subsonic_token = query_pairs.iter().any(|(key, _)| key == "t");
-    let has_subsonic_password = ["p", "u", "c"]
-        .into_iter()
-        .all(|required| query_pairs.iter().any(|(key, _)| key == required));
+    let shape = CredentialShape::of(&query_pairs);
 
     let mut redacted_query = false;
     let query_pairs: Vec<(String, String)> = query_pairs
         .into_iter()
         .map(|(key, value)| {
-            let sensitive = SENSITIVE_PARAMS.contains(&key.as_str())
-                || (has_subsonic_token && matches!(key.as_str(), "t" | "s"))
-                || (has_subsonic_password && key == "p");
-            if sensitive {
+            if shape.is_sensitive(&key) {
                 redacted_query = true;
                 (key, REDACTED.to_string())
             } else {
@@ -121,6 +126,161 @@ pub fn redact_url_secrets(uri: &str) -> String {
         }
     }
     url.to_string()
+}
+
+/// Which credential-bearing query parameters a URL actually carries.
+///
+/// The short Subsonic keys are only treated as credentials when their companion
+/// parameters identify the URL as Subsonic, so an ordinary `s` or `p` parameter
+/// on some other service is not mistaken for a secret.
+struct CredentialShape {
+    subsonic_token: bool,
+    subsonic_password: bool,
+}
+
+impl CredentialShape {
+    /// Parameters that are a credential wherever they appear.
+    const ALWAYS_SENSITIVE: &'static [&'static str] = &["X-Plex-Token", "api_key", "session-id"];
+
+    fn of(query_pairs: &[(String, String)]) -> Self {
+        Self {
+            subsonic_token: query_pairs.iter().any(|(key, _)| key == "t"),
+            subsonic_password: ["p", "u", "c"]
+                .into_iter()
+                .all(|required| query_pairs.iter().any(|(key, _)| key == required)),
+        }
+    }
+
+    fn is_sensitive(&self, key: &str) -> bool {
+        Self::ALWAYS_SENSITIVE.contains(&key)
+            || (self.subsonic_token && matches!(key, "t" | "s"))
+            || (self.subsonic_password && key == "p")
+    }
+}
+
+/// True when a URL carries a credential that must never reach another device.
+///
+/// This is the test that decides whether a stream has to be proxied before a
+/// Chromecast or an MPD daemon is allowed to fetch it. It recognises URL
+/// user-info, Plex's `X-Plex-Token`, Jellyfin's `api_key`, DAAP's `session-id`,
+/// and Subsonic's token/salt pair — and Subsonic's `p=enc:<hex>`, which is the
+/// user's *password*, not a revocable token.
+pub fn url_carries_credentials(url: &Url) -> bool {
+    if !url.username().is_empty() || url.password().is_some() {
+        return true;
+    }
+
+    let query_pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let shape = CredentialShape::of(&query_pairs);
+    query_pairs.iter().any(|(key, _)| shape.is_sensitive(key))
+}
+
+/// Whether a media URI may be handed directly to a network playback device.
+///
+/// Deliberately not `Debug`: `Protected` owns the complete credential-bearing
+/// URL. Callers must exchange that URL for an opaque, revocable proxy ticket
+/// before sending anything to MPD, Chromecast, or another receiver.
+pub enum MediaUriSecurity {
+    /// No supported credential shape was found. The caller may retain and use
+    /// the original input unchanged.
+    Direct,
+    /// An HTTP(S) URL carrying a supported credential shape.
+    Protected(Box<Url>),
+    /// A malformed declared HTTP(S) URL, or credentials on a scheme for which
+    /// the exact-origin proxy cannot provide its HTTP-specific guarantees.
+    Reject,
+}
+
+/// Classify a media URI at the boundary before it can reach a network player.
+///
+/// Ordinary radio URLs, local `file:` URLs, and MPD library paths remain
+/// direct. Credential-bearing HTTP(S) URLs must be proxied. A declared but
+/// malformed HTTP(S) URL is rejected rather than being mistaken for an MPD
+/// path, and a credential on an unsupported scheme is rejected rather than
+/// handed to another device.
+pub fn classify_media_uri(uri: &str) -> MediaUriSecurity {
+    let declares_http = declared_url_scheme(uri)
+        .is_some_and(|scheme| matches_ignore_ascii_case(scheme, "http", "https"));
+    if declares_http && !declared_scheme_has_authority(uri) {
+        return MediaUriSecurity::Reject;
+    }
+
+    let parsed = match Url::parse(uri) {
+        Ok(parsed) => parsed,
+        Err(_) if declares_http || malformed_uri_looks_credentialed(uri) => {
+            return MediaUriSecurity::Reject;
+        }
+        Err(_) => return MediaUriSecurity::Direct,
+    };
+
+    if matches!(parsed.scheme(), "http" | "https") {
+        if parsed.cannot_be_a_base() || parsed.host().is_none() {
+            return MediaUriSecurity::Reject;
+        }
+        if url_carries_credentials(&parsed) {
+            MediaUriSecurity::Protected(Box::new(parsed))
+        } else {
+            MediaUriSecurity::Direct
+        }
+    } else if url_carries_credentials(&parsed) {
+        MediaUriSecurity::Reject
+    } else {
+        MediaUriSecurity::Direct
+    }
+}
+
+fn declared_url_scheme(uri: &str) -> Option<&str> {
+    // URL parsers trim surrounding ASCII whitespace. Mirror that behaviour for
+    // the pre-parse declaration check so ` HTTP://[bad` cannot fall through as
+    // an opaque MPD path after parsing fails.
+    let candidate = uri.trim_matches(|character: char| character.is_ascii_whitespace());
+    let (scheme, _) = candidate.split_once(':')?;
+    let mut bytes = scheme.bytes();
+    if !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(scheme)
+}
+
+fn declared_scheme_has_authority(uri: &str) -> bool {
+    uri.trim_matches(|character: char| character.is_ascii_whitespace())
+        .split_once(':')
+        .is_some_and(|(_, remainder)| remainder.starts_with("//"))
+}
+
+fn matches_ignore_ascii_case(value: &str, first: &str, second: &str) -> bool {
+    value.eq_ignore_ascii_case(first) || value.eq_ignore_ascii_case(second)
+}
+
+fn malformed_uri_looks_credentialed(uri: &str) -> bool {
+    // Scheme-relative network references are not absolute upstream URLs and
+    // therefore cannot be proxied safely. Still recognize their user-info so
+    // they fail closed instead of reaching a network player.
+    let candidate = uri.trim_matches(|character: char| character.is_ascii_whitespace());
+    let authority = candidate
+        .strip_prefix("//")
+        .or_else(|| candidate.split_once("://").map(|(_, rest)| rest))
+        .and_then(|rest| rest.split(['/', '?', '#']).next());
+    if authority.is_some_and(|authority| authority.contains('@')) {
+        return true;
+    }
+
+    let Some(query) = candidate
+        .split_once('?')
+        .map(|(_, query)| query.split('#').next().unwrap_or(query))
+    else {
+        return false;
+    };
+    let query_pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let shape = CredentialShape::of(&query_pairs);
+    query_pairs.iter().any(|(key, _)| shape.is_sensitive(key))
 }
 
 fn authenticated_redirect_policy() -> reqwest::redirect::Policy {
@@ -229,16 +389,30 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_base_urls_reject_opaque_non_http_and_userinfo_inputs() {
+    fn authenticated_base_urls_reject_opaque_non_http_userinfo_query_and_fragment_inputs() {
         assert!(validate_base_url(&url("https://music.example.test:443/base")).is_ok());
         for unsafe_url in [
             "music.example.test:443",
             "ftp://music.example.test/base",
             "https://user:secret@music.example.test/base",
+            "https://music.example.test/base?api_key=secret",
+            "https://music.example.test/base#fragment",
         ] {
             let error = validate_base_url(&url(unsafe_url)).expect_err("unsafe base URL");
             assert!(!error.contains("secret"));
             assert!(!error.contains(unsafe_url));
+        }
+
+        for unsafe_text in [
+            "not a URL with secret-password",
+            "https://user:secret@music.example.test/base",
+            "https://music.example.test/base?api_key=secret",
+            "https://music.example.test/base#fragment",
+        ] {
+            let error = parse_base_url(unsafe_text).expect_err("unsafe base URL text");
+            assert_eq!(error, INVALID_BASE_URL);
+            assert!(!error.contains("secret"));
+            assert!(!error.contains(unsafe_text));
         }
     }
 
@@ -474,6 +648,104 @@ mod tests {
         assert!(!display.contains("password"));
         assert!(!display.contains("secret"));
         let _ = request_rx.recv().expect("error request");
+    }
+
+    /// This predicate decides whether a stream is safe to hand to a Chromecast
+    /// or an MPD daemon. A false negative publishes the user's credential to a
+    /// device on the LAN, so the negative cases below matter as much as the
+    /// positive ones.
+    #[test]
+    fn credential_bearing_urls_are_recognized() {
+        for carries in [
+            "https://plex.test/library/parts/1/a.flac?X-Plex-Token=secret",
+            "https://jellyfin.test/Audio/1/stream?api_key=secret",
+            "http://daap.test:3689/databases/1/items/2.mp3?session-id=secret",
+            // Subsonic token auth.
+            "https://sub.test/rest/stream.view?u=me&t=tok&s=salt&c=Tributary&id=1",
+            // Subsonic plaintext auth: `p=enc:<hex>` is the user's password.
+            "https://sub.test/rest/stream.view?u=me&p=enc%3A70617373&c=Tributary&id=1",
+            // Credentials in user-info.
+            "https://me:hunter2@music.test/stream.flac",
+            "https://me@music.test/stream.flac",
+        ] {
+            assert!(
+                url_carries_credentials(&url(carries)),
+                "{carries} carries a credential"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_urls_are_not_mistaken_for_credentials() {
+        for plain in [
+            "http://radio.test/stream.mp3",
+            "https://radio.test/listen?bitrate=128&format=mp3",
+            // `s` and `p` are Subsonic credentials only alongside their
+            // companion parameters; on any other service they are ordinary.
+            "https://radio.test/search?s=jazz&p=2",
+            "https://radio.test/browse?genre=rock",
+        ] {
+            assert!(
+                !url_carries_credentials(&url(plain)),
+                "{plain} carries no credential"
+            );
+        }
+    }
+
+    #[test]
+    fn media_uri_classifier_protects_every_supported_http_credential_shape() {
+        for protected in [
+            "https://user:password@music.test/stream.flac",
+            "https://plex.test/file.flac?X-Plex-Token=secret",
+            "https://jellyfin.test/stream?api_key=secret",
+            "http://daap.test/item?session-id=secret",
+            "https://sub.test/stream?u=me&t=token&s=salt&c=Tributary",
+            "https://sub.test/stream?u=me&p=enc%3Asecret&c=Tributary",
+        ] {
+            match classify_media_uri(protected) {
+                MediaUriSecurity::Protected(url) => {
+                    assert!(url_carries_credentials(&url), "{protected}");
+                    assert!(matches!(url.scheme(), "http" | "https"));
+                }
+                MediaUriSecurity::Direct | MediaUriSecurity::Reject => {
+                    panic!("supported credential URI was not protected")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_uri_classifier_keeps_noncredential_media_and_mpd_paths_direct() {
+        for direct in [
+            "https://radio.test/live.mp3?quality=high",
+            "file:///music/track.flac",
+            "Albums/Artist/track.flac",
+            "//nas/music/track.flac",
+        ] {
+            assert!(matches!(
+                classify_media_uri(direct),
+                MediaUriSecurity::Direct
+            ));
+        }
+    }
+
+    #[test]
+    fn media_uri_classifier_rejects_ambiguous_or_unsupported_credentials() {
+        for rejected in [
+            "HTTP://[malformed",
+            " https://[malformed ",
+            "http:/missing-host",
+            "https://?api_key=secret",
+            "ftp://user:password@music.test/stream.flac",
+            "ftp://music.test/stream?api_key=secret",
+            "//music.test/stream?api_key=secret",
+            "not an absolute URL?X-Plex-Token=secret",
+        ] {
+            assert!(
+                matches!(classify_media_uri(rejected), MediaUriSecurity::Reject),
+                "{rejected}"
+            );
+        }
     }
 
     #[test]

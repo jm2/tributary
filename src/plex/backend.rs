@@ -9,16 +9,16 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tracing::info;
-use url::Url;
 use uuid::Uuid;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
+use crate::architecture::{RemoteMediaResolver, ResolvedHttpRequest};
 
 use super::api::{
     PlexAlbum, PlexAlbumsResponse, PlexArtist, PlexArtistsResponse, PlexIdentityResponse,
-    PlexSectionsResponse, PlexTrack, PlexTracksResponse,
+    PlexMedia, PlexSectionsResponse, PlexTrack, PlexTracksResponse,
 };
 use super::client::PlexClient;
 
@@ -52,7 +52,10 @@ struct LibraryCache {
     tracks: Vec<Track>,
     albums: Vec<Album>,
     artists: Vec<Artist>,
-    track_by_uuid: HashMap<Uuid, usize>,
+    /// Application track UUID → Plex media part key.
+    stream_locator_by_uuid: HashMap<Uuid, String>,
+    /// Application track UUID → Plex thumbnail path.
+    track_artwork_locator_by_uuid: HashMap<Uuid, String>,
     /// Plex rating key → UUID we generated.
     #[allow(dead_code)]
     plex_id_to_uuid: HashMap<String, Uuid>,
@@ -64,7 +67,8 @@ impl LibraryCache {
             tracks: Vec::new(),
             albums: Vec::new(),
             artists: Vec::new(),
-            track_by_uuid: HashMap::new(),
+            stream_locator_by_uuid: HashMap::new(),
+            track_artwork_locator_by_uuid: HashMap::new(),
             plex_id_to_uuid: HashMap::new(),
         }
     }
@@ -160,7 +164,9 @@ impl PlexBackend {
         let mut all_tracks = Vec::new();
         let mut all_albums = Vec::new();
         let mut all_artists = Vec::new();
-        let mut track_by_uuid = HashMap::new();
+        let mut skipped_unplayable_tracks = 0usize;
+        let mut stream_locator_by_uuid = HashMap::new();
+        let mut track_artwork_locator_by_uuid = HashMap::new();
         let mut plex_id_to_uuid = HashMap::new();
 
         for lib in &self.music_libraries {
@@ -232,21 +238,15 @@ impl PlexBackend {
 
             // ── Accumulate tracks (type=10) ─────────────────────────
             for plex_track in &tracks {
-                let track_uuid = deterministic_uuid(&plex_track.rating_key);
-                let artist_id = plex_track
-                    .grandparent_rating_key
-                    .as_deref()
-                    .map(deterministic_uuid);
-                let album_id = plex_track
-                    .parent_rating_key
-                    .as_deref()
-                    .map(deterministic_uuid);
+                let Some((track_uuid, track, part_key)) = cacheable_plex_track(plex_track) else {
+                    skipped_unplayable_tracks += 1;
+                    continue;
+                };
 
-                let track =
-                    plex_track_to_track(plex_track, track_uuid, artist_id, album_id, &self.client);
-
-                let idx = all_tracks.len();
-                track_by_uuid.insert(track_uuid, idx);
+                stream_locator_by_uuid.insert(track_uuid, part_key);
+                if let Some(thumb_path) = &plex_track.thumb {
+                    track_artwork_locator_by_uuid.insert(track_uuid, thumb_path.clone());
+                }
                 plex_id_to_uuid.insert(plex_track.rating_key.clone(), track_uuid);
                 all_tracks.push(track);
             }
@@ -259,11 +259,6 @@ impl PlexBackend {
                     .as_deref()
                     .map(deterministic_uuid);
 
-                let cover_art_url = plex_album
-                    .thumb
-                    .as_deref()
-                    .map(|t| self.client.thumb_url(t));
-
                 let genre = plex_album.genre.first().and_then(|g| g.tag.clone());
 
                 all_albums.push(Album {
@@ -273,7 +268,7 @@ impl PlexBackend {
                     artist_id,
                     year: plex_album.year,
                     genre,
-                    cover_art_url,
+                    cover_art_url: None,
                     track_count: plex_album.leaf_count.unwrap_or(0),
                     total_duration_secs: plex_album.duration.map(|d| d / 1000),
                 });
@@ -282,11 +277,6 @@ impl PlexBackend {
             // ── Accumulate artists (type=8) ─────────────────────────
             for plex_artist in &artists {
                 let artist_uuid = deterministic_uuid(&plex_artist.rating_key);
-
-                let cover_art_url = plex_artist
-                    .thumb
-                    .as_deref()
-                    .map(|t| self.client.thumb_url(t));
 
                 // Count tracks and albums for this artist.
                 let track_count = all_tracks
@@ -303,7 +293,7 @@ impl PlexBackend {
                     name: plex_artist.title.clone().unwrap_or_default(),
                     album_count,
                     track_count,
-                    cover_art_url,
+                    cover_art_url: None,
                 });
             }
         }
@@ -312,6 +302,7 @@ impl PlexBackend {
             artists = all_artists.len(),
             albums = all_albums.len(),
             tracks = all_tracks.len(),
+            skipped_unplayable_tracks,
             "Plex library loaded"
         );
 
@@ -320,7 +311,8 @@ impl PlexBackend {
             tracks: all_tracks,
             albums: all_albums,
             artists: all_artists,
-            track_by_uuid,
+            stream_locator_by_uuid,
+            track_artwork_locator_by_uuid,
             plex_id_to_uuid,
         };
 
@@ -518,27 +510,6 @@ impl crate::architecture::MediaBackend for PlexBackend {
             .collect())
     }
 
-    async fn get_stream_url(&self, track_id: &Uuid) -> BackendResult<Url> {
-        let cache = self.cache.read().await;
-        let idx = cache
-            .track_by_uuid
-            .get(track_id)
-            .ok_or_else(|| BackendError::NotFound {
-                entity_type: "track".into(),
-                id: *track_id,
-            })?;
-        let track = &cache.tracks[*idx];
-        track.stream_url.clone().ok_or_else(|| {
-            BackendError::Internal(anyhow::anyhow!("Track {} has no stream URL", track_id))
-        })
-    }
-
-    async fn get_cover_art(&self, album_id: &Uuid) -> BackendResult<Option<Url>> {
-        let cache = self.cache.read().await;
-        let album = cache.albums.iter().find(|a| a.id == *album_id);
-        Ok(album.and_then(|a| a.cover_art_url.clone()))
-    }
-
     async fn get_stats(&self) -> BackendResult<LibraryStats> {
         let cache = self.cache.read().await;
         let total_duration: u64 = cache.tracks.iter().filter_map(|t| t.duration_secs).sum();
@@ -552,6 +523,38 @@ impl crate::architecture::MediaBackend for PlexBackend {
     }
 }
 
+#[async_trait]
+impl RemoteMediaResolver for PlexBackend {
+    async fn resolve_stream(&self, track_id: &Uuid) -> BackendResult<ResolvedHttpRequest> {
+        let part_key = self
+            .cache
+            .read()
+            .await
+            .stream_locator_by_uuid
+            .get(track_id)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound {
+                entity_type: "track".into(),
+                id: *track_id,
+            })?;
+        self.client.resolved_stream_request(&part_key)
+    }
+
+    async fn resolve_artwork(&self, track_id: &Uuid) -> BackendResult<Option<ResolvedHttpRequest>> {
+        let thumb_path = self
+            .cache
+            .read()
+            .await
+            .track_artwork_locator_by_uuid
+            .get(track_id)
+            .cloned();
+        thumb_path
+            .as_deref()
+            .map(|path| self.client.resolved_artwork_request(path))
+            .transpose()
+    }
+}
+
 // ── Conversion helpers ──────────────────────────────────────────────────
 
 /// Generate a deterministic UUID from a Plex rating key.
@@ -559,28 +562,44 @@ fn deterministic_uuid(plex_id: &str) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_URL, plex_id.as_bytes())
 }
 
+fn plex_stream_locator(plex: &PlexTrack) -> Option<&str> {
+    plex_stream_source(plex).map(|(_, locator)| locator)
+}
+
+fn plex_stream_source(plex: &PlexTrack) -> Option<(&PlexMedia, &str)> {
+    plex.media.iter().find_map(|media| {
+        media
+            .part
+            .iter()
+            .find_map(|part| part.key.as_deref().filter(|key| !key.trim().is_empty()))
+            .map(|locator| (media, locator))
+    })
+}
+
+fn cacheable_plex_track(plex: &PlexTrack) -> Option<(Uuid, Track, String)> {
+    let (media, stream_locator) = plex_stream_source(plex)?;
+    let track_uuid = deterministic_uuid(&plex.rating_key);
+    let artist_id = plex
+        .grandparent_rating_key
+        .as_deref()
+        .map(deterministic_uuid);
+    let album_id = plex.parent_rating_key.as_deref().map(deterministic_uuid);
+    let track = plex_track_to_track(plex, media, track_uuid, artist_id, album_id);
+    Some((track_uuid, track, stream_locator.to_string()))
+}
+
 fn plex_track_to_track(
     plex: &PlexTrack,
+    media: &PlexMedia,
     id: Uuid,
     artist_id: Option<Uuid>,
     album_id: Option<Uuid>,
-    client: &PlexClient,
 ) -> Track {
-    // Extract stream URL from the first media part.
-    let stream_url = plex
-        .media
-        .first()
-        .and_then(|m| m.part.first())
-        .and_then(|p| p.key.as_deref())
-        .map(|key| client.stream_url(key));
-
-    let cover_art_url = plex.thumb.as_deref().map(|t| client.thumb_url(t));
-
-    let bitrate_kbps = plex.media.first().and_then(|m| m.bitrate);
-    let format = plex
-        .media
-        .first()
-        .and_then(|m| m.audio_codec.clone().or_else(|| m.container.clone()));
+    let bitrate_kbps = media.bitrate;
+    let format = media
+        .audio_codec
+        .clone()
+        .or_else(|| media.container.clone());
 
     Track {
         id,
@@ -600,8 +619,8 @@ fn plex_track_to_track(
         genre: None, // Plex tracks don't carry genre directly; albums do.
         year: plex.year,
         file_path: None,
-        stream_url,
-        cover_art_url,
+        stream_url: None,
+        cover_art_url: None,
         date_added: None,
         date_modified: plex
             .updated_at
@@ -610,5 +629,80 @@ fn plex_track_to_track(
         sample_rate_hz: None, // Not available in Plex track metadata.
         format,
         play_count: plex.view_count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converted_track_does_not_expose_remote_urls() {
+        let track: PlexTrack = serde_json::from_value(serde_json::json!({
+            "ratingKey": "track-id",
+            "title": "Song",
+            "thumb": "/library/metadata/1/thumb/2",
+            "Media": [{
+                "Part": [{"key": "/library/parts/1/file.flac"}]
+            }]
+        }))
+        .unwrap();
+
+        let media = track.media.first().unwrap();
+        let converted = plex_track_to_track(&track, media, Uuid::new_v4(), None, None);
+        assert!(converted.stream_url.is_none());
+        assert!(converted.cover_art_url.is_none());
+    }
+
+    #[test]
+    fn missing_or_empty_media_parts_are_not_playable() {
+        for media in [
+            serde_json::json!([]),
+            serde_json::json!([{}]),
+            serde_json::json!([{"Part": [{}]}]),
+            serde_json::json!([{"Part": [{"key": ""}]}]),
+            serde_json::json!([{"Part": [{"key": "   "}]}]),
+        ] {
+            let track: PlexTrack = serde_json::from_value(serde_json::json!({
+                "ratingKey": "track-id",
+                "Media": media,
+            }))
+            .unwrap();
+
+            assert!(plex_stream_locator(&track).is_none());
+            assert!(cacheable_plex_track(&track).is_none());
+        }
+    }
+
+    #[test]
+    fn first_nonempty_media_part_is_used() {
+        let track: PlexTrack = serde_json::from_value(serde_json::json!({
+            "ratingKey": "track-id",
+            "Media": [
+                {
+                    "bitrate": 64,
+                    "audioCodec": "invalid",
+                    "Part": [{}, {"key": ""}]
+                },
+                {
+                    "bitrate": 1411,
+                    "audioCodec": "flac",
+                    "Part": [{"key": "/library/parts/2/file.flac"}]
+                },
+            ],
+        }))
+        .unwrap();
+
+        assert_eq!(
+            plex_stream_locator(&track),
+            Some("/library/parts/2/file.flac")
+        );
+        let (track_id, published, stream_locator) =
+            cacheable_plex_track(&track).expect("track should be published");
+        assert_eq!(track_id, deterministic_uuid("track-id"));
+        assert_eq!(published.id, track_id);
+        assert_eq!(published.bitrate_kbps, Some(1411));
+        assert_eq!(published.format.as_deref(), Some("flac"));
+        assert_eq!(stream_locator, "/library/parts/2/file.flac");
     }
 }

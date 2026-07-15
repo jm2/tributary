@@ -1,0 +1,3 @@
+# The English locale is historically CRLF. Keep Git's whitespace checker
+# strict while treating the carriage return at its line ending as intentional.
+locales/en.yml whitespace=cr-at-eol

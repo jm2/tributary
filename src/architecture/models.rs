@@ -59,10 +59,13 @@ pub struct Track {
     /// Local file path (only for the local backend).
     pub file_path: Option<String>,
 
-    /// Streamable URL (for remote backends, or local `file://` URIs).
+    /// Credential-free playable reference, when one is intrinsic to the
+    /// model. Authenticated remote backends leave this empty and resolve their
+    /// native track ID through a retained source session at playback time.
     pub stream_url: Option<Url>,
 
-    /// Cover art URL or local path.
+    /// Credential-free cover-art URL or local path. Authenticated remote
+    /// artwork is resolved through its retained source session instead.
     pub cover_art_url: Option<Url>,
 
     /// Timestamp when this track was first added to the library.

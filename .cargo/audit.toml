@@ -3,6 +3,10 @@
 
 [advisories]
 # rsa 0.9.10 — Marvin Attack (RUSTSEC-2023-0071)
-# No fixed version available; pulled in transitively via sqlx-mysql.
-# We don't use MySQL in production — SQLite only.
+# Cargo.lock retains this advisory through sqlx-mysql even though Tributary enables only
+# sqlx-sqlite. Both `cargo tree --locked -i rsa` and
+# `cargo tree --locked -e features -i sqlx-mysql` are empty for the configured build, but
+# cargo-audit still checks locked optional packages. No fixed rsa release is available.
+# Review by 2026-10-10 or before the next release, whichever comes first, and immediately
+# before enabling MySQL support.
 ignore = ["RUSTSEC-2023-0071"]
