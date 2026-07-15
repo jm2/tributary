@@ -101,7 +101,11 @@ pub fn build_tracklist(
         140,
         false,
         |t: &TrackObject| t.composer(),
-        |a, b| a.composer().to_lowercase().cmp(&b.composer().to_lowercase()),
+        |a, b| {
+            a.composer()
+                .to_lowercase()
+                .cmp(&b.composer().to_lowercase())
+        },
     );
     add_sorted_column(
         &column_view,

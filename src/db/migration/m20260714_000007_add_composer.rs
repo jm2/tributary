@@ -12,11 +12,7 @@ impl MigrationTrait for Migration {
             .alter_table(
                 Table::alter()
                     .table(Alias::new("tracks"))
-                    .add_column(
-                        ColumnDef::new(Alias::new("composer"))
-                            .string()
-                            .null(),
-                    )
+                    .add_column(ColumnDef::new(Alias::new("composer")).string().null())
                     .to_owned(),
             )
             .await

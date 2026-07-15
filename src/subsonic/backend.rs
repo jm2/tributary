@@ -532,7 +532,10 @@ fn song_to_track(
         track_number: song.track,
         disc_number: song.disc_number,
         duration_secs: song.duration,
-        composer: song.display_composer.clone().or_else(|| song.composer.clone()),
+        composer: song
+            .display_composer
+            .clone()
+            .or_else(|| song.composer.clone()),
         genre: song.genre.clone(),
         year: song.year,
         file_path: None, // Remote — no local file
