@@ -6,6 +6,7 @@
 //! endpoint remains safe to copy and inspect; credentials stay in separate,
 //! non-serializable storage until the app-owned proxy performs the request.
 
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -17,6 +18,163 @@ use url::Url;
 use uuid::Uuid;
 
 use super::backend::BackendResult;
+
+/// Maximum number of mDNS-advertised addresses retained for one HTTP origin.
+///
+/// Discovery input is unauthenticated and may contain duplicates or an
+/// unreasonable number of records. Sixteen addresses is ample for a
+/// multi-homed dual-stack server while keeping each route and reqwest DNS
+/// override bounded.
+const MAX_ADVERTISED_ROUTE_ADDRESSES: usize = 16;
+
+const ADVERTISED_ROUTE_ORIGIN_MISMATCH: &str =
+    "advertised HTTP route does not match the resolved media endpoint origin";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum HttpScheme {
+    Http,
+    Https,
+}
+
+/// A canonical set of discovered socket addresses for one HTTP(S) origin.
+///
+/// The hostname remains the request authority: this route changes only where
+/// reqwest opens a direct connection. Consequently HTTP `Host`, TLS SNI, and
+/// certificate identity continue to use the advertised hostname rather than
+/// an IP literal.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct AdvertisedHttpRoute {
+    scheme: HttpScheme,
+    hostname: String,
+    port: u16,
+    addresses: Arc<[SocketAddr]>,
+}
+
+impl AdvertisedHttpRoute {
+    /// Build a bounded route for an already-validated discovery origin.
+    ///
+    /// Invalid origins and advertisements with no usable address return
+    /// `None`, allowing callers to retain the hostname URL and fall back to
+    /// ordinary DNS. Input ports are normalized to the origin's effective
+    /// port, because an advertised address may never change HTTP origin.
+    pub(crate) fn new(
+        origin: &Url,
+        addresses: impl IntoIterator<Item = SocketAddr>,
+    ) -> Option<Self> {
+        if origin.query().is_some() || origin.fragment().is_some() {
+            return None;
+        }
+        let (scheme, hostname, port) = domain_origin(origin)?;
+        let addresses = canonical_addresses(addresses, port);
+        if addresses.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            scheme,
+            hostname,
+            port,
+            addresses,
+        })
+    }
+
+    /// Whether `url` has exactly the scheme, normalized hostname, and
+    /// effective port owned by this route. Paths and query data are not part
+    /// of an HTTP origin.
+    pub(crate) fn matches_origin(&self, url: &Url) -> bool {
+        domain_origin(url).is_some_and(|(scheme, hostname, port)| {
+            self.scheme == scheme && self.hostname == hostname && self.port == port
+        })
+    }
+
+    /// Union two advertisements only when they describe the same exact
+    /// origin. The result is recanonicalized and remains bounded.
+    pub(crate) fn merged_same_origin(&self, other: &Self) -> Option<Self> {
+        if self.scheme != other.scheme || self.hostname != other.hostname || self.port != other.port
+        {
+            return None;
+        }
+
+        let addresses = canonical_addresses(
+            self.addresses.iter().chain(other.addresses.iter()).copied(),
+            self.port,
+        );
+        Some(Self {
+            scheme: self.scheme,
+            hostname: self.hostname.clone(),
+            port: self.port,
+            addresses,
+        })
+    }
+
+    /// Domain key passed to reqwest's resolver override.
+    pub(crate) fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    /// Canonical direct-connection candidates for this origin.
+    pub(crate) fn addresses(&self) -> &[SocketAddr] {
+        &self.addresses
+    }
+}
+
+fn domain_origin(url: &Url) -> Option<(HttpScheme, String, u16)> {
+    if url.cannot_be_a_base() || !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    let scheme = match url.scheme() {
+        "http" => HttpScheme::Http,
+        "https" => HttpScheme::Https,
+        _ => return None,
+    };
+    let hostname = match url.host()? {
+        url::Host::Domain(hostname) => hostname.to_ascii_lowercase(),
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => return None,
+    };
+    let port = url.port_or_known_default()?;
+    Some((scheme, hostname, port))
+}
+
+fn canonical_addresses(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    port: u16,
+) -> Arc<[SocketAddr]> {
+    let mut addresses: Vec<_> = addresses
+        .into_iter()
+        .filter_map(|address| canonical_address(address, port))
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses.truncate(MAX_ADVERTISED_ROUTE_ADDRESSES);
+    addresses.into()
+}
+
+fn canonical_address(address: SocketAddr, port: u16) -> Option<SocketAddr> {
+    match address {
+        SocketAddr::V4(address) => {
+            let ip = *address.ip();
+            if ip.is_unspecified() || ip.is_multicast() || ip == Ipv4Addr::BROADCAST {
+                return None;
+            }
+            Some(SocketAddrV4::new(ip, port).into())
+        }
+        SocketAddr::V6(address) => {
+            let ip = *address.ip();
+            if ip.is_unspecified() || ip.is_multicast() {
+                return None;
+            }
+            let scope_id = if ip.is_unicast_link_local() {
+                if address.scope_id() == 0 {
+                    return None;
+                }
+                address.scope_id()
+            } else {
+                0
+            };
+            Some(SocketAddrV6::new(ip, port, 0, scope_id).into())
+        }
+    }
+}
 
 /// Revocable ownership guard attached to an already-resolved media request.
 ///
@@ -54,6 +212,7 @@ pub struct ResolvedHttpRequest {
     endpoint: Url,
     sensitive_headers: HeaderMap,
     private_query_pairs: Vec<(String, String)>,
+    advertised_route: Option<AdvertisedHttpRoute>,
     lease: Option<MediaLease>,
 }
 
@@ -65,6 +224,7 @@ impl ResolvedHttpRequest {
             endpoint,
             sensitive_headers: HeaderMap::new(),
             private_query_pairs: Vec::new(),
+            advertised_route: None,
             lease: None,
         })
     }
@@ -86,17 +246,18 @@ impl ResolvedHttpRequest {
         Ok(self)
     }
 
-    /// Add a private Subsonic authentication query pair.
+    /// Add a private Subsonic or DAAP authentication query pair.
     ///
-    /// Keeping this API to the four protocol-defined credential keys prevents
+    /// Keeping this API to the protocol-defined credential keys prevents
     /// arbitrary request-shaping state from crossing the resolver/proxy trust
-    /// boundary.
+    /// boundary. DAAP's `session-id` is a bearer credential just like the
+    /// isolated Subsonic fields.
     pub(crate) fn with_private_query_pair(
         mut self,
         key: &str,
         value: impl Into<String>,
     ) -> BackendResult<Self> {
-        if !matches!(key, "u" | "t" | "s" | "p") {
+        if !matches!(key, "u" | "t" | "s" | "p" | "session-id") {
             return Err(anyhow::anyhow!("media request query key is not allowlisted").into());
         }
         self.private_query_pairs
@@ -110,6 +271,18 @@ impl ResolvedHttpRequest {
         self
     }
 
+    /// Preserve a discovered direct route for this request's exact origin.
+    pub(crate) fn with_advertised_route(
+        mut self,
+        route: AdvertisedHttpRoute,
+    ) -> BackendResult<Self> {
+        if !route.matches_origin(&self.endpoint) {
+            return Err(anyhow::anyhow!(ADVERTISED_ROUTE_ORIGIN_MISMATCH).into());
+        }
+        self.advertised_route = Some(route);
+        Ok(self)
+    }
+
     pub(crate) fn endpoint(&self) -> &Url {
         &self.endpoint
     }
@@ -120,6 +293,10 @@ impl ResolvedHttpRequest {
 
     pub(crate) fn private_query_pairs(&self) -> &[(String, String)] {
         &self.private_query_pairs
+    }
+
+    pub(crate) fn advertised_route(&self) -> Option<&AdvertisedHttpRoute> {
+        self.advertised_route.as_ref()
     }
 
     /// Whether the source session that issued this request still owns it.
@@ -167,6 +344,7 @@ fn validate_endpoint(endpoint: &Url) -> BackendResult<()> {
                 | "access_token"
                 | "authorization"
                 | "x-plex-token"
+                | "session-id"
         )
     });
     if has_embedded_secret {
@@ -194,6 +372,7 @@ mod tests {
         for endpoint in [
             "https://user:password@example.test/audio",
             "https://example.test/audio?api_key=secret",
+            "https://example.test/audio?session-id=secret",
             "file:///tmp/audio.flac",
         ] {
             let result = ResolvedHttpRequest::new(Url::parse(endpoint).unwrap());
@@ -222,6 +401,10 @@ mod tests {
                 .is_err());
         }
         assert!(request
+            .clone()
+            .with_private_query_pair("session-id", "daap-bearer")
+            .is_ok());
+        assert!(request
             .with_private_query_pair("redirect", "https://attacker.test")
             .is_err());
     }
@@ -238,5 +421,173 @@ mod tests {
         lease.revoke();
         assert!(!request.is_active());
         assert!(!clone.is_active());
+    }
+
+    #[test]
+    fn advertised_route_requires_an_exact_http_domain_origin() {
+        let address: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        for invalid in [
+            "ftp://music.local:9000",
+            "https://user:secret@music.local:9000",
+            "https://music.local:9000?token=secret",
+            "https://music.local:9000#fragment",
+            "https://127.0.0.1:9000",
+            "file:///music",
+        ] {
+            assert!(
+                AdvertisedHttpRoute::new(&Url::parse(invalid).unwrap(), [address]).is_none(),
+                "{invalid} must not create a route"
+            );
+        }
+
+        let route = AdvertisedHttpRoute::new(
+            &Url::parse("https://MUSIC.local:443/base").unwrap(),
+            [address],
+        )
+        .expect("valid route");
+        assert_eq!(route.hostname(), "music.local");
+        assert!(route.matches_origin(&Url::parse("https://music.local/stream?id=1").unwrap()));
+        assert!(!route.matches_origin(&Url::parse("http://music.local:443/stream").unwrap()));
+        assert!(!route.matches_origin(&Url::parse("https://other.local/stream").unwrap()));
+        assert!(!route.matches_origin(&Url::parse("https://music.local:444/stream").unwrap()));
+    }
+
+    #[test]
+    fn advertised_addresses_are_sorted_deduplicated_normalized_and_capped() {
+        let origin = Url::parse("http://music.local:4533/base").unwrap();
+        let mut descending: Vec<SocketAddr> = (1..=24)
+            .rev()
+            .map(|last| SocketAddr::from(([10, 0, 0, last], 9999)))
+            .collect();
+        let extra: [SocketAddr; 4] = [
+            "10.0.0.3:1".parse().unwrap(),
+            "0.0.0.0:1".parse().unwrap(),
+            "224.0.0.1:1".parse().unwrap(),
+            "255.255.255.255:1".parse().unwrap(),
+        ];
+        descending.extend(extra);
+        let route = AdvertisedHttpRoute::new(&origin, descending).expect("usable addresses");
+
+        let expected: Vec<SocketAddr> = (1..=16)
+            .map(|last| SocketAddr::from(([10, 0, 0, last], 4533)))
+            .collect();
+        assert_eq!(route.addresses(), expected);
+
+        let reordered = AdvertisedHttpRoute::new(
+            &origin,
+            (1..=24).map(|last| SocketAddr::from(([10, 0, 0, last], 0))),
+        )
+        .expect("same canonical route");
+        assert_eq!(route, reordered, "canonical routes are stable cache keys");
+    }
+
+    #[test]
+    fn advertised_ipv6_addresses_preserve_only_required_link_local_scopes() {
+        use std::net::Ipv6Addr;
+
+        let origin = Url::parse("http://music.local:4533").unwrap();
+        let global = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let route = AdvertisedHttpRoute::new(
+            &origin,
+            [
+                SocketAddrV6::new(global, 1, 42, 7).into(),
+                SocketAddrV6::new(global, 2, 99, 8).into(),
+                SocketAddrV6::new(link_local, 3, 12, 0).into(),
+                SocketAddrV6::new(link_local, 4, 34, 9).into(),
+            ],
+        )
+        .expect("scoped route");
+
+        assert_eq!(route.addresses().len(), 2);
+        let global = route
+            .addresses()
+            .iter()
+            .find_map(|address| match address {
+                SocketAddr::V6(address) if address.ip() == &global => Some(address),
+                _ => None,
+            })
+            .expect("global IPv6 address");
+        assert_eq!(global.port(), 4533);
+        assert_eq!(global.flowinfo(), 0);
+        assert_eq!(global.scope_id(), 0);
+
+        let link_local = route
+            .addresses()
+            .iter()
+            .find_map(|address| match address {
+                SocketAddr::V6(address) if address.ip() == &link_local => Some(address),
+                _ => None,
+            })
+            .expect("scoped link-local IPv6 address");
+        assert_eq!(link_local.port(), 4533);
+        assert_eq!(link_local.flowinfo(), 0);
+        assert_eq!(link_local.scope_id(), 9);
+
+        assert!(AdvertisedHttpRoute::new(
+            &origin,
+            [SocketAddrV6::new(link_local.ip().to_owned(), 1, 0, 0).into()]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn advertised_routes_merge_only_within_the_same_origin() {
+        let implicit = Url::parse("https://music.local").unwrap();
+        let explicit = Url::parse("https://music.local:443/base").unwrap();
+        let first =
+            AdvertisedHttpRoute::new(&implicit, [SocketAddr::from(([192, 0, 2, 2], 443))]).unwrap();
+        let second =
+            AdvertisedHttpRoute::new(&explicit, [SocketAddr::from(([192, 0, 2, 1], 1))]).unwrap();
+        let merged = first.merged_same_origin(&second).expect("same origin");
+        assert_eq!(
+            merged.addresses(),
+            [
+                SocketAddr::from(([192, 0, 2, 1], 443)),
+                SocketAddr::from(([192, 0, 2, 2], 443)),
+            ]
+        );
+
+        let http = AdvertisedHttpRoute::new(
+            &Url::parse("http://music.local:443").unwrap(),
+            [SocketAddr::from(([192, 0, 2, 3], 443))],
+        )
+        .unwrap();
+        assert!(first.merged_same_origin(&http).is_none());
+    }
+
+    #[test]
+    fn resolved_request_accepts_only_a_matching_advertised_route() {
+        let matching = AdvertisedHttpRoute::new(
+            &Url::parse("https://music.local").unwrap(),
+            [SocketAddr::from(([192, 0, 2, 1], 443))],
+        )
+        .unwrap();
+        let request =
+            ResolvedHttpRequest::new(Url::parse("https://music.local/stream?id=track-1").unwrap())
+                .unwrap()
+                .with_advertised_route(matching.clone())
+                .expect("matching route");
+        assert_eq!(request.advertised_route(), Some(&matching));
+
+        let secret_host = format!("{}.invalid", Uuid::new_v4());
+        let mismatched = AdvertisedHttpRoute::new(
+            &Url::parse(&format!("https://{secret_host}")).unwrap(),
+            [SocketAddr::from(([192, 0, 2, 2], 443))],
+        )
+        .unwrap();
+        let Err(error) =
+            ResolvedHttpRequest::new(Url::parse("https://music.local/stream?id=track-2").unwrap())
+                .unwrap()
+                .with_advertised_route(mismatched)
+        else {
+            panic!("mismatched route must be rejected");
+        };
+        let rendered = error.to_string();
+        assert_eq!(
+            rendered,
+            format!("Internal error: {ADVERTISED_ROUTE_ORIGIN_MISMATCH}")
+        );
+        assert!(!rendered.contains(&secret_host));
     }
 }

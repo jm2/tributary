@@ -10,10 +10,11 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::architecture::ResolvedHttpRequest;
+use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
-    authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
+    apply_advertised_http_route, authenticated_client_builder, redact_url_secrets,
+    strip_request_url, validate_base_url,
 };
 
 use super::api::PlexSignInResponse;
@@ -48,6 +49,7 @@ const API_RESPONSE_DEADLINE: Duration = Duration::from_secs(120);
 /// `X-Plex-Token` header pre-configured on every request.
 pub struct PlexClient {
     base_url: Url,
+    advertised_route: Option<AdvertisedHttpRoute>,
     /// The raw auth token, kept for building stream/thumbnail URLs.
     auth_token: String,
     http: Client,
@@ -64,6 +66,15 @@ impl PlexClient {
     /// * `server_url` — Base URL of the Plex server (e.g. `https://plex.example.com:32400`)
     /// * `auth_token` — Plex authentication token (`X-Plex-Token`)
     pub fn new(server_url: &str, auth_token: &str) -> BackendResult<Self> {
+        Self::new_with_route(server_url, auth_token, None)
+    }
+
+    /// Build a client with an immutable address route supplied by discovery.
+    pub fn new_with_route(
+        server_url: &str,
+        auth_token: &str,
+        advertised_route: Option<AdvertisedHttpRoute>,
+    ) -> BackendResult<Self> {
         let base_url = Url::parse(server_url).map_err(|e| BackendError::ConnectionFailed {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
@@ -73,7 +84,7 @@ impl PlexClient {
             source: None,
         })?;
 
-        let http = build_http_client(auth_token)?;
+        let http = build_http_client(auth_token, &base_url, advertised_route.as_ref())?;
 
         info!(
             server = %redact_url_secrets(base_url.as_str()),
@@ -82,6 +93,7 @@ impl PlexClient {
 
         Ok(Self {
             base_url,
+            advertised_route,
             auth_token: auth_token.to_string(),
             http,
         })
@@ -97,6 +109,33 @@ impl PlexClient {
         username: &str,
         password: &str,
     ) -> BackendResult<Self> {
+        Self::authenticate_with_route(server_url, username, password, None).await
+    }
+
+    /// Authenticate via plex.tv, then route only the selected Plex server.
+    pub async fn authenticate_with_route(
+        server_url: &str,
+        username: &str,
+        password: &str,
+        advertised_route: Option<AdvertisedHttpRoute>,
+    ) -> BackendResult<Self> {
+        Self::authenticate_with_route_at(
+            server_url,
+            username,
+            password,
+            advertised_route,
+            PLEX_TV_SIGN_IN,
+        )
+        .await
+    }
+
+    async fn authenticate_with_route_at(
+        server_url: &str,
+        username: &str,
+        password: &str,
+        advertised_route: Option<AdvertisedHttpRoute>,
+        sign_in_url: &str,
+    ) -> BackendResult<Self> {
         let base_url = Url::parse(server_url).map_err(|e| BackendError::ConnectionFailed {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
@@ -105,6 +144,22 @@ impl PlexClient {
             message: message.to_string(),
             source: None,
         })?;
+
+        // Validate the local server's discovery route before constructing a
+        // credential-bearing plex.tv request. The returned builder is
+        // deliberately discarded: this route belongs only to the selected
+        // Plex server and must never be installed on the account client.
+        drop(
+            apply_advertised_http_route(
+                authenticated_client_builder(),
+                &base_url,
+                advertised_route.as_ref(),
+            )
+            .map_err(|message| BackendError::ConnectionFailed {
+                message: message.to_string(),
+                source: None,
+            })?,
+        );
 
         // Build Plex identification headers (no token yet).
         let mut headers = HeaderMap::new();
@@ -144,7 +199,7 @@ impl PlexClient {
         debug!("Plex sign-in request to plex.tv");
 
         let resp = pre_auth_http
-            .post(PLEX_TV_SIGN_IN)
+            .post(sign_in_url)
             .body(form_body)
             .timeout(AUTH_RESPONSE_DEADLINE)
             .send()
@@ -193,10 +248,14 @@ impl PlexClient {
             "Plex authentication successful"
         );
 
-        let http = build_http_client(&auth_token)?;
+        // The discovery route belongs to the selected Plex server. The
+        // account sign-in above intentionally uses the ordinary plex.tv
+        // client and must never inherit this route.
+        let http = build_http_client(&auth_token, &base_url, advertised_route.as_ref())?;
 
         Ok(Self {
             base_url,
+            advertised_route,
             auth_token,
             http,
         })
@@ -242,10 +301,14 @@ impl PlexClient {
         url.set_path(part_key);
         url.set_query(None);
         url.set_fragment(None);
-        ResolvedHttpRequest::new(url)?.with_sensitive_header(
+        let request = ResolvedHttpRequest::new(url)?.with_sensitive_header(
             HeaderName::from_static("x-plex-token"),
             plex_auth_header(&self.auth_token)?,
-        )
+        )?;
+        match &self.advertised_route {
+            Some(route) => request.with_advertised_route(route.clone()),
+            None => Ok(request),
+        }
     }
 
     /// Resolve a thumbnail request with the same credential isolation.
@@ -259,10 +322,14 @@ impl PlexClient {
         url.set_path(thumb_path);
         url.set_query(None);
         url.set_fragment(None);
-        ResolvedHttpRequest::new(url)?.with_sensitive_header(
+        let request = ResolvedHttpRequest::new(url)?.with_sensitive_header(
             HeaderName::from_static("x-plex-token"),
             plex_auth_header(&self.auth_token)?,
-        )
+        )?;
+        match &self.advertised_route {
+            Some(route) => request.with_advertised_route(route.clone()),
+            None => Ok(request),
+        }
     }
 
     /// Issue a GET request to a Plex endpoint and deserialize the
@@ -330,7 +397,11 @@ impl PlexClient {
 }
 
 /// Build a `reqwest::Client` with Plex auth and identification headers.
-fn build_http_client(auth_token: &str) -> BackendResult<Client> {
+fn build_http_client(
+    auth_token: &str,
+    base_url: &Url,
+    advertised_route: Option<&AdvertisedHttpRoute>,
+) -> BackendResult<Client> {
     let mut default_headers = HeaderMap::new();
     default_headers.insert("X-Plex-Token", plex_auth_header(auth_token)?);
     default_headers.insert(
@@ -344,11 +415,16 @@ fn build_http_client(auth_token: &str) -> BackendResult<Client> {
     );
     default_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
-    authenticated_client_builder()
+    let builder = authenticated_client_builder()
         .user_agent(CLIENT_NAME)
         .default_headers(default_headers)
         .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_TIMEOUT)
+        .read_timeout(READ_TIMEOUT);
+    apply_advertised_http_route(builder, base_url, advertised_route)
+        .map_err(|message| BackendError::ConnectionFailed {
+            message: message.to_string(),
+            source: None,
+        })?
         .build()
         .map_err(|e| BackendError::ConnectionFailed {
             message: format!("Failed to build HTTP client: {e}"),
@@ -389,7 +465,16 @@ fn response_body_error(context: &str, error: ResponseBodyError) -> BackendError 
 
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+
     use super::*;
+
+    fn advertised_route(origin: &str) -> AdvertisedHttpRoute {
+        let origin = Url::parse(origin).expect("route origin");
+        AdvertisedHttpRoute::new(&origin, [SocketAddr::from((Ipv4Addr::LOCALHOST, 45_323))])
+            .expect("domain route")
+    }
 
     #[test]
     fn maps_response_body_deadline_to_timeout() {
@@ -441,5 +526,85 @@ mod tests {
                 .expect("auth header");
             assert!(value.is_sensitive());
         }
+    }
+
+    #[test]
+    fn advertised_route_reaches_stream_and_artwork_requests() {
+        let origin = "https://plex.example.test";
+        let route = advertised_route(origin);
+        let client = PlexClient::new_with_route(origin, "route-token", Some(route.clone()))
+            .expect("routed client");
+
+        for request in [
+            client
+                .resolved_stream_request("/library/parts/1/file.flac")
+                .unwrap(),
+            client
+                .resolved_artwork_request("/library/metadata/1/thumb/2")
+                .unwrap(),
+        ] {
+            assert_eq!(request.advertised_route(), Some(&route));
+            assert_eq!(request.endpoint().host_str(), Some("plex.example.test"));
+        }
+
+        let ordinary = PlexClient::new(origin, "token").expect("ordinary client");
+        assert!(ordinary
+            .resolved_stream_request("/library/parts/1/file.flac")
+            .unwrap()
+            .advertised_route()
+            .is_none());
+    }
+
+    #[test]
+    fn mismatched_advertised_route_fails_without_exposing_credentials() {
+        let auth_token = uuid::Uuid::new_v4().to_string();
+        let Err(error) = PlexClient::new_with_route(
+            "https://plex.example.test",
+            &auth_token,
+            Some(advertised_route("https://other.example.test")),
+        ) else {
+            panic!("mismatched route must fail");
+        };
+
+        assert!(!error.to_string().contains(&auth_token));
+    }
+
+    #[tokio::test]
+    async fn mismatched_route_is_rejected_before_plex_tv_receives_credentials() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind sign-in sentinel");
+        listener
+            .set_nonblocking(true)
+            .expect("make sign-in sentinel nonblocking");
+        let sign_in_url = format!(
+            "http://{}/users/sign_in.json",
+            listener.local_addr().expect("sign-in sentinel address")
+        );
+        let username = uuid::Uuid::new_v4().to_string();
+        let password = uuid::Uuid::new_v4().to_string();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            PlexClient::authenticate_with_route_at(
+                "https://plex.example.test",
+                &username,
+                &password,
+                Some(advertised_route("https://other.example.test")),
+                &sign_in_url,
+            ),
+        )
+        .await
+        .expect("route mismatch must fail before sign-in I/O");
+        let Err(error) = outcome else {
+            panic!("mismatched route must fail");
+        };
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("advertised HTTP route does not match"));
+        assert!(!rendered.contains(&username));
+        assert!(!rendered.contains(&password));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == ErrorKind::WouldBlock
+        ));
     }
 }

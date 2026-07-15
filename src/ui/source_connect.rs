@@ -41,6 +41,52 @@ enum RemoteLibrarySnapshot {
     },
 }
 
+/// Registry ownership minted synchronously before a remote task is queued.
+///
+/// Discovery loss can run on the GTK loop immediately after this callback
+/// returns. Registering the attempt first lets that loss invalidate the exact
+/// generation even when Tokio has not polled the network future yet.
+enum RemoteConnectionAttempt {
+    Standard(crate::source_registry::ConnectionAttempt),
+    Daap(crate::daap::session::ConnectionAttempt),
+}
+
+impl RemoteConnectionAttempt {
+    fn is_latest(&self) -> bool {
+        match self {
+            Self::Standard(attempt) => attempt.is_latest(),
+            Self::Daap(attempt) => attempt.is_latest(),
+        }
+    }
+
+    fn into_standard(self) -> crate::source_registry::ConnectionAttempt {
+        match self {
+            Self::Standard(attempt) => attempt,
+            Self::Daap(_) => unreachable!("standard backend received a DAAP connection attempt"),
+        }
+    }
+
+    fn into_daap(self) -> crate::daap::session::ConnectionAttempt {
+        match self {
+            Self::Daap(attempt) => attempt,
+            Self::Standard(_) => {
+                unreachable!("DAAP backend received a standard connection attempt")
+            }
+        }
+    }
+}
+
+fn begin_remote_connection(
+    backend_type: &str,
+    source_key: String,
+) -> Option<RemoteConnectionAttempt> {
+    if backend_type == "daap" {
+        crate::daap::begin_connect(source_key).map(RemoteConnectionAttempt::Daap)
+    } else {
+        crate::source_registry::begin_connect(source_key).map(RemoteConnectionAttempt::Standard)
+    }
+}
+
 enum PlaylistLoadOutcome {
     Loaded(Vec<crate::architecture::models::Track>),
     Missing,
@@ -160,6 +206,43 @@ fn resolve_source_key(explicit_key: &str, server_url: &str, backend_type: &str) 
     } else {
         backend_type.to_string()
     }
+}
+
+/// Admit one authentication-dialog submission against the exact live intent.
+///
+/// Dialogs can outlive navigation changes and mDNS route updates or removal.
+/// The submitted credentials therefore gain authority only when the original
+/// pending request is still current and the exact source row still exists.
+/// Every rejected submission clears only the pending request it owns, leaving
+/// a newer connection attempt untouched.
+fn prepare_remote_auth_submission(
+    pending_connection: &RefCell<Option<PendingConnection>>,
+    source_navigation: &SourceNavigation,
+    connection_request: &SourceRequest,
+    sidebar_store: &gtk::gio::ListStore,
+    server_url: &str,
+    backend_type: &str,
+) -> Option<(u32, SourceObject)> {
+    let owns_pending = pending_connection
+        .borrow()
+        .as_ref()
+        .is_some_and(|pending| pending.request() == connection_request);
+    if !owns_pending {
+        return None;
+    }
+
+    let current_source = source_navigation
+        .is_current(connection_request)
+        .then(|| {
+            super::discovery_handler::remote_source_at(sidebar_store, server_url, backend_type)
+        })
+        .flatten()
+        .filter(|(_, source)| !source.connected() && !source.connecting());
+
+    if current_source.is_none() {
+        *pending_connection.borrow_mut() = None;
+    }
+    current_source
 }
 
 fn restore_pending_selection(
@@ -848,6 +931,7 @@ pub fn setup_source_connect(state: &WindowState) {
         // ── Discovered (unauthenticated) ────────────────────────
         let server_name = src.name();
         let server_url = src.server_url();
+        let advertised_route = src.advertised_route();
         let engine_tx = engine_tx.clone();
         let rt_handle = rt_handle.clone();
         let win = win.clone();
@@ -878,6 +962,13 @@ pub fn setup_source_connect(state: &WindowState) {
         // For passwordless DAAP servers, bypass the dialog entirely
         // and connect directly.
         if backend_type == "daap" && !requires_password {
+            // Mint ownership before queuing the task. A final mDNS Lost event
+            // can now invalidate this generation even if Tokio has not yet
+            // started the handshake.
+            let Some(attempt) = crate::daap::begin_connect(url_for_closure.clone()) else {
+                tracing::debug!("Skipping DAAP connect during shutdown");
+                return;
+            };
             *pending_connection.borrow_mut() = Some(PendingConnection::new(
                 url_for_closure.clone(),
                 connection_request.clone(),
@@ -906,22 +997,25 @@ pub fn setup_source_connect(state: &WindowState) {
             let pending_for_fail = pending_connection.clone();
             let navigation_for_fail = source_navigation.clone();
             let request_for_fail = connection_request.clone();
+            let url_for_fail = url_for_closure.clone();
             glib::MainContext::default().spawn_local(async move {
                 if fail_rx.recv().await.is_ok() {
-                    if let Some(src) = sidebar_store_for_fail
-                        .item(selected_pos)
-                        .and_downcast_ref::<SourceObject>()
-                    {
-                        src.set_connecting(false);
-                        let src = src.clone();
-                        sidebar_store_for_fail.remove(selected_pos);
-                        sidebar_store_for_fail.insert(selected_pos, &src);
-                    }
                     let owns_pending = pending_for_fail
                         .borrow()
                         .as_ref()
                         .is_some_and(|pending| pending.request() == &request_for_fail);
                     if owns_pending {
+                        if let Some((position, source)) =
+                            super::discovery_handler::remote_source_at(
+                                &sidebar_store_for_fail,
+                                &url_for_fail,
+                                "daap",
+                            )
+                        {
+                            source.set_connecting(false);
+                            sidebar_store_for_fail.remove(position);
+                            sidebar_store_for_fail.insert(position, &source);
+                        }
                         *pending_for_fail.borrow_mut() = None;
                         if navigation_for_fail.borrow().is_current(&request_for_fail) {
                             sel_for_fail.set_selected(pre_sel);
@@ -935,31 +1029,34 @@ pub fn setup_source_connect(state: &WindowState) {
             let pending_for_auth = pending_connection.clone();
             let navigation_for_auth = source_navigation.clone();
             let request_for_auth = connection_request.clone();
+            let url_for_auth = url_for_closure.clone();
             glib::MainContext::default().spawn_local(async move {
                 if auth_needed_rx.recv().await.is_ok() {
-                    // Clear connecting state and flip requires_password so the
-                    // re-fired selection lands in the auth-dialog branch.
-                    if let Some(src) = sidebar_store_for_auth
-                        .item(selected_pos)
-                        .and_downcast_ref::<SourceObject>()
-                    {
-                        src.set_connecting(false);
-                        src.set_requires_password(true);
-                        let src = src.clone();
-                        sidebar_store_for_auth.remove(selected_pos);
-                        sidebar_store_for_auth.insert(selected_pos, &src);
-                    }
                     let owns_pending = pending_for_auth
                         .borrow()
                         .as_ref()
                         .is_some_and(|pending| pending.request() == &request_for_auth);
                     if owns_pending {
+                        let Some((position, source)) = super::discovery_handler::remote_source_at(
+                            &sidebar_store_for_auth,
+                            &url_for_auth,
+                            "daap",
+                        ) else {
+                            *pending_for_auth.borrow_mut() = None;
+                            return;
+                        };
+                        // Clear connecting state and flip requires_password so
+                        // the re-fired selection lands in the dialog branch.
+                        source.set_connecting(false);
+                        source.set_requires_password(true);
+                        sidebar_store_for_auth.remove(position);
+                        sidebar_store_for_auth.insert(position, &source);
                         *pending_for_auth.borrow_mut() = None;
                         if navigation_for_auth.borrow().is_current(&request_for_auth) {
                             // Setting the same position is a no-op in
                             // GtkSingleSelection, so deselect then reselect.
                             sel_for_auth.set_selected(gtk::INVALID_LIST_POSITION);
-                            sel_for_auth.set_selected(selected_pos);
+                            sel_for_auth.set_selected(position);
                         }
                     }
                 }
@@ -968,13 +1065,21 @@ pub fn setup_source_connect(state: &WindowState) {
             let engine_tx = engine_tx.clone();
             let server_url = url_for_closure.clone();
             let server_name = name_for_closure.clone();
+            let advertised_route = advertised_route.clone();
             rt_handle.spawn(async move {
                 info!("Connecting to passwordless DAAP server...");
-                let Some(attempt) = crate::daap::begin_connect(server_url.clone()) else {
-                    tracing::debug!("Skipping DAAP connect during shutdown");
+                if !attempt.is_latest() {
+                    tracing::debug!("Skipping withdrawn DAAP connection attempt");
                     return;
-                };
-                match crate::daap::DaapBackend::connect(&server_name, &server_url, None).await {
+                }
+                match crate::daap::DaapBackend::connect_with_route(
+                    &server_name,
+                    &server_url,
+                    None,
+                    advertised_route,
+                )
+                .await
+                {
                     Ok(backend) => {
                         let Some(session) = attempt.retain(backend).await else {
                             tracing::debug!("DAAP connect was superseded");
@@ -1078,25 +1183,46 @@ pub fn setup_source_connect(state: &WindowState) {
                 let backend_type = backend_type.clone();
                 let connection_request = connection_request.clone();
 
+                // Discovery may update or withdraw the route while the user
+                // is typing. A dialog response owns no authority by itself:
+                // require the original pending/navigation intent and snapshot
+                // the exact current row only at submission time.
+                let Some((current_pos, submitted_source)) = prepare_remote_auth_submission(
+                    &pending_for_auth,
+                    &navigation_for_submit.borrow(),
+                    &connection_request,
+                    &sidebar_store,
+                    &server_url,
+                    &backend_type,
+                ) else {
+                    tracing::debug!(
+                        "Ignoring stale, withdrawn, or duplicate authentication submission"
+                    );
+                    return;
+                };
+                let advertised_route = submitted_source.advertised_route();
+                let Some(connection_attempt) =
+                    begin_remote_connection(&backend_type, server_url.clone())
+                else {
+                    // Controlled shutdown closed the registry. The submission
+                    // still owns this exact pending guard, so release it
+                    // without touching a newer attempt.
+                    *pending_for_auth.borrow_mut() = None;
+                    tracing::debug!("Skipping remote connect during shutdown");
+                    return;
+                };
+
                 // Mark as connecting → spinner in sidebar.
-                if let Some(src) = sidebar_store
-                    .item(selected_pos)
-                    .and_downcast_ref::<SourceObject>()
-                {
-                    src.set_connecting(true);
-                    let src = src.clone();
-                    sidebar_store.remove(selected_pos);
-                    sidebar_store.insert(selected_pos, &src);
-                }
-                *pending_for_auth.borrow_mut() = Some(PendingConnection::new(
-                    server_url.clone(),
-                    connection_request.clone(),
-                ));
+                submitted_source.set_connecting(true);
+                sidebar_store.remove(current_pos);
+                sidebar_store.insert(current_pos, &submitted_source);
 
                 // One-shot to signal failure back to the main thread so we
                 // can clear the spinner (GObjects are not Send).
                 let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
                 let sidebar_store_for_fail = sidebar_store.clone();
+                let backend_for_fail = backend_type.clone();
+                let url_for_fail = server_url.clone();
                 let sel_for_fail = sel_for_auth.clone();
                 let pre_sel = pre_connect_for_auth.get();
                 let pending_for_fail = pending_for_auth.clone();
@@ -1104,20 +1230,22 @@ pub fn setup_source_connect(state: &WindowState) {
                 let request_for_fail = connection_request.clone();
                 glib::MainContext::default().spawn_local(async move {
                     if fail_rx.recv().await.is_ok() {
-                        if let Some(src) = sidebar_store_for_fail
-                            .item(selected_pos)
-                            .and_downcast_ref::<SourceObject>()
-                        {
-                            src.set_connecting(false);
-                            let src = src.clone();
-                            sidebar_store_for_fail.remove(selected_pos);
-                            sidebar_store_for_fail.insert(selected_pos, &src);
-                        }
                         let owns_pending = pending_for_fail
                             .borrow()
                             .as_ref()
                             .is_some_and(|pending| pending.request() == &request_for_fail);
                         if owns_pending {
+                            if let Some((position, source)) =
+                                super::discovery_handler::remote_source_at(
+                                    &sidebar_store_for_fail,
+                                    &url_for_fail,
+                                    &backend_for_fail,
+                                )
+                            {
+                                source.set_connecting(false);
+                                sidebar_store_for_fail.remove(position);
+                                sidebar_store_for_fail.insert(position, &source);
+                            }
                             *pending_for_fail.borrow_mut() = None;
                             if navigation_for_fail.borrow().is_current(&request_for_fail) {
                                 sel_for_fail.set_selected(pre_sel);
@@ -1127,21 +1255,25 @@ pub fn setup_source_connect(state: &WindowState) {
                 });
 
                 rt_handle.spawn(async move {
+                    if !connection_attempt.is_latest() {
+                        tracing::debug!(
+                            backend = %backend_type,
+                            "Skipping withdrawn remote connection attempt"
+                        );
+                        return;
+                    }
                     let result: Result<
                         Option<RemoteLibrarySnapshot>,
                         crate::architecture::error::BackendError,
                     > = match backend_type.as_str() {
                         "jellyfin" => {
                             info!("Authenticating with Jellyfin...");
-                            let Some(attempt) =
-                                crate::source_registry::begin_connect(server_url.clone())
-                            else {
-                                return;
-                            };
-                            match crate::jellyfin::client::JellyfinClient::authenticate(
+                            let attempt = connection_attempt.into_standard();
+                            match crate::jellyfin::client::JellyfinClient::authenticate_with_route(
                                 &server_url,
                                 &user,
                                 &pass,
+                                advertised_route.clone(),
                             )
                             .await
                             {
@@ -1176,15 +1308,12 @@ pub fn setup_source_connect(state: &WindowState) {
                         }
                         "plex" => {
                             info!("Authenticating with Plex...");
-                            let Some(attempt) =
-                                crate::source_registry::begin_connect(server_url.clone())
-                            else {
-                                return;
-                            };
-                            match crate::plex::client::PlexClient::authenticate(
+                            let attempt = connection_attempt.into_standard();
+                            match crate::plex::client::PlexClient::authenticate_with_route(
                                 &server_url,
                                 &user,
                                 &pass,
+                                advertised_route.clone(),
                             )
                             .await
                             {
@@ -1224,48 +1353,44 @@ pub fn setup_source_connect(state: &WindowState) {
                             } else {
                                 Some(pass.as_str())
                             };
-                            match crate::daap::begin_connect(server_url.clone()) {
-                                None => Ok(None),
-                                Some(attempt) => match crate::daap::DaapBackend::connect(
-                                    &server_name,
-                                    &server_url,
-                                    password,
-                                )
-                                .await
-                                {
-                                    Ok(backend) => match attempt.retain(backend).await {
-                                        Some(session) => {
-                                            let tracks = session.all_tracks().await;
-                                            if session.is_current() {
-                                                Ok(Some(RemoteLibrarySnapshot::Daap {
-                                                    tracks,
-                                                    generation: session.generation(),
-                                                    session_key: session.session_key(),
-                                                }))
-                                            } else {
-                                                Ok(None)
-                                            }
+                            let attempt = connection_attempt.into_daap();
+                            match crate::daap::DaapBackend::connect_with_route(
+                                &server_name,
+                                &server_url,
+                                password,
+                                advertised_route.clone(),
+                            )
+                            .await
+                            {
+                                Ok(backend) => match attempt.retain(backend).await {
+                                    Some(session) => {
+                                        let tracks = session.all_tracks().await;
+                                        if session.is_current() {
+                                            Ok(Some(RemoteLibrarySnapshot::Daap {
+                                                tracks,
+                                                generation: session.generation(),
+                                                session_key: session.session_key(),
+                                            }))
+                                        } else {
+                                            Ok(None)
                                         }
-                                        None => Ok(None),
-                                    },
-                                    Err(_) if !attempt.is_latest() => Ok(None),
-                                    Err(error) => Err(error),
+                                    }
+                                    None => Ok(None),
                                 },
+                                Err(_) if !attempt.is_latest() => Ok(None),
+                                Err(error) => Err(error),
                             }
                         }
                         _ => {
                             // Default: Subsonic
                             info!("Authenticating with Subsonic...");
-                            let Some(attempt) =
-                                crate::source_registry::begin_connect(server_url.clone())
-                            else {
-                                return;
-                            };
-                            match crate::subsonic::SubsonicBackend::connect(
+                            let attempt = connection_attempt.into_standard();
+                            match crate::subsonic::SubsonicBackend::connect_with_route(
                                 &server_name,
                                 &server_url,
                                 &user,
                                 &pass,
+                                advertised_route.clone(),
                             )
                             .await
                             {
@@ -1379,13 +1504,18 @@ fn enumerate_device_audio_files(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
 
+    use url::Url;
+
     use crate::architecture::error::BackendError;
+    use crate::architecture::AdvertisedHttpRoute;
 
     use super::{
-        enumerate_device_audio_files, remote_failure_category, resolve_source_key,
-        RemoteFailureCategory,
+        enumerate_device_audio_files, prepare_remote_auth_submission, remote_failure_category,
+        resolve_source_key, PendingConnection, RemoteFailureCategory, SourceNavigation,
     };
 
     #[test]
@@ -1401,6 +1531,98 @@ mod tests {
         assert_eq!(resolve_source_key("", "", "radio-topvote"), "radio-topvote");
         assert_eq!(resolve_source_key("", "", "local"), "local");
         assert_eq!(resolve_source_key("", "", ""), "local");
+    }
+
+    fn advertised_route(address: &str) -> AdvertisedHttpRoute {
+        AdvertisedHttpRoute::new(
+            &Url::parse("http://mini.local:4533").expect("route origin"),
+            [address.parse::<SocketAddr>().expect("route address")],
+        )
+        .expect("advertised route")
+    }
+
+    #[test]
+    fn auth_submission_snapshots_the_current_discovery_route() {
+        let store = gtk::gio::ListStore::new::<super::SourceObject>();
+        let source = super::SourceObject::manual("Subsonic", "subsonic", "http://mini.local:4533");
+        source.set_advertised_route(Some(advertised_route("127.0.0.1:1")));
+        store.append(&source);
+
+        let mut navigation = SourceNavigation::new("local");
+        let request = navigation.select("http://mini.local:4533");
+        let pending = RefCell::new(Some(PendingConnection::new(
+            "http://mini.local:4533",
+            request.clone(),
+        )));
+
+        let refreshed_route = advertised_route("127.0.0.2:2");
+        source.set_advertised_route(Some(refreshed_route.clone()));
+        let (_, admitted) = prepare_remote_auth_submission(
+            &pending,
+            &navigation,
+            &request,
+            &store,
+            "HTTP://MINI.LOCAL:4533/",
+            "subsonic",
+        )
+        .expect("current submission");
+
+        assert_eq!(admitted.advertised_route(), Some(refreshed_route));
+        assert!(pending.borrow().is_some());
+    }
+
+    #[test]
+    fn stale_or_withdrawn_auth_submission_releases_only_its_own_guard() {
+        let store = gtk::gio::ListStore::new::<super::SourceObject>();
+        let mut navigation = SourceNavigation::new("local");
+        let stale = navigation.select("http://mini.local:4533");
+        let pending = RefCell::new(Some(PendingConnection::new(
+            "http://mini.local:4533",
+            stale.clone(),
+        )));
+        navigation.select("local");
+
+        assert!(prepare_remote_auth_submission(
+            &pending,
+            &navigation,
+            &stale,
+            &store,
+            "http://mini.local:4533",
+            "subsonic",
+        )
+        .is_none());
+        assert!(pending.borrow().is_none());
+
+        let old = navigation.select("http://mini.local:4533");
+        let newer = navigation.select("http://mini.local:4533");
+        *pending.borrow_mut() = Some(PendingConnection::new(
+            "http://mini.local:4533",
+            newer.clone(),
+        ));
+        assert!(prepare_remote_auth_submission(
+            &pending,
+            &navigation,
+            &old,
+            &store,
+            "http://mini.local:4533",
+            "subsonic",
+        )
+        .is_none());
+        assert_eq!(
+            pending.borrow().as_ref().map(PendingConnection::request),
+            Some(&newer)
+        );
+
+        assert!(prepare_remote_auth_submission(
+            &pending,
+            &navigation,
+            &newer,
+            &store,
+            "http://mini.local:4533",
+            "subsonic",
+        )
+        .is_none());
+        assert!(pending.borrow().is_none());
     }
 
     #[test]

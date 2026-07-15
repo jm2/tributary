@@ -5,6 +5,7 @@
 //! - Fetching remote album art URLs (Subsonic, Jellyfin, Plex cover art)
 //! - A persistent background worker thread with generation-based staleness detection
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -12,6 +13,7 @@ use gtk::glib;
 
 const REMOTE_ART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_REMOTE_ART_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_ROUTED_ART_CLIENTS: usize = 64;
 
 /// Global generation counter for album art requests.  Incremented on
 /// every track change; the worker checks this before sending results
@@ -46,10 +48,10 @@ struct ArtRequest {
 /// Remote artwork input. Deliberately not `Debug`: the resolved variant owns
 /// authentication material that must remain inside Tributary's fetch worker.
 enum ArtSource {
-    /// Legacy/direct URL path (including DAAP's just-in-time session URL).
+    /// Ordinary credential-free URL path.
     Url(String),
     /// Credential-isolated request produced by a retained remote source.
-    Resolved(crate::architecture::media::ResolvedHttpRequest),
+    Resolved(Box<crate::architecture::media::ResolvedHttpRequest>),
 }
 
 impl ArtSource {
@@ -72,7 +74,7 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
         // Build before spawning so a policy-construction failure disables
         // remote artwork instead of silently restoring reqwest's permissive
         // default redirect and Referer behavior.
-        let client = match crate::http_security::authenticated_blocking_client_builder()
+        let default_client = match crate::http_security::authenticated_blocking_client_builder()
             .timeout(REMOTE_ART_TIMEOUT)
             .build()
         {
@@ -88,6 +90,10 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
         let spawn_result = std::thread::Builder::new()
             .name("art-worker".into())
             .spawn(move || {
+                let mut routed_clients = HashMap::<
+                    crate::architecture::AdvertisedHttpRoute,
+                    reqwest::blocking::Client,
+                >::new();
                 while let Ok(req) = rx.recv() {
                     // Check if this request is still current before fetching.
                     if ART_GENERATION.load(Ordering::Relaxed) != req.generation {
@@ -99,8 +105,26 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
                     }
 
                     let request = match &req.source {
-                        ArtSource::Url(url) => client.get(url),
+                        ArtSource::Url(url) => default_client.get(url),
                         ArtSource::Resolved(resolved) => {
+                            let client = match resolved.advertised_route() {
+                                None => default_client.clone(),
+                                Some(route) => match routed_clients.get(route) {
+                                    Some(client) => client.clone(),
+                                    None => {
+                                        let Some(client) =
+                                            build_routed_art_client(resolved.endpoint(), route)
+                                        else {
+                                            continue;
+                                        };
+                                        if routed_clients.len() >= MAX_ROUTED_ART_CLIENTS {
+                                            routed_clients.clear();
+                                        }
+                                        routed_clients.insert(route.clone(), client.clone());
+                                        client
+                                    }
+                                },
+                            };
                             let mut endpoint = resolved.endpoint().clone();
                             {
                                 let mut query = endpoint.query_pairs_mut();
@@ -443,7 +467,29 @@ pub fn fetch_resolved_album_art(
     if !generation_is_current(generation) || !request.is_active() {
         return;
     }
-    enqueue_remote_album_art(image, ArtSource::Resolved(request), generation);
+    enqueue_remote_album_art(image, ArtSource::Resolved(Box::new(request)), generation);
+}
+
+fn build_routed_art_client(
+    endpoint: &url::Url,
+    route: &crate::architecture::AdvertisedHttpRoute,
+) -> Option<reqwest::blocking::Client> {
+    let builder =
+        crate::http_security::authenticated_blocking_client_builder().timeout(REMOTE_ART_TIMEOUT);
+    let Ok(builder) =
+        crate::http_security::apply_advertised_http_route_blocking(builder, endpoint, Some(route))
+    else {
+        tracing::warn!("Failed to apply advertised route to album art client");
+        return None;
+    };
+    match builder.build() {
+        Ok(client) => Some(client),
+        Err(error) => {
+            let error = crate::http_security::strip_request_url(error);
+            tracing::warn!(%error, "Failed to build routed album art HTTP client");
+            None
+        }
+    }
 }
 
 fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, generation: u64) {

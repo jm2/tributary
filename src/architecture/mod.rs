@@ -10,4 +10,4 @@ pub mod media;
 pub mod models;
 
 pub use backend::MediaBackend;
-pub use media::{RemoteMediaResolver, ResolvedHttpRequest};
+pub use media::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest};

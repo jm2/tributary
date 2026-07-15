@@ -31,7 +31,7 @@ has five independently verifiable tasks rather than the original three compound 
 denominator excludes the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**160/220 (72.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **43/76 P2**,
+**161/220 (73.2%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **44/76 P2**,
 and **3/30 P3** after those exclusions. The release-workflow dry run remains deliberately deferred
 rather than being counted as unfinished P0 remediation.
 
@@ -119,7 +119,7 @@ before final in-transaction validation, the mutation rolls back and publishes no
 - [x] Retain the connected backend/session for as long as the source is connected.
 - [x] Remove logout network activity from `DaapBackend::drop`.
 - [x] Populate and/or replace the explicit disconnect path with owned backend shutdown.
-- [x] Resolve stream/artwork URLs from the live session at playback time.
+- [x] Resolve stream/artwork from the live session at playback time.
 - [x] Add a mock DAAP lifecycle test covering connect, sync, play, and disconnect.
 - [x] Record implementation: PR #68; 7 focused lifecycle and
   replacement-race tests.
@@ -282,20 +282,20 @@ explicitly justified and time-bounded.
 This began as the tracker's highest live credential exposure. It is not limited to broad bearer
 tokens: Subsonic's legacy compatibility mode ultimately needs `p=enc:<hex_password>` on the
 upstream request — the user's password, hex-encoded and trivially reversible. The completed design
-keeps that material, Subsonic token/salt authentication, the Plex token, and the Jellyfin token out
-of generic catalogue and GTK values as well as every receiver. Playback credential material stays
-inside the retained backend client/resolver and is materialized for media only in the app-owned
-proxy's immediate exact-origin upstream request.
+keeps that material, Subsonic token/salt authentication, the Plex and Jellyfin tokens, and DAAP's
+bearer session ID out of generic catalogue and GTK values as well as every receiver. Playback
+credential material stays inside the retained backend client/resolver and is materialized for
+media only in the app-owned proxy's immediate exact-origin upstream request.
 
 Confirmed path, end to end:
 
 | Step | Location |
 |---|---|
 | Generic catalogue | Subsonic, Jellyfin, and Plex tracks keep `stream_url` and `cover_art_url` empty. Their backend caches retain backend-native stream locators and track-only artwork locators keyed by deterministic app track UUID, so a type-local album/artist ID cannot overwrite track art. DAAP continues to publish its already-credential-free live-session references. |
-| Source ownership | `source_registry.rs` retains an `Arc<dyn RemoteMediaResolver>` behind an exact source generation, random lease UUID, and revocable `MediaLease`. A replacement, release, discovery removal, manual deletion, or shutdown invalidates old references and already-resolved requests. DAAP retains its stateful session in its existing generation-scoped registry. |
+| Source ownership | `source_registry.rs` retains an `Arc<dyn RemoteMediaResolver>` behind an exact source generation, random lease UUID, and revocable `MediaLease`. A replacement, release, discovery removal, manual deletion, or shutdown invalidates old references and already-resolved requests. DAAP retains its stateful session in its existing generation-scoped registry and now attaches the same revocable-request guarantee to media issued by that session. |
 | GTK publication | A current standard-remote sync is converted to `tributary-remote://<lease>/{stream,artwork}/<track-uuid>`. The reference contains no source address, backend-native ID, or credential; a queued sync is rejected unless its generation and lease still own that source. |
-| Playback and artwork | `ui/playback.rs` resolves the exact opaque reference only when the item is consumed. Playback generations reject a result completed after Stop, Next, output replacement, or a newer replay; artwork repeats generation and lease checks before and after its worker fetch. |
-| Credential isolation | `ResolvedHttpRequest` is deliberately non-debuggable and non-serializable. Plex uses a sensitive `X-Plex-Token` header and Jellyfin a sensitive `X-Emby-Authorization` header. Subsonic protocol authentication remains private query material (`u` plus `t`/`s` or HTTPS-only `p`) and is appended only inside the app-owned proxy immediately before the exact-origin fetch. |
+| Playback and artwork | `ui/playback.rs` resolves the exact opaque standard or DAAP reference only when the item is consumed. Playback generations reject a result completed after Stop, Next, output replacement, or a newer replay; artwork repeats generation and lease checks before and after its worker fetch. |
+| Credential isolation | `ResolvedHttpRequest` is deliberately non-debuggable and non-serializable. Plex uses a sensitive `X-Plex-Token` header and Jellyfin a sensitive `X-Emby-Authorization` header. Subsonic protocol authentication remains private query material (`u` plus `t`/`s` or HTTPS-only `p`), and DAAP's bearer `session-id` is now private query material too; each is appended only inside the app-owned proxy immediately before the exact-origin fetch. |
 | Output boundary | `AudioOutput::load_resolved` accepts the typed request. Chromecast, MPD, local GStreamer, and AirPlay exchange it for their existing opaque, receiver-reachable tickets; none can fall back to the clean endpoint or serialized credential state. |
 
 The opaque source reference and the output ticket are separate capabilities. The first identifies
@@ -348,10 +348,12 @@ proxies. All ticket routes use OS-assigned ports and unguessable UUIDs.
   longer retain stream or artwork URLs; `RemoteMediaResolver::resolve_stream` and
   `resolve_artwork` translate a stable app track UUID through backend-private native locators only
   when playback/artwork is consumed. `ResolvedHttpRequest` separates the credential-free endpoint
-  from Plex/Jellyfin sensitive headers and Subsonic's protocol-required private query pairs. Only
-  the app-owned exact-origin proxy materializes those fields. The generation/lease registry and
-  opaque UI references implement the corresponding remote portion of P3.1 rather than creating a
-  second resolver later.
+  from Plex/Jellyfin sensitive headers, Subsonic's protocol-required private query pairs, and
+  DAAP's bearer `session-id`. Only the app-owned exact-origin proxy materializes those fields.
+  DAAP's sibling stateful registry now resolves through this same typed boundary and revokes
+  already-issued requests on replacement, release, discovery loss, or shutdown. The
+  generation/lease registry and opaque UI references implement the corresponding remote portion
+  of P3.1 rather than creating a second resolver later.
 - [x] Give credential-bearing upstream tickets a hard, absolute, non-sliding 24-hour TTL in
   addition to lifecycle revocation. A ticket is live only before its monotonic deadline; at the
   deadline an atomic lookup removes it and returns the same 404 as a revoked or unknown route.
@@ -374,12 +376,16 @@ proxies. All ticket routes use OS-assigned ports and unguessable UUIDs.
   publishing an opaque reference that can only fail, and searches later media/part entries before
   declaring a track unplayable. Locator, bitrate, and format now come from the same selected media
   entry; 2 focused tests cover missing, empty, and later valid locators and metadata alignment.
+  The P2.11 retained-route follow-up on the current branch converts DAAP's live URL materialization
+  into a typed, private-query, lease-bearing request without changing its credential-free
+  catalogue reference; PR #97.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
 device or daemon Tributary does not own, retained in a generic catalogue/UI value, or serialized
 through an output boundary. **Complete:** standard remote tracks and GTK rows contain only stable
-identity plus opaque lease references; DAAP retains its credential-free live-session references;
-all protected playback/artwork requests resolve through the current app-owned session and proxy;
+identity plus opaque lease references; DAAP retains credential-free live-session references whose
+bearer ID is isolated only in a typed, revocable request at consumption time; all protected
+playback/artwork requests resolve through the current app-owned session and proxy;
 and Chromecast, MPD, local GStreamer, and AirPlay receive only their scoped tickets. P1.4 and P1.6
 are complete.
 
@@ -915,7 +921,12 @@ then failed through the same shared path. Both backends converge on a dedicated 
 so this evidence de-prioritizes backend authentication and catalog parsing. The code audit found
 two independent defects at that boundary: `souphttpsrc` could apply an ambient proxy even to the
 loopback ticket, and each ticket server discarded the previous media client's pool while waiting
-without distinct upstream connect/header/body-idle deadlines or useful safe diagnostics.
+without distinct upstream connect/header/body-idle deadlines or useful safe diagnostics. The
+follow-up audit identified an additional shared resolver dependency: discovery discarded the
+addresses received with the mDNS record, so catalogue/API access and the later protected fetch
+independently re-resolved a `.local` hostname. The live Windows sequence is consistent with that
+risk—the first Subsonic API attempt timed out, its retry succeeded, and both Subsonic and DAAP later
+failed through the separately resolved media path—but did not prove DNS was the cause.
 
 - [x] Reuse one credential-free upstream client per GStreamer output across per-track ticket
   servers. Bound connect establishment at 5 seconds, dispatch through response headers at 10
@@ -939,20 +950,48 @@ without distinct upstream connect/header/body-idle deadlines or useful safe diag
   ambient proxy receives nothing. Two catalog-wide checks also prove the new user-facing error
   categories are translated without fallback and interpolate backend names in every supported
   locale. Thirteen focused additions cover this urgent slice.
-- [ ] Preserve addresses supplied by mDNS discovery for API and protected-media connection routing
-  without changing the URL hostname, HTTP `Host`, or TLS identity. Add injected stalled-DNS and
-  advertised-address/hostname regressions; do not globally disable proxies for the upstream server.
+- [x] Preserve addresses supplied by mDNS discovery for API and protected-media connection routing
+  without changing the URL hostname, HTTP `Host`, or TLS identity. Discovery now keys exact service
+  fullnames, preserves the authoritative SRV hostname, treats Avahi conflict-suffix cleanup as
+  display-only, applies scheme-correct default ports, retains scoped address candidates, aggregates
+  duplicate instances by exact origin, publishes address-only updates, and emits `Lost` only after
+  the final retained matching instance disappears within the discovery bounds. The route is
+  bounded, canonical, exact-origin, and
+  ephemeral on `SourceObject`; it is never persisted or used as source identity. Each connection
+  generation snapshots it immutably into the applicable API/auth client and typed stream/artwork
+  requests. Current mDNS discovery supplies routes for Subsonic, Plex, and DAAP. Jellyfin's client
+  accepts the same route contract, but Jellyfin UDP discovery supplies only a URL and therefore has
+  no advertised-address route today. DAAP now isolates `session-id` as private query material and
+  attaches a revocable session lease instead of reconstructing an authenticated URL. Protected
+  playback and album art keep immutable route-keyed pools; reqwest's `resolve_to_addrs` changes only
+  direct socket selection, so the hostname, HTTP authority, TLS SNI/certificate identity,
+  exact-origin redirect policy, and legitimate system/explicit proxy behavior remain unchanged.
+  The unchanged hostname structurally preserves TLS identity; the automated suite does not perform
+  a real certificate/SNI handshake. Unauthenticated discovery state is indexed by origin and
+  bounded to 512 total publications, 32 instances per exact origin, and 16 retained route
+  addresses, keeping each update's aggregation work bounded. Thirty newly authored focused tests
+  cover canonical and scoped routes, bounded duplicate/update/removal and cross-backend ownership,
+  exact-origin mismatch, backend client/media propagation, auth-attempt route snapshots, injected
+  stalled-resolver `Host`, the blocking-client path, explicit-proxy preservation, and final-loss
+  invalidation before queued network work starts. The existing DAAP lifecycle regression
+  additionally proves that release revokes an already-issued request, while the upgraded
+  cast-proxy integration regression routes an unresolvable advertised hostname to its captured
+  address and proves the exact `Host`, upstream-only authentication, receiver-header filtering,
+  opaque ticket, and post-revocation 404 contract. Implemented in PR #97.
 - [ ] Run full fake Subsonic and DAAP streams through GStreamer (reusing these timeout/proxy
   fixtures), confirm the packaged Windows source plugin enforces the same direct policy, and record
   live packaged-Windows playback. Support a verified alternate HTTP source or continue to fail
-  closed if a package lacks `souphttpsrc`.
+  closed if a package lacks `souphttpsrc`. Include strict DAAP media-header and reverse-proxy
+  base-path fixtures, a Subsonic HTTP-200 error-envelope fixture, and a proxy-selected-upstream case
+  so the remaining compatibility and diagnostic gaps are either fixed or explicitly bounded before
+  this milestone closes.
 
 Acceptance criteria: a protected remote load either begins playback or produces a phase-specific,
 URL-free failure before the downstream source times out; a loopback ticket never visits a configured
 external proxy; and logs can distinguish transport, upstream HTTP, decoder, and sink categories
-without exposing credentials or filesystem paths. The urgent shared-path implementation and
-deterministic proxy proof are complete; retained mDNS routing and packaged end-to-end validation
-remain open, so P2.11 is not yet closed as a milestone.
+without exposing credentials or filesystem paths. The urgent shared-path implementation,
+deterministic proxy proof, and retained mDNS routing are complete: four of five P2.11 tasks are
+closed. Packaged end-to-end validation remains open, so P2.11 is not yet closed as a milestone.
 
 ## P3 — Architecture and integration coverage
 
@@ -1042,22 +1081,24 @@ by P2.6. PR #94's containerized Flatpak build proved the manifest-local source g
 permission policy, but a local installed interactive portal/physical-media smoke pass remains
 outstanding, as does the deliberately deferred live release-workflow run.
 
-Most recent milestone validation (2026-07-15, P2.11 protected-playback urgent slice): `cargo fmt`,
-`cargo check --all-targets --all-features`, and strict all-target/all-feature Clippy pass in debug
-and release. Both profiles pass 18 library plus 598 application tests (616 per profile). Thirteen
-focused additions cover accepted connections without headers, deterministic immediate transport
-failure, preserved
-upstream statuses, failed/stalled/active response bodies, exact ticket-shape validation,
-`source-setup` enforcement, secret-free diagnostics, typed remote-error classification, and an
-isolated real-GStreamer child process whose poisoned ambient proxy receives no request while the
-loopback ticket fixture does. The remote and playback categories resolve native translations in
-all 13 locale catalogs, with catalog-wide no-fallback and backend-interpolation checks. Every locale
-catalog parses; `git diff --check`, AppStream
-validation, and the synchronized 0.5.0 release entry pass; and `cargo audit --no-fetch` reports
-exactly the two accepted unmaintained warnings recorded under P0.8. The unchanged desktop validator
-diagnostic remains tracked under P2.6. Retained mDNS address routing, packaged Windows/full-backend
-playback, interactive reauthorization, Flatpak portal behavior, and physical-media validation remain
-open local/integration tasks.
+Most recent branch validation (2026-07-15, P2.11 retained mDNS routing slice):
+`cargo check --all-targets`, strict `cargo clippy --all-targets --all-features -- -D warnings`, and
+strict `cargo clippy --release -- -D warnings` pass. Debug and release
+`cargo test --all-targets` pass 18 library plus 628 application tests (646 per profile). The current
+diff adds 30 tests covering canonical/scoped exact-origin routes; bounded mDNS duplicate, update,
+removal, spelling, and cross-backend ownership; async and blocking stalled-resolver bypass with the
+original HTTP `Host`; explicit-proxy preservation; Subsonic, Jellyfin, Plex, and DAAP request
+propagation; Plex sign-in isolation; ephemeral source identity; and auth-attempt route snapshots,
+stale-guard release, and final-loss invalidation before queued network work begins. Existing DAAP
+lifecycle and cast-proxy integration regressions were strengthened to cover request revocation and
+routed end-to-end Host/auth/header/ticket behavior. The earlier urgent slice
+remains covered by its 13 proxy, timeout, diagnostic, translation, and real-GStreamer
+poisoned-proxy regressions. `cargo fmt --all -- --check`, every locale-catalog YAML parse,
+`git diff --check`, and AppStream validation pass; `cargo audit --no-fetch` passes with exactly the
+two accepted unmaintained warnings recorded under P0.8. `desktop-file-validate` still reports only
+the known `AudioVideo` category diagnostic tracked under P2.6. Packaged Windows/full-backend
+playback, interactive reauthorization, Flatpak portal behavior, and physical-media validation
+remain open local/integration tasks; the release workflow remains deliberately deferred.
 
 **This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
 hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
@@ -1422,10 +1463,14 @@ Record scope or design decisions here so deferred work is explicit.
   the protected upstream fetch may still use a legitimate configured proxy. `souphttpsrc` needs
   `direct://`, not an empty proxy property: under libsoup3 an empty property restores the default
   system resolver. Connect, header, and per-body-read idle budgets are separate so startup and
-  wedges terminate before the downstream while healthy media has no total lifetime. Retaining
-  mDNS-advertised addresses is deliberately a follow-up because it must preserve hostname/Host/TLS
-  identity across discovery, source ownership, every backend API client, and protected media; it
-  is not approximated by globally disabling upstream proxies or rewriting URLs to an IP.
+  wedges terminate before the downstream while healthy media has no total lifetime. The retained
+  mDNS follow-up represents advertised addresses as a bounded, ephemeral capability for one exact
+  scheme/hostname/effective-port origin. A connection generation snapshots that route into its
+  applicable API and media clients; address updates affect the next generation, while final service
+  loss clears the route and revokes current ownership. reqwest's per-host address override was
+  chosen instead of globally disabling upstream proxies or rewriting URLs to an IP, preserving the
+  original hostname, HTTP authority, TLS identity, and legitimate proxy policy. Jellyfin UDP
+  discovery remains URL-only, and automated hostname/`Host` coverage is not a real TLS handshake.
 
 - 2026-07-13 — Documentation audit against the committed tree. Every `[x]` in P1.1–P1.7 was
   verified against the source and none was overstated. The drift was everywhere else: CHANGELOG
@@ -1486,3 +1531,4 @@ Add one line per completed task:
 | 2026-07-15 | P2.5 legacy-root reauthorization | PR #95 | Explicit portal reselection records an immutable OLD→NEW intent; a marker-backed authority lease and guarded atomic transaction preserve track identity/history and playlist links; a same-transaction receipt makes crash/ambiguous-commit recovery idempotent; and malformed, overlapping, colliding, or inconsistent states quarantine unsafe scopes. Effective-write UX and installed interactive smoke testing remain open. |
 | 2026-07-15 | P2.6 0.5.0 release metadata | PR #96 | Added the missing AppStream 0.5.0 release entry, archived the shipped release in the changelog, and advanced Cargo/changelog development metadata to 0.5.1. The live release-workflow verification remains deliberately deferred. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
+| 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |

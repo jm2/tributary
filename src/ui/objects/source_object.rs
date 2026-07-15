@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use gtk::glib;
 use gtk::subclass::prelude::*;
 
+use crate::architecture::AdvertisedHttpRoute;
+
 mod imp {
     use super::*;
 
@@ -24,6 +26,11 @@ mod imp {
         pub is_header: Cell<bool>,
         /// Base URL for remote servers (e.g. `https://music.example.com`).
         pub server_url: RefCell<String>,
+        /// Ephemeral address route supplied by network discovery. This is
+        /// deliberately separate from the persisted URL and logical source
+        /// key; a connection generation snapshots it when authentication
+        /// begins.
+        pub(super) advertised_route: RefCell<Option<AdvertisedHttpRoute>>,
         /// Logical identity kept separate from location for sources such as a
         /// removable filesystem remounted at a different path.
         pub source_key: RefCell<String>,
@@ -142,6 +149,9 @@ impl SourceObject {
     pub fn server_url(&self) -> String {
         self.imp().server_url.borrow().clone()
     }
+    pub(crate) fn advertised_route(&self) -> Option<AdvertisedHttpRoute> {
+        self.imp().advertised_route.borrow().clone()
+    }
     pub fn source_key(&self) -> String {
         self.imp().source_key.borrow().clone()
     }
@@ -160,6 +170,10 @@ impl SourceObject {
 
     pub fn set_icon_name(&self, name: &str) {
         self.imp().icon_name.replace(name.to_string());
+    }
+
+    pub(crate) fn set_advertised_route(&self, route: Option<AdvertisedHttpRoute>) {
+        self.imp().advertised_route.replace(route);
     }
 
     pub fn connecting(&self) -> bool {
@@ -226,9 +240,37 @@ impl SourceObject {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use std::path::PathBuf;
 
     use super::SourceObject;
+    use crate::architecture::AdvertisedHttpRoute;
+
+    #[test]
+    fn discovered_route_is_ephemeral_and_does_not_change_source_identity() {
+        let source =
+            SourceObject::discovered("Living Room", "subsonic", "http://mini-2.local:4533");
+        let origin = url::Url::parse("http://mini-2.local:4533").expect("origin");
+        let route = AdvertisedHttpRoute::new(
+            &origin,
+            ["192.0.2.44:4533".parse::<SocketAddr>().expect("address")],
+        )
+        .expect("advertised route");
+
+        assert_eq!(source.advertised_route(), None);
+        source.set_advertised_route(Some(route.clone()));
+        assert_eq!(source.advertised_route(), Some(route));
+        assert_eq!(source.name(), "Living Room");
+        assert_eq!(source.server_url(), "http://mini-2.local:4533");
+        assert!(source.source_key().is_empty());
+        assert!(!source.manually_added());
+        assert!(!source.connected());
+
+        source.set_advertised_route(None);
+        assert_eq!(source.advertised_route(), None);
+        assert_eq!(source.name(), "Living Room");
+        assert_eq!(source.server_url(), "http://mini-2.local:4533");
+    }
 
     #[test]
     fn removable_device_preserves_identity_and_mount_path() {
