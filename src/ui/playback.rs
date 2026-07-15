@@ -727,9 +727,18 @@ fn play_current(ctx: &PlaybackContext) -> bool {
                         active_output.borrow().load_resolved(request);
                     }
                 }
-                Ok(_) | Err(_) => {
+                Ok(_) => {
                     if session.borrow_mut().fail_pending_resolution(generation) {
-                        warn!("Could not resolve track through its live source session");
+                        warn!("Could not resolve track: source lease is inactive");
+                        active_output.borrow().stop();
+                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                            ctrl.update_playback(false);
+                        }
+                    }
+                }
+                Err(error) => {
+                    if session.borrow_mut().fail_pending_resolution(generation) {
+                        warn!(error = %error, "Could not resolve track through its live source session");
                         active_output.borrow().stop();
                         if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
                             ctrl.update_playback(false);
@@ -809,10 +818,14 @@ fn update_now_playing_ui(
             let reference = item.cover_art_url.clone();
             let album_art = ctx.album_art.clone();
             glib::MainContext::default().spawn_local(async move {
-                if let Ok(Some(request)) =
-                    crate::source_registry::resolve_artwork_reference(&reference).await
-                {
-                    album_art::fetch_resolved_album_art(&album_art, request, generation);
+                match crate::source_registry::resolve_artwork_reference(&reference).await {
+                    Ok(Some(request)) => {
+                        album_art::fetch_resolved_album_art(&album_art, request, generation);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(error = %error, "Could not resolve artwork through its live source session");
+                    }
                 }
             });
         } else {
