@@ -23,7 +23,7 @@ type TrackTuple = (
     u32,
     u32,
     &'static str,
-    &'static str
+    &'static str,
 );
 
 const TRACKS: &[TrackTuple] = &[
@@ -42,7 +42,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         87,
         "FLAC",
-        ""
+        "",
     ),
     (
         2,
@@ -58,7 +58,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         62,
         "FLAC",
-        ""
+        "",
     ),
     (
         3,
@@ -74,7 +74,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         34,
         "FLAC",
-        ""
+        "",
     ),
     (
         4,
@@ -90,7 +90,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         41,
         "FLAC",
-        ""
+        "",
     ),
     (
         5,
@@ -106,7 +106,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         55,
         "FLAC",
-        ""
+        "",
     ),
     (
         6,
@@ -122,7 +122,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         29,
         "FLAC",
-        ""
+        "",
     ),
     (
         7,
@@ -138,7 +138,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         18,
         "FLAC",
-        ""
+        "",
     ),
     // ── Jazz ────────────────────────────────────────────────────────
     (
@@ -155,7 +155,7 @@ const TRACKS: &[TrackTuple] = &[
         96000,
         120,
         "FLAC",
-        ""
+        "",
     ),
     (
         2,
@@ -171,7 +171,7 @@ const TRACKS: &[TrackTuple] = &[
         96000,
         98,
         "FLAC",
-        ""
+        "",
     ),
     (
         3,
@@ -187,7 +187,7 @@ const TRACKS: &[TrackTuple] = &[
         96000,
         74,
         "FLAC",
-        ""
+        "",
     ),
     (
         4,
@@ -203,7 +203,7 @@ const TRACKS: &[TrackTuple] = &[
         96000,
         51,
         "FLAC",
-        ""
+        "",
     ),
     (
         1,
@@ -219,7 +219,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         63,
         "MP3",
-        ""
+        "",
     ),
     (
         2,
@@ -235,7 +235,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         22,
         "MP3",
-        ""
+        "",
     ),
     // ── Electronic ──────────────────────────────────────────────────
     (
@@ -252,7 +252,7 @@ const TRACKS: &[TrackTuple] = &[
         48000,
         33,
         "FLAC",
-        ""
+        "",
     ),
     (
         2,
@@ -268,7 +268,7 @@ const TRACKS: &[TrackTuple] = &[
         48000,
         19,
         "FLAC",
-        ""
+        "",
     ),
     (
         3,
@@ -284,7 +284,7 @@ const TRACKS: &[TrackTuple] = &[
         48000,
         27,
         "FLAC",
-        ""
+        "",
     ),
     (
         1,
@@ -300,7 +300,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         45,
         "AAC",
-        ""
+        "",
     ),
     (
         2,
@@ -316,7 +316,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         38,
         "AAC",
-        ""
+        "",
     ),
     (
         3,
@@ -332,7 +332,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         12,
         "AAC",
-        ""
+        "",
     ),
     // ── Classical ───────────────────────────────────────────────────
     (
@@ -349,7 +349,7 @@ const TRACKS: &[TrackTuple] = &[
         96000,
         91,
         "FLAC",
-        ""
+        "",
     ),
     (
         2,
@@ -365,7 +365,7 @@ const TRACKS: &[TrackTuple] = &[
         96000,
         44,
         "FLAC",
-        ""
+        "",
     ),
     (
         3,
@@ -381,7 +381,7 @@ const TRACKS: &[TrackTuple] = &[
         96000,
         37,
         "FLAC",
-        ""
+        "",
     ),
     // ── Hip-Hop ─────────────────────────────────────────────────────
     (
@@ -398,7 +398,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         58,
         "MP3",
-        ""
+        "",
     ),
     (
         2,
@@ -414,7 +414,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         42,
         "MP3",
-        ""
+        "",
     ),
     (
         3,
@@ -430,7 +430,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         31,
         "MP3",
-        ""
+        "",
     ),
     (
         4,
@@ -446,7 +446,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         25,
         "MP3",
-        ""
+        "",
     ),
     (
         5,
@@ -462,7 +462,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         39,
         "MP3",
-        ""
+        "",
     ),
     // ── Folk ────────────────────────────────────────────────────────
     (
@@ -479,7 +479,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         67,
         "FLAC",
-        ""
+        "",
     ),
     (
         2,
@@ -495,7 +495,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         48,
         "FLAC",
-        ""
+        "",
     ),
     (
         3,
@@ -511,7 +511,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         35,
         "FLAC",
-        ""
+        "",
     ),
     (
         1,
@@ -527,7 +527,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         53,
         "FLAC",
-        ""
+        "",
     ),
     (
         2,
@@ -543,7 +543,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         29,
         "FLAC",
-        ""
+        "",
     ),
     (
         3,
@@ -559,7 +559,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         22,
         "FLAC",
-        ""
+        "",
     ),
     // ── More Rock (for volume) ──────────────────────────────────────
     (
@@ -576,7 +576,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         70,
         "MP3",
-        ""
+        "",
     ),
     (
         2,
@@ -592,7 +592,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         55,
         "MP3",
-        ""
+        "",
     ),
     (
         3,
@@ -608,7 +608,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         31,
         "MP3",
-        ""
+        "",
     ),
     (
         1,
@@ -624,7 +624,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         82,
         "FLAC",
-        ""
+        "",
     ),
     (
         2,
@@ -640,7 +640,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         64,
         "FLAC",
-        ""
+        "",
     ),
     (
         3,
@@ -656,7 +656,7 @@ const TRACKS: &[TrackTuple] = &[
         44100,
         47,
         "FLAC",
-        ""
+        "",
     ),
 ];
 
