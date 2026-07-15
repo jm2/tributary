@@ -25,7 +25,7 @@ use walkdir::WalkDir;
 use super::root_authority::{AbsenceProof, BoundDirectory, BoundFile, RootAuthorityLease};
 use super::tag_parser::{self, ParsedTrack};
 use crate::architecture::models::Track;
-use crate::db::entities::{library_root, track};
+use crate::db::entities::{library_root, track, unparseable_file};
 
 // ---------------------------------------------------------------------------
 // LibraryEvent — messages sent to GTK main thread
@@ -254,6 +254,20 @@ impl LibraryEngine {
         if let Err(e) = initial_scan(&db, &music_dirs, &tx).await {
             error!(error = %e, "Initial scan failed");
             let _ = tx.send(LibraryEvent::Error(e.to_string())).await;
+        }
+
+        // Discard filesystem events that the initial scan itself generated
+        // (e.g. creating the .tributary-root-id marker).  Without this flush
+        // the marker-creation event immediately triggers
+        // reconcile_root_marker_mutations, which starts a redundant second
+        // full scan before the watcher event loop even settles.
+        // Also reset the overflow flag: the bounded watcher channel may have
+        // filled during the scan (directory-traversal events), leaving a
+        // stale overflow that would otherwise trigger an immediate
+        // reconciliation scan on the very first event-loop iteration.
+        if let Some(watcher) = watcher.as_mut() {
+            discard_watcher_backlog(&mut watcher.rx);
+            watcher.ingress_overflowed.store(false, Ordering::Release);
         }
 
         // A missing or temporarily unwatchable root can become available
@@ -2373,6 +2387,7 @@ async fn initial_scan_with_root_trust_guards(
     // mounts remain independent reconciliation scopes even while unmounted.
     let existing_tracks = track::Entity::find().all(db).await?;
     let persisted_roots = library_root::Entity::find().all(db).await?;
+    let unparseable_files = unparseable_file::Entity::find().all(db).await?;
     let dirs = expanded_scan_roots(&configured_dirs, &persisted_roots).map_err(|error| {
         anyhow::anyhow!(
             "failed to inspect mounted library scopes; scan disabled to protect metadata: {error}"
@@ -2395,6 +2410,10 @@ async fn initial_scan_with_root_trust_guards(
     // from memory instead of issuing one SELECT per file. The same snapshot is
     // reused for the stale-removal pass below.
     let existing_by_path: HashMap<&str, &track::Model> = existing_tracks
+        .iter()
+        .map(|model| (model.file_path.as_str(), model))
+        .collect();
+    let unparseable_by_path: HashMap<&str, &unparseable_file::Model> = unparseable_files
         .iter()
         .map(|model| (model.file_path.as_str(), model))
         .collect();
@@ -2667,6 +2686,15 @@ async fn initial_scan_with_root_trust_guards(
         };
 
         if needs_update {
+            // Skip files that were previously determined unparseable
+            // when their mtime hasn't changed (file has not been fixed).
+            if let Some(failed) = unparseable_by_path.get(path_str.as_str()) {
+                if get_mtime(path) == failed.date_modified {
+                    scanned += 1;
+                    continue;
+                }
+            }
+
             let (identity_allows_parse, invalidated_root) = match revalidate_scan_root_for_path(
                 path,
                 &mut root_scans,
@@ -2721,6 +2749,15 @@ async fn initial_scan_with_root_trust_guards(
 
             match parse_result {
                 Ok(Ok(parsed)) => {
+                    // This file parsed successfully.  Remove any prior
+                    // unparseable-file record so the next scan knows to
+                    // use the new track row instead of marking it again.
+                    if unparseable_by_path.contains_key(path_str.as_str()) {
+                        if let Err(error) = delete_unparseable_file(db, &path_str).await {
+                            warn!(path = %path_str, %error, "Failed to clear unparseable-file record");
+                        }
+                    }
+
                     let (identity_allows_upsert, invalidated_root) =
                         match revalidate_scan_root_for_path(path, &mut root_scans).await {
                             Ok(result) => result,
@@ -2792,6 +2829,13 @@ async fn initial_scan_with_root_trust_guards(
                 }
                 Ok(Err(e)) => {
                     warn!(path = %path_str, error = %e, "Skipping unparseable file");
+                    // Record the failure so subsequent scans skip this file.
+                    // If the file is later fixed (mtime changes), the record
+                    // is superseded and the parse is re-attempted.
+                    let mtime = get_mtime(path);
+                    if let Err(error) = upsert_unparseable_file(db, &path_str, &mtime).await {
+                        warn!(path = %path_str, %error, "Failed to record unparseable file");
+                    }
                 }
                 Err(e) => {
                     warn!(path = %path_str, error = %e, "spawn_blocking failed");
@@ -3936,7 +3980,7 @@ async fn reconcile_playlists_after_watcher_batch(
         .await
 }
 
-const WATCHER_EVENT_CAPACITY: usize = 256;
+const WATCHER_EVENT_CAPACITY: usize = 65536;
 const WATCHER_DEBOUNCE_MS: u64 = 1500;
 const WATCHER_RECONCILIATION_RETRY_MS: u64 = 1000;
 
@@ -5329,6 +5373,43 @@ fn get_mtime(path: &Path) -> String {
             dt.to_rfc3339()
         })
         .unwrap_or_default()
+}
+
+/// Record a file that could not be parsed so subsequent scans skip it
+/// unless its mtime changes (indicating the file may have been fixed).
+async fn upsert_unparseable_file(
+    db: &DatabaseConnection,
+    file_path: &str,
+    date_modified: &str,
+) -> anyhow::Result<()> {
+    match unparseable_file::Entity::find_by_id(file_path)
+        .one(db)
+        .await?
+    {
+        Some(existing) => {
+            let mut active: unparseable_file::ActiveModel = existing.into();
+            active.date_modified = Set(date_modified.to_owned());
+            active.update(db).await?;
+        }
+        None => {
+            unparseable_file::ActiveModel {
+                file_path: Set(file_path.to_owned()),
+                date_modified: Set(date_modified.to_owned()),
+            }
+            .insert(db)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove a previously-recorded unparseable-file entry after the file has
+/// been successfully parsed, preventing stale records from accumulating.
+async fn delete_unparseable_file(db: &DatabaseConnection, file_path: &str) -> anyhow::Result<()> {
+    unparseable_file::Entity::delete_by_id(file_path)
+        .exec(db)
+        .await?;
+    Ok(())
 }
 
 /// Convert a database `track::Model` to an architecture `Track`.
