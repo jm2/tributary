@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
-use crate::architecture::{RemoteMediaResolver, ResolvedHttpRequest};
+use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest};
 
 use super::api::{AlbumEntry, ArtistEntry, SongEntry};
 use super::client::SubsonicClient;
@@ -89,7 +89,23 @@ impl SubsonicBackend {
         username: &str,
         password: &str,
     ) -> BackendResult<Self> {
-        let mut client = SubsonicClient::new(server_url, username, password)?;
+        Self::connect_with_route(name, server_url, username, password, None).await
+    }
+
+    /// Connect through an immutable address route supplied by discovery.
+    pub async fn connect_with_route(
+        name: &str,
+        server_url: &str,
+        username: &str,
+        password: &str,
+        advertised_route: Option<AdvertisedHttpRoute>,
+    ) -> BackendResult<Self> {
+        let mut client = match advertised_route {
+            Some(route) => {
+                SubsonicClient::new_with_route(server_url, username, password, Some(route))?
+            }
+            None => SubsonicClient::new(server_url, username, password)?,
+        };
 
         // Try token auth first (modern, recommended).
         match client.get("ping.view").await {

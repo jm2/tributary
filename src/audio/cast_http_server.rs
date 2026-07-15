@@ -5,8 +5,8 @@
 //! LAN-only HTTP server keyed by random UUID.
 //!
 //! The same server also **proxies authenticated remote streams**. Newly
-//! resolved Subsonic, Jellyfin, and Plex requests keep authentication separate
-//! from their clean endpoint; legacy DAAP URLs may still carry it in the query.
+//! resolved Subsonic, Jellyfin, Plex, and DAAP requests keep authentication
+//! separate from their clean endpoint.
 //! Handing either form to a receiver would publish account access to a device
 //! Tributary does not control. Instead the receiver receives an opaque ticket,
 //! and Tributary performs the authenticated upstream fetch itself.
@@ -56,6 +56,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::architecture::media::ResolvedHttpRequest;
+use crate::architecture::AdvertisedHttpRoute;
 
 const OPAQUE_UPSTREAM_BODY_ERROR: &str = "upstream media body stream failed";
 
@@ -76,6 +77,7 @@ const UPSTREAM_RESPONSE_HEADER_DEADLINE: Duration = Duration::from_secs(10);
 /// indefinitely while a wedged upstream is cut off before the downstream
 /// GStreamer source's own blocking-I/O timeout.
 const UPSTREAM_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ROUTED_UPSTREAM_CLIENTS: usize = 64;
 
 const STAGE_INBOUND_TICKET: &str = "inbound_ticket";
 const STAGE_TICKET_REGISTRATION: &str = "ticket_registration";
@@ -130,6 +132,8 @@ impl Default for UpstreamTimeouts {
 #[derive(Clone)]
 pub struct UpstreamMediaClient {
     http: reqwest::Client,
+    routed_http: Arc<DashMap<AdvertisedHttpRoute, reqwest::Client>>,
+    connect_timeout: Duration,
     timeouts: UpstreamTimeouts,
 }
 
@@ -150,7 +154,43 @@ impl UpstreamMediaClient {
             .connect_timeout(connect_timeout)
             .build()
             .map_err(|_| anyhow::anyhow!("Failed to build the upstream media client"))?;
-        Ok(Self { http, timeouts })
+        Ok(Self {
+            http,
+            routed_http: Arc::new(DashMap::new()),
+            connect_timeout,
+            timeouts,
+        })
+    }
+
+    /// Select an immutable connection pool for one advertised route snapshot.
+    /// The ordinary client remains the fallback for legacy and DNS-routed
+    /// requests; a route never mutates a client already serving another
+    /// source/session.
+    fn http_for(&self, request: &UpstreamRequest) -> Result<reqwest::Client, ()> {
+        let UpstreamRequest::Resolved(resolved) = request else {
+            return Ok(self.http.clone());
+        };
+        let Some(route) = resolved.advertised_route() else {
+            return Ok(self.http.clone());
+        };
+        if let Some(client) = self.routed_http.get(route) {
+            return Ok(client.clone());
+        }
+
+        let builder = crate::http_security::authenticated_client_builder()
+            .connect_timeout(self.connect_timeout);
+        let builder = crate::http_security::apply_advertised_http_route(
+            builder,
+            resolved.endpoint(),
+            Some(route),
+        )
+        .map_err(|_| ())?;
+        let client = builder.build().map_err(|_| ())?;
+        if self.routed_http.len() >= MAX_ROUTED_UPSTREAM_CLIENTS {
+            self.routed_http.clear();
+        }
+        self.routed_http.insert(route.clone(), client.clone());
+        Ok(client)
     }
 }
 
@@ -174,9 +214,9 @@ enum MediaSource {
 /// The fixed request behind an upstream ticket.
 ///
 /// Deliberately not `Debug`: both variants may retain credentials. The legacy
-/// variant exists for DAAP and for the URI-boundary defense in depth; newly
-/// resolved backend media uses the typed variant so its clean endpoint and
-/// authentication material cannot be separated or accidentally sent directly.
+/// variant exists only for the URI-boundary defense in depth; resolved backend
+/// media uses the typed variant so its clean endpoint and authentication
+/// material cannot be separated or accidentally sent directly.
 #[derive(Clone)]
 enum UpstreamRequest {
     Legacy(Box<Url>),
@@ -585,7 +625,16 @@ async fn proxy_upstream(
         }
     }
 
-    let mut request = client.http.get(upstream_url);
+    let Ok(http) = client.http_for(upstream_request) else {
+        error!(
+            stage = STAGE_CONNECT,
+            category = CATEGORY_TRANSPORT,
+            elapsed_ms = 0_u64,
+            "Protected media proxy failure"
+        );
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    let mut request = http.get(upstream_url);
     if let UpstreamRequest::Resolved(resolved) = upstream_request {
         for (name, value) in resolved.sensitive_headers() {
             request = request.header(name, value);
@@ -1285,14 +1334,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_proxy_materializes_auth_only_for_the_exact_upstream_fetch() {
+    async fn routed_resolved_proxy_preserves_origin_and_contains_auth_and_lifetime() {
+        const ADVERTISED_HOST: &str = "tributary-advertised-route.invalid";
         const PRIVATE_USER: &str = "proxy-user-value";
         const PRIVATE_PASSWORD: &str = "proxy-password-value";
         const EXPECTED_AUTH: &str = "Bearer request-owned-value";
 
         let (upstream_addr, mut captures, upstream_abort) = start_capture_server().await;
-        let endpoint =
-            Url::parse(&format!("http://{upstream_addr}/stream?track=42")).expect("clean endpoint");
+        let endpoint = Url::parse(&format!(
+            "http://{ADVERTISED_HOST}:{}/stream?track=42",
+            upstream_addr.port()
+        ))
+        .expect("clean advertised endpoint");
+        let route_origin = Url::parse(&format!(
+            "http://{ADVERTISED_HOST}:{}/",
+            upstream_addr.port()
+        ))
+        .expect("advertised origin");
+        let route = AdvertisedHttpRoute::new(&route_origin, [upstream_addr])
+            .expect("exact-origin advertised route");
+        let lease = MediaLease::new();
         let request = ResolvedHttpRequest::new(endpoint)
             .expect("resolved request")
             .with_sensitive_header(AUTHORIZATION, HeaderValue::from_static(EXPECTED_AUTH))
@@ -1300,14 +1361,18 @@ mod tests {
             .with_private_query_pair("u", PRIVATE_USER)
             .expect("private user")
             .with_private_query_pair("p", PRIVATE_PASSWORD)
-            .expect("private password");
+            .expect("private password")
+            .with_advertised_route(route)
+            .expect("matching advertised route")
+            .with_lease(lease.clone());
 
         let server = CastHttpServer::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .expect("proxy server");
         let ticket = server
-            .register_resolved(request)
+            .register_resolved(request.clone())
             .expect("active request gets a ticket");
+        assert!(!ticket.contains(ADVERTISED_HOST));
         assert!(!ticket.contains(PRIVATE_USER));
         assert!(!ticket.contains(PRIVATE_PASSWORD));
         assert!(!ticket.contains("request-owned-value"));
@@ -1325,6 +1390,7 @@ mod tests {
             .await
             .expect("ticket fetch");
         assert!(response.status().is_success());
+        assert_eq!(response.bytes().await.expect("proxied body"), "media");
 
         let (captured_uri, captured_headers) =
             tokio::time::timeout(Duration::from_secs(2), captures.recv())
@@ -1336,6 +1402,16 @@ mod tests {
             .unwrap_or_default()
             .split('&')
             .collect();
+        let expected_host = format!("{ADVERTISED_HOST}:{}", upstream_addr.port());
+        assert_eq!(
+            captured_headers
+                .get(header::HOST)
+                .expect("upstream Host header")
+                .to_str()
+                .expect("ASCII Host header"),
+            expected_host,
+            "the transport route must not replace the advertised HTTP origin"
+        );
         assert!(
             query.contains(&"track=42"),
             "public endpoint query is preserved"
@@ -1369,6 +1445,20 @@ mod tests {
                 "receiver-controlled headers are not forwarded"
             );
         }
+
+        lease.revoke();
+        assert!(
+            server.register_resolved(request).is_none(),
+            "an inactive source cannot mint another ticket"
+        );
+        let retired = reqwest::get(&ticket).await.expect("retired ticket fetch");
+        assert_eq!(retired.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), captures.recv())
+                .await
+                .is_err(),
+            "an inactive lease must fail before another upstream request"
+        );
 
         upstream_abort.abort();
     }
@@ -1406,6 +1496,8 @@ mod tests {
             .expect("test upstream client");
         UpstreamMediaClient {
             http,
+            routed_http: Arc::new(DashMap::new()),
+            connect_timeout,
             timeouts: UpstreamTimeouts {
                 response_headers,
                 body_idle,
@@ -1470,6 +1562,8 @@ mod tests {
             .expect("test upstream client");
         let client = UpstreamMediaClient {
             http,
+            routed_http: Arc::new(DashMap::new()),
+            connect_timeout: Duration::from_secs(1),
             timeouts: UpstreamTimeouts {
                 response_headers: Duration::from_secs(1),
                 body_idle: Duration::from_secs(1),

@@ -264,9 +264,10 @@ fn media_reference(lease_key: Uuid, kind: MediaKind, track_id: Uuid) -> String {
 /// Return true for references owned by this registry, including malformed
 /// ones that must fail closed instead of being passed to a media backend.
 pub fn is_media_reference(reference: &str) -> bool {
-    reference
-        .split_once(':')
-        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(MEDIA_REFERENCE_SCHEME))
+    crate::daap::is_media_reference(reference)
+        || reference
+            .split_once(':')
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(MEDIA_REFERENCE_SCHEME))
 }
 
 /// Whether a playable reference is owned by one exact retained lease.
@@ -282,6 +283,10 @@ pub fn stream_reference_uses_lease(reference: &str, lease_key: Uuid) -> bool {
 pub async fn resolve_stream_reference(
     reference: &str,
 ) -> Result<ResolvedHttpRequest, MediaReferenceError> {
+    if crate::daap::is_media_reference(reference) {
+        return crate::daap::resolve_stream_reference(reference)
+            .map_err(|_| MediaReferenceError::Unavailable);
+    }
     let parsed = parse_reference(reference, MediaKind::Stream)?;
     let (resolver, media_lease) = resolver_for(&parsed)?;
     let request = resolver
@@ -296,6 +301,11 @@ pub async fn resolve_stream_reference(
 pub async fn resolve_artwork_reference(
     reference: &str,
 ) -> Result<Option<ResolvedHttpRequest>, MediaReferenceError> {
+    if crate::daap::is_media_reference(reference) {
+        return crate::daap::resolve_artwork_reference(reference)
+            .map(Some)
+            .map_err(|_| MediaReferenceError::Unavailable);
+    }
     let parsed = parse_reference(reference, MediaKind::Artwork)?;
     let (resolver, media_lease) = resolver_for(&parsed)?;
     let request = resolver
@@ -540,6 +550,27 @@ mod tests {
             .retain(Arc::new(MockResolver::new("current")))
             .expect("current retained");
         assert!(current.is_current());
+        reset_registry();
+    }
+
+    #[tokio::test]
+    async fn discovery_loss_invalidates_an_attempt_before_network_start() {
+        let _guard = REGISTRY_TEST_LOCK.lock().await;
+        reset_registry();
+        let source_key = "queued-then-lost";
+        let attempt = begin_connect(source_key.to_string()).expect("queued attempt");
+
+        // No backend is active yet, but release must still retire the minted
+        // generation so a task first polled afterward cannot resurrect it.
+        assert!(!release_source(source_key));
+        assert!(!attempt.is_latest());
+        assert!(attempt
+            .retain(Arc::new(MockResolver::new("withdrawn")))
+            .is_none());
+        assert!(!lock_registry()
+            .pending_attempts
+            .iter()
+            .any(|(key, _)| key == source_key));
         reset_registry();
     }
 

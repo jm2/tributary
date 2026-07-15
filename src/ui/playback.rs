@@ -759,13 +759,7 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         return true;
     }
 
-    let playback_uri = match resolve_live_media_reference(item.uri()) {
-        Ok(uri) => uri,
-        Err(error) => {
-            warn!(error = %error, "Could not resolve track through its live source session");
-            return false;
-        }
-    };
+    let playback_uri = item.uri.clone();
 
     // Each output resolves the source at its own trust boundary. Chromecast
     // serves local files over its embedded LAN server; authenticated remote
@@ -838,19 +832,7 @@ fn update_now_playing_ui(
                 }
             });
         } else {
-            // Remote track with a cover art URL — resolve session-scoped
-            // references immediately before fetching.
-            match resolve_live_media_reference(&item.cover_art_url) {
-                Ok(cover_art_url) => {
-                    album_art::fetch_remote_album_art(&ctx.album_art, &cover_art_url);
-                }
-                Err(error) => {
-                    warn!(error = %error, "Could not resolve artwork through its live source session");
-                    album_art::invalidate();
-                    ctx.album_art
-                        .set_icon_name(Some("audio-x-generic-symbolic"));
-                }
-            }
+            album_art::fetch_remote_album_art(&ctx.album_art, &item.cover_art_url);
         }
     } else if let Some(playback_uri) = direct_playback_uri {
         // Local track — extract from embedded tags.
@@ -897,22 +879,6 @@ fn find_queue_item_position(
         occurrence += 1;
     }
     None
-}
-
-/// Resolve credential-free source references while passing ordinary media
-/// URLs through unchanged. DAAP resolution only reads retained in-memory
-/// session state and constructs a URL; it performs no network I/O.
-fn resolve_live_media_reference(reference: &str) -> Result<String, String> {
-    if !reference.starts_with("daap:") {
-        return Ok(reference.to_string());
-    }
-
-    let reference = url::Url::parse(reference)
-        .map_err(|error| format!("Invalid DAAP media reference: {error}"))?;
-    crate::daap::resolve_media_url(&reference)
-        .map_err(|error| error.to_string())?
-        .map(|url| url.to_string())
-        .ok_or_else(|| "DAAP media reference was not recognized".to_string())
 }
 
 /// Advance to the next track, respecting shuffle and repeat-all.
