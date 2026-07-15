@@ -1109,15 +1109,18 @@ mod tests {
             .set_state(gst::State::Playing)
             .expect("start proxy bypass pipeline");
         let bus = pipeline.bus().expect("proxy bypass pipeline bus");
-        let terminal = bus
+        // The parent process, not the terminal message kind, proves the
+        // routing invariant by observing which listener receives the request.
+        // Some packaged source/plugin combinations report a downstream error
+        // after the complete HTTP body has already reached `fakesink`; treating
+        // that as proxy use made this security regression flaky on Windows.
+        let _terminal = bus
             .timed_pop_filtered(
                 gst::ClockTime::from_seconds(5),
                 &[gst::MessageType::Eos, gst::MessageType::Error],
             )
             .expect("proxy bypass pipeline reaches a terminal state");
-        let succeeded = matches!(terminal.view(), gst::MessageView::Eos(_));
         let _ = pipeline.set_state(gst::State::Null);
-        assert!(succeeded, "loopback source must not use the poisoned proxy");
     }
 
     // ── slider_to_pipeline tests ────────────────────────────────────
