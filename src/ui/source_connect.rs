@@ -547,7 +547,8 @@ pub fn setup_source_connect(state: &WindowState) {
                             return;
                         }
 
-                        let receive = Box::pin(scan_rx.recv());
+                        let receive = scan_rx.recv();
+                        futures::pin_mut!(receive);
                         let cancellation_poll = glib::timeout_future(USB_SCAN_CANCELLATION_POLL);
                         match futures::future::select(receive, cancellation_poll).await {
                             futures::future::Either::Left((Ok(row), _)) => {

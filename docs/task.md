@@ -722,7 +722,8 @@ source falls back to Local, while an immediately reappearing active logical sour
 its new path for a fresh scan only if the exact automatic Local fallback remains current. An
 uncached device clears the prior source projection before scanning. Device audio is streamed lazily
 from a named worker through a capacity-64 channel; ownership is polled every 50 ms and after every
-row, closing the receiver when the generation is retired so a blocked producer wakes and stops.
+row, closing the receiver when the generation is retired so a blocked producer wakes and stops;
+its select loop uses the receive future directly and does not allocate once per discovered track.
 GTK objects remain main-thread-only and symlinks are not followed. Cancellation is cooperative
 rather than a hard interrupt of an in-progress kernel or tag-parser call. This is not proof of
 unique physical-device identity, automount/eject/MTP support, a nested-filesystem boundary, or
