@@ -531,8 +531,9 @@ Existing rule JSON remains usable across the option removal.
   exporting. The GTK path runs the blocking renderer/writer with `spawn_blocking` and reports
   success and failure.
 - [x] Prefer an exact existing file path before metadata matching. A valid local `file:` URI in
-  `<location>` is decoded and wins when it equals a stored path; non-file and malformed locations
-  are ignored as paths but may still match by metadata. The valid decoded source path is retained
+  `<location>` is decoded (including Windows drive-letter form) and wins when it equals a stored
+  path; non-file and malformed locations are ignored as paths but may still match by metadata. The
+  valid decoded source path is retained
   for the same first-priority reconciliation later. Path authority is limited to imported location
   evidence: metadata-only imports and manually added entries remain fingerprint-only even after a
   successful relink, so repeated delete/rescan cycles cannot promote a library path and let an

@@ -1002,9 +1002,9 @@ mod tests {
             "<track><location>not a URI</location>",
             "<title>Malformed</title><creator>Artist</creator></track>",
             "<track><location>https://example.test/not-local</location>",
-            "<location>file:///music/Local%20Song.flac</location>",
-            "<location>file:///music/Other.flac</location></track>",
-            "<track><location>file:///music/Query.flac?token=private</location></track>",
+            "<location>file:///C:/music/Local%20Song.flac</location>",
+            "<location>file:///C:/music/Other.flac</location></track>",
+            "<track><location>file:///C:/music/Query.flac?token=private</location></track>",
             "</trackList></playlist>"
         ))
         .expect("parse location variants");
