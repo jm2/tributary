@@ -201,6 +201,21 @@ smart_playlist:
   remove_rule: "ルールを削除"
   limit_to: "制限"
 
+# ── ユーザー向けエラー ────────────────────────────────────────────
+errors:
+  remote:
+    authentication_rejected: "%{backend} で認証が拒否されました"
+    connection_failed: "%{backend} に接続できませんでした"
+    connection_timed_out: "%{backend} への接続がタイムアウトしました"
+    invalid_response: "%{backend} から無効な応答が返されました"
+    authentication_method_unsupported: "%{backend} の認証方式はサポートされていません"
+    source_failed: "%{backend} ソースでエラーが発生しました"
+  playback:
+    network_request_failed: "オーディオのネットワークリクエストに失敗しました"
+    decoder_failed: "オーディオデコーダーでエラーが発生しました"
+    audio_output_failed: "オーディオ出力に失敗しました"
+    playback_failed: "オーディオ再生に失敗しました"
+
 # ── About dialog ───────────────────────────────────────────────────
 about:
   application_name: "Tributary"

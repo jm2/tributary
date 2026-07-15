@@ -201,6 +201,21 @@ smart_playlist:
   remove_rule: "Удалить правило"
   limit_to: "Ограничить до"
 
+# ── Сообщения об ошибках ───────────────────────────────────────────
+errors:
+  remote:
+    authentication_rejected: "Аутентификация %{backend} отклонена"
+    connection_failed: "Не удалось подключиться к %{backend}"
+    connection_timed_out: "Время ожидания подключения к %{backend} истекло"
+    invalid_response: "%{backend} вернул недопустимый ответ"
+    authentication_method_unsupported: "Метод аутентификации %{backend} не поддерживается"
+    source_failed: "Сбой источника %{backend}"
+  playback:
+    network_request_failed: "Сбой сетевого запроса аудио"
+    decoder_failed: "Сбой аудиодекодера"
+    audio_output_failed: "Сбой аудиовыхода"
+    playback_failed: "Сбой воспроизведения аудио"
+
 # ── About dialog ───────────────────────────────────────────────────
 about:
   application_name: "Tributary"

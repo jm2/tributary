@@ -201,6 +201,21 @@ smart_playlist:
   remove_rule: "Usuń regułę"
   limit_to: "Ogranicz do"
 
+# ── Komunikaty o błędach ───────────────────────────────────────────
+errors:
+  remote:
+    authentication_rejected: "Uwierzytelnianie %{backend} zostało odrzucone"
+    connection_failed: "Nie można połączyć się z %{backend}"
+    connection_timed_out: "Przekroczono limit czasu połączenia z %{backend}"
+    invalid_response: "%{backend} zwrócił nieprawidłową odpowiedź"
+    authentication_method_unsupported: "Metoda uwierzytelniania %{backend} nie jest obsługiwana"
+    source_failed: "Wystąpił błąd źródła %{backend}"
+  playback:
+    network_request_failed: "Sieciowe żądanie audio nie powiodło się"
+    decoder_failed: "Wystąpił błąd dekodera dźwięku"
+    audio_output_failed: "Wystąpił błąd wyjścia dźwięku"
+    playback_failed: "Odtwarzanie dźwięku nie powiodło się"
+
 # ── About dialog ───────────────────────────────────────────────────
 about:
   application_name: "Tributary"

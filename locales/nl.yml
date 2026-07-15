@@ -201,6 +201,21 @@ smart_playlist:
   remove_rule: "Regel verwijderen"
   limit_to: "Beperken tot"
 
+# ── Foutmeldingen voor gebruikers ──────────────────────────────────
+errors:
+  remote:
+    authentication_rejected: "De authenticatie van %{backend} is geweigerd"
+    connection_failed: "Kan geen verbinding maken met %{backend}"
+    connection_timed_out: "Er is een time-out opgetreden bij de verbinding met %{backend}"
+    invalid_response: "%{backend} heeft een ongeldig antwoord geretourneerd"
+    authentication_method_unsupported: "De authenticatiemethode van %{backend} wordt niet ondersteund"
+    source_failed: "De %{backend}-bron is mislukt"
+  playback:
+    network_request_failed: "De audionetwerkaanvraag is mislukt"
+    decoder_failed: "De audiodecoder is mislukt"
+    audio_output_failed: "De audio-uitvoer is mislukt"
+    playback_failed: "Het afspelen van audio is mislukt"
+
 # ── About dialog ───────────────────────────────────────────────────
 about:
   application_name: "Tributary"

@@ -201,6 +201,21 @@ smart_playlist:
   remove_rule: "刪除規則"
   limit_to: "限制為"
 
+# ── 使用者可見的錯誤 ──────────────────────────────────────────────
+errors:
+  remote:
+    authentication_rejected: "%{backend} 拒絕了身分驗證"
+    connection_failed: "無法連線至 %{backend}"
+    connection_timed_out: "與 %{backend} 的連線逾時"
+    invalid_response: "%{backend} 傳回了無效回應"
+    authentication_method_unsupported: "%{backend} 的身分驗證方式不受支援"
+    source_failed: "%{backend} 資料來源發生錯誤"
+  playback:
+    network_request_failed: "音訊網路請求失敗"
+    decoder_failed: "音訊解碼器發生錯誤"
+    audio_output_failed: "音訊輸出失敗"
+    playback_failed: "音訊播放失敗"
+
 # ── About dialog ───────────────────────────────────────────────────
 about:
   application_name: "Tributary"

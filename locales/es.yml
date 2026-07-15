@@ -201,6 +201,21 @@ smart_playlist:
   remove_rule: "Eliminar regla"
   limit_to: "Limitar a"
 
+# ── Errores para el usuario ────────────────────────────────────────
+errors:
+  remote:
+    authentication_rejected: "La autenticación de %{backend} fue rechazada"
+    connection_failed: "No se pudo conectar con %{backend}"
+    connection_timed_out: "Se agotó el tiempo de conexión con %{backend}"
+    invalid_response: "%{backend} devolvió una respuesta no válida"
+    authentication_method_unsupported: "El método de autenticación de %{backend} no es compatible"
+    source_failed: "La fuente %{backend} falló"
+  playback:
+    network_request_failed: "Falló la solicitud de audio por red"
+    decoder_failed: "Falló el decodificador de audio"
+    audio_output_failed: "Falló la salida de audio"
+    playback_failed: "Falló la reproducción de audio"
+
 # ── About dialog ───────────────────────────────────────────────────
 about:
   application_name: "Tributary"

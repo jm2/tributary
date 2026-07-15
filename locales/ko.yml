@@ -201,6 +201,21 @@ smart_playlist:
   remove_rule: "규칙 제거"
   limit_to: "제한"
 
+# ── 사용자 대상 오류 ──────────────────────────────────────────────
+errors:
+  remote:
+    authentication_rejected: "%{backend}에서 인증이 거부되었습니다"
+    connection_failed: "%{backend}에 연결하지 못했습니다"
+    connection_timed_out: "%{backend} 연결 시간이 초과되었습니다"
+    invalid_response: "%{backend}에서 잘못된 응답을 받았습니다"
+    authentication_method_unsupported: "%{backend}의 인증 방식은 지원되지 않습니다"
+    source_failed: "%{backend} 소스에 오류가 발생했습니다"
+  playback:
+    network_request_failed: "오디오 네트워크 요청에 실패했습니다"
+    decoder_failed: "오디오 디코더에 오류가 발생했습니다"
+    audio_output_failed: "오디오 출력에 실패했습니다"
+    playback_failed: "오디오 재생에 실패했습니다"
+
 # ── About dialog ───────────────────────────────────────────────────
 about:
   application_name: "Tributary"

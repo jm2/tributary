@@ -921,13 +921,23 @@ impl PipelineErrorSourceCategory {
         }
     }
 
-    fn ui_message(self) -> &'static str {
+    fn ui_message(self) -> String {
+        let locale = rust_i18n::locale();
+        self.ui_message_for_locale(&locale)
+    }
+
+    fn ui_message_for_locale(self, locale: &str) -> String {
         match self {
-            Self::Network => "Audio network request failed",
-            Self::Decoder => "Audio decoder failed",
-            Self::AudioOutput => "Audio output failed",
-            Self::Pipeline => "Audio playback failed",
+            Self::Network => {
+                rust_i18n::t!("errors.playback.network_request_failed", locale = locale)
+            }
+            Self::Decoder => rust_i18n::t!("errors.playback.decoder_failed", locale = locale),
+            Self::AudioOutput => {
+                rust_i18n::t!("errors.playback.audio_output_failed", locale = locale)
+            }
+            Self::Pipeline => rust_i18n::t!("errors.playback.playback_failed", locale = locale),
         }
+        .into_owned()
     }
 }
 
@@ -1334,6 +1344,30 @@ mod tests {
         ] {
             assert!(!category.as_str().contains(secret));
             assert!(!category.ui_message().contains(secret));
+        }
+    }
+
+    #[test]
+    fn pipeline_error_messages_are_localized_for_every_catalog() {
+        for category in [
+            PipelineErrorSourceCategory::Network,
+            PipelineErrorSourceCategory::Decoder,
+            PipelineErrorSourceCategory::AudioOutput,
+            PipelineErrorSourceCategory::Pipeline,
+        ] {
+            let english = category.ui_message_for_locale("en");
+            assert!(!english.is_empty());
+
+            for locale in rust_i18n::available_locales!() {
+                let localized = category.ui_message_for_locale(&locale);
+                assert!(!localized.is_empty(), "{locale} is empty for {category:?}");
+                if locale != "en" {
+                    assert_ne!(
+                        localized, english,
+                        "{locale} must not fall back to English for {category:?}"
+                    );
+                }
+            }
         }
     }
 }

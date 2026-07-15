@@ -81,16 +81,44 @@ impl RemoteFailureCategory {
     }
 
     pub(super) fn user_message(self, backend_type: &str) -> String {
+        let locale = rust_i18n::locale();
+        self.user_message_for_locale(backend_type, &locale)
+    }
+
+    fn user_message_for_locale(self, backend_type: &str, locale: &str) -> String {
         match self {
-            Self::Authentication => format!("{backend_type} authentication was rejected"),
-            Self::Connection => format!("Could not connect to {backend_type}"),
-            Self::Timeout => format!("{backend_type} connection timed out"),
-            Self::Response => format!("{backend_type} returned an invalid response"),
-            Self::AuthenticationMethod => {
-                format!("{backend_type} authentication method is unsupported")
-            }
-            Self::Backend => format!("{backend_type} source failed"),
+            Self::Authentication => rust_i18n::t!(
+                "errors.remote.authentication_rejected",
+                locale = locale,
+                backend = backend_type
+            ),
+            Self::Connection => rust_i18n::t!(
+                "errors.remote.connection_failed",
+                locale = locale,
+                backend = backend_type
+            ),
+            Self::Timeout => rust_i18n::t!(
+                "errors.remote.connection_timed_out",
+                locale = locale,
+                backend = backend_type
+            ),
+            Self::Response => rust_i18n::t!(
+                "errors.remote.invalid_response",
+                locale = locale,
+                backend = backend_type
+            ),
+            Self::AuthenticationMethod => rust_i18n::t!(
+                "errors.remote.authentication_method_unsupported",
+                locale = locale,
+                backend = backend_type
+            ),
+            Self::Backend => rust_i18n::t!(
+                "errors.remote.source_failed",
+                locale = locale,
+                backend = backend_type
+            ),
         }
+        .into_owned()
     }
 }
 
@@ -1408,6 +1436,40 @@ mod tests {
             assert!(!category.as_str().contains(SECRET));
             assert!(!category.log_message().contains(SECRET));
             assert!(!category.user_message("Subsonic").contains(SECRET));
+        }
+    }
+
+    #[test]
+    fn remote_failure_messages_are_localized_for_every_catalog() {
+        const BACKEND: &str = "TestBackend";
+        let categories = [
+            RemoteFailureCategory::Authentication,
+            RemoteFailureCategory::Connection,
+            RemoteFailureCategory::Timeout,
+            RemoteFailureCategory::Response,
+            RemoteFailureCategory::AuthenticationMethod,
+            RemoteFailureCategory::Backend,
+        ];
+
+        for category in categories {
+            let english = category.user_message_for_locale(BACKEND, "en");
+            assert!(english.contains(BACKEND));
+            assert!(!english.contains("%{backend}"));
+
+            for locale in rust_i18n::available_locales!() {
+                let localized = category.user_message_for_locale(BACKEND, &locale);
+                assert!(
+                    localized.contains(BACKEND),
+                    "{locale} must interpolate the backend name for {category:?}"
+                );
+                assert!(!localized.contains("%{backend}"));
+                if locale != "en" {
+                    assert_ne!(
+                        localized, english,
+                        "{locale} must not fall back to English for {category:?}"
+                    );
+                }
+            }
         }
     }
 

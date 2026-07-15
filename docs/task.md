@@ -935,7 +935,9 @@ without distinct upstream connect/header/body-idle deadlines or useful safe diag
   upstream-status, exact-ticket predicate, source-signal, fixed-diagnostic, and typed remote-error
   tests. An isolated child process initializes GStreamer with both proxy environment variables
   poisoned and no bypass list, then proves the loopback fixture receives the ticket while the
-  ambient proxy receives nothing. Eleven focused additions cover this urgent slice.
+  ambient proxy receives nothing. Two catalog-wide checks also prove the new user-facing error
+  categories are translated without fallback and interpolate backend names in every supported
+  locale. Thirteen focused additions cover this urgent slice.
 - [ ] Preserve addresses supplied by mDNS discovery for API and protected-media connection routing
   without changing the URL hostname, HTTP `Host`, or TLS identity. Add injected stalled-DNS and
   advertised-address/hostname regressions; do not globally disable proxies for the upstream server.
@@ -1041,12 +1043,14 @@ outstanding, as does the deliberately deferred live release-workflow run.
 
 Most recent milestone validation (2026-07-15, P2.11 protected-playback urgent slice): `cargo fmt`,
 `cargo check --all-targets --all-features`, and strict all-target/all-feature Clippy pass in debug
-and release. Both profiles pass 18 library plus 596 application tests (614 per profile). Eleven
+and release. Both profiles pass 18 library plus 598 application tests (616 per profile). Thirteen
 focused additions cover accepted connections without headers, refused connections, preserved
 upstream statuses, failed/stalled/active response bodies, exact ticket-shape validation,
 `source-setup` enforcement, secret-free diagnostics, typed remote-error classification, and an
 isolated real-GStreamer child process whose poisoned ambient proxy receives no request while the
-loopback ticket fixture does. All 13 locale catalogs parse; `git diff --check`, AppStream
+loopback ticket fixture does. The remote and playback categories resolve native translations in
+all 13 locale catalogs, with catalog-wide no-fallback and backend-interpolation checks. Every locale
+catalog parses; `git diff --check`, AppStream
 validation, and the synchronized 0.5.0 release entry pass; and `cargo audit --no-fetch` reports
 exactly the two accepted unmaintained warnings recorded under P0.8. The unchanged desktop validator
 diagnostic remains tracked under P2.6. Retained mDNS address routing, packaged Windows/full-backend
@@ -1479,4 +1483,4 @@ Add one line per completed task:
 | 2026-07-15 | P2.5 Flatpak generation and access policy | PR #94 | Vendored checksum-pinned Cargo generator shared by local builds and CI; consistent manifest-local source generation; read-only standard external-media roots; reviewed GVfs bus access; portal-selected writable custom libraries; and a fail-closed permission policy test. Effective-write UX, installed interactive portal/physical-media smoke testing, and the deliberately deferred release workflow remain open. |
 | 2026-07-15 | P2.5 legacy-root reauthorization | PR #95 | Explicit portal reselection records an immutable OLD→NEW intent; a marker-backed authority lease and guarded atomic transaction preserve track identity/history and playlist links; a same-transaction receipt makes crash/ambiguous-commit recovery idempotent; and malformed, overlapping, colliding, or inconsistent states quarantine unsafe scopes. Effective-write UX and installed interactive smoke testing remain open. |
 | 2026-07-15 | P2.6 0.5.0 release metadata | PR #96 | Added the missing AppStream 0.5.0 release entry, archived the shipped release in the changelog, and advanced Cargo/changelog development metadata to 0.5.1. The live release-workflow verification remains deliberately deferred. |
-| 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 11 focused regressions including an isolated poisoned-proxy process. Retained mDNS routing and packaged full-backend Windows playback remain open. |
+| 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
