@@ -1,32 +1,29 @@
-//! USB mass-storage device detection.
+//! Mounted portable-device discovery.
 //!
-//! Detects mounted removable drives that may contain music files so
-//! they can appear under "Devices" in the sidebar.
+//! GIO's native [`gtk::gio::VolumeMonitor`] supplies a cached snapshot of the
+//! user-visible mounts selected by each platform backend. The UI owns that
+//! monitor on the GTK main thread, publishes [`usb::mounted_devices`] snapshots,
+//! and wires its mount-added, changed, pre-unmount, and removed signals for live
+//! hotplug updates. Filesystem traversal remains separate background work.
 //!
-//! # Platform support
-//!
-//! - **Linux**: scans `/media/$USER/` and `/run/media/$USER/` for
-//!   removable volumes.
-//! - **macOS**: scans `/Volumes/` for non-system volumes.
-//! - **Windows**: enumerates drive letters and checks for removable
-//!   drives via `GetDriveTypeW`.
-//!
-//! # Status
-//!
-//! Detection-only. Sync / transfer / browsing operations beyond a
-//! one-shot library scan are not implemented (tracked in GitHub
-//! issues #1 and #8).
+//! This layer currently supports browsing mounted filesystems. Device sync,
+//! transfer, and mounting an unmounted volume remain outside its scope (tracked
+//! in GitHub issues #1 and #8).
 
 pub mod usb;
 
-/// Information about a detected portable device.
-///
-/// The fields are limited to what the UI consumes today (name +
-/// mount point); add others back in if/when sync/transfer lands.
-#[derive(Debug, Clone)]
+/// Information about one mounted, browseable device.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
-    /// Human-readable device name (volume label or mount-point name).
+    /// Best available logical source key from cached platform mount metadata.
+    ///
+    /// A filesystem UUID is preferred when available. It identifies a logical
+    /// filesystem rather than guaranteed unique physical hardware, so a cloned
+    /// filesystem can intentionally collide with its source. Fallback device
+    /// paths and root URIs can change across a replug or relocation.
+    pub source_key: String,
+    /// Human-readable name supplied by the platform mount backend.
     pub name: String,
-    /// Filesystem mount point path.
+    /// Native filesystem path used by the background audio scanner.
     pub mount_point: std::path::PathBuf,
 }

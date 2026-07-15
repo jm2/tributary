@@ -860,7 +860,7 @@ pub fn build_window(
     let sidebar_sel_for_events = sidebar_selection.clone();
     let pending_connection_for_events = pending_connection.clone();
     let pre_connect_selection_for_events = pre_connect_selection.clone();
-    super::source_connect::setup_source_connect(&WindowState {
+    let source_connection_state = WindowState {
         window: window.clone(),
         rt_handle: rt_handle.clone(),
         engine_tx: engine_tx.clone(),
@@ -879,7 +879,8 @@ pub fn build_window(
         app_config: app_config.clone(),
         pending_connection: pending_connection.clone(),
         pre_connect_selection: pre_connect_selection.clone(),
-    });
+    };
+    super::source_connect::setup_source_connect(&source_connection_state);
 
     // ═══════════════════════════════════════════════════════════════════
     // Phase 4: Audio Player + Desktop Integration
@@ -891,51 +892,13 @@ pub fn build_window(
     window.present();
     info!("Main window presented");
 
-    // Mount metadata can block indefinitely when a removable device goes
-    // stale. Keep every filesystem probe off the GTK thread and publish the
-    // completed snapshot atomically once the worker returns.
-    let usb_device_fallback = rust_i18n::t!("sidebar.usb_device").into_owned();
-    let devices_heading = rust_i18n::t!("sidebar.devices").into_owned();
-    let (usb_discovery_tx, usb_discovery_rx) = async_channel::bounded(1);
-    let sidebar_store_weak = sidebar_store.downgrade();
-    if let Err(error) = std::thread::Builder::new()
-        .name("usb-discovery".to_string())
-        .spawn(move || {
-            let devices = crate::device::usb::detect_usb_devices(&usb_device_fallback);
-            if usb_discovery_tx.try_send(devices).is_err() {
-                tracing::debug!("USB discovery receiver closed before publication");
-            }
-        })
-    {
-        warn!(%error, "Failed to start USB device discovery worker");
-    }
-
-    glib::MainContext::default().spawn_local(async move {
-        let Ok(devices) = usb_discovery_rx.recv().await else {
-            return;
-        };
-        if devices.is_empty() {
-            return;
-        }
-        let Some(sidebar_store) = sidebar_store_weak.upgrade() else {
-            return;
-        };
-
-        let mut rows = Vec::with_capacity(devices.len() + 1);
-        rows.push(SourceObject::header(&devices_heading));
-        for device in devices {
-            let source = SourceObject::discovered(
-                &device.name,
-                "usb-device",
-                &device.mount_point.to_string_lossy(),
-            );
-            source.set_connected(true);
-            source.set_requires_password(false);
-            source.set_icon_name("drive-removable-media-symbolic");
-            rows.push(source);
-        }
-        sidebar_store.splice(sidebar_store.n_items(), 0, &rows);
-    });
+    // GVolumeMonitor must stay on the GTK main thread. Its cached mount
+    // metadata drives an idempotent sidebar reconciliation, while selecting a
+    // device still performs filesystem walking/tag parsing on a bounded worker.
+    super::removable_media::setup_removable_media(
+        &source_connection_state,
+        invalidate_source_playback.clone(),
+    );
 
     // ── Create GStreamer player ──────────────────────────────────────
     let (player, player_rx) = match crate::audio::Player::new(rt_handle.clone()) {

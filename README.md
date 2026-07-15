@@ -56,7 +56,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Album artist sort (preference toggle) | ✅ |
 | Smart playlist compound sort (multi-key ordering) | ✅ |
 | Geo-distance sorting for Stations Near Me | ✅ |
-| USB device browsing (sidebar + tracklist scan) | ✅ |
+| USB/removable-media browsing (live native sidebar + bounded track scan) | ✅ |
 | USB file transfer (copy to device with progress) | ❌ Planned ([#8](https://github.com/jm2/tributary/issues/8)) |
 | Multiple music library directories | ✅ |
 | Playlist import/export (XSPF) | ✅ |
@@ -383,8 +383,8 @@ src/
 │   ├── client.rs           # HTTP client (5-step session handshake)
 │   └── backend.rs          # MediaBackend impl (in-memory cache)
 ├── device/
-│   ├── mod.rs              # Device trait + DeviceInfo (portable device abstraction)
-│   └── usb.rs              # USB mass storage detection (Linux, macOS, Windows)
+│   ├── mod.rs              # DeviceInfo model for mounted browseable media
+│   └── usb.rs              # GIO mount filtering + logical removable-source identity
 ├── radio/
 │   ├── mod.rs              # Internet Radio module root
 │   ├── api.rs              # RadioStation + GeoLocation serde types
@@ -395,6 +395,7 @@ src/
     ├── window.rs           # Main window orchestration (GTK lifecycle + event wiring)
     ├── window_state.rs     # Shared WindowState struct (Rc/RefCell state bundle)
     ├── source_connect.rs   # Sidebar selection handler (source switching + auth flows)
+    ├── removable_media.rs  # Native mount monitoring + live sidebar reconciliation
     ├── discovery_handler.rs# mDNS/DNS-SD event handler (sidebar + output list)
     ├── context_menu.rs     # Tracklist right-click menu (playlist ops + properties)
     ├── playlist_actions.rs # Playlist CRUD (create, rename, delete, reorder)
@@ -443,21 +444,44 @@ On first launch, Tributary scans your `~/Music` folder (configurable in Preferen
 
 ### Browsing Removable Media
 
-At startup, Tributary runs one removable-volume discovery pass on a dedicated worker so filesystem
-probes cannot hold up the GTK window. Exact mount paths are sorted and deduplicated before probing;
-each is checked once, and probe errors, vanished paths, and non-directories are skipped. GTK receives
-one bounded snapshot and atomically adds the translated **Devices** header and rows only when at
-least one device survives. A volume without a usable name receives the translated **USB Device**
-fallback. Selecting a device scans its audio on a background thread without following symlinks off
-the selected volume.
+Tributary reads cached native mount metadata from GIO's `VolumeMonitor` on the GTK main thread. It
+does not scan platform mount directories, enumerate drive letters, canonicalize paths, or perform
+filesystem probes during discovery. Shadowed roots and roots without native-path access are
+excluded, as are mounts the backend explicitly classifies as network or loop. A native-path mount
+is shown when the platform reports a removable drive, eject or unmount support, or the `device`
+volume class. Because class metadata is optional and `can_unmount` is broad, this best-effort policy
+can also include a non-removable or natively mounted network filesystem. The translated **Devices**
+heading exists only while at least one qualifying mount is present.
 
-Discovery is currently heuristic and one-shot: attaching or removing a device after startup
-requires restarting Tributary, and the same physical device exposed at two different paths can
-appear twice. There is no probe timeout or cancellation, so a hung filesystem call can leave the
-detached discovery worker running even though GTK remains responsive. A device can also disappear
-after the startup probe and before it is selected. Platform volume APIs and hotplug monitoring are
-still planned. Flatpak removable-media access also depends on the pending narrow permission or
-portal work tracked in [P2.5](docs/task.md#p25-repair-flatpak-behavior-and-local-build-path).
+The monitor reconciles mount-added, mount-changed, pre-unmount, and mount-removed notifications for
+the life of the window. A device keeps its best available logical source key separate from its
+native `PathBuf`: mount UUID is preferred, then volume UUID, Unix device identifier, and finally
+root URI.
+Rows sharing that key are deduplicated deterministically. A rename atomically replaces the row at
+the same position. Relocation of the same logical source retires its old scan and playback state,
+temporarily falls back to Local, and reselects it at the new path only if that exact automatic
+fallback is still current. A confirmed removal retires the matching path synchronously before the
+coalesced snapshot, so a rapid same-path reattach cannot preserve stale state; pre-unmount alone
+does not remove the row because the operation can fail. Unplugging an active source invalidates its
+pending navigation, cached tracks, and playback before removing the row and falling back to Local.
+
+Selecting an uncached device starts a named background scan that streams parsed tracks through a
+bounded channel. Its empty projection is installed immediately, so rows from the previous source
+cannot be queued under the device identity while the scan runs. GTK checks source ownership while
+consuming it. Re-selecting the same logical device, relocating it, or unplugging it retires the old
+generation and closes the receiver so the producer stops cooperatively; navigating to a different
+source instead lets the newest scan finish into its cache without rendering it. The walk is lazy
+and does not follow directory or file symlinks, so links cannot escape the selected volume. It can
+still traverse a real nested mount, and cancellation cannot interrupt the one filesystem or
+tag-parser operation currently in progress.
+
+The key is best-available logical identity, not proof of unique physical hardware: cloned
+filesystems may share a UUID, Unix-device and root-URI fallbacks can change with device/path
+assignment, and GIO's broad `can_unmount` signal can include a non-removable or native-path network
+mount when the backend supplies no class. Tributary does not mount unmounted volumes, eject
+devices, or browse MTP-only devices. Real USB add/change/unplug behavior still needs cross-platform
+hardware validation. Flatpak access also depends on the narrow permission or portal work tracked in
+[P2.5](docs/task.md#p25-repair-flatpak-behavior-and-local-build-path).
 
 ### Connecting to Remote Servers
 

@@ -29,9 +29,9 @@ Progress snapshot (2026-07-15), recounted from the literal P0–P3 task checkbox
 earlier numerator/denominator drift. The denominator excludes the two deferred P0.7 live-workflow
 verification boxes and the withdrawn P2.6 false finding; section-summary and global-validation
 gate boxes are not task progress:
-**149/213 (70.0%)** in-scope checklist items complete; **114/114 (100%)** across P0 and P1 after
-the same P0.7 exclusion. The release-workflow dry run remains deliberately deferred rather than
-being counted as unfinished P0 remediation.
+**150/213 (70.4%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **33/69 P2**,
+and **3/30 P3** after those exclusions. The release-workflow dry run remains deliberately deferred
+rather than being counted as unfinished P0 remediation.
 
 ## P0 — Release blockers
 
@@ -648,9 +648,11 @@ original track's stable identity, history, or playlist links.
 
 ### P2.4 Make removable-media browsing safe and asynchronous
 
-Re-scoped 2026-07-13. `device/usb.rs` performs **no recursive traversal**: it shallowly enumerates
-the platform mount roots and metadata-probes each candidate. The audio-file traversal lives in the
-UI, so that is where the symlink defect was.
+Re-scoped 2026-07-13 and completed in two stages. PR #92 first moved the old platform-directory and
+drive-letter probes to a one-shot worker. The current slice removes those heuristics entirely:
+`device/usb.rs` projects cached native `gio::VolumeMonitor` metadata into plain `DeviceInfo` values
+on GTK's main thread and performs no filesystem I/O. Recursive audio traversal remains a separate,
+bounded background operation in `ui/source_connect.rs`, where the original symlink defect lived.
 
 - [x] Disable symlink following during device scans. The walk used
   `WalkDir::new(mount_path).follow_links(true)`, so a USB stick containing `music -> /home/user`
@@ -663,38 +665,67 @@ UI, so that is where the symlink defect was.
   the mount can now be reached through a link. (A bind mount or a nested real filesystem under the
   mount point is still followed; the library scanner's `filesystem_boundary_id` check is the model
   to copy if that matters here.)
-- [x] Move one-shot mount **discovery** off the GTK thread. The platform heuristics now run wholly
-  on one named `usb-discovery` standard-library thread and send exactly one sorted, deduplicated
-  `Vec<DeviceInfo>` snapshot through an `async_channel::bounded(1)` handoff. GTK awaits that
-  snapshot with `spawn_local`, upgrades only a weak sidebar-store reference after receipt, creates
-  every `SourceObject` on the main thread, and publishes the localized header plus rows in one
-  `ListStore::splice`. A kernel filesystem probe can still strand the detached worker because this
-  slice adds no timeout or cancellation, but it can no longer block window construction or touch
-  GTK from the worker.
-- [ ] Use platform mount/volume APIs rather than directory heuristics, and add live hotplug/unplug
-  updates. The current worker runs the existing heuristics once at startup. Exact raw-path
-  deduplication does not coalesce aliases or two mount points for the same physical device.
+- [x] Keep mount discovery from blocking GTK. PR #92's interim implementation isolated every
+  heuristic filesystem probe on one named `usb-discovery` worker behind a capacity-one snapshot.
+  The final implementation has no discovery worker or path probe to strand: `VolumeMonitor`, its
+  mount objects, and their cached getters stay on the GTK main thread, while canonicalization,
+  metadata probing, directory enumeration, and tag parsing never occur in monitor callbacks.
+- [x] Use native platform mount/volume APIs and reconcile live hotplug/unplug updates. One
+  window-owned controller takes an initial `VolumeMonitor::mounts()` snapshot, then coalesces
+  mount-added and mount-changed signals onto an idle reconciliation pass. Mount-removed retires and
+  removes the matching tracked path synchronously before scheduling that pass, so remove/re-add at
+  the same key and path cannot be coalesced into a false no-op. Mount-pre-unmount invalidates a
+  matching scan, cache, and playback before its namespace disappears, but deliberately retains the
+  row and inventory until removal is confirmed because an unmount can fail. Signal closures hold
+  only a weak controller; window destruction invalidates every device scan generation and
+  disconnects every handler. The Devices header follows the empty/non-empty inventory, rows are
+  inserted deterministically by logical key, and name changes atomically replace the row at the
+  same position.
+
+  The best available logical key is kept separate from the current native `PathBuf`. The priority
+  is opaque mount UUID, volume UUID, Unix device identifier, then root URI. Shadowed and pathless
+  roots are rejected, as are roots without native-path access and mounts the backend explicitly
+  classifies as network or loop. A native-path mount is retained when GIO reports a removable
+  drive, eject support, `device` class, or unmount support; because class metadata is optional and
+  `can_unmount` is broad, this fallback can admit a non-removable or natively mounted network
+  filesystem. Aliases sharing one logical key retain the lexically first path. A UUID identifies a
+  logical filesystem rather than unique hardware, so clones can collide; Unix-device and root-URI
+  fallbacks can change with device or path assignment.
 - [x] Add malicious symlink tests: a device tree with both a directory symlink and a file symlink
   pointing off-device yields only the files physically on the device.
-- [x] Add deterministic failed/vanished-candidate and exact-duplicate-path tests — the testable
-  portion of the original stale-mount/duplicate-device item. Candidate paths are sorted and
-  deduplicated by exact `PathBuf` before probing, so each exact path is checked once. Probe errors
-  and paths that are no longer directories are skipped without hiding healthy candidates. Two pure
-  tests cover error/non-directory filtering and shuffled duplicate inputs; they replace the
-  host-dependent detection smoke test. A truly hung stale-mount probe remains deliberately
-  unbounded on the detached worker, and a mount can still disappear after its successful probe.
-  The GTK publication path inserts no empty Devices header, and both its header and unnamed-device
-  fallback use the locale catalogs.
-- [ ] Record partial implementation: symlink containment in commit `1886847`; one-shot background
-  discovery in PR #92; 4 focused tests across traversal containment and deterministic
-  discovery filtering. Platform mount APIs, hotplug, live manual UI validation, and the P2.5
-  Flatpak permission/portal work remain open.
+- [x] Add deterministic stale/duplicate-device coverage. The native policy tests reject shadowed,
+  pathless, non-native, network, loop, and ineligible fixed mounts; exercise every supported
+  eligibility signal and identity tier; preserve opaque identifiers; deterministically deduplicate
+  aliases; and distinguish root-URI fallbacks. Pure inventory tests cover idempotence, add/rename/
+  remove ordering, active removal/relocation, confirmed remove followed by same-path reattach,
+  cancelled pre-unmount retention, and exact-generation reactivation that yields to later user
+  navigation. There is no longer a pre-publication filesystem liveness probe: GIO removal signals
+  reconcile a stale snapshot, while navigation generations prevent its retired scan from later
+  caching or rendering.
+- [ ] Record implementation and manual validation: symlink containment landed in commit `1886847`;
+  PR #92 supplied the nonblocking one-shot bridge; the native-monitor/hotplug PR is pending. The
+  final working tree passes `cargo check`, strict all-target Clippy in debug and release, and 18
+  library plus 557 application tests in both profiles (575 each). Formatting, `git diff --check`,
+  AppStream validation, and `cargo audit` also pass; the audit reports exactly the two already
+  accepted unmaintained warnings. Twenty-six focused P2.4 tests cover traversal, native policy,
+  source identity/path ownership, invalidation, bounded scanning, and lifecycle reconciliation. A
+  live add, rename/change, relocation, active pre-unmount, and removal pass with real removable
+  hardware is still required before this record can close. P2.5's Flatpak permission/portal work
+  remains separate and open.
 
-Acceptance criteria for this slice: window construction never waits for mount discovery; the
-worker publishes one bounded snapshot without constructing GTK objects; exact duplicate paths are
-probed once; failed and non-directory candidates are omitted; and GTK atomically inserts a localized
-header only when at least one device row survives. This is not a timeout, post-probe liveness
-guarantee, physical-device identity, hotplug, or sandbox-permission implementation.
+Acceptance criteria for the implemented portion: discovery reads only cached native mount metadata
+on GTK's main thread; add/change/pre-unmount/remove signals keep the sidebar inventory live without
+filesystem work in callbacks; logical identity and native paths remain distinct; removal or
+relocation invalidates pending navigation, track cache, and source-owned playback; an active removed
+source falls back to Local, while an immediately reappearing active logical source is reselected at
+its new path for a fresh scan only if the exact automatic Local fallback remains current. An
+uncached device clears the prior source projection before scanning. Device audio is streamed lazily
+from a named worker through a capacity-64 channel; ownership is polled every 50 ms and after every
+row, closing the receiver when the generation is retired so a blocked producer wakes and stops.
+GTK objects remain main-thread-only and symlinks are not followed. Cancellation is cooperative
+rather than a hard interrupt of an in-progress kernel or tag-parser call. This is not proof of
+unique physical-device identity, automount/eject/MTP support, a nested-filesystem boundary, or
+sandbox-permission implementation; real-hardware validation is still outstanding.
 
 ### P2.5 Repair Flatpak behavior and local build path
 
@@ -887,11 +918,13 @@ Run before marking any milestone complete:
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
-Most recent milestone validation (2026-07-15, P2.4 one-shot USB discovery plus the live
-idle-Play crash follow-up): 18 library plus 537 application tests passed in debug (555 total), and
-the release suite passed with the same 555 tests; strict all-target Clippy passed in both profiles;
-formatting and `git diff --check` were clean; and `cargo audit` passed with exactly the two accepted
-unmaintained warnings recorded under P0.8.
+Most recent milestone validation (2026-07-15, P2.4 native removable-media monitoring): `cargo
+check` passed; 18 library plus 557 application tests passed in debug and release (575 per profile);
+strict all-target Clippy passed in both profiles; formatting, `git diff --check`, and AppStream
+validation were clean; and `cargo audit` passed with exactly the two accepted unmaintained warnings
+recorded under P0.8. The first sandboxed debug-suite attempt denied loopback binds and therefore
+failed 41 network-fixture tests with `Operation not permitted`; the required unrestricted rerun
+passed all 575 tests and is the result recorded here.
 
 **This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
 hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
@@ -907,6 +940,17 @@ Record scope or design decisions here so deferred work is explicit.
 - 2026-07-10 — Implemented P0.1, P0.3-P0.6, and P0.8 in PR #68. P0.7's
   workflow contract is implemented, but its live manual-dispatch acceptance test requires a
   pushed ref and remains open.
+- 2026-07-15 — P2.4 uses GIO as a desktop mount inventory, not as proof of physical USB
+  hardware. Cached `VolumeMonitor` objects remain on GTK's main thread; only the selected native
+  path crosses to a named filesystem-scan worker. The best available key is stored separately from
+  that path and prefers mount UUID, volume UUID, Unix device identifier, then root URI. This lets a
+  same-key relocation retire stale navigation/cache/playback state and rescan at the new location;
+  pre-unmount performs the retirement but keeps the row until removal is confirmed. UUID clones may
+  collide, Unix-device and URI fallbacks can move with device/path assignment, and broad
+  `can_unmount` eligibility can admit a non-removable or native-path network mount when backend
+  class metadata is absent. Automount, eject, MTP/pathless browsing, hard interruption of an
+  in-progress filesystem/tag-parser call, nested-mount exclusion, Flatpak access, and live
+  physical-device validation remain outside this implementation.
 - 2026-07-10 — P0.2 now fails closed for incomplete traversal, unavailable/replaced roots,
   nested mounts, mount-table failures, and ambiguous legacy databases. Legacy roots with
   existing metadata are intentionally not made deletion-authoritative from content heuristics;
@@ -1275,3 +1319,4 @@ Add one line per completed task:
 | 2026-07-15 | P2.1 | PR #89 | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
 | 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
 | 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR #91 | Numeric validation; bounded exclusive UUID-plus-format sibling files; exact scan/watcher exclusion and temp-to-original metadata refresh that preserve track identity, history, and playlist links; RAII cleanup; permission copying and pre-rename `fsync`; album-artist handling; and 11 focused tests including a public-API round trip against a generated silent FLAC fixture. |
+| 2026-07-15 | P2.4 native mount lifecycle | Pending PR | GIO main-thread mount inventory and live signals; best-available logical keys separate from native paths; synchronous confirmed-removal retirement; exact-intent relocation reactivation; bounded cancellable scans; and 26 focused tests. Physical-device validation and P2.5 Flatpak access remain open. |
