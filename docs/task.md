@@ -378,7 +378,7 @@ proxies. All ticket routes use OS-assigned ports and unguessable UUIDs.
   entry; 2 focused tests cover missing, empty, and later valid locators and metadata alignment.
   The P2.11 retained-route follow-up on the current branch converts DAAP's live URL materialization
   into a typed, private-query, lease-bearing request without changing its credential-free
-  catalogue reference; PR pending.
+  catalogue reference; PR #97.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
 device or daemon Tributary does not own, retained in a generic catalogue/UI value, or serialized
@@ -977,7 +977,7 @@ failed through the separately resolved media path—but did not prove DNS was th
   additionally proves that release revokes an already-issued request, while the upgraded
   cast-proxy integration regression routes an unresolvable advertised hostname to its captured
   address and proves the exact `Host`, upstream-only authentication, receiver-header filtering,
-  opaque ticket, and post-revocation 404 contract. Implemented on the current branch; PR pending.
+  opaque ticket, and post-revocation 404 contract. Implemented in PR #97.
 - [ ] Run full fake Subsonic and DAAP streams through GStreamer (reusing these timeout/proxy
   fixtures), confirm the packaged Windows source plugin enforces the same direct policy, and record
   live packaged-Windows playback. Support a verified alternate HTTP source or continue to fail
@@ -1531,4 +1531,4 @@ Add one line per completed task:
 | 2026-07-15 | P2.5 legacy-root reauthorization | PR #95 | Explicit portal reselection records an immutable OLD→NEW intent; a marker-backed authority lease and guarded atomic transaction preserve track identity/history and playlist links; a same-transaction receipt makes crash/ambiguous-commit recovery idempotent; and malformed, overlapping, colliding, or inconsistent states quarantine unsafe scopes. Effective-write UX and installed interactive smoke testing remain open. |
 | 2026-07-15 | P2.6 0.5.0 release metadata | PR #96 | Added the missing AppStream 0.5.0 release entry, archived the shipped release in the changelog, and advanced Cargo/changelog development metadata to 0.5.1. The live release-workflow verification remains deliberately deferred. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
-| 2026-07-15 | P2.11 retained mDNS address routing | PR pending | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
+| 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
