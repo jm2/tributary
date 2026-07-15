@@ -466,7 +466,7 @@ All edits require an explicit **Save** click. Cancel discards all changes. Suppo
 Tributary supports regular and smart playlists for the local library:
 
 - **Regular playlists** — Right-click the Playlists header in the sidebar to create a new playlist. Right-click tracks in the tracklist to add them. Playlists survive library folder changes via fingerprint-based track matching.
-- **Smart playlists** — iTunes-style rules engine with 15 filterable fields, text/numeric/date operators, result limiting, and live updating. Create via the sidebar context menu.
+- **Smart playlists** — iTunes-style rules engine with filterable metadata fields, text/numeric/date operators, sorting, and result limiting. Smart playlists are evaluated against the current local library whenever they are opened or exported; they are not stored snapshots. Create them via the sidebar context menu.
 
 ### Playback Controls
 

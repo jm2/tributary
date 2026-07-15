@@ -140,7 +140,6 @@ smart_playlist:
   add_rule: "添加规则"
   remove_rule: "删除规则"
   limit_to: "限制为"
-  live_updating: "实时更新"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

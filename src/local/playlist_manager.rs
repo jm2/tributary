@@ -250,7 +250,9 @@ impl PlaylistManager {
             smart_rules::MatchMode::All => "all".to_string(),
             smart_rules::MatchMode::Any => "any".to_string(),
         });
-        model.live_updating = Set(rules.live_updating);
+        // Kept only for compatibility with the historical NOT NULL column.
+        // Smart playlists are always evaluated against the current library.
+        model.live_updating = Set(true);
 
         if let Some(limit) = &rules.limit {
             model.limit_enabled = Set(true);
@@ -305,7 +307,6 @@ impl PlaylistManager {
                 match_mode: smart_rules::MatchMode::All,
                 rules: Vec::new(),
                 limit: None,
-                live_updating: true,
                 sort_order: Vec::new(),
             },
         };
@@ -440,7 +441,6 @@ impl PlaylistManager {
                 value: smart_rules::RuleValue::Number(30),
             }],
             limit: None,
-            live_updating: true,
             sort_order: vec![smart_rules::SortCriterion {
                 field: smart_rules::SortField::DateAdded,
                 direction: smart_rules::SortDirection::Descending,
@@ -470,7 +470,6 @@ impl PlaylistManager {
                 },
             ],
             limit: None,
-            live_updating: true,
             sort_order: vec![smart_rules::SortCriterion {
                 field: smart_rules::SortField::DateModified,
                 direction: smart_rules::SortDirection::Descending,
@@ -494,7 +493,6 @@ impl PlaylistManager {
                 unit: smart_rules::LimitUnit::Items,
                 selected_by: smart_rules::LimitSort::MostPlayed,
             }),
-            live_updating: true,
             sort_order: vec![],
         };
         let pl = self.create_playlist("Top 25 Most Played", true).await?;
@@ -521,7 +519,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     use super::PlaylistManager;
-    use crate::db::entities::{playlist_entry, track};
+    use crate::db::entities::{playlist, playlist_entry, track};
     use crate::db::migration::Migrator;
 
     /// Open a fresh in-memory SQLite database with all migrations applied.
@@ -596,6 +594,90 @@ mod tests {
             .all(db)
             .await
             .expect("load playlist entries")
+    }
+
+    #[tokio::test]
+    async fn legacy_live_updating_false_still_reevaluates_and_is_canonicalized_on_save() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let created = manager
+            .create_playlist("Legacy smart playlist", true)
+            .await
+            .expect("create smart playlist");
+        let playlist_id = created.id.clone();
+
+        // Older releases persisted this option in both the rules JSON and a
+        // NOT NULL table column. It never changed evaluation semantics: smart
+        // playlists are evaluated from the current track table on every load.
+        let legacy_json = r#"{
+            "match_mode":"All",
+            "rules":[{
+                "field":"Artist",
+                "operator":"Contains",
+                "value":{"Text":"Legacy Artist"}
+            }],
+            "limit":null,
+            "live_updating":false,
+            "sort_order":[]
+        }"#;
+        let mut legacy: playlist::ActiveModel = created.into();
+        legacy.smart_rules_json = Set(Some(legacy_json.to_string()));
+        legacy.live_updating = Set(false);
+        legacy.update(&db).await.expect("persist legacy rules");
+
+        insert_track(
+            &db,
+            "legacy-one",
+            "/music/legacy-one.flac",
+            "First",
+            "Legacy Artist",
+            "Album",
+            Some(180),
+        )
+        .await;
+        assert_eq!(
+            manager
+                .evaluate_smart_playlist(&playlist_id)
+                .await
+                .expect("evaluate legacy rules")
+                .len(),
+            1
+        );
+
+        insert_track(
+            &db,
+            "legacy-two",
+            "/music/legacy-two.flac",
+            "Second",
+            "Legacy Artist",
+            "Album",
+            Some(200),
+        )
+        .await;
+        assert_eq!(
+            manager
+                .evaluate_smart_playlist(&playlist_id)
+                .await
+                .expect("reevaluate legacy rules against current library")
+                .len(),
+            2
+        );
+
+        let rules = serde_json::from_str(legacy_json).expect("parse legacy rules JSON");
+        manager
+            .set_smart_rules(&playlist_id, &rules)
+            .await
+            .expect("save legacy rules");
+        let saved = manager
+            .get_playlist(&playlist_id)
+            .await
+            .expect("load saved playlist")
+            .expect("saved playlist exists");
+        assert!(saved.live_updating);
+        assert!(!saved
+            .smart_rules_json
+            .expect("saved rules JSON")
+            .contains("live_updating"));
     }
 
     #[tokio::test]

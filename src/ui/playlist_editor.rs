@@ -286,12 +286,6 @@ pub fn show_smart_playlist_editor(
     limit_row.append(&gtk::Label::new(Some("selected by")));
     limit_row.append(&limit_sort_dropdown);
 
-    // ── Live updating ───────────────────────────────────────────────
-    let live_check = gtk::CheckButton::builder()
-        .label("Live updating")
-        .active(existing_rules.map(|r| r.live_updating).unwrap_or(true))
-        .build();
-
     // ── Layout ──────────────────────────────────────────────────────
     let vbox = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -316,7 +310,6 @@ pub fn show_smart_playlist_editor(
     add_row.append(&add_btn);
     vbox.append(&add_row);
     vbox.append(&limit_row);
-    vbox.append(&live_check);
 
     // ── Sort order section ──────────────────────────────────────────
     let sort_label = gtk::Label::builder()
@@ -437,7 +430,6 @@ pub fn show_smart_playlist_editor(
             match_mode,
             rules,
             limit,
-            live_updating: live_check.is_active(),
             sort_order,
         };
 

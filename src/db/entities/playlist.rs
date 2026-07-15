@@ -17,6 +17,8 @@ pub struct Model {
     pub limit_unit: Option<String>,
     pub limit_sort: Option<String>,
     pub match_mode: String,
+    /// Legacy schema-compatibility column. Smart playlists are always
+    /// evaluated against the current library, and new writes store `true`.
     pub live_updating: bool,
     pub created_at: String,
     pub updated_at: String,

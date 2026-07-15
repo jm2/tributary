@@ -140,7 +140,6 @@ smart_playlist:
   add_rule: "Añadir regla"
   remove_rule: "Eliminar regla"
   limit_to: "Limitar a"
-  live_updating: "Actualización en vivo"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:
