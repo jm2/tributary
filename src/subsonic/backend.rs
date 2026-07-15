@@ -701,10 +701,15 @@ mod tests {
             .expect("serve Subsonic fixture");
         });
 
-        let backend =
-            SubsonicBackend::connect("fixture", &format!("http://{address}"), "user", "password")
-                .await
-                .expect("connect to fixture");
+        let fixture_secret = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect(
+            "fixture",
+            &format!("http://{address}"),
+            "user",
+            &fixture_secret,
+        )
+        .await
+        .expect("connect to fixture");
         let shared_id = deterministic_uuid("shared-native-id");
 
         let initial = backend
