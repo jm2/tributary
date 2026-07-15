@@ -777,7 +777,7 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   still prove the offline bundle build; a local installed-app pass must verify XDG Music writes,
   a portal-selected custom directory across restart, a legacy direct path's fail-closed behavior,
   and read-only add/change/remove under each applicable standard mount root.
-- [ ] Record implementation: pending the PR number and the local interactive smoke test. The
+- [ ] Record implementation: PR #94 is open; the local interactive smoke test remains pending. The
   noninteractive working tree passes the exact vendored checksum, Python and shell syntax, YAML
   parsing, the positive/negative permission-policy suite, cwd-independent generation from `/tmp`
   and `/`, nonempty JSON parsing, and byte-identical repeated generation. No repository-root
@@ -1386,4 +1386,4 @@ Add one line per completed task:
 | 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
 | 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR #91 | Numeric validation; bounded exclusive UUID-plus-format sibling files; exact scan/watcher exclusion and temp-to-original metadata refresh that preserve track identity, history, and playlist links; RAII cleanup; permission copying and pre-rename `fsync`; album-artist handling; and 11 focused tests including a public-API round trip against a generated silent FLAC fixture. |
 | 2026-07-15 | P2.4 native mount lifecycle | PR #93 | GIO main-thread mount inventory and live signals; best-available logical keys separate from native paths; synchronous confirmed-removal retirement; exact-intent relocation reactivation; bounded cancellable scans; and 26 focused tests. Physical-device validation remains open; Flatpak access follows under P2.5. |
-| 2026-07-15 | P2.5 Flatpak generation and access policy | Pending PR | Vendored checksum-pinned Cargo generator shared by local builds and CI; consistent manifest-local source generation; read-only standard external-media roots; reviewed GVfs bus access; portal-selected writable custom libraries; and a fail-closed permission policy test. Legacy-root relocation, effective-write UX, local interactive portal/physical-media smoke testing, and the deliberately deferred release workflow remain open. |
+| 2026-07-15 | P2.5 Flatpak generation and access policy | PR #94 | Vendored checksum-pinned Cargo generator shared by local builds and CI; consistent manifest-local source generation; read-only standard external-media roots; reviewed GVfs bus access; portal-selected writable custom libraries; and a fail-closed permission policy test. Legacy-root relocation, effective-write UX, local interactive portal/physical-media smoke testing, and the deliberately deferred release workflow remain open. |
