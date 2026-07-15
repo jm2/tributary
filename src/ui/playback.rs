@@ -585,10 +585,11 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         }
     };
 
-    // Local (`file://`) library tracks are cast to the device by the
-    // Chromecast output itself, which serves them over its embedded LAN
-    // `CastHttpServer` (see `ChromecastOutput::resolve_uri`); local, MPD and
-    // AirPlay outputs play them directly. No output swap is needed here.
+    // Each output resolves the source at its own trust boundary. Chromecast
+    // serves local files over its embedded LAN server; authenticated remote
+    // media is exchanged for an app-owned proxy ticket before Chromecast,
+    // MPD, local playbin, or AirPlay uridecodebin can consume it. No output
+    // swap is needed here.
 
     tracing::debug!("Playing track");
 

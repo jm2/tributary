@@ -68,7 +68,7 @@ pub fn setup_output_selector(
     let event_sender = event_sender.clone();
     let volume_scale = volume_scale.clone();
     let output_button = output_button.clone();
-    // Real runtime handle for Chromecast and MPD's embedded media servers.
+    // Real runtime handle for embedded media servers used by remote outputs.
     let rt_handle = rt_handle.clone();
 
     output_list.connect_row_activated(move |list_box, activated_row| {
@@ -150,6 +150,7 @@ pub fn setup_output_selector(
                     &parked_local,
                     &event_sender,
                     &volume_scale,
+                    &rt_handle,
                 );
             } else {
                 handle_mpd_switch(
@@ -276,6 +277,7 @@ fn handle_airplay_switch(
     parked_local: &Rc<RefCell<Option<Box<dyn AudioOutput>>>>,
     event_sender: &async_channel::Sender<PlayerEvent>,
     volume_scale: &gtk::Scale,
+    rt_handle: &tokio::runtime::Handle,
 ) {
     let airplay_name = activated_row
         .first_child()
@@ -302,7 +304,8 @@ fn handle_airplay_switch(
         port,
         event_sender.clone(),
         volume_scale.value(),
-    );
+    )
+    .with_runtime(rt_handle.clone());
     let supports_volume = airplay.supports_volume();
     *active_output.borrow_mut() = Box::new(airplay);
     info!(
