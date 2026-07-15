@@ -510,13 +510,11 @@ mod tests {
     fn advertised_route_reaches_stream_and_artwork_requests() {
         let origin = "https://music.example.test";
         let route = advertised_route(origin);
-        let client = SubsonicClient::new_with_route(
-            origin,
-            "route-user",
-            "route-password",
-            Some(route.clone()),
-        )
-        .expect("routed client");
+        let username = uuid::Uuid::new_v4().to_string();
+        let password = uuid::Uuid::new_v4().to_string();
+        let client =
+            SubsonicClient::new_with_route(origin, &username, &password, Some(route.clone()))
+                .expect("routed client");
 
         for request in [
             client.resolved_stream_request("song-id").unwrap(),
@@ -526,7 +524,7 @@ mod tests {
             assert_eq!(request.endpoint().host_str(), Some("music.example.test"));
         }
 
-        let ordinary = SubsonicClient::new(origin, "user", "password").expect("ordinary client");
+        let ordinary = SubsonicClient::new(origin, &username, &password).expect("ordinary client");
         assert!(ordinary
             .resolved_stream_request("song-id")
             .unwrap()
