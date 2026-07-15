@@ -327,9 +327,9 @@ unguessable UUID routes; the credential-bearing upstream stays inside Tributary.
   through byte-for-byte. Missing runtime, bind/client/ticket validation, malformed declared
   HTTP(S), and credentialed unsupported schemes fail closed with fixed URL-free events. A
   replacement (including direct or rejected media), Stop, EOS, pipeline error, setup/preroll/start
-  failure, output drop, or proxy drop revokes the route; pause, play, and seek retain it. Dedicated
-  servers plus identity-checked cleanup ensure a delayed callback can retire only its own ticket,
-  never a newer load.
+  failure, output drop, or proxy drop revokes the route; pause, play, and seek retain it only
+  within its hard 24-hour lifetime. Dedicated servers plus identity-checked cleanup ensure a
+  delayed callback can retire only its own ticket, never a newer load.
 - [ ] Keep backend credentials outside generic `Track` values: drop the credential from
   `Track.stream_url` and add a backend `resolve_stream(&track) -> (Url, HeaderMap)` called at
   playback time, moving `X-Plex-Token` / `api_key` / Subsonic `u,t,s,p` out of the query string
@@ -348,8 +348,8 @@ unguessable UUID routes; the credential-bearing upstream stays inside Tributary.
   tests (10 worker/ticket lifecycle, 3 media classification, and 5 route/body-error tests); hard
   upstream-ticket expiry in commit `8735862` with 6 deterministic deadline, non-renewal,
   revocation/supersession, local-route, admitted-response, and 404-equivalence tests; the
-  local/AirPlay GStreamer boundary is in `2188efb` with 8 focused
-  tests. Credential-free `Track` values remain open.
+  local/AirPlay GStreamer boundary is in `2188efb` with 8 focused tests. Making generic
+  `Track`/UI values credential-free remains open.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
 device or daemon Tributary does not own. **Chromecast and MPD now meet the receiver-boundary
@@ -874,9 +874,10 @@ Record scope or design decisions here so deferred work is explicit.
   exact-origin/no-`Referer` client sees the upstream URL. The proxy forwards only `Range`; direct
   media stays byte-for-byte direct. Malformed or unsupported protected inputs and missing runtime,
   bind, client, or ticket state fail closed. Replacement, Stop, EOS/error, setup/preroll/start
-  failure, and teardown revoke the ticket, while pause/play/seek retain it; identity-checked
-  cleanup and per-load servers prevent stale callbacks from revoking a newer load. This completes
-  P1.4 without changing the still-open generic credential-bearing `Track` representation.
+  failure, and teardown revoke the ticket, while pause/play/seek retain it only within its hard
+  24-hour lifetime; identity-checked cleanup and per-load servers prevent stale callbacks from
+  revoking a newer load. This completes P1.4 without changing the still-open generic
+  credential-bearing `Track` representation.
 - 2026-07-12 — P1.5 treats every finite HTTP response as an observed byte stream rather than
   trusting `Content-Length`: Subsonic, Jellyfin, Plex, DAAP, authentication, radio/geolocation,
   artwork, and MusicBrainz reads now stop at endpoint-specific caps and carry end-to-end request
