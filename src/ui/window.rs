@@ -16,7 +16,9 @@ use crate::audio::local_output::LocalOutput;
 use crate::audio::output::AudioOutput;
 use crate::audio::{PlayerEvent, PlayerState};
 use crate::desktop_integration::MediaAction;
-use crate::local::engine::{LibraryEngine, LibraryEvent};
+use crate::local::engine::{
+    LibraryEngine, LibraryEvent, RootReauthorizationOutcome, RootReauthorizationRequest,
+};
 use crate::ui::header_bar::RepeatMode;
 
 use super::browser;
@@ -453,19 +455,38 @@ pub fn build_window(
     // Use the configured library paths from preferences, which default
     // to the XDG / platform music directory (e.g. ~/Musique on French
     // systems) via dirs::audio_dir() with a ~/Music fallback.
-    let music_dirs: Vec<std::path::PathBuf> = app_config
-        .borrow()
-        .library_paths
-        .iter()
-        .map(std::path::PathBuf::from)
-        .collect();
+    let (music_dirs, pending_root_reauthorizations) = {
+        let config = app_config.borrow();
+        let music_dirs = config
+            .library_paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        let pending = config
+            .pending_root_reauthorizations
+            .iter()
+            .map(|request| {
+                RootReauthorizationRequest::new(
+                    &request.request_id,
+                    std::path::PathBuf::from(&request.old_path),
+                    std::path::PathBuf::from(&request.new_path),
+                )
+            })
+            .collect();
+        (music_dirs, pending)
+    };
 
     let engine_tx_clone = engine_tx.clone();
     rt_handle.spawn(async move {
         match crate::db::connection::init_db().await {
             Ok(db) => {
-                let engine =
-                    LibraryEngine::new(db, music_dirs, engine_tx_clone, library_command_rx);
+                let engine = LibraryEngine::new(
+                    db,
+                    music_dirs,
+                    pending_root_reauthorizations,
+                    engine_tx_clone,
+                    library_command_rx,
+                );
                 engine.run().await;
             }
             Err(e) => {
@@ -924,6 +945,7 @@ pub fn build_window(
                 playback_session.clone(),
                 root_trust_prompts.clone(),
                 invalidate_source_playback.clone(),
+                app_config.clone(),
             );
             return;
         }
@@ -1788,6 +1810,7 @@ pub fn build_window(
         playback_session,
         root_trust_prompts,
         invalidate_source_playback,
+        app_config,
     );
 }
 
@@ -1901,6 +1924,7 @@ fn setup_library_events(
     playback_session: Rc<RefCell<PlaybackSession>>,
     root_trust_prompts: root_trust::RootTrustPromptController,
     invalidate_source_playback: SourcePlaybackInvalidator,
+    app_config: Rc<RefCell<preferences::AppConfig>>,
 ) {
     let browser_widget = browser_widget.clone();
     let column_view = column_view.clone();
@@ -2360,6 +2384,76 @@ fn setup_library_events(
                     outcome,
                 } => {
                     root_trust_prompts.handle_finished(request_id, path, reason, outcome);
+                }
+
+                LibraryEvent::RootReauthorizationFinished {
+                    request_id,
+                    old_path,
+                    new_path,
+                    outcome,
+                    message,
+                } => {
+                    if outcome.committed() {
+                        let old_path = old_path.to_string_lossy();
+                        let new_path = new_path.to_string_lossy();
+                        let mut config = app_config.borrow_mut();
+                        let mut candidate = config.clone();
+                        if preferences::complete_root_reauthorization(
+                            &mut candidate,
+                            &request_id,
+                            old_path.as_ref(),
+                            new_path.as_ref(),
+                        ) && preferences::save_config(&candidate)
+                        {
+                            *config = candidate;
+                            info!(
+                                %request_id,
+                                old_path = %old_path,
+                                new_path = %new_path,
+                                ?outcome,
+                                "Committed library root reauthorization to config"
+                            );
+                        } else {
+                            warn!(
+                                %request_id,
+                                old_path = %old_path,
+                                new_path = %new_path,
+                                ?outcome,
+                                "Database relocation committed but config cleanup did not; durable receipt will retry"
+                            );
+                        }
+                    } else {
+                        if outcome == RootReauthorizationOutcome::Rejected {
+                            let old_key = old_path.to_string_lossy();
+                            let new_key = new_path.to_string_lossy();
+                            let mut config = app_config.borrow_mut();
+                            let mut candidate = config.clone();
+                            if preferences::reject_root_reauthorization(
+                                &mut candidate,
+                                &request_id,
+                                old_key.as_ref(),
+                                new_key.as_ref(),
+                            ) && preferences::save_config(&candidate)
+                            {
+                                *config = candidate;
+                            }
+                        }
+                        warn!(
+                            %request_id,
+                            old_path = %old_path.display(),
+                            new_path = %new_path.display(),
+                            ?outcome,
+                            detail = message.as_deref().unwrap_or("validation failed"),
+                            "Library root reauthorization did not commit"
+                        );
+                        let status = match outcome {
+                            RootReauthorizationOutcome::Inconsistent => rust_i18n::t!(
+                                "preferences.reauthorization_inconsistent_status"
+                            ),
+                            _ => rust_i18n::t!("preferences.reauthorization_failed_status"),
+                        };
+                        status_label.set_text(status.as_ref());
+                    }
                 }
 
                 LibraryEvent::Error(msg) => {
