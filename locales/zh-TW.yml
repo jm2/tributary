@@ -27,6 +27,8 @@ sidebar:
   top_voted: "最高評分"
   stations_near_me: "附近電台"
   playlists: "播放清單"
+  devices: "裝置"
+  usb_device: "USB 裝置"
   add_server: "新增伺服器"
   new_playlist: "新建播放清單"
   remove_server: "移除伺服器"

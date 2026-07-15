@@ -441,6 +441,24 @@ data/                        # .desktop, AppStream metainfo, icons
 
 On first launch, Tributary scans your `~/Music` folder (configurable in Preferences) and displays all discovered tracks in the main tracklist. Use the **browser panes** above the tracklist to filter by Genre → Artist → Album. Click any column header to sort; click again to reverse; click a third time to clear the sort.
 
+### Browsing Removable Media
+
+At startup, Tributary runs one removable-volume discovery pass on a dedicated worker so filesystem
+probes cannot hold up the GTK window. Exact mount paths are sorted and deduplicated before probing;
+each is checked once, and probe errors, vanished paths, and non-directories are skipped. GTK receives
+one bounded snapshot and atomically adds the translated **Devices** header and rows only when at
+least one device survives. A volume without a usable name receives the translated **USB Device**
+fallback. Selecting a device scans its audio on a background thread without following symlinks off
+the selected volume.
+
+Discovery is currently heuristic and one-shot: attaching or removing a device after startup
+requires restarting Tributary, and the same physical device exposed at two different paths can
+appear twice. There is no probe timeout or cancellation, so a hung filesystem call can leave the
+detached discovery worker running even though GTK remains responsive. A device can also disappear
+after the startup probe and before it is selected. Platform volume APIs and hotplug monitoring are
+still planned. Flatpak removable-media access also depends on the pending narrow permission or
+portal work tracked in [P2.5](docs/task.md#p25-repair-flatpak-behavior-and-local-build-path).
+
 ### Connecting to Remote Servers
 
 Remote servers are discovered automatically via mDNS (DAAP, Subsonic, Plex) and UDP broadcast (Jellyfin). Discovered servers appear in the sidebar — click one to connect. Password-protected DAAP shares show a lock icon; passwordless shares connect with a single click.

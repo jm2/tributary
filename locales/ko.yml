@@ -27,6 +27,8 @@ sidebar:
   top_voted: "평점 높은 방송국"
   stations_near_me: "내 주변 방송국"
   playlists: "재생목록"
+  devices: "장치"
+  usb_device: "USB 장치"
   add_server: "서버 추가"
   new_playlist: "새 재생목록"
   remove_server: "서버 제거"

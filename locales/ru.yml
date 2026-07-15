@@ -27,6 +27,8 @@ sidebar:
   top_voted: "Самые рейтинговые"
   stations_near_me: "Станции поблизости"
   playlists: "Плейлисты"
+  devices: "Устройства"
+  usb_device: "USB-устройство"
   add_server: "Добавить сервер"
   new_playlist: "Новый плейлист"
   remove_server: "Удалить сервер"

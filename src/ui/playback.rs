@@ -598,6 +598,16 @@ fn resolve_play_request(has_current: bool, item_count: u32, shuffle: bool) -> Pl
     })
 }
 
+/// Read the session behind a function boundary so its `Ref` is released before
+/// the caller handles a request that may replace the queue.
+fn resolve_session_play_request(
+    session: &RefCell<PlaybackSession>,
+    item_count: u32,
+    shuffle: bool,
+) -> PlayRequest {
+    resolve_play_request(session.borrow().has_current(), item_count, shuffle)
+}
+
 /// Try to play the track at `position` in the given model.
 ///
 /// Captures the visible sorted model as an immutable playback queue, then
@@ -658,11 +668,10 @@ pub fn play_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
     if ctx.session.borrow().resolution_failed {
         return play_current(ctx);
     }
-    match resolve_play_request(
-        ctx.session.borrow().has_current(),
-        ctx.model.n_items(),
-        shuffle,
-    ) {
+    // Do not borrow the RefCell directly in the match scrutinee: scrutinee
+    // temporaries live through the selected arm, and StartAt mutably borrows
+    // the same session while installing the newly captured queue.
+    match resolve_session_play_request(&ctx.session, ctx.model.n_items(), shuffle) {
         PlayRequest::Resume => {
             ctx.active_output.borrow().play();
             true
@@ -1490,18 +1499,27 @@ mod tests {
 
     #[test]
     fn os_stop_then_play_starts_a_fresh_visible_queue() {
-        let mut session = PlaybackSession::default();
-        assert!(session.replace_queue(vec![item("local", "a")], 0));
+        let session = RefCell::new(PlaybackSession::default());
+        assert!(session
+            .borrow_mut()
+            .replace_queue(vec![item("local", "a")], 0));
         assert_eq!(
-            resolve_play_request(session.has_current(), 3, false),
+            resolve_session_play_request(&session, 3, false),
             PlayRequest::Resume
         );
 
-        session.clear();
+        session.borrow_mut().clear();
 
         assert_eq!(
-            resolve_play_request(session.has_current(), 3, false),
+            resolve_session_play_request(&session, 3, false),
             PlayRequest::StartAt(0)
+        );
+        assert!(
+            session
+                .try_borrow_mut()
+                .expect("play-request resolution must release its immutable borrow")
+                .replace_queue(vec![item("remote", "fresh")], 0),
+            "the StartAt arm must be able to install a fresh queue"
         );
     }
 

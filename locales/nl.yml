@@ -27,6 +27,8 @@ sidebar:
   top_voted: "Hoogst gewaardeerd"
   stations_near_me: "Stations in de buurt"
   playlists: "Afspeellijsten"
+  devices: "Apparaten"
+  usb_device: "USB-apparaat"
   add_server: "Server toevoegen"
   new_playlist: "Nieuwe afspeellijst"
   remove_server: "Server verwijderen"

@@ -27,6 +27,8 @@ sidebar:
   top_voted: "Mais votadas"
   stations_near_me: "Estações próximas"
   playlists: "Listas de reprodução"
+  devices: "Dispositivos"
+  usb_device: "Dispositivo USB"
   add_server: "Adicionar servidor"
   new_playlist: "Nova lista de reprodução"
   remove_server: "Remover servidor"
