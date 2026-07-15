@@ -11,8 +11,24 @@ use sea_orm::{ActiveValue::Set, QueryOrder, TransactionTrait};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use super::playlist_io::{ImportedTrack, ImportedTrackMatchIndex};
 use super::smart_rules::{self, SmartRules};
 use crate::db::entities::{playlist, playlist_entry, track};
+
+/// Per-entry outcome counts for one committed playlist import.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlaylistImportCounts {
+    pub matched: usize,
+    pub unmatched: usize,
+    pub failed: usize,
+}
+
+/// A newly imported playlist and the outcome for every source entry.
+#[derive(Debug)]
+pub struct PlaylistImportResult {
+    pub playlist: playlist::Model,
+    pub counts: PlaylistImportCounts,
+}
 
 /// Manages playlist persistence and track reconciliation.
 pub struct PlaylistManager {
@@ -50,6 +66,120 @@ impl PlaylistManager {
         let result = model.insert(&self.db).await?;
         info!(id = %result.id, name = %result.name, "Playlist created");
         Ok(result)
+    }
+
+    /// Import one regular playlist and all usable entries atomically.
+    ///
+    /// Matching and persistence share one database transaction and track-table
+    /// snapshot. A database error therefore rolls back the playlist and every
+    /// entry instead of leaving a partially imported result. Entries with a
+    /// usable path or metadata fingerprint are retained even when no current
+    /// track matches, so reconciliation can link them after the library
+    /// changes. Source rows with no usable identity, or a duration that cannot
+    /// be represented by the playlist schema, are counted as failed.
+    pub async fn import_regular_playlist(
+        &self,
+        name: &str,
+        imported: &[ImportedTrack],
+    ) -> Result<PlaylistImportResult, DbErr> {
+        let txn = self.db.begin().await?;
+        let all_tracks = track::Entity::find().all(&txn).await?;
+        let match_index = ImportedTrackMatchIndex::new(&all_tracks);
+        let now = now_rfc3339();
+        let playlist = playlist::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            name: Set(name.to_string()),
+            is_smart: Set(false),
+            smart_rules_json: Set(None),
+            limit_enabled: Set(false),
+            limit_value: Set(None),
+            limit_unit: Set(None),
+            limit_sort: Set(None),
+            match_mode: Set("all".to_string()),
+            live_updating: Set(true),
+            created_at: Set(now.clone()),
+            updated_at: Set(now),
+        }
+        .insert(&txn)
+        .await?;
+
+        let mut counts = PlaylistImportCounts::default();
+        let mut position = 0i32;
+
+        for source in imported {
+            let has_path = !source.file_path.trim().is_empty();
+            let has_fingerprint =
+                !source.title.trim().is_empty() && !source.artist.trim().is_empty();
+            if !has_path && !has_fingerprint {
+                counts.failed += 1;
+                continue;
+            }
+
+            let imported_duration = match source.duration_secs {
+                Some(value) => match i32::try_from(value) {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        counts.failed += 1;
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let matched = match_index.find(source);
+            let (track_id, match_file_path, title, artist, album, match_duration) =
+                if let Some(track) = matched {
+                    counts.matched += 1;
+                    (
+                        Some(track.id.clone()),
+                        Some(track.file_path.clone()),
+                        normalize_fingerprint(&track.title),
+                        normalize_fingerprint(&track.artist_name),
+                        normalize_fingerprint(&track.album_title),
+                        track
+                            .duration_secs
+                            .and_then(|value| i32::try_from(value).ok()),
+                    )
+                } else {
+                    counts.unmatched += 1;
+                    (
+                        None,
+                        has_path.then(|| source.file_path.clone()),
+                        normalize_fingerprint(&source.title),
+                        normalize_fingerprint(&source.artist),
+                        normalize_fingerprint(&source.album),
+                        imported_duration,
+                    )
+                };
+
+            playlist_entry::ActiveModel {
+                id: Set(Uuid::new_v4().to_string()),
+                playlist_id: Set(playlist.id.clone()),
+                position: Set(position),
+                track_id: Set(track_id),
+                match_file_path: Set(match_file_path),
+                match_title: Set(title),
+                match_artist: Set(artist),
+                match_album: Set(album),
+                match_duration_secs: Set(match_duration),
+            }
+            .insert(&txn)
+            .await?;
+
+            position = position
+                .checked_add(1)
+                .ok_or_else(|| DbErr::Custom("Playlist has too many entries".to_string()))?;
+        }
+
+        txn.commit().await?;
+        info!(
+            id = %playlist.id,
+            name = %playlist.name,
+            matched = counts.matched,
+            unmatched = counts.unmatched,
+            failed = counts.failed,
+            "Playlist import committed"
+        );
+        Ok(PlaylistImportResult { playlist, counts })
     }
 
     /// Delete a playlist and all its entries (cascade).
@@ -118,6 +248,7 @@ impl PlaylistManager {
             playlist_id: Set(playlist_id.to_string()),
             position: Set(max_pos + 1),
             track_id: Set(Some(track.id.clone())),
+            match_file_path: Set(Some(track.file_path.clone())),
             match_title: Set(track.title.to_lowercase().trim().to_string()),
             match_artist: Set(track.artist_name.to_lowercase().trim().to_string()),
             match_album: Set(track.album_title.to_lowercase().trim().to_string()),
@@ -327,8 +458,8 @@ impl PlaylistManager {
     ///
     /// Called after a library rebuild (FullSync). Finds entries with
     /// `track_id IS NULL` and attempts to match them against current
-    /// tracks by `(title, artist, album)` fingerprint with optional
-    /// duration tolerance (±2 seconds).
+    /// tracks by exact retained path first, then by a normalized
+    /// `(title, artist, album)` fingerprint with optional duration tolerance.
     ///
     /// Returns the number of entries re-linked.
     pub async fn reconcile_all(&self) -> Result<u32, DbErr> {
@@ -346,68 +477,50 @@ impl PlaylistManager {
             "Reconciling orphaned playlist entries"
         );
 
-        // Load the track table once and index it by normalized
-        // (title, artist, album) fingerprint, so each orphan is resolved with
-        // an in-memory lookup instead of a full-table-scan SQL query per
-        // orphan (the SQL `lower(col)` predicate couldn't use the column
-        // indexes). The keys are lowercased AND trimmed to match how the
-        // `match_*` fields are stored in `add_track`.
+        // Load one track-table snapshot. The same pure path/fingerprint
+        // resolver is used by import and reconciliation, keeping duration and
+        // ambiguity behavior identical across both paths.
         let all_tracks = track::Entity::find().all(&self.db).await?;
-        let mut index: HashMap<(String, String, String), Vec<&track::Model>> = HashMap::new();
-        for t in &all_tracks {
-            let key = (
-                t.title.to_lowercase().trim().to_string(),
-                t.artist_name.to_lowercase().trim().to_string(),
-                t.album_title.to_lowercase().trim().to_string(),
-            );
-            index.entry(key).or_default().push(t);
-        }
+        let match_index = ImportedTrackMatchIndex::new(&all_tracks);
 
         let mut relinked = 0u32;
 
         for orphan in orphans {
-            // `match_*` are already lowercased + trimmed at insert time.
-            let key = (
-                orphan.match_title.clone(),
-                orphan.match_artist.clone(),
-                orphan.match_album.clone(),
-            );
-            let Some(candidates) = index.get(&key) else {
-                continue;
-            };
-
-            // Never choose arbitrarily among duplicate fingerprint matches.
-            // Duration narrows the eligible set when available; the orphan is
-            // left unresolved unless exactly one candidate remains.
-            let best = {
-                let expected_duration = orphan.match_duration_secs;
-                let mut eligible = candidates.iter().copied().filter(|candidate| {
-                    expected_duration.is_none_or(|duration| {
-                        candidate
-                            .duration_secs
-                            .is_some_and(|value| (value - i64::from(duration)).abs() <= 2)
-                    })
-                });
-                match (eligible.next(), eligible.next()) {
-                    (Some(candidate), None) => Some(candidate),
-                    (Some(_), Some(_)) => {
-                        warn!(
-                            entry = %orphan.id,
-                            title = %orphan.match_title,
-                            artist = %orphan.match_artist,
-                            album = %orphan.match_album,
-                            "Playlist entry has multiple eligible track matches; leaving it orphaned"
-                        );
-                        None
+            let duration_secs = match orphan.match_duration_secs {
+                Some(value) => match u64::try_from(value) {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        warn!(entry = %orphan.id, "Playlist entry has an invalid negative duration");
+                        continue;
                     }
-                    _ => None,
-                }
+                },
+                None => None,
             };
+            let imported = ImportedTrack {
+                title: orphan.match_title.clone(),
+                artist: orphan.match_artist.clone(),
+                album: orphan.match_album.clone(),
+                file_path: orphan.match_file_path.clone().unwrap_or_default(),
+                duration_secs,
+            };
+            let best = match_index.find(&imported);
 
             if let Some(best) = best {
                 let track_id = best.id.clone();
+                let match_file_path = best.file_path.clone();
+                let match_title = normalize_fingerprint(&best.title);
+                let match_artist = normalize_fingerprint(&best.artist_name);
+                let match_album = normalize_fingerprint(&best.album_title);
+                let match_duration_secs = best
+                    .duration_secs
+                    .and_then(|value| i32::try_from(value).ok());
                 let mut entry: playlist_entry::ActiveModel = orphan.into();
                 entry.track_id = Set(Some(track_id));
+                entry.match_file_path = Set(Some(match_file_path));
+                entry.match_title = Set(match_title);
+                entry.match_artist = Set(match_artist);
+                entry.match_album = Set(match_album);
+                entry.match_duration_secs = Set(match_duration_secs);
                 entry.update(&self.db).await?;
                 relinked += 1;
             }
@@ -505,6 +618,10 @@ impl PlaylistManager {
     }
 }
 
+fn normalize_fingerprint(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
 /// Get current time as RFC3339 string.
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -513,14 +630,15 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use sea_orm::{
-        ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait,
-        QueryFilter, QueryOrder,
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, Database,
+        DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
     };
     use sea_orm_migration::MigratorTrait;
 
     use super::PlaylistManager;
     use crate::db::entities::{playlist, playlist_entry, track};
     use crate::db::migration::Migrator;
+    use crate::local::playlist_io::ImportedTrack;
 
     /// Open a fresh in-memory SQLite database with all migrations applied.
     ///
@@ -540,6 +658,7 @@ mod tests {
             playlist_id: Set(playlist_id.to_string()),
             position: Set(position),
             track_id: Set(None),
+            match_file_path: Set(None),
             match_title: Set(String::new()),
             match_artist: Set(String::new()),
             match_album: Set(String::new()),
@@ -594,6 +713,167 @@ mod tests {
             .all(db)
             .await
             .expect("load playlist entries")
+    }
+
+    #[tokio::test]
+    async fn import_commits_matched_unmatched_and_failed_counts_and_reconciles_path() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let existing = insert_track(
+            &db,
+            "existing",
+            "/music/existing.flac",
+            "Canonical Title",
+            "Canonical Artist",
+            "Canonical Album",
+            Some(180),
+        )
+        .await;
+        let imported = vec![
+            ImportedTrack {
+                title: "Wrong metadata".to_string(),
+                artist: "Wrong artist".to_string(),
+                album: String::new(),
+                file_path: existing.file_path.clone(),
+                duration_secs: None,
+            },
+            ImportedTrack {
+                title: String::new(),
+                artist: String::new(),
+                album: String::new(),
+                file_path: "/music/available-later.flac".to_string(),
+                duration_secs: Some(200),
+            },
+            ImportedTrack {
+                title: "No artist".to_string(),
+                artist: String::new(),
+                album: String::new(),
+                file_path: String::new(),
+                duration_secs: None,
+            },
+            ImportedTrack {
+                title: "Exact path must not bypass schema validation".to_string(),
+                artist: "Artist".to_string(),
+                album: String::new(),
+                file_path: existing.file_path.clone(),
+                duration_secs: Some(2_147_483_648_u64),
+            },
+        ];
+
+        let result = manager
+            .import_regular_playlist("Imported", &imported)
+            .await
+            .expect("commit playlist import");
+        assert_eq!(result.counts.matched, 1);
+        assert_eq!(result.counts.unmatched, 1);
+        assert_eq!(result.counts.failed, 2);
+
+        let before = playlist_entries(&db, &result.playlist.id).await;
+        assert_eq!(before.len(), 2);
+        assert_eq!(before[0].position, 0);
+        assert_eq!(before[0].track_id.as_deref(), Some(existing.id.as_str()));
+        assert_eq!(before[0].match_title, "canonical title");
+        assert_eq!(before[1].position, 1);
+        assert_eq!(before[1].track_id, None);
+        assert_eq!(
+            before[1].match_file_path.as_deref(),
+            Some("/music/available-later.flac")
+        );
+
+        let later = insert_track(
+            &db,
+            "available-later",
+            "/music/available-later.flac",
+            "Metadata can differ",
+            "Path wins",
+            "Album",
+            Some(200),
+        )
+        .await;
+        assert_eq!(manager.reconcile_all().await.expect("reconcile path"), 1);
+        let after = playlist_entries(&db, &result.playlist.id).await;
+        assert_eq!(after[1].id, before[1].id);
+        assert_eq!(after[1].position, before[1].position);
+        assert_eq!(after[1].track_id.as_deref(), Some(later.id.as_str()));
+        assert_eq!(after[1].match_title, "metadata can differ");
+        assert_eq!(after[1].match_artist, "path wins");
+        assert_eq!(after[1].match_album, "album");
+        assert_eq!(after[1].match_duration_secs, Some(200));
+    }
+
+    #[tokio::test]
+    async fn import_entry_failure_rolls_back_playlist_and_prior_entries() {
+        let db = in_memory_db().await;
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_second_import_entry
+             BEFORE INSERT ON playlist_entries
+             WHEN NEW.position = 1
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected import failure');
+             END",
+        )
+        .await
+        .expect("install failure trigger");
+        let manager = PlaylistManager::new(db.clone());
+        let imported = vec![
+            ImportedTrack {
+                title: "One".to_string(),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                file_path: String::new(),
+                duration_secs: None,
+            },
+            ImportedTrack {
+                title: "Two".to_string(),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                file_path: String::new(),
+                duration_secs: None,
+            },
+        ];
+
+        assert!(manager
+            .import_regular_playlist("Must roll back", &imported)
+            .await
+            .is_err());
+        let playlists = playlist::Entity::find()
+            .filter(playlist::Column::Name.eq("Must roll back"))
+            .all(&db)
+            .await
+            .expect("query rolled-back playlist");
+        assert!(playlists.is_empty());
+        assert!(playlist_entry::Entity::find()
+            .all(&db)
+            .await
+            .expect("query rolled-back entries")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_propagates_track_table_read_errors_without_creating_a_playlist() {
+        let db = in_memory_db().await;
+        db.execute_unprepared("DROP TABLE tracks")
+            .await
+            .expect("drop tracks table");
+        let manager = PlaylistManager::new(db.clone());
+        let imported = vec![ImportedTrack {
+            title: "Song".to_string(),
+            artist: "Artist".to_string(),
+            album: String::new(),
+            file_path: String::new(),
+            duration_secs: None,
+        }];
+
+        assert!(manager
+            .import_regular_playlist("DB failure", &imported)
+            .await
+            .is_err());
+        let playlists = playlist::Entity::find()
+            .filter(playlist::Column::Name.eq("DB failure"))
+            .all(&db)
+            .await
+            .expect("query playlists after failed import");
+        assert!(playlists.is_empty());
     }
 
     #[tokio::test]

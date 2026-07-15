@@ -112,7 +112,7 @@ fn playlist_creation_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append(Some("New Playlist"), Some("pl-add.create-regular"));
     menu.append(Some("New Smart Playlist"), Some("pl-add.create-smart"));
-    menu.append(Some("Import Playlist\u{2026}"), Some("pl-add.import"));
+    menu.append(Some("Import XSPF Playlist\u{2026}"), Some("pl-add.import"));
     menu
 }
 
@@ -292,10 +292,13 @@ pub fn build_sidebar(
                 if is_playlist_header {
                     menu.append(Some("New Playlist"), Some("playlist.create-regular"));
                     menu.append(Some("New Smart Playlist"), Some("playlist.create-smart"));
-                    menu.append(Some("Import Playlist\u{2026}"), Some("playlist.import"));
+                    menu.append(
+                        Some("Import XSPF Playlist\u{2026}"),
+                        Some("playlist.import"),
+                    );
                 } else if is_playlist {
                     menu.append(Some("Rename"), Some("playlist.rename"));
-                    menu.append(Some("Export\u{2026}"), Some("playlist.export"));
+                    menu.append(Some("Export as XSPF\u{2026}"), Some("playlist.export"));
                     menu.append(Some("Delete"), Some("playlist.delete"));
                     if bt == "smart-playlist" {
                         menu.append(

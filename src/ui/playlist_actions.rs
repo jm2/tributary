@@ -415,9 +415,18 @@ fn insert_playlist_into_sidebar(
 // Playlist import/export
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Opens a file dialog, parses the XSPF, matches tracks against the local
-/// library via fingerprinting, creates a new regular playlist, and updates
-/// the sidebar.
+fn show_playlist_alert(win: &adw::ApplicationWindow, heading: &str, body: &str) {
+    let alert = adw::AlertDialog::builder()
+        .heading(heading)
+        .body(body)
+        .build();
+    alert.add_response("ok", "OK");
+    alert.present(Some(win));
+}
+
+/// Opens an XSPF v1 file, parses it off the async worker threads, imports the
+/// playlist transactionally, and publishes the committed playlist in the
+/// sidebar together with an explicit outcome summary.
 fn handle_import_playlist(
     win: &adw::ApplicationWindow,
     sidebar_store: &gtk::gio::ListStore,
@@ -427,89 +436,152 @@ fn handle_import_playlist(
     let rt = rt_handle.clone();
 
     let xspf_filter = gtk::FileFilter::new();
-    xspf_filter.set_name(Some("XSPF Playlists"));
+    xspf_filter.set_name(Some("XSPF v1 Playlists (*.xspf)"));
     xspf_filter.add_pattern("*.xspf");
 
     let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
     filters.append(&xspf_filter);
 
     let dialog = gtk::FileDialog::builder()
-        .title("Import Playlist")
+        .title("Import XSPF Playlist")
         .modal(true)
         .filters(&filters)
         .build();
 
     let win = win.clone();
-    dialog.open(Some(&win), None::<&gtk::gio::Cancellable>, move |result| {
-        let Ok(file) = result else { return };
-        let Some(path) = file.path() else { return };
-
-        info!(path = %path.display(), "Importing XSPF playlist");
-
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "Imported Playlist".to_string());
-
-        // Channel: send (playlist_name, playlist_id) back to GTK thread.
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Option<(String, String)>>();
-
-        let path_clone = path.clone();
-        let name_clone = name.clone();
-        rt.spawn(async move {
-            let imported = match crate::local::playlist_io::import_xspf(&path_clone) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to parse XSPF");
-                    let _ = result_tx.send(None);
+    let dialog_parent = win.clone();
+    dialog.open(
+        Some(&dialog_parent),
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            let file = match result {
+                Ok(file) => file,
+                Err(error) if error.matches(gtk::gio::IOErrorEnum::Cancelled) => return,
+                Err(error) => {
+                    show_playlist_alert(
+                        &win,
+                        "Could Not Open XSPF Playlist",
+                        &format!("The file chooser failed: {error}"),
+                    );
                     return;
                 }
             };
-
-            let db = match crate::db::connection::init_db().await {
-                Ok(db) => db,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to open DB for import");
-                    let _ = result_tx.send(None);
-                    return;
-                }
+            let Some(path) = file.path() else {
+                show_playlist_alert(
+                    &win,
+                    "Choose a Local XSPF Playlist",
+                    "Tributary can import only XSPF files available through a local filesystem path.",
+                );
+                return;
             };
 
-            let (matched, _unmatched) =
-                crate::local::playlist_io::match_imported_tracks(&db, &imported).await;
-            let matched_count = matched.len();
+            info!(path = %path.display(), "Importing XSPF playlist");
 
-            let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
-            let playlist = match mgr.create_playlist(&name_clone, false).await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create playlist");
-                    let _ = result_tx.send(None);
-                    return;
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Imported Playlist".to_string());
+
+            // Carry an explicit committed result or a user-visible error back
+            // to GTK. A dropped sender is handled as a failure too.
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel::<
+                Result<
+                    (
+                        String,
+                        String,
+                        crate::local::playlist_manager::PlaylistImportCounts,
+                    ),
+                    String,
+                >,
+            >();
+
+            let path_clone = path.clone();
+            let name_clone = name.clone();
+            rt.spawn(async move {
+                let outcome: Result<_, String> = async {
+                    let imported = tokio::task::spawn_blocking(move || {
+                        crate::local::playlist_io::import_xspf(&path_clone)
+                    })
+                    .await
+                    .map_err(|error| format!("The XSPF parser worker stopped: {error}"))?
+                    .map_err(|error| format!("Could not parse the XSPF file: {error}"))?;
+
+                    let db = crate::db::connection::init_db().await.map_err(|error| {
+                        format!("Could not open the playlist database: {error}")
+                    })?;
+                    let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
+                    let result = mgr
+                        .import_regular_playlist(&name_clone, &imported)
+                        .await
+                        .map_err(|error| {
+                            format!("Could not commit the playlist import: {error}")
+                        })?;
+
+                    Ok((
+                        result.playlist.name,
+                        result.playlist.id,
+                        result.counts,
+                    ))
                 }
-            };
+                .await;
 
-            for track in &matched {
-                let _ = mgr.add_track(&playlist.id, track).await;
-            }
+                if let Err(error) = &outcome {
+                    tracing::error!(error = %error, "XSPF playlist import failed");
+                }
+                let _ = result_tx.send(outcome);
+            });
 
-            info!(name = %name_clone, matched = matched_count, "Playlist import complete");
-            let _ = result_tx.send(Some((playlist.name.clone(), playlist.id.clone())));
-        });
-
-        // Receive the result on the GTK main thread.
-        glib::MainContext::default().spawn_local(async move {
-            if let Ok(Some((pname, pid))) = result_rx.await {
-                insert_playlist_into_sidebar(&sidebar_store, &pname, &pid, false);
-            }
-        });
-    });
+            // Receive the committed result on the GTK main thread. Only this
+            // success branch is allowed to expose a new sidebar row.
+            let win = win.clone();
+            glib::MainContext::default().spawn_local(async move {
+                match result_rx.await {
+                    Ok(Ok((pname, pid, counts))) => {
+                        info!(
+                            name = %pname,
+                            matched = counts.matched,
+                            unmatched = counts.unmatched,
+                            failed = counts.failed,
+                            "XSPF playlist import complete"
+                        );
+                        let body = format!(
+                            "Imported \"{pname}\".\n\nMatched: {}\nUnmatched (preserved): {}\nFailed (not imported): {}",
+                            counts.matched, counts.unmatched, counts.failed
+                        );
+                        let heading = if counts.failed == 0 {
+                            "XSPF Playlist Imported"
+                        } else {
+                            "XSPF Playlist Imported with Warnings"
+                        };
+                        // The manager returned only after the playlist and
+                        // all retained entries committed together.
+                        insert_playlist_into_sidebar(&sidebar_store, &pname, &pid, false);
+                        show_playlist_alert(&win, heading, &body);
+                    }
+                    Ok(Err(error)) => show_playlist_alert(
+                        &win,
+                        "Could Not Import XSPF Playlist",
+                        &format!(
+                            "{error}\n\nNo playlist or entries were committed; any database changes were rolled back."
+                        ),
+                    ),
+                    Err(error) => show_playlist_alert(
+                        &win,
+                        "Could Not Import XSPF Playlist",
+                        &format!(
+                            "The import worker stopped before reporting a result: {error}\n\nNo committed playlist was published."
+                        ),
+                    ),
+                }
+            });
+        },
+    );
 }
 
 /// Export a playlist to an XSPF file.
 ///
-/// Shows a save dialog first (GTK main thread), then fetches tracks
-/// from the database and writes the XSPF file on the async runtime.
+/// Shows a save dialog first (GTK main thread), fetches tracks asynchronously,
+/// and performs the blocking atomic XSPF write on a blocking worker.
 fn handle_export_playlist(
     win: &adw::ApplicationWindow,
     rt_handle: &tokio::runtime::Handle,
@@ -519,70 +591,123 @@ fn handle_export_playlist(
     let pid = playlist_id.to_string();
 
     let xspf_filter = gtk::FileFilter::new();
-    xspf_filter.set_name(Some("XSPF Playlist"));
+    xspf_filter.set_name(Some("XSPF v1 Playlist (*.xspf)"));
     xspf_filter.add_pattern("*.xspf");
 
     let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
     filters.append(&xspf_filter);
 
     let dialog = gtk::FileDialog::builder()
-        .title("Export Playlist")
+        .title("Export XSPF Playlist")
         .modal(true)
         .initial_name("playlist.xspf")
         .filters(&filters)
         .build();
 
     let win = win.clone();
-    dialog.save(Some(&win), None::<&gtk::gio::Cancellable>, move |result| {
-        let Ok(file) = result else { return };
-        let Some(path) = file.path() else { return };
-
-        // User picked a path — now fetch tracks and write on the async runtime.
-        let path = path.clone();
-        let pid = pid.clone();
-        rt.spawn(async move {
-            let db = match crate::db::connection::init_db().await {
-                Ok(db) => db,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to open DB for export");
+    let dialog_parent = win.clone();
+    dialog.save(
+        Some(&dialog_parent),
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            let file = match result {
+                Ok(file) => file,
+                Err(error) if error.matches(gtk::gio::IOErrorEnum::Cancelled) => return,
+                Err(error) => {
+                    show_playlist_alert(
+                        &win,
+                        "Could Not Choose XSPF Destination",
+                        &format!("The file chooser failed: {error}"),
+                    );
                     return;
                 }
             };
-
-            let mgr = crate::local::playlist_manager::PlaylistManager::new(db.clone());
-
-            let Ok(Some(playlist)) = mgr.get_playlist(&pid).await else {
-                tracing::error!(id = %pid, "Playlist not found for export");
+            let Some(path) = file.path() else {
+                show_playlist_alert(
+                    &win,
+                    "Choose a Local XSPF Destination",
+                    "Tributary can export only to a local filesystem path.",
+                );
                 return;
             };
 
-            // Get tracks: if smart, evaluate; if regular, get entries.
-            let tracks = if playlist.is_smart {
-                match mgr.evaluate_smart_playlist(&pid).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to evaluate smart playlist");
-                        return;
-                    }
-                }
-            } else {
-                match mgr.get_playlist_tracks(&pid).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to get playlist tracks");
-                        return;
-                    }
-                }
-            };
+            // Fetch tracks asynchronously, then isolate XML generation and
+            // atomic filesystem replacement from async workers.
+            let path = path.clone();
+            let pid = pid.clone();
+            let (result_tx, result_rx) =
+                tokio::sync::oneshot::channel::<Result<std::path::PathBuf, String>>();
+            rt.spawn(async move {
+                let outcome: Result<_, String> = async {
+                    let db = crate::db::connection::init_db().await.map_err(|error| {
+                        format!("Could not open the playlist database: {error}")
+                    })?;
+                    let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
+                    let playlist = mgr
+                        .get_playlist(&pid)
+                        .await
+                        .map_err(|error| format!("Could not read the playlist: {error}"))?
+                        .ok_or_else(|| "The selected playlist no longer exists.".to_string())?;
 
-            match crate::local::playlist_io::export_xspf(&tracks, &path) {
-                Ok(()) => {
-                    info!(path = %path.display(), "Playlist exported");
+                    // Smart playlists are evaluated from the current library;
+                    // regular playlists use their persisted reconciled entries.
+                    let tracks = if playlist.is_smart {
+                        mgr.evaluate_smart_playlist(&pid)
+                            .await
+                            .map_err(|error| {
+                                format!("Could not evaluate the smart playlist: {error}")
+                            })?
+                    } else {
+                        mgr.get_playlist_tracks(&pid).await.map_err(|error| {
+                            format!("Could not read playlist tracks: {error}")
+                        })?
+                    };
+
+                    let export_path = path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::local::playlist_io::export_xspf(&tracks, &export_path)
+                    })
+                    .await
+                    .map_err(|error| format!("The XSPF writer worker stopped: {error}"))?
+                    .map_err(|error| format!("Could not write the XSPF file: {error}"))?;
+
+                    Ok(path)
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to export playlist");
+                .await;
+
+                if let Err(error) = &outcome {
+                    tracing::error!(error = %error, "XSPF playlist export failed");
                 }
-            }
-        });
-    });
+                let _ = result_tx.send(outcome);
+            });
+
+            let win = win.clone();
+            glib::MainContext::default().spawn_local(async move {
+                match result_rx.await {
+                    Ok(Ok(path)) => {
+                        info!(path = %path.display(), "XSPF playlist exported");
+                        show_playlist_alert(
+                            &win,
+                            "XSPF Playlist Exported",
+                            &format!("Saved the playlist atomically to {}.", path.display()),
+                        );
+                    }
+                    Ok(Err(error)) => show_playlist_alert(
+                        &win,
+                        "Could Not Export XSPF Playlist",
+                        &format!(
+                            "{error}\n\nThe destination was left unchanged; any temporary file was removed."
+                        ),
+                    ),
+                    Err(error) => show_playlist_alert(
+                        &win,
+                        "Could Not Export XSPF Playlist",
+                        &format!(
+                            "The export worker stopped before reporting a result: {error}"
+                        ),
+                    ),
+                }
+            });
+        },
+    );
 }

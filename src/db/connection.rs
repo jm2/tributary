@@ -234,6 +234,7 @@ mod tests {
             match_artist: Set("Artist".to_string()),
             match_album: Set("Album".to_string()),
             match_duration_secs: Set(None),
+            match_file_path: Set(None),
         }
         .insert(&db)
         .await
