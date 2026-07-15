@@ -74,8 +74,20 @@ impl SourceNavigation {
         request
     }
 
-    pub fn current(&self) -> SourceRequest {
-        self.active.clone()
+    /// Return the newest request generation minted for one source key.
+    ///
+    /// The visible projection can intentionally differ from the active request
+    /// while a remote authentication attempt owns the deferred navigation intent.
+    /// Callers that maintain the still-visible projection use this token so an
+    /// away-and-back re-selection still supersedes older callbacks.
+    pub fn latest_request(&self, source_key: &str) -> Option<SourceRequest> {
+        self.latest_by_key
+            .get(source_key)
+            .copied()
+            .map(|generation| SourceRequest {
+                source_key: source_key.to_string(),
+                generation,
+            })
     }
 
     pub fn is_current(&self, request: &SourceRequest) -> bool {
@@ -95,6 +107,32 @@ impl SourceNavigation {
         } else {
             CompletionDisposition::CacheOnly
         }
+    }
+
+    /// Whether an exact request may refresh the source that remains visible.
+    ///
+    /// Usually the visible source is also the current navigation request. A
+    /// pending remote connection is the one deliberate exception: it owns the
+    /// deferred intent while the prior source stays on screen. In that state,
+    /// the newest generation for the visible source may still refresh its
+    /// derived status/browser projection, but an older same-key generation may
+    /// not.
+    pub fn may_refresh_visible(
+        &self,
+        visible_source_key: &str,
+        request: &SourceRequest,
+        pending_request: Option<&SourceRequest>,
+    ) -> bool {
+        if request.source_key() != visible_source_key
+            || self.completion(request) == CompletionDisposition::Ignore
+        {
+            return false;
+        }
+
+        self.is_current(request)
+            || pending_request.is_some_and(|pending| {
+                pending.source_key() != visible_source_key && self.is_current(pending)
+            })
     }
 
     /// Retire all pending/cache-eligible requests in one source namespace.
@@ -245,10 +283,27 @@ mod tests {
     #[test]
     fn local_debounce_token_is_rejected_after_away_and_back_navigation() {
         let mut navigation = SourceNavigation::new("local");
-        let debounce = navigation.current();
+        let debounce = navigation
+            .latest_request("local")
+            .expect("initial local request");
         navigation.select("playlist:a");
         navigation.select("local");
 
-        assert!(!navigation.is_current(&debounce));
+        assert!(!navigation.may_refresh_visible("local", &debounce, None));
+    }
+
+    #[test]
+    fn pending_remote_intent_keeps_exact_visible_generation_refreshable() {
+        let mut navigation = SourceNavigation::new("local");
+        let visible_local = navigation
+            .latest_request("local")
+            .expect("initial local request");
+        let remote = navigation.select("https://music.example.test/");
+
+        assert!(navigation.may_refresh_visible("local", &visible_local, Some(&remote)));
+
+        navigation.select("playlist:a");
+
+        assert!(!navigation.may_refresh_visible("local", &visible_local, Some(&remote)));
     }
 }

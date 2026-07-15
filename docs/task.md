@@ -416,7 +416,10 @@ race that a bare active-key comparison could not distinguish.
 - [x] Promote the guard from a bare source **key** to an exact key plus monotonic **generation**.
   Re-selecting the same playlist advances its generation, so the older request can neither replace
   the newer cache entry nor render last. Playlist, USB, radio, local-debounce, pending-remote,
-  disconnect, and forced-local callbacks all consult the shared navigation authority.
+  disconnect, and forced-local callbacks all consult the shared navigation authority. When remote
+  authentication owns a deferred intent, the prior visible source retains its own exact latest
+  generation so its derived browser/status projection can stay fresh without accepting an older
+  away-and-back callback.
 - [x] Reload an active playlist after watcher reconciliation remints or relinks track IDs. The
   engine publishes a post-reconciliation `PlaylistProjectionsInvalidated` event during initial
   scan and after a watcher batch commits a track mutation and attempts reconciliation; the UI
@@ -427,18 +430,20 @@ race that a bare active-key comparison could not distinguish.
   may update its cache; an inactive result is cache-only, while rendering additionally requires
   the exact current request. A transient playlist query/database failure preserves the last valid
   cache and visible rows, while a confirmed missing playlist deliberately evicts them.
-- [x] Add navigation-race tests, including same-key re-selection. Seven focused navigation tests
+- [x] Add navigation-race tests, including same-key re-selection. Eight focused navigation tests
   cover inactive caching, same-key and reverse-order supersession, playlist invalidation,
-  pending-remote intent, and local debounce away/back behavior; two engine tests cover initial-scan
-  and watcher post-reconciliation invalidation ordering, including the reconciliation-error path.
-- [x] Record implementation: PR #88; seven focused
+  pending-remote intent, visible-local refresh during pending authentication, and local debounce
+  away/back behavior; two engine tests cover initial-scan and watcher post-reconciliation
+  invalidation ordering, including the reconciliation-error path.
+- [x] Record implementation: PR #88; eight focused
   navigation tests plus two focused engine invalidation tests.
 
 Acceptance criteria: a late async result never renders into a source the user has already
 navigated away from, and never replaces a newer result for the same source. **Complete:** a
 pending remote authentication/connection owns a distinct navigation intent even while the prior
 source remains visible, so a playlist refresh, sidebar rebuild, background remote publication, or
-stale connection callback cannot steal that intent or leave the sidebar and content out of sync.
+stale connection callback cannot steal that intent or leave the sidebar and content out of sync;
+the prior visible source can still refresh from its exact latest projection generation.
 
 ### P1.10 Make foreign-key enforcement explicit
 
@@ -757,8 +762,8 @@ Run before marking any milestone complete:
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
 Most recent milestone validation (2026-07-15, P1.9 source-navigation generations): 18 library plus
-498 application tests passed in debug (516 total), and the release suite passed with the same
-516 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
+499 application tests passed in debug (517 total), and the release suite passed with the same
+517 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
 were clean; and `cargo audit` passed with exactly the two accepted unmaintained warnings recorded
 under P0.8.
 
@@ -1038,14 +1043,17 @@ Record scope or design decisions here so deferred work is explicit.
   source can remain visible; only its exact completion may auto-select the server, and stale
   success, failure, cancellation, discovery loss, sidebar rebuild, or background publication
   cannot steal a newer intent. A rejected click while that connection is pending restores the
-  pending row rather than leaving sidebar selection inconsistent with the content.
+  pending row rather than leaving sidebar selection inconsistent with the content. The exact
+  latest generation for the prior visible source remains independently refreshable while the
+  remote intent is deferred, so local browser/status updates do not freeze during authentication;
+  an older local generation after away-and-back navigation is still rejected.
   Playlist projection freshness is a separate engine-to-UI handoff: initial scan publishes an
   ordered invalidation after playlist reconciliation, and a watcher batch does so after it commits
   a track mutation and attempts reconciliation. The UI invalidates old playlist request
   generations before clearing the cache and any active actionable rows, then reloads only if the
   exact playlist still owns navigation. A transient playlist query failure preserves the last
   valid cache/display; only a confirmed missing playlist is intentionally represented as empty.
-  Seven pure navigation tests and two engine ordering/failure-path tests cover the resulting
+  Eight pure navigation tests and two engine ordering/failure-path tests cover the resulting
   contract.
 
 - 2026-07-13 — Documentation audit against the committed tree. Every `[x]` in P1.1–P1.7 was
@@ -1097,4 +1105,4 @@ Add one line per completed task:
 | 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
 | 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |
 | 2026-07-13 | P1.8 | `eb0b9ca`, `fbaaa7f` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable song identity, shared-queue preservation, ownership preflight, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
-| 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, preserves pending remote intent and valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; seven navigation and two engine tests cover the races and event ordering. |
+| 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, keeps the prior visible projection fresh while remote intent is pending, preserves valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; eight navigation and two engine tests cover the races and event ordering. |

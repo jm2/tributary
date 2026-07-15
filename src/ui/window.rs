@@ -2115,13 +2115,25 @@ fn setup_library_events(
                         let status_label = status_label.clone();
                         let active_source_key = active_source_key.clone();
                         let source_navigation = source_navigation.clone();
-                        let navigation_request = source_navigation.borrow().current();
+                        let navigation_request = source_navigation.borrow().latest_request("local");
+                        let pending_connection = pending_connection.clone();
 
                         glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                            let Some(navigation_request) = navigation_request else {
+                                return;
+                            };
+                            let pending_request = pending_connection
+                                .borrow()
+                                .as_ref()
+                                .map(|pending| pending.request().clone());
+                            let may_refresh = source_navigation.borrow().may_refresh_visible(
+                                "local",
+                                &navigation_request,
+                                pending_request.as_ref(),
+                            );
                             if gen_rc.get() != gen
                                 || *active_source_key.borrow() != "local"
-                                || navigation_request.source_key() != "local"
-                                || !source_navigation.borrow().is_current(&navigation_request)
+                                || !may_refresh
                             {
                                 return; // Superseded by a newer event.
                             }
@@ -2180,13 +2192,25 @@ fn setup_library_events(
                         let status_label = status_label.clone();
                         let active_source_key = active_source_key.clone();
                         let source_navigation = source_navigation.clone();
-                        let navigation_request = source_navigation.borrow().current();
+                        let navigation_request = source_navigation.borrow().latest_request("local");
+                        let pending_connection = pending_connection.clone();
 
                         glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                            let Some(navigation_request) = navigation_request else {
+                                return;
+                            };
+                            let pending_request = pending_connection
+                                .borrow()
+                                .as_ref()
+                                .map(|pending| pending.request().clone());
+                            let may_refresh = source_navigation.borrow().may_refresh_visible(
+                                "local",
+                                &navigation_request,
+                                pending_request.as_ref(),
+                            );
                             if gen_rc.get() != gen
                                 || *active_source_key.borrow() != "local"
-                                || navigation_request.source_key() != "local"
-                                || !source_navigation.borrow().is_current(&navigation_request)
+                                || !may_refresh
                             {
                                 return; // Superseded by a newer event.
                             }
