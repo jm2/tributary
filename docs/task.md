@@ -360,7 +360,10 @@ proxies. All ticket routes use OS-assigned ports and unguessable UUIDs.
   credential-isolated requests, backend-private native locators, exact generation/lease
   publication, async playback/artwork resolution, lease-aware output proxying, and 36 newly
   authored focused tests across request validation, all three standard backends, registry races,
-  stale playback/artwork work, each output boundary, and pre-persistence server-URL rejection.
+  stale playback/artwork work, each output boundary, and pre-persistence server-URL rejection. A
+  late review follow-up in this PR omits Plex tracks that have no non-empty media part instead of
+  publishing an opaque reference that can only fail, and searches later media/part entries before
+  declaring a track unplayable; 2 focused tests cover missing, empty, and later valid locators.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
 device or daemon Tributary does not own, retained in a generic catalogue/UI value, or serialized
@@ -743,8 +746,8 @@ Run before marking any milestone complete:
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
-Most recent milestone validation (2026-07-14, P1.6 playback-time resolver): 18 library plus 488
-application tests passed in debug (506 total), and the release suite passed; strict all-target
+Most recent milestone validation (2026-07-15, P1.6 Plex locator follow-up): 18 library plus 490
+application tests passed in debug (508 total), and the release suite passed; strict all-target
 Clippy passed in both profiles; formatting and `git diff --check` were clean; and `cargo audit`
 passed with exactly the two accepted unmaintained warnings recorded under P0.8.
 
@@ -978,6 +981,12 @@ Record scope or design decisions here so deferred work is explicit.
   and playback-time remote-resolution boxes. P3.1 still needs stable source IDs, stable local and
   playlist resolution, centralized refresh/failure state, and a lifecycle decision for local,
   radio, and external files.
+- 2026-07-15 — A late PR #86 review found that Plex catalogue publication did not distinguish a
+  track with no `Media`/`Part.key` from a resolvable track: GTK received a non-empty opaque
+  reference that failed only after selection, whereas the old direct-URL path had left that row
+  disabled. The follow-up omits tracks with no non-empty part and searches all media/part entries
+  for a later usable locator, preserving the resolver invariant that every published Plex track
+  has a backend-private stream locator.
 - 2026-07-12 — P1.7 places the non-`Send` Cast device, application, media session, controls,
   heartbeat, status polling, and teardown on one FIFO worker. Epoch checks bracket every Cast
   effect and event; ownership is recorded immediately after application launch and media load so
@@ -1053,6 +1062,7 @@ Add one line per completed task:
 | 2026-07-14 | P1.6 receiver tickets | `c6aa7df`, `e23efd8` | Chromecast and MPD now receive revocable single-media tickets instead of backend credentials. MPD binds a dedicated IPv4/IPv6 proxy to the successful connection route, fails closed without it, and revokes across replacement, Stop, failure, ownership loss, EOS, shutdown, and stale generations; 18 new MPD/classifier/route tests cover the slice. |
 | 2026-07-14 | P1.6 upstream-ticket TTL | `8735862` | Credential-bearing upstream routes now expire at a hard, non-sliding 24-hour monotonic deadline in addition to earlier lifecycle revocation. Boundary lookup atomically removes the route and returns 404; admitted responses may finish, local-file routes remain server-lifetime, and 6 deterministic tests cover the contract. |
 | 2026-07-14 | P1.6 playback-time resolver | PR #86 | Standard remote catalogue/UI values carry only stable identity and exact opaque lease references. A generation-owned registry retains backend resolvers; typed playback/artwork requests isolate Plex/Jellyfin headers and Subsonic private query material until the app-owned exact-origin proxy fetch. Lease replacement/release/shutdown revokes old references and already-issued requests; unsafe manual, saved, environment, and discovery base URLs are rejected before persistence, display, logs, discovery publication, or ownership; and 36 focused tests cover request isolation, backends, native-ID collisions, registry races, stale UI work, URL rejection, and output boundaries. |
+| 2026-07-15 | P1.6 Plex locator follow-up | _this PR_ | Plex tracks without a non-empty media part are omitted before opaque-reference publication, while later valid media/part entries remain playable; 2 focused tests cover the late PR #86 review finding. |
 | 2026-07-12 | P1.7 | `60ee2af` | One worker owns the Cast session and serializes effects, authoritative state, cancellation, cleanup retries, and stale-event suppression. |
 | 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
 | 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |

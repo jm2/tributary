@@ -164,6 +164,7 @@ impl PlexBackend {
         let mut all_tracks = Vec::new();
         let mut all_albums = Vec::new();
         let mut all_artists = Vec::new();
+        let mut skipped_unplayable_tracks = 0usize;
         let mut stream_locator_by_uuid = HashMap::new();
         let mut track_artwork_locator_by_uuid = HashMap::new();
         let mut plex_id_to_uuid = HashMap::new();
@@ -237,26 +238,12 @@ impl PlexBackend {
 
             // ── Accumulate tracks (type=10) ─────────────────────────
             for plex_track in &tracks {
-                let track_uuid = deterministic_uuid(&plex_track.rating_key);
-                let artist_id = plex_track
-                    .grandparent_rating_key
-                    .as_deref()
-                    .map(deterministic_uuid);
-                let album_id = plex_track
-                    .parent_rating_key
-                    .as_deref()
-                    .map(deterministic_uuid);
+                let Some((track_uuid, track, part_key)) = cacheable_plex_track(plex_track) else {
+                    skipped_unplayable_tracks += 1;
+                    continue;
+                };
 
-                let track = plex_track_to_track(plex_track, track_uuid, artist_id, album_id);
-
-                if let Some(part_key) = plex_track
-                    .media
-                    .first()
-                    .and_then(|media| media.part.first())
-                    .and_then(|part| part.key.as_ref())
-                {
-                    stream_locator_by_uuid.insert(track_uuid, part_key.clone());
-                }
+                stream_locator_by_uuid.insert(track_uuid, part_key);
                 if let Some(thumb_path) = &plex_track.thumb {
                     track_artwork_locator_by_uuid.insert(track_uuid, thumb_path.clone());
                 }
@@ -315,6 +302,7 @@ impl PlexBackend {
             artists = all_artists.len(),
             albums = all_albums.len(),
             tracks = all_tracks.len(),
+            skipped_unplayable_tracks,
             "Plex library loaded"
         );
 
@@ -574,6 +562,27 @@ fn deterministic_uuid(plex_id: &str) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_URL, plex_id.as_bytes())
 }
 
+fn plex_stream_locator(plex: &PlexTrack) -> Option<&str> {
+    plex.media.iter().find_map(|media| {
+        media
+            .part
+            .iter()
+            .find_map(|part| part.key.as_deref().filter(|key| !key.trim().is_empty()))
+    })
+}
+
+fn cacheable_plex_track(plex: &PlexTrack) -> Option<(Uuid, Track, String)> {
+    let stream_locator = plex_stream_locator(plex)?.to_string();
+    let track_uuid = deterministic_uuid(&plex.rating_key);
+    let artist_id = plex
+        .grandparent_rating_key
+        .as_deref()
+        .map(deterministic_uuid);
+    let album_id = plex.parent_rating_key.as_deref().map(deterministic_uuid);
+    let track = plex_track_to_track(plex, track_uuid, artist_id, album_id);
+    Some((track_uuid, track, stream_locator))
+}
+
 fn plex_track_to_track(
     plex: &PlexTrack,
     id: Uuid,
@@ -635,5 +644,47 @@ mod tests {
         let track = plex_track_to_track(&track, Uuid::new_v4(), None, None);
         assert!(track.stream_url.is_none());
         assert!(track.cover_art_url.is_none());
+    }
+
+    #[test]
+    fn missing_or_empty_media_parts_are_not_playable() {
+        for media in [
+            serde_json::json!([]),
+            serde_json::json!([{}]),
+            serde_json::json!([{"Part": [{}]}]),
+            serde_json::json!([{"Part": [{"key": ""}]}]),
+            serde_json::json!([{"Part": [{"key": "   "}]}]),
+        ] {
+            let track: PlexTrack = serde_json::from_value(serde_json::json!({
+                "ratingKey": "track-id",
+                "Media": media,
+            }))
+            .unwrap();
+
+            assert!(plex_stream_locator(&track).is_none());
+            assert!(cacheable_plex_track(&track).is_none());
+        }
+    }
+
+    #[test]
+    fn first_nonempty_media_part_is_used() {
+        let track: PlexTrack = serde_json::from_value(serde_json::json!({
+            "ratingKey": "track-id",
+            "Media": [
+                {"Part": [{}, {"key": ""}]},
+                {"Part": [{"key": "/library/parts/2/file.flac"}]},
+            ],
+        }))
+        .unwrap();
+
+        assert_eq!(
+            plex_stream_locator(&track),
+            Some("/library/parts/2/file.flac")
+        );
+        let (track_id, published, stream_locator) =
+            cacheable_plex_track(&track).expect("track should be published");
+        assert_eq!(track_id, deterministic_uuid("track-id"));
+        assert_eq!(published.id, track_id);
+        assert_eq!(stream_locator, "/library/parts/2/file.flac");
     }
 }
