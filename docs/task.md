@@ -26,10 +26,11 @@ Status summary:
 - [ ] P3 architecture and integration coverage complete
 
 Progress snapshot (2026-07-15), recounted from the literal P0–P3 task checkboxes to correct the
-earlier numerator/denominator drift. The denominator excludes the two deferred P0.7 live-workflow
-verification boxes and the withdrawn P2.6 false finding; section-summary and global-validation
-gate boxes are not task progress:
-**154/215 (71.6%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **37/71 P2**,
+earlier numerator/denominator drift. The live protected-playback finding recorded under P2.11 added
+three tasks to the prior 215-item scope. The denominator excludes the two deferred P0.7
+live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
+global-validation gate boxes are not task progress:
+**156/218 (71.6%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **39/74 P2**,
 and **3/30 P3** after those exclusions. The release-workflow dry run remains deliberately deferred
 rather than being counted as unfinished P0 remediation.
 
@@ -764,26 +765,44 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   directory persistently with requested write permission, and Tributary stores the returned portal
   path. Host filesystem permissions remain authoritative, so the portal cannot make read-only
   storage writable.
-- [ ] Add an explicit identity-preserving legacy-root reauthorization flow. Removing an old direct
-  host path and adding the portal path loses the old→new intent: exact-path scanning creates new
-  track IDs while preserving the inaccessible rows and their playlist links. Until a guarded
-  root-relative relocation preserves IDs, dates, play history, and playlist foreign keys, the UI
-  and documentation must not recommend remove-and-reselect as a migration.
+- [x] Add an explicit identity-preserving legacy-root reauthorization flow. Preferences now offers
+  a per-root **Reauthorize** action through `GtkFileDialog`, rejects non-native, non-Unicode,
+  duplicate, nested, and component-overlapping endpoint scopes, and requires explicit confirmation
+  that the selected folder is the same logical library. It atomically persists an immutable UUID,
+  OLD, and NEW write-ahead intent while keeping OLD configured, locks the in-flight source against
+  removal/supersession, and requires a restart so relocation runs before watcher installation or
+  scanning. The engine consults a durable receipt before mutable config validation, scans the
+  selected destination completely, requires an exact marker match for a confirmed source, and
+  creates a marker for an unconfirmed markerless writable destination while deliberately leaving
+  it unavailable/unconfirmed for the existing root-trust flow. A confirmed legacy identity without
+  a durable marker, a markerless read-only destination, an authority change, a collision, unsafe
+  path evidence, or an ambiguous scope fails closed. One guarded SQLite transaction retargets
+  descendant track and imported-playlist match paths while preserving track UUIDs, metadata,
+  dates, play history, and playlist foreign keys; moves root state; and writes the completion
+  receipt. A retained destination authority lease is revalidated after SQL and immediately before
+  commit. Receipt-backed retry resolves ambiguous COMMIT results and config-write crashes
+  idempotently; inconsistent receipts, receipt-query failures, malformed request IDs without a
+  matching consistent receipt, and their overlapping endpoint scopes scan neither path rather than
+  risking a second identity set. Exact
+  compare-and-swap config cleanup installs NEW only for the request the engine processed. Twenty-
+  eight focused preference, migration, path-planning, atomicity, marker, collision, crash-recovery,
+  and quarantine tests cover the contract. Implementation is in the current PR.
 - [ ] Surface effective write capability in track Properties. Automatic Devices roots are
   read-only at the Flatpak sandbox boundary, but the dialog currently enables Save from format
   support alone and reports the filesystem error only after an attempted write. Disable editing or
   explain the limitation before Save when the selected source cannot be written.
 - [ ] Run a local Flatpak build and smoke-test USB/custom-library behavior. This environment has
   Flatpak 1.18 but no `flatpak-builder` or installed builder runtime, and cannot provide the
-  interactive portal plus physical removable-media pass. The PR's containerized Flatpak job must
-  still prove the offline bundle build; a local installed-app pass must verify XDG Music writes,
-  a portal-selected custom directory across restart, a legacy direct path's fail-closed behavior,
-  and read-only add/change/remove under each applicable standard mount root.
-- [ ] Record implementation: PR #94 is open; the local interactive smoke test remains pending. The
-  noninteractive working tree passes the exact vendored checksum, Python and shell syntax, YAML
-  parsing, the positive/negative permission-policy suite, cwd-independent generation from `/tmp`
-  and `/`, nonempty JSON parsing, and byte-identical repeated generation. No repository-root
-  `cargo-sources.json` is created. The release workflow remains intentionally out of scope.
+  interactive portal plus physical removable-media pass. PR #94's containerized Flatpak job proved
+  the offline bundle build; a local installed-app pass must still verify XDG Music writes, a
+  portal-selected custom directory across restart, a legacy direct path's reauthorization and
+  fail-closed behavior, and read-only add/change/remove under each applicable standard mount root.
+- [x] Record implementation: PR #94 merged with its containerized Flatpak build green. The
+  noninteractive branch passed the exact vendored checksum, Python and shell syntax, YAML parsing,
+  the positive/negative permission-policy suite, cwd-independent generation from `/tmp` and `/`,
+  nonempty JSON parsing, and byte-identical repeated generation. No repository-root
+  `cargo-sources.json` was created. The installed interactive portal/physical-media smoke task
+  above remains open, and the release workflow remains intentionally out of scope.
 
 ### P2.6 Synchronize packaging metadata
 
@@ -881,6 +900,39 @@ error that tells the user what to install.
 - [ ] Add held-ACK worker FIFO, slow-first-greeting fairness, and real IPv6 loopback coverage.
 - [ ] Record implementation: _pending_
 
+### P2.11 Bound protected remote-playback startup and expose safe diagnostics
+
+Filed 2026-07-15 from a live Windows Subsonic failure. The initial source connection failed after
+10.001 seconds, exactly the Subsonic client's configured connect timeout, then succeeded on retry.
+Protected local playback subsequently failed after 15.004 seconds, exactly the default blocking-I/O
+timeout of GStreamer's HTTP sources. Local playback correctly used an opaque ticket on Tributary's
+`127.0.0.1` proxy; this does not indicate that Chromecast was selected. The strongest inference is
+that the proxy's fresh upstream client repeated the flaky `mini.local` DNS/connect path while its
+`request.send()` had no explicit connection/response-header phase deadline, so GStreamer abandoned
+the downstream leg first. A system proxy intercepting the loopback request remains a plausible
+alternative because the current logs expose neither phase.
+
+- [ ] Reuse an origin-pooled, credential-free upstream client and separately bound DNS/connect/TLS,
+  response-header, and body-idle phases without imposing a total lifetime on a valid media stream.
+  Make the app-owned proxy return a deterministic credential-free 502/504 before the downstream
+  GStreamer source deadline, while retaining exact-origin, Range, revocation, and secret-isolation
+  guarantees. Preserve advertised mDNS addresses for connection routing without changing the URL
+  hostname, Host header, or TLS identity.
+- [ ] Guarantee that opaque loopback tickets bypass ambient system proxies, distinguish transport
+  timeout/connect failures from genuine authentication rejection, and add fixed-category telemetry
+  for inbound ticket receipt, upstream start/headers/status/body-idle, and GStreamer domain/code/
+  source category. Never retain or display a raw URL, ticket, query, header, server error string,
+  GStreamer message/debug string, or local path.
+- [ ] Add stalled-DNS/connect, accepted-without-headers, stalled-body, upstream-status, poisoned
+  system-proxy, mDNS-address, and full fake-Subsonic-through-GStreamer regressions; record the
+  implementation and packaged-Windows validation. Existing P3.3/P3.4 harness work should reuse
+  these fixtures rather than creating a second timeout model.
+
+Acceptance criteria: a protected remote load either begins playback or produces a phase-specific,
+URL-free failure before the downstream source times out; a loopback ticket never visits a configured
+external proxy; and logs can distinguish transport, upstream HTTP, decoder, and sink categories
+without exposing credentials or filesystem paths.
+
 ## P3 — Architecture and integration coverage
 
 ### P3.1 Introduce a source/session registry
@@ -965,22 +1017,22 @@ Run before marking any milestone complete:
 - [x] Confirm `git diff --check` is clean
 
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
-by P2.6. P2.5's manifest-local source generation and permission-policy checks pass, but a full local
-Flatpak build and installed interactive smoke pass remain outstanding, as does the deliberately
-deferred live release-workflow run.
+by P2.6. PR #94's containerized Flatpak build proved the manifest-local source generation and
+permission policy, but a local installed interactive portal/physical-media smoke pass remains
+outstanding, as does the deliberately deferred live release-workflow run.
 
-Most recent milestone validation (2026-07-15, P2.5 Flatpak generation and access policy): the
-vendored generator matches its recorded SHA-256; Python, Bash, POSIX-shell, manifest YAML, and CI
-workflow YAML parse; and the positive/negative permission-policy suite passes. Invoking the shared
-helper by absolute path from `/tmp` and `/` produced a nonempty JSON array only at
-`build-aux/flatpak/cargo-sources.json`; two runs were byte-identical with SHA-256
-`fd5f6081ad3e8d15fefc0bc08f513f9c21e93132a4935c99a898efdd6d92e0b4`, and
-`scripts/build-linux.sh --help` works outside the checkout. `cargo check`, strict all-target Clippy
-in debug and release, and 18 library plus 557 application tests in both profiles pass (575 per
-profile). Formatting, `git diff --check`, AppStream validation, and `cargo audit` also pass; the
-audit reports exactly the two accepted unmaintained warnings recorded under P0.8. The unchanged
-desktop validator diagnostic remains tracked under P2.6. `flatpak-builder` and its runtime are not
-installed here, so the PR's Flatpak job is still required to validate the complete offline bundle.
+Most recent milestone validation (2026-07-15, P2.5 legacy-root reauthorization): `cargo fmt`,
+`cargo check --all-targets`, and strict all-target/all-feature Clippy pass in debug and release.
+Both profiles pass 18 library plus 585 application tests (603 per profile). Twenty-eight focused
+tests cover preference intent/CAS behavior, exact receipt migration shape and partial-migration
+retry, component-aware path planning, marker success/mismatch, atomic identity/history/playlist
+preservation, collisions, unsafe paths, authority loss, ambiguous commit recovery, receipt-first
+stale-config recovery, malformed-ID quarantine, and later imported old-path evidence. All 13 locale
+catalogs parse after translating the new UI, `git diff --check` and AppStream validation pass, and
+`cargo audit` reports exactly the two accepted unmaintained warnings recorded under P0.8. The
+unchanged desktop validator diagnostic remains tracked under P2.6. PR #94's Flatpak CI is green;
+installed interactive reauthorization and physical-media behavior still require the open local
+smoke task.
 
 **This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
 hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
@@ -1015,10 +1067,15 @@ Record scope or design decisions here so deferred work is explicit.
   Tributary uses its cached native mount inventory and neither requests raw USB/UDisks access nor
   exposes the GVfs filesystem sockets. A custom directory receives a persistent requested-write
   portal grant only after explicit `GtkFileDialog` selection, subject to its host permissions. A
-  legacy direct root cannot yet be safely reauthorized: remove-and-reselect loses path identity and
-  can duplicate tracks while playlists remain linked to the old rows, so explicit guarded
-  relocation remains open. The permission contract is executable in CI; effective-write UX plus
-  local interactive portal and physical-media smoke testing remain required.
+  legacy direct root is reauthorized only through an explicit OLD→NEW write-ahead intent; ordinary
+  remove-and-add remains a different operation and is not identity preserving. Startup resolves
+  the intent before scanning, uses a marker-backed retained authority lease and one transactional
+  row relocation, and treats its same-transaction receipt as the durable authority across an
+  ambiguous commit or failed config cleanup. Confirmed sources without a supported marker and
+  markerless read-only destinations remain protected rather than guessed; a newly marked legacy
+  source remains unconfirmed until the normal root-trust flow completes. The permission contract
+  is executable in CI; effective-write UX plus local interactive portal and physical-media smoke
+  testing remain required.
 - 2026-07-10 — P0.2 now fails closed for incomplete traversal, unavailable/replaced roots,
   nested mounts, mount-table failures, and ambiguous legacy databases. Legacy roots with
   existing metadata are intentionally not made deletion-authoritative from content heuristics;
@@ -1388,4 +1445,5 @@ Add one line per completed task:
 | 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
 | 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR #91 | Numeric validation; bounded exclusive UUID-plus-format sibling files; exact scan/watcher exclusion and temp-to-original metadata refresh that preserve track identity, history, and playlist links; RAII cleanup; permission copying and pre-rename `fsync`; album-artist handling; and 11 focused tests including a public-API round trip against a generated silent FLAC fixture. |
 | 2026-07-15 | P2.4 native mount lifecycle | PR #93 | GIO main-thread mount inventory and live signals; best-available logical keys separate from native paths; synchronous confirmed-removal retirement; exact-intent relocation reactivation; bounded cancellable scans; and 26 focused tests. Physical-device validation remains open; Flatpak access follows under P2.5. |
-| 2026-07-15 | P2.5 Flatpak generation and access policy | PR #94 | Vendored checksum-pinned Cargo generator shared by local builds and CI; consistent manifest-local source generation; read-only standard external-media roots; reviewed GVfs bus access; portal-selected writable custom libraries; and a fail-closed permission policy test. Legacy-root relocation, effective-write UX, local interactive portal/physical-media smoke testing, and the deliberately deferred release workflow remain open. |
+| 2026-07-15 | P2.5 Flatpak generation and access policy | PR #94 | Vendored checksum-pinned Cargo generator shared by local builds and CI; consistent manifest-local source generation; read-only standard external-media roots; reviewed GVfs bus access; portal-selected writable custom libraries; and a fail-closed permission policy test. Effective-write UX, installed interactive portal/physical-media smoke testing, and the deliberately deferred release workflow remain open. |
+| 2026-07-15 | P2.5 legacy-root reauthorization | PR #95 | Explicit portal reselection records an immutable OLD→NEW intent; a marker-backed authority lease and guarded atomic transaction preserve track identity/history and playlist links; a same-transaction receipt makes crash/ambiguous-commit recovery idempotent; and malformed, overlapping, colliding, or inconsistent states quarantine unsafe scopes. Effective-write UX and installed interactive smoke testing remain open. |

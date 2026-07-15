@@ -26,7 +26,7 @@ use super::root_authority::{AbsenceProof, BoundDirectory, BoundFile, RootAuthori
 use super::tag_parser::{self, ParsedTrack};
 use super::tag_writer;
 use crate::architecture::models::Track;
-use crate::db::entities::{library_root, track};
+use crate::db::entities::{library_root, playlist_entry, root_reauthorization_receipt, track};
 
 // ---------------------------------------------------------------------------
 // LibraryEvent — messages sent to GTK main thread
@@ -78,6 +78,17 @@ pub enum LibraryEvent {
         reason: RootTrustReason,
         outcome: RootTrustOutcome,
     },
+    /// Result of an explicit old-path to portal-path root reauthorization.
+    /// Successful outcomes let GTK commit the matching write-ahead config
+    /// intent; rejected requests deliberately leave the old configured path
+    /// in place so the selected destination cannot mint duplicate track IDs.
+    RootReauthorizationFinished {
+        request_id: String,
+        old_path: PathBuf,
+        new_path: PathBuf,
+        outcome: RootReauthorizationOutcome,
+        message: Option<String>,
+    },
     /// An error occurred.
     Error(String),
 }
@@ -105,6 +116,59 @@ pub enum RootTrustOutcome {
     Stale,
     /// A marker, database, task, or scan operation failed.
     Failed,
+}
+
+/// Public result of one startup root-reauthorization request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootReauthorizationOutcome {
+    /// Track and root paths moved in one guarded database transaction.
+    Applied,
+    /// A matching durable receipt proved an earlier transaction committed.
+    AlreadyApplied,
+    /// Validation failed before a durable receipt was observed. The engine
+    /// retains the old root as its only effective scan path.
+    Rejected,
+    /// Durability cannot be established, or a receipt no longer agrees with
+    /// the database. Neither path is scanned because guessing could split one
+    /// library into two IDs.
+    Inconsistent,
+}
+
+impl RootReauthorizationOutcome {
+    pub fn committed(self) -> bool {
+        matches!(self, Self::Applied | Self::AlreadyApplied)
+    }
+}
+
+/// Explicit write-ahead intent captured by Preferences and consumed exactly
+/// once at startup before watcher installation or library scanning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootReauthorizationRequest {
+    request_id: String,
+    old_path: PathBuf,
+    new_path: PathBuf,
+}
+
+impl RootReauthorizationRequest {
+    pub fn new(request_id: impl ToString, old_path: PathBuf, new_path: PathBuf) -> Self {
+        Self {
+            request_id: request_id.to_string(),
+            old_path,
+            new_path,
+        }
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn old_path(&self) -> &Path {
+        &self.old_path
+    }
+
+    pub fn new_path(&self) -> &Path {
+        &self.new_path
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,6 +270,7 @@ pub enum LibraryCommand {
 pub struct LibraryEngine {
     db: DatabaseConnection,
     music_dirs: Vec<PathBuf>,
+    pending_root_reauthorizations: Vec<RootReauthorizationRequest>,
     tx: async_channel::Sender<LibraryEvent>,
     command_rx: async_channel::Receiver<LibraryCommand>,
 }
@@ -217,12 +282,14 @@ impl LibraryEngine {
     pub fn new(
         db: DatabaseConnection,
         music_dirs: Vec<PathBuf>,
+        pending_root_reauthorizations: Vec<RootReauthorizationRequest>,
         tx: async_channel::Sender<LibraryEvent>,
         command_rx: async_channel::Receiver<LibraryCommand>,
     ) -> Self {
         Self {
             db,
             music_dirs,
+            pending_root_reauthorizations,
             tx,
             command_rx,
         }
@@ -234,10 +301,22 @@ impl LibraryEngine {
         let Self {
             db,
             music_dirs,
+            pending_root_reauthorizations,
             tx,
             command_rx,
         } = self;
         let db = Arc::new(db);
+
+        // Resolve explicit old→new identity transfers before either path can
+        // be watched or scanned. A rejected request keeps only the old path;
+        // an inconsistent durable receipt removes both paths fail-closed.
+        let music_dirs = resolve_pending_root_reauthorizations(
+            db.as_ref(),
+            music_dirs,
+            &pending_root_reauthorizations,
+            &tx,
+        )
+        .await;
 
         // Install before traversing so changes observed during the initial
         // scan are retained for replay after its snapshot is published.
@@ -301,6 +380,693 @@ impl LibraryEngine {
             &mut completed_commands,
         )
         .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Explicit library-root reauthorization
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct PreparedRootReauthorization {
+    old_state: Option<library_root::Model>,
+    marker_identity: String,
+    authority_lease: Arc<RootAuthorityLease>,
+}
+
+#[derive(Debug)]
+enum RootReauthorizationResolution {
+    UseNew(RootReauthorizationOutcome),
+    KeepOld(String),
+    ScanNeither(String),
+}
+
+fn path_has_only_absolute_normal_components(path: &Path) -> bool {
+    if !path.is_absolute() || path.to_str().is_none() {
+        return false;
+    }
+
+    path.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::Normal(_)
+        )
+    })
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn path_is_descendant(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root)
+        .is_ok_and(|relative| !relative.as_os_str().is_empty())
+}
+
+fn retarget_descendant_path(path: &Path, old_root: &Path, new_root: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix(old_root).ok()?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(new_root.join(relative))
+}
+
+fn validate_root_reauthorization_request(
+    configured_roots: &[PathBuf],
+    requests: &[RootReauthorizationRequest],
+    request: &RootReauthorizationRequest,
+) -> anyhow::Result<()> {
+    Uuid::parse_str(&request.request_id)
+        .map_err(|_| anyhow::anyhow!("library root reauthorization request ID is malformed"))?;
+    if !path_has_only_absolute_normal_components(&request.old_path)
+        || !path_has_only_absolute_normal_components(&request.new_path)
+    {
+        return Err(anyhow::anyhow!(
+            "library root reauthorization requires absolute UTF-8 paths without traversal components"
+        ));
+    }
+    if paths_overlap(&request.old_path, &request.new_path) {
+        return Err(anyhow::anyhow!(
+            "library root reauthorization endpoints must be distinct and non-overlapping"
+        ));
+    }
+    if configured_roots
+        .iter()
+        .filter(|root| *root == &request.old_path)
+        .count()
+        != 1
+    {
+        return Err(anyhow::anyhow!(
+            "reauthorization source is not exactly one configured library root"
+        ));
+    }
+    if configured_roots
+        .iter()
+        .any(|root| root == &request.new_path)
+    {
+        return Err(anyhow::anyhow!(
+            "reauthorization destination is already configured"
+        ));
+    }
+    if configured_roots.iter().any(|root| {
+        root != &request.old_path
+            && (paths_overlap(root, &request.old_path) || paths_overlap(root, &request.new_path))
+    }) {
+        return Err(anyhow::anyhow!(
+            "reauthorization endpoint overlaps another configured library root"
+        ));
+    }
+
+    for other in requests {
+        if std::ptr::eq(other, request) {
+            continue;
+        }
+        if other.request_id == request.request_id
+            || paths_overlap(&other.old_path, &request.old_path)
+            || paths_overlap(&other.old_path, &request.new_path)
+            || paths_overlap(&other.new_path, &request.old_path)
+            || paths_overlap(&other.new_path, &request.new_path)
+        {
+            return Err(anyhow::anyhow!(
+                "library root reauthorization intents have duplicate or overlapping identities"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn replace_effective_root(effective_roots: &mut Vec<PathBuf>, old_root: &Path, new_root: &Path) {
+    // A durable receipt takes precedence over any later manual config edit.
+    // Remove every spelling that overlaps either endpoint, then install the
+    // single receipt-backed destination even if OLD disappeared from config.
+    effective_roots.retain(|root| !paths_overlap(root, old_root) && !paths_overlap(root, new_root));
+    effective_roots.push(new_root.to_path_buf());
+    effective_roots.sort_unstable();
+    effective_roots.dedup();
+}
+
+fn remove_effective_endpoints(
+    effective_roots: &mut Vec<PathBuf>,
+    old_root: &Path,
+    new_root: &Path,
+) {
+    effective_roots.retain(|root| !paths_overlap(root, old_root) && !paths_overlap(root, new_root));
+}
+
+async fn resolve_pending_root_reauthorizations(
+    db: &DatabaseConnection,
+    configured_roots: Vec<PathBuf>,
+    requests: &[RootReauthorizationRequest],
+    tx: &async_channel::Sender<LibraryEvent>,
+) -> Vec<PathBuf> {
+    let mut effective_roots = configured_roots.clone();
+
+    for request in requests {
+        let validation_error =
+            validate_root_reauthorization_request(&configured_roots, requests, request)
+                .err()
+                .map(|error| error.to_string());
+        let resolution =
+            resolve_root_reauthorization_with_validation(db, request, validation_error).await;
+
+        let (outcome, message) = match resolution {
+            RootReauthorizationResolution::UseNew(outcome) => {
+                replace_effective_root(&mut effective_roots, &request.old_path, &request.new_path);
+                (outcome, None)
+            }
+            RootReauthorizationResolution::KeepOld(message) => {
+                // Even malformed or manually edited config may already list
+                // the selected destination or a nested/containing spelling.
+                // Quarantine every overlapping endpoint on rejection;
+                // otherwise the ordinary scan could mint a second set of IDs
+                // while the remembered source rows remain at the old prefix.
+                effective_roots.retain(|root| {
+                    root == &request.old_path
+                        || (!paths_overlap(root, &request.old_path)
+                            && !paths_overlap(root, &request.new_path))
+                });
+                warn!(
+                    request_id = %request.request_id,
+                    old_root = %request.old_path.display(),
+                    new_root = %request.new_path.display(),
+                    %message,
+                    "Library root reauthorization rejected; retaining old effective root"
+                );
+                (RootReauthorizationOutcome::Rejected, Some(message))
+            }
+            RootReauthorizationResolution::ScanNeither(message) => {
+                remove_effective_endpoints(
+                    &mut effective_roots,
+                    &request.old_path,
+                    &request.new_path,
+                );
+                error!(
+                    request_id = %request.request_id,
+                    old_root = %request.old_path.display(),
+                    new_root = %request.new_path.display(),
+                    %message,
+                    "Library root reauthorization cannot be resolved safely; disabling both paths"
+                );
+                (RootReauthorizationOutcome::Inconsistent, Some(message))
+            }
+        };
+
+        let _ = tx
+            .send(LibraryEvent::RootReauthorizationFinished {
+                request_id: request.request_id.clone(),
+                old_path: request.old_path.clone(),
+                new_path: request.new_path.clone(),
+                outcome,
+                message,
+            })
+            .await;
+    }
+
+    effective_roots
+}
+
+async fn resolve_root_reauthorization(
+    db: &DatabaseConnection,
+    request: &RootReauthorizationRequest,
+) -> RootReauthorizationResolution {
+    resolve_root_reauthorization_with_validation(db, request, None).await
+}
+
+/// Resolve a startup intent with the durable receipt as the first authority.
+/// Config is intentionally mutable and may still contain a stale or malformed
+/// intent after the database transaction committed. Only an absent receipt
+/// permits validation to decide whether OLD remains safe.
+async fn resolve_root_reauthorization_with_validation(
+    db: &DatabaseConnection,
+    request: &RootReauthorizationRequest,
+    validation_error: Option<String>,
+) -> RootReauthorizationResolution {
+    match root_reauthorization_receipt::Entity::find_by_id(request.request_id.clone())
+        .one(db)
+        .await
+    {
+        Ok(Some(receipt)) => {
+            return match root_reauthorization_receipt_is_consistent(db, request, &receipt).await {
+                Ok(true) => RootReauthorizationResolution::UseNew(
+                    RootReauthorizationOutcome::AlreadyApplied,
+                ),
+                Ok(false) => RootReauthorizationResolution::ScanNeither(
+                    "durable reauthorization receipt does not match current library state"
+                        .to_string(),
+                ),
+                Err(error) => RootReauthorizationResolution::ScanNeither(format!(
+                    "could not validate durable reauthorization receipt: {error}"
+                )),
+            };
+        }
+        Ok(None) => {
+            if let Some(error) = validation_error {
+                return if Uuid::parse_str(&request.request_id).is_err() {
+                    RootReauthorizationResolution::ScanNeither(error)
+                } else {
+                    RootReauthorizationResolution::KeepOld(error)
+                };
+            }
+        }
+        Err(error) => {
+            return RootReauthorizationResolution::ScanNeither(format!(
+                "could not determine reauthorization durability: {error}"
+            ));
+        }
+    }
+
+    let prepared = match prepare_root_reauthorization(db, request).await {
+        Ok(prepared) => prepared,
+        Err(error) => return RootReauthorizationResolution::KeepOld(error.to_string()),
+    };
+    let marker_identity = prepared.marker_identity.clone();
+    let authority_lease = prepared.authority_lease.clone();
+    let outcome = relocate_library_root_rows(
+        db,
+        request,
+        prepared.old_state.as_ref(),
+        &marker_identity,
+        move || async move {
+            spawn_authority_probe(move || authority_lease.validate().is_ok())
+                .await
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    match outcome {
+        Ok(()) => RootReauthorizationResolution::UseNew(RootReauthorizationOutcome::Applied),
+        Err(error) => classify_root_reauthorization_error(db, request, error).await,
+    }
+}
+
+/// Resolve the transaction's durability boundary through the receipt written
+/// in that same transaction. A database driver can report a COMMIT error even
+/// when storage made the commit durable; scanning OLD in that case would split
+/// identity. Only a successful no-receipt query proves that OLD remains safe.
+async fn classify_root_reauthorization_error(
+    db: &DatabaseConnection,
+    request: &RootReauthorizationRequest,
+    error: anyhow::Error,
+) -> RootReauthorizationResolution {
+    let original_error = error.to_string();
+    match root_reauthorization_receipt::Entity::find_by_id(request.request_id.clone())
+        .one(db)
+        .await
+    {
+        Ok(Some(receipt)) => {
+            match root_reauthorization_receipt_is_consistent(db, request, &receipt).await {
+                Ok(true) => RootReauthorizationResolution::UseNew(
+                    RootReauthorizationOutcome::AlreadyApplied,
+                ),
+                Ok(false) => RootReauthorizationResolution::ScanNeither(format!(
+                    "reauthorization failed ({original_error}) and its durable receipt is inconsistent"
+                )),
+                Err(receipt_error) => RootReauthorizationResolution::ScanNeither(format!(
+                    "reauthorization failed ({original_error}) and receipt validation failed: {receipt_error}"
+                )),
+            }
+        }
+        Ok(None) => RootReauthorizationResolution::KeepOld(original_error),
+        Err(receipt_error) => RootReauthorizationResolution::ScanNeither(format!(
+            "reauthorization failed ({original_error}) and commit durability could not be determined: {receipt_error}"
+        )),
+    }
+}
+
+async fn root_reauthorization_receipt_is_consistent(
+    db: &DatabaseConnection,
+    request: &RootReauthorizationRequest,
+    receipt: &root_reauthorization_receipt::Model,
+) -> anyhow::Result<bool> {
+    let old_key = request.old_path.to_string_lossy();
+    let new_key = request.new_path.to_string_lossy();
+    if receipt.old_path != old_key
+        || receipt.new_path != new_key
+        || !is_marker_identity(&receipt.marker_identity)
+    {
+        return Ok(false);
+    }
+
+    let old_state = library_root::Entity::find_by_id(old_key.as_ref())
+        .one(db)
+        .await?;
+    let new_state = library_root::Entity::find_by_id(new_key.as_ref())
+        .one(db)
+        .await?;
+    if old_state.is_some()
+        || !new_state.is_some_and(|state| {
+            state.device_id.as_deref() == Some(receipt.marker_identity.as_str())
+        })
+    {
+        return Ok(false);
+    }
+
+    let tracks = track::Entity::find().all(db).await?;
+    if tracks
+        .iter()
+        .any(|row| path_is_descendant(Path::new(&row.file_path), &request.old_path))
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn validate_reauthorization_database_scopes(
+    roots: &[library_root::Model],
+    request: &RootReauthorizationRequest,
+    marker_identity: Option<&str>,
+) -> anyhow::Result<()> {
+    for state in roots {
+        let path = Path::new(&state.path);
+        if path == request.old_path {
+            continue;
+        }
+        if path == request.new_path {
+            return Err(anyhow::anyhow!(
+                "reauthorization destination already has persisted root state"
+            ));
+        }
+        if paths_overlap(path, &request.old_path) || paths_overlap(path, &request.new_path) {
+            return Err(anyhow::anyhow!(
+                "reauthorization endpoint overlaps another persisted library scope"
+            ));
+        }
+        if marker_identity.is_some_and(|marker| state.device_id.as_deref() == Some(marker)) {
+            return Err(anyhow::anyhow!(
+                "reauthorization marker is already claimed by another library root"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn create_reauthorization_marker(scan: &RootScan) -> anyhow::Result<String> {
+    let observed_identity = scan
+        .device_id
+        .as_deref()
+        .filter(|identity| is_legacy_identity(identity))
+        .ok_or_else(|| anyhow::anyhow!("reauthorization destination has no usable identity"))?;
+    let observed_generation = scan.mount_generation.ok_or_else(|| {
+        anyhow::anyhow!("reauthorization destination has no mount-generation evidence")
+    })?;
+    let current_identity = legacy_filesystem_identity(&scan.root)?;
+    let current_generation = root_mount_generation(&scan.root)?;
+    if current_identity != observed_identity || current_generation != observed_generation {
+        return Err(anyhow::anyhow!(
+            "reauthorization destination changed before marker creation"
+        ));
+    }
+    if read_root_marker(&scan.root)?.is_some() {
+        return Err(anyhow::anyhow!(
+            "a marker appeared at the reauthorization destination"
+        ));
+    }
+
+    let creation = create_root_marker(&scan.root)?;
+    if !creation.created
+        || legacy_filesystem_identity(&scan.root)? != current_identity
+        || root_mount_generation(&scan.root)? != current_generation
+        || read_root_marker(&scan.root)?.as_deref() != Some(creation.identity.as_str())
+    {
+        return Err(anyhow::anyhow!(
+            "reauthorization destination changed while creating its marker"
+        ));
+    }
+    Ok(creation.identity)
+}
+
+async fn prepare_root_reauthorization(
+    db: &DatabaseConnection,
+    request: &RootReauthorizationRequest,
+) -> anyhow::Result<PreparedRootReauthorization> {
+    let old_key = request.old_path.to_string_lossy().into_owned();
+    let old_state = library_root::Entity::find_by_id(&old_key).one(db).await?;
+    let roots = library_root::Entity::find().all(db).await?;
+    validate_reauthorization_database_scopes(&roots, request, None)?;
+
+    let tracks = track::Entity::find().all(db).await?;
+    let remembered_tracks = tracks
+        .iter()
+        .filter(|row| path_is_descendant(Path::new(&row.file_path), &request.old_path))
+        .count();
+    if old_state.is_none() && remembered_tracks == 0 {
+        return Err(anyhow::anyhow!(
+            "reauthorization source has no persisted root or track identity to preserve"
+        ));
+    }
+
+    let destination = request.new_path.clone();
+    let mut scan = spawn_authority_probe(move || scan_root(destination))
+        .await
+        .map_err(|error| AuthorityTaskJoinFailure(error.to_string()))?;
+    if !scan.is_complete() {
+        return Err(anyhow::anyhow!(
+            "reauthorization destination could not be scanned completely: {}",
+            scan.errors.join("; ")
+        ));
+    }
+
+    let confirmed_marker = old_state.as_ref().and_then(|state| {
+        state
+            .identity_confirmed
+            .then_some(state.device_id.as_deref())
+            .flatten()
+            .filter(|identity| is_marker_identity(identity))
+    });
+    if old_state
+        .as_ref()
+        .is_some_and(|state| state.identity_confirmed)
+        && confirmed_marker.is_none()
+    {
+        return Err(anyhow::anyhow!(
+            "confirmed reauthorization source has no supported durable marker"
+        ));
+    }
+
+    let marker_identity = match scan.device_id.as_deref() {
+        Some(identity) if is_marker_identity(identity) => identity.to_string(),
+        Some(identity) if is_legacy_identity(identity) && confirmed_marker.is_none() => {
+            let marker_scan = scan;
+            let marker_identity =
+                spawn_authority_probe(move || create_reauthorization_marker(&marker_scan))
+                    .await
+                    .map_err(|error| AuthorityTaskJoinFailure(error.to_string()))??;
+            let destination = request.new_path.clone();
+            scan = spawn_authority_probe(move || scan_root(destination))
+                .await
+                .map_err(|error| AuthorityTaskJoinFailure(error.to_string()))?;
+            if !scan.is_complete() || scan.device_id.as_deref() != Some(marker_identity.as_str()) {
+                return Err(anyhow::anyhow!(
+                    "reauthorization destination marker-backed rescan was incomplete"
+                ));
+            }
+            marker_identity
+        }
+        Some(_) if confirmed_marker.is_some() => {
+            return Err(anyhow::anyhow!(
+                "reauthorization destination does not expose the confirmed root marker"
+            ));
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "reauthorization destination has no supported filesystem identity"
+            ));
+        }
+    };
+
+    if confirmed_marker.is_some_and(|expected| expected != marker_identity) {
+        return Err(anyhow::anyhow!(
+            "reauthorization destination marker does not match the confirmed source"
+        ));
+    }
+    validate_reauthorization_database_scopes(&roots, request, Some(&marker_identity))?;
+    let authority_lease = scan.authority_lease.ok_or_else(|| {
+        anyhow::anyhow!("reauthorization destination authority could not be retained")
+    })?;
+
+    Ok(PreparedRootReauthorization {
+        old_state,
+        marker_identity,
+        authority_lease,
+    })
+}
+
+async fn relocate_library_root_rows<F, Fut>(
+    db: &DatabaseConnection,
+    request: &RootReauthorizationRequest,
+    expected_old_state: Option<&library_root::Model>,
+    marker_identity: &str,
+    commit_guard: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let transaction = db.begin().await?;
+    let result: anyhow::Result<()> = async {
+        if root_reauthorization_receipt::Entity::find_by_id(request.request_id.clone())
+            .one(&transaction)
+            .await?
+            .is_some()
+        {
+            return Err(anyhow::anyhow!(
+                "reauthorization receipt appeared during a new relocation"
+            ));
+        }
+
+        let old_key = request.old_path.to_string_lossy().into_owned();
+        let new_key = request.new_path.to_string_lossy().into_owned();
+        let current_old_state = library_root::Entity::find_by_id(&old_key)
+            .one(&transaction)
+            .await?;
+        if current_old_state.as_ref() != expected_old_state {
+            return Err(anyhow::anyhow!(
+                "reauthorization source state changed before relocation"
+            ));
+        }
+        if current_old_state.as_ref().is_some_and(|state| {
+            state.identity_confirmed && state.device_id.as_deref() != Some(marker_identity)
+        }) {
+            return Err(anyhow::anyhow!(
+                "confirmed reauthorization source marker changed"
+            ));
+        }
+
+        let roots = library_root::Entity::find().all(&transaction).await?;
+        validate_reauthorization_database_scopes(&roots, request, Some(marker_identity))?;
+
+        let rows = track::Entity::find().all(&transaction).await?;
+        if rows
+            .iter()
+            .any(|row| path_is_descendant(Path::new(&row.file_path), &request.new_path))
+        {
+            return Err(anyhow::anyhow!(
+                "reauthorization destination already owns indexed tracks"
+            ));
+        }
+
+        let mut moves = Vec::new();
+        let mut destinations = HashSet::new();
+        for row in &rows {
+            let source_path = Path::new(&row.file_path);
+            if !path_is_descendant(source_path, &request.old_path) {
+                continue;
+            }
+            let destination =
+                retarget_descendant_path(source_path, &request.old_path, &request.new_path)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("reauthorization source contains an unsafe track path")
+                    })?;
+            let destination = destination.to_str().ok_or_else(|| {
+                anyhow::anyhow!("reauthorization produced a non-UTF-8 track path")
+            })?;
+            if !destinations.insert(destination.to_string()) {
+                return Err(anyhow::anyhow!(
+                    "reauthorization track paths collide at the destination"
+                ));
+            }
+            moves.push((row.clone(), destination.to_string()));
+        }
+        if moves.is_empty() && current_old_state.is_none() {
+            return Err(anyhow::anyhow!(
+                "reauthorization source identity disappeared before relocation"
+            ));
+        }
+        if rows.iter().any(|row| {
+            destinations.contains(&row.file_path)
+                && !path_is_descendant(Path::new(&row.file_path), &request.old_path)
+        }) {
+            return Err(anyhow::anyhow!(
+                "reauthorization would overwrite an existing destination track"
+            ));
+        }
+
+        for (row, destination) in moves {
+            let mut active: track::ActiveModel = row.into();
+            active.file_path = Set(destination);
+            active.update(&transaction).await?;
+        }
+
+        let entries = playlist_entry::Entity::find().all(&transaction).await?;
+        for entry in entries {
+            let Some(source_path) = entry.match_file_path.as_deref() else {
+                continue;
+            };
+            let source_path = Path::new(source_path);
+            if !path_is_descendant(source_path, &request.old_path) {
+                continue;
+            }
+            let destination =
+                retarget_descendant_path(source_path, &request.old_path, &request.new_path)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "reauthorization source contains an unsafe playlist match path"
+                        )
+                    })?;
+            let destination = destination.to_str().ok_or_else(|| {
+                anyhow::anyhow!("reauthorization produced a non-UTF-8 playlist match path")
+            })?;
+            let mut active: playlist_entry::ActiveModel = entry.into();
+            active.match_file_path = Set(Some(destination.to_string()));
+            active.update(&transaction).await?;
+        }
+
+        let identity_confirmed = current_old_state.as_ref().is_some_and(|state| {
+            state.identity_confirmed && state.device_id.as_deref() == Some(marker_identity)
+        });
+        library_root::ActiveModel {
+            path: Set(new_key.clone()),
+            device_id: Set(Some(marker_identity.to_string())),
+            identity_confirmed: Set(identity_confirmed),
+            is_available: Set(false),
+            last_scan_complete: Set(false),
+            last_checked_at: Set(Utc::now().to_rfc3339()),
+        }
+        .insert(&transaction)
+        .await?;
+        if current_old_state.is_some() {
+            library_root::Entity::delete_by_id(&old_key)
+                .exec(&transaction)
+                .await?;
+        }
+
+        root_reauthorization_receipt::ActiveModel {
+            request_id: Set(request.request_id.clone()),
+            old_path: Set(old_key),
+            new_path: Set(new_key),
+            marker_identity: Set(marker_identity.to_string()),
+            completed_at: Set(Utc::now().to_rfc3339()),
+        }
+        .insert(&transaction)
+        .await?;
+
+        if !commit_guard().await {
+            return Err(anyhow::anyhow!(
+                "reauthorization destination changed before commit"
+            ));
+        }
+
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            transaction.commit().await?;
+            Ok(())
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            Err(error)
+        }
     }
 }
 
@@ -5457,6 +6223,740 @@ mod tests {
             .expect("create test root marker")
             .identity;
         RootAuthorityLease::acquire(root, &identity).expect("retain test root authority")
+    }
+
+    fn test_marker_identity() -> String {
+        format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4())
+    }
+
+    async fn insert_reauthorization_root(
+        db: &DatabaseConnection,
+        path: &Path,
+        marker_identity: &str,
+        identity_confirmed: bool,
+    ) -> library_root::Model {
+        library_root::ActiveModel {
+            path: Set(path.to_string_lossy().into_owned()),
+            device_id: Set(Some(marker_identity.to_string())),
+            identity_confirmed: Set(identity_confirmed),
+            is_available: Set(identity_confirmed),
+            last_scan_complete: Set(true),
+            last_checked_at: Set("2026-07-15T12:00:00Z".to_string()),
+        }
+        .insert(db)
+        .await
+        .expect("insert reauthorization root")
+    }
+
+    #[test]
+    fn reauthorization_path_planning_is_component_aware_and_rejects_nested_scopes() {
+        let source = directory_fixture_path("/music");
+        let destination = directory_fixture_path("/portal/music");
+        assert_eq!(
+            retarget_descendant_path(
+                &directory_fixture_path("/music/Album/song.flac"),
+                &source,
+                &destination,
+            ),
+            Some(directory_fixture_path("/portal/music/Album/song.flac"))
+        );
+        assert_eq!(
+            retarget_descendant_path(
+                &directory_fixture_path("/music2/song.flac"),
+                &source,
+                &destination,
+            ),
+            None,
+            "a textual path prefix is not a descendant"
+        );
+
+        let nested = library_root::Model {
+            path: directory_fixture_key("/music/nested"),
+            device_id: Some(test_marker_identity()),
+            identity_confirmed: true,
+            is_available: true,
+            last_scan_complete: true,
+            last_checked_at: "2026-07-15T12:00:00Z".to_string(),
+        };
+        let request = RootReauthorizationRequest::new(Uuid::new_v4(), source, destination);
+        assert!(validate_reauthorization_database_scopes(&[nested], &request, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn root_reauthorization_preserves_track_and_playlist_identity_atomically() {
+        let db = rename_test_database().await;
+        let old_root = directory_fixture_path("/legacy/Music");
+        let new_root = directory_fixture_path("/portal/Music");
+        let marker = test_marker_identity();
+        let stored_root = insert_reauthorization_root(&db, &old_root, &marker, true).await;
+        let source_path = old_root.join("Album").join("song.flac");
+        let original = insert_rename_test_track(
+            &db,
+            "reauthorized-track",
+            source_path.to_string_lossy().as_ref(),
+            "Remembered",
+            37,
+        )
+        .await;
+
+        let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Remembered playlist", false)
+            .await
+            .expect("create playlist");
+        manager
+            .add_track(&playlist.id, &original)
+            .await
+            .expect("link remembered track");
+        let entry = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(&playlist.id))
+            .one(&db)
+            .await
+            .expect("load playlist entry")
+            .expect("playlist entry exists");
+        let mut entry_with_match: playlist_entry::ActiveModel = entry.clone().into();
+        entry_with_match.match_file_path = Set(Some(source_path.to_string_lossy().into_owned()));
+        let entry_with_match = entry_with_match
+            .update(&db)
+            .await
+            .expect("retain imported match path");
+
+        let request =
+            RootReauthorizationRequest::new(Uuid::new_v4(), old_root.clone(), new_root.clone());
+        relocate_library_root_rows(&db, &request, Some(&stored_root), &marker, || async {
+            true
+        })
+        .await
+        .expect("relocate library root rows");
+
+        let destination_path = new_root.join("Album").join("song.flac");
+        let moved = track::Entity::find_by_id(&original.id)
+            .one(&db)
+            .await
+            .expect("load moved track")
+            .expect("moved track exists");
+        let mut expected_track = original.clone();
+        expected_track.file_path = destination_path.to_string_lossy().into_owned();
+        assert_eq!(moved, expected_track, "only the path may change");
+
+        let moved_entry = playlist_entry::Entity::find_by_id(&entry.id)
+            .one(&db)
+            .await
+            .expect("load moved playlist entry")
+            .expect("playlist entry survives");
+        let mut expected_entry = entry_with_match;
+        expected_entry.match_file_path = Some(destination_path.to_string_lossy().into_owned());
+        assert_eq!(moved_entry, expected_entry);
+        assert_eq!(moved_entry.track_id.as_deref(), Some(original.id.as_str()));
+
+        assert!(
+            library_root::Entity::find_by_id(old_root.to_string_lossy().as_ref())
+                .one(&db)
+                .await
+                .expect("query old root")
+                .is_none()
+        );
+        let moved_root = library_root::Entity::find_by_id(new_root.to_string_lossy().as_ref())
+            .one(&db)
+            .await
+            .expect("query new root")
+            .expect("new root state exists");
+        assert_eq!(moved_root.device_id.as_deref(), Some(marker.as_str()));
+        assert!(moved_root.identity_confirmed);
+        assert!(!moved_root.is_available);
+        assert!(!moved_root.last_scan_complete);
+
+        let receipt = root_reauthorization_receipt::Entity::find_by_id(request.request_id.clone())
+            .one(&db)
+            .await
+            .expect("query completion receipt")
+            .expect("completion receipt exists");
+        assert_eq!(receipt.old_path, old_root.to_string_lossy());
+        assert_eq!(receipt.new_path, new_root.to_string_lossy());
+        assert_eq!(receipt.marker_identity, marker);
+    }
+
+    #[tokio::test]
+    async fn root_reauthorization_collision_and_commit_guard_failures_roll_back_every_row() {
+        let db = rename_test_database().await;
+        let old_root = directory_fixture_path("/legacy/Music");
+        let new_root = directory_fixture_path("/portal/Music");
+        let marker = test_marker_identity();
+        let stored_root = insert_reauthorization_root(&db, &old_root, &marker, true).await;
+        let source = insert_rename_test_track(
+            &db,
+            "source-identity",
+            old_root.join("song.flac").to_string_lossy().as_ref(),
+            "Source",
+            11,
+        )
+        .await;
+        let destination = insert_rename_test_track(
+            &db,
+            "destination-identity",
+            new_root.join("song.flac").to_string_lossy().as_ref(),
+            "Destination",
+            22,
+        )
+        .await;
+        let collision_request =
+            RootReauthorizationRequest::new(Uuid::new_v4(), old_root.clone(), new_root.clone());
+
+        assert!(relocate_library_root_rows(
+            &db,
+            &collision_request,
+            Some(&stored_root),
+            &marker,
+            || async { true },
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            track::Entity::find_by_id(&source.id)
+                .one(&db)
+                .await
+                .expect("query source after collision"),
+            Some(source.clone())
+        );
+        assert_eq!(
+            track::Entity::find_by_id(&destination.id)
+                .one(&db)
+                .await
+                .expect("query destination after collision"),
+            Some(destination.clone())
+        );
+        track::Entity::delete_by_id(&destination.id)
+            .exec(&db)
+            .await
+            .expect("remove collision fixture");
+
+        let guarded_request =
+            RootReauthorizationRequest::new(Uuid::new_v4(), old_root.clone(), new_root.clone());
+        assert!(relocate_library_root_rows(
+            &db,
+            &guarded_request,
+            Some(&stored_root),
+            &marker,
+            || async { false },
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            track::Entity::find_by_id(&source.id)
+                .one(&db)
+                .await
+                .expect("query source after guard rejection"),
+            Some(source)
+        );
+        assert!(
+            library_root::Entity::find_by_id(new_root.to_string_lossy().as_ref())
+                .one(&db)
+                .await
+                .expect("query rolled-back destination root")
+                .is_none()
+        );
+        assert!(root_reauthorization_receipt::Entity::find_by_id(
+            guarded_request.request_id.clone()
+        )
+        .one(&db)
+        .await
+        .expect("query rolled-back receipt")
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn unsafe_descendant_rows_reject_reauthorization_without_partial_mutation() {
+        let db = rename_test_database().await;
+        let old_root = directory_fixture_path("/legacy/Music");
+        let new_root = directory_fixture_path("/portal/Music");
+        let marker = test_marker_identity();
+        let stored_root = insert_reauthorization_root(&db, &old_root, &marker, true).await;
+        let unsafe_path = old_root.join("Album").join("..").join("song.flac");
+        let unsafe_track = insert_rename_test_track(
+            &db,
+            "unsafe-source-path",
+            unsafe_path.to_string_lossy().as_ref(),
+            "Unsafe",
+            1,
+        )
+        .await;
+        let track_request =
+            RootReauthorizationRequest::new(Uuid::new_v4(), old_root.clone(), new_root.clone());
+
+        assert!(relocate_library_root_rows(
+            &db,
+            &track_request,
+            Some(&stored_root),
+            &marker,
+            || async { true },
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            track::Entity::find_by_id(&unsafe_track.id)
+                .one(&db)
+                .await
+                .expect("query unsafe track"),
+            Some(unsafe_track.clone())
+        );
+        assert!(
+            root_reauthorization_receipt::Entity::find_by_id(track_request.request_id.clone())
+                .one(&db)
+                .await
+                .expect("query rejected track receipt")
+                .is_none()
+        );
+
+        track::Entity::delete_by_id(&unsafe_track.id)
+            .exec(&db)
+            .await
+            .expect("remove unsafe track fixture");
+        let safe_track = insert_rename_test_track(
+            &db,
+            "safe-track-unsafe-match",
+            old_root.join("song.flac").to_string_lossy().as_ref(),
+            "Safe track",
+            2,
+        )
+        .await;
+        let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Unsafe match", false)
+            .await
+            .expect("create playlist");
+        manager
+            .add_track(&playlist.id, &safe_track)
+            .await
+            .expect("add safe track");
+        let entry = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(&playlist.id))
+            .one(&db)
+            .await
+            .expect("query playlist entry")
+            .expect("playlist entry exists");
+        let mut unsafe_entry: playlist_entry::ActiveModel = entry.into();
+        unsafe_entry.match_file_path = Set(Some(unsafe_path.to_string_lossy().into_owned()));
+        let unsafe_entry = unsafe_entry
+            .update(&db)
+            .await
+            .expect("store unsafe imported path fixture");
+        let entry_request =
+            RootReauthorizationRequest::new(Uuid::new_v4(), old_root.clone(), new_root.clone());
+
+        assert!(relocate_library_root_rows(
+            &db,
+            &entry_request,
+            Some(&stored_root),
+            &marker,
+            || async { true },
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            track::Entity::find_by_id(&safe_track.id)
+                .one(&db)
+                .await
+                .expect("query rolled-back safe track"),
+            Some(safe_track)
+        );
+        assert_eq!(
+            playlist_entry::Entity::find_by_id(&unsafe_entry.id)
+                .one(&db)
+                .await
+                .expect("query rolled-back unsafe match"),
+            Some(unsafe_entry)
+        );
+        assert_eq!(
+            library_root::Entity::find_by_id(old_root.to_string_lossy().as_ref())
+                .one(&db)
+                .await
+                .expect("query retained old root"),
+            Some(stored_root)
+        );
+        assert!(
+            library_root::Entity::find_by_id(new_root.to_string_lossy().as_ref())
+                .one(&db)
+                .await
+                .expect("query absent new root")
+                .is_none()
+        );
+        assert!(
+            root_reauthorization_receipt::Entity::find_by_id(entry_request.request_id.clone())
+                .one(&db)
+                .await
+                .expect("query rejected entry receipt")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn markerless_explicit_reauthorization_moves_rows_but_requires_root_trust() {
+        let db = rename_test_database().await;
+        let fixture = TestDirectory::new("markerless-reauthorization");
+        let old_root = fixture.path().join("legacy-path");
+        let new_root = fixture.path().join("portal-path");
+        std::fs::create_dir(&new_root).expect("create selected portal directory");
+        std::fs::write(new_root.join("song.flac"), b"not parsed during preparation")
+            .expect("create observed audio path");
+        let original = insert_rename_test_track(
+            &db,
+            "legacy-track",
+            old_root.join("song.flac").to_string_lossy().as_ref(),
+            "Legacy",
+            9,
+        )
+        .await;
+        let request =
+            RootReauthorizationRequest::new(Uuid::new_v4(), old_root.clone(), new_root.clone());
+
+        let resolution = resolve_root_reauthorization(&db, &request).await;
+        assert!(matches!(
+            resolution,
+            RootReauthorizationResolution::UseNew(RootReauthorizationOutcome::Applied)
+        ));
+        let marker = read_root_marker(&new_root)
+            .expect("read created marker")
+            .expect("marker was created");
+        let moved = track::Entity::find_by_id(&original.id)
+            .one(&db)
+            .await
+            .expect("query moved legacy track")
+            .expect("legacy track survives");
+        assert_eq!(
+            moved.file_path,
+            new_root.join("song.flac").to_string_lossy()
+        );
+        assert_eq!(moved.play_count, original.play_count);
+
+        let state = library_root::Entity::find_by_id(new_root.to_string_lossy().as_ref())
+            .one(&db)
+            .await
+            .expect("query new root state")
+            .expect("new root state exists");
+        assert_eq!(state.device_id.as_deref(), Some(marker.as_str()));
+        assert!(!state.identity_confirmed);
+        assert!(!state.is_available);
+        assert!(!state.last_scan_complete);
+    }
+
+    #[tokio::test]
+    async fn confirmed_marker_mismatch_rejects_without_database_mutation() {
+        let db = rename_test_database().await;
+        let fixture = TestDirectory::new("confirmed-marker-mismatch");
+        let old_root = fixture.path().join("legacy-path");
+        let new_root = fixture.path().join("portal-path");
+        std::fs::create_dir(&new_root).expect("create selected portal directory");
+        let expected_marker = test_marker_identity();
+        let observed_marker = create_root_marker(&new_root)
+            .expect("create different destination marker")
+            .identity;
+        assert_ne!(expected_marker, observed_marker);
+        let stored_root = insert_reauthorization_root(&db, &old_root, &expected_marker, true).await;
+        let original = insert_rename_test_track(
+            &db,
+            "confirmed-track",
+            old_root.join("song.flac").to_string_lossy().as_ref(),
+            "Confirmed",
+            3,
+        )
+        .await;
+        let request =
+            RootReauthorizationRequest::new(Uuid::new_v4(), old_root.clone(), new_root.clone());
+
+        assert!(prepare_root_reauthorization(&db, &request).await.is_err());
+        assert_eq!(
+            library_root::Entity::find_by_id(old_root.to_string_lossy().as_ref())
+                .one(&db)
+                .await
+                .expect("query source state"),
+            Some(stored_root)
+        );
+        assert_eq!(
+            track::Entity::find_by_id(&original.id)
+                .one(&db)
+                .await
+                .expect("query remembered track"),
+            Some(original)
+        );
+        assert!(
+            root_reauthorization_receipt::Entity::find_by_id(request.request_id.clone())
+                .one(&db)
+                .await
+                .expect("query absent receipt")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_confirmed_marker_reauthorizes_end_to_end() {
+        let db = rename_test_database().await;
+        let fixture = TestDirectory::new("confirmed-marker-reauthorization");
+        let old_root = fixture.path().join("legacy-path");
+        let new_root = fixture.path().join("portal-path");
+        std::fs::create_dir(&new_root).expect("create selected portal directory");
+        let marker = create_root_marker(&new_root)
+            .expect("create destination marker")
+            .identity;
+        std::fs::write(new_root.join("song.flac"), b"enumeration fixture")
+            .expect("create destination audio path");
+        insert_reauthorization_root(&db, &old_root, &marker, true).await;
+        let original = insert_rename_test_track(
+            &db,
+            "confirmed-track-success",
+            old_root.join("song.flac").to_string_lossy().as_ref(),
+            "Confirmed",
+            8,
+        )
+        .await;
+        let request =
+            RootReauthorizationRequest::new(Uuid::new_v4(), old_root.clone(), new_root.clone());
+
+        assert!(matches!(
+            resolve_root_reauthorization(&db, &request).await,
+            RootReauthorizationResolution::UseNew(RootReauthorizationOutcome::Applied)
+        ));
+        let moved = track::Entity::find_by_id(&original.id)
+            .one(&db)
+            .await
+            .expect("query moved confirmed track")
+            .expect("confirmed track survives");
+        assert_eq!(
+            moved.file_path,
+            new_root.join("song.flac").to_string_lossy()
+        );
+        assert_eq!(moved.play_count, original.play_count);
+        let state = library_root::Entity::find_by_id(new_root.to_string_lossy().as_ref())
+            .one(&db)
+            .await
+            .expect("query moved confirmed root")
+            .expect("confirmed root survives");
+        assert_eq!(state.device_id.as_deref(), Some(marker.as_str()));
+        assert!(state.identity_confirmed);
+    }
+
+    #[tokio::test]
+    async fn receipt_retry_is_idempotent_and_inconsistent_receipt_scans_neither_path() {
+        let db = rename_test_database().await;
+        let old_root = directory_fixture_path("/legacy/Music");
+        let new_root = directory_fixture_path("/portal/Music");
+        let marker = test_marker_identity();
+        insert_reauthorization_root(&db, &new_root, &marker, false).await;
+        let request =
+            RootReauthorizationRequest::new(Uuid::new_v4(), old_root.clone(), new_root.clone());
+        root_reauthorization_receipt::ActiveModel {
+            request_id: Set(request.request_id.clone()),
+            old_path: Set(old_root.to_string_lossy().into_owned()),
+            new_path: Set(new_root.to_string_lossy().into_owned()),
+            marker_identity: Set(marker),
+            completed_at: Set("2026-07-15T12:00:00Z".to_string()),
+        }
+        .insert(&db)
+        .await
+        .expect("insert committed receipt");
+
+        let (tx, rx) = async_channel::bounded(2);
+        let effective = resolve_pending_root_reauthorizations(
+            &db,
+            vec![old_root.clone()],
+            std::slice::from_ref(&request),
+            &tx,
+        )
+        .await;
+        assert_eq!(effective.as_slice(), std::slice::from_ref(&new_root));
+        assert!(matches!(
+            rx.recv().await.expect("receive retry outcome"),
+            LibraryEvent::RootReauthorizationFinished {
+                outcome: RootReauthorizationOutcome::AlreadyApplied,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_root_reauthorization_error(
+                &db,
+                &request,
+                anyhow::anyhow!("simulated ambiguous COMMIT result"),
+            )
+            .await,
+            RootReauthorizationResolution::UseNew(RootReauthorizationOutcome::AlreadyApplied)
+        ));
+
+        let uncommitted = RootReauthorizationRequest::new(
+            Uuid::new_v4(),
+            directory_fixture_path("/legacy/Other"),
+            directory_fixture_path("/portal/Other"),
+        );
+        assert!(matches!(
+            classify_root_reauthorization_error(
+                &db,
+                &uncommitted,
+                anyhow::anyhow!("simulated rejected transaction"),
+            )
+            .await,
+            RootReauthorizationResolution::KeepOld(_)
+        ));
+
+        library_root::Entity::delete_by_id(new_root.to_string_lossy().as_ref())
+            .exec(&db)
+            .await
+            .expect("corrupt receipt-backed root state");
+        assert!(matches!(
+            classify_root_reauthorization_error(
+                &db,
+                &request,
+                anyhow::anyhow!("simulated ambiguous COMMIT result"),
+            )
+            .await,
+            RootReauthorizationResolution::ScanNeither(_)
+        ));
+        let effective = resolve_pending_root_reauthorizations(
+            &db,
+            vec![old_root],
+            std::slice::from_ref(&request),
+            &tx,
+        )
+        .await;
+        assert!(effective.is_empty());
+        assert!(matches!(
+            rx.recv().await.expect("receive inconsistent outcome"),
+            LibraryEvent::RootReauthorizationFinished {
+                outcome: RootReauthorizationOutcome::Inconsistent,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_receipt_takes_precedence_over_invalid_later_config() {
+        let db = rename_test_database().await;
+        let old_root = directory_fixture_path("/legacy/Music");
+        let new_root = directory_fixture_path("/portal/Music");
+        let marker = test_marker_identity();
+        insert_reauthorization_root(&db, &new_root, &marker, false).await;
+        let request =
+            RootReauthorizationRequest::new(Uuid::new_v4(), old_root.clone(), new_root.clone());
+        root_reauthorization_receipt::ActiveModel {
+            request_id: Set(request.request_id.clone()),
+            old_path: Set(old_root.to_string_lossy().into_owned()),
+            new_path: Set(new_root.to_string_lossy().into_owned()),
+            marker_identity: Set(marker),
+            completed_at: Set("2026-07-15T12:00:00Z".to_string()),
+        }
+        .insert(&db)
+        .await
+        .expect("insert committed receipt");
+        // A playlist can be imported after the relocation committed but
+        // before config recovery. Its old-path match evidence is not proof
+        // that the earlier atomic relocation was partial.
+        let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Imported after relocation", false)
+            .await
+            .expect("create later playlist");
+        playlist_entry::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            playlist_id: Set(playlist.id),
+            position: Set(0),
+            track_id: Set(None),
+            match_title: Set("Remembered".to_string()),
+            match_artist: Set(String::new()),
+            match_album: Set(String::new()),
+            match_duration_secs: Set(None),
+            match_file_path: Set(Some(
+                old_root.join("song.flac").to_string_lossy().into_owned(),
+            )),
+        }
+        .insert(&db)
+        .await
+        .expect("insert later old-path match evidence");
+
+        let (tx, rx) = async_channel::bounded(1);
+        let effective = resolve_pending_root_reauthorizations(
+            &db,
+            vec![
+                old_root,
+                new_root.clone(),
+                new_root.join("manually-added-nested-root"),
+            ],
+            std::slice::from_ref(&request),
+            &tx,
+        )
+        .await;
+
+        assert_eq!(effective, [new_root]);
+        assert!(matches!(
+            rx.recv().await.expect("receive receipt-backed outcome"),
+            LibraryEvent::RootReauthorizationFinished {
+                outcome: RootReauthorizationOutcome::AlreadyApplied,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_request_id_quarantines_both_endpoint_scopes() {
+        let db = rename_test_database().await;
+        let old_root = directory_fixture_path("/legacy/Music");
+        let new_root = directory_fixture_path("/portal/Music");
+        let unrelated = directory_fixture_path("/other/Music");
+        let request =
+            RootReauthorizationRequest::new("not-a-uuid", old_root.clone(), new_root.clone());
+        let (tx, rx) = async_channel::bounded(1);
+
+        let effective = resolve_pending_root_reauthorizations(
+            &db,
+            vec![
+                old_root.clone(),
+                old_root.join("nested"),
+                new_root.clone(),
+                new_root.join("nested"),
+                unrelated.clone(),
+            ],
+            std::slice::from_ref(&request),
+            &tx,
+        )
+        .await;
+
+        assert_eq!(effective, [unrelated]);
+        assert!(matches!(
+            rx.recv().await.expect("receive malformed-intent outcome"),
+            LibraryEvent::RootReauthorizationFinished {
+                request_id,
+                outcome: RootReauthorizationOutcome::Inconsistent,
+                ..
+            } if request_id == "not-a-uuid"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_intent_quarantines_a_destination_already_added_to_config() {
+        let db = rename_test_database().await;
+        let old_root = directory_fixture_path("/legacy/Music");
+        let new_root = directory_fixture_path("/portal/Music");
+        let request =
+            RootReauthorizationRequest::new(Uuid::new_v4(), old_root.clone(), new_root.clone());
+        let (tx, rx) = async_channel::bounded(1);
+
+        let effective = resolve_pending_root_reauthorizations(
+            &db,
+            vec![
+                old_root.clone(),
+                old_root.join("nested-config"),
+                new_root.join("nested-config"),
+                new_root,
+            ],
+            std::slice::from_ref(&request),
+            &tx,
+        )
+        .await;
+
+        assert_eq!(effective, [old_root]);
+        assert!(matches!(
+            rx.recv().await.expect("receive rejected outcome"),
+            LibraryEvent::RootReauthorizationFinished {
+                outcome: RootReauthorizationOutcome::Rejected,
+                ..
+            }
+        ));
     }
 
     fn rename_event(
