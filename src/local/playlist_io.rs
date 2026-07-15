@@ -16,7 +16,7 @@ use anyhow::{anyhow, bail};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 use crate::db::entities::track;
@@ -38,10 +38,10 @@ pub struct ImportedTrack {
 /// Export a list of tracks to an XSPF file.
 ///
 /// Writes a valid XSPF v1 XML document containing `<location>`, `<title>`,
-/// `<creator>`, `<album>`, and `<duration>` for each track.
+/// `<creator>`, and `<album>` for each track, plus `<duration>` whenever the
+/// stored value is non-negative and representable as `u64` milliseconds.
 pub fn export_xspf(tracks: &[track::Model], path: &Path) -> anyhow::Result<()> {
     // Validate and render the whole document before touching the destination.
-    // In particular, an invalid duration must not truncate a previous export.
     let document = serialize_xspf(tracks)?;
     let parent = destination_parent(path);
     let prefix = temporary_file_prefix(path);
@@ -106,15 +106,23 @@ fn serialize_xspf(tracks: &[track::Model]) -> anyhow::Result<Vec<u8>> {
         }
         if let Some(dur) = t.duration_secs {
             // XSPF duration is in milliseconds.
-            let duration_secs = u64::try_from(dur)
-                .map_err(|_| anyhow!("track {} has a negative duration: {dur}", t.id))?;
-            let duration_ms = duration_secs.checked_mul(1000).ok_or_else(|| {
-                anyhow!(
-                    "track {} duration overflows XSPF milliseconds: {duration_secs}",
-                    t.id
-                )
-            })?;
-            writeln!(document, "      <duration>{duration_ms}</duration>")?;
+            match u64::try_from(dur) {
+                Ok(duration_secs) => match duration_secs.checked_mul(1000) {
+                    Some(duration_ms) => {
+                        writeln!(document, "      <duration>{duration_ms}</duration>")?;
+                    }
+                    None => warn!(
+                        track_id = %t.id,
+                        duration_secs,
+                        "Omitting XSPF duration that overflows u64 milliseconds"
+                    ),
+                },
+                Err(_) => warn!(
+                    track_id = %t.id,
+                    duration_secs = dur,
+                    "Omitting negative duration from XSPF export"
+                ),
+            }
         }
 
         writeln!(document, "    </track>")?;
@@ -619,6 +627,7 @@ impl<'a> ImportedTrackMatchIndex<'a> {
                     album: normalized_metadata(&model.album_title),
                     duration_secs: model
                         .duration_secs
+                        .and_then(|duration| i32::try_from(duration).ok())
                         .and_then(|duration| u64::try_from(duration).ok()),
                 });
         }
@@ -1011,7 +1020,7 @@ mod tests {
 
     #[test]
     fn invalid_or_out_of_range_xspf_duration_rejects_the_document() {
-        for duration in ["not-a-number", "18446744073709551616"] {
+        for duration in ["", "   ", "not-a-number", "18446744073709551616"] {
             let document = format!(
                 "<playlist version='1' xmlns='http://xspf.org/ns/0/'><trackList>\
                  <track><duration>{duration}</duration></track>\
@@ -1261,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_duration_preserves_existing_export_without_tempfiles() {
+    fn invalid_duration_is_omitted_during_atomic_export() {
         let directory = tempfile::tempdir().expect("create temporary directory");
         let destination = directory.path().join("playlist.xspf");
         fs::write(&destination, "previous contents").expect("write previous export");
@@ -1274,11 +1283,13 @@ mod tests {
             Some(-1),
         )];
 
-        assert!(export_xspf(&negative, &destination).is_err());
-        assert_eq!(
-            fs::read_to_string(&destination).expect("read preserved export"),
-            "previous contents"
-        );
+        export_xspf(&negative, &destination)
+            .expect("an invalid optional duration must not block export");
+        let imported = import_xspf(&destination).expect("read replaced XSPF export");
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].file_path, "/negative");
+        assert_eq!(imported[0].title, "Song");
+        assert_eq!(imported[0].duration_secs, None);
         assert!(temporary_artifacts(directory.path(), &destination).is_empty());
     }
 
@@ -1306,18 +1317,36 @@ mod tests {
     }
 
     #[test]
-    fn overflowing_duration_is_rejected_during_serialization() {
-        let tracks = vec![library_track(
-            "overflow",
-            "/overflow",
-            "Song",
-            "Artist",
-            "Album",
-            Some(i64::MAX),
-        )];
+    fn invalid_stored_durations_are_omitted_without_losing_tracks() {
+        let tracks = vec![
+            library_track(
+                "negative",
+                "/negative",
+                "Negative",
+                "Artist",
+                "Album",
+                Some(-1),
+            ),
+            library_track(
+                "overflow",
+                "/overflow",
+                "Overflow",
+                "Artist",
+                "Album",
+                Some(i64::MAX),
+            ),
+            library_track("valid", "/valid", "Valid", "Artist", "Album", Some(100)),
+        ];
 
-        let error = serialize_xspf(&tracks).expect_err("milliseconds must not overflow");
-        assert!(error.to_string().contains("overflows XSPF milliseconds"));
+        let document = String::from_utf8(
+            serialize_xspf(&tracks).expect("invalid optional durations must not block export"),
+        )
+        .expect("serialized XSPF is UTF-8");
+        assert_eq!(document.matches("    <track>").count(), 3);
+        assert_eq!(document.matches("<duration>").count(), 1);
+        assert!(document.contains("<duration>100000</duration>"));
+        assert!(document.contains("<title>Negative</title>"));
+        assert!(document.contains("<title>Overflow</title>"));
     }
 
     #[test]

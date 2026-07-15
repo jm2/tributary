@@ -475,7 +475,9 @@ The menus and file chooser identify that format explicitly; Apple Music/iTunes X
 Takeout CSV, M3U, and service-specific playlist URLs are not accepted directly. Export writes the
 complete XSPF document to a temporary sibling and atomically replaces the chosen destination, so
 an error leaves an existing export unchanged. XML 1.0-forbidden control characters are rejected
-before the temporary file or destination is touched.
+before the temporary file or destination is touched. A corrupt negative stored duration or one
+outside Tributary's supported `u64` millisecond range is omitted rather than blocking the otherwise
+valid playlist, because XSPF duration is optional.
 
 Import requires a valid leading XML 1.0 declaration when one is present, `version="1"`, and the
 canonical XSPF namespace, expressed either as the default namespace or through a prefix. It
@@ -492,7 +494,13 @@ On import, each XSPF `<track>` is resolved against the local library in this ord
    also exact. This is normalization, not fuzzy or “similarly named” matching.
 3. If `<duration>` is present, only candidates within five seconds qualify and the unique nearest
    duration wins. Without a duration, the metadata candidate must already be unique. Ties and
-   duplicate metadata remain unmatched instead of choosing an arbitrary song.
+duplicate metadata remain unmatched instead of choosing an arbitrary song.
+
+Only a valid imported `<location>` supplies path authority. Metadata-only imports and tracks added
+inside Tributary remain fingerprint-only across later relinks, so a different song that eventually
+reuses a scanned library path cannot silently take over the playlist entry. Corrupt negative or
+out-of-schema library durations are ignored as optional matching evidence rather than wrapped or
+allowed to block an otherwise safe path/fingerprint reconciliation.
 
 The entire playlist and its entries commit in one database transaction. The completion dialog
 reports **matched**, **unmatched**, and **failed** counts. An unmatched entry with a usable path or

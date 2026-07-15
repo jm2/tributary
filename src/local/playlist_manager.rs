@@ -131,13 +131,11 @@ impl PlaylistManager {
                     counts.matched += 1;
                     (
                         Some(track.id.clone()),
-                        Some(track.file_path.clone()),
+                        has_path.then(|| source.file_path.clone()),
                         normalize_fingerprint(&track.title),
                         normalize_fingerprint(&track.artist_name),
                         normalize_fingerprint(&track.album_title),
-                        track
-                            .duration_secs
-                            .and_then(|value| i32::try_from(value).ok()),
+                        valid_track_match_duration(track),
                     )
                 } else {
                     counts.unmatched += 1;
@@ -248,11 +246,16 @@ impl PlaylistManager {
             playlist_id: Set(playlist_id.to_string()),
             position: Set(max_pos + 1),
             track_id: Set(Some(track.id.clone())),
-            match_file_path: Set(Some(track.file_path.clone())),
+            // A path is authoritative only when an imported playlist supplied
+            // it as durable location evidence. A manually added entry follows
+            // the song fingerprint after deletion/rename; otherwise a
+            // different file later scanned at the reused path could silently
+            // replace the user's original choice.
+            match_file_path: Set(None),
             match_title: Set(track.title.to_lowercase().trim().to_string()),
             match_artist: Set(track.artist_name.to_lowercase().trim().to_string()),
             match_album: Set(track.album_title.to_lowercase().trim().to_string()),
-            match_duration_secs: Set(track.duration_secs.map(|d| d as i32)),
+            match_duration_secs: Set(valid_track_match_duration(track)),
         };
         entry.insert(&txn).await?;
         txn.commit().await?;
@@ -487,13 +490,15 @@ impl PlaylistManager {
 
         for orphan in orphans {
             let duration_secs = match orphan.match_duration_secs {
-                Some(value) => match u64::try_from(value) {
-                    Ok(value) => Some(value),
-                    Err(_) => {
-                        warn!(entry = %orphan.id, "Playlist entry has an invalid negative duration");
-                        continue;
-                    }
-                },
+                Some(value) if value >= 0 => Some(value as u64),
+                Some(value) => {
+                    warn!(
+                        entry = %orphan.id,
+                        duration_secs = value,
+                        "Ignoring invalid negative playlist match duration"
+                    );
+                    None
+                }
                 None => None,
             };
             let imported = ImportedTrack {
@@ -507,16 +512,12 @@ impl PlaylistManager {
 
             if let Some(best) = best {
                 let track_id = best.id.clone();
-                let match_file_path = best.file_path.clone();
                 let match_title = normalize_fingerprint(&best.title);
                 let match_artist = normalize_fingerprint(&best.artist_name);
                 let match_album = normalize_fingerprint(&best.album_title);
-                let match_duration_secs = best
-                    .duration_secs
-                    .and_then(|value| i32::try_from(value).ok());
+                let match_duration_secs = valid_track_match_duration(best);
                 let mut entry: playlist_entry::ActiveModel = orphan.into();
                 entry.track_id = Set(Some(track_id));
-                entry.match_file_path = Set(Some(match_file_path));
                 entry.match_title = Set(match_title);
                 entry.match_artist = Set(match_artist);
                 entry.match_album = Set(match_album);
@@ -620,6 +621,27 @@ impl PlaylistManager {
 
 fn normalize_fingerprint(value: &str) -> String {
     value.trim().to_lowercase()
+}
+
+/// Convert library duration metadata into safe playlist match evidence.
+///
+/// Duration is optional during reconciliation. Corrupt negative values and
+/// values outside the playlist schema's non-negative `i32` range must not
+/// wrap, block exact-path matching, or make an otherwise unique fingerprint
+/// appear authoritative.
+fn valid_track_match_duration(track: &track::Model) -> Option<i32> {
+    let duration_secs = track.duration_secs?;
+    match i32::try_from(duration_secs) {
+        Ok(value) if value >= 0 => Some(value),
+        _ => {
+            warn!(
+                track_id = %track.id,
+                duration_secs,
+                "Omitting invalid track duration from playlist match evidence"
+            );
+            None
+        }
+    }
 }
 
 /// Get current time as RFC3339 string.
@@ -738,6 +760,13 @@ mod tests {
                 duration_secs: None,
             },
             ImportedTrack {
+                title: " canonical title ".to_string(),
+                artist: "CANONICAL ARTIST".to_string(),
+                album: "Canonical Album".to_string(),
+                file_path: String::new(),
+                duration_secs: Some(180),
+            },
+            ImportedTrack {
                 title: String::new(),
                 artist: String::new(),
                 album: String::new(),
@@ -764,19 +793,26 @@ mod tests {
             .import_regular_playlist("Imported", &imported)
             .await
             .expect("commit playlist import");
-        assert_eq!(result.counts.matched, 1);
+        assert_eq!(result.counts.matched, 2);
         assert_eq!(result.counts.unmatched, 1);
         assert_eq!(result.counts.failed, 2);
 
         let before = playlist_entries(&db, &result.playlist.id).await;
-        assert_eq!(before.len(), 2);
+        assert_eq!(before.len(), 3);
         assert_eq!(before[0].position, 0);
         assert_eq!(before[0].track_id.as_deref(), Some(existing.id.as_str()));
+        assert_eq!(
+            before[0].match_file_path.as_deref(),
+            Some(existing.file_path.as_str())
+        );
         assert_eq!(before[0].match_title, "canonical title");
         assert_eq!(before[1].position, 1);
-        assert_eq!(before[1].track_id, None);
+        assert_eq!(before[1].track_id.as_deref(), Some(existing.id.as_str()));
+        assert_eq!(before[1].match_file_path, None);
+        assert_eq!(before[2].position, 2);
+        assert_eq!(before[2].track_id, None);
         assert_eq!(
-            before[1].match_file_path.as_deref(),
+            before[2].match_file_path.as_deref(),
             Some("/music/available-later.flac")
         );
 
@@ -792,13 +828,13 @@ mod tests {
         .await;
         assert_eq!(manager.reconcile_all().await.expect("reconcile path"), 1);
         let after = playlist_entries(&db, &result.playlist.id).await;
-        assert_eq!(after[1].id, before[1].id);
-        assert_eq!(after[1].position, before[1].position);
-        assert_eq!(after[1].track_id.as_deref(), Some(later.id.as_str()));
-        assert_eq!(after[1].match_title, "metadata can differ");
-        assert_eq!(after[1].match_artist, "path wins");
-        assert_eq!(after[1].match_album, "album");
-        assert_eq!(after[1].match_duration_secs, Some(200));
+        assert_eq!(after[2].id, before[2].id);
+        assert_eq!(after[2].position, before[2].position);
+        assert_eq!(after[2].track_id.as_deref(), Some(later.id.as_str()));
+        assert_eq!(after[2].match_title, "metadata can differ");
+        assert_eq!(after[2].match_artist, "path wins");
+        assert_eq!(after[2].match_album, "album");
+        assert_eq!(after[2].match_duration_secs, Some(200));
     }
 
     #[tokio::test]
@@ -1077,6 +1113,206 @@ mod tests {
                 .expect("repeat reconciliation"),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn manual_entry_does_not_relink_a_different_track_at_a_reused_path() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Reused path", false)
+            .await
+            .expect("create playlist");
+        let original = insert_track(
+            &db,
+            "original-track",
+            "/music/reused.flac",
+            "Original Song",
+            "Original Artist",
+            "Original Album",
+            Some(180),
+        )
+        .await;
+        manager
+            .add_track(&playlist.id, &original)
+            .await
+            .expect("add original track to playlist");
+        let linked = playlist_entries(&db, &playlist.id)
+            .await
+            .pop()
+            .expect("linked playlist entry");
+        assert_eq!(linked.match_file_path, None);
+
+        track::Entity::delete_by_id(&original.id)
+            .exec(&db)
+            .await
+            .expect("delete original track");
+        insert_track(
+            &db,
+            "different-at-original-path",
+            "/music/reused.flac",
+            "Different Song",
+            "Different Artist",
+            "Different Album",
+            Some(300),
+        )
+        .await;
+        let relocated = insert_track(
+            &db,
+            "relocated-original",
+            "/music/relocated.flac",
+            "Original Song",
+            "Original Artist",
+            "Original Album",
+            Some(180),
+        )
+        .await;
+
+        assert_eq!(
+            manager
+                .reconcile_all()
+                .await
+                .expect("reconcile relocated fingerprint"),
+            1
+        );
+        let relinked = playlist_entries(&db, &playlist.id)
+            .await
+            .pop()
+            .expect("relinked playlist entry");
+        assert_eq!(relinked.track_id.as_deref(), Some(relocated.id.as_str()));
+        assert_eq!(relinked.match_file_path, None);
+
+        track::Entity::delete_by_id(&relocated.id)
+            .exec(&db)
+            .await
+            .expect("delete relocated original");
+        insert_track(
+            &db,
+            "different-at-relocated-path",
+            "/music/relocated.flac",
+            "Another Song",
+            "Another Artist",
+            "Another Album",
+            Some(180),
+        )
+        .await;
+        assert_eq!(
+            manager
+                .reconcile_all()
+                .await
+                .expect("reconcile second reused path"),
+            0
+        );
+        let orphan = playlist_entries(&db, &playlist.id)
+            .await
+            .pop()
+            .expect("preserved orphan");
+        assert_eq!(orphan.track_id, None);
+        assert_eq!(orphan.match_title, "original song");
+        assert_eq!(orphan.match_artist, "original artist");
+        assert_eq!(orphan.match_album, "original album");
+        assert_eq!(orphan.match_file_path, None);
+    }
+
+    #[tokio::test]
+    async fn invalid_duration_evidence_is_omitted_and_cannot_block_path_reconciliation() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Invalid duration evidence", false)
+            .await
+            .expect("create playlist");
+        let negative = insert_track(
+            &db,
+            "negative-duration",
+            "/music/negative.flac",
+            "Negative",
+            "Artist",
+            "Album",
+            Some(-1),
+        )
+        .await;
+        let overflowing = insert_track(
+            &db,
+            "overflowing-duration",
+            "/music/overflowing.flac",
+            "Overflowing",
+            "Artist",
+            "Album",
+            Some(i64::from(i32::MAX) + 1),
+        )
+        .await;
+        manager
+            .add_track(&playlist.id, &negative)
+            .await
+            .expect("add negative-duration track");
+        manager
+            .add_track(&playlist.id, &overflowing)
+            .await
+            .expect("add overflowing-duration track");
+
+        let linked = playlist_entries(&db, &playlist.id).await;
+        assert_eq!(linked.len(), 2);
+        assert!(linked
+            .iter()
+            .all(|entry| entry.match_duration_secs.is_none()));
+
+        let imported = [ImportedTrack {
+            title: overflowing.title.clone(),
+            artist: overflowing.artist_name.clone(),
+            album: overflowing.album_title.clone(),
+            file_path: String::new(),
+            duration_secs: Some(i32::MAX as u64),
+        }];
+        let import_result = manager
+            .import_regular_playlist("Out-of-range candidate", &imported)
+            .await
+            .expect("import against out-of-range library duration");
+        assert_eq!(import_result.counts.matched, 0);
+        assert_eq!(import_result.counts.unmatched, 1);
+        let imported_orphan = playlist_entries(&db, &import_result.playlist.id)
+            .await
+            .pop()
+            .expect("preserved import with valid source duration");
+        assert_eq!(imported_orphan.track_id, None);
+        assert_eq!(imported_orphan.match_duration_secs, Some(i32::MAX));
+
+        playlist_entry::ActiveModel {
+            id: Set("corrupt-duration-orphan".to_string()),
+            playlist_id: Set(playlist.id.clone()),
+            position: Set(2),
+            track_id: Set(None),
+            match_file_path: Set(Some(overflowing.file_path.clone())),
+            match_title: Set(String::new()),
+            match_artist: Set(String::new()),
+            match_album: Set(String::new()),
+            match_duration_secs: Set(Some(-1)),
+        }
+        .insert(&db)
+        .await
+        .expect("insert orphan with corrupt duration evidence");
+
+        assert_eq!(
+            manager
+                .reconcile_all()
+                .await
+                .expect("reconcile despite corrupt optional duration"),
+            1
+        );
+        let reconciled = playlist_entries(&db, &playlist.id)
+            .await
+            .into_iter()
+            .find(|entry| entry.id == "corrupt-duration-orphan")
+            .expect("reconciled corrupt-duration entry");
+        assert_eq!(
+            reconciled.track_id.as_deref(),
+            Some(overflowing.id.as_str())
+        );
+        assert_eq!(
+            reconciled.match_file_path.as_deref(),
+            Some(overflowing.file_path.as_str())
+        );
+        assert_eq!(reconciled.match_duration_secs, None);
     }
 
     #[tokio::test]

@@ -420,7 +420,7 @@ fn show_playlist_alert(win: &adw::ApplicationWindow, heading: &str, body: &str) 
         .heading(heading)
         .body(body)
         .build();
-    alert.add_response("ok", "OK");
+    alert.add_response("ok", rust_i18n::t!("dialogs.ok").as_ref());
     alert.present(Some(win));
 }
 
@@ -436,14 +436,14 @@ fn handle_import_playlist(
     let rt = rt_handle.clone();
 
     let xspf_filter = gtk::FileFilter::new();
-    xspf_filter.set_name(Some("XSPF v1 Playlists (*.xspf)"));
+    xspf_filter.set_name(Some(rust_i18n::t!("playlist_io.import_filter").as_ref()));
     xspf_filter.add_pattern("*.xspf");
 
     let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
     filters.append(&xspf_filter);
 
     let dialog = gtk::FileDialog::builder()
-        .title("Import XSPF Playlist")
+        .title(rust_i18n::t!("playlist_io.import_dialog_title").as_ref())
         .modal(true)
         .filters(&filters)
         .build();
@@ -460,8 +460,8 @@ fn handle_import_playlist(
                 Err(error) => {
                     show_playlist_alert(
                         &win,
-                        "Could Not Open XSPF Playlist",
-                        &format!("The file chooser failed: {error}"),
+                        rust_i18n::t!("playlist_io.import_chooser_failed_heading").as_ref(),
+                        rust_i18n::t!("playlist_io.file_chooser_failed", error = error).as_ref(),
                     );
                     return;
                 }
@@ -469,8 +469,8 @@ fn handle_import_playlist(
             let Some(path) = file.path() else {
                 show_playlist_alert(
                     &win,
-                    "Choose a Local XSPF Playlist",
-                    "Tributary can import only XSPF files available through a local filesystem path.",
+                    rust_i18n::t!("playlist_io.import_local_path_heading").as_ref(),
+                    rust_i18n::t!("playlist_io.import_local_path_body").as_ref(),
                 );
                 return;
             };
@@ -480,7 +480,9 @@ fn handle_import_playlist(
             let name = path
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Imported Playlist".to_string());
+                .unwrap_or_else(|| {
+                    rust_i18n::t!("playlist_io.imported_playlist_name").into_owned()
+                });
 
             // Carry an explicit committed result or a user-visible error back
             // to GTK. A dropped sender is handled as a failure too.
@@ -503,25 +505,28 @@ fn handle_import_playlist(
                         crate::local::playlist_io::import_xspf(&path_clone)
                     })
                     .await
-                    .map_err(|error| format!("The XSPF parser worker stopped: {error}"))?
-                    .map_err(|error| format!("Could not parse the XSPF file: {error}"))?;
+                    .map_err(|error| {
+                        rust_i18n::t!("playlist_io.parser_worker_failed", error = error)
+                            .into_owned()
+                    })?
+                    .map_err(|error| {
+                        rust_i18n::t!("playlist_io.parse_failed", error = error).into_owned()
+                    })?;
 
                     let db = crate::db::connection::init_db().await.map_err(|error| {
-                        format!("Could not open the playlist database: {error}")
+                        rust_i18n::t!("playlist_io.database_open_failed", error = error)
+                            .into_owned()
                     })?;
                     let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
                     let result = mgr
                         .import_regular_playlist(&name_clone, &imported)
                         .await
                         .map_err(|error| {
-                            format!("Could not commit the playlist import: {error}")
+                            rust_i18n::t!("playlist_io.import_commit_failed", error = error)
+                                .into_owned()
                         })?;
 
-                    Ok((
-                        result.playlist.name,
-                        result.playlist.id,
-                        result.counts,
-                    ))
+                    Ok((result.playlist.name, result.playlist.id, result.counts))
                 }
                 .await;
 
@@ -544,33 +549,33 @@ fn handle_import_playlist(
                             failed = counts.failed,
                             "XSPF playlist import complete"
                         );
-                        let body = format!(
-                            "Imported \"{pname}\".\n\nMatched: {}\nUnmatched (preserved): {}\nFailed (not imported): {}",
-                            counts.matched, counts.unmatched, counts.failed
+                        let body = rust_i18n::t!(
+                            "playlist_io.import_success_body",
+                            name = pname,
+                            matched = counts.matched,
+                            unmatched = counts.unmatched,
+                            failed = counts.failed
                         );
                         let heading = if counts.failed == 0 {
-                            "XSPF Playlist Imported"
+                            rust_i18n::t!("playlist_io.import_success_heading")
                         } else {
-                            "XSPF Playlist Imported with Warnings"
+                            rust_i18n::t!("playlist_io.import_warning_heading")
                         };
                         // The manager returned only after the playlist and
                         // all retained entries committed together.
                         insert_playlist_into_sidebar(&sidebar_store, &pname, &pid, false);
-                        show_playlist_alert(&win, heading, &body);
+                        show_playlist_alert(&win, heading.as_ref(), body.as_ref());
                     }
                     Ok(Err(error)) => show_playlist_alert(
                         &win,
-                        "Could Not Import XSPF Playlist",
-                        &format!(
-                            "{error}\n\nNo playlist or entries were committed; any database changes were rolled back."
-                        ),
+                        rust_i18n::t!("playlist_io.import_failed_heading").as_ref(),
+                        rust_i18n::t!("playlist_io.import_rollback_body", error = error).as_ref(),
                     ),
                     Err(error) => show_playlist_alert(
                         &win,
-                        "Could Not Import XSPF Playlist",
-                        &format!(
-                            "The import worker stopped before reporting a result: {error}\n\nNo committed playlist was published."
-                        ),
+                        rust_i18n::t!("playlist_io.import_failed_heading").as_ref(),
+                        rust_i18n::t!("playlist_io.import_worker_failed_body", error = error)
+                            .as_ref(),
                     ),
                 }
             });
@@ -591,16 +596,16 @@ fn handle_export_playlist(
     let pid = playlist_id.to_string();
 
     let xspf_filter = gtk::FileFilter::new();
-    xspf_filter.set_name(Some("XSPF v1 Playlist (*.xspf)"));
+    xspf_filter.set_name(Some(rust_i18n::t!("playlist_io.export_filter").as_ref()));
     xspf_filter.add_pattern("*.xspf");
 
     let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
     filters.append(&xspf_filter);
 
     let dialog = gtk::FileDialog::builder()
-        .title("Export XSPF Playlist")
+        .title(rust_i18n::t!("playlist_io.export_dialog_title").as_ref())
         .modal(true)
-        .initial_name("playlist.xspf")
+        .initial_name(rust_i18n::t!("playlist_io.export_filename").as_ref())
         .filters(&filters)
         .build();
 
@@ -616,8 +621,8 @@ fn handle_export_playlist(
                 Err(error) => {
                     show_playlist_alert(
                         &win,
-                        "Could Not Choose XSPF Destination",
-                        &format!("The file chooser failed: {error}"),
+                        rust_i18n::t!("playlist_io.export_chooser_failed_heading").as_ref(),
+                        rust_i18n::t!("playlist_io.file_chooser_failed", error = error).as_ref(),
                     );
                     return;
                 }
@@ -625,8 +630,8 @@ fn handle_export_playlist(
             let Some(path) = file.path() else {
                 show_playlist_alert(
                     &win,
-                    "Choose a Local XSPF Destination",
-                    "Tributary can export only to a local filesystem path.",
+                    rust_i18n::t!("playlist_io.export_local_path_heading").as_ref(),
+                    rust_i18n::t!("playlist_io.export_local_path_body").as_ref(),
                 );
                 return;
             };
@@ -640,26 +645,35 @@ fn handle_export_playlist(
             rt.spawn(async move {
                 let outcome: Result<_, String> = async {
                     let db = crate::db::connection::init_db().await.map_err(|error| {
-                        format!("Could not open the playlist database: {error}")
+                        rust_i18n::t!("playlist_io.database_open_failed", error = error)
+                            .into_owned()
                     })?;
                     let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
                     let playlist = mgr
                         .get_playlist(&pid)
                         .await
-                        .map_err(|error| format!("Could not read the playlist: {error}"))?
-                        .ok_or_else(|| "The selected playlist no longer exists.".to_string())?;
+                        .map_err(|error| {
+                            rust_i18n::t!("playlist_io.playlist_read_failed", error = error)
+                                .into_owned()
+                        })?
+                        .ok_or_else(|| {
+                            rust_i18n::t!("playlist_io.playlist_missing").into_owned()
+                        })?;
 
                     // Smart playlists are evaluated from the current library;
                     // regular playlists use their persisted reconciled entries.
                     let tracks = if playlist.is_smart {
-                        mgr.evaluate_smart_playlist(&pid)
-                            .await
-                            .map_err(|error| {
-                                format!("Could not evaluate the smart playlist: {error}")
-                            })?
+                        mgr.evaluate_smart_playlist(&pid).await.map_err(|error| {
+                            rust_i18n::t!(
+                                "playlist_io.smart_playlist_evaluation_failed",
+                                error = error
+                            )
+                            .into_owned()
+                        })?
                     } else {
                         mgr.get_playlist_tracks(&pid).await.map_err(|error| {
-                            format!("Could not read playlist tracks: {error}")
+                            rust_i18n::t!("playlist_io.playlist_tracks_read_failed", error = error)
+                                .into_owned()
                         })?
                     };
 
@@ -668,8 +682,13 @@ fn handle_export_playlist(
                         crate::local::playlist_io::export_xspf(&tracks, &export_path)
                     })
                     .await
-                    .map_err(|error| format!("The XSPF writer worker stopped: {error}"))?
-                    .map_err(|error| format!("Could not write the XSPF file: {error}"))?;
+                    .map_err(|error| {
+                        rust_i18n::t!("playlist_io.writer_worker_failed", error = error)
+                            .into_owned()
+                    })?
+                    .map_err(|error| {
+                        rust_i18n::t!("playlist_io.write_failed", error = error).into_owned()
+                    })?;
 
                     Ok(path)
                 }
@@ -688,23 +707,21 @@ fn handle_export_playlist(
                         info!(path = %path.display(), "XSPF playlist exported");
                         show_playlist_alert(
                             &win,
-                            "XSPF Playlist Exported",
-                            &format!("Saved the playlist atomically to {}.", path.display()),
+                            rust_i18n::t!("playlist_io.export_success_heading").as_ref(),
+                            rust_i18n::t!("playlist_io.export_success_body", path = path.display())
+                                .as_ref(),
                         );
                     }
                     Ok(Err(error)) => show_playlist_alert(
                         &win,
-                        "Could Not Export XSPF Playlist",
-                        &format!(
-                            "{error}\n\nThe destination was left unchanged; any temporary file was removed."
-                        ),
+                        rust_i18n::t!("playlist_io.export_failed_heading").as_ref(),
+                        rust_i18n::t!("playlist_io.export_unchanged_body", error = error).as_ref(),
                     ),
                     Err(error) => show_playlist_alert(
                         &win,
-                        "Could Not Export XSPF Playlist",
-                        &format!(
-                            "The export worker stopped before reporting a result: {error}"
-                        ),
+                        rust_i18n::t!("playlist_io.export_failed_heading").as_ref(),
+                        rust_i18n::t!("playlist_io.export_worker_failed_body", error = error)
+                            .as_ref(),
                     ),
                 }
             });

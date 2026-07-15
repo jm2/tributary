@@ -508,7 +508,8 @@ Existing rule JSON remains usable across the option removal.
 
 - [x] Define supported source formats and provide adapters or actionable conversion guidance
   for Apple Music XML and YouTube Music exports. Direct support is deliberately XSPF v1 only, and
-  every menu, dialog, and filter now says XSPF instead of implying arbitrary playlist formats.
+  every menu, dialog, and filter now says XSPF instead of implying arbitrary playlist formats. All
+  new menu, chooser, outcome, and failure text uses the existing 13-language locale catalogs.
   The namespace-aware parser requires a valid leading XML 1.0 declaration when one is present,
   `version="1"`, and the canonical XSPF namespace in default or prefixed form; validates every
   attribute's XML syntax and namespace binding; rejects DTDs, malformed/multiple/trailing
@@ -524,19 +525,28 @@ Existing rule JSON remains usable across the option removal.
   is rendered before the destination is touched, written to an exclusively created random sibling,
   flushed and `fsync`ed, then atomically persisted over the destination. XML 1.0-forbidden control
   characters are rejected before any temporary or destination file is touched. Serialization,
-  write, and rename failures remove the temporary file and preserve an existing export. The GTK
-  path runs the blocking renderer/writer with `spawn_blocking` and reports success and failure.
+  write, and rename failures remove the temporary file and preserve an existing export. A corrupt
+  negative stored duration or one outside Tributary's supported `u64` millisecond range is omitted
+  with a warning because XSPF makes duration optional; it cannot block otherwise valid tracks from
+  exporting. The GTK path runs the blocking renderer/writer with `spawn_blocking` and reports
+  success and failure.
 - [x] Prefer an exact existing file path before metadata matching. A valid local `file:` URI in
   `<location>` is decoded and wins when it equals a stored path; non-file and malformed locations
   are ignored as paths but may still match by metadata. The valid decoded source path is retained
-  on an unmatched entry for the same first-priority reconciliation later.
+  for the same first-priority reconciliation later. Path authority is limited to imported location
+  evidence: metadata-only imports and manually added entries remain fingerprint-only even after a
+  successful relink, so repeated delete/rescan cycles cannot promote a library path and let an
+  unrelated track later scanned there replace the user's original choice.
 - [x] Enforce the documented duration tolerance and deterministic tie-breaking. Metadata matching
   requires normalized-exact (trimmed, case-insensitive) title + artist and, when supplied, album;
   it is not fuzzy name matching. A supplied duration is a hard inclusive ±5-second gate and only
   the unique nearest candidate wins. Equal-nearest ties remain unmatched; without duration, the
   metadata match itself must be unique. Import and later orphan reconciliation share this resolver.
   Each track snapshot indexes paths and normalized metadata once instead of rescanning and
-  renormalizing the full library for every playlist row.
+  renormalizing the full library for every playlist row. Corrupt negative library durations and
+  values outside the playlist schema's non-negative `i32` range are omitted from match evidence
+  instead of wrapping or blocking path/fingerprint reconciliation; already-corrupt negative
+  playlist evidence is likewise treated as absent.
 - [x] Return database errors rather than treating them as no-match. Matching uses one transaction's
   track snapshot instead of per-entry fallible queries hidden behind `if let Ok`; a read or write
   error now escapes as `DbErr`, reaches the UI as an explicit failure, and prevents publication.
@@ -556,7 +566,7 @@ Existing rule JSON remains usable across the option removal.
   completion alert shows all three counts; parse, database, worker, and export failures show
   actionable alerts rather than disappearing into a silent `Option` or log-only branch.
 - [x] Record implementation: PR #90. Focused coverage
-  adds 25 regressions for atomic replacement and cleanup, malformed or non-XSPF input, path-first
+  adds 27 regressions for atomic replacement and cleanup, malformed or non-XSPF input, path-first
   and normalized metadata resolution, duration boundaries and ambiguity, transactional
   rollback/database errors, retained unmatched entries, migration round trips, and outcome counts.
 
@@ -824,8 +834,8 @@ Run before marking any milestone complete:
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
 Most recent milestone validation (2026-07-15, P2.2 playlist import/export): 18 library plus
-530 application tests passed in debug (548 total), and the release suite passed with the same
-548 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
+532 application tests passed in debug (550 total), and the release suite passed with the same
+550 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
 were clean; and `cargo audit` passed with exactly the two accepted unmaintained warnings recorded
 under P0.8.
 
@@ -1138,8 +1148,10 @@ Record scope or design decisions here so deferred work is explicit.
   canonical namespace in default or prefixed form, validates any XML declaration plus each
   attribute's syntax and namespace binding, rejects DTDs and malformed document structure, and
   considers only direct XSPF
-  track-list children. Resolution first accepts an exact local path decoded from a valid `file:`
-  URI, then normalized-exact title/artist plus optional album; a
+  track-list children. Resolution first accepts an exact local path decoded from a valid imported
+  `file:` URI, then normalized-exact title/artist plus optional album; manual additions deliberately
+  retain no authoritative path so a different song cannot take over an orphan merely by reusing
+  its former filename. A
   supplied duration narrows candidates to the inclusive five-second window and selects only a
   unique nearest result.
   Any tie stays orphaned. This same resolver and its per-snapshot path/metadata index are reused
