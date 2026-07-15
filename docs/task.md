@@ -135,7 +135,7 @@ logged out exactly once on explicit disconnect or controlled shutdown.
 - [x] Add tests for sort, filter, source change, output change, EOS, and external-file playback.
 - [x] Record implementation: PR #68; 25 focused UI/output tests. A 2026-07-15 live Windows DAAP
   check exposed a separate idle-Play abort: the immutable `RefCell` borrow used to choose
-  `StartAt` lived through the `match` arm that installed the new queue. PR _pending_ resolves the
+  `StartAt` lived through the `match` arm that installed the new queue. PR #92 resolves the
   request behind a function boundary before dispatch; the existing Stop-then-Play regression now
   uses the real `RefCell` boundary and proves the `StartAt` result permits immediate mutable queue
   replacement.
@@ -686,7 +686,7 @@ UI, so that is where the symlink defect was.
   The GTK publication path inserts no empty Devices header, and both its header and unnamed-device
   fallback use the locale catalogs.
 - [ ] Record partial implementation: symlink containment in commit `1886847`; one-shot background
-  discovery in PR _pending_; 4 focused tests across traversal containment and deterministic
+  discovery in PR #92; 4 focused tests across traversal containment and deterministic
   discovery filtering. Platform mount APIs, hotplug, live manual UI validation, and the P2.5
   Flatpak permission/portal work remain open.
 
@@ -1271,7 +1271,7 @@ Add one line per completed task:
 | 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |
 | 2026-07-13 | P1.8 | `eb0b9ca`, `fbaaa7f` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable song identity, shared-queue preservation, ownership preflight, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
 | 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, keeps the prior visible projection fresh while remote intent is pending, preserves valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; eight navigation and two engine tests cover the races and event ordering. |
-| 2026-07-15 | P0.4 playback-start follow-up | PR _pending_ | Idle Play now releases the session read used to select `StartAt` before the arm installs its queue, preventing the live Windows DAAP `RefCell already borrowed` abort; the existing Stop-then-Play regression exercises the real `RefCell` boundary and immediate mutable replacement. |
+| 2026-07-15 | P0.4 playback-start follow-up | PR #92 | Idle Play now releases the session read used to select `StartAt` before the arm installs its queue, preventing the live Windows DAAP `RefCell already borrowed` abort; the existing Stop-then-Play regression exercises the real `RefCell` boundary and immediate mutable replacement. |
 | 2026-07-15 | P2.1 | PR #89 | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
 | 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
 | 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR #91 | Numeric validation; bounded exclusive UUID-plus-format sibling files; exact scan/watcher exclusion and temp-to-original metadata refresh that preserve track identity, history, and playlist links; RAII cleanup; permission copying and pre-rename `fsync`; album-artist handling; and 11 focused tests including a public-API round trip against a generated silent FLAC fixture. |
