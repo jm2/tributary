@@ -17,6 +17,7 @@ use tracing::{error, info};
 use super::cast_http_server::CastHttpServer;
 use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
+use crate::architecture::media::ResolvedHttpRequest;
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const POSITION_POLL_INTERVAL_SECS: u64 = 1;
@@ -1509,6 +1510,23 @@ impl ChromecastOutput {
         }
     }
 
+    /// Put a typed authenticated request behind the LAN proxy unconditionally.
+    /// No endpoint string from this path is ever eligible for a direct Cast
+    /// device load.
+    fn resolve_request(&self, request: ResolvedHttpRequest) -> CastResult<String> {
+        self.revoke_proxy_tickets();
+        if !request.is_active() {
+            return Err(CastFailure::new("media source availability"));
+        }
+        let server = self.ensure_cast_server()?;
+        let server = server
+            .as_ref()
+            .ok_or_else(|| CastFailure::new("media proxy startup"))?;
+        server
+            .register_resolved(request)
+            .ok_or_else(|| CastFailure::new("media source availability"))
+    }
+
     fn resolve_local_file(&self, file_path: &std::path::Path) -> CastResult<String> {
         let file_path = file_path.to_path_buf();
         // A regular file, not merely something that exists: `file://` parses to
@@ -1579,6 +1597,18 @@ impl AudioOutput for ChromecastOutput {
     fn load_uri(&self, uri: &str) {
         let owner = self.next_owner();
         let kind = match self.resolve_uri(uri) {
+            Ok(uri) => CommandKind::Load {
+                uri,
+                volume: self.volume,
+            },
+            Err(failure) => CommandKind::RejectLoad { failure },
+        };
+        let _ = self.enqueue(owner, kind);
+    }
+
+    fn load_resolved(&self, request: ResolvedHttpRequest) {
+        let owner = self.next_owner();
+        let kind = match self.resolve_request(request) {
             Ok(uri) => CommandKind::Load {
                 uri,
                 volume: self.volume,
@@ -2851,6 +2881,30 @@ mod tests {
         assert_eq!(rendered, "Chromecast local media URI validation failed");
         assert!(!rendered.contains("cast-secret-token"));
         assert!(!rendered.contains("file://"));
+    }
+
+    #[test]
+    fn typed_request_resolution_cannot_fall_through_to_a_direct_cast_load() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let (event_tx, _events) = async_channel::unbounded();
+        let output = ChromecastOutput::new("Living Room", "127.0.0.1", 8009, event_tx, 1.0);
+        *output.cast_server.lock().expect("cast server lock") = Some(
+            runtime
+                .block_on(CastHttpServer::start_on(std::net::SocketAddr::from((
+                    std::net::Ipv4Addr::LOCALHOST,
+                    0,
+                ))))
+                .expect("loopback cast server"),
+        );
+        let endpoint = url::Url::parse("https://music.test/clean/track.flac?track=42")
+            .expect("clean endpoint");
+        let request = ResolvedHttpRequest::new(endpoint.clone()).expect("resolved request");
+
+        let ticket = output.resolve_request(request).expect("proxied request");
+        assert_ne!(ticket, endpoint.as_str());
+        assert!(ticket.starts_with("http://127.0.0.1:"));
+        assert!(!ticket.contains("music.test"));
+        assert!(!ticket.contains("track=42"));
     }
 
     #[test]

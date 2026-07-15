@@ -6,6 +6,8 @@
 
 pub mod backend;
 pub mod error;
+pub mod media;
 pub mod models;
 
 pub use backend::MediaBackend;
+pub use media::{RemoteMediaResolver, ResolvedHttpRequest};

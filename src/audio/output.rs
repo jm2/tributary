@@ -29,6 +29,7 @@
 //! sidebar and are completely independent of the active output.
 
 use super::{PlayerEventGeneration, PlayerState};
+use crate::architecture::media::ResolvedHttpRequest;
 
 /// Identifies the type of an audio output for UI purposes (icon, label).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,14 @@ pub trait AudioOutput {
     /// credential-bearing URL may reach only Tributary's app-owned proxy, not
     /// a playback library, daemon, or receiver.
     fn load_uri(&self, uri: &str);
+
+    /// Load one backend-resolved authenticated request and start playback.
+    ///
+    /// This owned typed path is deliberately separate from [`load_uri`](Self::load_uri):
+    /// implementations must put the request behind an app-owned opaque ticket
+    /// before invoking GStreamer, MPD, or a receiver. The endpoint and its
+    /// authentication material must never fall through to a direct URI load.
+    fn load_resolved(&self, request: ResolvedHttpRequest);
 
     /// Tag subsequent events with the playback load that owns them.
     ///

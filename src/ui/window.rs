@@ -5,6 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -56,6 +57,23 @@ const PREV_RESTART_THRESHOLD_MS: u64 = 3000;
 /// prevents a stalled engine from accumulating unbounded confirmations.
 const LIBRARY_COMMAND_CAPACITY: usize = 16;
 
+type SharedAudioOutput = Rc<RefCell<Box<dyn AudioOutput>>>;
+type PlaybackUiReset = Rc<dyn Fn()>;
+type SourcePlaybackInvalidator = Rc<dyn Fn(&str)>;
+
+fn configured_server_url(variable: &'static str) -> Option<String> {
+    let raw = std::env::var(variable).ok()?;
+    match crate::http_security::parse_base_url(&raw) {
+        Ok(url) => Some(url.to_string()),
+        Err(error) => {
+            // The rejected value may itself contain a password/token. Log only
+            // the fixed validation category and the non-secret variable name.
+            warn!(variable, error, "Ignoring invalid configured server URL");
+            None
+        }
+    }
+}
+
 /// Build and present the main Tributary window.
 pub fn build_window(
     app: &adw::Application,
@@ -64,6 +82,36 @@ pub fn build_window(
     engine_rx: async_channel::Receiver<LibraryEvent>,
 ) {
     info!("Building main window (Phase 4 — audio + desktop integration)");
+
+    // Parse external source identities once, before they can be logged,
+    // published to GTK, or handed to a connection registry. Invalid values
+    // may contain credentials, so `configured_server_url` never returns or
+    // formats them in an error.
+    let subsonic_env = match (
+        configured_server_url("SUBSONIC_URL"),
+        std::env::var("SUBSONIC_USER"),
+        std::env::var("SUBSONIC_PASS"),
+    ) {
+        (Some(url), Ok(user), Ok(pass)) => Some((url, user, pass)),
+        _ => None,
+    };
+    let jellyfin_env = match (
+        configured_server_url("JELLYFIN_URL"),
+        std::env::var("JELLYFIN_API_KEY"),
+        std::env::var("JELLYFIN_USER_ID"),
+    ) {
+        (Some(url), Ok(api_key), Ok(user_id)) => Some((url, api_key, user_id)),
+        _ => None,
+    };
+    let plex_env = match (
+        configured_server_url("PLEX_URL"),
+        std::env::var("PLEX_TOKEN"),
+    ) {
+        (Some(url), Ok(token)) => Some((url, token)),
+        _ => None,
+    };
+    let daap_env =
+        configured_server_url("DAAP_URL").map(|url| (url, std::env::var("DAAP_PASSWORD").ok()));
 
     // ── Load and apply persisted preferences ─────────────────────────
     let app_config: Rc<RefCell<preferences::AppConfig>> =
@@ -108,7 +156,6 @@ pub fn build_window(
         sources.push(src);
         info!(
             name = %entry.name,
-            url = %entry.url,
             backend = %entry.server_type,
             "Loaded saved server from servers.json"
         );
@@ -116,43 +163,39 @@ pub fn build_window(
 
     // If env vars are set, add pre-configured remote server entries
     // under their respective category headers.
-    if let (Ok(url), Ok(_user), Ok(_pass)) = (
-        std::env::var("SUBSONIC_URL"),
-        std::env::var("SUBSONIC_USER"),
-        std::env::var("SUBSONIC_PASS"),
-    ) {
+    if let Some((url, _user, _pass)) = subsonic_env.as_ref() {
         ensure_category_header_vec(&mut sources, "subsonic");
-        let src = SourceObject::source("Subsonic (env)", "subsonic", "network-server-symbolic");
+        let src = SourceObject::discovered("Subsonic (env)", "subsonic", url);
+        src.set_connecting(true);
         sources.push(src);
-        info!(url = %url, "Subsonic server configured via env vars");
+        info!("Subsonic server configured via env vars");
     }
 
-    if let (Ok(url), Ok(_key), Ok(_uid)) = (
-        std::env::var("JELLYFIN_URL"),
-        std::env::var("JELLYFIN_API_KEY"),
-        std::env::var("JELLYFIN_USER_ID"),
-    ) {
+    if let Some((url, _key, _uid)) = jellyfin_env.as_ref() {
         ensure_category_header_vec(&mut sources, "jellyfin");
-        let src = SourceObject::source("Jellyfin (env)", "jellyfin", "network-server-symbolic");
+        let src = SourceObject::discovered("Jellyfin (env)", "jellyfin", url);
+        src.set_connecting(true);
         sources.push(src);
-        info!(url = %url, "Jellyfin server configured via env vars");
+        info!("Jellyfin server configured via env vars");
     }
 
-    if let (Ok(url), Ok(_token)) = (std::env::var("PLEX_URL"), std::env::var("PLEX_TOKEN")) {
+    if let Some((url, _token)) = plex_env.as_ref() {
         ensure_category_header_vec(&mut sources, "plex");
-        let src = SourceObject::source("Plex (env)", "plex", "network-server-symbolic");
+        let src = SourceObject::discovered("Plex (env)", "plex", url);
+        src.set_connecting(true);
         sources.push(src);
-        info!(url = %url, "Plex server configured via env vars");
+        info!("Plex server configured via env vars");
     }
 
-    if let Ok(url) = std::env::var("DAAP_URL") {
+    if let Some((url, _password)) = daap_env.as_ref() {
         ensure_category_header_vec(&mut sources, "daap");
         // Keep the configured URL as the source identity so the retained
         // session, generation-scoped sync event, sidebar row, and disconnect action all
         // address the same owner.
-        let src = SourceObject::discovered("DAAP (env)", "daap", &url);
+        let src = SourceObject::discovered("DAAP (env)", "daap", url);
+        src.set_connecting(true);
         sources.push(src);
-        info!(url = %url, "DAAP server configured via env vars");
+        info!("DAAP server configured via env vars");
     }
 
     // ── Header Bar with all interactive widgets ──────────────────────
@@ -220,6 +263,30 @@ pub fn build_window(
     let playback_session = Rc::new(RefCell::new(PlaybackSession::default()));
     let seeking = Rc::new(Cell::new(false));
     let buffering_tracker = Rc::new(BufferingTracker::default());
+
+    // Source discovery and deletion are wired before the audio output exists.
+    // Keep indirection slots so those handlers can still retire playback
+    // deterministically once the output/UI are installed later in this build.
+    let active_output_slot: Rc<RefCell<Option<SharedAudioOutput>>> = Rc::new(RefCell::new(None));
+    let playback_ui_reset_slot: Rc<RefCell<Option<PlaybackUiReset>>> = Rc::new(RefCell::new(None));
+    let invalidate_source_playback: SourcePlaybackInvalidator = {
+        let playback_session = playback_session.clone();
+        let active_output_slot = active_output_slot.clone();
+        let playback_ui_reset_slot = playback_ui_reset_slot.clone();
+        Rc::new(move |source_key| {
+            if !playback_session.borrow_mut().clear_if_source(source_key) {
+                return;
+            }
+
+            if let Some(active_output) = active_output_slot.borrow().as_ref().cloned() {
+                active_output.borrow().stop();
+            }
+            if let Some(clear_ui) = playback_ui_reset_slot.borrow().as_ref().cloned() {
+                clear_ui();
+            }
+            info!("Stopped playback owned by a retired source");
+        })
+    };
 
     // ── Connection guard ─────────────────────────────────────────────
     // Tracks which server URL is currently being connected to, and the
@@ -361,10 +428,10 @@ pub fn build_window(
         window.maximize();
     }
 
-    // Save window geometry and explicitly close every retained DAAP session.
-    // Gate new connections synchronously, then let Tokio perform network I/O
-    // while GTK remains responsive. Once shutdown completes, close() re-enters
-    // this handler with `shutdown_complete` set and is allowed to proceed.
+    // Save geometry, revoke standard remote leases, and explicitly close every
+    // retained DAAP session. Gate new connections synchronously, then let Tokio
+    // perform DAAP network I/O while GTK remains responsive. Once shutdown
+    // completes, close() re-enters this handler and is allowed to proceed.
     let shutdown_handle = rt_handle.clone();
     let shutdown_started = Rc::new(Cell::new(false));
     let shutdown_complete = Rc::new(Cell::new(false));
@@ -375,6 +442,7 @@ pub fn build_window(
         }
 
         if !shutdown_started.replace(true) {
+            crate::source_registry::begin_shutdown();
             crate::daap::begin_shutdown();
             let (done_tx, done_rx) = async_channel::bounded::<()>(1);
             shutdown_handle.spawn(async move {
@@ -432,27 +500,41 @@ pub fn build_window(
     });
 
     // ── Start Subsonic backend if configured via env vars ──────────
-    if let (Ok(url), Ok(user), Ok(pass)) = (
-        std::env::var("SUBSONIC_URL"),
-        std::env::var("SUBSONIC_USER"),
-        std::env::var("SUBSONIC_PASS"),
-    ) {
+    if let Some((url, user, pass)) = subsonic_env {
         let tx = engine_tx.clone();
         rt_handle.spawn(async move {
-            info!(server = %url, "Connecting to Subsonic server...");
+            info!("Connecting to Subsonic server...");
+            let Some(attempt) = crate::source_registry::begin_connect(url.clone()) else {
+                tracing::debug!("Skipping Subsonic connect during shutdown");
+                return;
+            };
             match crate::subsonic::SubsonicBackend::connect("Subsonic", &url, &user, &pass).await {
                 Ok(backend) => {
                     let tracks: Vec<crate::architecture::models::Track> =
                         backend.all_tracks().await;
+                    let Some(source) = attempt.retain(Arc::new(backend)) else {
+                        tracing::debug!("Subsonic connect was superseded");
+                        return;
+                    };
+                    if !source.is_current() {
+                        tracing::debug!("Subsonic sync was superseded");
+                        return;
+                    }
                     info!(count = tracks.len(), "Subsonic library fetched");
                     let _ = tx
                         .send(LibraryEvent::RemoteSync {
                             source_key: url.clone(),
+                            generation: source.generation(),
+                            lease_key: source.lease_key(),
                             tracks,
                         })
                         .await;
                 }
                 Err(e) => {
+                    if !attempt.is_latest() {
+                        tracing::debug!("Ignoring superseded Subsonic connection failure");
+                        return;
+                    }
                     tracing::error!(error = %e, "Subsonic connection failed");
                     let _ = tx.send(LibraryEvent::Error(format!("Subsonic: {e}"))).await;
                 }
@@ -461,29 +543,43 @@ pub fn build_window(
     }
 
     // ── Start Jellyfin backend if configured via env vars ──────────
-    if let (Ok(url), Ok(api_key), Ok(user_id)) = (
-        std::env::var("JELLYFIN_URL"),
-        std::env::var("JELLYFIN_API_KEY"),
-        std::env::var("JELLYFIN_USER_ID"),
-    ) {
+    if let Some((url, api_key, user_id)) = jellyfin_env {
         let tx = engine_tx.clone();
         rt_handle.spawn(async move {
-            info!(server = %url, "Connecting to Jellyfin server...");
+            info!("Connecting to Jellyfin server...");
+            let Some(attempt) = crate::source_registry::begin_connect(url.clone()) else {
+                tracing::debug!("Skipping Jellyfin connect during shutdown");
+                return;
+            };
             match crate::jellyfin::JellyfinBackend::connect("Jellyfin", &url, &api_key, &user_id)
                 .await
             {
                 Ok(backend) => {
                     let tracks: Vec<crate::architecture::models::Track> =
                         backend.all_tracks().await;
+                    let Some(source) = attempt.retain(Arc::new(backend)) else {
+                        tracing::debug!("Jellyfin connect was superseded");
+                        return;
+                    };
+                    if !source.is_current() {
+                        tracing::debug!("Jellyfin sync was superseded");
+                        return;
+                    }
                     info!(count = tracks.len(), "Jellyfin library fetched");
                     let _ = tx
                         .send(LibraryEvent::RemoteSync {
                             source_key: url.clone(),
+                            generation: source.generation(),
+                            lease_key: source.lease_key(),
                             tracks,
                         })
                         .await;
                 }
                 Err(e) => {
+                    if !attempt.is_latest() {
+                        tracing::debug!("Ignoring superseded Jellyfin connection failure");
+                        return;
+                    }
                     tracing::error!(error = %e, "Jellyfin connection failed");
                     let _ = tx.send(LibraryEvent::Error(format!("Jellyfin: {e}"))).await;
                 }
@@ -492,23 +588,41 @@ pub fn build_window(
     }
 
     // ── Start Plex backend if configured via env vars ──────────────
-    if let (Ok(url), Ok(token)) = (std::env::var("PLEX_URL"), std::env::var("PLEX_TOKEN")) {
+    if let Some((url, token)) = plex_env {
         let tx = engine_tx.clone();
         rt_handle.spawn(async move {
-            info!(server = %url, "Connecting to Plex server...");
+            info!("Connecting to Plex server...");
+            let Some(attempt) = crate::source_registry::begin_connect(url.clone()) else {
+                tracing::debug!("Skipping Plex connect during shutdown");
+                return;
+            };
             match crate::plex::PlexBackend::connect("Plex", &url, &token).await {
                 Ok(backend) => {
                     let tracks: Vec<crate::architecture::models::Track> =
                         backend.all_tracks().await;
+                    let Some(source) = attempt.retain(Arc::new(backend)) else {
+                        tracing::debug!("Plex connect was superseded");
+                        return;
+                    };
+                    if !source.is_current() {
+                        tracing::debug!("Plex sync was superseded");
+                        return;
+                    }
                     info!(count = tracks.len(), "Plex library fetched");
                     let _ = tx
                         .send(LibraryEvent::RemoteSync {
                             source_key: url.clone(),
+                            generation: source.generation(),
+                            lease_key: source.lease_key(),
                             tracks,
                         })
                         .await;
                 }
                 Err(e) => {
+                    if !attempt.is_latest() {
+                        tracing::debug!("Ignoring superseded Plex connection failure");
+                        return;
+                    }
                     tracing::error!(error = %e, "Plex connection failed");
                     let _ = tx.send(LibraryEvent::Error(format!("Plex: {e}"))).await;
                 }
@@ -517,24 +631,24 @@ pub fn build_window(
     }
 
     // ── Start DAAP backend if configured via env vars ──────────────
-    if let Ok(url) = std::env::var("DAAP_URL") {
-        let password = std::env::var("DAAP_PASSWORD").ok();
+    if let Some((url, password)) = daap_env {
         let tx = engine_tx.clone();
         rt_handle.spawn(async move {
-            info!(server = %url, "Connecting to DAAP server...");
+            info!("Connecting to DAAP server...");
             let Some(attempt) = crate::daap::begin_connect(url.clone()) else {
-                tracing::debug!(server = %url, "Skipping DAAP connect during shutdown");
+                tracing::debug!("Skipping DAAP connect during shutdown");
                 return;
             };
             match crate::daap::DaapBackend::connect("DAAP", &url, password.as_deref()).await {
                 Ok(backend) => {
                     let Some(session) = attempt.retain(backend).await else {
-                        tracing::debug!(server = %url, "DAAP connect was superseded");
+                        tracing::debug!("DAAP connect was superseded");
                         return;
                     };
-                    let tracks: Vec<crate::architecture::models::Track> = session.all_tracks().await;
+                    let tracks: Vec<crate::architecture::models::Track> =
+                        session.all_tracks().await;
                     if !session.is_current() {
-                        tracing::debug!(server = %url, "DAAP sync was superseded");
+                        tracing::debug!("DAAP sync was superseded");
                         return;
                     }
                     info!(count = tracks.len(), "DAAP library fetched");
@@ -549,7 +663,7 @@ pub fn build_window(
                 }
                 Err(e) => {
                     if !attempt.is_latest() {
-                        tracing::debug!(server = %url, "Ignoring superseded DAAP connection failure");
+                        tracing::debug!("Ignoring superseded DAAP connection failure");
                         return;
                     }
                     tracing::error!(error = %e, "DAAP connection failed");
@@ -581,6 +695,7 @@ pub fn build_window(
             pre_connect_selection: pre_connect_selection.clone(),
         },
         &hb.output_list,
+        invalidate_source_playback.clone(),
     );
 
     // ── Wire "+" add-server button ──────────────────────────────────
@@ -625,10 +740,12 @@ pub fn build_window(
         let status_label = status_label.clone();
         let column_view = column_view.clone();
         let rt_handle = rt_handle.clone();
+        let invalidate_source_playback = invalidate_source_playback.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = delete_rx.recv().await {
-                info!(source = %source_key, "Manual server delete requested");
+                info!("Manual server delete requested");
+                invalidate_source_playback(&source_key);
 
                 // A connected DAAP source normally uses the eject action,
                 // but deletion must still transfer and close ownership if a
@@ -638,6 +755,7 @@ pub fn build_window(
                         backend.disconnect().await;
                     });
                 }
+                crate::source_registry::release_source(&source_key);
 
                 // Remove from servers.json.
                 remove_saved_server(&source_key);
@@ -692,10 +810,12 @@ pub fn build_window(
         let status_label = status_label.clone();
         let column_view = column_view.clone();
         let rt_handle = rt_handle.clone();
+        let invalidate_source_playback = invalidate_source_playback.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = disconnect_rx.recv().await {
-                info!(source = %source_key, "DAAP disconnect requested");
+                info!("DAAP disconnect requested");
+                invalidate_source_playback(&source_key);
 
                 // Transfer ownership out of the live-session registry before
                 // updating the UI. This makes a subsequent fast reconnect
@@ -705,7 +825,7 @@ pub fn build_window(
                         backend.disconnect().await;
                     });
                 } else {
-                    tracing::warn!(source = %source_key, "DAAP source had no retained session");
+                    tracing::warn!("DAAP source had no retained session");
                 }
 
                 // 1. Remove from source_tracks map.
@@ -808,6 +928,7 @@ pub fn build_window(
                 pending_connection_for_events.clone(),
                 playback_session.clone(),
                 root_trust_prompts.clone(),
+                invalidate_source_playback.clone(),
             );
             return;
         }
@@ -819,8 +940,8 @@ pub fn build_window(
 
     // Wrap the raw Player in LocalOutput → Box<dyn AudioOutput>.
     let local_output = LocalOutput::new(player);
-    let active_output: Rc<RefCell<Box<dyn AudioOutput>>> =
-        Rc::new(RefCell::new(Box::new(local_output)));
+    let active_output: SharedAudioOutput = Rc::new(RefCell::new(Box::new(local_output)));
+    *active_output_slot.borrow_mut() = Some(active_output.clone());
     let active_output_target = Rc::new(RefCell::new(super::output_switch::OutputTarget::Local));
 
     // Parking slot for the local output when an MPD output is active.
@@ -893,7 +1014,7 @@ pub fn build_window(
     // Every terminal/reset path uses this one operation. Besides resetting the
     // visible controls it invalidates delayed spinner callbacks and both local
     // and remote artwork workers before installing the idle placeholder.
-    let clear_playback_ui: Rc<dyn Fn()> = {
+    let clear_playback_ui: PlaybackUiReset = {
         let play_button = hb.play_button.clone();
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
@@ -925,6 +1046,7 @@ pub fn build_window(
             }
         })
     };
+    *playback_ui_reset_slot.borrow_mut() = Some(clear_playback_ui.clone());
 
     match crate::desktop_integration::MediaController::new(hwnd) {
         Ok((ctrl, media_rx)) => {
@@ -966,7 +1088,19 @@ pub fn build_window(
                             }
                         }
                         MediaAction::Pause => {
-                            if playback_session.borrow().has_current() {
+                            if playback_session
+                                .borrow_mut()
+                                .cancel_pending_resolution_for_retry()
+                            {
+                                // No media has reached the output yet. Stop is
+                                // cleanup only; the cancelled resolver cannot
+                                // claim the session, and the next Play resolves
+                                // the protected reference again.
+                                active_output.borrow().stop();
+                                if let Some(ref mut ctrl) = *ctrl_for_ctx.borrow_mut() {
+                                    ctrl.update_playback(false);
+                                }
+                            } else if playback_session.borrow().has_current() {
                                 active_output.borrow().pause();
                                 if let Some(ref mut ctrl) = *ctrl_for_ctx.borrow_mut() {
                                     ctrl.update_playback(false);
@@ -1460,6 +1594,17 @@ pub fn build_window(
 
                     PlayerEvent::Error { message, .. } => {
                         tracing::error!(error = %message, "Player error");
+                        // A protected resolver has already handed its request
+                        // to the output at this point. If that load fails, keep
+                        // the queue item but force the next Play through a new
+                        // resolution instead of calling `play()` on an output
+                        // that may never have accepted media.
+                        if playback_session
+                            .borrow_mut()
+                            .mark_protected_load_failed(event_generation)
+                        {
+                            active_output.borrow().stop();
+                        }
                         // On error, restore the play icon (stop the spinner
                         // if we were buffering).
                         buffering_tracker.invalidate();
@@ -1643,6 +1788,7 @@ pub fn build_window(
         pending_connection_for_events,
         playback_session,
         root_trust_prompts,
+        invalidate_source_playback,
     );
 }
 
@@ -1753,6 +1899,7 @@ fn setup_library_events(
     pending_connection: Rc<RefCell<Option<String>>>,
     playback_session: Rc<RefCell<PlaybackSession>>,
     root_trust_prompts: root_trust::RootTrustPromptController,
+    invalidate_source_playback: SourcePlaybackInvalidator,
 ) {
     let browser_widget = browser_widget.clone();
     let column_view = column_view.clone();
@@ -1766,30 +1913,43 @@ fn setup_library_events(
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(event) = engine_rx.recv().await {
-            // A DAAP connection can be replaced while its track snapshot is
-            // queued for GTK. Validate the generation at the publication
-            // boundary so an older session can never repopulate the source
-            // with references that its replacement already invalidated.
-            let event = match event {
+            // A remote connection can be replaced while its track snapshot is
+            // queued for GTK. Validate exact ownership at the publication
+            // boundary so an older session cannot repopulate the source.
+            match &event {
+                LibraryEvent::RemoteSync {
+                    source_key,
+                    generation,
+                    lease_key,
+                    ..
+                } if !crate::source_registry::is_current_source(
+                    source_key,
+                    *generation,
+                    *lease_key,
+                ) =>
+                {
+                    tracing::debug!(
+                        generation,
+                        %lease_key,
+                        "Ignoring stale remote library sync"
+                    );
+                    continue;
+                }
                 LibraryEvent::DaapSync {
                     source_key,
                     generation,
                     session_key,
-                    tracks,
-                } => {
-                    if !crate::daap::is_current_session(&source_key, generation, session_key) {
-                        tracing::debug!(
-                            source = %source_key,
-                            generation,
-                            %session_key,
-                            "Ignoring stale DAAP library sync"
-                        );
-                        continue;
-                    }
-                    LibraryEvent::RemoteSync { source_key, tracks }
+                    ..
+                } if !crate::daap::is_current_session(source_key, *generation, *session_key) => {
+                    tracing::debug!(
+                        generation,
+                        %session_key,
+                        "Ignoring stale DAAP library sync"
+                    );
+                    continue;
                 }
-                event => event,
-            };
+                _ => {}
+            }
 
             match event {
                 LibraryEvent::FullSync(tracks) => {
@@ -1825,63 +1985,52 @@ fn setup_library_events(
                     }
                 }
 
-                LibraryEvent::RemoteSync { source_key, tracks } => {
-                    info!(
-                        source = %source_key,
-                        count = tracks.len(),
-                        "Received remote library sync"
+                LibraryEvent::RemoteSync {
+                    source_key,
+                    generation: _,
+                    lease_key,
+                    tracks,
+                } => {
+                    let replaces_current_queue = {
+                        let session = playback_session.borrow();
+                        session.current_identity().is_some_and(|identity| {
+                            identity.source_id.as_str() == source_key.as_str()
+                                && session.current().is_some_and(|item| {
+                                    !crate::source_registry::stream_reference_uses_lease(
+                                        item.uri(),
+                                        lease_key,
+                                    )
+                                })
+                        })
+                    };
+                    if replaces_current_queue {
+                        // Retargeting old queue IDs could cross into a new
+                        // login or library on the same URL. Stop it instead;
+                        // the newly published rows carry the replacement lease.
+                        invalidate_source_playback(&source_key);
+                    }
+
+                    info!(count = tracks.len(), "Received remote library sync");
+
+                    let objects: Vec<TrackObject> = tracks
+                        .iter()
+                        .map(|track| arch_remote_track_to_object(track, lease_key))
+                        .collect();
+                    publish_remote_library(
+                        source_key,
+                        objects,
+                        &source_tracks,
+                        &sidebar_store,
+                        &pending_connection,
+                        &sidebar_selection,
+                        &active_source_key,
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
                     );
-
-                    let objects: Vec<TrackObject> =
-                        tracks.iter().map(arch_track_to_object).collect();
-
-                    // Store per-source.
-                    source_tracks
-                        .borrow_mut()
-                        .insert(source_key.clone(), objects.clone());
-
-                    // Update the sidebar item: mark connected, force rebind.
-                    let mut auto_selected = false;
-                    for i in 0..sidebar_store.n_items() {
-                        if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>()
-                        {
-                            if src.server_url() == source_key && !src.connected() {
-                                src.set_connected(true);
-                                src.set_connecting(false);
-                                // Remove + re-insert to force ListView rebind.
-                                let src = src.clone();
-                                sidebar_store.remove(i);
-                                sidebar_store.insert(i, &src);
-                                // Clear the pending connection guard BEFORE
-                                // auto-selecting so the selection_changed handler
-                                // isn't blocked by the guard (it checks
-                                // pending_connection and early-returns if set).
-                                *pending_connection.borrow_mut() = None;
-                                // Auto-select this source.
-                                sidebar_selection.set_selected(i);
-                                auto_selected = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    // Display if this source is now active. Skip when the
-                    // auto-select above already fired the selection_changed
-                    // handler, which renders the same tracklist/browser —
-                    // this avoids a redundant double render on connect.
-                    // (The explicit call still handles re-syncing a source
-                    // that is already connected and active.)
-                    if !auto_selected && *active_source_key.borrow() == source_key {
-                        display_tracks(
-                            &objects,
-                            &track_store,
-                            &master_tracks,
-                            &browser_widget,
-                            &browser_state,
-                            &status_label,
-                            &column_view,
-                        );
-                    }
                 }
 
                 LibraryEvent::TrackUpserted(track) => {
@@ -2100,12 +2249,87 @@ fn setup_library_events(
                     scan_spinner.set_visible(false);
                 }
 
-                LibraryEvent::DaapSync { .. } => {
-                    unreachable!("DAAP syncs are normalized before event dispatch")
+                LibraryEvent::DaapSync {
+                    source_key, tracks, ..
+                } => {
+                    // DAAP publishes one snapshot per retained session. A new
+                    // snapshot for the same source therefore replaces the
+                    // session embedded in any captured `daap://` queue refs.
+                    invalidate_source_playback(&source_key);
+                    info!(count = tracks.len(), "Received DAAP library sync");
+                    let objects: Vec<TrackObject> =
+                        tracks.iter().map(arch_track_to_object).collect();
+                    publish_remote_library(
+                        source_key,
+                        objects,
+                        &source_tracks,
+                        &sidebar_store,
+                        &pending_connection,
+                        &sidebar_selection,
+                        &active_source_key,
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
                 }
             }
         }
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_remote_library(
+    source_key: String,
+    objects: Vec<TrackObject>,
+    source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    sidebar_store: &gtk::gio::ListStore,
+    pending_connection: &Rc<RefCell<Option<String>>>,
+    sidebar_selection: &gtk::SingleSelection,
+    active_source_key: &Rc<RefCell<String>>,
+    track_store: &gtk::gio::ListStore,
+    master_tracks: &Rc<RefCell<Vec<TrackObject>>>,
+    browser_widget: &gtk::Box,
+    browser_state: &browser::BrowserState,
+    status_label: &gtk::Label,
+    column_view: &gtk::ColumnView,
+) {
+    source_tracks
+        .borrow_mut()
+        .insert(source_key.clone(), objects.clone());
+
+    let mut auto_selected = false;
+    for i in 0..sidebar_store.n_items() {
+        if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
+            if src.server_url() == source_key && !src.connected() {
+                src.set_connected(true);
+                src.set_connecting(false);
+                let src = src.clone();
+                sidebar_store.remove(i);
+                sidebar_store.insert(i, &src);
+                // Clear the guard before selecting: the selection handler
+                // otherwise treats this completed connection as still pending.
+                *pending_connection.borrow_mut() = None;
+                sidebar_selection.set_selected(i);
+                auto_selected = true;
+                break;
+            }
+        }
+    }
+
+    if !auto_selected && *active_source_key.borrow() == source_key {
+        display_tracks(
+            &objects,
+            track_store,
+            master_tracks,
+            browser_widget,
+            browser_state,
+            status_label,
+            column_view,
+        );
+    }
 }
 
 /// Convert an architecture `Track` to a UI `TrackObject`.
@@ -2122,6 +2346,24 @@ pub fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObje
         })
         .unwrap_or_default();
 
+    track_to_object(t, &uri, t.cover_art_url.as_ref().map(url::Url::as_str))
+}
+
+/// Convert a standard remote track using only opaque registry references.
+fn arch_remote_track_to_object(
+    track: &crate::architecture::models::Track,
+    lease_key: uuid::Uuid,
+) -> TrackObject {
+    let stream_reference = crate::source_registry::stream_reference(lease_key, track.id);
+    let artwork_reference = crate::source_registry::artwork_reference(lease_key, track.id);
+    track_to_object(track, &stream_reference, Some(&artwork_reference))
+}
+
+fn track_to_object(
+    t: &crate::architecture::models::Track,
+    uri: &str,
+    artwork_reference: Option<&str>,
+) -> TrackObject {
     let obj = TrackObject::new(
         t.track_number.unwrap_or(0),
         &t.title,
@@ -2137,14 +2379,13 @@ pub fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObje
         t.sample_rate_hz.unwrap_or(0),
         t.play_count.unwrap_or(0),
         t.format.as_deref().unwrap_or(""),
-        &uri,
+        uri,
     );
 
     obj.set_track_id(&t.id.to_string());
 
-    // Propagate cover art URL for remote tracks.
-    if let Some(ref art_url) = t.cover_art_url {
-        obj.set_cover_art_url(art_url.as_str());
+    if let Some(artwork_reference) = artwork_reference {
+        obj.set_cover_art_url(artwork_reference);
     }
 
     // Propagate album artist for browser grouping.

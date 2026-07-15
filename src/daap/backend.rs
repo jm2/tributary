@@ -336,6 +336,26 @@ impl DaapBackend {
         Ok(self.client.cover_art_url(song_id))
     }
 
+    /// Resolve a cached application track ID for DAAP lifecycle tests.
+    ///
+    /// Production playback resolves the opaque `daap://` reference through
+    /// the retained session registry instead of exposing this direct URL.
+    #[cfg(test)]
+    pub(super) async fn stream_url_for_track(&self, track_id: &Uuid) -> BackendResult<Url> {
+        let cache = self.cache.read().await;
+        let song_id =
+            cache
+                .track_to_daap_id
+                .get(track_id)
+                .ok_or_else(|| BackendError::NotFound {
+                    entity_type: "track".into(),
+                    id: *track_id,
+                })?;
+        let idx = cache.track_by_uuid[track_id];
+        let format = cache.tracks[idx].format.as_deref().unwrap_or("mp3");
+        self.stream_url_for_item(*song_id, format)
+    }
+
     fn ensure_connected(&self) -> BackendResult<()> {
         if self.disconnect.state.load(Ordering::Acquire) != SESSION_CONNECTED {
             return Err(BackendError::ConnectionFailed {
@@ -458,27 +478,6 @@ impl crate::architecture::MediaBackend for DaapBackend {
             .filter(|t| t.artist_id.as_ref() == Some(artist_id))
             .cloned()
             .collect())
-    }
-
-    async fn get_stream_url(&self, track_id: &Uuid) -> BackendResult<Url> {
-        let cache = self.cache.read().await;
-        let song_id =
-            cache
-                .track_to_daap_id
-                .get(track_id)
-                .ok_or_else(|| BackendError::NotFound {
-                    entity_type: "track".into(),
-                    id: *track_id,
-                })?;
-        let idx = cache.track_by_uuid[track_id];
-        let format = cache.tracks[idx].format.as_deref().unwrap_or("mp3");
-        self.stream_url_for_item(*song_id, format)
-    }
-
-    async fn get_cover_art(&self, _album_id: &Uuid) -> BackendResult<Option<Url>> {
-        // DAAP artwork is item-scoped rather than album-scoped. Track models
-        // carry an opaque item reference that playback resolves live.
-        Ok(None)
     }
 
     async fn get_stats(&self) -> BackendResult<LibraryStats> {

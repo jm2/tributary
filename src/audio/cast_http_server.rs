@@ -4,14 +4,12 @@
 //! cannot access `file:///` URIs — so local files are served through a minimal,
 //! LAN-only HTTP server keyed by random UUID.
 //!
-//! The same server also **proxies credential-bearing remote streams**. A
-//! Subsonic, Jellyfin, or Plex stream URL carries the user's token in its query
-//! string — and with Subsonic's plaintext auth mode, `p=enc:<hex>` is the
-//! user's actual *password*, which unlike a token cannot be revoked. Handing
-//! that URL to a Cast device would publish the credential to a device Tributary
-//! does not control, on a LAN it does not control. Instead the receiver is given
-//! an opaque ticket URL, and Tributary fetches the upstream itself, so the
-//! credential never leaves this process.
+//! The same server also **proxies authenticated remote streams**. Newly
+//! resolved Subsonic, Jellyfin, and Plex requests keep authentication separate
+//! from their clean endpoint; legacy DAAP URLs may still carry it in the query.
+//! Handing either form to a receiver would publish account access to a device
+//! Tributary does not control. Instead the receiver receives an opaque ticket,
+//! and Tributary performs the authenticated upstream fetch itself.
 //!
 //! # Security
 //!
@@ -56,6 +54,8 @@ use tracing::{debug, error, info};
 use url::Url;
 use uuid::Uuid;
 
+use crate::architecture::media::ResolvedHttpRequest;
+
 const OPAQUE_UPSTREAM_BODY_ERROR: &str = "upstream media body stream failed";
 
 /// Hard maximum lifetime of a receiver-facing credential ticket.
@@ -68,27 +68,57 @@ const UPSTREAM_TICKET_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// What a registered ticket resolves to.
 ///
-/// `Clone` but deliberately **not** `Debug`: an `Upstream` holds a
-/// credential-bearing URL, and the whole point of this type is that the URL
-/// never gets printed, logged, or handed to a receiver.
+/// `Clone` but deliberately **not** `Debug`: an `Upstream` retains protected
+/// request state that must never be printed, logged, or handed to a receiver.
 #[derive(Clone)]
 enum MediaSource {
     /// A local file, streamed from disk.
     Local(PathBuf),
     /// A remote stream that Tributary fetches on the receiver's behalf.
     Upstream {
-        url: Box<Url>,
+        request: UpstreamRequest,
         /// Absolute, monotonic deadline. The entry is live only while the
         /// current instant is strictly before this value.
         expires_at: Instant,
     },
 }
 
+/// The fixed request behind an upstream ticket.
+///
+/// Deliberately not `Debug`: both variants may retain credentials. The legacy
+/// variant exists for DAAP and for the URI-boundary defense in depth; newly
+/// resolved backend media uses the typed variant so its clean endpoint and
+/// authentication material cannot be separated or accidentally sent directly.
+#[derive(Clone)]
+enum UpstreamRequest {
+    Legacy(Box<Url>),
+    Resolved(Box<ResolvedHttpRequest>),
+}
+
+impl UpstreamRequest {
+    fn endpoint(&self) -> &Url {
+        match self {
+            Self::Legacy(url) => url,
+            Self::Resolved(request) => request.endpoint(),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        match self {
+            Self::Legacy(_) => true,
+            Self::Resolved(request) => request.is_active(),
+        }
+    }
+}
+
 impl MediaSource {
     fn is_expired_at(&self, now: Instant) -> bool {
         matches!(
             self,
-            Self::Upstream { expires_at, .. } if now >= *expires_at
+            Self::Upstream {
+                request,
+                expires_at,
+            } if now >= *expires_at || !request.is_active()
         )
     }
 }
@@ -102,7 +132,7 @@ impl MediaSource {
 fn replace_upstream_at(
     media: &DashMap<String, MediaSource>,
     ticket: String,
-    url: &Url,
+    request: UpstreamRequest,
     registered_at: Instant,
     ttl: Duration,
 ) {
@@ -111,7 +141,7 @@ fn replace_upstream_at(
     media.insert(
         ticket,
         MediaSource::Upstream {
-            url: Box::new(url.clone()),
+            request,
             expires_at,
         },
     );
@@ -303,6 +333,30 @@ impl CastHttpServer {
     /// seek, and a restartable remote Stop retain the route only until it
     /// expires. Explicit revocation may end it sooner.
     pub fn register_upstream(&self, url: &Url) -> String {
+        self.register_upstream_request(UpstreamRequest::Legacy(Box::new(url.clone())))
+    }
+
+    /// Register a resolved backend request and return an opaque receiver URL.
+    ///
+    /// Typed requests are never eligible for direct playback: the clean
+    /// endpoint, sensitive headers, and private query material remain joined
+    /// behind this app-owned route. An already-retired source lease is
+    /// rejected before a ticket is issued; retirement after registration is
+    /// enforced again on every lookup.
+    pub(crate) fn register_resolved(&self, request: ResolvedHttpRequest) -> Option<String> {
+        if !request.is_active() {
+            return None;
+        }
+        let lease_probe = request.clone();
+        let ticket = self.register_upstream_request(UpstreamRequest::Resolved(Box::new(request)));
+        if !lease_probe.is_active() {
+            self.revoke_upstreams();
+            return None;
+        }
+        Some(ticket)
+    }
+
+    fn register_upstream_request(&self, request: UpstreamRequest) -> String {
         // Carry the upstream's media extension onto the ticket. The Cast
         // `content_type` is guessed from the URL it is handed, so an
         // extensionless ticket would advertise a proxied FLAC or Opus stream as
@@ -311,7 +365,7 @@ impl CastHttpServer {
         // Only a known audio extension is copied: the ticket path must stay
         // opaque, and nothing from the upstream URL beyond this fixed set is
         // allowed to shape it.
-        let ticket = match upstream_media_extension(url) {
+        let ticket = match upstream_media_extension(request.endpoint()) {
             Some(extension) => format!("{}.{extension}", Uuid::new_v4()),
             None => Uuid::new_v4().to_string(),
         };
@@ -319,7 +373,7 @@ impl CastHttpServer {
         replace_upstream_at(
             &self.media,
             ticket.clone(),
-            url,
+            request,
             Instant::now(),
             UPSTREAM_TICKET_TTL,
         );
@@ -390,19 +444,45 @@ async fn serve_media(
 
     match source {
         MediaSource::Local(path) => serve_local_file(&path, &headers).await,
-        MediaSource::Upstream { url, .. } => proxy_upstream(&state.upstream, &url, &headers).await,
+        MediaSource::Upstream { request, .. } => {
+            proxy_upstream(&state.upstream, &request, &headers).await
+        }
     }
 }
 
-/// Fetch a credential-bearing stream and relay it to the receiver.
+/// Fetch an authenticated stream and relay it to the receiver.
 ///
 /// The upstream URL is fixed at registration, so this cannot be driven to fetch
 /// an arbitrary target. Only `Range` is forwarded — none of the receiver's other
 /// headers reach the user's music server. Errors never carry the URL, because a
 /// `reqwest` error would otherwise print the credential straight into the log.
-async fn proxy_upstream(client: &reqwest::Client, url: &Url, headers: &HeaderMap) -> Response {
-    let mut request = client.get(url.clone());
-    if let Some(range) = headers.get(header::RANGE) {
+async fn proxy_upstream(
+    client: &reqwest::Client,
+    upstream_request: &UpstreamRequest,
+    receiver_headers: &HeaderMap,
+) -> Response {
+    if !upstream_request.is_active() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // Private query material exists in a temporary request URL only for the
+    // duration of this fetch. It is absent from the registry key, ticket URL,
+    // logs, and every receiver-facing value.
+    let mut upstream_url = upstream_request.endpoint().clone();
+    if let UpstreamRequest::Resolved(resolved) = upstream_request {
+        let mut query = upstream_url.query_pairs_mut();
+        for (name, value) in resolved.private_query_pairs() {
+            query.append_pair(name, value);
+        }
+    }
+
+    let mut request = client.get(upstream_url);
+    if let UpstreamRequest::Resolved(resolved) = upstream_request {
+        for (name, value) in resolved.sensitive_headers() {
+            request = request.header(name, value);
+        }
+    }
+    if let Some(range) = receiver_headers.get(header::RANGE) {
         request = request.header(header::RANGE, range.clone());
     }
 
@@ -601,7 +681,12 @@ fn parse_range_header(header: &str, file_size: u64) -> Option<(u64, u64)> {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV6};
 
+    use axum::extract::OriginalUri;
+    use axum::http::Uri;
     use futures::StreamExt;
+    use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, COOKIE, REFERER};
+
+    use crate::architecture::media::MediaLease;
 
     use super::*;
 
@@ -655,6 +740,10 @@ mod tests {
         Url::parse(value).expect("test URL")
     }
 
+    fn legacy(value: &str) -> UpstreamRequest {
+        UpstreamRequest::Legacy(Box::new(url(value)))
+    }
+
     /// The Cast `content_type` is guessed from the URL the device is handed, so
     /// an extensionless ticket advertises a proxied FLAC as `audio/mpeg` and the
     /// receiver misplays or refuses it.
@@ -705,7 +794,7 @@ mod tests {
         replace_upstream_at(
             &media,
             "ticket".to_string(),
-            &url("https://music.test/stream?api_key=secret"),
+            legacy("https://music.test/stream?api_key=secret"),
             registered_at,
             ttl,
         );
@@ -735,7 +824,7 @@ mod tests {
         replace_upstream_at(
             &media,
             "ticket".to_string(),
-            &url("https://music.test/stream?X-Plex-Token=secret"),
+            legacy("https://music.test/stream?X-Plex-Token=secret"),
             registered_at,
             ttl,
         );
@@ -771,7 +860,7 @@ mod tests {
         replace_upstream_at(
             &media,
             "first".to_string(),
-            &url("https://music.test/first?api_key=secret"),
+            legacy("https://music.test/first?api_key=secret"),
             first_registered,
             ttl,
         );
@@ -781,7 +870,7 @@ mod tests {
         replace_upstream_at(
             &media,
             "old".to_string(),
-            &url("https://music.test/old?api_key=secret"),
+            legacy("https://music.test/old?api_key=secret"),
             first_registered,
             ttl,
         );
@@ -791,7 +880,7 @@ mod tests {
         replace_upstream_at(
             &media,
             "new".to_string(),
-            &url("https://music.test/new?api_key=secret"),
+            legacy("https://music.test/new?api_key=secret"),
             replacement_registered,
             ttl,
         );
@@ -819,13 +908,21 @@ mod tests {
         let ttl = Duration::from_secs(10);
         let deadline = registered_at.checked_add(ttl).expect("test deadline");
         let upstream = url("https://music.test/stream?api_key=admitted-secret");
-        replace_upstream_at(&media, "ticket".to_string(), &upstream, registered_at, ttl);
+        replace_upstream_at(
+            &media,
+            "ticket".to_string(),
+            UpstreamRequest::Legacy(Box::new(upstream.clone())),
+            registered_at,
+            ttl,
+        );
 
         let admitted = resolve_media_with_clock(&media, "ticket", || registered_at)
             .expect("request admitted before expiry");
         assert!(resolve_media_with_clock(&media, "ticket", || deadline).is_none());
         match admitted {
-            MediaSource::Upstream { url, .. } => assert_eq!(*url, upstream),
+            MediaSource::Upstream { request, .. } => {
+                assert_eq!(request.endpoint(), &upstream);
+            }
             MediaSource::Local(_) => panic!("expected admitted upstream source"),
         }
     }
@@ -843,7 +940,7 @@ mod tests {
         replace_upstream_at(
             &media,
             "expired".to_string(),
-            &url("https://music.test/expired?api_key=secret"),
+            legacy("https://music.test/expired?api_key=secret"),
             Instant::now(),
             Duration::ZERO,
         );
@@ -859,7 +956,7 @@ mod tests {
         replace_upstream_at(
             &media,
             "revoked".to_string(),
-            &url("https://music.test/revoked?api_key=secret"),
+            legacy("https://music.test/revoked?api_key=secret"),
             Instant::now(),
             UPSTREAM_TICKET_TTL,
         );
@@ -950,6 +1047,148 @@ mod tests {
                 .expect("a non-portable IPv6 address must be rejected");
             assert!(error.to_string().contains("portable receiver URL"));
         }
+    }
+
+    async fn capture_request(
+        State(tx): State<tokio::sync::mpsc::UnboundedSender<(Uri, HeaderMap)>>,
+        OriginalUri(uri): OriginalUri,
+        headers: HeaderMap,
+    ) -> Response {
+        let _ = tx.send((uri, headers));
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "audio/mpeg")
+            .body(Body::from("media"))
+            .expect("capture response")
+    }
+
+    async fn start_capture_server() -> (
+        SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<(Uri, HeaderMap)>,
+        tokio::task::AbortHandle,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/stream", get(capture_request))
+            .with_state(tx);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("capture listener");
+        let addr = listener.local_addr().expect("capture address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("capture server");
+        });
+        (addr, rx, task.abort_handle())
+    }
+
+    #[tokio::test]
+    async fn resolved_proxy_materializes_auth_only_for_the_exact_upstream_fetch() {
+        const PRIVATE_USER: &str = "proxy-user-value";
+        const PRIVATE_PASSWORD: &str = "proxy-password-value";
+        const EXPECTED_AUTH: &str = "Bearer request-owned-value";
+
+        let (upstream_addr, mut captures, upstream_abort) = start_capture_server().await;
+        let endpoint =
+            Url::parse(&format!("http://{upstream_addr}/stream?track=42")).expect("clean endpoint");
+        let request = ResolvedHttpRequest::new(endpoint)
+            .expect("resolved request")
+            .with_sensitive_header(AUTHORIZATION, HeaderValue::from_static(EXPECTED_AUTH))
+            .expect("allowlisted header")
+            .with_private_query_pair("u", PRIVATE_USER)
+            .expect("private user")
+            .with_private_query_pair("p", PRIVATE_PASSWORD)
+            .expect("private password");
+
+        let server = CastHttpServer::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("proxy server");
+        let ticket = server
+            .register_resolved(request)
+            .expect("active request gets a ticket");
+        assert!(!ticket.contains(PRIVATE_USER));
+        assert!(!ticket.contains(PRIVATE_PASSWORD));
+        assert!(!ticket.contains("request-owned-value"));
+        assert!(!ticket.contains("track=42"));
+
+        let response = reqwest::Client::new()
+            .get(&ticket)
+            .header(header::RANGE, "bytes=7-11")
+            .header(COOKIE, "receiver-cookie-value")
+            .header(REFERER, "https://receiver.invalid/")
+            .header(AUTHORIZATION, "Bearer receiver-owned-value")
+            .header("x-plex-token", "receiver-token-value")
+            .header("x-receiver-custom", "receiver-custom-value")
+            .send()
+            .await
+            .expect("ticket fetch");
+        assert!(response.status().is_success());
+
+        let (captured_uri, captured_headers) =
+            tokio::time::timeout(Duration::from_secs(2), captures.recv())
+                .await
+                .expect("capture timeout")
+                .expect("captured request");
+        let query: Vec<_> = captured_uri
+            .query()
+            .unwrap_or_default()
+            .split('&')
+            .collect();
+        assert!(
+            query.contains(&"track=42"),
+            "public endpoint query is preserved"
+        );
+        let expected_user = format!("u={PRIVATE_USER}");
+        let expected_password = format!("p={PRIVATE_PASSWORD}");
+        assert!(
+            query.contains(&expected_user.as_str()),
+            "private user pair is applied upstream"
+        );
+        assert!(
+            query.contains(&expected_password.as_str()),
+            "private password pair is applied upstream"
+        );
+        assert!(
+            captured_headers.get(AUTHORIZATION) == Some(&HeaderValue::from_static(EXPECTED_AUTH)),
+            "request-owned authorization is applied upstream"
+        );
+        assert!(
+            captured_headers.get(header::RANGE) == Some(&HeaderValue::from_static("bytes=7-11")),
+            "receiver Range is forwarded"
+        );
+        for absent in [
+            COOKIE,
+            REFERER,
+            HeaderName::from_static("x-plex-token"),
+            HeaderName::from_static("x-receiver-custom"),
+        ] {
+            assert!(
+                captured_headers.get(absent).is_none(),
+                "receiver-controlled headers are not forwarded"
+            );
+        }
+
+        upstream_abort.abort();
+    }
+
+    #[tokio::test]
+    async fn retired_resolved_requests_are_rejected_and_existing_tickets_become_not_found() {
+        let server = CastHttpServer::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("proxy server");
+        let lease = MediaLease::new();
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/stream.flac").expect("clean endpoint"),
+        )
+        .expect("resolved request")
+        .with_lease(lease.clone());
+        let ticket = server
+            .register_resolved(request.clone())
+            .expect("active request gets a ticket");
+
+        lease.revoke();
+        assert!(server.register_resolved(request).is_none());
+        let response = reqwest::get(ticket).await.expect("retired ticket fetch");
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -41,6 +41,7 @@ use gtk::glib;
 use tracing::{debug, error, info, warn};
 
 use self::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket};
+use crate::architecture::media::ResolvedHttpRequest;
 
 // ── Events ──────────────────────────────────────────────────────────────
 
@@ -250,6 +251,22 @@ impl Player {
     /// spinner while the pipeline transitions to `Playing`.
     pub fn load_uri(&self, uri: &str) {
         tracing::debug!("Loading track");
+        let generation = self.begin_load();
+        let prepared = self.media_proxy.prepare(uri);
+        self.finish_load(generation, prepared);
+    }
+
+    /// Load one backend-resolved authenticated request through an app-owned
+    /// loopback ticket. The typed request is never eligible for direct
+    /// GStreamer playback.
+    pub fn load_resolved(&self, request: ResolvedHttpRequest) {
+        tracing::debug!("Loading resolved track");
+        let generation = self.begin_load();
+        let prepared = self.media_proxy.prepare_resolved(request);
+        self.finish_load(generation, prepared);
+    }
+
+    fn begin_load(&self) -> PlayerEventGeneration {
         // Remove the previous generation's watch before driving that pipeline
         // to NULL. Flush the bus during teardown as well: otherwise a queued
         // EOS from the old URI could be consumed by the newly attached watch
@@ -260,9 +277,21 @@ impl Player {
             bus.set_flushing(true);
         }
         let _ = self.playbin.set_state(gst::State::Null);
+        // Retiring the pipeline state does not clear playbin's URI property.
+        // If preparation of the replacement media then fails, a later Play
+        // must not be able to restart the previous track under the new queue
+        // item's metadata.
+        self.playbin.set_property("uri", "");
 
-        let generation = self.event_generation.get();
-        let prepared = match self.media_proxy.prepare(uri) {
+        self.event_generation.get()
+    }
+
+    fn finish_load(
+        &self,
+        generation: PlayerEventGeneration,
+        prepared: Result<gstreamer_media::PreparedGstreamerMedia, &'static str>,
+    ) {
+        let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(failure) => {
                 error!(error = %failure, "Audio media preparation failed");

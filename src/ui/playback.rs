@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::glib;
 use tracing::warn;
 
 use crate::audio::output::AudioOutput;
@@ -195,6 +196,14 @@ pub struct PlaybackSession {
     current_index: Option<usize>,
     shuffle: Option<ShuffleState>,
     event_generation: PlayerEventGeneration,
+    /// A protected source reference is being resolved for this generation.
+    /// Play/toggle requests are accepted as no-ops until the exact request is
+    /// handed to the output, so they cannot revive a superseded track.
+    pending_resolution: Option<PlayerEventGeneration>,
+    /// The current protected reference failed before reaching an output. A
+    /// later Play/Toggle retries resolution instead of issuing `play()` to an
+    /// output that has no loaded media.
+    resolution_failed: bool,
 }
 
 impl PlaybackSession {
@@ -205,6 +214,8 @@ impl PlaybackSession {
         self.queue = queue;
         self.current_index = Some(start_index);
         self.shuffle = None;
+        self.pending_resolution = None;
+        self.resolution_failed = false;
         true
     }
 
@@ -213,6 +224,25 @@ impl PlaybackSession {
         self.current_index = None;
         self.shuffle = None;
         self.event_generation = self.event_generation.next();
+        self.pending_resolution = None;
+        self.resolution_failed = false;
+    }
+
+    /// Clear playback only when the current queue belongs to `source_id`.
+    ///
+    /// Remote source replacement and removal retire every opaque reference
+    /// captured by that queue. Keeping it would strand Next/Previous on a
+    /// revoked lease, while retargeting it could cross into a different login
+    /// or library that reused the same server-native track identifiers.
+    pub(crate) fn clear_if_source(&mut self, source_id: &str) -> bool {
+        if self
+            .current_identity()
+            .is_none_or(|identity| identity.source_id != source_id)
+        {
+            return false;
+        }
+        self.clear();
+        true
     }
 
     /// Stable local-library IDs currently retained by the queue.
@@ -297,7 +327,83 @@ impl PlaybackSession {
 
     fn begin_event_generation(&mut self) -> PlayerEventGeneration {
         self.event_generation = self.event_generation.next();
+        self.pending_resolution = None;
+        self.resolution_failed = false;
         self.event_generation
+    }
+
+    fn begin_pending_resolution(&mut self) -> PlayerEventGeneration {
+        let generation = self.begin_event_generation();
+        self.pending_resolution = Some(generation);
+        self.resolution_failed = false;
+        generation
+    }
+
+    /// Claim a completed resolution only while its queue item/generation still
+    /// owns playback. Stop, Next, output replacement, and a newer replay all
+    /// invalidate this proof before they can reach the output boundary.
+    fn finish_pending_resolution(&mut self, generation: PlayerEventGeneration) -> bool {
+        if self.pending_resolution != Some(generation) || !self.accepts_event_generation(generation)
+        {
+            return false;
+        }
+        self.pending_resolution = None;
+        self.resolution_failed = false;
+        true
+    }
+
+    fn fail_pending_resolution(&mut self, generation: PlayerEventGeneration) -> bool {
+        if self.pending_resolution != Some(generation) || !self.accepts_event_generation(generation)
+        {
+            return false;
+        }
+        self.pending_resolution = None;
+        self.resolution_failed = true;
+        true
+    }
+
+    /// Cancel the current protected resolution while keeping its queue item
+    /// available for a later Play retry.
+    ///
+    /// No media has reached the output yet, so pausing the output cannot
+    /// preserve the user's intent. Clearing the exact pending claim makes its
+    /// async completion a no-op; `resolution_failed` routes the next Play
+    /// through a fresh playback-time resolution instead of calling `play()` on
+    /// an empty output.
+    pub(crate) fn cancel_pending_resolution_for_retry(&mut self) -> bool {
+        if !self.is_resolution_pending() {
+            return false;
+        }
+        self.pending_resolution = None;
+        self.resolution_failed = true;
+        true
+    }
+
+    /// Turn a protected output failure into a fresh-resolution retry state.
+    ///
+    /// Resolution has already finished by the time `load_resolved` reaches an
+    /// output, so proxy startup, daemon, or receiver failures arrive through
+    /// `PlayerEvent::Error`. Without this transition, a later Play would call
+    /// `play()` on an output that never accepted media. Advancing the event
+    /// generation also rejects any delayed state emitted by the failed load.
+    pub(crate) fn mark_protected_load_failed(&mut self, generation: PlayerEventGeneration) -> bool {
+        if self.pending_resolution.is_some()
+            || !self.accepts_event_generation(generation)
+            || !self.current().is_some_and(|item| {
+                crate::source_registry::is_media_reference(item.uri())
+                    || item.uri().starts_with("daap:")
+            })
+        {
+            return false;
+        }
+
+        self.event_generation = self.event_generation.next();
+        self.resolution_failed = true;
+        true
+    }
+
+    fn is_resolution_pending(&self) -> bool {
+        self.pending_resolution == Some(self.event_generation) && self.has_current()
     }
 
     pub fn accepts_event_generation(&self, generation: PlayerEventGeneration) -> bool {
@@ -332,6 +438,8 @@ impl PlaybackSession {
                 return None;
             };
             self.current_index = Some(selected);
+            self.pending_resolution = None;
+            self.resolution_failed = false;
             return Some(selected);
         }
 
@@ -351,6 +459,8 @@ impl PlaybackSession {
 
             // A one-item queue repeats itself under repeat-all.
             if state.remaining.is_empty() {
+                self.pending_resolution = None;
+                self.resolution_failed = false;
                 return Some(current);
             }
         }
@@ -358,6 +468,8 @@ impl PlaybackSession {
         let selected = state.remaining.pop()?;
         state.history.push(selected);
         self.current_index = Some(selected);
+        self.pending_resolution = None;
+        self.resolution_failed = false;
         Some(selected)
     }
 
@@ -374,6 +486,8 @@ impl PlaybackSession {
                 return None;
             };
             self.current_index = Some(selected);
+            self.pending_resolution = None;
+            self.resolution_failed = false;
             return Some(selected);
         }
 
@@ -387,6 +501,8 @@ impl PlaybackSession {
             }
             let selected = *state.history.last()?;
             self.current_index = Some(selected);
+            self.pending_resolution = None;
+            self.resolution_failed = false;
             return Some(selected);
         }
 
@@ -402,6 +518,8 @@ impl PlaybackSession {
         state.history = vec![selected];
         state.remaining = candidates;
         self.current_index = Some(selected);
+        self.pending_resolution = None;
+        self.resolution_failed = false;
         Some(selected)
     }
 }
@@ -534,6 +652,12 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
 /// Resume the session's current item, or create a new queue from the visible
 /// model when playback is idle (including after an OS Stop action).
 pub fn play_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
+    if ctx.session.borrow().is_resolution_pending() {
+        return true;
+    }
+    if ctx.session.borrow().resolution_failed {
+        return play_current(ctx);
+    }
     match resolve_play_request(
         ctx.session.borrow().has_current(),
         ctx.model.n_items(),
@@ -550,7 +674,11 @@ pub fn play_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
 
 /// Header/OS-toggle behavior: toggle a loaded item, otherwise start a queue.
 pub fn toggle_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
-    if ctx.session.borrow().has_current() {
+    if ctx.session.borrow().is_resolution_pending() {
+        true
+    } else if ctx.session.borrow().resolution_failed {
+        play_current(ctx)
+    } else if ctx.session.borrow().has_current() {
         ctx.active_output.borrow().toggle_play_pause();
         true
     } else {
@@ -577,6 +705,51 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         warn!("Track has no playable URI");
         return false;
     }
+
+    if crate::source_registry::is_media_reference(item.uri()) {
+        // Retire the prior output/ticket before awaiting the source resolver.
+        // The Stop captures the old event generation; the new generation below
+        // therefore rejects any delayed terminal event it produces.
+        ctx.active_output.borrow().stop();
+        let generation = ctx.session.borrow_mut().begin_pending_resolution();
+        ctx.active_output.borrow().set_event_generation(generation);
+        update_now_playing_ui(ctx, &item, identity.as_ref(), None);
+
+        let reference = item.uri.clone();
+        let session = Rc::clone(&ctx.session);
+        let active_output = Rc::clone(&ctx.active_output);
+        let media_ctrl = Rc::clone(&ctx.media_ctrl);
+        glib::MainContext::default().spawn_local(async move {
+            let resolved = crate::source_registry::resolve_stream_reference(&reference).await;
+            match resolved {
+                Ok(request) if request.is_active() => {
+                    if session.borrow_mut().finish_pending_resolution(generation) {
+                        active_output.borrow().load_resolved(request);
+                    }
+                }
+                Ok(_) => {
+                    if session.borrow_mut().fail_pending_resolution(generation) {
+                        warn!("Could not resolve track: source lease is inactive");
+                        active_output.borrow().stop();
+                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                            ctrl.update_playback(false);
+                        }
+                    }
+                }
+                Err(error) => {
+                    if session.borrow_mut().fail_pending_resolution(generation) {
+                        warn!(error = %error, "Could not resolve track through its live source session");
+                        active_output.borrow().stop();
+                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                            ctrl.update_playback(false);
+                        }
+                    }
+                }
+            }
+        });
+        return true;
+    }
+
     let playback_uri = match resolve_live_media_reference(item.uri()) {
         Ok(uri) => uri,
         Err(error) => {
@@ -596,6 +769,17 @@ fn play_current(ctx: &PlaybackContext) -> bool {
     let generation = ctx.session.borrow_mut().begin_event_generation();
     ctx.active_output.borrow().set_event_generation(generation);
     ctx.active_output.borrow().load_uri(&playback_uri);
+    update_now_playing_ui(ctx, &item, identity.as_ref(), Some(&playback_uri));
+
+    true
+}
+
+fn update_now_playing_ui(
+    ctx: &PlaybackContext,
+    item: &QueueItem,
+    identity: Option<&PlaybackIdentity>,
+    direct_playback_uri: Option<&str>,
+) {
     ctx.title_label.set_label(&item.title);
     ctx.title_label.set_tooltip_text(Some(&item.title));
     let artist_album = format!("{} \u{2014} {}", item.artist, item.album);
@@ -605,13 +789,10 @@ fn play_current(ctx: &PlaybackContext) -> bool {
     // Scroll only when the queue's source and item are present in the current
     // view. Navigation still works when the user is viewing another source or
     // has filtered the playing item out.
-    if identity
-        .as_ref()
-        .is_some_and(|identity| *ctx.active_source_key.borrow() == identity.source_id)
-    {
+    if identity.is_some_and(|identity| *ctx.active_source_key.borrow() == identity.source_id) {
         if let Some(position) = find_queue_item_position(
             ctx.model.n_items(),
-            identity.as_ref().map_or("", |identity| &identity.track_id),
+            identity.map_or("", |identity| &identity.track_id),
             item.occurrence,
             item.row_instance_id,
             |index| {
@@ -632,22 +813,43 @@ fn play_current(ctx: &PlaybackContext) -> bool {
 
     // ── Update album art ─────────────────────────────────────────
     if !item.cover_art_url.is_empty() {
-        // Remote track with a cover art URL — resolve session-scoped
-        // references immediately before fetching.
-        match resolve_live_media_reference(&item.cover_art_url) {
-            Ok(cover_art_url) => {
-                album_art::fetch_remote_album_art(&ctx.album_art, &cover_art_url);
-            }
-            Err(error) => {
-                warn!(error = %error, "Could not resolve artwork through its live source session");
-                album_art::invalidate();
-                ctx.album_art
-                    .set_icon_name(Some("audio-x-generic-symbolic"));
+        if crate::source_registry::is_media_reference(&item.cover_art_url) {
+            let generation = album_art::begin_remote_album_art(&ctx.album_art);
+            let reference = item.cover_art_url.clone();
+            let album_art = ctx.album_art.clone();
+            glib::MainContext::default().spawn_local(async move {
+                match crate::source_registry::resolve_artwork_reference(&reference).await {
+                    Ok(Some(request)) => {
+                        album_art::fetch_resolved_album_art(&album_art, request, generation);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(error = %error, "Could not resolve artwork through its live source session");
+                    }
+                }
+            });
+        } else {
+            // Remote track with a cover art URL — resolve session-scoped
+            // references immediately before fetching.
+            match resolve_live_media_reference(&item.cover_art_url) {
+                Ok(cover_art_url) => {
+                    album_art::fetch_remote_album_art(&ctx.album_art, &cover_art_url);
+                }
+                Err(error) => {
+                    warn!(error = %error, "Could not resolve artwork through its live source session");
+                    album_art::invalidate();
+                    ctx.album_art
+                        .set_icon_name(Some("audio-x-generic-symbolic"));
+                }
             }
         }
-    } else {
+    } else if let Some(playback_uri) = direct_playback_uri {
         // Local track — extract from embedded tags.
-        album_art::update_album_art(&ctx.album_art, &playback_uri);
+        album_art::update_album_art(&ctx.album_art, playback_uri);
+    } else {
+        album_art::invalidate();
+        ctx.album_art
+            .set_icon_name(Some("audio-x-generic-symbolic"));
     }
 
     if let Some(ref mut ctrl) = *ctx.media_ctrl.borrow_mut() {
@@ -656,8 +858,6 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         // load is accepted and let a later Paused/Stopped event correct it.
         ctrl.update_playback(true);
     }
-
-    true
 }
 
 fn find_queue_item_position(
@@ -833,6 +1033,12 @@ mod tests {
             album: "Album".to_string(),
             cover_art_url: String::new(),
         }
+    }
+
+    fn protected_item(source: &str, id: &str) -> QueueItem {
+        let mut item = item(source, id);
+        item.uri = "tributary-remote://00000000-0000-4000-8000-000000000001/stream/00000000-0000-4000-8000-000000000002".to_string();
+        item
     }
 
     fn projected_row(id: &str, uri: &str) -> TrackObject {
@@ -1156,6 +1362,22 @@ mod tests {
     }
 
     #[test]
+    fn source_retirement_clears_only_its_own_queue() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![protected_item("remote-a", "a")], 0));
+        let retired_generation = session.begin_pending_resolution();
+
+        assert!(!session.clear_if_source("remote-b"));
+        assert!(session.accepts_event_generation(retired_generation));
+        assert!(session.has_current());
+
+        assert!(session.clear_if_source("remote-a"));
+        assert!(!session.accepts_event_generation(retired_generation));
+        assert!(!session.has_current());
+        assert!(session.queue.is_empty());
+    }
+
+    #[test]
     fn stale_player_events_are_rejected_after_track_change_and_reset() {
         let mut session = PlaybackSession::default();
         assert!(session.replace_queue(vec![item("local", "a"), item("local", "b")], 0));
@@ -1170,6 +1392,87 @@ mod tests {
 
         session.clear();
         assert!(!session.accepts_event_generation(second_generation));
+    }
+
+    #[test]
+    fn protected_resolution_is_owned_by_exact_playback_generation() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item("remote", "a"), item("remote", "b")], 0));
+
+        let stale = session.begin_pending_resolution();
+        assert!(session.is_resolution_pending());
+        assert_eq!(session.advance(RepeatMode::Off, false), Some(1));
+        let current = session.begin_pending_resolution();
+
+        assert!(!session.finish_pending_resolution(stale));
+        assert!(session.finish_pending_resolution(current));
+        assert!(!session.is_resolution_pending());
+        assert!(!session.resolution_failed);
+    }
+
+    #[test]
+    fn failed_resolution_is_retryable_and_stop_invalidates_it() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item("remote", "a")], 0));
+        let failed = session.begin_pending_resolution();
+
+        assert!(session.fail_pending_resolution(failed));
+        assert!(session.resolution_failed);
+        assert!(!session.is_resolution_pending());
+
+        let retry = session.begin_pending_resolution();
+        assert!(!session.resolution_failed);
+        session.clear();
+        assert!(!session.finish_pending_resolution(retry));
+        assert!(!session.has_current());
+    }
+
+    #[test]
+    fn pending_pause_cancels_completion_and_keeps_play_retryable() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![protected_item("remote", "a")], 0));
+        let cancelled = session.begin_pending_resolution();
+
+        assert!(session.cancel_pending_resolution_for_retry());
+        assert!(!session.is_resolution_pending());
+        assert!(session.resolution_failed);
+        assert!(session.has_current());
+        assert!(!session.finish_pending_resolution(cancelled));
+
+        let retry = session.begin_pending_resolution();
+        assert_ne!(retry, cancelled);
+        assert!(session.finish_pending_resolution(retry));
+        assert!(!session.resolution_failed);
+    }
+
+    #[test]
+    fn protected_output_error_retries_resolution_but_direct_error_does_not() {
+        let mut protected = PlaybackSession::default();
+        assert!(protected.replace_queue(vec![protected_item("remote", "a")], 0));
+        let failed_load = protected.begin_pending_resolution();
+        assert!(protected.finish_pending_resolution(failed_load));
+
+        assert!(protected.mark_protected_load_failed(failed_load));
+        assert!(protected.resolution_failed);
+        assert!(!protected.accepts_event_generation(failed_load));
+        let retry = protected.begin_pending_resolution();
+        assert_ne!(retry, failed_load);
+
+        let mut daap = PlaybackSession::default();
+        let mut daap_item = item("daap-source", "a");
+        daap_item.uri =
+            "daap://00000000-0000-4000-8000-000000000001/stream/1?format=mp3".to_string();
+        assert!(daap.replace_queue(vec![daap_item], 0));
+        let daap_load = daap.begin_event_generation();
+        assert!(daap.mark_protected_load_failed(daap_load));
+        assert!(daap.resolution_failed);
+
+        let mut direct = PlaybackSession::default();
+        assert!(direct.replace_queue(vec![item("local", "a")], 0));
+        let direct_load = direct.begin_event_generation();
+        assert!(!direct.mark_protected_load_failed(direct_load));
+        assert!(!direct.resolution_failed);
+        assert!(direct.accepts_event_generation(direct_load));
     }
 
     #[test]

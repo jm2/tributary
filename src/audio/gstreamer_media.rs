@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use url::{Host, Url};
 
 use super::cast_http_server::CastHttpServer;
+use crate::architecture::media::ResolvedHttpRequest;
 use crate::http_security::{classify_media_uri, MediaUriSecurity};
 
 const MEDIA_PREPARATION_FAILED: &str = "protected media preparation failed";
@@ -113,6 +114,66 @@ impl GstreamerMediaProxy {
                 0,
             ))))
         })
+    }
+
+    /// Retire the previous load and prepare one typed protected request.
+    ///
+    /// Unlike [`Self::prepare`], this path performs no URI classification: a
+    /// resolved request is protected by construction and always receives a
+    /// dedicated app-owned loopback ticket. An inactive request or unavailable
+    /// proxy fails closed.
+    pub(super) fn prepare_resolved(
+        &self,
+        request: ResolvedHttpRequest,
+    ) -> Result<PreparedGstreamerMedia, &'static str> {
+        self.prepare_resolved_with_server_start(request, |runtime| {
+            runtime.block_on(CastHttpServer::start_on(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                0,
+            ))))
+        })
+    }
+
+    fn prepare_resolved_with_server_start<F>(
+        &self,
+        request: ResolvedHttpRequest,
+        start_server: F,
+    ) -> Result<PreparedGstreamerMedia, &'static str>
+    where
+        F: FnOnce(&tokio::runtime::Handle) -> anyhow::Result<CastHttpServer>,
+    {
+        if !request.is_active() {
+            self.revoke();
+            return Err(MEDIA_PREPARATION_FAILED);
+        }
+
+        let generation = Arc::new(PreparationGeneration);
+        let (previous, runtime) = {
+            let mut state = self.lock_state();
+            state.generation = Arc::clone(&generation);
+            (state.active.take(), state.runtime.clone())
+        };
+
+        if let Some(previous) = previous {
+            previous.revoke();
+        }
+
+        let runtime = runtime.ok_or(MEDIA_PREPARATION_FAILED)?;
+        let server = start_server(&runtime).map_err(|_| MEDIA_PREPARATION_FAILED)?;
+        let uri = server
+            .register_resolved(request)
+            .ok_or(MEDIA_PREPARATION_FAILED)?;
+        if !valid_loopback_ticket(server.addr(), &uri) {
+            server.revoke_upstreams();
+            return Err(MEDIA_PREPARATION_FAILED);
+        }
+
+        let ticket = Arc::new(GstreamerMediaTicket { server, uri });
+        if !self.install_if_current(&generation, &ticket) {
+            ticket.revoke();
+            return Err(MEDIA_PREPARATION_FAILED);
+        }
+        Ok(PreparedGstreamerMedia::Protected(ticket))
     }
 
     fn prepare_with_server_start<F>(
@@ -448,6 +509,73 @@ mod tests {
                 assert!(!prepared.uri().contains(secret));
             }
         }
+    }
+
+    #[test]
+    fn typed_requests_always_receive_a_ticket_even_when_the_endpoint_is_clean() {
+        let runtime = runtime();
+        let proxy = GstreamerMediaProxy::new(Some(runtime.handle().clone()));
+        let endpoint =
+            Url::parse("https://music.test/clean/track.flac?track=42").expect("clean endpoint");
+        let request = ResolvedHttpRequest::new(endpoint.clone()).expect("resolved request");
+
+        let prepared = proxy.prepare_resolved(request).expect("typed media ticket");
+        assert!(matches!(&prepared, PreparedGstreamerMedia::Protected(_)));
+        assert!(prepared.ticket().is_some());
+        assert_ne!(prepared.uri(), endpoint.as_str());
+        assert!(!prepared.uri().contains("music.test"));
+        assert!(!prepared.uri().contains("track=42"));
+    }
+
+    #[test]
+    fn typed_requests_fail_closed_without_proxy_runtime() {
+        let proxy = GstreamerMediaProxy::new(None);
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/clean/track.flac").expect("clean endpoint"),
+        )
+        .expect("resolved request");
+
+        assert_eq!(
+            proxy.prepare_resolved(request).err(),
+            Some(MEDIA_PREPARATION_FAILED)
+        );
+    }
+
+    #[test]
+    fn delayed_typed_startup_cannot_replace_a_newer_load() {
+        let runtime = runtime();
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/clean/track.flac").expect("clean endpoint"),
+        )
+        .expect("resolved request");
+        let (startup_entered_tx, startup_entered_rx) = mpsc::channel();
+        let (release_startup_tx, release_startup_rx) = mpsc::channel();
+
+        let older_proxy = Arc::clone(&proxy);
+        let older = thread::spawn(move || {
+            older_proxy.prepare_resolved_with_server_start(request, move |runtime| {
+                startup_entered_tx.send(()).expect("report startup");
+                release_startup_rx.recv().expect("release startup");
+                runtime.block_on(CastHttpServer::start_on(SocketAddr::from((
+                    Ipv4Addr::LOCALHOST,
+                    0,
+                ))))
+            })
+        });
+        startup_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("typed preparation reached startup");
+
+        let newer = proxy
+            .prepare("https://radio.test/live.mp3")
+            .expect("newer direct load");
+        assert!(matches!(newer, PreparedGstreamerMedia::Direct(_)));
+        release_startup_tx.send(()).expect("finish startup");
+        assert_eq!(
+            older.join().expect("typed preparation thread").err(),
+            Some(MEDIA_PREPARATION_FAILED)
+        );
     }
 
     #[test]

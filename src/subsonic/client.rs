@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::architecture::ResolvedHttpRequest;
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
     authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
@@ -178,6 +179,8 @@ impl SubsonicClient {
     /// Build a full API URL with authentication query parameters.
     pub fn api_url(&self, endpoint: &str) -> Url {
         let mut url = self.base_url.clone();
+        url.set_query(None);
+        url.set_fragment(None);
         {
             let mut segments = url.path_segments_mut().expect("base URL cannot-be-a-base");
             segments.push("rest");
@@ -204,20 +207,21 @@ impl SubsonicClient {
         url
     }
 
-    /// Build a `stream.view` URL for the given Subsonic song ID.
-    /// This URL can be passed directly to GStreamer — it includes all
-    /// authentication parameters.
-    pub fn stream_url(&self, song_id: &str) -> Url {
-        let mut url = self.api_url("stream.view");
-        url.query_pairs_mut().append_pair("id", song_id);
-        url
+    /// Resolve a stream request while keeping Subsonic authentication out of
+    /// the inspectable endpoint.
+    pub(crate) fn resolved_stream_request(
+        &self,
+        song_id: &str,
+    ) -> BackendResult<ResolvedHttpRequest> {
+        self.resolved_media_request("stream.view", song_id)
     }
 
-    /// Build a `getCoverArt.view` URL for the given Subsonic cover art ID.
-    pub fn cover_art_url(&self, cover_art_id: &str) -> Url {
-        let mut url = self.api_url("getCoverArt.view");
-        url.query_pairs_mut().append_pair("id", cover_art_id);
-        url
+    /// Resolve an artwork request with the same credential isolation.
+    pub(crate) fn resolved_artwork_request(
+        &self,
+        cover_art_id: &str,
+    ) -> BackendResult<ResolvedHttpRequest> {
+        self.resolved_media_request("getCoverArt.view", cover_art_id)
     }
 
     /// Issue a GET request to a Subsonic endpoint and deserialize the
@@ -326,6 +330,39 @@ impl SubsonicClient {
         };
         AuthMode::Token { token, salt }
     }
+
+    fn resolved_media_request(
+        &self,
+        endpoint: &str,
+        media_id: &str,
+    ) -> BackendResult<ResolvedHttpRequest> {
+        let mut url = self.base_url.clone();
+        {
+            let mut segments = url.path_segments_mut().expect("base URL cannot-be-a-base");
+            segments.push("rest");
+            segments.push(endpoint);
+        }
+        {
+            let mut query = url.query_pairs_mut();
+            query
+                .append_pair("id", media_id)
+                .append_pair("v", API_VERSION)
+                .append_pair("c", CLIENT_NAME)
+                .append_pair("f", "json");
+        }
+
+        let mut request =
+            ResolvedHttpRequest::new(url)?.with_private_query_pair("u", &self.username)?;
+        request = match &self.auth {
+            AuthMode::Token { token, salt } => request
+                .with_private_query_pair("t", token)?
+                .with_private_query_pair("s", salt)?,
+            AuthMode::Plaintext { hex_password } => {
+                request.with_private_query_pair("p", format!("enc:{hex_password}"))?
+            }
+        };
+        Ok(request)
+    }
 }
 
 fn response_body_error(context: &str, error: ResponseBodyError) -> BackendError {
@@ -377,5 +414,62 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains("embedded-user"));
         assert!(!rendered.contains(&secret));
+    }
+
+    #[test]
+    fn resolved_token_request_separates_endpoint_and_private_auth() {
+        let username = uuid::Uuid::new_v4().to_string();
+        let password = uuid::Uuid::new_v4().to_string();
+        let client = SubsonicClient::new("https://music.example.test", &username, &password)
+            .expect("client");
+
+        let request = client
+            .resolved_stream_request("song-id")
+            .expect("resolved request");
+        let endpoint = request.endpoint().as_str();
+        assert!(!endpoint.contains(&username));
+        assert!(!endpoint.contains(&password));
+        let mut public_keys: Vec<_> = request
+            .endpoint()
+            .query_pairs()
+            .map(|(key, _)| key.into_owned())
+            .collect();
+        public_keys.sort();
+        assert_eq!(public_keys, ["c", "f", "id", "v"]);
+        assert!(request.sensitive_headers().is_empty());
+        assert!(request
+            .private_query_pairs()
+            .iter()
+            .any(|(key, value)| key == "u" && value == &username));
+        assert!(request
+            .private_query_pairs()
+            .iter()
+            .any(|(key, _)| key == "t"));
+        assert!(request
+            .private_query_pairs()
+            .iter()
+            .any(|(key, _)| key == "s"));
+    }
+
+    #[test]
+    fn resolved_plaintext_request_keeps_password_state_private() {
+        let username = uuid::Uuid::new_v4().to_string();
+        let password = uuid::Uuid::new_v4().to_string();
+        let mut client = SubsonicClient::new("https://music.example.test", &username, &password)
+            .expect("client");
+        client.switch_to_plaintext_auth().expect("HTTPS fallback");
+
+        let request = client
+            .resolved_stream_request("song-id")
+            .expect("resolved request");
+        assert!(!request.endpoint().as_str().contains(&password));
+        assert!(request
+            .private_query_pairs()
+            .iter()
+            .any(|(key, value)| key == "p" && value.starts_with("enc:")));
+        assert!(!request
+            .private_query_pairs()
+            .iter()
+            .any(|(key, _)| matches!(key.as_str(), "t" | "s")));
     }
 }

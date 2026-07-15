@@ -4,6 +4,8 @@
 //! the network discovery service — adds/removes servers in the sidebar
 //! and AirPlay/Chromecast devices in the output selector.
 
+use std::rc::Rc;
+
 use adw::prelude::*;
 use gtk::glib;
 use tracing::info;
@@ -15,7 +17,11 @@ use super::window_state::WindowState;
 
 /// Wire mDNS/DNS-SD discovery: adds/removes servers in the sidebar
 /// and AirPlay/Chromecast devices in the output selector.
-pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
+pub fn setup_discovery(
+    state: &WindowState,
+    output_list: &gtk::ListBox,
+    invalidate_source_playback: Rc<dyn Fn(&str)>,
+) {
     let discovery_rx = crate::discovery::start_discovery();
     let store = state.sidebar_store.clone();
     let rt_handle = state.rt_handle.clone();
@@ -51,7 +57,6 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                     if server.service_type == "airplay2" {
                         info!(
                             name = %server.name,
-                            url = %server.url,
                             "AirPlay 2 receiver discovered — skipping (sender support not yet implemented)"
                         );
                         continue;
@@ -60,6 +65,16 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                     // ── Chromecast devices go to the output selector, not sidebar ──
                     if server.service_type == "chromecast" {
                         handle_chromecast_found(&output_list, &server);
+                        continue;
+                    }
+
+                    // Treat every remote-library discovery event as
+                    // unauthenticated input at the GTK boundary too. Current
+                    // producers already construct or validate safe base URLs;
+                    // this second check prevents a future producer from
+                    // publishing user-info/query credentials to a row or log.
+                    if let Err(error) = crate::http_security::parse_base_url(&server.url) {
+                        tracing::warn!(error, "Ignoring discovered server with invalid URL");
                         continue;
                     }
 
@@ -76,7 +91,6 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
 
                     info!(
                         name = %server.name,
-                        url = %server.url,
                         backend = %server.service_type,
                         "Adding discovered server to sidebar"
                     );
@@ -129,6 +143,7 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                     // queued sync work is generation-rejected and logout is
                     // tracked by controlled shutdown.
                     if service_type == "daap" {
+                        invalidate_source_playback(&url);
                         if let Some(session) = crate::daap::release_source(&url) {
                             rt_handle.spawn(async move {
                                 session.disconnect().await;
@@ -137,7 +152,6 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                     }
 
                     info!(
-                        url = %url,
                         backend = %service_type,
                         "Handling lost server discovery event"
                     );
@@ -180,6 +194,11 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                                 // If connected and still the active source,
                                 // switch to local before removing.
                                 let was_active = *active_source_key.borrow() == url;
+
+                                if service_type != "daap" {
+                                    invalidate_source_playback(&url);
+                                    crate::source_registry::release_source(&url);
+                                }
 
                                 if src.connected() {
                                     // Remove from source_tracks map.

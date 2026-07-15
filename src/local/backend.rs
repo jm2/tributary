@@ -6,7 +6,6 @@ use sea_orm::{
     ColumnTrait, Condition, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
     QueryOrder, QuerySelect,
 };
-use url::Url;
 use uuid::Uuid;
 
 use crate::architecture::backend::{BackendResult, MediaBackend};
@@ -210,35 +209,6 @@ impl MediaBackend for LocalBackend {
         Err(BackendError::Unsupported {
             operation: "LocalBackend::get_artist_tracks (artist IDs are not persisted)".into(),
         })
-    }
-
-    async fn get_stream_url(&self, track_id: &Uuid) -> BackendResult<Url> {
-        let id_str = track_id.to_string();
-        let row = track::Entity::find_by_id(&id_str)
-            .one(&self.db)
-            .await
-            .map_err(|e| BackendError::Internal(e.into()))?
-            .ok_or_else(|| BackendError::NotFound {
-                entity_type: "Track".to_string(),
-                id: *track_id,
-            })?;
-
-        // Build the file URL via from_file_path so reserved characters in
-        // the path ('#', '?', spaces, …) are percent-encoded correctly,
-        // rather than string-concatenating a "file://…" URL that mis-parses.
-        Url::from_file_path(&row.file_path).map_err(|()| {
-            BackendError::Internal(anyhow::anyhow!(
-                "Invalid file path for stream URL: {}",
-                row.file_path
-            ))
-        })
-    }
-
-    async fn get_cover_art(&self, _album_id: &Uuid) -> BackendResult<Option<Url>> {
-        // Cover art is extracted on-the-fly from embedded tags in window.rs
-        // (update_album_art / extract_album_art_bytes) rather than through
-        // this trait method.  Returns None — no separate cover art URL.
-        Ok(None)
     }
 
     async fn get_stats(&self) -> BackendResult<LibraryStats> {

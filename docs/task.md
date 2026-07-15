@@ -29,7 +29,7 @@ Progress snapshot (2026-07-14), recounted from the literal P0–P3 task checkbox
 earlier numerator/denominator drift. The denominator excludes the two deferred P0.7 live-workflow
 verification boxes and the withdrawn P2.6 false finding; section-summary and global-validation
 gate boxes are not task progress:
-**124/213 (58.2%)** in-scope checklist items complete; **108/114 (94.7%)** across P0 and P1 after
+**128/213 (60.1%)** in-scope checklist items complete; **109/114 (95.6%)** across P0 and P1 after
 the same P0.7 exclusion.
 
 ## P0 — Release blockers
@@ -270,34 +270,37 @@ explicitly justified and time-bounded.
 
 ### P1.6 Stop handing backend credentials to receivers
 
-This began as the tracker's highest live credential exposure. It is not limited to "broad bearer
-tokens": with Subsonic's plaintext auth mode the URL carries `p=enc:<hex_password>` — the
-user's actual password, hex-encoded and trivially reversible. Chromecast and MPD no longer
-receive those URLs. The credentials are still retained in generic track/UI values, but local and
-AirPlay now exchange them for app-owned loopback tickets before GStreamer sees the media; only the
-remaining generic-model/playback-time resolver work is open.
+This began as the tracker's highest live credential exposure. It is not limited to broad bearer
+tokens: Subsonic's legacy compatibility mode ultimately needs `p=enc:<hex_password>` on the
+upstream request — the user's password, hex-encoded and trivially reversible. The completed design
+keeps that material, Subsonic token/salt authentication, the Plex token, and the Jellyfin token out
+of generic catalogue and GTK values as well as every receiver. Playback credential material stays
+inside the retained backend client/resolver and is materialized for media only in the app-owned
+proxy's immediate exact-origin upstream request.
 
 Confirmed path, end to end:
 
 | Step | Location |
 |---|---|
-| Credential is baked into the stream URL | `plex/client.rs:236-242` (`X-Plex-Token`, account-wide), `jellyfin/client.rs:256-260` (`api_key`), `subsonic/client.rs:195-198` (`p=enc:<hex_password>`) |
-| Retained in the generic model | `architecture/models.rs:60` — `Track.stream_url` |
-| Copied verbatim into the UI object | `ui/window.rs::arch_track_to_object` (the `stream_url` branch) |
-| Classified at the receiver boundary | `audio/chromecast_output.rs::classify_cast_uri` and `audio/mpd_output.rs::MpdOutput::load_uri` exchange supported credential-bearing HTTP(S) URLs for opaque tickets before Cast `content_id` or MPD `addid`. Plaintext MPD protocol traffic, queue state, and logs therefore see only the ticket. |
-| Classified at the local/AirPlay boundary | `audio/gstreamer_media.rs::GstreamerMediaProxy::prepare` exchanges protected URLs for dedicated `127.0.0.1` tickets before `audio/mod.rs::Player::load_uri` (`playbin3`) or `audio/airplay_output.rs::open_session` (`uridecodebin`) can consume them. GStreamer receives only the ticket; the original URL stays inside Tributary's exact-origin/no-`Referer` proxy. |
+| Generic catalogue | Subsonic, Jellyfin, and Plex tracks keep `stream_url` and `cover_art_url` empty. Their backend caches retain backend-native stream locators and track-only artwork locators keyed by deterministic app track UUID, so a type-local album/artist ID cannot overwrite track art. DAAP continues to publish its already-credential-free live-session references. |
+| Source ownership | `source_registry.rs` retains an `Arc<dyn RemoteMediaResolver>` behind an exact source generation, random lease UUID, and revocable `MediaLease`. A replacement, release, discovery removal, manual deletion, or shutdown invalidates old references and already-resolved requests. DAAP retains its stateful session in its existing generation-scoped registry. |
+| GTK publication | A current standard-remote sync is converted to `tributary-remote://<lease>/{stream,artwork}/<track-uuid>`. The reference contains no source address, backend-native ID, or credential; a queued sync is rejected unless its generation and lease still own that source. |
+| Playback and artwork | `ui/playback.rs` resolves the exact opaque reference only when the item is consumed. Playback generations reject a result completed after Stop, Next, output replacement, or a newer replay; artwork repeats generation and lease checks before and after its worker fetch. |
+| Credential isolation | `ResolvedHttpRequest` is deliberately non-debuggable and non-serializable. Plex uses a sensitive `X-Plex-Token` header and Jellyfin a sensitive `X-Emby-Authorization` header. Subsonic protocol authentication remains private query material (`u` plus `t`/`s` or HTTPS-only `p`) and is appended only inside the app-owned proxy immediately before the exact-origin fetch. |
+| Output boundary | `AudioOutput::load_resolved` accepts the typed request. Chromecast, MPD, local GStreamer, and AirPlay exchange it for their existing opaque, receiver-reachable tickets; none can fall back to the clean endpoint or serialized credential state. |
 
-Design — the existing local-file server is now also a media ticket proxy. Chromecast keeps its
-LAN IPv4 listener, while MPD binds a dedicated proxy to the local IP and address family of the
-successful MPD TCP connection. Local `playbin3` and AirPlay `uridecodebin` each use a dedicated
-loopback-only proxy for the current protected load. All variants use OS-assigned ports and
-unguessable UUID routes; the credential-bearing upstream stays inside Tributary.
+The opaque source reference and the output ticket are separate capabilities. The first identifies
+one track through one live app session and is useful only inside Tributary. Resolution produces a
+typed, revocable HTTP request, and only then does the selected output mint a ticket reachable by
+its receiver. Chromecast keeps its LAN IPv4 listener; MPD binds to the successful connection's
+local IP/address family; local `playbin3` and AirPlay `uridecodebin` use dedicated loopback-only
+proxies. All ticket routes use OS-assigned ports and unguessable UUIDs.
 
-- [x] Give the proxy two registration kinds: `MediaSource::Local(PathBuf)` (today's behavior) and
-  `MediaSource::Upstream(Url)`, where the proxy — not the receiver — fetches from the backend
-  using an app-owned client bound by the P1.4 exact-origin policy. Only `Range` is forwarded
-  upstream, and the target URL is fixed at registration, so the proxy cannot be driven to fetch
-  anything else.
+- [x] Give the proxy local and upstream registration kinds. Local routes retain a bound path;
+  upstream routes accept the legacy/direct `Url` or the current typed `ResolvedHttpRequest`, and
+  the proxy — not the receiver — fetches from the backend using an app-owned client bound by the
+  P1.4 exact-origin policy. Only `Range` is forwarded upstream, and the endpoint/auth state is
+  fixed at registration, so the proxy cannot be driven to fetch anything else.
 - [x] Issue receivers an opaque ticket URL. The device sees
   `http://<bound-ip>:<port>/cast/<uuid>[.<audio-ext>]` (with IPv6 bracketed) and never a
   credential. Chromecast uses a LAN IPv4 address; MPD uses the successful connection's local
@@ -306,16 +309,18 @@ unguessable UUID routes; the credential-bearing upstream stays inside Tributary.
   previous one, so at most one credential-bearing ticket is live; `stop()` revokes them all.
   Revocation deliberately does **not** happen on pause or seek — a Cast device re-fetches with a
   `Range` header when it seeks, so a ticket must outlive those within its hard lifetime.
-- [x] Route **Chromecast** through it (`classify_cast_uri`). Unauthenticated streams (internet
-  radio) still pass through directly: there is no secret to protect and relaying a live radio
-  stream through this process would buy nothing.
+- [x] Route **Chromecast** through it. Standard remote media enters through typed
+  `load_resolved`; `classify_cast_uri` remains the fail-closed boundary for direct/legacy inputs.
+  Unauthenticated streams (internet radio) still pass through directly: there is no secret to
+  protect and relaying a live radio stream through this process would buy nothing.
 - [x] Threat-model spoofed and compromised LAN receivers: a hostile receiver now obtains a
   single-media ticket whose route is revoked on stop, superseded on the next load, and denies all
   new lookups after 24 hours instead of an account credential.
-- [x] Route **MPD** through the same proxy. `MpdOutput::load_uri` classifies media before it can
-  enter the ordered worker; after classification, a protected URL remains app-private and is
-  consumed only by the ordered worker/proxy. The worker starts a dedicated proxy on the successful
-  TCP connection's exact local IPv4/IPv6 route and sends only the opaque ticket via `addid`.
+- [x] Route **MPD** through the same proxy. Standard remote media uses typed `load_resolved`, while
+  `MpdOutput::load_uri` still classifies every direct/legacy input before it can enter the ordered
+  worker. A protected request remains app-private and is consumed only by the ordered worker/proxy.
+  The worker starts a dedicated proxy on the successful TCP connection's exact local IPv4/IPv6
+  route and sends only the opaque ticket via `addid`.
   Missing runtime/address state, unusable IPv6 scope, proxy startup,
   registration, and generated-argument failures all fail closed without falling back to the raw
   URL. A replacing direct, protected, or rejected load, user Stop, output drop, natural end,
@@ -330,12 +335,14 @@ unguessable UUID routes; the credential-bearing upstream stays inside Tributary.
   failure, output drop, or proxy drop revokes the route; pause, play, and seek retain it only
   within its hard 24-hour lifetime. Dedicated servers plus identity-checked cleanup ensure a
   delayed callback can retire only its own ticket, never a newer load.
-- [ ] Keep backend credentials outside generic `Track` values: drop the credential from
-  `Track.stream_url` and add a backend `resolve_stream(&track) -> (Url, HeaderMap)` called at
-  playback time, moving `X-Plex-Token` / `api_key` / Subsonic `u,t,s,p` out of the query string
-  and into request headers held only inside the proxy. The proxy makes the *leak* stop; this makes
-  the credential stop being copied through the UI layer at all. Build it to serve P3.1's
-  "resolve playable URLs at playback time" as well, rather than twice.
+- [x] Keep backend credentials outside generic `Track` and GTK values. Standard remote tracks no
+  longer retain stream or artwork URLs; `RemoteMediaResolver::resolve_stream` and
+  `resolve_artwork` translate a stable app track UUID through backend-private native locators only
+  when playback/artwork is consumed. `ResolvedHttpRequest` separates the credential-free endpoint
+  from Plex/Jellyfin sensitive headers and Subsonic's protocol-required private query pairs. Only
+  the app-owned exact-origin proxy materializes those fields. The generation/lease registry and
+  opaque UI references implement the corresponding remote portion of P3.1 rather than creating a
+  second resolver later.
 - [x] Give credential-bearing upstream tickets a hard, absolute, non-sliding 24-hour TTL in
   addition to lifecycle revocation. A ticket is live only before its monotonic deadline; at the
   deadline an atomic lookup removes it and returns the same 404 as a revoked or unknown route.
@@ -349,13 +356,19 @@ unguessable UUID routes; the credential-bearing upstream stays inside Tributary.
   upstream-ticket expiry in commit `8735862` with 6 deterministic deadline, non-renewal,
   revocation/supersession, local-route, admitted-response, and 404-equivalence tests; the
   local/AirPlay GStreamer boundary is in `2188efb` with concurrency review follow-up `28e3400`
-  and 10 focused tests. Making generic `Track`/UI values credential-free remains open.
+  and 10 focused tests. The playback-time resolver/source-lease slice is in PR #86: typed
+  credential-isolated requests, backend-private native locators, exact generation/lease
+  publication, async playback/artwork resolution, lease-aware output proxying, and 36 newly
+  authored focused tests across request validation, all three standard backends, registry races,
+  stale playback/artwork work, each output boundary, and pre-persistence server-URL rejection.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
-device or daemon Tributary does not own. **Chromecast and MPD now meet the receiver-boundary
-criterion, and local/AirPlay GStreamer now meet the app-owned-fetch criterion.** P1.6 remains open
-only because generic `Track`/UI values still carry credentials instead of resolving protected
-media at playback time. P1.4 is complete.
+device or daemon Tributary does not own, retained in a generic catalogue/UI value, or serialized
+through an output boundary. **Complete:** standard remote tracks and GTK rows contain only stable
+identity plus opaque lease references; DAAP retains its credential-free live-session references;
+all protected playback/artwork requests resolve through the current app-owned session and proxy;
+and Chromecast, MPD, local GStreamer, and AirPlay receive only their scoped tickets. P1.4 and P1.6
+are complete.
 
 ### P1.7 Serialize Chromecast lifecycle and commands
 
@@ -648,16 +661,31 @@ error that tells the user what to install.
 
 ### P3.1 Introduce a source/session registry
 
-- [ ] Define stable source IDs and backend-native track IDs.
-- [ ] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source.
-- [ ] Remove long-lived authenticated URLs from the generic `Track` model.
-- [ ] Resolve playable URLs/tickets at playback time.
+- [ ] Define stable source IDs and backend-native track IDs. Standard backends now retain their
+  native stream/artwork locators privately, but the registry and queue still use the configured
+  URL string as source identity; a first-class stable source ID and its migration rules remain.
+- [x] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source. P1.6 now
+  retains an `Arc<dyn RemoteMediaResolver>` behind an exact generation and random revocable lease
+  for each standard remote source; the existing DAAP registry retains its stateful live backend.
+- [x] Remove long-lived authenticated URLs from the generic `Track` model. Standard remote
+  catalogue models retain stable app identity and backend-private locators, not stream/artwork
+  requests; DAAP's generic values remain credential-free session references.
+- [x] Resolve remote playable URLs/tickets at playback time. The GTK/queue value is an opaque
+  exact-lease reference; consuming it yields a typed `ResolvedHttpRequest`, and the selected
+  output then mints its receiver-scoped proxy ticket. Stale playback and artwork completions are
+  generation- and lease-rejected.
 - [ ] Resolve local/playlist media by stable track ID at playback, navigation, and receiver-load
   time so fallback reconciliation and in-flight casts cannot retain dead file paths.
-- [ ] Centralize source refresh, cancellation, disconnect, and failure state.
-- [ ] Decide how local, radio, and external-file sources fit the same lifecycle.
+- [ ] Centralize source refresh, cancellation, disconnect, and failure state. Generation/lease
+  ownership and source-owned playback retirement are centralized, but environment startup,
+  interactive auth, manual add, refresh publication, and UI failure handling remain separate
+  paths, and DAAP still has a sibling registry because it owns an explicit logout lifecycle.
+- [ ] Decide how local, radio, and external-file sources fit the same lifecycle. They deliberately
+  stay on their existing direct paths in this security slice.
 - [ ] Record architecture decision: _pending_
-- [ ] Record implementation: _pending_
+- [ ] Record implementation: P1.6 completed the remote resolver/session ownership subset in this
+  PR. Stable source IDs, local/playlist resolution, unified refresh/failure state, and the
+  local/radio/external lifecycle remain before P3.1 as a whole can be recorded complete.
 
 ### P3.2 Make the backend abstraction real and stable
 
@@ -715,10 +743,10 @@ Run before marking any milestone complete:
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
-Most recent milestone validation (2026-07-14, P1.4 local/AirPlay boundary): 18 library plus 452
-application tests passed in both debug and release (470 each); strict all-target Clippy passed in
-both profiles; formatting and `git diff --check` were clean; and `cargo audit` passed with exactly
-the two accepted unmaintained warnings recorded under P0.8.
+Most recent milestone validation (2026-07-14, P1.6 playback-time resolver): 18 library plus 488
+application tests passed in debug (506 total), and the release suite passed; strict all-target
+Clippy passed in both profiles; formatting and `git diff --check` were clean; and `cargo audit`
+passed with exactly the two accepted unmaintained warnings recorded under P0.8.
 
 **This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
 hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
@@ -879,8 +907,9 @@ Record scope or design decisions here so deferred work is explicit.
   revoking a newer load. Server startup and route revocation run outside the proxy-state mutex;
   an allocation-identity generation lets a newer load, Stop, or runtime replacement supersede an
   in-flight startup without waiting, and prevents that older startup from installing afterward.
-  This completes P1.4 without changing the still-open generic credential-bearing `Track`
-  representation.
+  This completed P1.4 without changing the generic credential-bearing `Track` representation at
+  that milestone; P1.6 has since removed authenticated URLs from standard remote catalogue/UI
+  values.
 - 2026-07-12 — P1.5 treats every finite HTTP response as an observed byte stream rather than
   trusting `Content-Length`: Subsonic, Jellyfin, Plex, DAAP, authentication, radio/geolocation,
   artwork, and MusicBrainz reads now stop at endpoint-specific caps and carry end-to-end request
@@ -889,14 +918,14 @@ Record scope or design decisions here so deferred work is explicit.
   fail cleanly on impossible or unavailable allocations. Audio and live-radio media streams remain
   deliberately uncapped because they are length-unbounded playback transports. The Chromecast and
   MPD credential boundaries are handled by P1.6's revocable proxy tickets, and local/AirPlay fetch
-  ownership is now handled by P1.4's loopback-only tickets. Credential-free generic track values
-  remain separate open work. Credential-bearing upstream tickets also carry P1.6's hard absolute
-  lifetime rather than relying on revocation alone.
-- 2026-07-14 — P1.6 classifies every media URI before it can reach MPD. Supported credential
-  shapes (URL userinfo; Plex `X-Plex-Token`; Jellyfin `api_key`; DAAP `session-id`; and Subsonic
-  `t`/`s` or shaped `p`) require a proxy; malformed declared HTTP(S), credentialed unsupported
-  schemes, and scheme-relative or malformed credential shapes fail closed. Non-credential radio
-  URLs, `file:` URLs, and MPD library paths remain direct.
+  ownership is now handled by P1.4's loopback-only tickets. P1.6 subsequently made standard remote
+  catalogue/UI values credential-free. Credential-bearing upstream tickets also carry P1.6's hard
+  absolute lifetime rather than relying on revocation alone.
+- 2026-07-14 — P1.6's receiver-ticket slice classifies every legacy/direct media URI before it can
+  reach MPD. Supported credential shapes (URL userinfo; Plex `X-Plex-Token`; Jellyfin `api_key`;
+  DAAP `session-id`; and Subsonic `t`/`s` or shaped `p`) require a proxy; malformed declared
+  HTTP(S), credentialed unsupported schemes, and scheme-relative or malformed credential shapes
+  fail closed. Non-credential radio URLs, `file:` URLs, and MPD library paths remain direct.
   A protected load first establishes the MPD TCP connection, reads that socket's local address,
   and starts one dedicated OS-port-assigned proxy on the same local IP and address family. The
   full upstream URL remains app-private; only the worker supplies it to the in-process proxy.
@@ -919,9 +948,36 @@ Record scope or design decisions here so deferred work is explicit.
   admitted. Local-file routes retain their server-lifetime capability contract because they do not
   front backend credentials. This TTL bounds a missed/crashed-session cleanup while the app and
   server remain alive; process/runtime death already closes the listener. Local and AirPlay now
-  exchange protected URLs for loopback tickets before GStreamer sees them. Generic
-  `Track.stream_url`/UI values still hold the original URL, so only the remaining P1.6
-  playback-time resolver/model box stays open.
+  exchange protected requests for loopback tickets before GStreamer sees them.
+  The completed resolver slice removes authenticated stream and artwork URLs from standard remote
+  `Track`/album/artist/search results and GTK rows. Subsonic, Jellyfin, and Plex retain only
+  backend-private native locators behind a process-owned `Arc<dyn RemoteMediaResolver>`. Every
+  connection attempt registers before network I/O; only the newest attempt may install, while a
+  failed newer attempt leaves the prior active lease usable. Remote publication carries an exact
+  generation and random lease and synthesizes only
+  `tributary-remote://<lease>/{stream,artwork}/<track-uuid>`; same-source replacement, release,
+  discovery removal, manual delete, and shutdown revoke the old lease. Resolution clones the
+  resolver under the registry mutex, awaits outside it, revalidates exact ownership, and attaches
+  a shared revocation lease to the typed request. Playback and artwork generation checks prevent a
+  stale async result from reaching an output or persistent worker. Retiring a source clears and
+  stops playback only when that source owns the queue; pending resolution is invalidated without
+  disturbing another source. Pause during resolution cancels that completion and leaves Play
+  retryable, while an error from a protected output forces the next Play to resolve through the
+  live lease again instead of replaying a stale resolved request.
+  `ResolvedHttpRequest` separates a credential-free endpoint from secret request state: Plex uses
+  a sensitive `X-Plex-Token` header, Jellyfin uses a sensitive `X-Emby-Authorization` header, and
+  Subsonic keeps its protocol-required `u` plus `t`/`s` or HTTPS-only `p` pairs private until the
+  proxy materializes them for the exact upstream request. The type is neither debuggable nor
+  serializable, rejects embedded endpoint credentials and non-allowlisted auth fields, and every
+  output's typed load path fails closed rather than falling through to its clean endpoint.
+  Manual, saved, environment-configured, and discovered remote-server URLs are also validated as
+  credential-free base URLs before persistence, auth-dialog display, logs, discovery state/UI
+  publication, or ownership. Raw Jellyfin UDP discovery bodies are never logged; malformed URLs,
+  userinfo, query, and fragment state fail with one fixed input-free error. This
+  completes P1.6 and also completes P3.1's remote session-retention, authenticated-URL removal,
+  and playback-time remote-resolution boxes. P3.1 still needs stable source IDs, stable local and
+  playlist resolution, centralized refresh/failure state, and a lifecycle decision for local,
+  radio, and external files.
 - 2026-07-12 — P1.7 places the non-`Send` Cast device, application, media session, controls,
   heartbeat, status polling, and teardown on one FIFO worker. Epoch checks bracket every Cast
   effect and event; ownership is recorded immediately after application launch and media load so
@@ -994,8 +1050,9 @@ Add one line per completed task:
 | 2026-07-12 | P1.4a | `eb5458f` | Exact-origin/no-Referer policy and URL-free errors/logging cover every then-app-owned credential HTTP fetch; Chromecast and MPD are ticketed by P1.6. |
 | 2026-07-14 | P1.4b | `2188efb`, `28e3400` | Local playbin3 and AirPlay uridecodebin now receive only dedicated opaque loopback tickets for protected media; app-owned exact-origin/no-Referer fetching, Range-only forwarding, fail-closed setup, lifecycle revocation, and stale-callback isolation complete P1.4. The review follow-up moves server startup/revocation outside the state mutex and uses generation ownership so newer loads and Stop supersede in-flight startup without waiting or stale installation; 10 focused tests cover the slice. |
 | 2026-07-12 | P1.5 | `842341b` | Counted finite-response reads enforce endpoint caps and total deadlines across API, authentication, DAAP, radio, artwork, and metadata clients. |
-| 2026-07-14 | P1.6 receiver tickets | `c6aa7df`, `e23efd8` | Chromecast and MPD now receive revocable single-media tickets instead of backend credentials. MPD binds a dedicated IPv4/IPv6 proxy to the successful connection route, fails closed without it, and revokes across replacement, Stop, failure, ownership loss, EOS, shutdown, and stale generations; 18 new MPD/classifier/route tests cover the slice. Generic credential-free track values remain open. |
+| 2026-07-14 | P1.6 receiver tickets | `c6aa7df`, `e23efd8` | Chromecast and MPD now receive revocable single-media tickets instead of backend credentials. MPD binds a dedicated IPv4/IPv6 proxy to the successful connection route, fails closed without it, and revokes across replacement, Stop, failure, ownership loss, EOS, shutdown, and stale generations; 18 new MPD/classifier/route tests cover the slice. |
 | 2026-07-14 | P1.6 upstream-ticket TTL | `8735862` | Credential-bearing upstream routes now expire at a hard, non-sliding 24-hour monotonic deadline in addition to earlier lifecycle revocation. Boundary lookup atomically removes the route and returns 404; admitted responses may finish, local-file routes remain server-lifetime, and 6 deterministic tests cover the contract. |
+| 2026-07-14 | P1.6 playback-time resolver | PR #86 | Standard remote catalogue/UI values carry only stable identity and exact opaque lease references. A generation-owned registry retains backend resolvers; typed playback/artwork requests isolate Plex/Jellyfin headers and Subsonic private query material until the app-owned exact-origin proxy fetch. Lease replacement/release/shutdown revokes old references and already-issued requests; unsafe manual, saved, environment, and discovery base URLs are rejected before persistence, display, logs, discovery publication, or ownership; and 36 focused tests cover request isolation, backends, native-ID collisions, registry races, stale UI work, URL rejection, and output boundaries. |
 | 2026-07-12 | P1.7 | `60ee2af` | One worker owns the Cast session and serializes effects, authoritative state, cancellation, cleanup retries, and stale-event suppression. |
 | 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
 | 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |

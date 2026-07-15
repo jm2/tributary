@@ -40,7 +40,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket};
+use super::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket, PreparedGstreamerMedia};
 use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
 
@@ -48,6 +48,8 @@ use gst::prelude::*;
 use gstreamer as gst;
 use gtk::glib;
 use tracing::{debug, error, info, warn};
+
+use crate::architecture::media::ResolvedHttpRequest;
 
 /// Active AirPlay session: the dedicated GStreamer pipeline plus, if we
 /// fell back to it, the `shairport-sync` child process.
@@ -168,6 +170,19 @@ impl AirPlayOutput {
             .media_proxy
             .prepare(uri)
             .map_err(|_| "AirPlay media preparation failed".to_string())?;
+        self.open_prepared_media(prepared)
+    }
+
+    fn open_resolved_session(&self, request: ResolvedHttpRequest) -> Result<(), String> {
+        self.close_session();
+        let prepared = self
+            .media_proxy
+            .prepare_resolved(request)
+            .map_err(|_| "AirPlay media preparation failed".to_string())?;
+        self.open_prepared_media(prepared)
+    }
+
+    fn open_prepared_media(&self, prepared: PreparedGstreamerMedia) -> Result<(), String> {
         let media_ticket = prepared.ticket();
         let result = self.open_prepared_session(prepared.uri(), media_ticket.clone());
         if result.is_err() {
@@ -176,6 +191,27 @@ impl AirPlayOutput {
             }
         }
         result
+    }
+
+    fn finish_load(&self, generation: PlayerEventGeneration, result: Result<(), String>) {
+        if let Err(e) = result {
+            error!(error = %e, "AirPlay: failed to open session");
+            let _ = self.event_tx.try_send(PlayerEvent::error(generation, e));
+            let _ = self
+                .event_tx
+                .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
+        } else if !self.set_pipeline_state(gst::State::Playing) {
+            // `open_session` only prerolls the pipeline to Paused; like every
+            // other output, a load must actually start playback.
+            self.close_session();
+            let _ = self.event_tx.try_send(PlayerEvent::error(
+                generation,
+                "AirPlay playback failed to start",
+            ));
+            let _ = self
+                .event_tx
+                .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
+        }
     }
 
     fn open_prepared_session(
@@ -488,27 +524,16 @@ impl AudioOutput for AirPlayOutput {
             .event_tx
             .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
 
-        if let Err(e) = self.open_session(uri) {
-            error!(error = %e, "AirPlay: failed to open session");
-            let _ = self.event_tx.try_send(PlayerEvent::error(generation, e));
-            let _ = self
-                .event_tx
-                .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
-        } else {
-            // `open_session` only prerolls the pipeline to Paused; like every
-            // other output, `load_uri` must actually start playback, so drive
-            // it to Playing now that buffers are prerolled.
-            if !self.set_pipeline_state(gst::State::Playing) {
-                self.close_session();
-                let _ = self.event_tx.try_send(PlayerEvent::error(
-                    generation,
-                    "AirPlay playback failed to start",
-                ));
-                let _ = self
-                    .event_tx
-                    .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
-            }
-        }
+        self.finish_load(generation, self.open_session(uri));
+    }
+
+    fn load_resolved(&self, request: ResolvedHttpRequest) {
+        info!("AirPlay: loading resolved media");
+        let generation = self.event_generation();
+        let _ = self
+            .event_tx
+            .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
+        self.finish_load(generation, self.open_resolved_session(request));
     }
 
     fn set_event_generation(&self, generation: PlayerEventGeneration) {

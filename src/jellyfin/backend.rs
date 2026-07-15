@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tracing::info;
-use url::Url;
 use uuid::Uuid;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
+use crate::architecture::{RemoteMediaResolver, ResolvedHttpRequest};
 
 use super::api::{JellyfinItem, JellyfinItemsResponse, JellyfinViewsResponse};
 use super::client::JellyfinClient;
@@ -47,8 +47,12 @@ struct LibraryCache {
     tracks: Vec<Track>,
     albums: Vec<Album>,
     artists: Vec<Artist>,
-    track_by_uuid: HashMap<Uuid, usize>,
+    /// Application track UUID → Jellyfin audio item ID.
+    stream_locator_by_uuid: HashMap<Uuid, String>,
+    /// Application track UUID → Jellyfin item ID with primary artwork.
+    track_artwork_locator_by_uuid: HashMap<Uuid, String>,
     /// Jellyfin item ID → UUID we generated.
+    #[allow(dead_code)]
     jellyfin_id_to_uuid: HashMap<String, Uuid>,
 }
 
@@ -58,7 +62,8 @@ impl LibraryCache {
             tracks: Vec::new(),
             albums: Vec::new(),
             artists: Vec::new(),
-            track_by_uuid: HashMap::new(),
+            stream_locator_by_uuid: HashMap::new(),
+            track_artwork_locator_by_uuid: HashMap::new(),
             jellyfin_id_to_uuid: HashMap::new(),
         }
     }
@@ -158,7 +163,8 @@ impl JellyfinBackend {
         let mut all_tracks = Vec::new();
         let mut all_albums = Vec::new();
         let mut all_artists = Vec::new();
-        let mut track_by_uuid = HashMap::new();
+        let mut stream_locator_by_uuid = HashMap::new();
+        let mut track_artwork_locator_by_uuid = HashMap::new();
         let mut jellyfin_id_to_uuid = HashMap::new();
 
         for lib in &self.music_libraries {
@@ -184,24 +190,12 @@ impl JellyfinBackend {
                 let artist_id = item.artist_items.first().map(|a| deterministic_uuid(&a.id));
                 let album_id = item.album_id.as_deref().map(deterministic_uuid);
 
-                let stream_url = self.client.stream_url(&item.id);
+                let track = jellyfin_item_to_track(item, track_uuid, artist_id, album_id);
 
-                let cover_art_url = item
-                    .album_id
-                    .as_deref()
-                    .map(|aid| self.client.image_url(aid));
-
-                let track = jellyfin_item_to_track(
-                    item,
-                    track_uuid,
-                    artist_id,
-                    album_id,
-                    stream_url,
-                    cover_art_url,
-                );
-
-                let idx = all_tracks.len();
-                track_by_uuid.insert(track_uuid, idx);
+                stream_locator_by_uuid.insert(track_uuid, item.id.clone());
+                if let Some(album_id) = &item.album_id {
+                    track_artwork_locator_by_uuid.insert(track_uuid, album_id.clone());
+                }
                 jellyfin_id_to_uuid.insert(item.id.clone(), track_uuid);
                 all_tracks.push(track);
             }
@@ -210,17 +204,6 @@ impl JellyfinBackend {
                 let album_uuid = deterministic_uuid(&item.id);
                 let artist_id = item.artist_items.first().map(|a| deterministic_uuid(&a.id));
 
-                let cover_art_url = if item
-                    .image_tags
-                    .as_ref()
-                    .and_then(|v| v.get("Primary"))
-                    .is_some()
-                {
-                    Some(self.client.image_url(&item.id))
-                } else {
-                    None
-                };
-
                 all_albums.push(Album {
                     id: album_uuid,
                     title: item.name.clone().unwrap_or_default(),
@@ -228,7 +211,7 @@ impl JellyfinBackend {
                     artist_id,
                     year: item.production_year,
                     genre: item.genres.first().cloned(),
-                    cover_art_url,
+                    cover_art_url: None,
                     track_count: item.child_count.unwrap_or(0),
                     total_duration_secs: item.run_time_ticks.map(|t| t / 10_000_000),
                 });
@@ -236,17 +219,6 @@ impl JellyfinBackend {
 
             for item in &artists {
                 let artist_uuid = deterministic_uuid(&item.id);
-
-                let cover_art_url = if item
-                    .image_tags
-                    .as_ref()
-                    .and_then(|v| v.get("Primary"))
-                    .is_some()
-                {
-                    Some(self.client.image_url(&item.id))
-                } else {
-                    None
-                };
 
                 // Count tracks and albums for this artist from what we've already fetched.
                 let track_count = all_tracks
@@ -263,7 +235,7 @@ impl JellyfinBackend {
                     name: item.name.clone().unwrap_or_default(),
                     album_count,
                     track_count,
-                    cover_art_url,
+                    cover_art_url: None,
                 });
             }
         }
@@ -280,7 +252,8 @@ impl JellyfinBackend {
             tracks: all_tracks,
             albums: all_albums,
             artists: all_artists,
-            track_by_uuid,
+            stream_locator_by_uuid,
+            track_artwork_locator_by_uuid,
             jellyfin_id_to_uuid,
         };
 
@@ -401,6 +374,8 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
         let mut tracks = Vec::new();
         let mut albums = Vec::new();
         let mut artists = Vec::new();
+        let mut stream_locators = Vec::new();
+        let mut track_artwork_locators = Vec::new();
 
         for item in &resp.items {
             match item.item_type.as_deref() {
@@ -408,33 +383,13 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
                     let uuid = deterministic_uuid(&item.id);
                     let artist_id = item.artist_items.first().map(|a| deterministic_uuid(&a.id));
                     let album_id = item.album_id.as_deref().map(deterministic_uuid);
-                    let stream_url = self.client.stream_url(&item.id);
-                    let cover_art_url = item
-                        .album_id
-                        .as_deref()
-                        .map(|aid| self.client.image_url(aid));
-                    tracks.push(jellyfin_item_to_track(
-                        item,
-                        uuid,
-                        artist_id,
-                        album_id,
-                        stream_url,
-                        cover_art_url,
-                    ));
+                    stream_locators.push((uuid, item.id.clone()));
+                    track_artwork_locators.push((uuid, item.album_id.clone()));
+                    tracks.push(jellyfin_item_to_track(item, uuid, artist_id, album_id));
                 }
                 Some("MusicAlbum") => {
                     let uuid = deterministic_uuid(&item.id);
                     let artist_id = item.artist_items.first().map(|a| deterministic_uuid(&a.id));
-                    let cover_art_url = if item
-                        .image_tags
-                        .as_ref()
-                        .and_then(|v| v.get("Primary"))
-                        .is_some()
-                    {
-                        Some(self.client.image_url(&item.id))
-                    } else {
-                        None
-                    };
                     albums.push(Album {
                         id: uuid,
                         title: item.name.clone().unwrap_or_default(),
@@ -442,32 +397,34 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
                         artist_id,
                         year: item.production_year,
                         genre: item.genres.first().cloned(),
-                        cover_art_url,
+                        cover_art_url: None,
                         track_count: item.child_count.unwrap_or(0),
                         total_duration_secs: item.run_time_ticks.map(|t| t / 10_000_000),
                     });
                 }
                 Some("MusicArtist") => {
                     let uuid = deterministic_uuid(&item.id);
-                    let cover_art_url = if item
-                        .image_tags
-                        .as_ref()
-                        .and_then(|v| v.get("Primary"))
-                        .is_some()
-                    {
-                        Some(self.client.image_url(&item.id))
-                    } else {
-                        None
-                    };
                     artists.push(Artist {
                         id: uuid,
                         name: item.name.clone().unwrap_or_default(),
                         album_count: item.album_count.unwrap_or(0),
                         track_count: 0,
-                        cover_art_url,
+                        cover_art_url: None,
                     });
                 }
                 _ => {}
+            }
+        }
+
+        let mut cache = self.cache.write().await;
+        cache.stream_locator_by_uuid.extend(stream_locators);
+        for (track_id, artwork_item_id) in track_artwork_locators {
+            if let Some(artwork_item_id) = artwork_item_id {
+                cache
+                    .track_artwork_locator_by_uuid
+                    .insert(track_id, artwork_item_id);
+            } else {
+                cache.track_artwork_locator_by_uuid.remove(&track_id);
             }
         }
 
@@ -525,27 +482,6 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
             .collect())
     }
 
-    async fn get_stream_url(&self, track_id: &Uuid) -> BackendResult<Url> {
-        let cache = self.cache.read().await;
-        let idx = cache
-            .track_by_uuid
-            .get(track_id)
-            .ok_or_else(|| BackendError::NotFound {
-                entity_type: "track".into(),
-                id: *track_id,
-            })?;
-        let track = &cache.tracks[*idx];
-        track.stream_url.clone().ok_or_else(|| {
-            BackendError::Internal(anyhow::anyhow!("Track {} has no stream URL", track_id))
-        })
-    }
-
-    async fn get_cover_art(&self, album_id: &Uuid) -> BackendResult<Option<Url>> {
-        let cache = self.cache.read().await;
-        let album = cache.albums.iter().find(|a| a.id == *album_id);
-        Ok(album.and_then(|a| a.cover_art_url.clone()))
-    }
-
     async fn get_stats(&self) -> BackendResult<LibraryStats> {
         let cache = self.cache.read().await;
         let total_duration: u64 = cache.tracks.iter().filter_map(|t| t.duration_secs).sum();
@@ -556,6 +492,38 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
             total_artists: cache.artists.len() as u64,
             total_duration_secs: total_duration,
         })
+    }
+}
+
+#[async_trait]
+impl RemoteMediaResolver for JellyfinBackend {
+    async fn resolve_stream(&self, track_id: &Uuid) -> BackendResult<ResolvedHttpRequest> {
+        let item_id = self
+            .cache
+            .read()
+            .await
+            .stream_locator_by_uuid
+            .get(track_id)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound {
+                entity_type: "track".into(),
+                id: *track_id,
+            })?;
+        self.client.resolved_stream_request(&item_id)
+    }
+
+    async fn resolve_artwork(&self, track_id: &Uuid) -> BackendResult<Option<ResolvedHttpRequest>> {
+        let item_id = self
+            .cache
+            .read()
+            .await
+            .track_artwork_locator_by_uuid
+            .get(track_id)
+            .cloned();
+        item_id
+            .as_deref()
+            .map(|id| self.client.resolved_artwork_request(id))
+            .transpose()
     }
 }
 
@@ -571,8 +539,6 @@ fn jellyfin_item_to_track(
     id: Uuid,
     artist_id: Option<Uuid>,
     album_id: Option<Uuid>,
-    stream_url: Url,
-    cover_art_url: Option<Url>,
 ) -> Track {
     // Extract bitrate and sample rate from media sources.
     let (bitrate_kbps, sample_rate_hz) = item
@@ -608,8 +574,8 @@ fn jellyfin_item_to_track(
         genre: item.genres.first().cloned(),
         year: item.production_year,
         file_path: None,
-        stream_url: Some(stream_url),
-        cover_art_url,
+        stream_url: None,
+        cover_art_url: None,
         date_added: None,
         date_modified: item.date_created.as_deref().and_then(|s| {
             chrono::DateTime::parse_from_rfc3339(s)
@@ -620,5 +586,25 @@ fn jellyfin_item_to_track(
         sample_rate_hz,
         format: item.container.clone(),
         play_count: item.user_data.as_ref().and_then(|ud| ud.play_count),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converted_track_does_not_expose_remote_urls() {
+        let item: JellyfinItem = serde_json::from_value(serde_json::json!({
+            "Id": "track-id",
+            "Name": "Song",
+            "Type": "Audio",
+            "AlbumId": "album-id"
+        }))
+        .unwrap();
+
+        let track = jellyfin_item_to_track(&item, Uuid::new_v4(), None, None);
+        assert!(track.stream_url.is_none());
+        assert!(track.cover_art_url.is_none());
     }
 }

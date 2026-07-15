@@ -66,6 +66,7 @@ mod local;
 #[allow(dead_code)]
 mod plex;
 mod radio;
+mod source_registry;
 mod subsonic;
 mod ui;
 
