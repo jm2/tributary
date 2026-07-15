@@ -39,6 +39,10 @@ pub enum LibraryEvent {
     /// Tracks from a remote backend, keyed by source (e.g. server URL).
     RemoteSync {
         source_key: String,
+        /// Connection generation validated at the GTK publication boundary.
+        generation: u64,
+        /// Opaque registry lease used to synthesize credential-free media refs.
+        lease_key: Uuid,
         tracks: Vec<Track>,
     },
     /// Tracks from a generation-scoped DAAP session. The GTK receiver

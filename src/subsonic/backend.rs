@@ -2,8 +2,8 @@
 //!
 //! All metadata is held in memory — nothing touches the local SQLite DB.
 //! The full library is fetched during [`SubsonicBackend::connect`] and
-//! cached for fast browsing.  Streaming URLs include authentication
-//! tokens so GStreamer can fetch audio directly.
+//! cached for fast browsing. Credentials remain in the retained backend and
+//! are resolved into proxy-only requests at playback time.
 
 use std::collections::HashMap;
 
@@ -11,12 +11,12 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::sync::RwLock;
 use tracing::info;
-use url::Url;
 use uuid::Uuid;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
+use crate::architecture::{RemoteMediaResolver, ResolvedHttpRequest};
 
 use super::api::{AlbumEntry, ArtistEntry, SongEntry};
 use super::client::SubsonicClient;
@@ -34,8 +34,10 @@ struct LibraryCache {
     tracks: Vec<Track>,
     albums: Vec<Album>,
     artists: Vec<Artist>,
-    /// Subsonic song ID → index in `tracks`.
-    track_by_uuid: HashMap<Uuid, usize>,
+    /// Application track UUID → Subsonic song ID.
+    stream_locator_by_uuid: HashMap<Uuid, String>,
+    /// Application track UUID → Subsonic cover-art ID.
+    track_artwork_locator_by_uuid: HashMap<Uuid, String>,
     /// Subsonic song ID (string) → Uuid we generated.
     #[allow(dead_code)]
     subsonic_id_to_uuid: HashMap<String, Uuid>,
@@ -47,7 +49,8 @@ impl LibraryCache {
             tracks: Vec::new(),
             albums: Vec::new(),
             artists: Vec::new(),
-            track_by_uuid: HashMap::new(),
+            stream_locator_by_uuid: HashMap::new(),
+            track_artwork_locator_by_uuid: HashMap::new(),
             subsonic_id_to_uuid: HashMap::new(),
         }
     }
@@ -241,7 +244,8 @@ impl SubsonicBackend {
         let mut all_tracks = Vec::new();
         let mut all_albums = Vec::new();
         let mut all_artists = Vec::new();
-        let mut track_by_uuid = HashMap::new();
+        let mut stream_locator_by_uuid = HashMap::new();
+        let mut track_artwork_locator_by_uuid = HashMap::new();
         let mut subsonic_id_to_uuid = HashMap::new();
 
         for (ai, (_, albums)) in artist_albums.iter().enumerate() {
@@ -263,21 +267,13 @@ impl SubsonicBackend {
 
                 for song in songs {
                     let track_uuid = deterministic_uuid(&song.id);
-                    let stream_url = self.client.stream_url(&song.id);
+                    let track =
+                        song_to_track(song, track_uuid, Some(artist_uuid), Some(album_uuid));
 
-                    let track = song_to_track(
-                        song,
-                        track_uuid,
-                        Some(artist_uuid),
-                        Some(album_uuid),
-                        stream_url,
-                        song.cover_art
-                            .as_deref()
-                            .map(|id| self.client.cover_art_url(id)),
-                    );
-
-                    let idx = all_tracks.len();
-                    track_by_uuid.insert(track_uuid, idx);
+                    stream_locator_by_uuid.insert(track_uuid, song.id.clone());
+                    if let Some(cover_art_id) = &song.cover_art {
+                        track_artwork_locator_by_uuid.insert(track_uuid, cover_art_id.clone());
+                    }
                     subsonic_id_to_uuid.insert(song.id.clone(), track_uuid);
                     all_tracks.push(track);
                 }
@@ -288,10 +284,6 @@ impl SubsonicBackend {
                     api_album,
                     album_uuid,
                     Some(artist_uuid),
-                    api_album
-                        .cover_art
-                        .as_deref()
-                        .map(|id| self.client.cover_art_url(id)),
                 ));
             }
 
@@ -300,10 +292,7 @@ impl SubsonicBackend {
                 name: api_artist.name.clone(),
                 album_count: api_albums.len() as u32,
                 track_count: artist_track_count,
-                cover_art_url: api_artist
-                    .cover_art
-                    .as_deref()
-                    .map(|id| self.client.cover_art_url(id)),
+                cover_art_url: None,
             });
         }
 
@@ -319,7 +308,8 @@ impl SubsonicBackend {
             tracks: all_tracks,
             albums: all_albums,
             artists: all_artists,
-            track_by_uuid,
+            stream_locator_by_uuid,
+            track_artwork_locator_by_uuid,
             subsonic_id_to_uuid,
         };
 
@@ -374,7 +364,7 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
                 song: Vec::new(),
             });
 
-        Ok(SearchResults {
+        let results = SearchResults {
             artists: sr
                 .artist
                 .iter()
@@ -383,10 +373,7 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
                     name: a.name.clone(),
                     album_count: a.album_count.unwrap_or(0),
                     track_count: 0,
-                    cover_art_url: a
-                        .cover_art
-                        .as_deref()
-                        .map(|id| self.client.cover_art_url(id)),
+                    cover_art_url: None,
                 })
                 .collect(),
             albums: sr
@@ -397,9 +384,6 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
                         a,
                         deterministic_uuid(&a.id),
                         a.artist_id.as_deref().map(deterministic_uuid),
-                        a.cover_art
-                            .as_deref()
-                            .map(|id| self.client.cover_art_url(id)),
                     )
                 })
                 .collect(),
@@ -413,14 +397,28 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
                         uuid,
                         s.artist_id.as_deref().map(deterministic_uuid),
                         s.album_id.as_deref().map(deterministic_uuid),
-                        self.client.stream_url(&s.id),
-                        s.cover_art
-                            .as_deref()
-                            .map(|id| self.client.cover_art_url(id)),
                     )
                 })
                 .collect(),
-        })
+        };
+
+        // Search results may include entities outside the initially loaded
+        // catalogue. Retain their native locators before exposing the generic
+        // models so selecting one can still resolve at playback time.
+        let mut cache = self.cache.write().await;
+        for song in &sr.song {
+            let uuid = deterministic_uuid(&song.id);
+            cache.stream_locator_by_uuid.insert(uuid, song.id.clone());
+            if let Some(cover_art_id) = &song.cover_art {
+                cache
+                    .track_artwork_locator_by_uuid
+                    .insert(uuid, cover_art_id.clone());
+            } else {
+                cache.track_artwork_locator_by_uuid.remove(&uuid);
+            }
+        }
+
+        Ok(results)
     }
 
     async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
@@ -470,27 +468,6 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
             .collect())
     }
 
-    async fn get_stream_url(&self, track_id: &Uuid) -> BackendResult<Url> {
-        let cache = self.cache.read().await;
-        let idx = cache
-            .track_by_uuid
-            .get(track_id)
-            .ok_or_else(|| BackendError::NotFound {
-                entity_type: "track".into(),
-                id: *track_id,
-            })?;
-        let track = &cache.tracks[*idx];
-        track.stream_url.clone().ok_or_else(|| {
-            BackendError::Internal(anyhow::anyhow!("Track {} has no stream URL", track_id))
-        })
-    }
-
-    async fn get_cover_art(&self, album_id: &Uuid) -> BackendResult<Option<Url>> {
-        let cache = self.cache.read().await;
-        let album = cache.albums.iter().find(|a| a.id == *album_id);
-        Ok(album.and_then(|a| a.cover_art_url.clone()))
-    }
-
     async fn get_stats(&self) -> BackendResult<LibraryStats> {
         let cache = self.cache.read().await;
         let total_duration: u64 = cache.tracks.iter().filter_map(|t| t.duration_secs).sum();
@@ -501,6 +478,38 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
             total_artists: cache.artists.len() as u64,
             total_duration_secs: total_duration,
         })
+    }
+}
+
+#[async_trait]
+impl RemoteMediaResolver for SubsonicBackend {
+    async fn resolve_stream(&self, track_id: &Uuid) -> BackendResult<ResolvedHttpRequest> {
+        let song_id = self
+            .cache
+            .read()
+            .await
+            .stream_locator_by_uuid
+            .get(track_id)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound {
+                entity_type: "track".into(),
+                id: *track_id,
+            })?;
+        self.client.resolved_stream_request(&song_id)
+    }
+
+    async fn resolve_artwork(&self, track_id: &Uuid) -> BackendResult<Option<ResolvedHttpRequest>> {
+        let cover_art_id = self
+            .cache
+            .read()
+            .await
+            .track_artwork_locator_by_uuid
+            .get(track_id)
+            .cloned();
+        cover_art_id
+            .as_deref()
+            .map(|id| self.client.resolved_artwork_request(id))
+            .transpose()
     }
 }
 
@@ -518,8 +527,6 @@ fn song_to_track(
     id: Uuid,
     artist_id: Option<Uuid>,
     album_id: Option<Uuid>,
-    stream_url: Url,
-    cover_art_url: Option<Url>,
 ) -> Track {
     Track {
         id,
@@ -535,8 +542,8 @@ fn song_to_track(
         genre: song.genre.clone(),
         year: song.year,
         file_path: None, // Remote — no local file
-        stream_url: Some(stream_url),
-        cover_art_url,
+        stream_url: None,
+        cover_art_url: None,
         date_added: None,
         date_modified: None,
         bitrate_kbps: song.bit_rate,
@@ -546,12 +553,7 @@ fn song_to_track(
     }
 }
 
-fn album_entry_to_album(
-    entry: &AlbumEntry,
-    id: Uuid,
-    artist_id: Option<Uuid>,
-    cover_art_url: Option<Url>,
-) -> Album {
+fn album_entry_to_album(entry: &AlbumEntry, id: Uuid, artist_id: Option<Uuid>) -> Album {
     Album {
         id,
         title: entry.name.clone(),
@@ -559,8 +561,170 @@ fn album_entry_to_album(
         artist_id,
         year: entry.year,
         genre: entry.genre.clone(),
-        cover_art_url,
+        cover_art_url: None,
         track_count: entry.song_count.unwrap_or(0),
         total_duration_secs: entry.duration,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use axum::extract::OriginalUri;
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use axum::{Json, Router};
+
+    use crate::architecture::MediaBackend as _;
+
+    use super::*;
+
+    async fn overlapping_id_fixture(OriginalUri(uri): OriginalUri) -> Response {
+        let body = match uri.path() {
+            "/rest/ping.view" => serde_json::json!({
+                "subsonic-response": { "status": "ok" }
+            }),
+            "/rest/getArtists.view" => serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artists": {
+                        "index": [{
+                            "artist": [{
+                                "id": "shared-native-id",
+                                "name": "Artist",
+                                "coverArt": "full-artist-cover"
+                            }]
+                        }]
+                    }
+                }
+            }),
+            "/rest/getArtist.view" => serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artist": {
+                        "id": "shared-native-id",
+                        "name": "Artist",
+                        "album": [{
+                            "id": "shared-native-id",
+                            "name": "Album",
+                            "coverArt": "full-album-cover"
+                        }]
+                    }
+                }
+            }),
+            "/rest/getAlbum.view" => serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "album": {
+                        "id": "shared-native-id",
+                        "name": "Album",
+                        "song": [{
+                            "id": "shared-native-id",
+                            "title": "Song",
+                            "coverArt": "full-song-cover"
+                        }]
+                    }
+                }
+            }),
+            "/rest/search3.view" => serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "searchResult3": {
+                        "artist": [{
+                            "id": "shared-native-id",
+                            "name": "Artist",
+                            "coverArt": "search-artist-cover"
+                        }],
+                        "album": [{
+                            "id": "shared-native-id",
+                            "name": "Album",
+                            "coverArt": "search-album-cover"
+                        }],
+                        "song": [{
+                            "id": "shared-native-id",
+                            "title": "Song",
+                            "coverArt": "search-song-cover"
+                        }]
+                    }
+                }
+            }),
+            _ => return StatusCode::NOT_FOUND.into_response(),
+        };
+        Json(body).into_response()
+    }
+
+    fn resolved_media_id(request: &ResolvedHttpRequest) -> String {
+        request
+            .endpoint()
+            .query_pairs()
+            .find_map(|(key, value)| (key == "id").then(|| value.into_owned()))
+            .expect("resolved Subsonic request carries a public media ID")
+    }
+
+    #[test]
+    fn converted_models_do_not_expose_remote_credentials_or_urls() {
+        let song: SongEntry = serde_json::from_value(serde_json::json!({
+            "id": "song-id",
+            "title": "Song",
+            "coverArt": "cover-id"
+        }))
+        .unwrap();
+        let album: AlbumEntry = serde_json::from_value(serde_json::json!({
+            "id": "album-id",
+            "name": "Album",
+            "coverArt": "cover-id"
+        }))
+        .unwrap();
+
+        let track = song_to_track(&song, Uuid::new_v4(), None, None);
+        let album = album_entry_to_album(&album, Uuid::new_v4(), None);
+
+        assert!(track.stream_url.is_none());
+        assert!(track.cover_art_url.is_none());
+        assert!(album.cover_art_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn track_artwork_survives_same_native_album_and_artist_ids() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind Subsonic fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(get(overlapping_id_fixture)),
+            )
+            .await
+            .expect("serve Subsonic fixture");
+        });
+
+        let backend =
+            SubsonicBackend::connect("fixture", &format!("http://{address}"), "user", "password")
+                .await
+                .expect("connect to fixture");
+        let shared_id = deterministic_uuid("shared-native-id");
+
+        let initial = backend
+            .resolve_artwork(&shared_id)
+            .await
+            .expect("resolve full-library artwork")
+            .expect("full-library artwork");
+        assert_eq!(resolved_media_id(&initial), "full-song-cover");
+
+        let results = backend.search("Song", 10).await.expect("search fixture");
+        assert_eq!(results.tracks.len(), 1);
+        assert_eq!(results.albums.len(), 1);
+        assert_eq!(results.artists.len(), 1);
+        let searched = backend
+            .resolve_artwork(&shared_id)
+            .await
+            .expect("resolve searched artwork")
+            .expect("searched artwork");
+        assert_eq!(resolved_media_id(&searched), "search-song-cover");
+
+        server.abort();
     }
 }

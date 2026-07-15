@@ -6,7 +6,6 @@
 //! making data-source swapping and multi-source aggregation trivial.
 
 use async_trait::async_trait;
-use url::Url;
 use uuid::Uuid;
 
 use super::error::BackendError;
@@ -74,24 +73,6 @@ pub trait MediaBackend: Send + Sync {
 
     /// Retrieve every track belonging to a specific artist.
     async fn get_artist_tracks(&self, artist_id: &Uuid) -> BackendResult<Vec<Track>>;
-
-    // -------------------------------------------------------------------
-    // Playback
-    // -------------------------------------------------------------------
-
-    /// Obtain a playable URL for a track.
-    ///
-    /// * **Local backend:** returns a `file:///` URI.
-    /// * **Remote backends:** returns an authenticated streaming URL
-    ///   (possibly time-limited).
-    async fn get_stream_url(&self, track_id: &Uuid) -> BackendResult<Url>;
-
-    // -------------------------------------------------------------------
-    // Artwork
-    // -------------------------------------------------------------------
-
-    /// Retrieve cover art for an album, if available.
-    async fn get_cover_art(&self, album_id: &Uuid) -> BackendResult<Option<Url>>;
 
     // -------------------------------------------------------------------
     // Statistics

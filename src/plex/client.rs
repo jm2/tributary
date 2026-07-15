@@ -3,13 +3,14 @@
 
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
 use reqwest::Client;
 use tracing::{debug, info};
 use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::architecture::ResolvedHttpRequest;
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
     authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
@@ -228,28 +229,40 @@ impl PlexClient {
         url
     }
 
-    /// Build a stream URL for a track part.
+    /// Resolve a stream request for a track part.
     ///
     /// The `part_key` is a relative path like `/library/parts/12345/file.flac`.
-    /// The token is appended as a query parameter so GStreamer's `playbin3`
-    /// can fetch the audio without needing custom HTTP headers.
-    pub fn stream_url(&self, part_key: &str) -> Url {
+    /// Authentication is retained as a sensitive header, never appended to
+    /// the URL copied into generic models.
+    pub(crate) fn resolved_stream_request(
+        &self,
+        part_key: &str,
+    ) -> BackendResult<ResolvedHttpRequest> {
         let mut url = self.base_url.clone();
         url.set_path(part_key);
-        url.query_pairs_mut()
-            .append_pair("X-Plex-Token", &self.auth_token);
-        url
+        url.set_query(None);
+        url.set_fragment(None);
+        ResolvedHttpRequest::new(url)?.with_sensitive_header(
+            HeaderName::from_static("x-plex-token"),
+            plex_auth_header(&self.auth_token)?,
+        )
     }
 
-    /// Build a thumbnail URL.
+    /// Resolve a thumbnail request with the same credential isolation.
     ///
     /// The `thumb_path` is a relative path like `/library/metadata/12345/thumb/1234567890`.
-    pub fn thumb_url(&self, thumb_path: &str) -> Url {
+    pub(crate) fn resolved_artwork_request(
+        &self,
+        thumb_path: &str,
+    ) -> BackendResult<ResolvedHttpRequest> {
         let mut url = self.base_url.clone();
         url.set_path(thumb_path);
-        url.query_pairs_mut()
-            .append_pair("X-Plex-Token", &self.auth_token);
-        url
+        url.set_query(None);
+        url.set_fragment(None);
+        ResolvedHttpRequest::new(url)?.with_sensitive_header(
+            HeaderName::from_static("x-plex-token"),
+            plex_auth_header(&self.auth_token)?,
+        )
     }
 
     /// Issue a GET request to a Plex endpoint and deserialize the
@@ -319,13 +332,7 @@ impl PlexClient {
 /// Build a `reqwest::Client` with Plex auth and identification headers.
 fn build_http_client(auth_token: &str) -> BackendResult<Client> {
     let mut default_headers = HeaderMap::new();
-    default_headers.insert(
-        "X-Plex-Token",
-        HeaderValue::from_str(auth_token).map_err(|e| BackendError::ConnectionFailed {
-            message: format!("Invalid auth token value: {e}"),
-            source: Some(Box::new(e)),
-        })?,
-    );
+    default_headers.insert("X-Plex-Token", plex_auth_header(auth_token)?);
     default_headers.insert(
         "X-Plex-Client-Identifier",
         HeaderValue::from_static(CLIENT_NAME),
@@ -347,6 +354,19 @@ fn build_http_client(auth_token: &str) -> BackendResult<Client> {
             message: format!("Failed to build HTTP client: {e}"),
             source: Some(Box::new(e)),
         })
+}
+
+fn invalid_auth_header(error: reqwest::header::InvalidHeaderValue) -> BackendError {
+    BackendError::ConnectionFailed {
+        message: format!("Invalid auth token value: {error}"),
+        source: Some(Box::new(error)),
+    }
+}
+
+fn plex_auth_header(auth_token: &str) -> BackendResult<HeaderValue> {
+    let mut value = HeaderValue::from_str(auth_token).map_err(invalid_auth_header)?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 fn response_body_error(context: &str, error: ResponseBodyError) -> BackendError {
@@ -397,5 +417,29 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains("embedded-user"));
         assert!(!rendered.contains(&secret));
+    }
+
+    #[test]
+    fn resolved_media_requests_keep_token_out_of_urls() {
+        let auth_token = uuid::Uuid::new_v4().to_string();
+        let client = PlexClient::new("https://plex.example.test", &auth_token).expect("client");
+
+        for request in [
+            client
+                .resolved_stream_request("/library/parts/1/file.flac")
+                .unwrap(),
+            client
+                .resolved_artwork_request("/library/metadata/1/thumb/2")
+                .unwrap(),
+        ] {
+            assert!(!request.endpoint().as_str().contains(&auth_token));
+            assert!(request.endpoint().query().is_none());
+            assert!(request.private_query_pairs().is_empty());
+            let value = request
+                .sensitive_headers()
+                .get("x-plex-token")
+                .expect("auth header");
+            assert!(value.is_sensitive());
+        }
     }
 }

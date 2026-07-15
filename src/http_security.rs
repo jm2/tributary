@@ -11,6 +11,7 @@ use reqwest::Url;
 
 const MAX_REDIRECTS: usize = 10;
 const REDACTED: &str = "REDACTED";
+const INVALID_BASE_URL: &str = "Invalid server URL: use an http:// or https:// base URL with a host and without embedded credentials, a query, or a fragment";
 
 /// Start an asynchronous client builder with credential-safe redirect defaults.
 pub fn authenticated_client_builder() -> reqwest::ClientBuilder {
@@ -53,14 +54,26 @@ pub fn strip_request_url(error: reqwest::Error) -> reqwest::Error {
 pub fn validate_base_url(url: &Url) -> Result<(), &'static str> {
     if url.cannot_be_a_base()
         || !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
-        return Err(
-            "Invalid server URL: use an http:// or https:// URL without embedded credentials",
-        );
+        return Err(INVALID_BASE_URL);
     }
     Ok(())
+}
+
+/// Parse and validate user/config supplied base-URL text before it is logged,
+/// persisted, or published as a source identity.
+///
+/// The error is deliberately fixed and never includes `input`, because the
+/// rejected value may itself contain a password or bearer token.
+pub fn parse_base_url(input: &str) -> Result<Url, &'static str> {
+    let url = Url::parse(input).map_err(|_| INVALID_BASE_URL)?;
+    validate_base_url(&url)?;
+    Ok(url)
 }
 
 /// Mask credentials embedded in a URL before it is written to a log.
@@ -376,16 +389,30 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_base_urls_reject_opaque_non_http_and_userinfo_inputs() {
+    fn authenticated_base_urls_reject_opaque_non_http_userinfo_query_and_fragment_inputs() {
         assert!(validate_base_url(&url("https://music.example.test:443/base")).is_ok());
         for unsafe_url in [
             "music.example.test:443",
             "ftp://music.example.test/base",
             "https://user:secret@music.example.test/base",
+            "https://music.example.test/base?api_key=secret",
+            "https://music.example.test/base#fragment",
         ] {
             let error = validate_base_url(&url(unsafe_url)).expect_err("unsafe base URL");
             assert!(!error.contains("secret"));
             assert!(!error.contains(unsafe_url));
+        }
+
+        for unsafe_text in [
+            "not a URL with secret-password",
+            "https://user:secret@music.example.test/base",
+            "https://music.example.test/base?api_key=secret",
+            "https://music.example.test/base#fragment",
+        ] {
+            let error = parse_base_url(unsafe_text).expect_err("unsafe base URL text");
+            assert_eq!(error, INVALID_BASE_URL);
+            assert!(!error.contains("secret"));
+            assert!(!error.contains(unsafe_text));
         }
     }
 

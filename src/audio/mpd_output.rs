@@ -20,6 +20,7 @@ use url::Url;
 use super::cast_http_server::CastHttpServer;
 use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
+use crate::architecture::media::ResolvedHttpRequest;
 use crate::http_security::{classify_media_uri, MediaUriSecurity};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -65,6 +66,9 @@ enum CommandKind {
     },
     ProtectedLoad {
         upstream: Box<Url>,
+    },
+    ResolvedLoad {
+        request: Box<ResolvedHttpRequest>,
     },
     RejectLoad {
         failure: MpdFailure,
@@ -124,12 +128,38 @@ trait MpdMediaTicket: Send + Sync {
     fn revoke(&self);
 }
 
+/// Protected upstream state carried through the ordered worker.
+///
+/// Deliberately not `Debug`: the legacy URL may embed a credential and the
+/// typed request owns sensitive headers/private query material.
+enum MpdUpstream {
+    Legacy(Box<Url>),
+    Resolved(Box<ResolvedHttpRequest>),
+}
+
+impl MpdUpstream {
+    #[cfg(test)]
+    fn endpoint(&self) -> &Url {
+        match self {
+            Self::Legacy(url) => url,
+            Self::Resolved(request) => request.endpoint(),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        match self {
+            Self::Legacy(_) => true,
+            Self::Resolved(request) => request.is_active(),
+        }
+    }
+}
+
 trait MpdProxyFactory: Send + Sync + 'static {
     fn start(
         &self,
         runtime: &tokio::runtime::Handle,
         local_addr: SocketAddr,
-        upstream: &Url,
+        upstream: &MpdUpstream,
     ) -> MpdResult<Arc<dyn MpdMediaTicket>>;
 }
 
@@ -155,12 +185,20 @@ impl MpdProxyFactory for CastMpdProxyFactory {
         &self,
         runtime: &tokio::runtime::Handle,
         local_addr: SocketAddr,
-        upstream: &Url,
+        upstream: &MpdUpstream,
     ) -> MpdResult<Arc<dyn MpdMediaTicket>> {
         let server = runtime
             .block_on(CastHttpServer::start_on(local_addr))
             .map_err(|error| opaque_mpd_failure("media proxy startup", error))?;
-        let uri = server.register_upstream(upstream);
+        if !upstream.is_active() {
+            return Err(MpdFailure::new("media source availability"));
+        }
+        let uri = match upstream {
+            MpdUpstream::Legacy(url) => server.register_upstream(url),
+            MpdUpstream::Resolved(request) => server
+                .register_resolved(request.as_ref().clone())
+                .ok_or_else(|| MpdFailure::new("media source availability"))?,
+        };
         // Keep the same command and URI bounds for generated tickets as for
         // direct media. Registration is fail-closed if the route cannot yield
         // a valid MPD argument.
@@ -204,9 +242,12 @@ impl ProxyServices {
         &self,
         owner: CommandOwner,
         local_addr: SocketAddr,
-        upstream: &Url,
+        upstream: &MpdUpstream,
         intent_epoch: &AtomicU64,
     ) -> MpdResult<SessionTicket> {
+        if !upstream.is_active() {
+            return Err(MpdFailure::new("media source availability"));
+        }
         let runtime = self
             .runtime
             .lock()
@@ -214,6 +255,10 @@ impl ProxyServices {
             .clone()
             .ok_or_else(|| MpdFailure::new("media proxy runtime"))?;
         let ticket = self.factory.start(&runtime, local_addr, upstream)?;
+        if !upstream.is_active() {
+            ticket.revoke();
+            return Err(MpdFailure::new("media source availability"));
+        }
         if let Err(failure) = encode_mpd_arg(ticket.uri()) {
             ticket.revoke();
             return Err(failure);
@@ -899,7 +944,7 @@ enum CleanupKind {
 /// variant contains the upstream credential that must never reach MPD.
 enum MpdMedia {
     Direct(String),
-    Protected(Box<Url>),
+    Protected(MpdUpstream),
 }
 
 fn spawn_mpd_worker<C>(
@@ -973,7 +1018,21 @@ fn run_mpd_worker<C>(
                             &mut connector,
                             &mut active,
                             command.owner,
-                            MpdMedia::Protected(upstream),
+                            MpdMedia::Protected(MpdUpstream::Legacy(upstream)),
+                            &proxy,
+                            &intent_epoch,
+                            &cache,
+                            &event_tx,
+                            timing,
+                        );
+                        true
+                    }
+                    CommandKind::ResolvedLoad { request } => {
+                        handle_load(
+                            &mut connector,
+                            &mut active,
+                            command.owner,
+                            MpdMedia::Protected(MpdUpstream::Resolved(request)),
                             &proxy,
                             &intent_epoch,
                             &cache,
@@ -2134,6 +2193,21 @@ impl MpdOutput {
             );
         }
     }
+
+    fn begin_load(&self) -> CommandOwner {
+        let owner = self.next_owner();
+        self.proxy.revoke_before(owner.epoch);
+        // Retire the previous track's cached state immediately. The worker may
+        // still be finishing bounded cleanup, and callers such as Previous
+        // must not apply that old position to the newly selected track.
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cache.state = PlayerState::Buffering;
+        cache.position_ms = None;
+        owner
+    }
 }
 
 impl AudioOutput for MpdOutput {
@@ -2150,19 +2224,7 @@ impl AudioOutput for MpdOutput {
     }
 
     fn load_uri(&self, uri: &str) {
-        let owner = self.next_owner();
-        self.proxy.revoke_before(owner.epoch);
-        // Retire the previous track's cached state immediately. The worker may
-        // still be finishing bounded cleanup, and callers such as Previous
-        // must not apply that old position to the newly selected track.
-        {
-            let mut cache = self
-                .cache
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            cache.state = PlayerState::Buffering;
-            cache.position_ms = None;
-        }
+        let owner = self.begin_load();
         let kind = match encode_mpd_arg(uri) {
             Err(failure) => CommandKind::RejectLoad { failure },
             Ok(_) => match classify_media_uri(uri) {
@@ -2174,6 +2236,20 @@ impl AudioOutput for MpdOutput {
                     failure: MpdFailure::new("media URI validation"),
                 },
             },
+        };
+        self.enqueue(owner, kind);
+    }
+
+    fn load_resolved(&self, request: ResolvedHttpRequest) {
+        let owner = self.begin_load();
+        let kind = if request.is_active() {
+            CommandKind::ResolvedLoad {
+                request: Box::new(request),
+            }
+        } else {
+            CommandKind::RejectLoad {
+                failure: MpdFailure::new("media source availability"),
+            }
         };
         self.enqueue(owner, kind);
     }
@@ -2559,7 +2635,7 @@ mod tests {
             &self,
             _runtime: &tokio::runtime::Handle,
             local_addr: SocketAddr,
-            upstream: &Url,
+            upstream: &MpdUpstream,
         ) -> MpdResult<Arc<dyn MpdMediaTicket>> {
             self.shared
                 .starts
@@ -2570,7 +2646,7 @@ mod tests {
                 .upstreams
                 .lock()
                 .expect("proxy upstreams lock")
-                .push(upstream.as_str().to_string());
+                .push(upstream.endpoint().as_str().to_string());
             if self.shared.fail_start.load(Ordering::SeqCst) {
                 return Err(MpdFailure::new("media proxy registration"));
             }
@@ -2797,6 +2873,38 @@ mod tests {
 
         harness.shutdown();
         assert!(!proxy_shared.active(0), "shutdown must revoke the route");
+    }
+
+    #[test]
+    fn resolved_load_adds_only_the_route_ticket_and_never_the_clean_endpoint() {
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_with_proxy(Arc::clone(&shared), proxy);
+        let owner = harness.next_replacing_owner(1);
+        let endpoint =
+            Url::parse("https://music.test/clean/track.flac?track=42").expect("clean endpoint");
+        let request = ResolvedHttpRequest::new(endpoint.clone()).expect("resolved request");
+
+        harness.send(
+            owner,
+            CommandKind::ResolvedLoad {
+                request: Box::new(request),
+            },
+        );
+        harness.fence(owner);
+
+        let added = shared.added_uris();
+        assert_eq!(added.len(), 1);
+        assert!(added[0].starts_with("http://127.0.0.1:46000/cast/opaque-"));
+        assert_ne!(added[0], endpoint.as_str());
+        assert!(!added[0].contains("music.test"));
+        assert!(!added[0].contains("track=42"));
+        assert!(proxy_shared.active(0));
+
+        harness.shutdown();
+        assert!(!proxy_shared.active(0));
     }
 
     #[test]
@@ -3061,11 +3169,14 @@ mod tests {
             epoch: 1,
             event_generation: PlayerEventGeneration::from_raw(1),
         };
+        let old_upstream = MpdUpstream::Legacy(Box::new(
+            Url::parse("https://music.test/old?api_key=secret").expect("old URL"),
+        ));
         let old = proxy
             .start_ticket(
                 old_owner,
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 50_001)),
-                &Url::parse("https://music.test/old?api_key=secret").expect("old URL"),
+                &old_upstream,
                 &epoch,
             )
             .expect("old ticket");
@@ -3074,11 +3185,14 @@ mod tests {
             epoch: 2,
             event_generation: PlayerEventGeneration::from_raw(2),
         };
+        let new_upstream = MpdUpstream::Legacy(Box::new(
+            Url::parse("https://music.test/new?api_key=secret").expect("new URL"),
+        ));
         let new = proxy
             .start_ticket(
                 new_owner,
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 50_002)),
-                &Url::parse("https://music.test/new?api_key=secret").expect("new URL"),
+                &new_upstream,
                 &epoch,
             )
             .expect("new ticket");
@@ -4297,6 +4411,37 @@ mod tests {
             worker_rx.recv().expect("direct command").kind,
             CommandKind::Load { uri } if uri == "Albums/Artist/track.flac"
         ));
+    }
+
+    #[test]
+    fn typed_load_enters_the_ordered_worker_without_serializing_its_endpoint() {
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let output = MpdOutput {
+            display_name: "test".to_string(),
+            event_tx,
+            event_generation: AtomicU64::new(3),
+            volume: 1.0,
+            intent_epoch: Arc::new(AtomicU64::new(0)),
+            cache: Arc::new(Mutex::new(MpdCache::default())),
+            proxy: ProxyServices::production(),
+            worker_tx,
+        };
+        let endpoint =
+            Url::parse("https://music.test/clean/track.flac?track=42").expect("clean endpoint");
+        let request = ResolvedHttpRequest::new(endpoint.clone()).expect("resolved request");
+
+        output.load_resolved(request);
+
+        let command = worker_rx.recv().expect("resolved command");
+        assert_eq!(command.owner.epoch, 1);
+        assert_eq!(command.owner.event_generation.as_raw(), 3);
+        match command.kind {
+            CommandKind::ResolvedLoad { request } => {
+                assert_eq!(request.endpoint(), &endpoint);
+            }
+            _ => panic!("typed request must stay typed through the MPD worker boundary"),
+        }
     }
 
     #[test]
