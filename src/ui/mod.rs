@@ -21,6 +21,7 @@ pub mod root_trust;
 pub mod server_dialogs;
 pub mod sidebar;
 pub mod source_connect;
+pub mod source_navigation;
 pub mod tracklist;
 #[cfg(target_os = "windows")]
 pub mod win32_snap;

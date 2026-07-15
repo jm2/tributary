@@ -27,6 +27,7 @@ pub fn setup_discovery(
     let rt_handle = state.rt_handle.clone();
     let source_tracks = state.source_tracks.clone();
     let active_source_key = state.active_source_key.clone();
+    let source_navigation = state.source_navigation.clone();
     let sidebar_selection = state.sidebar_selection.clone();
     let track_store = state.track_store.clone();
     let master_tracks = state.master_tracks.clone();
@@ -116,8 +117,18 @@ pub fn setup_discovery(
                 }
 
                 crate::discovery::DiscoveryEvent::Lost { url, service_type } => {
-                    if pending_connection.borrow().as_deref() == Some(url.as_str()) {
+                    let lost_pending = pending_connection
+                        .borrow()
+                        .as_ref()
+                        .filter(|pending| pending.source_key() == url)
+                        .cloned();
+                    if let Some(pending) = lost_pending {
                         *pending_connection.borrow_mut() = None;
+                        if source_navigation.borrow().is_current(pending.request()) {
+                            source_navigation
+                                .borrow_mut()
+                                .select(active_source_key.borrow().clone());
+                        }
                     }
 
                     // ── Chromecast devices: remove from output selector ──
@@ -173,6 +184,7 @@ pub fn setup_discovery(
                                         store.insert(i, &src);
 
                                         if was_active {
+                                            source_navigation.borrow_mut().select("local");
                                             *active_source_key.borrow_mut() = "local".to_string();
                                             sidebar_selection.set_selected(1);
                                             let st = source_tracks.borrow();
@@ -214,6 +226,7 @@ pub fn setup_discovery(
 
                                 // If this was the active source, switch to local.
                                 if was_active {
+                                    source_navigation.borrow_mut().select("local");
                                     *active_source_key.borrow_mut() = "local".to_string();
                                     sidebar_selection.set_selected(1);
 

@@ -14,6 +14,7 @@ use crate::local::engine::LibraryEvent;
 use super::browser::BrowserState;
 use super::objects::TrackObject;
 use super::preferences;
+use super::source_navigation::{PendingConnection, SourceNavigation};
 
 /// Shared UI state for the main window.
 ///
@@ -54,6 +55,10 @@ pub struct WindowState {
     /// Used by: discovery_handler, source_connect, context_menu, window.
     pub active_source_key: Rc<RefCell<String>>,
 
+    /// Generation-owned navigation state for async source loads.
+    /// Used by: source_connect, radio, discovery_handler, window.
+    pub source_navigation: Rc<RefCell<SourceNavigation>>,
+
     // ── Sidebar ─────────────────────────────────────────────────────
     /// Sidebar backing store (list of `SourceObject`s with headers).
     /// Used by: discovery_handler, source_connect, playlist_actions, context_menu, window.
@@ -90,10 +95,10 @@ pub struct WindowState {
     pub app_config: Rc<RefCell<preferences::AppConfig>>,
 
     // ── Connection guard ────────────────────────────────────────────
-    /// URL of the server currently being connected to, if any.
-    /// Prevents duplicate connection attempts.
+    /// Server and navigation intent currently being connected, if any.
+    /// Prevents duplicate attempts and stale completion auto-selection.
     /// Used by: source_connect, window (library events).
-    pub pending_connection: Rc<RefCell<Option<String>>>,
+    pub pending_connection: Rc<RefCell<Option<PendingConnection>>>,
 
     /// Sidebar position to revert to if a connection attempt fails.
     /// Used by: source_connect.

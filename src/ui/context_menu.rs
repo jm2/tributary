@@ -24,6 +24,7 @@ pub fn setup_context_menu(state: &WindowState) {
     let rt_handle = state.rt_handle.clone();
     let track_store = state.track_store.clone();
     let source_tracks = state.source_tracks.clone();
+    let source_navigation = state.source_navigation.clone();
     let master_tracks = state.master_tracks.clone();
     let status_label = state.status_label.clone();
     let browser_widget = state.browser_widget.clone();
@@ -65,6 +66,7 @@ pub fn setup_context_menu(state: &WindowState) {
                 &rt_handle,
                 &track_store,
                 &source_tracks,
+                &source_navigation,
                 &master_tracks,
                 &status_label,
                 &browser_widget,
@@ -121,6 +123,7 @@ fn build_remove_from_playlist_action(
     source_tracks: &std::rc::Rc<
         std::cell::RefCell<std::collections::HashMap<String, Vec<TrackObject>>>,
     >,
+    source_navigation: &std::rc::Rc<std::cell::RefCell<super::source_navigation::SourceNavigation>>,
     master_tracks: &std::rc::Rc<std::cell::RefCell<Vec<TrackObject>>>,
     status_label: &gtk::Label,
     browser_widget: &gtk::Box,
@@ -133,6 +136,7 @@ fn build_remove_from_playlist_action(
     let rt = rt_handle.clone();
     let track_store = track_store.clone();
     let source_tracks = source_tracks.clone();
+    let source_navigation = source_navigation.clone();
     let master_tracks = master_tracks.clone();
     let status_label = status_label.clone();
     let browser_widget = browser_widget.clone();
@@ -149,11 +153,20 @@ fn build_remove_from_playlist_action(
         let uris = uris.clone();
         let track_store = track_store.clone();
         let source_tracks = source_tracks.clone();
+        let source_navigation = source_navigation.clone();
         let master_tracks = master_tracks.clone();
         let status_label = status_label.clone();
         let browser_widget = browser_widget.clone();
         let browser_state = browser_state.clone();
         let active_key = active_key.clone();
+
+        // A popover action can outlive the rows it was built for. It must not
+        // mutate another source, and an already-running refresh must not put
+        // the just-removed entry back afterward.
+        if !source_navigation.borrow().is_key(&active_key) {
+            return;
+        }
+        source_navigation.borrow_mut().select(active_key.clone());
 
         // Remove from the visible store immediately. Honour the per-URI
         // selection count so that selecting one of N duplicate rows removes

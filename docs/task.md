@@ -21,16 +21,17 @@ Created: 2026-07-10
 Status summary:
 
 - [ ] P0 release blockers complete
-- [ ] P1 correctness and security complete
+- [x] P1 correctness and security complete
 - [ ] P2 resilience and packaging complete
 - [ ] P3 architecture and integration coverage complete
 
-Progress snapshot (2026-07-14), recounted from the literal P0–P3 task checkboxes to correct the
+Progress snapshot (2026-07-15), recounted from the literal P0–P3 task checkboxes to correct the
 earlier numerator/denominator drift. The denominator excludes the two deferred P0.7 live-workflow
 verification boxes and the withdrawn P2.6 false finding; section-summary and global-validation
 gate boxes are not task progress:
-**128/213 (60.1%)** in-scope checklist items complete; **109/114 (95.6%)** across P0 and P1 after
-the same P0.7 exclusion.
+**133/213 (62.4%)** in-scope checklist items complete; **114/114 (100%)** across P0 and P1 after
+the same P0.7 exclusion. The release-workflow dry run remains deliberately deferred rather than
+being counted as unfinished P0 remediation.
 
 ## P0 — Release blockers
 
@@ -398,38 +399,51 @@ are complete.
 
 ### P1.9 Prevent stale async source rendering
 
-Re-scoped 2026-07-13 after auditing the actual call sites. The original wording implied
-playlist, radio, and remote loads were all unguarded. They are not — most already hold the
-active-key guard, and only the two radio loads are genuinely exposed:
-
-| Load | Location | Guarded? |
-|---|---|---|
-| Playlist / smart playlist | `ui/source_connect.rs:209` | yes |
-| USB device | `ui/source_connect.rs:350` | yes |
-| Remote sync (Subsonic/Jellyfin/Plex/DAAP) | `ui/window.rs:1795`, `:1854` | yes |
-| Disconnect | `ui/discovery_handler.rs:152`, `:182` | yes |
-| Radio Top Clicked / Top Voted | `ui/source_connect.rs:434-448` | **no** — `display_tracks` fires unconditionally; `active_source_key` is not even cloned into the closure |
-| Radio Stations Near Me | `ui/radio.rs:331-345` | **no** — `fetch_and_display_nearme` does not take `active_source_key`, so it structurally cannot guard |
-
-`ui/browser.rs` and `ui/playlist_actions.rs` need no guard: neither performs an async load that
-reaches `display_tracks`.
+Re-scoped 2026-07-13 after auditing the actual call sites, then completed 2026-07-15 with one
+navigation authority shared by playlist/smart-playlist, USB, radio, local debounce, remote
+connection, disconnect, and forced-local transitions. Every navigation mints an exact
+`{source_key, generation}` request. A completion is classified as superseded and ignored, the
+newest completion for an inactive key and cached without rendering, or the exact current request
+and both cached and rendered. This closes both cross-source races and the same-key re-selection
+race that a bare active-key comparison could not distinguish.
 
 - [x] Refresh already-open playlist URIs after an ID-preserving local rename and overlay committed
   URIs onto an in-flight result before publication.
-- [x] Guard the two radio loads with the same active-key check the playlist and USB loads already
-  use. `fetch_and_display_nearme` now takes `active_source_key` and checks it before rendering, and
-  the Top Clicked / Top Voted closure clones and checks it too. Clicking away from a slow radio
-  fetch no longer replaces the library view with stations while the sidebar still says Local.
-- [ ] Promote the guard from a bare source **key** to a key plus **generation**: re-selecting the
-  same playlist twice leaves two in-flight loads with identical keys, so the older one can still
-  render last. This is the residual recorded in the 2026-07-12 decision note.
-- [ ] Reload an active playlist after watcher reconciliation remints or relinks track IDs.
-- [ ] Cache completed results even when no longer active.
-- [ ] Add navigation-race tests, including same-key re-selection.
-- [ ] Record implementation: _pending_
+- [x] Guard both radio load paths. Top Clicked / Top Voted and Stations Near Me now carry their
+  exact navigation request through the fetch; Near Me carries it through the consent dialog too,
+  so a stale response neither starts a fetch nor forces a source change. Clicking away from slow
+  radio work no longer replaces the library view while the sidebar still names another source.
+- [x] Promote the guard from a bare source **key** to an exact key plus monotonic **generation**.
+  Re-selecting the same playlist advances its generation, so the older request can neither replace
+  the newer cache entry nor render last. Playlist, USB, radio, local-debounce, pending-remote,
+  disconnect, and forced-local callbacks all consult the shared navigation authority. When remote
+  authentication owns a deferred intent, the prior visible source retains its own exact latest
+  generation so its derived browser/status projection can stay fresh without accepting an older
+  away-and-back callback.
+- [x] Reload an active playlist after watcher reconciliation remints or relinks track IDs. The
+  engine publishes a post-reconciliation `PlaylistProjectionsInvalidated` event during initial
+  scan and after a watcher batch commits a track mutation and attempts reconciliation; the UI
+  first invalidates every outstanding playlist request and cached projection, clears rows whose
+  IDs may no longer be actionable, and reloads only when that exact playlist still owns the
+  current navigation intent.
+- [x] Cache completed results even when no longer active. Only the newest generation for a source
+  may update its cache; an inactive result is cache-only, while rendering additionally requires
+  the exact current request. A transient playlist query/database failure preserves the last valid
+  cache and visible rows, while a confirmed missing playlist deliberately evicts them.
+- [x] Add navigation-race tests, including same-key re-selection. Eight focused navigation tests
+  cover inactive caching, same-key and reverse-order supersession, playlist invalidation,
+  pending-remote intent, visible-local refresh during pending authentication, and local debounce
+  away/back behavior; two engine tests cover initial-scan and watcher post-reconciliation
+  invalidation ordering, including the reconciliation-error path.
+- [x] Record implementation: PR #88; eight focused
+  navigation tests plus two focused engine invalidation tests.
 
 Acceptance criteria: a late async result never renders into a source the user has already
-navigated away from, and never replaces a newer result for the same source.
+navigated away from, and never replaces a newer result for the same source. **Complete:** a
+pending remote authentication/connection owns a distinct navigation intent even while the prior
+source remains visible, so a playlist refresh, sidebar rebuild, background remote publication, or
+stale connection callback cannot steal that intent or leave the sidebar and content out of sync;
+the prior visible source can still refresh from its exact latest projection generation.
 
 ### P1.10 Make foreign-key enforcement explicit
 
@@ -747,10 +761,11 @@ Run before marking any milestone complete:
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
-Most recent milestone validation (2026-07-15, P1.6 Plex locator follow-up): 18 library plus 490
-application tests passed in debug (508 total), and the release suite passed; strict all-target
-Clippy passed in both profiles; formatting and `git diff --check` were clean; and `cargo audit`
-passed with exactly the two accepted unmaintained warnings recorded under P0.8.
+Most recent milestone validation (2026-07-15, P1.9 source-navigation generations): 18 library plus
+499 application tests passed in debug (517 total), and the release suite passed with the same
+517 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
+were clean; and `cargo audit` passed with exactly the two accepted unmaintained warnings recorded
+under P0.8.
 
 **This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
 hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
@@ -1019,6 +1034,27 @@ Record scope or design decisions here so deferred work is explicit.
   and some external queue changes, while opaque synchronized ACKs cannot yet distinguish a missing
   ID from other rejections. Those narrower resilience and shared-partition improvements, plus
   deeper OS loopback coverage, are tracked as P2.10 rather than overstated as part of P1.8.
+- 2026-07-15 — P1.9 separates the source whose rows remain visible from the user's current
+  navigation intent. Each selection advances one monotonic generation and records an exact
+  `{source_key, generation}` request; completion has three explicit dispositions: ignore a
+  superseded request, cache the newest result for an inactive key, or cache and render the exact
+  current request. This makes same-key re-selection ordered without discarding useful inactive
+  results. A pending remote login owns navigation before network work begins even though the prior
+  source can remain visible; only its exact completion may auto-select the server, and stale
+  success, failure, cancellation, discovery loss, sidebar rebuild, or background publication
+  cannot steal a newer intent. A rejected click while that connection is pending restores the
+  pending row rather than leaving sidebar selection inconsistent with the content. The exact
+  latest generation for the prior visible source remains independently refreshable while the
+  remote intent is deferred, so local browser/status updates do not freeze during authentication;
+  an older local generation after away-and-back navigation is still rejected.
+  Playlist projection freshness is a separate engine-to-UI handoff: initial scan publishes an
+  ordered invalidation after playlist reconciliation, and a watcher batch does so after it commits
+  a track mutation and attempts reconciliation. The UI invalidates old playlist request
+  generations before clearing the cache and any active actionable rows, then reloads only if the
+  exact playlist still owns navigation. A transient playlist query failure preserves the last
+  valid cache/display; only a confirmed missing playlist is intentionally represented as empty.
+  Eight pure navigation tests and two engine ordering/failure-path tests cover the resulting
+  contract.
 
 - 2026-07-13 — Documentation audit against the committed tree. Every `[x]` in P1.1–P1.7 was
   verified against the source and none was overstated. The drift was everywhere else: CHANGELOG
@@ -1069,3 +1105,4 @@ Add one line per completed task:
 | 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
 | 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |
 | 2026-07-13 | P1.8 | `eb0b9ca`, `fbaaa7f` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable song identity, shared-queue preservation, ownership preflight, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
+| 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, keeps the prior visible projection fresh while remote intent is pending, preserves valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; eight navigation and two engine tests cover the races and event ordering. |

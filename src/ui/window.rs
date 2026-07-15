@@ -36,6 +36,7 @@ use super::preferences;
 use super::root_trust;
 use super::server_dialogs::{load_saved_servers, remove_saved_server, show_add_server_dialog};
 use super::sidebar;
+use super::source_navigation::{PendingConnection, SourceNavigation};
 use super::tracklist;
 use super::window_state::WindowState;
 
@@ -293,7 +294,7 @@ pub fn build_window(
     // sidebar position that was active before the connection attempt.
     // Used to (a) only auto-select on a remote sync if the source matches
     // the pending connection, and (b) revert the sidebar on failure.
-    let pending_connection: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let pending_connection = Rc::new(RefCell::new(None));
     let pre_connect_selection: Rc<Cell<u32>> = Rc::new(Cell::new(1)); // default: local (index 1)
 
     // ── Per-source track storage ────────────────────────────────────
@@ -301,6 +302,7 @@ pub fn build_window(
     let source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>> =
         Rc::new(RefCell::new(HashMap::new()));
     let active_source_key: Rc<RefCell<String>> = Rc::new(RefCell::new("local".to_string()));
+    let source_navigation = Rc::new(RefCell::new(SourceNavigation::new("local")));
 
     // ── Browser (starts empty, updated by FullSync) ──────────────────
     let track_store_for_filter = track_store.clone();
@@ -683,6 +685,7 @@ pub fn build_window(
             master_tracks: master_tracks.clone(),
             source_tracks: source_tracks.clone(),
             active_source_key: active_source_key.clone(),
+            source_navigation: source_navigation.clone(),
             sidebar_store: sidebar_store.clone(),
             sidebar_selection: sidebar_selection.clone(),
             browser_widget: browser_widget.clone(),
@@ -733,6 +736,7 @@ pub fn build_window(
         let sidebar_selection = sidebar_selection.clone();
         let source_tracks = source_tracks.clone();
         let active_source_key = active_source_key.clone();
+        let source_navigation = source_navigation.clone();
         let track_store = track_store.clone();
         let master_tracks = master_tracks.clone();
         let browser_widget = browser_widget.clone();
@@ -778,6 +782,7 @@ pub fn build_window(
 
                 // If this was the active source, switch to "local".
                 if *active_source_key.borrow() == source_key {
+                    source_navigation.borrow_mut().select("local");
                     *active_source_key.borrow_mut() = "local".to_string();
                     sidebar_selection.set_selected(1);
 
@@ -803,6 +808,7 @@ pub fn build_window(
         let sidebar_selection = sidebar_selection.clone();
         let source_tracks = source_tracks.clone();
         let active_source_key = active_source_key.clone();
+        let source_navigation = source_navigation.clone();
         let track_store = track_store.clone();
         let master_tracks = master_tracks.clone();
         let browser_widget = browser_widget.clone();
@@ -850,6 +856,7 @@ pub fn build_window(
 
                 // 3. If this was the active source, switch to "local".
                 if *active_source_key.borrow() == source_key {
+                    source_navigation.borrow_mut().select("local");
                     *active_source_key.borrow_mut() = "local".to_string();
 
                     // Select the local source in the sidebar (index 1, after header).
@@ -885,6 +892,7 @@ pub fn build_window(
         master_tracks: master_tracks.clone(),
         source_tracks: source_tracks.clone(),
         active_source_key: active_source_key.clone(),
+        source_navigation: source_navigation.clone(),
         sidebar_store: sidebar_store.clone(),
         sidebar_selection: sidebar_selection.clone(),
         browser_widget: browser_widget.clone(),
@@ -914,11 +922,13 @@ pub fn build_window(
             tracing::error!(error = %e, "Failed to create audio player — playback disabled");
             setup_library_events(
                 engine_rx,
+                rt_handle.clone(),
                 track_store,
                 status_label,
                 master_tracks,
                 source_tracks,
                 active_source_key,
+                source_navigation.clone(),
                 &browser_widget,
                 browser_state,
                 &column_view,
@@ -1315,6 +1325,7 @@ pub fn build_window(
         master_tracks: master_tracks.clone(),
         source_tracks: source_tracks.clone(),
         active_source_key: active_source_key.clone(),
+        source_navigation: source_navigation.clone(),
         sidebar_store: sidebar_store_for_events.clone(),
         sidebar_selection: sidebar_sel_for_events.clone(),
         browser_widget: browser_widget.clone(),
@@ -1757,6 +1768,7 @@ pub fn build_window(
             master_tracks: master_tracks.clone(),
             source_tracks: source_tracks.clone(),
             active_source_key: active_source_key.clone(),
+            source_navigation: source_navigation.clone(),
             sidebar_store: sidebar_store_for_events.clone(),
             sidebar_selection: sidebar_sel_for_events.clone(),
             browser_widget: browser_widget.clone(),
@@ -1774,11 +1786,13 @@ pub fn build_window(
     // ── Receive LibraryEvents on GTK main thread ─────────────────────
     setup_library_events(
         engine_rx,
+        rt_handle.clone(),
         track_store,
         status_label,
         master_tracks,
         source_tracks,
         active_source_key,
+        source_navigation,
         &browser_widget,
         browser_state,
         &column_view,
@@ -1885,18 +1899,20 @@ fn refresh_active_playlist_uris(
 #[allow(clippy::too_many_arguments)]
 fn setup_library_events(
     engine_rx: async_channel::Receiver<LibraryEvent>,
+    rt_handle: tokio::runtime::Handle,
     track_store: gtk::gio::ListStore,
     status_label: gtk::Label,
     master_tracks: Rc<RefCell<Vec<TrackObject>>>,
     source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
     active_source_key: Rc<RefCell<String>>,
+    source_navigation: Rc<RefCell<SourceNavigation>>,
     browser_widget: &gtk::Box,
     browser_state: browser::BrowserState,
     column_view: &gtk::ColumnView,
     sidebar_store: gtk::gio::ListStore,
     sidebar_selection: gtk::SingleSelection,
     scan_spinner: gtk::Spinner,
-    pending_connection: Rc<RefCell<Option<String>>>,
+    pending_connection: Rc<RefCell<Option<PendingConnection>>>,
     playback_session: Rc<RefCell<PlaybackSession>>,
     root_trust_prompts: root_trust::RootTrustPromptController,
     invalidate_source_playback: SourcePlaybackInvalidator,
@@ -2024,6 +2040,7 @@ fn setup_library_events(
                         &pending_connection,
                         &sidebar_selection,
                         &active_source_key,
+                        &source_navigation,
                         &track_store,
                         &master_tracks,
                         &browser_widget,
@@ -2096,9 +2113,28 @@ fn setup_library_events(
                         let browser_widget = browser_widget.clone();
                         let browser_state = browser_state.clone();
                         let status_label = status_label.clone();
+                        let active_source_key = active_source_key.clone();
+                        let source_navigation = source_navigation.clone();
+                        let navigation_request = source_navigation.borrow().latest_request("local");
+                        let pending_connection = pending_connection.clone();
 
                         glib::timeout_add_local_once(Duration::from_millis(500), move || {
-                            if gen_rc.get() != gen {
+                            let Some(navigation_request) = navigation_request else {
+                                return;
+                            };
+                            let pending_request = pending_connection
+                                .borrow()
+                                .as_ref()
+                                .map(|pending| pending.request().clone());
+                            let may_refresh = source_navigation.borrow().may_refresh_visible(
+                                "local",
+                                &navigation_request,
+                                pending_request.as_ref(),
+                            );
+                            if gen_rc.get() != gen
+                                || *active_source_key.borrow() != "local"
+                                || !may_refresh
+                            {
                                 return; // Superseded by a newer event.
                             }
                             let st = source_tracks.borrow();
@@ -2154,9 +2190,28 @@ fn setup_library_events(
                         let browser_widget = browser_widget.clone();
                         let browser_state = browser_state.clone();
                         let status_label = status_label.clone();
+                        let active_source_key = active_source_key.clone();
+                        let source_navigation = source_navigation.clone();
+                        let navigation_request = source_navigation.borrow().latest_request("local");
+                        let pending_connection = pending_connection.clone();
 
                         glib::timeout_add_local_once(Duration::from_millis(500), move || {
-                            if gen_rc.get() != gen {
+                            let Some(navigation_request) = navigation_request else {
+                                return;
+                            };
+                            let pending_request = pending_connection
+                                .borrow()
+                                .as_ref()
+                                .map(|pending| pending.request().clone());
+                            let may_refresh = source_navigation.borrow().may_refresh_visible(
+                                "local",
+                                &navigation_request,
+                                pending_request.as_ref(),
+                            );
+                            if gen_rc.get() != gen
+                                || *active_source_key.borrow() != "local"
+                                || !may_refresh
+                            {
                                 return; // Superseded by a newer event.
                             }
                             let st = source_tracks.borrow();
@@ -2183,8 +2238,74 @@ fn setup_library_events(
                     scan_spinner.set_visible(false);
                 }
 
+                LibraryEvent::PlaylistProjectionsInvalidated => {
+                    let active_key = active_source_key.borrow().clone();
+
+                    // Any local mutation can change a live smart playlist, and
+                    // reconciliation can remint/relink regular-playlist track
+                    // IDs. Retire pre-settlement requests before clearing the
+                    // cache so a late query cannot put stale rows back.
+                    source_navigation
+                        .borrow_mut()
+                        .invalidate_prefix(PLAYLIST_SOURCE_PREFIX);
+                    source_tracks
+                        .borrow_mut()
+                        .retain(|key, _| !key.starts_with(PLAYLIST_SOURCE_PREFIX));
+
+                    if let Some(playlist_id) = active_key
+                        .strip_prefix(PLAYLIST_SOURCE_PREFIX)
+                        .map(str::to_string)
+                    {
+                        // The old rows may hold orphaned/reminted IDs. Do not
+                        // leave them actionable while the settled projection
+                        // is loading.
+                        display_tracks(
+                            &[],
+                            &track_store,
+                            &master_tracks,
+                            &browser_widget,
+                            &browser_state,
+                            &status_label,
+                            &column_view,
+                        );
+
+                        // `active_source_key` names the visible rows, while
+                        // SourceNavigation names the user's latest intent.
+                        // During remote authentication those intentionally
+                        // differ. Never let background playlist maintenance
+                        // supersede that newer remote intent.
+                        if source_navigation.borrow().is_key(&active_key) {
+                            let request = source_navigation.borrow_mut().select(active_key.clone());
+                            super::source_connect::load_playlist_source(
+                                rt_handle.clone(),
+                                playlist_id,
+                                request,
+                                source_navigation.clone(),
+                                source_tracks.clone(),
+                                active_source_key.clone(),
+                                track_store.clone(),
+                                master_tracks.clone(),
+                                browser_widget.clone(),
+                                browser_state.clone(),
+                                status_label.clone(),
+                                column_view.clone(),
+                            );
+                        }
+                    }
+                }
+
                 LibraryEvent::PlaylistsLoaded(playlists) => {
                     info!(count = playlists.len(), "Populating sidebar with playlists");
+                    let active_key = active_source_key.borrow().clone();
+                    let active_playlist_id = source_navigation
+                        .borrow()
+                        .is_key(&active_key)
+                        .then(|| {
+                            active_key
+                                .strip_prefix(PLAYLIST_SOURCE_PREFIX)
+                                .map(str::to_string)
+                        })
+                        .flatten();
 
                     // Find the "Playlists" header position in sidebar.
                     let mut playlist_header_pos = None;
@@ -2223,9 +2344,22 @@ fn setup_library_events(
                         }
 
                         // Insert new playlist entries.
+                        let mut active_position = None;
                         for (idx, (id, name, is_smart)) in playlists.iter().enumerate() {
                             let src = SourceObject::playlist(name, id, *is_smart);
-                            sidebar_store.insert(insert_pos + idx as u32, &src);
+                            let position = insert_pos + idx as u32;
+                            sidebar_store.insert(position, &src);
+                            if active_playlist_id.as_deref() == Some(id.as_str()) {
+                                active_position = Some(position);
+                            }
+                        }
+
+                        // Rebuilding the rows invalidates GtkSingleSelection's
+                        // selected object. Restore the row that corresponds to
+                        // the still-active playlist so sidebar and content do
+                        // not diverge during watcher fallback scans.
+                        if let Some(position) = active_position {
+                            sidebar_selection.set_selected(position);
                         }
                     }
                 }
@@ -2267,6 +2401,7 @@ fn setup_library_events(
                         &pending_connection,
                         &sidebar_selection,
                         &active_source_key,
+                        &source_navigation,
                         &track_store,
                         &master_tracks,
                         &browser_widget,
@@ -2286,9 +2421,10 @@ fn publish_remote_library(
     objects: Vec<TrackObject>,
     source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
     sidebar_store: &gtk::gio::ListStore,
-    pending_connection: &Rc<RefCell<Option<String>>>,
+    pending_connection: &Rc<RefCell<Option<PendingConnection>>>,
     sidebar_selection: &gtk::SingleSelection,
     active_source_key: &Rc<RefCell<String>>,
+    source_navigation: &Rc<RefCell<SourceNavigation>>,
     track_store: &gtk::gio::ListStore,
     master_tracks: &Rc<RefCell<Vec<TrackObject>>>,
     browser_widget: &gtk::Box,
@@ -2300,6 +2436,19 @@ fn publish_remote_library(
         .borrow_mut()
         .insert(source_key.clone(), objects.clone());
 
+    let pending_intent = pending_connection.borrow().clone();
+    let should_auto_select = pending_intent
+        .as_ref()
+        .is_some_and(|pending| pending.may_auto_select(&source_key, &source_navigation.borrow()));
+    let should_clear_pending = pending_intent
+        .as_ref()
+        .is_some_and(|pending| pending.source_key() == source_key);
+    if should_clear_pending {
+        // Clear before any programmatic selection: the selection handler
+        // otherwise treats this completed connection as still pending.
+        *pending_connection.borrow_mut() = None;
+    }
+
     let mut auto_selected = false;
     for i in 0..sidebar_store.n_items() {
         if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
@@ -2309,17 +2458,19 @@ fn publish_remote_library(
                 let src = src.clone();
                 sidebar_store.remove(i);
                 sidebar_store.insert(i, &src);
-                // Clear the guard before selecting: the selection handler
-                // otherwise treats this completed connection as still pending.
-                *pending_connection.borrow_mut() = None;
-                sidebar_selection.set_selected(i);
-                auto_selected = true;
+                if should_auto_select {
+                    sidebar_selection.set_selected(i);
+                    auto_selected = true;
+                }
                 break;
             }
         }
     }
 
-    if !auto_selected && *active_source_key.borrow() == source_key {
+    if !auto_selected
+        && *active_source_key.borrow() == source_key
+        && source_navigation.borrow().is_key(&source_key)
+    {
         display_tracks(
             &objects,
             track_store,
