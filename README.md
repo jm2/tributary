@@ -455,11 +455,15 @@ Use the **search bar** above the browser panes to filter tracks in real-time. Th
 
 Right-click any local track and select **Properties…** to view and edit its metadata. The Properties dialog supports:
 
-- **Single-track editing** — Title, Artist, Album, Genre, Year, Track #, Disc # (plus read-only Format, Bitrate, Sample Rate, Duration, and File Path)
-- **Batch editing** — Select multiple tracks, then right-click → Properties. Only batch-appropriate fields are shown (Artist, Album, Genre, Year, Disc #). Fields with mixed values display "Mixed" as a placeholder; only fields you explicitly change are written.
+- **Single-track editing** — Title, Artist, Album, Genre, Composer, Year, Track #, Disc # (plus read-only Format, Bitrate, Sample Rate, Duration, and File Path)
+- **Batch editing** — Select multiple tracks, then right-click → Properties. Only batch-appropriate fields are shown (Artist, Album, Genre, Composer, Year, Disc #). Fields with mixed values display "Mixed" as a placeholder; only fields you explicitly change are written.
 - **MusicBrainz Lookup** — In single-track mode, click "MusicBrainz Lookup" to search by title + artist. Results populate the form but are **not** saved automatically — you must click Save.
 
-All edits require an explicit **Save** click. Cancel discards all changes. Supported formats: MP3 (ID3v2), M4A/AAC, OGG Vorbis, and FLAC.
+All edits require an explicit **Save** click. Cancel discards all changes. Numeric edits are
+validated before a file is touched. Successful saves use an exclusively created randomized sibling
+that retains the source audio extension, flush it before atomic replacement, best-effort copy the
+original permissions, and remove the sibling on any failure. Supported formats: MP3 (ID3v2),
+M4A/AAC, OGG Vorbis, and FLAC.
 
 ### Playlists
 

@@ -29,7 +29,7 @@ Progress snapshot (2026-07-15), recounted from the literal P0–P3 task checkbox
 earlier numerator/denominator drift. The denominator excludes the two deferred P0.7 live-workflow
 verification boxes and the withdrawn P2.6 false finding; section-summary and global-validation
 gate boxes are not task progress:
-**146/213 (68.5%)** in-scope checklist items complete; **114/114 (100%)** across P0 and P1 after
+**147/213 (69.0%)** in-scope checklist items complete; **114/114 (100%)** across P0 and P1 after
 the same P0.7 exclusion. The release-workflow dry run remains deliberately deferred rather than
 being counted as unfinished P0 remediation.
 
@@ -580,8 +580,8 @@ and README accurately advertise direct XSPF v1 support rather than Apple/Google 
 ### P2.3 Harden tag writes
 
 Re-scoped 2026-07-13. The temp-file-plus-rename path the review implied was missing **already
-exists** (`local/tag_writer.rs:81-106`). The real defects are narrower and all reachable from
-right-click → Properties → Save (`ui/properties_dialog.rs:302`, `:385-400`):
+exists** in `src/local/tag_writer.rs`. The real defects are narrower and all reachable through
+`write_tags` from right-click → Properties → Save in `src/ui/properties_dialog.rs`:
 
 - [x] Validate numeric edits before rewriting the file. Year, track, and disc each used
   `else if let Ok(n) = …parse::<u32>()` with **no `else` branch**, so an unparseable value was
@@ -596,24 +596,37 @@ right-click → Properties → Save (`ui/properties_dialog.rs:302`, `:385-400`):
 - [x] Use an exclusively created random sibling temp path. The fixed `.tributary-tag-tmp` suffix
   created via `fs::copy` had no `O_EXCL` and no randomness, so two concurrent saves to the same
   file clobbered each other and the copy would follow a symlink planted at the predictable path.
-  Temp files are now created with `create_new` (`O_EXCL`) under a random UUID name.
+  Temp files are now created with `create_new` (`O_EXCL`) under a random UUID name. The first real
+  audio round-trip exposed a second production defect in that replacement: the randomized sibling
+  ended in `.tmp`, so `lofty::read_from_path` could not determine the copied audio format and every
+  otherwise-valid tag write failed before applying edits. The random name now retains the source
+  audio extension as its final extension.
 - [x] Apply or remove the declared album-artist edit. `TagEdits.album_artist` existed and counted
   toward `is_empty()`, but `write_tags_to` never read it — the file was rewritten and the field
   ignored. It is now applied via `ItemKey::AlbumArtist`. (Still no widget sets it; implementing it
   removes the trap for whoever adds one.)
 - [x] Preserve permissions and define durability/fsync behavior accurately. Permissions are copied
-  from the file being replaced, and the tagged copy is `fsync`ed before the rename, so a crash
-  cannot leave a truncated file where the original was. The module doc now states this rather than
-  implying it.
-- [x] Add injected-failure tests: 6 focused tests cover validation, a malformed number leaving the
-  file byte-for-byte untouched with no temp behind, temp cleanup after a failed tag write,
-  unsupported formats, and temp-path uniqueness plus self-removal. Concurrency is covered by the
-  exclusivity property rather than by racing two threads.
-- [ ] Add a happy-path fixture test. Every test above asserts behavior *before* lofty succeeds or
-  *when* it fails, because they use files that are named like audio but are not decodable. Nothing
-  yet asserts that a valid edit actually lands in a real MP3/FLAC — that needs a committed audio
-  fixture and belongs with P3.5's coverage work.
-- [x] Record implementation: commit `6d0ec95`; 6 focused tests.
+  on a best-effort basis from the file being replaced, and the tagged copy is `fsync`ed before the
+  rename, so a crash cannot leave a truncated file where the original was. The module doc now states
+  this rather than implying it.
+- [x] Add focused failure and platform tests: 7 regressions cover validation, a malformed number
+  leaving the file byte-for-byte untouched with no temp behind, temp cleanup after a failed tag
+  write, unsupported formats, temp-path uniqueness plus self-removal, and Windows-compatible
+  flushing through a writable handle. Concurrency is covered by the exclusivity property rather
+  than by racing two threads.
+- [x] Add a happy-path fixture test. A committed 99-byte, 100 ms silent FLAC generated entirely
+  from silence is copied into an isolated test directory and exercised through the public
+  `write_tags` path. Reopening it with Lofty verifies that all ten declared fields—title, artist,
+  album, album artist, genre, composer, year, track, disc, and comment—round-trip, the audio remains
+  readable with its 100 ms duration, and no `.tributary-tag-*` sibling remains.
+  `tests/fixtures/audio/README.md` records the generation recipe, GPL-3.0-or-later/no-third-party-
+  recording provenance, and SHA-256
+  `c47ed5dbe255701328f28b58fbe7408a70ae2ad20057089b5393253a00eab946`.
+- [x] Record implementation: commits `6d0ec95` and `2d305e7` plus PR _pending_; 8 focused tests.
+
+Acceptance criteria: invalid edits leave the original byte-for-byte untouched, every failed save
+removes its temporary sibling, and a successful public tag write preserves readable audio while all
+declared fields round-trip without temporary-file residue.
 
 ### P2.4 Make removable-media browsing safe and asynchronous
 
@@ -834,9 +847,9 @@ Run before marking any milestone complete:
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
-Most recent milestone validation (2026-07-15, P2.2 playlist import/export): 18 library plus
-532 application tests passed in debug (550 total), and the release suite passed with the same
-550 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
+Most recent milestone validation (2026-07-15, P2.3 tag-write happy path): 18 library plus
+533 application tests passed in debug (551 total), and the release suite passed with the same
+551 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
 were clean; and `cargo audit` passed with exactly the two accepted unmaintained warnings recorded
 under P0.8.
 
@@ -1220,3 +1233,4 @@ Add one line per completed task:
 | 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, keeps the prior visible projection fresh while remote intent is pending, preserves valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; eight navigation and two engine tests cover the races and event ordering. |
 | 2026-07-15 | P2.1 | PR #89 | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
 | 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
+| 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR _pending_ | Numeric validation, exclusive randomized extension-preserving sibling files, RAII cleanup, permission copying and pre-rename `fsync`, album-artist handling, and eight focused tests including a public-API round trip against a generated silent FLAC fixture. |

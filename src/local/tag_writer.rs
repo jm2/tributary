@@ -123,8 +123,13 @@ impl TempFile {
         let file_name = target.file_name().unwrap_or_default();
 
         for _ in 0..8 {
-            let mut candidate_name = file_name.to_os_string();
-            candidate_name.push(format!(".tributary-tag-{}.tmp", Uuid::new_v4()));
+            // Keep the target filename (and therefore its extension) last.
+            // `lofty::read_from_path` infers the audio format from that final
+            // extension, so a generic `.tmp` suffix would make every valid
+            // copied audio file unreadable before tags could be written.
+            let mut candidate_name =
+                std::ffi::OsString::from(format!(".tributary-tag-{}-", Uuid::new_v4()));
+            candidate_name.push(file_name);
             let candidate = directory.join(candidate_name);
 
             match std::fs::OpenOptions::new()
@@ -402,9 +407,7 @@ mod tests {
             Self { path }
         }
 
-        /// A file that is *named* like audio but is not decodable, which is all
-        /// these tests need: every assertion here is about what happens before
-        /// lofty succeeds, or when it fails.
+        /// Copy arbitrary fixture bytes into this test's isolated directory.
         fn audio_file(&self, name: &str, contents: &[u8]) -> PathBuf {
             let path = self.path.join(name);
             std::fs::write(&path, contents).expect("write test file");
@@ -516,6 +519,63 @@ mod tests {
             directory.temp_files().is_empty(),
             "the temp file must be removed on the failure path"
         );
+    }
+
+    #[test]
+    fn a_valid_flac_round_trips_every_supported_edit() {
+        use std::time::Duration;
+
+        use lofty::file::AudioFile;
+
+        let directory = TestDirectory::new("happy-path");
+        let track = directory.audio_file(
+            "silence.flac",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        );
+        let edits = TagEdits {
+            title: Some("Fixture Title".to_string()),
+            artist: Some("Fixture Artist".to_string()),
+            album: Some("Fixture Album".to_string()),
+            album_artist: Some("Fixture Album Artist".to_string()),
+            genre: Some("Fixture Genre".to_string()),
+            composer: Some("Fixture Composer".to_string()),
+            year: Some("2026".to_string()),
+            track_number: Some("7".to_string()),
+            disc_number: Some("2".to_string()),
+            comment: Some("Fixture comment".to_string()),
+        };
+
+        write_tags(&track, &edits).expect("write every supported edit to a valid FLAC");
+        assert!(
+            directory.temp_files().is_empty(),
+            "a successful write must not leave its sibling temp file behind"
+        );
+
+        let tagged_file = lofty::read_from_path(&track).expect("reopen tagged FLAC");
+        assert_eq!(
+            tagged_file.properties().duration(),
+            Duration::from_millis(100),
+            "tagging must preserve the readable audio stream"
+        );
+        let tag = tagged_file
+            .primary_tag()
+            .expect("tagged FLAC must have a primary tag");
+        assert_eq!(tag.title().as_deref(), Some("Fixture Title"));
+        assert_eq!(tag.artist().as_deref(), Some("Fixture Artist"));
+        assert_eq!(tag.album().as_deref(), Some("Fixture Album"));
+        assert_eq!(
+            tag.get_string(ItemKey::AlbumArtist),
+            Some("Fixture Album Artist")
+        );
+        assert_eq!(tag.genre().as_deref(), Some("Fixture Genre"));
+        assert_eq!(tag.get_string(ItemKey::Composer), Some("Fixture Composer"));
+        assert_eq!(tag.get_string(ItemKey::Year), Some("2026"));
+        assert_eq!(tag.track(), Some(7));
+        assert_eq!(tag.disk(), Some(2));
+        assert_eq!(tag.comment().as_deref(), Some("Fixture comment"));
     }
 
     #[test]
