@@ -283,6 +283,10 @@ pub fn evaluate<T: SmartTrack + Clone>(rules: &SmartRules, tracks: &[T]) -> Vec<
         .cloned()
         .collect();
 
+    if results.is_empty() {
+        return results;
+    }
+
     // Select membership before applying the presentation order. A limit's
     // `selected_by` sort decides which tracks make the cut; `sort_order`
     // independently decides how that selected subset is displayed.
