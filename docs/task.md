@@ -256,7 +256,7 @@ explicitly justified and time-bounded.
 - [x] Add redirect matrix tests using mock servers.
 - [x] Record implementation: commit `eb5458f` plus review follow-ups; 18 focused origin,
   redirect, Referer, header, redaction, userinfo, DAAP, and MPD tests. Local/AirPlay protected
-  playback boundary: commit `2188efb`; 8 focused proxy,
+  playback boundary: commit `2188efb` with concurrency review follow-up `28e3400`; 10 focused proxy,
   redirect/header-isolation, stale-cleanup, lifecycle, and fail-closed tests.
 
 ### P1.5 Enforce response limits while streaming
@@ -348,8 +348,8 @@ unguessable UUID routes; the credential-bearing upstream stays inside Tributary.
   tests (10 worker/ticket lifecycle, 3 media classification, and 5 route/body-error tests); hard
   upstream-ticket expiry in commit `8735862` with 6 deterministic deadline, non-renewal,
   revocation/supersession, local-route, admitted-response, and 404-equivalence tests; the
-  local/AirPlay GStreamer boundary is in `2188efb` with 8 focused tests. Making generic
-  `Track`/UI values credential-free remains open.
+  local/AirPlay GStreamer boundary is in `2188efb` with concurrency review follow-up `28e3400`
+  and 10 focused tests. Making generic `Track`/UI values credential-free remains open.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
 device or daemon Tributary does not own. **Chromecast and MPD now meet the receiver-boundary
@@ -715,8 +715,8 @@ Run before marking any milestone complete:
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
-Most recent milestone validation (2026-07-14, P1.4 local/AirPlay boundary): 18 library plus 450
-application tests passed in both debug and release (468 each); strict all-target Clippy passed in
+Most recent milestone validation (2026-07-14, P1.4 local/AirPlay boundary): 18 library plus 452
+application tests passed in both debug and release (470 each); strict all-target Clippy passed in
 both profiles; formatting and `git diff --check` were clean; and `cargo audit` passed with exactly
 the two accepted unmaintained warnings recorded under P0.8.
 
@@ -876,8 +876,11 @@ Record scope or design decisions here so deferred work is explicit.
   bind, client, or ticket state fail closed. Replacement, Stop, EOS/error, setup/preroll/start
   failure, and teardown revoke the ticket, while pause/play/seek retain it only within its hard
   24-hour lifetime; identity-checked cleanup and per-load servers prevent stale callbacks from
-  revoking a newer load. This completes P1.4 without changing the still-open generic
-  credential-bearing `Track` representation.
+  revoking a newer load. Server startup and route revocation run outside the proxy-state mutex;
+  an allocation-identity generation lets a newer load, Stop, or runtime replacement supersede an
+  in-flight startup without waiting, and prevents that older startup from installing afterward.
+  This completes P1.4 without changing the still-open generic credential-bearing `Track`
+  representation.
 - 2026-07-12 — P1.5 treats every finite HTTP response as an observed byte stream rather than
   trusting `Content-Length`: Subsonic, Jellyfin, Plex, DAAP, authentication, radio/geolocation,
   artwork, and MusicBrainz reads now stop at endpoint-specific caps and carry end-to-end request
@@ -989,7 +992,7 @@ Add one line per completed task:
 | 2026-07-12 | P1.2 | `93d03bf`, `b961b7c`, `17babaf`, `000d9c0` | Identity preserved across authoritative paired file and directory renames; queue and active-playlist snapshots re-resolve ID-preserving committed changes by stable track ID. |
 | 2026-07-12 | P1.3 | `4eb79d0` | Watchers install before scanning; bounded nonblocking ingress replays ordinary events and routes overflow, backend loss, rescan notices, and marker changes through retrying authoritative reconciliation. |
 | 2026-07-12 | P1.4a | `eb5458f` | Exact-origin/no-Referer policy and URL-free errors/logging cover every then-app-owned credential HTTP fetch; Chromecast and MPD are ticketed by P1.6. |
-| 2026-07-14 | P1.4b | `2188efb` | Local playbin3 and AirPlay uridecodebin now receive only dedicated opaque loopback tickets for protected media; app-owned exact-origin/no-Referer fetching, Range-only forwarding, fail-closed setup, lifecycle revocation, and stale-callback isolation complete P1.4 with 8 focused tests. |
+| 2026-07-14 | P1.4b | `2188efb`, `28e3400` | Local playbin3 and AirPlay uridecodebin now receive only dedicated opaque loopback tickets for protected media; app-owned exact-origin/no-Referer fetching, Range-only forwarding, fail-closed setup, lifecycle revocation, and stale-callback isolation complete P1.4. The review follow-up moves server startup/revocation outside the state mutex and uses generation ownership so newer loads and Stop supersede in-flight startup without waiting or stale installation; 10 focused tests cover the slice. |
 | 2026-07-12 | P1.5 | `842341b` | Counted finite-response reads enforce endpoint caps and total deadlines across API, authentication, DAAP, radio, artwork, and metadata clients. |
 | 2026-07-14 | P1.6 receiver tickets | `c6aa7df`, `e23efd8` | Chromecast and MPD now receive revocable single-media tickets instead of backend credentials. MPD binds a dedicated IPv4/IPv6 proxy to the successful connection route, fails closed without it, and revokes across replacement, Stop, failure, ownership loss, EOS, shutdown, and stale generations; 18 new MPD/classifier/route tests cover the slice. Generic credential-free track values remain open. |
 | 2026-07-14 | P1.6 upstream-ticket TTL | `8735862` | Credential-bearing upstream routes now expire at a hard, non-sliding 24-hour monotonic deadline in addition to earlier lifecycle revocation. Boundary lookup atomically removes the route and returns 404; admitted responses may finish, local-file routes remain server-lifetime, and 6 deterministic tests cover the contract. |
