@@ -622,7 +622,7 @@ exists** in `src/local/tag_writer.rs`. The real defects are narrower and all rea
   `tests/fixtures/audio/README.md` records the generation recipe, GPL-3.0-or-later/no-third-party-
   recording provenance, and SHA-256
   `c47ed5dbe255701328f28b58fbe7408a70ae2ad20057089b5393253a00eab946`.
-- [x] Record implementation: commits `6d0ec95` and `2d305e7` plus PR _pending_; 8 focused tests.
+- [x] Record implementation: commits `6d0ec95` and `2d305e7` plus PR #91; 8 focused tests.
 
 Acceptance criteria: invalid edits leave the original byte-for-byte untouched, every failed save
 removes its temporary sibling, and a successful public tag write preserves readable audio while all
@@ -1233,4 +1233,4 @@ Add one line per completed task:
 | 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, keeps the prior visible projection fresh while remote intent is pending, preserves valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; eight navigation and two engine tests cover the races and event ordering. |
 | 2026-07-15 | P2.1 | PR #89 | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
 | 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
-| 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR _pending_ | Numeric validation, exclusive randomized extension-preserving sibling files, RAII cleanup, permission copying and pre-rename `fsync`, album-artist handling, and eight focused tests including a public-API round trip against a generated silent FLAC fixture. |
+| 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR #91 | Numeric validation, exclusive randomized extension-preserving sibling files, RAII cleanup, permission copying and pre-rename `fsync`, album-artist handling, and eight focused tests including a public-API round trip against a generated silent FLAC fixture. |
