@@ -497,8 +497,8 @@ Acceptance criteria: playlist-entry integrity does not depend on an upstream def
   selection, item and capacity limits before presentation ordering, a randomly selected subset
   with deterministic final ordering, compound direction/tie behavior, legacy rule JSON, and
   end-to-end reevaluation of a legacy `live_updating = false` playlist.
-- [x] Record implementation: date semantics in commit `93f6772`; this branch completes limit/sort
-  ordering and removes the false snapshot option with six focused regressions; PR pending.
+- [x] Record implementation: date semantics in commit `93f6772`; PR #89 completes limit/sort
+  ordering and removes the false snapshot option with six focused regressions.
 
 Acceptance criteria: limiting chooses the documented subset before the independent final sort,
 and the editor/persisted rule contract advertises only the always-current behavior it implements.
@@ -1135,4 +1135,4 @@ Add one line per completed task:
 | 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |
 | 2026-07-13 | P1.8 | `eb0b9ca`, `fbaaa7f` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable song identity, shared-queue preservation, ownership preflight, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
 | 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, keeps the prior visible projection fresh while remote intent is pending, preserves valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; eight navigation and two engine tests cover the races and event ordering. |
-| 2026-07-15 | P2.1 | branch `agent/p2-smart-playlist-semantics`; PR pending | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
+| 2026-07-15 | P2.1 | PR #89 | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
