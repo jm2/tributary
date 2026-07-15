@@ -29,7 +29,7 @@ Progress snapshot (2026-07-15), recounted from the literal P0–P3 task checkbox
 earlier numerator/denominator drift. The denominator excludes the two deferred P0.7 live-workflow
 verification boxes and the withdrawn P2.6 false finding; section-summary and global-validation
 gate boxes are not task progress:
-**150/213 (70.4%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **33/69 P2**,
+**154/215 (71.6%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **37/71 P2**,
 and **3/30 P3** after those exclusions. The release-workflow dry run remains deliberately deferred
 rather than being counted as unfinished P0 remediation.
 
@@ -706,13 +706,13 @@ bounded background operation in `ui/source_connect.rs`, where the original symli
   PR #92 supplied the nonblocking one-shot bridge; PR #93 supplies the native monitor and live
   hotplug lifecycle. The final working tree passes `cargo check` and strict all-target Clippy in
   debug and release. Both profiles pass 18 library plus 557 application tests (575 each).
-  Formatting, `git diff --check`,
-  AppStream validation, and `cargo audit` also pass; the audit reports exactly the two already
+  Formatting, `git diff --check`, AppStream validation, and `cargo audit` also pass; the audit
+  reports exactly the two already
   accepted unmaintained warnings. Twenty-six focused P2.4 tests cover traversal, native policy,
   source identity/path ownership, invalidation, bounded scanning, and lifecycle reconciliation. A
   live add, rename/change, relocation, active pre-unmount, and removal pass with real removable
-  hardware is still required before this record can close. P2.5's Flatpak permission/portal work
-  remains separate and open.
+  hardware is still required before this record can close. P2.5 now supplies the Flatpak
+  permission/portal policy, but its installed-sandbox smoke pass also remains open.
 
 Acceptance criteria for the implemented portion: discovery reads only cached native mount metadata
 on GTK's main thread; add/change/pre-unmount/remove signals keep the sidebar inventory live without
@@ -731,12 +731,57 @@ sandbox-permission implementation; real-hardware validation is still outstanding
 
 ### P2.5 Repair Flatpak behavior and local build path
 
-- [ ] Put the pinned generator where local and CI builds both use it.
-- [ ] Generate `build-aux/flatpak/cargo-sources.json` consistently.
-- [ ] Define narrow USB/removable-media permissions or a portal workflow.
-- [ ] Define writable custom-library behavior for tag editing.
-- [ ] Run a local Flatpak build and smoke-test USB/custom-library behavior.
-- [ ] Record implementation: _pending_
+- [x] Put the pinned generator where local and CI builds both use it. The byte-for-byte upstream
+  script at commit `737c0085912f9f7dabf9341d4608e2a77a51a73a` is now checked in beside its
+  immutable URL, MIT declaration, update procedure, and SHA-256
+  `b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c`. CI no
+  longer downloads the generator script at build time; it still installs the explicitly named
+  Python dependencies, whose transitive graph is not hash-locked. The deliberately deferred
+  release workflow still downloads and verifies the identical generator bytes before use.
+- [x] Generate `build-aux/flatpak/cargo-sources.json` consistently. One cwd-independent helper
+  verifies the vendored pin, enforces Python 3.9+ and the exact direct dependency versions, reads
+  the repository `Cargo.lock`, and always writes the ignored output beside the Flatpak manifest.
+  CI and `scripts/build-linux.sh --flatpak` both use that helper; the Linux build helper now anchors
+  itself to the repository root when invoked elsewhere. Local instructions use an isolated virtual
+  environment and configure Flathub; `flatpak-builder` installs the manifest's runtime, SDK, and
+  Rust extension dependencies from that remote. Flatpak-only mode bypasses host Rust/GTK checks,
+  the directory source excludes known VCS/agent/generated trees (including the 36 GiB host
+  `target/`), and the resulting single-file bundle records Flathub as its runtime repository.
+- [x] Define narrow USB/removable-media permissions or a portal workflow. The manifest replaces
+  `home:ro` with read-only `/media`, `/run/media`, and `/mnt`, plus the documented
+  `org.gtk.vfs.*` session-bus namespace. That bus grant exposes the host GVfs service methods, not
+  just a single listing call; Tributary uses cached mount discovery, retains native paths only, and
+  omits the GVfs filesystem sockets. It grants no raw USB/all-device, UDisks, whole-host/root, or
+  whole-home library/content access; the separate theme/icon resources remain read-only. A
+  fail-closed exact allowlist and negative quoted/commented/escaped-key, duplicate/missing-entry,
+  and arbitrary-grant fixtures enforce all 13 reviewed finish arguments in CI. The
+  automatic Devices filesystem path is read-only; Tributary still rejects non-native GIO roots.
+- [x] Define writable custom-library behavior for tag editing. XDG Music remains directly
+  read/write. Every other writable library must be chosen explicitly through the existing
+  `GtkFileDialog::select_folder` flow; the FileChooser/Documents portals export that selected
+  directory persistently with requested write permission, and Tributary stores the returned portal
+  path. Host filesystem permissions remain authoritative, so the portal cannot make read-only
+  storage writable.
+- [ ] Add an explicit identity-preserving legacy-root reauthorization flow. Removing an old direct
+  host path and adding the portal path loses the old→new intent: exact-path scanning creates new
+  track IDs while preserving the inaccessible rows and their playlist links. Until a guarded
+  root-relative relocation preserves IDs, dates, play history, and playlist foreign keys, the UI
+  and documentation must not recommend remove-and-reselect as a migration.
+- [ ] Surface effective write capability in track Properties. Automatic Devices roots are
+  read-only at the Flatpak sandbox boundary, but the dialog currently enables Save from format
+  support alone and reports the filesystem error only after an attempted write. Disable editing or
+  explain the limitation before Save when the selected source cannot be written.
+- [ ] Run a local Flatpak build and smoke-test USB/custom-library behavior. This environment has
+  Flatpak 1.18 but no `flatpak-builder` or installed builder runtime, and cannot provide the
+  interactive portal plus physical removable-media pass. The PR's containerized Flatpak job must
+  still prove the offline bundle build; a local installed-app pass must verify XDG Music writes,
+  a portal-selected custom directory across restart, a legacy direct path's fail-closed behavior,
+  and read-only add/change/remove under each applicable standard mount root.
+- [ ] Record implementation: pending the PR number and the local interactive smoke test. The
+  noninteractive working tree passes the exact vendored checksum, Python and shell syntax, YAML
+  parsing, the positive/negative permission-policy suite, cwd-independent generation from `/tmp`
+  and `/`, nonempty JSON parsing, and byte-identical repeated generation. No repository-root
+  `cargo-sources.json` is created. The release workflow remains intentionally out of scope.
 
 ### P2.6 Synchronize packaging metadata
 
@@ -918,15 +963,22 @@ Run before marking any milestone complete:
 - [x] Confirm `git diff --check` is clean
 
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
-by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
+by P2.6. P2.5's manifest-local source generation and permission-policy checks pass, but a full local
+Flatpak build and installed interactive smoke pass remain outstanding, as does the deliberately
+deferred live release-workflow run.
 
-Most recent milestone validation (2026-07-15, P2.4 native removable-media monitoring): `cargo
-check` passed; 18 library plus 557 application tests passed in debug and release (575 per profile);
-strict all-target Clippy passed in both profiles; formatting, `git diff --check`, and AppStream
-validation were clean; and `cargo audit` passed with exactly the two accepted unmaintained warnings
-recorded under P0.8. The first sandboxed debug-suite attempt denied loopback binds and therefore
-failed 41 network-fixture tests with `Operation not permitted`; the required unrestricted rerun
-passed all 575 tests and is the result recorded here.
+Most recent milestone validation (2026-07-15, P2.5 Flatpak generation and access policy): the
+vendored generator matches its recorded SHA-256; Python, Bash, POSIX-shell, manifest YAML, and CI
+workflow YAML parse; and the positive/negative permission-policy suite passes. Invoking the shared
+helper by absolute path from `/tmp` and `/` produced a nonempty JSON array only at
+`build-aux/flatpak/cargo-sources.json`; two runs were byte-identical with SHA-256
+`fd5f6081ad3e8d15fefc0bc08f513f9c21e93132a4935c99a898efdd6d92e0b4`, and
+`scripts/build-linux.sh --help` works outside the checkout. `cargo check`, strict all-target Clippy
+in debug and release, and 18 library plus 557 application tests in both profiles pass (575 per
+profile). Formatting, `git diff --check`, AppStream validation, and `cargo audit` also pass; the
+audit reports exactly the two accepted unmaintained warnings recorded under P0.8. The unchanged
+desktop validator diagnostic remains tracked under P2.6. `flatpak-builder` and its runtime are not
+installed here, so the PR's Flatpak job is still required to validate the complete offline bundle.
 
 **This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
 hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
@@ -952,7 +1004,19 @@ Record scope or design decisions here so deferred work is explicit.
   `can_unmount` eligibility can admit a non-removable or native-path network mount when backend
   class metadata is absent. Automount, eject, MTP/pathless browsing, hard interruption of an
   in-progress filesystem/tag-parser call, nested-mount exclusion, Flatpak access, and live
-  physical-device validation remain outside this implementation.
+  physical-device validation were outside that implementation. P2.5 now supplies the standard
+  native mount-root and custom-library portal policy; physical-device validation remains open.
+- 2026-07-15 — P2.5 treats automatic Devices browsing and writable custom libraries as different
+  authority paths. For library/content access, the Flatpak statically exposes XDG Music read/write
+  and the conventional `/media`, `/run/media`, and `/mnt` roots read-only; separate read-only theme
+  and icon grants remain UI resources. `org.gtk.vfs.*` exposes the host GVfs service namespace;
+  Tributary uses its cached native mount inventory and neither requests raw USB/UDisks access nor
+  exposes the GVfs filesystem sockets. A custom directory receives a persistent requested-write
+  portal grant only after explicit `GtkFileDialog` selection, subject to its host permissions. A
+  legacy direct root cannot yet be safely reauthorized: remove-and-reselect loses path identity and
+  can duplicate tracks while playlists remain linked to the old rows, so explicit guarded
+  relocation remains open. The permission contract is executable in CI; effective-write UX plus
+  local interactive portal and physical-media smoke testing remain required.
 - 2026-07-10 — P0.2 now fails closed for incomplete traversal, unavailable/replaced roots,
   nested mounts, mount-table failures, and ambiguous legacy databases. Legacy roots with
   existing metadata are intentionally not made deletion-authoritative from content heuristics;
@@ -1321,4 +1385,5 @@ Add one line per completed task:
 | 2026-07-15 | P2.1 | PR #89 | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
 | 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
 | 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR #91 | Numeric validation; bounded exclusive UUID-plus-format sibling files; exact scan/watcher exclusion and temp-to-original metadata refresh that preserve track identity, history, and playlist links; RAII cleanup; permission copying and pre-rename `fsync`; album-artist handling; and 11 focused tests including a public-API round trip against a generated silent FLAC fixture. |
-| 2026-07-15 | P2.4 native mount lifecycle | PR #93 | GIO main-thread mount inventory and live signals; best-available logical keys separate from native paths; synchronous confirmed-removal retirement; exact-intent relocation reactivation; bounded cancellable scans; and 26 focused tests. Physical-device validation and P2.5 Flatpak access remain open. |
+| 2026-07-15 | P2.4 native mount lifecycle | PR #93 | GIO main-thread mount inventory and live signals; best-available logical keys separate from native paths; synchronous confirmed-removal retirement; exact-intent relocation reactivation; bounded cancellable scans; and 26 focused tests. Physical-device validation remains open; Flatpak access follows under P2.5. |
+| 2026-07-15 | P2.5 Flatpak generation and access policy | Pending PR | Vendored checksum-pinned Cargo generator shared by local builds and CI; consistent manifest-local source generation; read-only standard external-media roots; reviewed GVfs bus access; portal-selected writable custom libraries; and a fail-closed permission policy test. Legacy-root relocation, effective-write UX, local interactive portal/physical-media smoke testing, and the deliberately deferred release workflow remain open. |
