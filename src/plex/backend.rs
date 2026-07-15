@@ -18,7 +18,7 @@ use crate::architecture::{RemoteMediaResolver, ResolvedHttpRequest};
 
 use super::api::{
     PlexAlbum, PlexAlbumsResponse, PlexArtist, PlexArtistsResponse, PlexIdentityResponse,
-    PlexSectionsResponse, PlexTrack, PlexTracksResponse,
+    PlexMedia, PlexSectionsResponse, PlexTrack, PlexTracksResponse,
 };
 use super::client::PlexClient;
 
@@ -563,37 +563,43 @@ fn deterministic_uuid(plex_id: &str) -> Uuid {
 }
 
 fn plex_stream_locator(plex: &PlexTrack) -> Option<&str> {
+    plex_stream_source(plex).map(|(_, locator)| locator)
+}
+
+fn plex_stream_source(plex: &PlexTrack) -> Option<(&PlexMedia, &str)> {
     plex.media.iter().find_map(|media| {
         media
             .part
             .iter()
             .find_map(|part| part.key.as_deref().filter(|key| !key.trim().is_empty()))
+            .map(|locator| (media, locator))
     })
 }
 
 fn cacheable_plex_track(plex: &PlexTrack) -> Option<(Uuid, Track, String)> {
-    let stream_locator = plex_stream_locator(plex)?.to_string();
+    let (media, stream_locator) = plex_stream_source(plex)?;
     let track_uuid = deterministic_uuid(&plex.rating_key);
     let artist_id = plex
         .grandparent_rating_key
         .as_deref()
         .map(deterministic_uuid);
     let album_id = plex.parent_rating_key.as_deref().map(deterministic_uuid);
-    let track = plex_track_to_track(plex, track_uuid, artist_id, album_id);
-    Some((track_uuid, track, stream_locator))
+    let track = plex_track_to_track(plex, media, track_uuid, artist_id, album_id);
+    Some((track_uuid, track, stream_locator.to_string()))
 }
 
 fn plex_track_to_track(
     plex: &PlexTrack,
+    media: &PlexMedia,
     id: Uuid,
     artist_id: Option<Uuid>,
     album_id: Option<Uuid>,
 ) -> Track {
-    let bitrate_kbps = plex.media.first().and_then(|m| m.bitrate);
-    let format = plex
-        .media
-        .first()
-        .and_then(|m| m.audio_codec.clone().or_else(|| m.container.clone()));
+    let bitrate_kbps = media.bitrate;
+    let format = media
+        .audio_codec
+        .clone()
+        .or_else(|| media.container.clone());
 
     Track {
         id,
@@ -641,9 +647,10 @@ mod tests {
         }))
         .unwrap();
 
-        let track = plex_track_to_track(&track, Uuid::new_v4(), None, None);
-        assert!(track.stream_url.is_none());
-        assert!(track.cover_art_url.is_none());
+        let media = track.media.first().unwrap();
+        let converted = plex_track_to_track(&track, media, Uuid::new_v4(), None, None);
+        assert!(converted.stream_url.is_none());
+        assert!(converted.cover_art_url.is_none());
     }
 
     #[test]
@@ -671,8 +678,16 @@ mod tests {
         let track: PlexTrack = serde_json::from_value(serde_json::json!({
             "ratingKey": "track-id",
             "Media": [
-                {"Part": [{}, {"key": ""}]},
-                {"Part": [{"key": "/library/parts/2/file.flac"}]},
+                {
+                    "bitrate": 64,
+                    "audioCodec": "invalid",
+                    "Part": [{}, {"key": ""}]
+                },
+                {
+                    "bitrate": 1411,
+                    "audioCodec": "flac",
+                    "Part": [{"key": "/library/parts/2/file.flac"}]
+                },
             ],
         }))
         .unwrap();
@@ -685,6 +700,8 @@ mod tests {
             cacheable_plex_track(&track).expect("track should be published");
         assert_eq!(track_id, deterministic_uuid("track-id"));
         assert_eq!(published.id, track_id);
+        assert_eq!(published.bitrate_kbps, Some(1411));
+        assert_eq!(published.format.as_deref(), Some("flac"));
         assert_eq!(stream_locator, "/library/parts/2/file.flac");
     }
 }
