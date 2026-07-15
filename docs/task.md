@@ -703,9 +703,10 @@ bounded background operation in `ui/source_connect.rs`, where the original symli
   reconcile a stale snapshot, while navigation generations prevent its retired scan from later
   caching or rendering.
 - [ ] Record implementation and manual validation: symlink containment landed in commit `1886847`;
-  PR #92 supplied the nonblocking one-shot bridge; the native-monitor/hotplug PR is pending. The
-  final working tree passes `cargo check`, strict all-target Clippy in debug and release, and 18
-  library plus 557 application tests in both profiles (575 each). Formatting, `git diff --check`,
+  PR #92 supplied the nonblocking one-shot bridge; PR #93 supplies the native monitor and live
+  hotplug lifecycle. The final working tree passes `cargo check` and strict all-target Clippy in
+  debug and release. Both profiles pass 18 library plus 557 application tests (575 each).
+  Formatting, `git diff --check`,
   AppStream validation, and `cargo audit` also pass; the audit reports exactly the two already
   accepted unmaintained warnings. Twenty-six focused P2.4 tests cover traversal, native policy,
   source identity/path ownership, invalidation, bounded scanning, and lifecycle reconciliation. A
@@ -1319,4 +1320,4 @@ Add one line per completed task:
 | 2026-07-15 | P2.1 | PR #89 | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
 | 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
 | 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR #91 | Numeric validation; bounded exclusive UUID-plus-format sibling files; exact scan/watcher exclusion and temp-to-original metadata refresh that preserve track identity, history, and playlist links; RAII cleanup; permission copying and pre-rename `fsync`; album-artist handling; and 11 focused tests including a public-API round trip against a generated silent FLAC fixture. |
-| 2026-07-15 | P2.4 native mount lifecycle | Pending PR | GIO main-thread mount inventory and live signals; best-available logical keys separate from native paths; synchronous confirmed-removal retirement; exact-intent relocation reactivation; bounded cancellable scans; and 26 focused tests. Physical-device validation and P2.5 Flatpak access remain open. |
+| 2026-07-15 | P2.4 native mount lifecycle | PR #93 | GIO main-thread mount inventory and live signals; best-available logical keys separate from native paths; synchronous confirmed-removal retirement; exact-intent relocation reactivation; bounded cancellable scans; and 26 focused tests. Physical-device validation and P2.5 Flatpak access remain open. |
