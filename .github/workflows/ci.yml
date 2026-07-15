@@ -330,7 +330,7 @@ jobs:
             || python3 -m pip install --requirement build-aux/flatpak/generator-requirements.txt
 
       - name: Generate cargo-sources.json
-        run: build-aux/flatpak/generate-cargo-sources.sh
+        run: bash build-aux/flatpak/generate-cargo-sources.sh
 
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:

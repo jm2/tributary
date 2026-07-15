@@ -81,7 +81,7 @@ build_flatpak() {
 
   local manifest="build-aux/flatpak/io.github.tributary.Tributary.yml"
   info "Generating cargo-sources.json..."
-  build-aux/flatpak/generate-cargo-sources.sh
+  bash build-aux/flatpak/generate-cargo-sources.sh
 
   info "Building Flatpak bundle..."
   flatpak-builder --user --install-deps-from=flathub --force-clean \

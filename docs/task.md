@@ -746,7 +746,9 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   environment and configure Flathub; `flatpak-builder` installs the manifest's runtime, SDK, and
   Rust extension dependencies from that remote. Flatpak-only mode bypasses host Rust/GTK checks,
   the directory source excludes known VCS/agent/generated trees (including the 36 GiB host
-  `target/`), and the resulting single-file bundle records Flathub as its runtime repository.
+  `target/`), and the resulting single-file bundle records Flathub as its runtime repository. The
+  PR review follow-up normalizes surrounding whitespace on otherwise exact dependency pins and
+  invokes the Bash helper explicitly from CI and the Linux build script.
 - [x] Define narrow USB/removable-media permissions or a portal workflow. The manifest replaces
   `home:ro` with read-only `/media`, `/run/media`, and `/mnt`, plus the documented
   `org.gtk.vfs.*` session-bus namespace. That bus grant exposes the host GVfs service methods, not

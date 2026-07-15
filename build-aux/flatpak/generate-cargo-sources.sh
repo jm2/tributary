@@ -45,6 +45,8 @@ for line_number, raw_line in enumerate(
     if not requirement:
         continue
     package, separator, expected = requirement.partition("==")
+    package = package.strip()
+    expected = expected.strip()
     if not separator or not package or not expected or "==" in expected:
         problems.append(
             f"{sys.argv[1]}:{line_number}: expected an exact name==version pin"
