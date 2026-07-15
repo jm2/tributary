@@ -27,6 +27,8 @@ sidebar:
   top_voted: "Les mieux notées"
   stations_near_me: "Stations à proximité"
   playlists: "Listes de lecture"
+  devices: "Appareils"
+  usb_device: "Périphérique USB"
   add_server: "Ajouter un serveur"
   new_playlist: "Nouvelle liste de lecture"
   remove_server: "Supprimer le serveur"

@@ -27,6 +27,8 @@ sidebar:
   top_voted: "高評価の局"
   stations_near_me: "近くの局"
   playlists: "プレイリスト"
+  devices: "デバイス"
+  usb_device: "USBデバイス"
   add_server: "サーバーを追加"
   new_playlist: "新しいプレイリスト"
   remove_server: "サーバーを削除"

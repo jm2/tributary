@@ -121,33 +121,9 @@ pub fn build_window(
     // ── Load custom CSS ──────────────────────────────────────────────
     load_css();
 
-    // ── Detect USB devices and add to sidebar ────────────────────────
-    let usb_devices = crate::device::usb::detect_usb_devices();
-
     // ── Sidebar sources ────────────────────────────────────────────────
     let sources = super::dummy_data::build_sources();
     let mut sources = sources;
-
-    // Add detected USB devices under a "Devices" category header.
-    if !usb_devices.is_empty() {
-        sources.push(SourceObject::header("Devices"));
-        for dev in &usb_devices {
-            let src =
-                SourceObject::source(&dev.name, "usb-device", "drive-removable-media-symbolic");
-            // Store the mount point path as the server_url for retrieval
-            // when the user clicks the device in the sidebar.
-            let obj = SourceObject::discovered(
-                &dev.name,
-                "usb-device",
-                &dev.mount_point.to_string_lossy(),
-            );
-            obj.set_connected(true);
-            obj.set_requires_password(false);
-            obj.set_icon_name("drive-removable-media-symbolic");
-            sources.push(obj);
-            let _ = src; // consumed above via discovered()
-        }
-    }
 
     // Load manually-added servers from servers.json.
     let saved_servers = load_saved_servers();
@@ -914,6 +890,52 @@ pub fn build_window(
     // exists after the window has been realized and mapped.
     window.present();
     info!("Main window presented");
+
+    // Mount metadata can block indefinitely when a removable device goes
+    // stale. Keep every filesystem probe off the GTK thread and publish the
+    // completed snapshot atomically once the worker returns.
+    let usb_device_fallback = rust_i18n::t!("sidebar.usb_device").into_owned();
+    let devices_heading = rust_i18n::t!("sidebar.devices").into_owned();
+    let (usb_discovery_tx, usb_discovery_rx) = async_channel::bounded(1);
+    let sidebar_store_weak = sidebar_store.downgrade();
+    if let Err(error) = std::thread::Builder::new()
+        .name("usb-discovery".to_string())
+        .spawn(move || {
+            let devices = crate::device::usb::detect_usb_devices(&usb_device_fallback);
+            if usb_discovery_tx.try_send(devices).is_err() {
+                tracing::debug!("USB discovery receiver closed before publication");
+            }
+        })
+    {
+        warn!(%error, "Failed to start USB device discovery worker");
+    }
+
+    glib::MainContext::default().spawn_local(async move {
+        let Ok(devices) = usb_discovery_rx.recv().await else {
+            return;
+        };
+        if devices.is_empty() {
+            return;
+        }
+        let Some(sidebar_store) = sidebar_store_weak.upgrade() else {
+            return;
+        };
+
+        let mut rows = Vec::with_capacity(devices.len() + 1);
+        rows.push(SourceObject::header(&devices_heading));
+        for device in devices {
+            let source = SourceObject::discovered(
+                &device.name,
+                "usb-device",
+                &device.mount_point.to_string_lossy(),
+            );
+            source.set_connected(true);
+            source.set_requires_password(false);
+            source.set_icon_name("drive-removable-media-symbolic");
+            rows.push(source);
+        }
+        sidebar_store.splice(sidebar_store.n_items(), 0, &rows);
+    });
 
     // ── Create GStreamer player ──────────────────────────────────────
     let (player, player_rx) = match crate::audio::Player::new(rt_handle.clone()) {

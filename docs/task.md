@@ -29,7 +29,7 @@ Progress snapshot (2026-07-15), recounted from the literal P0–P3 task checkbox
 earlier numerator/denominator drift. The denominator excludes the two deferred P0.7 live-workflow
 verification boxes and the withdrawn P2.6 false finding; section-summary and global-validation
 gate boxes are not task progress:
-**147/213 (69.0%)** in-scope checklist items complete; **114/114 (100%)** across P0 and P1 after
+**149/213 (70.0%)** in-scope checklist items complete; **114/114 (100%)** across P0 and P1 after
 the same P0.7 exclusion. The release-workflow dry run remains deliberately deferred rather than
 being counted as unfinished P0 remediation.
 
@@ -133,10 +133,16 @@ logged out exactly once on explicit disconnect or controlled shutdown.
 - [x] Make reselecting the current output a no-op.
 - [x] Explicitly transfer or clear playback when the output target changes.
 - [x] Add tests for sort, filter, source change, output change, EOS, and external-file playback.
-- [x] Record implementation: PR #68; 25 focused UI/output tests.
+- [x] Record implementation: PR #68; 25 focused UI/output tests. A 2026-07-15 live Windows DAAP
+  check exposed a separate idle-Play abort: the immutable `RefCell` borrow used to choose
+  `StartAt` lived through the `match` arm that installed the new queue. PR #92 resolves the
+  request behind a function boundary before dispatch; the existing Stop-then-Play regression now
+  uses the real `RefCell` boundary and proves the `StartAt` result permits immediate mutable queue
+  replacement.
 
 Acceptance criteria: view mutations never change the identity of the playing track or the
-meaning of queue navigation.
+meaning of queue navigation. Starting playback from an idle non-empty view releases every session
+read borrow before installing the new queue.
 
 ### P0.5 Fix recycled sidebar action handlers
 
@@ -642,8 +648,9 @@ original track's stable identity, history, or playlist links.
 
 ### P2.4 Make removable-media browsing safe and asynchronous
 
-Re-scoped 2026-07-13. `device/usb.rs` performs **no traversal at all** — it only `read_dir`s the
-mount roots (`:64-87`), so the symlink defect is not there. The traversal lives in the UI.
+Re-scoped 2026-07-13. `device/usb.rs` performs **no recursive traversal**: it shallowly enumerates
+the platform mount roots and metadata-probes each candidate. The audio-file traversal lives in the
+UI, so that is where the symlink defect was.
 
 - [x] Disable symlink following during device scans. The walk used
   `WalkDir::new(mount_path).follow_links(true)`, so a USB stick containing `music -> /home/user`
@@ -651,22 +658,43 @@ mount roots (`:64-87`), so the symlink defect is not there. The traversal lives 
   now extracted into `enumerate_device_audio_files`, uses `.follow_links(false)`, and tests
   `entry.file_type()` rather than `Path::is_file()` — the latter follows the link anyway and would
   still have pulled in an individual file symlinked from off the device. This matches the library
-  scanner's policy (`local/engine.rs:772`).
+  scanner's no-follow policy.
 - [x] Verify descendants remain on the selected mount/device, for the symlink case: nothing outside
   the mount can now be reached through a link. (A bind mount or a nested real filesystem under the
   mount point is still followed; the library scanner's `filesystem_boundary_id` check is the model
   to copy if that matters here.)
-- [ ] Move mount **discovery** off the GTK thread. `ui/window.rs:71` calls `detect_usb_devices()`
-  synchronously inside `build_window`. It is only a shallow `read_dir` + `is_dir()`, but against a
-  hung mount (stale NFS, yanked stick) `is_dir()` blocks in the kernel and the app hangs at
-  startup before the window is drawn. The *traversal* is already off-thread, so that half is done.
-  Left open deliberately: it reorders sidebar population at startup and wants a live UI review.
-- [ ] Use platform mount/volume APIs rather than directory heuristics.
+- [x] Move one-shot mount **discovery** off the GTK thread. The platform heuristics now run wholly
+  on one named `usb-discovery` standard-library thread and send exactly one sorted, deduplicated
+  `Vec<DeviceInfo>` snapshot through an `async_channel::bounded(1)` handoff. GTK awaits that
+  snapshot with `spawn_local`, upgrades only a weak sidebar-store reference after receipt, creates
+  every `SourceObject` on the main thread, and publishes the localized header plus rows in one
+  `ListStore::splice`. A kernel filesystem probe can still strand the detached worker because this
+  slice adds no timeout or cancellation, but it can no longer block window construction or touch
+  GTK from the worker.
+- [ ] Use platform mount/volume APIs rather than directory heuristics, and add live hotplug/unplug
+  updates. The current worker runs the existing heuristics once at startup. Exact raw-path
+  deduplication does not coalesce aliases or two mount points for the same physical device.
 - [x] Add malicious symlink tests: a device tree with both a directory symlink and a file symlink
   pointing off-device yields only the files physically on the device.
-- [ ] Add stale-mount and duplicate-device tests.
-- [ ] Record implementation: symlink containment in commit `1886847`; 2 focused traversal tests. Mount
-  discovery and platform volume APIs remain open.
+- [x] Add deterministic failed/vanished-candidate and exact-duplicate-path tests — the testable
+  portion of the original stale-mount/duplicate-device item. Candidate paths are sorted and
+  deduplicated by exact `PathBuf` before probing, so each exact path is checked once. Probe errors
+  and paths that are no longer directories are skipped without hiding healthy candidates. Two pure
+  tests cover error/non-directory filtering and shuffled duplicate inputs; they replace the
+  host-dependent detection smoke test. A truly hung stale-mount probe remains deliberately
+  unbounded on the detached worker, and a mount can still disappear after its successful probe.
+  The GTK publication path inserts no empty Devices header, and both its header and unnamed-device
+  fallback use the locale catalogs.
+- [ ] Record partial implementation: symlink containment in commit `1886847`; one-shot background
+  discovery in PR #92; 4 focused tests across traversal containment and deterministic
+  discovery filtering. Platform mount APIs, hotplug, live manual UI validation, and the P2.5
+  Flatpak permission/portal work remain open.
+
+Acceptance criteria for this slice: window construction never waits for mount discovery; the
+worker publishes one bounded snapshot without constructing GTK objects; exact duplicate paths are
+probed once; failed and non-directory candidates are omitted; and GTK atomically inserts a localized
+header only when at least one device row survives. This is not a timeout, post-probe liveness
+guarantee, physical-device identity, hotplug, or sandbox-permission implementation.
 
 ### P2.5 Repair Flatpak behavior and local build path
 
@@ -859,11 +887,11 @@ Run before marking any milestone complete:
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
-Most recent milestone validation (2026-07-15, P2.3 review follow-ups): 18 library plus
-536 application tests passed in debug (554 total), and the release suite passed with the same
-554 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
-were clean; and `cargo audit` passed with exactly the two accepted unmaintained warnings recorded
-under P0.8.
+Most recent milestone validation (2026-07-15, P2.4 one-shot USB discovery plus the live
+idle-Play crash follow-up): 18 library plus 537 application tests passed in debug (555 total), and
+the release suite passed with the same 555 tests; strict all-target Clippy passed in both profiles;
+formatting and `git diff --check` were clean; and `cargo audit` passed with exactly the two accepted
+unmaintained warnings recorded under P0.8.
 
 **This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
 hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
@@ -1243,6 +1271,7 @@ Add one line per completed task:
 | 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |
 | 2026-07-13 | P1.8 | `eb0b9ca`, `fbaaa7f` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable song identity, shared-queue preservation, ownership preflight, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
 | 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, keeps the prior visible projection fresh while remote intent is pending, preserves valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; eight navigation and two engine tests cover the races and event ordering. |
+| 2026-07-15 | P0.4 playback-start follow-up | PR #92 | Idle Play now releases the session read used to select `StartAt` before the arm installs its queue, preventing the live Windows DAAP `RefCell already borrowed` abort; the existing Stop-then-Play regression exercises the real `RefCell` boundary and immediate mutable replacement. |
 | 2026-07-15 | P2.1 | PR #89 | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
 | 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
 | 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR #91 | Numeric validation; bounded exclusive UUID-plus-format sibling files; exact scan/watcher exclusion and temp-to-original metadata refresh that preserve track identity, history, and playlist links; RAII cleanup; permission copying and pre-rename `fsync`; album-artist handling; and 11 focused tests including a public-API round trip against a generated silent FLAC fixture. |
