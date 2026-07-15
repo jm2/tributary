@@ -27,6 +27,42 @@ use lofty::file::TaggedFileExt;
 use lofty::tag::{Accessor, ItemKey, ItemValue, TagExt, TagItem};
 use uuid::Uuid;
 
+/// Reserved filename prefix for the private sibling used by atomic tag writes.
+const TAG_WRITE_TEMP_PREFIX: &str = ".tributary-tag-";
+
+/// Formats whose tags Tributary can rewrite safely.
+const WRITABLE_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "ogg", "flac"];
+
+/// Return whether `path` has the exact shape emitted for a tag-write sibling.
+///
+/// The bounded ASCII name is `.tributary-tag-<canonical UUID>.<format>`. Exact
+/// recognition minimizes the reserved namespace while allowing the scanner
+/// and watcher to keep an in-progress full-size copy out of the library.
+pub fn is_tag_write_temp_file(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let Some(suffix) = name
+        .as_encoded_bytes()
+        .strip_prefix(TAG_WRITE_TEMP_PREFIX.as_bytes())
+    else {
+        return false;
+    };
+    if suffix.len() < 38 || suffix.get(36) != Some(&b'.') {
+        return false;
+    }
+
+    let Ok(id) = std::str::from_utf8(&suffix[..36]) else {
+        return false;
+    };
+    let Ok(extension) = std::str::from_utf8(&suffix[37..]) else {
+        return false;
+    };
+
+    WRITABLE_EXTENSIONS.contains(&extension)
+        && Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id)
+}
+
 /// Fields that can be edited in the properties dialog.
 ///
 /// Each field is `Option<String>` — `None` means "don't change this field",
@@ -120,11 +156,22 @@ impl TempFile {
     /// follow a symlink an attacker planted at a predictable path.
     fn create_beside(target: &Path) -> Result<(Self, std::fs::File)> {
         let directory = target.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = target.file_name().unwrap_or_default();
+        let extension = target
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
 
         for _ in 0..8 {
-            let mut candidate_name = file_name.to_os_string();
-            candidate_name.push(format!(".tributary-tag-{}.tmp", Uuid::new_v4()));
+            // `lofty::read_from_path` infers the format from the final
+            // extension. Preserve only that extension: including the whole
+            // source name could overflow a filesystem's component-length
+            // limit for an otherwise valid long filename.
+            let mut candidate_name =
+                std::ffi::OsString::from(format!("{TAG_WRITE_TEMP_PREFIX}{}", Uuid::new_v4()));
+            if let Some(extension) = extension.as_deref() {
+                candidate_name.push(".");
+                candidate_name.push(extension);
+            }
             let candidate = directory.join(candidate_name);
 
             match std::fs::OpenOptions::new()
@@ -182,9 +229,6 @@ impl Drop for TempFile {
         }
     }
 }
-
-/// Supported formats for tag writing.
-const WRITABLE_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "ogg", "flac"];
 
 /// Returns `true` if the file extension is a format we can write tags to.
 pub fn is_writable(path: &Path) -> bool {
@@ -402,9 +446,7 @@ mod tests {
             Self { path }
         }
 
-        /// A file that is *named* like audio but is not decodable, which is all
-        /// these tests need: every assertion here is about what happens before
-        /// lofty succeeds, or when it fails.
+        /// Copy arbitrary fixture bytes into this test's isolated directory.
         fn audio_file(&self, name: &str, contents: &[u8]) -> PathBuf {
             let path = self.path.join(name);
             std::fs::write(&path, contents).expect("write test file");
@@ -519,6 +561,63 @@ mod tests {
     }
 
     #[test]
+    fn a_valid_flac_round_trips_every_supported_edit() {
+        use std::time::Duration;
+
+        use lofty::file::AudioFile;
+
+        let directory = TestDirectory::new("happy-path");
+        let track = directory.audio_file(
+            "silence.flac",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        );
+        let edits = TagEdits {
+            title: Some("Fixture Title".to_string()),
+            artist: Some("Fixture Artist".to_string()),
+            album: Some("Fixture Album".to_string()),
+            album_artist: Some("Fixture Album Artist".to_string()),
+            genre: Some("Fixture Genre".to_string()),
+            composer: Some("Fixture Composer".to_string()),
+            year: Some("2026".to_string()),
+            track_number: Some("7".to_string()),
+            disc_number: Some("2".to_string()),
+            comment: Some("Fixture comment".to_string()),
+        };
+
+        write_tags(&track, &edits).expect("write every supported edit to a valid FLAC");
+        assert!(
+            directory.temp_files().is_empty(),
+            "a successful write must not leave its sibling temp file behind"
+        );
+
+        let tagged_file = lofty::read_from_path(&track).expect("reopen tagged FLAC");
+        assert_eq!(
+            tagged_file.properties().duration(),
+            Duration::from_millis(100),
+            "tagging must preserve the readable audio stream"
+        );
+        let tag = tagged_file
+            .primary_tag()
+            .expect("tagged FLAC must have a primary tag");
+        assert_eq!(tag.title().as_deref(), Some("Fixture Title"));
+        assert_eq!(tag.artist().as_deref(), Some("Fixture Artist"));
+        assert_eq!(tag.album().as_deref(), Some("Fixture Album"));
+        assert_eq!(
+            tag.get_string(ItemKey::AlbumArtist),
+            Some("Fixture Album Artist")
+        );
+        assert_eq!(tag.genre().as_deref(), Some("Fixture Genre"));
+        assert_eq!(tag.get_string(ItemKey::Composer), Some("Fixture Composer"));
+        assert_eq!(tag.get_string(ItemKey::Year), Some("2026"));
+        assert_eq!(tag.track(), Some(7));
+        assert_eq!(tag.disk(), Some(2));
+        assert_eq!(tag.comment().as_deref(), Some("Fixture comment"));
+    }
+
+    #[test]
     fn an_unsupported_format_is_refused_before_any_copy() {
         let directory = TestDirectory::new("format");
         let track = directory.audio_file("notes.txt", b"text");
@@ -544,7 +643,7 @@ mod tests {
     #[test]
     fn temp_paths_are_unique_and_exclusively_created() {
         let directory = TestDirectory::new("exclusive");
-        let track = directory.audio_file("song.mp3", b"audio");
+        let track = directory.path.join(format!("{}.FLAC", "x".repeat(220)));
 
         let (first, _first_handle) = TempFile::create_beside(&track).expect("first temp");
         let (second, _second_handle) = TempFile::create_beside(&track).expect("second temp");
@@ -553,6 +652,15 @@ mod tests {
         assert!(first.path().exists());
         assert!(second.path().exists());
         assert_eq!(first.path().parent(), track.parent());
+        assert_eq!(
+            first.path().extension().and_then(|ext| ext.to_str()),
+            Some("flac")
+        );
+        assert!(is_tag_write_temp_file(first.path()));
+        assert!(
+            first.path().file_name().unwrap().len() < 80,
+            "the sibling component must not inherit the long source filename"
+        );
 
         let first_path = first.path().to_path_buf();
         drop(first);
