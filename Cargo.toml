@@ -34,6 +34,9 @@ futures = "0.3"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 
+# Safe, namespace-aware XSPF parsing
+quick-xml = "0.41"
+
 # URL handling
 url = { version = "2", features = ["serde"] }
 
@@ -59,6 +62,7 @@ async-channel = "2"
 
 # XDG / platform directories
 dirs = "6"
+tempfile = "3"
 
 # Shuffle randomness (zero-dependency PRNG)
 fastrand = "2"

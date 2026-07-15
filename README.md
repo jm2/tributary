@@ -468,6 +468,90 @@ Tributary supports regular and smart playlists for the local library:
 - **Regular playlists** — Right-click the Playlists header in the sidebar to create a new playlist. Right-click tracks in the tracklist to add them. Playlists survive library folder changes via fingerprint-based track matching.
 - **Smart playlists** — iTunes-style rules engine with filterable metadata fields, text/numeric/date operators, sorting, and result limiting. Smart playlists are evaluated against the current local library whenever they are opened or exported; they are not stored snapshots. Create them via the sidebar context menu.
 
+#### Importing and exporting playlists
+
+Tributary directly reads and writes only [XSPF version 1](https://www.xspf.org/spec) (`.xspf`).
+The menus and file chooser identify that format explicitly; Apple Music/iTunes XML, Google
+Takeout CSV, M3U, and service-specific playlist URLs are not accepted directly. Export writes the
+complete XSPF document to a temporary sibling and atomically replaces the chosen destination, so
+an error leaves an existing export unchanged. XML 1.0-forbidden control characters are rejected
+before the temporary file or destination is touched. A corrupt negative stored duration or one
+outside Tributary's supported `u64` millisecond range is omitted rather than blocking the otherwise
+valid playlist, because XSPF duration is optional.
+
+Import requires a valid leading XML 1.0 declaration when one is present, `version="1"`, and the
+canonical XSPF namespace, expressed either as the default namespace or through a prefix. It
+validates every attribute's XML syntax and namespace binding; rejects DTDs, malformed or trailing
+documents, and elements that only look like tracks inside comments, CDATA, extensions, or other
+nesting; and imports only direct XSPF `<track>` children of `<trackList>`. Standard named and numeric
+character references are decoded by the XML parser.
+
+On import, each XSPF `<track>` is resolved against the local library in this order:
+
+1. An exact local path decoded from a valid `file:` URI in `<location>`. HTTP(S), other schemes,
+   and malformed locations are ignored as paths, though the row can still match by metadata.
+2. An exact title + artist match after trimming whitespace and ignoring case; a supplied album is
+   also exact. This is normalization, not fuzzy or “similarly named” matching.
+3. If `<duration>` is present, only candidates within five seconds qualify and the unique nearest
+   duration wins. Without a duration, the metadata candidate must already be unique. Ties and
+duplicate metadata remain unmatched instead of choosing an arbitrary song.
+
+Only a valid imported `<location>` supplies path authority. Metadata-only imports and tracks added
+inside Tributary remain fingerprint-only across later relinks, so a different song that eventually
+reuses a scanned library path cannot silently take over the playlist entry. Corrupt negative or
+out-of-schema library durations are ignored as optional matching evidence rather than wrapped or
+allowed to block an otherwise safe path/fingerprint reconciliation.
+
+The entire playlist and its entries commit in one database transaction. The completion dialog
+reports **matched**, **unmatched**, and **failed** counts. An unmatched entry with a usable path or
+title/artist fingerprint is preserved in playlist order and can be linked by a later library
+reconciliation; it is not currently playable until a unique local match appears. A row fails only
+when it has no usable path or title/artist identity (or contains a duration too large for the
+playlist schema). A database or write failure rolls the import back and does not add a sidebar row.
+An XSPF `<duration>` that is not a valid unsigned millisecond value rejects the document before a
+database transaction begins; a syntactically valid value that exceeds the playlist database range
+instead counts that individual row as failed.
+
+Apple Music and iTunes can export playlist metadata as XML, but their XML is an Apple property-list
+format, not XSPF. Follow Apple's official export steps for
+[Music on Mac](https://support.apple.com/en-ca/guide/music/-mus27cd5060f/mac) or
+[iTunes on Windows](https://support.apple.com/guide/itunes/itns2998/windows), then use a converter
+that dereferences each playlist item's `Track ID` through the XML `Tracks` dictionary and emits one
+XSPF `<track>` with these mappings:
+
+| Apple XML track key | XSPF v1 element | Conversion |
+|---|---|---|
+| `Location` | `<location>` | Preserve the `file:` URI when it points at the same local file; otherwise update it to the local library path. |
+| `Name` | `<title>` | Copy as text. |
+| `Artist` | `<creator>` | Copy as text. |
+| `Album` | `<album>` | Copy when present. |
+| `Total Time` | `<duration>` | Copy as milliseconds; both formats use milliseconds here. |
+
+Apple's export contains metadata and references, not the audio files themselves. Subscription-only
+or unavailable catalog items may therefore lack a corresponding local path, and duplicate editions
+with identical normalized metadata stay unmatched unless duration identifies one uniquely.
+
+For YouTube Music, use the official [Google Takeout download
+flow](https://support.google.com/accounts/answer/3024190) to obtain your YouTube/YouTube Music data.
+Takeout's CSV layout and available fields can vary, so convert each playlist row field by field:
+
+| Takeout value, when available | XSPF v1 element | Conversion |
+|---|---|---|
+| A verified path to the corresponding local audio file | `<location>` | Encode it as a `file:` URI. Do **not** put a YouTube watch URL here and expect local-file matching. |
+| Track/song title | `<title>` | Copy the music title, removing video-only decoration only when you can verify it. |
+| Music artist | `<creator>` | Copy the artist; a channel/uploader name is often not the tagged artist and should not be guessed. |
+| Release/album | `<album>` | Copy only when Takeout supplies or you can verify it. |
+| Duration | `<duration>` | Convert seconds to milliseconds; omit rather than estimate. |
+
+An archive containing only video IDs, watch URLs, or timestamps does not contain enough information
+for safe local-library matching; enrich it with verified local metadata before creating XSPF.
+Google also documents a [direct Takeout transfer to Apple
+Music](https://support.google.com/accounts/answer/14792019), after which the Apple XML conversion
+above can be used. That service transfer is a one-time copy, currently requires Apple Music,
+transfers all user-created playlists rather than selected ones, may omit songs absent from the
+destination catalog, and excludes saved third-party playlists, user-uploaded/private content, and
+podcasts. Tributary deliberately does not guess through any of those gaps.
+
 ### Playback Controls
 
 - **Play/Pause** — click the circular play button, or double-click any track in the tracklist

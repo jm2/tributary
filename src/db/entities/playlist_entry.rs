@@ -18,6 +18,8 @@ pub struct Model {
     pub match_artist: String,
     pub match_album: String,
     pub match_duration_secs: Option<i32>,
+    /// Exact source path retained from an imported playlist, when provided.
+    pub match_file_path: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

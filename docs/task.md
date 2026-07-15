@@ -29,7 +29,7 @@ Progress snapshot (2026-07-15), recounted from the literal P0–P3 task checkbox
 earlier numerator/denominator drift. The denominator excludes the two deferred P0.7 live-workflow
 verification boxes and the withdrawn P2.6 false finding; section-summary and global-validation
 gate boxes are not task progress:
-**137/213 (64.3%)** in-scope checklist items complete; **114/114 (100%)** across P0 and P1 after
+**146/213 (68.5%)** in-scope checklist items complete; **114/114 (100%)** across P0 and P1 after
 the same P0.7 exclusion. The release-workflow dry run remains deliberately deferred rather than
 being counted as unfinished P0 remediation.
 
@@ -506,16 +506,76 @@ Existing rule JSON remains usable across the option removal.
 
 ### P2.2 Make playlist import/export transactional and deterministic
 
-- [ ] Define supported source formats and provide adapters or actionable conversion guidance
-  for Apple Music XML and YouTube Music exports.
-- [ ] Export through a sibling temporary file and atomic replacement.
-- [ ] Prefer an exact existing file path before metadata matching.
-- [ ] Enforce the documented duration tolerance and deterministic tie-breaking.
-- [ ] Return database errors rather than treating them as no-match.
-- [ ] Import playlist and entries in one transaction.
-- [ ] Preserve unmatched entries for later reconciliation.
-- [ ] Surface matched, unmatched, and failed counts.
-- [ ] Record implementation: _pending_
+- [x] Define supported source formats and provide adapters or actionable conversion guidance
+  for Apple Music XML and YouTube Music exports. Direct support is deliberately XSPF v1 only, and
+  every menu, dialog, and filter now says XSPF instead of implying arbitrary playlist formats. All
+  new menu, chooser, outcome, and failure text uses the existing 13-language locale catalogs.
+  The namespace-aware parser requires a valid leading XML 1.0 declaration when one is present,
+  `version="1"`, and the canonical XSPF namespace in default or prefixed form; validates every
+  attribute's XML syntax and namespace binding; rejects DTDs, malformed/multiple/trailing
+  documents, and phantom elements in
+  comments, CDATA, extensions, or other nesting; and imports only direct XSPF `trackList`/`track`
+  children while decoding standard named and numeric character references. Renamed Apple XML or
+  arbitrary `<track>` fragments therefore fail rather than producing a misleading empty import.
+  README documents exact Apple `Location`/`Name`/`Artist`/`Album`/`Total Time` and Takeout
+  local-path/title/artist/album/duration mappings, links the official Apple and Google export
+  instructions, and calls out catalog, missing-metadata, uploader-name, ambiguity, and
+  service-transfer limitations rather than promising fuzzy cloud-to-local resolution.
+- [x] Export through a sibling temporary file and atomic replacement. The complete XSPF document
+  is rendered before the destination is touched, written to an exclusively created random sibling,
+  flushed and `fsync`ed, then atomically persisted over the destination. XML 1.0-forbidden control
+  characters are rejected before any temporary or destination file is touched. Serialization,
+  write, and rename failures remove the temporary file and preserve an existing export. A corrupt
+  negative stored duration or one outside Tributary's supported `u64` millisecond range is omitted
+  with a warning because XSPF makes duration optional; it cannot block otherwise valid tracks from
+  exporting. The GTK path runs the blocking renderer/writer with `spawn_blocking` and reports
+  success and failure.
+- [x] Prefer an exact existing file path before metadata matching. A valid local `file:` URI in
+  `<location>` is decoded (including Windows drive-letter form) and wins when it equals a stored
+  path; non-file and malformed locations are ignored as paths but may still match by metadata. The
+  valid decoded source path is retained
+  for the same first-priority reconciliation later. Path authority is limited to imported location
+  evidence: metadata-only imports and manually added entries remain fingerprint-only even after a
+  successful relink, so repeated delete/rescan cycles cannot promote a library path and let an
+  unrelated track later scanned there replace the user's original choice.
+- [x] Enforce the documented duration tolerance and deterministic tie-breaking. Metadata matching
+  requires normalized-exact (trimmed, case-insensitive) title + artist and, when supplied, album;
+  it is not fuzzy name matching. A supplied duration is a hard inclusive ±5-second gate and only
+  the unique nearest candidate wins. Equal-nearest ties remain unmatched; without duration, the
+  metadata match itself must be unique. Import and later orphan reconciliation share this resolver.
+  Each track snapshot indexes paths and normalized metadata once instead of rescanning and
+  renormalizing the full library for every playlist row. Corrupt negative library durations and
+  values outside the playlist schema's non-negative `i32` range are omitted from match evidence
+  instead of wrapping or blocking path/fingerprint reconciliation; already-corrupt negative
+  playlist evidence is likewise treated as absent.
+- [x] Return database errors rather than treating them as no-match. Matching uses one transaction's
+  track snapshot instead of per-entry fallible queries hidden behind `if let Ok`; a read or write
+  error now escapes as `DbErr`, reaches the UI as an explicit failure, and prevents publication.
+- [x] Import playlist and entries in one transaction. Playlist creation, deterministic matching,
+  preserved-entry insertion, and positions commit together; any database failure rolls everything
+  back. The sidebar row is inserted only after the manager returns a committed result, and XSPF
+  parsing is isolated with `spawn_blocking` before the transaction begins.
+- [x] Preserve unmatched entries for later reconciliation. Rows with a valid decoded local path or
+  usable title/artist fingerprint retain their original order with `track_id = NULL`, including
+  optional album/duration evidence. They stay non-playable until a later scan finds one
+  unambiguous local match, at which point the shared resolver relinks them. The additive nullable
+  path migration is retry-safe and preserves existing entry data in both directions.
+- [x] Surface matched, unmatched, and failed counts. The committed result accounts for every source
+  row: uniquely linked entries are matched, retained orphans are unmatched, and rows with no usable
+  identity or a valid duration too large for the database schema are failed. A syntactically
+  invalid or out-of-`u64` XSPF duration is a document parse error before the transaction. The
+  completion alert shows all three counts; parse, database, worker, and export failures show
+  actionable alerts rather than disappearing into a silent `Option` or log-only branch.
+- [x] Record implementation: PR #90. Focused coverage
+  adds 27 regressions for atomic replacement and cleanup, malformed or non-XSPF input, path-first
+  and normalized metadata resolution, duration boundaries and ambiguity, transactional
+  rollback/database errors, retained unmatched entries, migration round trips, and outcome counts.
+
+Acceptance criteria: a failed export cannot truncate the prior destination; a failed import cannot
+publish or persist a partial playlist; each usable source row is either deterministically linked or
+retained for reconciliation without guessing; every completed import accounts for matched,
+unmatched, and failed rows. Blocking XML/filesystem work stays off async and GTK workers, and the UI
+and README accurately advertise direct XSPF v1 support rather than Apple/Google native formats.
 
 ### P2.3 Harden tag writes
 
@@ -774,9 +834,9 @@ Run before marking any milestone complete:
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
-Most recent milestone validation (2026-07-15, P2.1 smart-playlist semantics): 18 library plus
-505 application tests passed in debug (523 total), and the release suite passed with the same
-523 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
+Most recent milestone validation (2026-07-15, P2.2 playlist import/export): 18 library plus
+532 application tests passed in debug (550 total), and the release suite passed with the same
+550 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
 were clean; and `cargo audit` passed with exactly the two accepted unmaintained warnings recorded
 under P0.8.
 
@@ -1084,6 +1144,29 @@ Record scope or design decisions here so deferred work is explicit.
   state, upgrade/backfill and live/snapshot transition rules, and reconciliation semantics; it can
   be designed as a future feature rather than inferred from this legacy no-op bit. Five rule-engine
   regressions plus one database-backed compatibility/reevaluation test cover the decision.
+- 2026-07-15 — P2.2 treats an imported playlist row as durable intent, not a request to guess the
+  closest current song. Direct import/export is XSPF v1 only. A namespace-aware parser accepts the
+  canonical namespace in default or prefixed form, validates any XML declaration plus each
+  attribute's syntax and namespace binding, rejects DTDs and malformed document structure, and
+  considers only direct XSPF
+  track-list children. Resolution first accepts an exact local path decoded from a valid imported
+  `file:` URI, then normalized-exact title/artist plus optional album; manual additions deliberately
+  retain no authoritative path so a different song cannot take over an orphan merely by reusing
+  its former filename. A
+  supplied duration narrows candidates to the inclusive five-second window and selects only a
+  unique nearest result.
+  Any tie stays orphaned. This same resolver and its per-snapshot path/metadata index are reused
+  after library reconciliation so an initially missing file can link later without changing the
+  contract or making each entry rescan the complete library. The import reads one track snapshot
+  and writes the playlist and all valid matched/orphan entries in one transaction; SQL
+  errors abort rather than masquerading as a no-match. Non-file or malformed locations never become
+  stored paths. Rows with neither a path nor title/artist, or a valid duration the schema cannot
+  represent, are explicitly counted as failed instead of being silently dropped; invalid XSPF
+  duration syntax rejects the document before the transaction. The UI exposes matched/unmatched/
+  failed counts and only publishes the playlist after commit. Apple property-list XML and Google
+  Takeout data remain conversion inputs rather than partially supported formats; README provides
+  field-level, official-source guidance and warns where either source lacks the local identity
+  needed for safe matching.
 
 - 2026-07-13 — Documentation audit against the committed tree. Every `[x]` in P1.1–P1.7 was
   verified against the source and none was overstated. The drift was everywhere else: CHANGELOG
@@ -1136,3 +1219,4 @@ Add one line per completed task:
 | 2026-07-13 | P1.8 | `eb0b9ca`, `fbaaa7f` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable song identity, shared-queue preservation, ownership preflight, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
 | 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, keeps the prior visible projection fresh while remote intent is pending, preserves valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; eight navigation and two engine tests cover the races and event ordering. |
 | 2026-07-15 | P2.1 | PR #89 | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
+| 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
