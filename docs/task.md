@@ -599,8 +599,10 @@ exists** in `src/local/tag_writer.rs`. The real defects are narrower and all rea
   Temp files are now created with `create_new` (`O_EXCL`) under a random UUID name. The first real
   audio round-trip exposed a second production defect in that replacement: the randomized sibling
   ended in `.tmp`, so `lofty::read_from_path` could not determine the copied audio format and every
-  otherwise-valid tag write failed before applying edits. The random name now retains the source
-  audio extension as its final extension.
+  otherwise-valid tag write failed before applying edits. The first extension-preserving spelling
+  appended the complete source basename, which could exceed a filesystem component limit for an
+  otherwise-valid long filename. The final component is bounded and source-stem-independent:
+  `.tributary-tag-<canonical UUID>.<case-normalized source format extension>`.
 - [x] Apply or remove the declared album-artist edit. `TagEdits.album_artist` existed and counted
   toward `is_empty()`, but `write_tags_to` never read it — the file was rewritten and the field
   ignored. It is now applied via `ItemKey::AlbumArtist`. (Still no widget sets it; implementing it
@@ -609,11 +611,19 @@ exists** in `src/local/tag_writer.rs`. The real defects are narrower and all rea
   on a best-effort basis from the file being replaced, and the tagged copy is `fsync`ed before the
   rename, so a crash cannot leave a truncated file where the original was. The module doc now states
   this rather than implying it.
-- [x] Add focused failure and platform tests: 7 regressions cover validation, a malformed number
-  leaving the file byte-for-byte untouched with no temp behind, temp cleanup after a failed tag
-  write, unsupported formats, temp-path uniqueness plus self-removal, and Windows-compatible
-  flushing through a writable handle. Concurrency is covered by the exclusivity property rather
-  than by racing two threads.
+- [x] Add focused failure, platform, and indexing tests: 10 regressions cover validation, a
+  malformed number leaving the file byte-for-byte untouched with no temp behind, temp cleanup after
+  a failed tag write, unsupported formats, temp-path uniqueness plus self-removal, and
+  Windows-compatible flushing through a writable handle. The exclusivity test also uses a
+  220-character source stem
+  and uppercase extension to prove the sibling stays bounded and case-normalized. Three review
+  regressions cover exact-versus-near-miss private-name recognition, initial enumeration exclusion,
+  standalone temp create/remove events, and combined, tracked-split, and adjacent-split
+  temp-to-original watcher renames. Concurrency is covered by the exclusivity property rather than
+  by racing two threads. Exact writer-owned siblings are rejected before scan admission; watcher
+  replacement queues only a metadata upsert at the public destination, never an identity-preserving
+  rename from a temporary row, so slow saves retain the original track ID, history, and playlist
+  links.
 - [x] Add a happy-path fixture test. A committed 99-byte, 100 ms silent FLAC generated entirely
   from silence is copied into an isolated test directory and exercised through the public
   `write_tags` path. Reopening it with Lofty verifies that all ten declared fields—title, artist,
@@ -622,11 +632,13 @@ exists** in `src/local/tag_writer.rs`. The real defects are narrower and all rea
   `tests/fixtures/audio/README.md` records the generation recipe, GPL-3.0-or-later/no-third-party-
   recording provenance, and SHA-256
   `c47ed5dbe255701328f28b58fbe7408a70ae2ad20057089b5393253a00eab946`.
-- [x] Record implementation: commits `6d0ec95` and `2d305e7` plus PR #91; 8 focused tests.
+- [x] Record implementation: commits `6d0ec95` and `2d305e7` plus PR #91; 11 focused tests.
 
 Acceptance criteria: invalid edits leave the original byte-for-byte untouched, every failed save
 removes its temporary sibling, and a successful public tag write preserves readable audio while all
-declared fields round-trip without temporary-file residue.
+declared fields round-trip without temporary-file residue. The private filename remains bounded for
+near-limit source names, and even a slow save cannot publish a temporary library row or replace the
+original track's stable identity, history, or playlist links.
 
 ### P2.4 Make removable-media browsing safe and asynchronous
 
@@ -847,9 +859,9 @@ Run before marking any milestone complete:
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
-Most recent milestone validation (2026-07-15, P2.3 tag-write happy path): 18 library plus
-533 application tests passed in debug (551 total), and the release suite passed with the same
-551 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
+Most recent milestone validation (2026-07-15, P2.3 review follow-ups): 18 library plus
+536 application tests passed in debug (554 total), and the release suite passed with the same
+554 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
 were clean; and `cargo audit` passed with exactly the two accepted unmaintained warnings recorded
 under P0.8.
 
@@ -1233,4 +1245,4 @@ Add one line per completed task:
 | 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, keeps the prior visible projection fresh while remote intent is pending, preserves valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; eight navigation and two engine tests cover the races and event ordering. |
 | 2026-07-15 | P2.1 | PR #89 | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
 | 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
-| 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR #91 | Numeric validation, exclusive randomized extension-preserving sibling files, RAII cleanup, permission copying and pre-rename `fsync`, album-artist handling, and eight focused tests including a public-API round trip against a generated silent FLAC fixture. |
+| 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR #91 | Numeric validation; bounded exclusive UUID-plus-format sibling files; exact scan/watcher exclusion and temp-to-original metadata refresh that preserve track identity, history, and playlist links; RAII cleanup; permission copying and pre-rename `fsync`; album-artist handling; and 11 focused tests including a public-API round trip against a generated silent FLAC fixture. |

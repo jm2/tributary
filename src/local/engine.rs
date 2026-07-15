@@ -24,6 +24,7 @@ use walkdir::WalkDir;
 
 use super::root_authority::{AbsenceProof, BoundDirectory, BoundFile, RootAuthorityLease};
 use super::tag_parser::{self, ParsedTrack};
+use super::tag_writer;
 use crate::architecture::models::Track;
 use crate::db::entities::{library_root, track};
 
@@ -3806,6 +3807,9 @@ impl WatcherBatch {
     }
 
     fn record_remove(&mut self, path: PathBuf) {
+        if tag_writer::is_tag_write_temp_file(&path) {
+            return;
+        }
         if self.paired_paths.contains(&path) {
             return;
         }
@@ -3820,6 +3824,9 @@ impl WatcherBatch {
     }
 
     fn record_upsert(&mut self, path: PathBuf) {
+        if tag_writer::is_tag_write_temp_file(&path) {
+            return;
+        }
         let paired = self.paired_paths.contains(&path);
         match watcher_upsert_path_kind(&path) {
             Ok(WatcherUpsertPathKind::Unsafe) | Err(_) => {
@@ -3850,6 +3857,25 @@ impl WatcherBatch {
     }
 
     fn record_rename_pair(&mut self, from: PathBuf, to: PathBuf) {
+        match (
+            tag_writer::is_tag_write_temp_file(&from),
+            tag_writer::is_tag_write_temp_file(&to),
+        ) {
+            (true, true) => return,
+            (true, false) => {
+                // Atomic tag replacement is a private sibling becoming the
+                // original track. Refresh metadata at the public path without
+                // transferring identity from a path that was never indexed.
+                self.record_upsert(to);
+                return;
+            }
+            (false, true) => {
+                self.record_remove(from);
+                return;
+            }
+            (false, false) => {}
+        }
+
         let pair = WatcherRenamePair { from, to };
         if pair.from == pair.to {
             self.record_upsert(pair.to);
@@ -5751,6 +5777,84 @@ mod tests {
             "a vanished upsert must reach the guarded removal backstop"
         );
         assert!(!batch.reconciliation_required);
+    }
+
+    #[test]
+    fn library_enumeration_ignores_private_tag_write_siblings() {
+        let library = TestDirectory::new("tag-write-scan-exclusion");
+        let track = library.path().join("track.flac");
+        let sibling = library
+            .path()
+            .join(".tributary-tag-00000000-0000-4000-8000-000000000000.flac");
+        std::fs::write(&track, b"audio").expect("create public audio path");
+        std::fs::write(&sibling, b"copy").expect("create private tag sibling");
+
+        let (audio_files, errors) = enumerate_audio_files(library.path(), None, &[]);
+
+        assert!(errors.is_empty());
+        assert_eq!(audio_files, vec![track]);
+    }
+
+    #[test]
+    fn watcher_ignores_tag_siblings_and_refreshes_the_replaced_track() {
+        let library = TestDirectory::new("tag-write-watcher-exclusion");
+        let track = library.path().join("track.flac");
+        let sibling = library
+            .path()
+            .join(".tributary-tag-00000000-0000-4000-8000-000000000000.flac");
+        std::fs::write(&sibling, b"copy in progress").expect("create private tag sibling");
+
+        let mut batch = WatcherBatch::default();
+        batch.record_upsert(sibling.clone());
+        std::fs::remove_file(&sibling).expect("finish private copy");
+        batch.record_remove(sibling.clone());
+        assert!(
+            batch.is_empty(),
+            "private sibling create/remove events must be invisible"
+        );
+
+        std::fs::write(&track, b"tagged audio").expect("publish tagged track");
+        batch.record_remove(track.clone());
+        batch.collect(rename_event(
+            notify::event::RenameMode::Both,
+            &[sibling.to_str().unwrap(), track.to_str().unwrap()],
+            None,
+        ));
+
+        assert_eq!(batch.upsert_paths, HashSet::from([track.clone()]));
+        assert!(batch.rename_pairs.is_empty());
+        assert!(batch.deferred_paths.is_empty());
+        assert!(!batch.reconciliation_required);
+
+        let mut tracked_split = WatcherBatch::default();
+        tracked_split.collect(rename_event(
+            notify::event::RenameMode::From,
+            &[sibling.to_str().unwrap()],
+            Some(7),
+        ));
+        tracked_split.collect(rename_event(
+            notify::event::RenameMode::To,
+            &[track.to_str().unwrap()],
+            Some(7),
+        ));
+        assert_eq!(tracked_split.upsert_paths, HashSet::from([track.clone()]));
+        assert!(tracked_split.rename_pairs.is_empty());
+        assert!(tracked_split.deferred_paths.is_empty());
+
+        let mut adjacent_split = WatcherBatch::default();
+        adjacent_split.collect(rename_event(
+            notify::event::RenameMode::From,
+            &[sibling.to_str().unwrap()],
+            None,
+        ));
+        adjacent_split.collect(rename_event(
+            notify::event::RenameMode::To,
+            &[track.to_str().unwrap()],
+            None,
+        ));
+        assert_eq!(adjacent_split.upsert_paths, HashSet::from([track]));
+        assert!(adjacent_split.rename_pairs.is_empty());
+        assert!(adjacent_split.deferred_paths.is_empty());
     }
 
     #[cfg(unix)]

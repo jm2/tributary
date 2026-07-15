@@ -460,10 +460,13 @@ Right-click any local track and select **Properties…** to view and edit its me
 - **MusicBrainz Lookup** — In single-track mode, click "MusicBrainz Lookup" to search by title + artist. Results populate the form but are **not** saved automatically — you must click Save.
 
 All edits require an explicit **Save** click. Cancel discards all changes. Numeric edits are
-validated before a file is touched. Successful saves use an exclusively created randomized sibling
-that retains the source audio extension, flush it before atomic replacement, best-effort copy the
-original permissions, and remove the sibling on any failure. Supported formats: MP3 (ID3v2),
-M4A/AAC, OGG Vorbis, and FLAC.
+validated before a file is touched. Successful saves use an exclusively created, bounded
+`.tributary-tag-<UUID>.<format>` sibling carrying only the case-normalized source format extension,
+flush it before atomic replacement, best-effort copy the original permissions, and remove the
+sibling on any failure. Local scans and the filesystem watcher recognize only that exact internal
+shape: an in-progress copy never appears as another library track, and final replacement refreshes
+the original path without losing its stable identity, history, or playlist links. Supported formats:
+MP3 (ID3v2), M4A/AAC, OGG Vorbis, and FLAC.
 
 ### Playlists
 

@@ -10,17 +10,23 @@ use lofty::file::{AudioFile, FileType, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::Accessor;
 
+use super::tag_writer::is_tag_write_temp_file;
+
 /// Supported audio file extensions.
 pub const AUDIO_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "aac", "ogg", "opus", "wav", "wma", "aiff", "aif",
 ];
 
-/// Returns `true` if the path has a supported audio extension.
+/// Returns `true` for an indexable path with a supported audio extension.
+/// Private tag-write siblings deliberately remain outside the library.
 pub fn is_audio_file(path: &Path) -> bool {
-    path.extension()
+    let supported = path
+        .extension()
         .and_then(|e| e.to_str())
         .map(|e| AUDIO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
-        .unwrap_or(false)
+        .unwrap_or(false);
+
+    supported && !is_tag_write_temp_file(path)
 }
 
 /// Parsed metadata from a single audio file.
@@ -239,6 +245,23 @@ mod tests {
         // .flac as a filename (no stem) — extension is "flac" on some platforms
         // but Path::extension() returns None for ".flac" (it's the stem).
         assert!(!is_audio_file(Path::new(".flac")));
+    }
+
+    #[test]
+    fn test_is_audio_file_reserves_only_real_tag_write_siblings() {
+        let sibling = Path::new("/music/.tributary-tag-00000000-0000-4000-8000-000000000000.flac");
+
+        assert!(is_tag_write_temp_file(sibling));
+        assert!(!is_audio_file(sibling));
+        assert!(!is_tag_write_temp_file(Path::new(
+            "/music/.tributary-tag-00000000000040008000000000000000.flac"
+        )));
+        assert!(!is_tag_write_temp_file(Path::new(
+            "/music/.tributary-tag-00000000-0000-4000-8000-000000000000.wav"
+        )));
+        assert!(is_audio_file(Path::new(
+            "/music/.tributary-tag-not-a-uuid.flac"
+        )));
     }
 
     #[test]

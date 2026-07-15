@@ -27,6 +27,42 @@ use lofty::file::TaggedFileExt;
 use lofty::tag::{Accessor, ItemKey, ItemValue, TagExt, TagItem};
 use uuid::Uuid;
 
+/// Reserved filename prefix for the private sibling used by atomic tag writes.
+const TAG_WRITE_TEMP_PREFIX: &str = ".tributary-tag-";
+
+/// Formats whose tags Tributary can rewrite safely.
+const WRITABLE_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "ogg", "flac"];
+
+/// Return whether `path` has the exact shape emitted for a tag-write sibling.
+///
+/// The bounded ASCII name is `.tributary-tag-<canonical UUID>.<format>`. Exact
+/// recognition minimizes the reserved namespace while allowing the scanner
+/// and watcher to keep an in-progress full-size copy out of the library.
+pub fn is_tag_write_temp_file(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let Some(suffix) = name
+        .as_encoded_bytes()
+        .strip_prefix(TAG_WRITE_TEMP_PREFIX.as_bytes())
+    else {
+        return false;
+    };
+    if suffix.len() < 38 || suffix.get(36) != Some(&b'.') {
+        return false;
+    }
+
+    let Ok(id) = std::str::from_utf8(&suffix[..36]) else {
+        return false;
+    };
+    let Ok(extension) = std::str::from_utf8(&suffix[37..]) else {
+        return false;
+    };
+
+    WRITABLE_EXTENSIONS.contains(&extension)
+        && Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id)
+}
+
 /// Fields that can be edited in the properties dialog.
 ///
 /// Each field is `Option<String>` — `None` means "don't change this field",
@@ -120,16 +156,22 @@ impl TempFile {
     /// follow a symlink an attacker planted at a predictable path.
     fn create_beside(target: &Path) -> Result<(Self, std::fs::File)> {
         let directory = target.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = target.file_name().unwrap_or_default();
+        let extension = target
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
 
         for _ in 0..8 {
-            // Keep the target filename (and therefore its extension) last.
-            // `lofty::read_from_path` infers the audio format from that final
-            // extension, so a generic `.tmp` suffix would make every valid
-            // copied audio file unreadable before tags could be written.
+            // `lofty::read_from_path` infers the format from the final
+            // extension. Preserve only that extension: including the whole
+            // source name could overflow a filesystem's component-length
+            // limit for an otherwise valid long filename.
             let mut candidate_name =
-                std::ffi::OsString::from(format!(".tributary-tag-{}-", Uuid::new_v4()));
-            candidate_name.push(file_name);
+                std::ffi::OsString::from(format!("{TAG_WRITE_TEMP_PREFIX}{}", Uuid::new_v4()));
+            if let Some(extension) = extension.as_deref() {
+                candidate_name.push(".");
+                candidate_name.push(extension);
+            }
             let candidate = directory.join(candidate_name);
 
             match std::fs::OpenOptions::new()
@@ -187,9 +229,6 @@ impl Drop for TempFile {
         }
     }
 }
-
-/// Supported formats for tag writing.
-const WRITABLE_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "ogg", "flac"];
 
 /// Returns `true` if the file extension is a format we can write tags to.
 pub fn is_writable(path: &Path) -> bool {
@@ -604,7 +643,7 @@ mod tests {
     #[test]
     fn temp_paths_are_unique_and_exclusively_created() {
         let directory = TestDirectory::new("exclusive");
-        let track = directory.audio_file("song.mp3", b"audio");
+        let track = directory.path.join(format!("{}.FLAC", "x".repeat(220)));
 
         let (first, _first_handle) = TempFile::create_beside(&track).expect("first temp");
         let (second, _second_handle) = TempFile::create_beside(&track).expect("second temp");
@@ -613,6 +652,15 @@ mod tests {
         assert!(first.path().exists());
         assert!(second.path().exists());
         assert_eq!(first.path().parent(), track.parent());
+        assert_eq!(
+            first.path().extension().and_then(|ext| ext.to_str()),
+            Some("flac")
+        );
+        assert!(is_tag_write_temp_file(first.path()));
+        assert!(
+            first.path().file_name().unwrap().len() < 80,
+            "the sibling component must not inherit the long source filename"
+        );
 
         let first_path = first.path().to_path_buf();
         drop(first);
