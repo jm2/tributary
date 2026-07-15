@@ -64,6 +64,9 @@ pub enum LibraryEvent {
     /// Playlists loaded from the database.
     /// Vec of (id, name, is_smart).
     PlaylistsLoaded(Vec<(String, String, bool)>),
+    /// Persisted track changes and any resulting playlist reconciliation have
+    /// settled, so active playlist projections should be loaded again.
+    PlaylistProjectionsInvalidated,
     /// Complete, exact-configured roots which require an explicit user trust
     /// decision before their observed storage may become authoritative.
     RootTrustRequired(Vec<RootTrustRequest>),
@@ -2993,6 +2996,7 @@ async fn initial_scan_with_root_trust_guards(
         }
         Err(e) => warn!(error = %e, "Failed to load playlists"),
     }
+    let _ = tx.send(LibraryEvent::PlaylistProjectionsInvalidated).await;
 
     if !trust_requests.is_empty() {
         let _ = tx
@@ -3936,6 +3940,23 @@ async fn reconcile_playlists_after_watcher_batch(
         .await
 }
 
+/// Finish the playlist work caused by one watcher batch, then tell the UI to
+/// rebuild any active projection. The notification is deliberately emitted
+/// even when reconciliation fails: the committed track mutation still needs
+/// to become visible, and a later batch or scan can retry orphan relinking.
+async fn settle_playlist_projections_after_watcher_batch(
+    db: &DatabaseConnection,
+    tx: &async_channel::Sender<LibraryEvent>,
+    upsert_committed: bool,
+    track_mutation_committed: bool,
+) -> Result<u32, sea_orm::DbErr> {
+    let result = reconcile_playlists_after_watcher_batch(db, upsert_committed).await;
+    if track_mutation_committed {
+        let _ = tx.send(LibraryEvent::PlaylistProjectionsInvalidated).await;
+    }
+    result
+}
+
 const WATCHER_EVENT_CAPACITY: usize = 256;
 const WATCHER_DEBOUNCE_MS: u64 = 1500;
 const WATCHER_RECONCILIATION_RETRY_MS: u64 = 1000;
@@ -4258,6 +4279,7 @@ async fn process_directory_events(
 
         let mut reconciliation_required = batch.reconciliation_required;
         let mut upsert_committed = false;
+        let mut track_mutation_committed = false;
         let mut library_snapshot_dirty = false;
 
         // Apply authoritative same-root rename pairs before standalone removals
@@ -4424,6 +4446,7 @@ async fn process_directory_events(
                                 ))))
                                 .await;
                             upsert_committed = true;
+                            track_mutation_committed = true;
                             info!(from = %pair.from.display(), to = %pair.to.display(), id = %model.id, "Preserved track identity across filesystem rename");
                         }
                         Ok(RenameTrackOutcome::SourceMissing) => {
@@ -4600,6 +4623,7 @@ async fn process_directory_events(
                         }) => {
                             if !moved.is_empty() || displaced > 0 {
                                 library_snapshot_dirty = true;
+                                track_mutation_committed = true;
                             }
                             // Displacing a row nulls its playlist links through
                             // the foreign key; the surviving row can reclaim them.
@@ -4656,6 +4680,7 @@ async fn process_directory_events(
             {
                 Ok(true) => {
                     let _ = tx.send(LibraryEvent::TrackRemoved(path_str)).await;
+                    track_mutation_committed = true;
                 }
                 Ok(false) => {
                     warn!(path = %path.display(), "Ignored removal without a stable confirmed library root");
@@ -4744,6 +4769,7 @@ async fn process_directory_events(
                         {
                             Ok(true) => {
                                 let _ = tx.send(LibraryEvent::TrackRemoved(path_str)).await;
+                                track_mutation_committed = true;
                             }
                             Ok(false) => {}
                             Err(error) => {
@@ -4863,6 +4889,7 @@ async fn process_directory_events(
                         match outcome {
                             Ok(GuardedTrackUpsertOutcome::Committed(model)) => {
                                 upsert_committed = true;
+                                track_mutation_committed = true;
                                 let t = db_model_to_track(&model);
                                 let _ = tx.send(LibraryEvent::TrackUpserted(Box::new(t))).await;
                             }
@@ -4917,7 +4944,14 @@ async fn process_directory_events(
         // Reconcile once after all successful upserts in this debounced batch
         // so a replacement file can restore those links immediately. A
         // reconciliation error is retryable and must not terminate watching.
-        match reconcile_playlists_after_watcher_batch(db.as_ref(), upsert_committed).await {
+        match settle_playlist_projections_after_watcher_batch(
+            db.as_ref(),
+            tx,
+            upsert_committed,
+            track_mutation_committed,
+        )
+        .await
+        {
             Ok(relinked) if relinked > 0 => {
                 info!(relinked, "Playlist entries reconciled after watcher batch");
             }
@@ -6269,7 +6303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_batch_reconciles_only_after_a_committed_upsert() {
+    async fn watcher_batch_invalidates_projections_after_mutation_and_reconciliation() {
         use sea_orm::{ConnectionTrait, Database};
         use sea_orm_migration::MigratorTrait;
 
@@ -6312,13 +6346,18 @@ mod tests {
         )
         .await
         .expect("insert orphaned playlist entry");
+        let (event_tx, event_rx) = async_channel::unbounded();
 
         assert_eq!(
-            reconcile_playlists_after_watcher_batch(&db, false)
+            settle_playlist_projections_after_watcher_batch(&db, &event_tx, false, false)
                 .await
-                .expect("skip watcher reconciliation"),
+                .expect("skip unchanged watcher batch"),
             0
         );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
         let still_orphaned = playlist_entry::Entity::find_by_id("watcher-entry")
             .one(&db)
             .await
@@ -6327,17 +6366,92 @@ mod tests {
         assert_eq!(still_orphaned.track_id, None);
 
         assert_eq!(
-            reconcile_playlists_after_watcher_batch(&db, true)
+            settle_playlist_projections_after_watcher_batch(&db, &event_tx, false, true)
+                .await
+                .expect("settle removal-only watcher batch"),
+            0
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(LibraryEvent::PlaylistProjectionsInvalidated)
+        ));
+        let still_orphaned = playlist_entry::Entity::find_by_id("watcher-entry")
+            .one(&db)
+            .await
+            .expect("query removal-only reconciliation")
+            .expect("playlist entry remains");
+        assert_eq!(still_orphaned.track_id, None);
+
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_watcher_playlist_reconciliation
+             BEFORE UPDATE OF track_id ON playlist_entries
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected watcher reconciliation failure');
+             END;",
+        )
+        .await
+        .expect("install reconciliation failure trigger");
+        settle_playlist_projections_after_watcher_batch(&db, &event_tx, true, true)
+            .await
+            .expect_err("surface watcher reconciliation failure");
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(LibraryEvent::PlaylistProjectionsInvalidated)
+        ));
+        db.execute_unprepared("DROP TRIGGER fail_watcher_playlist_reconciliation")
+            .await
+            .expect("remove reconciliation failure trigger");
+
+        assert_eq!(
+            settle_playlist_projections_after_watcher_batch(&db, &event_tx, true, true)
                 .await
                 .expect("run watcher reconciliation"),
             1
         );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(LibraryEvent::PlaylistProjectionsInvalidated)
+        ));
         let relinked = playlist_entry::Entity::find_by_id("watcher-entry")
             .one(&db)
             .await
             .expect("query watcher reconciliation")
             .expect("playlist entry remains");
         assert_eq!(relinked.track_id.as_deref(), Some("watcher-track"));
+    }
+
+    #[tokio::test]
+    async fn initial_scan_invalidates_playlist_projections_before_scan_complete() {
+        let db = rename_test_database().await;
+        let (event_tx, event_rx) = async_channel::unbounded();
+
+        initial_scan(&db, &[], &event_tx)
+            .await
+            .expect("run empty initial scan");
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let invalidation_index = events
+            .iter()
+            .position(|event| matches!(event, LibraryEvent::PlaylistProjectionsInvalidated))
+            .expect("initial scan invalidates playlist projections");
+        let playlists_loaded_index = events
+            .iter()
+            .position(|event| matches!(event, LibraryEvent::PlaylistsLoaded(_)))
+            .expect("initial scan publishes playlist rows");
+        let completion_index = events
+            .iter()
+            .position(|event| matches!(event, LibraryEvent::ScanComplete))
+            .expect("initial scan completes");
+        assert!(playlists_loaded_index < invalidation_index);
+        assert!(invalidation_index < completion_index);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LibraryEvent::PlaylistProjectionsInvalidated))
+                .count(),
+            1,
+            "one initial scan produces one post-reconciliation invalidation"
+        );
     }
 
     // ── Paired directory renames ────────────────────────────────────────

@@ -5,6 +5,9 @@
 
 use adw::prelude::*;
 use gtk::glib;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use tracing::info;
 
@@ -17,6 +20,9 @@ use super::radio::{
     apply_radio_columns, handle_radio_nearme, is_radio_backend, radio_station_to_track_object,
 };
 use super::server_dialogs::{show_auth_dialog, validate_remote_server_url};
+use super::source_navigation::{
+    CompletionDisposition, PendingConnection, SourceNavigation, SourceRequest,
+};
 use super::tracklist;
 use super::window::{arch_track_to_object, display_tracks};
 use super::window_state::WindowState;
@@ -34,6 +40,205 @@ enum RemoteLibrarySnapshot {
     },
 }
 
+enum PlaylistLoadOutcome {
+    Loaded(Vec<crate::architecture::models::Track>),
+    Missing,
+    Failed,
+}
+
+fn restore_pending_selection(
+    sidebar_store: &gtk::gio::ListStore,
+    selection: &gtk::SingleSelection,
+    pending_source_key: &str,
+    fallback_position: u32,
+) {
+    let position = (0..sidebar_store.n_items())
+        .find(|position| {
+            sidebar_store
+                .item(*position)
+                .and_downcast_ref::<SourceObject>()
+                .is_some_and(|source| source.server_url() == pending_source_key)
+        })
+        .unwrap_or(fallback_position);
+    if selection.selected() != position {
+        selection.set_selected(position);
+    }
+}
+
+/// Cache a completed source load if it is still the newest request for that
+/// source, and report whether it also owns the visible projection.
+pub(super) fn cache_source_completion(
+    navigation: &Rc<RefCell<SourceNavigation>>,
+    request: &SourceRequest,
+    source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    objects: &[TrackObject],
+    active_source_key: &Rc<RefCell<String>>,
+) -> bool {
+    match navigation.borrow().completion(request) {
+        CompletionDisposition::Ignore => false,
+        CompletionDisposition::CacheOnly => {
+            source_tracks
+                .borrow_mut()
+                .insert(request.source_key().to_string(), objects.to_vec());
+            false
+        }
+        CompletionDisposition::CacheAndRender => {
+            source_tracks
+                .borrow_mut()
+                .insert(request.source_key().to_string(), objects.to_vec());
+            *active_source_key.borrow() == request.source_key()
+        }
+    }
+}
+
+fn evict_source_completion(
+    navigation: &Rc<RefCell<SourceNavigation>>,
+    request: &SourceRequest,
+    source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    active_source_key: &Rc<RefCell<String>>,
+) -> bool {
+    match navigation.borrow().completion(request) {
+        CompletionDisposition::Ignore => false,
+        CompletionDisposition::CacheOnly => {
+            source_tracks.borrow_mut().remove(request.source_key());
+            false
+        }
+        CompletionDisposition::CacheAndRender => {
+            source_tracks.borrow_mut().remove(request.source_key());
+            *active_source_key.borrow() == request.source_key()
+        }
+    }
+}
+
+/// Load and publish a playlist through the same generation-owned path used by
+/// both explicit navigation and post-reconciliation refreshes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn load_playlist_source(
+    rt_handle: tokio::runtime::Handle,
+    playlist_id: String,
+    request: SourceRequest,
+    navigation: Rc<RefCell<SourceNavigation>>,
+    source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    active_source_key: Rc<RefCell<String>>,
+    track_store: gtk::gio::ListStore,
+    master_tracks: Rc<RefCell<Vec<TrackObject>>>,
+    browser_widget: gtk::Box,
+    browser_state: super::browser::BrowserState,
+    status_label: gtk::Label,
+    column_view: gtk::ColumnView,
+) {
+    let (tracks_tx, tracks_rx) = async_channel::bounded::<PlaylistLoadOutcome>(1);
+
+    rt_handle.spawn(async move {
+        let outcome = match crate::db::connection::init_db().await {
+            Ok(db) => {
+                let manager = crate::local::playlist_manager::PlaylistManager::new(db);
+                match manager.get_playlist(&playlist_id).await {
+                    Ok(Some(playlist)) => {
+                        let models = if playlist.is_smart {
+                            manager.evaluate_smart_playlist(&playlist_id).await
+                        } else {
+                            manager.get_playlist_tracks(&playlist_id).await
+                        };
+                        match models {
+                            Ok(models) => PlaylistLoadOutcome::Loaded(
+                                models
+                                    .iter()
+                                    .map(crate::local::engine::db_model_to_track)
+                                    .collect(),
+                            ),
+                            Err(error) => {
+                                tracing::warn!(%error, "Failed to load playlist tracks");
+                                PlaylistLoadOutcome::Failed
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::debug!("Playlist disappeared before its tracks were loaded");
+                        PlaylistLoadOutcome::Missing
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Failed to identify playlist type");
+                        PlaylistLoadOutcome::Failed
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "Failed to open DB for playlist");
+                PlaylistLoadOutcome::Failed
+            }
+        };
+        let _ = tracks_tx.send(outcome).await;
+    });
+
+    glib::MainContext::default().spawn_local(async move {
+        let Ok(outcome) = tracks_rx.recv().await else {
+            return;
+        };
+        let tracks = match outcome {
+            PlaylistLoadOutcome::Loaded(tracks) => tracks,
+            PlaylistLoadOutcome::Missing => {
+                if evict_source_completion(
+                    &navigation,
+                    &request,
+                    &source_tracks,
+                    &active_source_key,
+                ) {
+                    display_tracks(
+                        &[],
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
+                }
+                return;
+            }
+            PlaylistLoadOutcome::Failed => {
+                // A transient database/query failure is not an empty playlist.
+                // Preserve the last successful cache and visible stale-while-
+                // revalidate snapshot for a later retry.
+                return;
+            }
+        };
+        let objects: Vec<TrackObject> = tracks.iter().map(arch_track_to_object).collect();
+
+        // A paired rename may commit while this database result is in flight.
+        // Overlay the latest committed local paths at the GTK publication
+        // boundary so either callback order converges on the live URI.
+        if let Some(local_tracks) = source_tracks.borrow().get("local") {
+            refresh_projected_library_uris(&objects, local_tracks);
+        }
+
+        let should_render = cache_source_completion(
+            &navigation,
+            &request,
+            &source_tracks,
+            &objects,
+            &active_source_key,
+        );
+        if should_render {
+            display_tracks(
+                &objects,
+                &track_store,
+                &master_tracks,
+                &browser_widget,
+                &browser_state,
+                &status_label,
+                &column_view,
+            );
+        } else {
+            tracing::debug!(
+                source = %request.source_key(),
+                generation = request.generation(),
+                "Playlist result cached or ignored without rendering"
+            );
+        }
+    });
+}
+
 /// Wire the sidebar selection-changed signal.
 ///
 /// This function owns all the logic for switching between sources when
@@ -49,6 +254,7 @@ pub fn setup_source_connect(state: &WindowState) {
     let master_tracks = state.master_tracks.clone();
     let source_tracks = state.source_tracks.clone();
     let active_source_key = state.active_source_key.clone();
+    let source_navigation = state.source_navigation.clone();
     let browser_widget = state.browser_widget.clone();
     let browser_state = state.browser_state.clone();
     let status_label = state.status_label.clone();
@@ -74,15 +280,21 @@ pub fn setup_source_connect(state: &WindowState) {
         // tasks when the user clicks a server that is still connecting
         // (applies to all network sources: Subsonic, Jellyfin, Plex, DAAP).
         if pending_connection.borrow().is_some() {
-            let pending_url = pending_connection.borrow().clone();
-            if let Some(ref pu) = pending_url {
+            let pending = pending_connection.borrow().clone();
+            if let Some(pending) = pending {
                 // If clicking the same server that's already connecting, just ignore.
-                if src.server_url() == *pu {
+                if src.server_url() == pending.source_key() {
                     return;
                 }
                 // If clicking a different server while one is connecting,
                 // also ignore — let the first connection finish first.
                 if src.connecting() || (!src.connected() && !src.server_url().is_empty()) {
+                    restore_pending_selection(
+                        &sidebar_store,
+                        sel,
+                        pending.source_key(),
+                        pre_connect_selection.get(),
+                    );
                     return;
                 }
             }
@@ -105,7 +317,9 @@ pub fn setup_source_connect(state: &WindowState) {
 
         // ── Local source: switch to local view ───────────────────
         if key == "local" {
+            source_navigation.borrow_mut().select("local");
             *active_source_key.borrow_mut() = "local".to_string();
+            pre_connect_selection.set(sel.selected());
 
             // Restore music column layout if coming from radio.
             apply_radio_columns(&column_view, false);
@@ -137,7 +351,11 @@ pub fn setup_source_connect(state: &WindowState) {
 
             let playlist_source_key =
                 format!("{}{playlist_id}", super::playback::PLAYLIST_SOURCE_PREFIX);
+            let request = source_navigation
+                .borrow_mut()
+                .select(playlist_source_key.clone());
             *active_source_key.borrow_mut() = playlist_source_key.clone();
+            pre_connect_selection.set(sel.selected());
 
             // Restore music column layout (not radio).
             apply_radio_columns(&column_view, false);
@@ -148,87 +366,31 @@ pub fn setup_source_connect(state: &WindowState) {
             preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
             drop(cfg);
 
-            let is_smart = backend_type == "smart-playlist";
-            let rt_handle = rt_handle.clone();
-            let track_store = track_store.clone();
-            let master_tracks = master_tracks.clone();
-            let browser_widget = browser_widget.clone();
-            let browser_state = browser_state.clone();
-            let status_label = status_label.clone();
-            let column_view = column_view.clone();
-            let pid = playlist_id.clone();
-            let source_tracks_for_load = source_tracks.clone();
-            let active_source_key_for_load = active_source_key.clone();
-            let requested_source_key = playlist_source_key;
+            let cached = source_tracks.borrow().get(&playlist_source_key).cloned();
+            display_tracks(
+                cached.as_deref().unwrap_or_default(),
+                &track_store,
+                &master_tracks,
+                &browser_widget,
+                &browser_state,
+                &status_label,
+                &column_view,
+            );
 
-            let (tracks_tx, tracks_rx) = async_channel::bounded::<String>(1);
-
-            rt_handle.spawn(async move {
-                match crate::db::connection::init_db().await {
-                    Ok(db) => {
-                        let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
-                        let tracks = if is_smart {
-                            mgr.evaluate_smart_playlist(&pid).await
-                        } else {
-                            mgr.get_playlist_tracks(&pid).await
-                        };
-                        match tracks {
-                            Ok(models) => {
-                                let arch_tracks: Vec<crate::architecture::models::Track> = models
-                                    .iter()
-                                    .map(crate::local::engine::db_model_to_track)
-                                    .collect();
-                                let json = serde_json::to_string(&arch_tracks).unwrap_or_default();
-                                let _ = tracks_tx.send(json).await;
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Failed to load playlist tracks");
-                                let _ = tracks_tx.send("[]".to_string()).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to open DB for playlist");
-                        let _ = tracks_tx.send("[]".to_string()).await;
-                    }
-                }
-            });
-
-            glib::MainContext::default().spawn_local(async move {
-                if let Ok(json) = tracks_rx.recv().await {
-                    let tracks: Vec<crate::architecture::models::Track> =
-                        serde_json::from_str(&json).unwrap_or_default();
-                    let objects: Vec<TrackObject> =
-                        tracks.iter().map(arch_track_to_object).collect();
-
-                    // A paired rename may commit while this database result is
-                    // in flight. Overlay the latest committed local paths at
-                    // the GTK publication boundary so either callback order
-                    // converges on the live URI.
-                    if let Some(local_tracks) = source_tracks_for_load.borrow().get("local") {
-                        refresh_projected_library_uris(&objects, local_tracks);
-                    }
-
-                    // A slow playlist query must never replace a source the
-                    // user selected while it was running.
-                    if *active_source_key_for_load.borrow() != requested_source_key {
-                        tracing::debug!(
-                            source = %requested_source_key,
-                            "Ignoring playlist result for an inactive source"
-                        );
-                        return;
-                    }
-                    display_tracks(
-                        &objects,
-                        &track_store,
-                        &master_tracks,
-                        &browser_widget,
-                        &browser_state,
-                        &status_label,
-                        &column_view,
-                    );
-                }
-            });
+            load_playlist_source(
+                rt_handle.clone(),
+                playlist_id,
+                request,
+                source_navigation.clone(),
+                source_tracks.clone(),
+                active_source_key.clone(),
+                track_store.clone(),
+                master_tracks.clone(),
+                browser_widget.clone(),
+                browser_state.clone(),
+                status_label.clone(),
+                column_view.clone(),
+            );
             return;
         }
 
@@ -239,7 +401,9 @@ pub fn setup_source_connect(state: &WindowState) {
                 return;
             }
 
+            let request = source_navigation.borrow_mut().select(key.clone());
             *active_source_key.borrow_mut() = key.clone();
+            pre_connect_selection.set(sel.selected());
 
             // Restore music column layout if coming from radio.
             apply_radio_columns(&column_view, false);
@@ -265,7 +429,6 @@ pub fn setup_source_connect(state: &WindowState) {
             } else {
                 // Scan on a background thread to avoid blocking UI.
                 let mount = mount_point.clone();
-                let source_key = key.clone();
                 let track_store = track_store.clone();
                 let master_tracks = master_tracks.clone();
                 let source_tracks = source_tracks.clone();
@@ -274,6 +437,8 @@ pub fn setup_source_connect(state: &WindowState) {
                 let status_label = status_label.clone();
                 let column_view = column_view.clone();
                 let active_source_key = active_source_key.clone();
+                let source_navigation = source_navigation.clone();
+                let request = request.clone();
 
                 // Serialisable track data for cross-thread transfer.
                 // TrackObject is a GObject (not Send), so we send
@@ -336,13 +501,15 @@ pub fn setup_source_connect(state: &WindowState) {
                         objects.push(obj);
                     }
 
-                    // Store for future source switches.
-                    source_tracks
-                        .borrow_mut()
-                        .insert(source_key.clone(), objects.clone());
+                    let should_render = cache_source_completion(
+                        &source_navigation,
+                        &request,
+                        &source_tracks,
+                        &objects,
+                        &active_source_key,
+                    );
 
-                    // Display if still the active source.
-                    if *active_source_key.borrow() == source_key {
+                    if should_render {
                         display_tracks(
                             &objects,
                             &track_store,
@@ -360,18 +527,32 @@ pub fn setup_source_connect(state: &WindowState) {
 
         // ── Radio source: fetch stations ────────────────────────
         if is_radio_backend(&backend_type) {
+            let request = source_navigation.borrow_mut().select(backend_type.clone());
             *active_source_key.borrow_mut() = backend_type.clone();
+            pre_connect_selection.set(sel.selected());
 
             // Switch to radio column layout.
             apply_radio_columns(&column_view, true);
             // Hide browser for radio.
             browser_widget.set_visible(false);
 
-            // Clear the tracklist immediately so local songs don't
-            // show while radio stations are loading asynchronously.
-            track_store.remove_all();
-            tracklist::update_status(&status_label, &[]);
-            *master_tracks.borrow_mut() = Vec::new();
+            // Show a prior completed result while refreshing. If this source
+            // has never loaded, clear the old source immediately.
+            if let Some(cached) = source_tracks.borrow().get(&backend_type).cloned() {
+                display_tracks(
+                    &cached,
+                    &track_store,
+                    &master_tracks,
+                    &browser_widget,
+                    &browser_state,
+                    &status_label,
+                    &column_view,
+                );
+            } else {
+                track_store.remove_all();
+                tracklist::update_status(&status_label, &[]);
+                *master_tracks.borrow_mut() = Vec::new();
+            }
 
             // Handle "Stations Near Me" with geo consent.
             if backend_type == super::radio::NEARME_SOURCE_KEY {
@@ -384,6 +565,7 @@ pub fn setup_source_connect(state: &WindowState) {
                 let status_label = status_label.clone();
                 let column_view = column_view.clone();
                 let active_source_key = active_source_key.clone();
+                let source_navigation = source_navigation.clone();
                 let sidebar_selection = sel.clone();
                 let source_tracks = source_tracks.clone();
                 let win = win.clone();
@@ -399,6 +581,8 @@ pub fn setup_source_connect(state: &WindowState) {
                     status_label,
                     column_view,
                     active_source_key,
+                    source_navigation,
+                    request,
                     sidebar_selection,
                     source_tracks,
                 );
@@ -413,7 +597,8 @@ pub fn setup_source_connect(state: &WindowState) {
                 let status_label = status_label.clone();
                 let column_view = column_view.clone();
                 let active_source_key = active_source_key.clone();
-                let requested_source_key = backend_type.clone();
+                let source_navigation = source_navigation.clone();
+                let source_tracks = source_tracks.clone();
 
                 let (stations_tx, stations_rx) = async_channel::bounded::<String>(1);
 
@@ -432,25 +617,27 @@ pub fn setup_source_connect(state: &WindowState) {
 
                 glib::MainContext::default().spawn_local(async move {
                     if let Ok(json) = stations_rx.recv().await {
-                        // The fetch takes seconds. If the user has since picked
-                        // another source, this result is stale and must not
-                        // overwrite whatever they are looking at now.
-                        if *active_source_key.borrow() != requested_source_key {
-                            return;
-                        }
                         let stations: Vec<crate::radio::RadioStation> =
                             serde_json::from_str(&json).unwrap_or_default();
                         let objects: Vec<TrackObject> =
                             stations.iter().map(radio_station_to_track_object).collect();
-                        display_tracks(
+                        if cache_source_completion(
+                            &source_navigation,
+                            &request,
+                            &source_tracks,
                             &objects,
-                            &track_store,
-                            &master_tracks,
-                            &browser_widget,
-                            &browser_state,
-                            &status_label,
-                            &column_view,
-                        );
+                            &active_source_key,
+                        ) {
+                            display_tracks(
+                                &objects,
+                                &track_store,
+                                &master_tracks,
+                                &browser_widget,
+                                &browser_state,
+                                &status_label,
+                                &column_view,
+                            );
+                        }
                     }
                 });
             }
@@ -459,7 +646,9 @@ pub fn setup_source_connect(state: &WindowState) {
 
         // ── Connected source: switch view ───────────────────────
         if src.connected() {
+            source_navigation.borrow_mut().select(key.clone());
             *active_source_key.borrow_mut() = key.clone();
+            pre_connect_selection.set(sel.selected());
 
             // Restore music column layout if coming from radio.
             apply_radio_columns(&column_view, false);
@@ -510,12 +699,18 @@ pub fn setup_source_connect(state: &WindowState) {
             return;
         }
 
+        // Backend/session generations protect remote ownership, but they do
+        // not say whether the user still wants this pending connection to
+        // change the selected source when it completes.
+        let connection_request = source_navigation.borrow_mut().select(server_url.clone());
+
         // For passwordless DAAP servers, bypass the dialog entirely
         // and connect directly.
         if backend_type == "daap" && !requires_password {
-            // Save the current selection so we can revert on failure.
-            pre_connect_selection.set(selected_pos);
-            *pending_connection.borrow_mut() = Some(url_for_closure.clone());
+            *pending_connection.borrow_mut() = Some(PendingConnection::new(
+                url_for_closure.clone(),
+                connection_request.clone(),
+            ));
 
             // Mark as connecting → spinner in sidebar.
             if let Some(src) = sidebar_store
@@ -538,6 +733,8 @@ pub fn setup_source_connect(state: &WindowState) {
             let sel_for_fail = sel.clone();
             let pre_sel = pre_connect_selection.get();
             let pending_for_fail = pending_connection.clone();
+            let navigation_for_fail = source_navigation.clone();
+            let request_for_fail = connection_request.clone();
             glib::MainContext::default().spawn_local(async move {
                 if fail_rx.recv().await.is_ok() {
                     if let Some(src) = sidebar_store_for_fail
@@ -549,16 +746,24 @@ pub fn setup_source_connect(state: &WindowState) {
                         sidebar_store_for_fail.remove(selected_pos);
                         sidebar_store_for_fail.insert(selected_pos, &src);
                     }
-                    // Revert sidebar to the previous selection.
-                    sel_for_fail.set_selected(pre_sel);
-                    // Clear the pending connection guard.
-                    *pending_for_fail.borrow_mut() = None;
+                    let owns_pending = pending_for_fail
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|pending| pending.request() == &request_for_fail);
+                    if owns_pending {
+                        *pending_for_fail.borrow_mut() = None;
+                        if navigation_for_fail.borrow().is_current(&request_for_fail) {
+                            sel_for_fail.set_selected(pre_sel);
+                        }
+                    }
                 }
             });
 
             let sidebar_store_for_auth = sidebar_store.clone();
             let sel_for_auth = sel.clone();
             let pending_for_auth = pending_connection.clone();
+            let navigation_for_auth = source_navigation.clone();
+            let request_for_auth = connection_request.clone();
             glib::MainContext::default().spawn_local(async move {
                 if auth_needed_rx.recv().await.is_ok() {
                     // Clear connecting state and flip requires_password so the
@@ -573,12 +778,19 @@ pub fn setup_source_connect(state: &WindowState) {
                         sidebar_store_for_auth.remove(selected_pos);
                         sidebar_store_for_auth.insert(selected_pos, &src);
                     }
-                    // Drop the pending guard and re-fire selection-changed.
-                    // Setting the same position is a no-op in GtkSingleSelection,
-                    // so deselect (INVALID_LIST_POSITION) then reselect.
-                    *pending_for_auth.borrow_mut() = None;
-                    sel_for_auth.set_selected(gtk::INVALID_LIST_POSITION);
-                    sel_for_auth.set_selected(selected_pos);
+                    let owns_pending = pending_for_auth
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|pending| pending.request() == &request_for_auth);
+                    if owns_pending {
+                        *pending_for_auth.borrow_mut() = None;
+                        if navigation_for_auth.borrow().is_current(&request_for_auth) {
+                            // Setting the same position is a no-op in
+                            // GtkSingleSelection, so deselect then reselect.
+                            sel_for_auth.set_selected(gtk::INVALID_LIST_POSITION);
+                            sel_for_auth.set_selected(selected_pos);
+                        }
+                    }
                 }
             });
 
@@ -644,8 +856,10 @@ pub fn setup_source_connect(state: &WindowState) {
         // shown so a second sidebar click while the dialog is open is
         // ignored at the top of this handler. The submit closure and
         // the cancel callback below clear it when appropriate.
-        *pending_connection.borrow_mut() = Some(url_for_closure.clone());
-        pre_connect_selection.set(selected_pos);
+        *pending_connection.borrow_mut() = Some(PendingConnection::new(
+            url_for_closure.clone(),
+            connection_request.clone(),
+        ));
 
         // Clone Rc's before moving into the auth dialog closure so
         // the outer `Fn` closure can be called multiple times.
@@ -656,9 +870,26 @@ pub fn setup_source_connect(state: &WindowState) {
         // If the user cancels / escapes the auth dialog, drop the
         // pending-connection guard so the next sidebar click works.
         let pending_for_cancel = pending_connection.clone();
+        let navigation_for_cancel = source_navigation.clone();
+        let request_for_cancel = connection_request.clone();
+        let sel_for_cancel = sel.clone();
+        let pre_sel_for_cancel = pre_connect_selection.get();
         let on_cancel = move || {
-            *pending_for_cancel.borrow_mut() = None;
+            let owns_pending = pending_for_cancel
+                .borrow()
+                .as_ref()
+                .is_some_and(|pending| pending.request() == &request_for_cancel);
+            if owns_pending {
+                *pending_for_cancel.borrow_mut() = None;
+                if navigation_for_cancel
+                    .borrow()
+                    .is_current(&request_for_cancel)
+                {
+                    sel_for_cancel.set_selected(pre_sel_for_cancel);
+                }
+            }
         };
+        let navigation_for_submit = source_navigation.clone();
 
         show_auth_dialog(
             &win,
@@ -670,6 +901,7 @@ pub fn setup_source_connect(state: &WindowState) {
                 let server_url = url_for_closure.clone();
                 let server_name = name_for_closure.clone();
                 let backend_type = backend_type.clone();
+                let connection_request = connection_request.clone();
 
                 // Mark as connecting → spinner in sidebar.
                 if let Some(src) = sidebar_store
@@ -681,9 +913,10 @@ pub fn setup_source_connect(state: &WindowState) {
                     sidebar_store.remove(selected_pos);
                     sidebar_store.insert(selected_pos, &src);
                 }
-                // Save the current selection so we can revert on failure.
-                pre_connect_for_auth.set(selected_pos);
-                *pending_for_auth.borrow_mut() = Some(server_url.clone());
+                *pending_for_auth.borrow_mut() = Some(PendingConnection::new(
+                    server_url.clone(),
+                    connection_request.clone(),
+                ));
 
                 // One-shot to signal failure back to the main thread so we
                 // can clear the spinner (GObjects are not Send).
@@ -692,6 +925,8 @@ pub fn setup_source_connect(state: &WindowState) {
                 let sel_for_fail = sel_for_auth.clone();
                 let pre_sel = pre_connect_for_auth.get();
                 let pending_for_fail = pending_for_auth.clone();
+                let navigation_for_fail = navigation_for_submit.clone();
+                let request_for_fail = connection_request.clone();
                 glib::MainContext::default().spawn_local(async move {
                     if fail_rx.recv().await.is_ok() {
                         if let Some(src) = sidebar_store_for_fail
@@ -703,10 +938,16 @@ pub fn setup_source_connect(state: &WindowState) {
                             sidebar_store_for_fail.remove(selected_pos);
                             sidebar_store_for_fail.insert(selected_pos, &src);
                         }
-                        // Revert sidebar to the previous selection.
-                        sel_for_fail.set_selected(pre_sel);
-                        // Clear the pending connection guard.
-                        *pending_for_fail.borrow_mut() = None;
+                        let owns_pending = pending_for_fail
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|pending| pending.request() == &request_for_fail);
+                        if owns_pending {
+                            *pending_for_fail.borrow_mut() = None;
+                            if navigation_for_fail.borrow().is_current(&request_for_fail) {
+                                sel_for_fail.set_selected(pre_sel);
+                            }
+                        }
                     }
                 });
 
