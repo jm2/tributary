@@ -17,6 +17,7 @@ pub mod playlist_editor;
 pub mod preferences;
 pub mod properties_dialog;
 pub mod radio;
+pub mod removable_media;
 pub mod root_trust;
 pub mod server_dialogs;
 pub mod sidebar;

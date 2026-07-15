@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 use crate::local::engine::LibraryEvent;
@@ -44,6 +45,27 @@ enum PlaylistLoadOutcome {
     Loaded(Vec<crate::architecture::models::Track>),
     Missing,
     Failed,
+}
+
+/// Bound parsed USB rows so a fast filesystem cannot grow memory without
+/// limit while GTK is busy. Closing the receiver wakes a blocked producer.
+const USB_SCAN_CHANNEL_CAPACITY: usize = 64;
+
+/// Poll exact navigation ownership even while no scan row is arriving. This
+/// lets unplug/supersession close the bounded channel promptly; the filesystem
+/// walk itself can still remain blocked in the kernel until that call returns.
+const USB_SCAN_CANCELLATION_POLL: Duration = Duration::from_millis(50);
+
+fn resolve_source_key(explicit_key: &str, server_url: &str, backend_type: &str) -> String {
+    if !explicit_key.is_empty() {
+        explicit_key.to_string()
+    } else if !server_url.is_empty() {
+        server_url.to_string()
+    } else if backend_type == "local" || backend_type.is_empty() {
+        "local".to_string()
+    } else {
+        backend_type.to_string()
+    }
 }
 
 fn restore_pending_selection(
@@ -302,18 +324,12 @@ pub fn setup_source_connect(state: &WindowState) {
 
         let backend_type = src.backend_type();
 
-        // Determine the source key.
-        // Remote sources use their server URL; local sources with a
-        // specific backend_type (radio, playlist) use that type as
-        // the key so they don't all collapse into "local".
+        // Determine the source key. Device rows carry an explicit logical key;
+        // legacy/remote rows fall back to their server URL, while local static
+        // sources use the backend type so they do not collapse into "local".
+        let explicit_key = src.source_key();
         let url = src.server_url();
-        let key = if !url.is_empty() {
-            url.clone()
-        } else if backend_type == "local" || backend_type.is_empty() {
-            "local".to_string()
-        } else {
-            backend_type.clone()
-        };
+        let key = resolve_source_key(&explicit_key, &url, &backend_type);
 
         // ── Local source: switch to local view ───────────────────
         if key == "local" {
@@ -396,10 +412,9 @@ pub fn setup_source_connect(state: &WindowState) {
 
         // ── USB device source: scan and display music files ──────
         if backend_type == "usb-device" {
-            let mount_point = src.server_url();
-            if mount_point.is_empty() {
+            let Some(mount_point) = src.device_mount_point() else {
                 return;
-            }
+            };
 
             let request = source_navigation.borrow_mut().select(key.clone());
             *active_source_key.borrow_mut() = key.clone();
@@ -427,8 +442,22 @@ pub fn setup_source_connect(state: &WindowState) {
                     &column_view,
                 );
             } else {
+                // The source identity changes immediately, so its projection
+                // must change with it. Leaving the previous source's rows in
+                // place would let a click queue those tracks under this USB
+                // source key while a large device scan is still running.
+                display_tracks(
+                    &[],
+                    &track_store,
+                    &master_tracks,
+                    &browser_widget,
+                    &browser_state,
+                    &status_label,
+                    &column_view,
+                );
+
                 // Scan on a background thread to avoid blocking UI.
-                let mount = mount_point.clone();
+                let mount = mount_point;
                 let track_store = track_store.clone();
                 let master_tracks = master_tracks.clone();
                 let source_tracks = source_tracks.clone();
@@ -459,48 +488,94 @@ pub fn setup_source_connect(state: &WindowState) {
                     String,
                     String,
                 );
-                let (scan_tx, scan_rx) = async_channel::unbounded::<ScanRow>();
+                let (scan_tx, scan_rx) =
+                    async_channel::bounded::<ScanRow>(USB_SCAN_CHANNEL_CAPACITY);
 
-                // Background thread: walk the device filesystem.
-                std::thread::spawn(move || {
-                    let mount_path = std::path::Path::new(&mount);
-                    for path in enumerate_device_audio_files(mount_path) {
-                        let path = path.as_path();
-                        if let Ok(parsed) = crate::local::tag_parser::parse_audio_file(path) {
-                            let uri = url::Url::from_file_path(path)
-                                .map(|u| u.to_string())
-                                .unwrap_or_default();
-                            let row: ScanRow = (
-                                parsed.track_number.unwrap_or(0),
-                                parsed.title,
-                                parsed.duration_secs.unwrap_or(0),
-                                parsed.artist_name,
-                                parsed.album_title,
-                                parsed.genre.unwrap_or_else(|| "Unknown".to_string()),
-                                parsed.composer.unwrap_or_default(),
-                                parsed.year.unwrap_or(0),
-                                parsed.date_modified.format("%Y-%m-%d").to_string(),
-                                parsed.bitrate_kbps.unwrap_or(0),
-                                parsed.sample_rate_hz.unwrap_or(0),
-                                parsed.format,
-                                uri,
-                            );
-                            let _ = scan_tx.try_send(row);
+                // Background thread: stream the device filesystem into a
+                // bounded channel. A superseded/unplugged receiver closes the
+                // channel, waking send_blocking and stopping the producer.
+                if let Err(error) = std::thread::Builder::new()
+                    .name("usb-scan".to_string())
+                    .spawn(move || {
+                        for path in enumerate_device_audio_files(&mount) {
+                            if scan_tx.is_closed() {
+                                break;
+                            }
+                            let path = path.as_path();
+                            if let Ok(parsed) = crate::local::tag_parser::parse_audio_file(path) {
+                                let uri = url::Url::from_file_path(path)
+                                    .map(|u| u.to_string())
+                                    .unwrap_or_default();
+                                let row: ScanRow = (
+                                    parsed.track_number.unwrap_or(0),
+                                    parsed.title,
+                                    parsed.duration_secs.unwrap_or(0),
+                                    parsed.artist_name,
+                                    parsed.album_title,
+                                    parsed.genre.unwrap_or_else(|| "Unknown".to_string()),
+                                    parsed.composer.unwrap_or_default(),
+                                    parsed.year.unwrap_or(0),
+                                    parsed.date_modified.format("%Y-%m-%d").to_string(),
+                                    parsed.bitrate_kbps.unwrap_or(0),
+                                    parsed.sample_rate_hz.unwrap_or(0),
+                                    parsed.format,
+                                    uri,
+                                );
+                                if scan_tx.send_blocking(row).is_err() {
+                                    break;
+                                }
+                            }
                         }
-                    }
-                    // Close the sender to signal completion.
-                    drop(scan_tx);
-                });
+                    })
+                {
+                    tracing::warn!(%error, "Failed to start USB device scan worker");
+                    // The failed spawn drops its closure and sender, so the
+                    // channel is closed explicitly and this request remains
+                    // uncached, allowing a later selection to retry.
+                    scan_rx.close();
+                    return;
+                }
 
                 // Collect results on the GTK main thread.
                 glib::MainContext::default().spawn_local(async move {
                     let mut objects = Vec::new();
-                    while let Ok(row) = scan_rx.recv().await {
-                        let obj = TrackObject::new(
-                            row.0, &row.1, row.2, &row.3, &row.4, &row.5, &row.6, row.7, &row.8,
-                            row.9, row.10, 0, &row.11, &row.12,
-                        );
-                        objects.push(obj);
+                    loop {
+                        if source_navigation.borrow().completion(&request)
+                            == CompletionDisposition::Ignore
+                        {
+                            scan_rx.close();
+                            return;
+                        }
+
+                        let receive = scan_rx.recv();
+                        futures::pin_mut!(receive);
+                        let cancellation_poll = glib::timeout_future(USB_SCAN_CANCELLATION_POLL);
+                        match futures::future::select(receive, cancellation_poll).await {
+                            futures::future::Either::Left((Ok(row), _)) => {
+                                // Ownership may have changed while recv was
+                                // ready but before GTK resumed this task.
+                                if source_navigation.borrow().completion(&request)
+                                    == CompletionDisposition::Ignore
+                                {
+                                    scan_rx.close();
+                                    return;
+                                }
+                                let obj = TrackObject::new(
+                                    row.0, &row.1, row.2, &row.3, &row.4, &row.5, &row.6, row.7,
+                                    &row.8, row.9, row.10, 0, &row.11, &row.12,
+                                );
+                                objects.push(obj);
+                            }
+                            futures::future::Either::Left((Err(_), _)) => break,
+                            futures::future::Either::Right(((), _)) => {}
+                        }
+                    }
+
+                    if source_navigation.borrow().completion(&request)
+                        == CompletionDisposition::Ignore
+                    {
+                        scan_rx.close();
+                        return;
                     }
 
                     let should_render = cache_source_completion(
@@ -1192,7 +1267,9 @@ pub fn setup_source_connect(state: &WindowState) {
 ///
 /// This matches the policy the library scanner already applies in
 /// `local::engine`.
-fn enumerate_device_audio_files(mount: &std::path::Path) -> Vec<std::path::PathBuf> {
+fn enumerate_device_audio_files(
+    mount: &std::path::Path,
+) -> impl Iterator<Item = std::path::PathBuf> {
     walkdir::WalkDir::new(mount)
         .follow_links(false)
         .into_iter()
@@ -1200,14 +1277,28 @@ fn enumerate_device_audio_files(mount: &std::path::Path) -> Vec<std::path::PathB
         .filter(|entry| entry.file_type().is_file())
         .map(walkdir::DirEntry::into_path)
         .filter(|path| crate::local::tag_parser::is_audio_file(path))
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::enumerate_device_audio_files;
+    use super::{enumerate_device_audio_files, resolve_source_key};
+
+    #[test]
+    fn explicit_source_identity_precedes_legacy_fallbacks() {
+        assert_eq!(
+            resolve_source_key("device:uuid:123", "file:///legacy", "usb-device"),
+            "device:uuid:123"
+        );
+        assert_eq!(
+            resolve_source_key("", "https://music.example.test", "subsonic"),
+            "https://music.example.test"
+        );
+        assert_eq!(resolve_source_key("", "", "radio-topvote"), "radio-topvote");
+        assert_eq!(resolve_source_key("", "", "local"), "local");
+        assert_eq!(resolve_source_key("", "", ""), "local");
+    }
 
     struct TestTree {
         path: PathBuf,
@@ -1273,8 +1364,19 @@ mod tests {
         device.audio("Album/cover.jpg");
         device.audio("notes.txt");
 
-        let found = enumerate_device_audio_files(device.path());
+        let found: Vec<_> = enumerate_device_audio_files(device.path()).collect();
         assert_eq!(file_names(&found), vec!["root.mp3", "track.flac"]);
+    }
+
+    #[test]
+    fn device_audio_enumeration_is_lazy() {
+        let device = TestTree::new("lazy");
+        let track = device.audio("removed-before-poll.mp3");
+        let mut paths = enumerate_device_audio_files(device.path());
+
+        std::fs::remove_file(track).expect("remove track before polling iterator");
+
+        assert_eq!(paths.next(), None);
     }
 
     /// The P2.4 defect: the walk followed symlinks, so a stick containing
@@ -1296,7 +1398,7 @@ mod tests {
         )
         .expect("link a file off-device");
 
-        let found = enumerate_device_audio_files(device.path());
+        let found: Vec<_> = enumerate_device_audio_files(device.path()).collect();
 
         assert_eq!(
             file_names(&found),

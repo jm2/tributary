@@ -144,6 +144,15 @@ impl SourceNavigation {
         self.latest_by_key
             .retain(|source_key, _| !source_key.starts_with(prefix));
     }
+
+    /// Retire pending/cache-eligible work for exactly one source key.
+    ///
+    /// The active request is intentionally left intact. Callers removing an
+    /// active source can then perform their visible fallback as a separate,
+    /// explicit navigation transition.
+    pub fn invalidate_key(&mut self, key: &str) {
+        self.latest_by_key.remove(key);
+    }
 }
 
 /// One in-flight remote connection paired with the navigation intent that
@@ -266,6 +275,58 @@ mod tests {
 
         assert!(navigation.is_current(&remote));
         assert!(!navigation.is_key("playlist:a"));
+    }
+
+    #[test]
+    fn exact_invalidation_rejects_old_completion_without_changing_active_request() {
+        let mut navigation = SourceNavigation::new("local");
+        let device = navigation.select("device:uuid:a");
+
+        navigation.invalidate_key("device:uuid:a");
+
+        assert!(navigation.is_current(&device));
+        assert!(navigation.is_key("device:uuid:a"));
+        assert_eq!(
+            navigation.completion(&device),
+            CompletionDisposition::Ignore
+        );
+        assert!(navigation.latest_request("device:uuid:a").is_none());
+    }
+
+    #[test]
+    fn exact_invalidation_leaves_unrelated_pending_navigation_untouched() {
+        let mut navigation = SourceNavigation::new("local");
+        navigation.select("device:uuid:a");
+        let remote = navigation.select("https://music.example.test/");
+        let pending = PendingConnection::new("https://music.example.test/", remote.clone());
+
+        navigation.invalidate_key("device:uuid:a");
+
+        assert!(navigation.is_current(&remote));
+        assert_eq!(
+            navigation.completion(&remote),
+            CompletionDisposition::CacheAndRender
+        );
+        assert!(pending.may_auto_select("https://music.example.test/", &navigation));
+    }
+
+    #[test]
+    fn invalidated_key_can_be_reselected_with_a_new_accepted_generation() {
+        let mut navigation = SourceNavigation::new("local");
+        let removed = navigation.select("device:uuid:a");
+        navigation.invalidate_key("device:uuid:a");
+
+        let reattached = navigation.select("device:uuid:a");
+
+        assert!(reattached.generation() > removed.generation());
+        assert_eq!(
+            navigation.completion(&removed),
+            CompletionDisposition::Ignore
+        );
+        assert_eq!(
+            navigation.completion(&reattached),
+            CompletionDisposition::CacheAndRender
+        );
     }
 
     #[test]
