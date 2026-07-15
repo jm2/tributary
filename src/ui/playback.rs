@@ -1043,7 +1043,7 @@ mod tests {
 
     fn projected_row(id: &str, uri: &str) -> TrackObject {
         let row = TrackObject::new(
-            1, "Title", 60, "Artist", "Album", "", 0, "", 0, 0, 0, "", uri,
+            1, "Title", 60, "Artist", "Album", "", "", 0, "", 0, 0, 0, "", uri,
         );
         row.set_track_id(id);
         row

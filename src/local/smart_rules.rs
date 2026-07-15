@@ -41,6 +41,7 @@ pub enum SortField {
     AlbumArtist,
     Album,
     Title,
+    Composer,
     Year,
     TrackNumber,
     DiscNumber,
@@ -82,6 +83,7 @@ pub enum RuleField {
     AlbumArtist,
     Album,
     Genre,
+    Composer,
     Year,
     TrackNumber,
     DiscNumber,
@@ -185,6 +187,7 @@ pub trait SmartTrack {
     fn album_artist(&self) -> &str;
     fn album(&self) -> &str;
     fn genre(&self) -> &str;
+    fn composer(&self) -> &str;
     fn year(&self) -> Option<i32>;
     fn track_number(&self) -> Option<i32>;
     fn disc_number(&self) -> Option<i32>;
@@ -214,6 +217,9 @@ impl SmartTrack for crate::db::entities::track::Model {
     }
     fn genre(&self) -> &str {
         self.genre.as_deref().unwrap_or("")
+    }
+    fn composer(&self) -> &str {
+        self.composer.as_deref().unwrap_or("")
     }
     fn year(&self) -> Option<i32> {
         self.year
@@ -352,6 +358,7 @@ fn sort_key<T: SmartTrack>(track: &T, field: SortField) -> SortKey {
         SortField::Album => SortKey::Text(track.album().to_lowercase()),
         SortField::Title => SortKey::Text(track.title().to_lowercase()),
         SortField::Genre => SortKey::Text(track.genre().to_lowercase()),
+        SortField::Composer => SortKey::Text(track.composer().to_lowercase()),
         SortField::Year => SortKey::Int(track.year().map(i64::from)),
         SortField::TrackNumber => SortKey::Int(track.track_number().map(i64::from)),
         SortField::DiscNumber => SortKey::Int(track.disc_number().map(i64::from)),
@@ -371,6 +378,7 @@ fn evaluate_rule<T: SmartTrack>(rule: &SmartRule, track: &T) -> bool {
         RuleField::AlbumArtist => eval_text(track.album_artist(), &rule.operator, &rule.value),
         RuleField::Album => eval_text(track.album(), &rule.operator, &rule.value),
         RuleField::Genre => eval_text(track.genre(), &rule.operator, &rule.value),
+        RuleField::Composer => eval_text(track.composer(), &rule.operator, &rule.value),
         RuleField::Format => eval_text(track.format(), &rule.operator, &rule.value),
         RuleField::Year => eval_number(track.year().map(|v| v as i64), &rule.operator, &rule.value),
         RuleField::TrackNumber => eval_number(
@@ -675,6 +683,7 @@ mod tests {
         artist: String,
         album: String,
         genre: String,
+        composer: String,
         year: Option<i32>,
         track_number: Option<i32>,
         disc_number: Option<i32>,
@@ -695,6 +704,7 @@ mod tests {
                 artist: artist.to_string(),
                 album: album.to_string(),
                 genre: String::new(),
+                composer: String::new(),
                 year: None,
                 track_number: None,
                 disc_number: None,
@@ -725,6 +735,9 @@ mod tests {
         }
         fn genre(&self) -> &str {
             &self.genre
+        }
+        fn composer(&self) -> &str {
+            &self.composer
         }
         fn year(&self) -> Option<i32> {
             self.year

@@ -396,6 +396,7 @@ fn build_properties_action(
                                 artist: track.artist(),
                                 album: track.album(),
                                 genre: track.genre(),
+                                composer: track.composer(),
                                 year: track.year_display(),
                                 track_number: if track.track_number() > 0 {
                                     track.track_number().to_string()

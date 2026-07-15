@@ -1,6 +1,6 @@
 //! Tracklist — iTunes-style dense metadata grid using `GtkColumnView`.
 //!
-//! 12 resizable, sortable columns backed by `gio::ListStore<TrackObject>`
+//! 13 resizable, sortable columns backed by `gio::ListStore<TrackObject>`
 //! wrapped in a `gtk::SortListModel` for click-to-sort column headers.
 
 use std::cell::RefCell;
@@ -94,6 +94,18 @@ pub fn build_tracklist(
         false,
         |t: &TrackObject| t.genre(),
         |a, b| a.genre().to_lowercase().cmp(&b.genre().to_lowercase()),
+    );
+    add_sorted_column(
+        &column_view,
+        "Composer",
+        140,
+        false,
+        |t: &TrackObject| t.composer(),
+        |a, b| {
+            a.composer()
+                .to_lowercase()
+                .cmp(&b.composer().to_lowercase())
+        },
     );
     add_sorted_column(
         &column_view,

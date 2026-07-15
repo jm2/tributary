@@ -2371,6 +2371,7 @@ fn track_to_object(
         &t.artist_name,
         &t.album_title,
         t.genre.as_deref().unwrap_or("Unknown"),
+        t.composer.as_deref().unwrap_or(""),
         t.year.unwrap_or(0),
         &t.date_modified
             .map(|dt| dt.format("%Y-%m-%d").to_string())

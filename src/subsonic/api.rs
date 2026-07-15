@@ -164,6 +164,11 @@ pub struct SongEntry {
     pub cover_art: Option<String>,
     #[serde(default)]
     pub play_count: Option<u32>,
+    #[serde(default)]
+    pub composer: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "displayComposer")]
+    pub display_composer: Option<String>,
 }
 
 // ── search3 ─────────────────────────────────────────────────────────────

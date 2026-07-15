@@ -615,6 +615,7 @@ fn plex_track_to_track(
         track_number: plex.index,
         disc_number: plex.parent_index,
         duration_secs: plex.duration.map(|d| d / 1000), // ms → s
+        composer: None,
         genre: None, // Plex tracks don't carry genre directly; albums do.
         year: plex.year,
         file_path: None,

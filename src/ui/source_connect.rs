@@ -286,6 +286,7 @@ pub fn setup_source_connect(state: &WindowState) {
                     String,
                     String,
                     String,
+                    String,
                     i32,
                     String,
                     u32,
@@ -311,6 +312,7 @@ pub fn setup_source_connect(state: &WindowState) {
                                 parsed.artist_name,
                                 parsed.album_title,
                                 parsed.genre.unwrap_or_else(|| "Unknown".to_string()),
+                                parsed.composer.unwrap_or_default(),
                                 parsed.year.unwrap_or(0),
                                 parsed.date_modified.format("%Y-%m-%d").to_string(),
                                 parsed.bitrate_kbps.unwrap_or(0),
@@ -330,8 +332,8 @@ pub fn setup_source_connect(state: &WindowState) {
                     let mut objects = Vec::new();
                     while let Ok(row) = scan_rx.recv().await {
                         let obj = TrackObject::new(
-                            row.0, &row.1, row.2, &row.3, &row.4, &row.5, row.6, &row.7, row.8,
-                            row.9, 0, &row.10, &row.11,
+                            row.0, &row.1, row.2, &row.3, &row.4, &row.5, &row.6, row.7, &row.8,
+                            row.9, row.10, 0, &row.11, &row.12,
                         );
                         objects.push(obj);
                     }

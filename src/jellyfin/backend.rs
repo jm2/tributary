@@ -571,6 +571,7 @@ fn jellyfin_item_to_track(
         track_number: item.index_number,
         disc_number: item.parent_index_number,
         duration_secs: item.run_time_ticks.map(|t| t / 10_000_000),
+        composer: None,
         genre: item.genres.first().cloned(),
         year: item.production_year,
         file_path: None,

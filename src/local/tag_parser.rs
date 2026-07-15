@@ -38,6 +38,7 @@ pub struct ParsedTrack {
     pub duration_secs: Option<u64>,
     pub bitrate_kbps: Option<u32>,
     pub sample_rate_hz: Option<u32>,
+    pub composer: Option<String>,
     pub format: String,
     pub date_modified: DateTime<Utc>,
     pub file_size_bytes: Option<u64>,
@@ -95,6 +96,11 @@ pub fn parse_audio_file_from_file(mut file: File, path: &Path) -> Result<ParsedT
         t.get_string(ItemKey::AlbumArtist).map(str::to_string)
     });
 
+    let composer = tag.and_then(|t| {
+        use lofty::tag::ItemKey;
+        t.get_string(ItemKey::Composer).map(str::to_string)
+    });
+
     let album_title = tag
         .and_then(|t| t.album().map(|s| s.to_string()))
         .unwrap_or_else(|| "Unknown Album".to_string());
@@ -137,6 +143,7 @@ pub fn parse_audio_file_from_file(mut file: File, path: &Path) -> Result<ParsedT
         album_artist_name,
         album_title,
         genre,
+        composer,
         year,
         track_number,
         disc_number,

@@ -38,6 +38,7 @@ pub struct TagEdits {
     pub album: Option<String>,
     pub album_artist: Option<String>,
     pub genre: Option<String>,
+    pub composer: Option<String>,
     pub year: Option<String>,
     pub track_number: Option<String>,
     pub disc_number: Option<String>,
@@ -52,6 +53,7 @@ impl TagEdits {
             && self.album.is_none()
             && self.album_artist.is_none()
             && self.genre.is_none()
+            && self.composer.is_none()
             && self.year.is_none()
             && self.track_number.is_none()
             && self.disc_number.is_none()
@@ -330,6 +332,17 @@ fn write_tags_to(temp_path: &Path, edits: &TagEdits) -> Result<()> {
             tag.remove_genre();
         } else {
             tag.set_genre(genre.clone());
+        }
+    }
+
+    if let Some(ref composer) = edits.composer {
+        if composer.is_empty() {
+            tag.remove_key(ItemKey::Composer);
+        } else {
+            tag.insert(TagItem::new(
+                ItemKey::Composer,
+                ItemValue::Text(composer.clone()),
+            ));
         }
     }
 
