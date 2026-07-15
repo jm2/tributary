@@ -431,7 +431,7 @@ race that a bare active-key comparison could not distinguish.
   cover inactive caching, same-key and reverse-order supersession, playlist invalidation,
   pending-remote intent, and local debounce away/back behavior; two engine tests cover initial-scan
   and watcher post-reconciliation invalidation ordering, including the reconciliation-error path.
-- [x] Record implementation: branch `agent/p1-source-render-generation`; PR pending; seven focused
+- [x] Record implementation: PR #88; seven focused
   navigation tests plus two focused engine invalidation tests.
 
 Acceptance criteria: a late async result never renders into a source the user has already
@@ -1097,4 +1097,4 @@ Add one line per completed task:
 | 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
 | 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |
 | 2026-07-13 | P1.8 | `eb0b9ca`, `fbaaa7f` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable song identity, shared-queue preservation, ownership preflight, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
-| 2026-07-15 | P1.9 | branch `agent/p1-source-render-generation`; PR pending | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, preserves pending remote intent and valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; seven navigation and two engine tests cover the races and event ordering. |
+| 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, preserves pending remote intent and valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; seven navigation and two engine tests cover the races and event ordering. |
