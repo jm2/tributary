@@ -47,6 +47,72 @@ enum PlaylistLoadOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RemoteFailureCategory {
+    Authentication,
+    Connection,
+    Timeout,
+    Response,
+    AuthenticationMethod,
+    Backend,
+}
+
+impl RemoteFailureCategory {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Connection => "connection",
+            Self::Timeout => "timeout",
+            Self::Response => "response",
+            Self::AuthenticationMethod => "authentication-method",
+            Self::Backend => "backend",
+        }
+    }
+
+    pub(super) fn log_message(self) -> &'static str {
+        match self {
+            Self::Authentication => "Remote authentication rejected",
+            Self::Connection => "Remote connection failed",
+            Self::Timeout => "Remote connection timed out",
+            Self::Response => "Remote response failed",
+            Self::AuthenticationMethod => "Remote authentication method failed",
+            Self::Backend => "Remote source failed",
+        }
+    }
+
+    pub(super) fn user_message(self, backend_type: &str) -> String {
+        match self {
+            Self::Authentication => format!("{backend_type} authentication was rejected"),
+            Self::Connection => format!("Could not connect to {backend_type}"),
+            Self::Timeout => format!("{backend_type} connection timed out"),
+            Self::Response => format!("{backend_type} returned an invalid response"),
+            Self::AuthenticationMethod => {
+                format!("{backend_type} authentication method is unsupported")
+            }
+            Self::Backend => format!("{backend_type} source failed"),
+        }
+    }
+}
+
+pub(super) fn remote_failure_category(
+    error: &crate::architecture::error::BackendError,
+) -> RemoteFailureCategory {
+    use crate::architecture::error::BackendError;
+
+    match error {
+        BackendError::AuthenticationFailed { .. } => RemoteFailureCategory::Authentication,
+        BackendError::ConnectionFailed { .. } | BackendError::Io(_) => {
+            RemoteFailureCategory::Connection
+        }
+        BackendError::Timeout { .. } => RemoteFailureCategory::Timeout,
+        BackendError::ParseError { .. } => RemoteFailureCategory::Response,
+        BackendError::TokenAuthNotSupported { .. } => RemoteFailureCategory::AuthenticationMethod,
+        BackendError::NotFound { .. }
+        | BackendError::Unsupported { .. }
+        | BackendError::Internal(_) => RemoteFailureCategory::Backend,
+    }
+}
+
 /// Bound parsed USB rows so a fast filesystem cannot grow memory without
 /// limit while GTK is busy. Closing the receiver wakes a blocked producer.
 const USB_SCAN_CHANNEL_CAPACITY: usize = 64;
@@ -916,9 +982,13 @@ pub fn setup_source_connect(state: &WindowState) {
                             tracing::debug!("Ignoring superseded DAAP connection failure");
                             return;
                         }
-                        tracing::error!(error = %e, "DAAP connection failed");
+                        let category = remote_failure_category(&e);
+                        tracing::error!(
+                            category = category.as_str(),
+                            "Passwordless DAAP connection failed"
+                        );
                         let _ = engine_tx
-                            .send(LibraryEvent::Error(format!("DAAP auth failed: {e}")))
+                            .send(LibraryEvent::Error(category.user_message("DAAP")))
                             .await;
                         let _ = fail_tx.send(()).await;
                     }
@@ -1237,15 +1307,15 @@ pub fn setup_source_connect(state: &WindowState) {
                             "Remote connection was superseded or shutdown-gated"
                         ),
                         Err(e) => {
+                            let category = remote_failure_category(&e);
                             tracing::error!(
                                 backend = %backend_type,
-                                error = %e,
-                                "Authentication failed"
+                                category = category.as_str(),
+                                "{}",
+                                category.log_message()
                             );
                             let _ = engine_tx
-                                .send(LibraryEvent::Error(format!(
-                                    "{backend_type} auth failed: {e}"
-                                )))
+                                .send(LibraryEvent::Error(category.user_message(&backend_type)))
                                 .await;
                             let _ = fail_tx.send(()).await;
                         }
@@ -1283,7 +1353,12 @@ fn enumerate_device_audio_files(
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{enumerate_device_audio_files, resolve_source_key};
+    use crate::architecture::error::BackendError;
+
+    use super::{
+        enumerate_device_audio_files, remote_failure_category, resolve_source_key,
+        RemoteFailureCategory,
+    };
 
     #[test]
     fn explicit_source_identity_precedes_legacy_fallbacks() {
@@ -1298,6 +1373,42 @@ mod tests {
         assert_eq!(resolve_source_key("", "", "radio-topvote"), "radio-topvote");
         assert_eq!(resolve_source_key("", "", "local"), "local");
         assert_eq!(resolve_source_key("", "", ""), "local");
+    }
+
+    #[test]
+    fn remote_failures_have_typed_secret_free_categories_and_messages() {
+        const SECRET: &str = "server-supplied-secret";
+        let connection = BackendError::ConnectionFailed {
+            message: SECRET.to_string(),
+            source: None,
+        };
+        let cases = [
+            (connection, RemoteFailureCategory::Connection),
+            (
+                BackendError::Timeout { duration_secs: 10 },
+                RemoteFailureCategory::Timeout,
+            ),
+            (
+                BackendError::AuthenticationFailed {
+                    message: SECRET.to_string(),
+                },
+                RemoteFailureCategory::Authentication,
+            ),
+            (
+                BackendError::ParseError {
+                    message: SECRET.to_string(),
+                    source: None,
+                },
+                RemoteFailureCategory::Response,
+            ),
+        ];
+        for (error, expected) in cases {
+            let category = remote_failure_category(&error);
+            assert_eq!(category, expected);
+            assert!(!category.as_str().contains(SECRET));
+            assert!(!category.log_message().contains(SECRET));
+            assert!(!category.user_message("Subsonic").contains(SECRET));
+        }
     }
 
     struct TestTree {

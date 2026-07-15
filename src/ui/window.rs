@@ -534,8 +534,11 @@ pub fn build_window(
                         tracing::debug!("Ignoring superseded Subsonic connection failure");
                         return;
                     }
-                    tracing::error!(error = %e, "Subsonic connection failed");
-                    let _ = tx.send(LibraryEvent::Error(format!("Subsonic: {e}"))).await;
+                    let category = super::source_connect::remote_failure_category(&e);
+                    tracing::error!(category = category.as_str(), "Subsonic connection failed");
+                    let _ = tx
+                        .send(LibraryEvent::Error(category.user_message("Subsonic")))
+                        .await;
                 }
             }
         });
@@ -579,8 +582,11 @@ pub fn build_window(
                         tracing::debug!("Ignoring superseded Jellyfin connection failure");
                         return;
                     }
-                    tracing::error!(error = %e, "Jellyfin connection failed");
-                    let _ = tx.send(LibraryEvent::Error(format!("Jellyfin: {e}"))).await;
+                    let category = super::source_connect::remote_failure_category(&e);
+                    tracing::error!(category = category.as_str(), "Jellyfin connection failed");
+                    let _ = tx
+                        .send(LibraryEvent::Error(category.user_message("Jellyfin")))
+                        .await;
                 }
             }
         });
@@ -622,8 +628,11 @@ pub fn build_window(
                         tracing::debug!("Ignoring superseded Plex connection failure");
                         return;
                     }
-                    tracing::error!(error = %e, "Plex connection failed");
-                    let _ = tx.send(LibraryEvent::Error(format!("Plex: {e}"))).await;
+                    let category = super::source_connect::remote_failure_category(&e);
+                    tracing::error!(category = category.as_str(), "Plex connection failed");
+                    let _ = tx
+                        .send(LibraryEvent::Error(category.user_message("Plex")))
+                        .await;
                 }
             }
         });
@@ -665,8 +674,11 @@ pub fn build_window(
                         tracing::debug!("Ignoring superseded DAAP connection failure");
                         return;
                     }
-                    tracing::error!(error = %e, "DAAP connection failed");
-                    let _ = tx.send(LibraryEvent::Error(format!("DAAP: {e}"))).await;
+                    let category = super::source_connect::remote_failure_category(&e);
+                    tracing::error!(category = category.as_str(), "DAAP connection failed");
+                    let _ = tx
+                        .send(LibraryEvent::Error(category.user_message("DAAP")))
+                        .await;
                 }
             }
         });

@@ -26,11 +26,12 @@ Status summary:
 - [ ] P3 architecture and integration coverage complete
 
 Progress snapshot (2026-07-15), recounted from the literal P0–P3 task checkboxes to correct the
-earlier numerator/denominator drift. The live protected-playback finding recorded under P2.11 added
-three tasks to the prior 215-item scope. The denominator excludes the two deferred P0.7
+earlier numerator/denominator drift. The live protected-playback finding recorded under P2.11 now
+has five independently verifiable tasks rather than the original three compound boxes. The
+denominator excludes the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**156/218 (71.6%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **39/74 P2**,
+**160/220 (72.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **43/76 P2**,
 and **3/30 P3** after those exclusions. The release-workflow dry run remains deliberately deferred
 rather than being counted as unfinished P0 remediation.
 
@@ -786,7 +787,7 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   risking a second identity set. Exact
   compare-and-swap config cleanup installs NEW only for the request the engine processed. Twenty-
   eight focused preference, migration, path-planning, atomicity, marker, collision, crash-recovery,
-  and quarantine tests cover the contract. Implementation is in the current PR.
+  and quarantine tests cover the contract. Implementation merged in PR #95.
 - [ ] Surface effective write capability in track Properties. Automatic Devices roots are
   read-only at the Flatpak sandbox boundary, but the dialog currently enables Save from format
   support alone and reports the filesystem error only after an attempted write. Disable editing or
@@ -824,7 +825,11 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   advertises for 0.5.0 does not work: the `MimeType` entry is present and the binary handles
   opens, but the desktop entry never passes the URI.
 - [ ] Add the required `AudioVideo` desktop category.
-- [ ] Add the 0.5.0 AppStream release entry (newest is 0.4.1).
+- [x] Add the 0.5.0 AppStream release entry and synchronize post-release development metadata.
+  The AppStream history now records the shipped 0.5.0 feature release dated 2026-05-08;
+  `CHANGELOG.md` archives the same release and opens an Unreleased 0.5.1 section; and Cargo package
+  metadata advances to 0.5.1. Implemented on the P2.11 protected-playback branch so this inherited
+  partial update is explicit and independently reviewable rather than an undocumented side change.
 - [x] Update README Rust requirement from 1.80 to 1.85. Implemented in commit `e6c68bc`.
 - [ ] Add CI on the declared Rust 1.85 MSRV. Every toolchain in CI is
   `dtolnay/rust-toolchain@stable`; nothing verifies that 1.85 still compiles.
@@ -902,36 +907,49 @@ error that tells the user what to install.
 
 ### P2.11 Bound protected remote-playback startup and expose safe diagnostics
 
-Filed 2026-07-15 from a live Windows Subsonic failure. The initial source connection failed after
-10.001 seconds, exactly the Subsonic client's configured connect timeout, then succeeded on retry.
-Protected local playback subsequently failed after 15.004 seconds, exactly the default blocking-I/O
-timeout of GStreamer's HTTP sources. Local playback correctly used an opaque ticket on Tributary's
-`127.0.0.1` proxy; this does not indicate that Chromecast was selected. The strongest inference is
-that the proxy's fresh upstream client repeated the flaky `mini.local` DNS/connect path while its
-`request.send()` had no explicit connection/response-header phase deadline, so GStreamer abandoned
-the downstream leg first. A system proxy intercepting the loopback request remains a plausible
-alternative because the current logs expose neither phase.
+Filed 2026-07-15 from a live Windows Subsonic failure and immediately expanded when protected DAAP
+playback produced the same repeated error. The initial Subsonic source connection failed after
+10.001 seconds, exactly its configured connect timeout, then succeeded on retry. Protected local
+playback failed after 15.004 seconds, exactly GStreamer's `souphttpsrc` blocking-I/O default; DAAP
+then failed through the same shared path. Both backends converge on a dedicated `127.0.0.1` ticket,
+so this evidence de-prioritizes backend authentication and catalog parsing. The code audit found
+two independent defects at that boundary: `souphttpsrc` could apply an ambient proxy even to the
+loopback ticket, and each ticket server discarded the previous media client's pool while waiting
+without distinct upstream connect/header/body-idle deadlines or useful safe diagnostics.
 
-- [ ] Reuse an origin-pooled, credential-free upstream client and separately bound DNS/connect/TLS,
-  response-header, and body-idle phases without imposing a total lifetime on a valid media stream.
-  Make the app-owned proxy return a deterministic credential-free 502/504 before the downstream
-  GStreamer source deadline, while retaining exact-origin, Range, revocation, and secret-isolation
-  guarantees. Preserve advertised mDNS addresses for connection routing without changing the URL
-  hostname, Host header, or TLS identity.
-- [ ] Guarantee that opaque loopback tickets bypass ambient system proxies, distinguish transport
-  timeout/connect failures from genuine authentication rejection, and add fixed-category telemetry
-  for inbound ticket receipt, upstream start/headers/status/body-idle, and GStreamer domain/code/
-  source category. Never retain or display a raw URL, ticket, query, header, server error string,
-  GStreamer message/debug string, or local path.
-- [ ] Add stalled-DNS/connect, accepted-without-headers, stalled-body, upstream-status, poisoned
-  system-proxy, mDNS-address, and full fake-Subsonic-through-GStreamer regressions; record the
-  implementation and packaged-Windows validation. Existing P3.3/P3.4 harness work should reuse
-  these fixtures rather than creating a second timeout model.
+- [x] Reuse one credential-free upstream client per GStreamer output across per-track ticket
+  servers. Bound connect establishment at 5 seconds, dispatch through response headers at 10
+  seconds, and silence between body chunks at 10 seconds while imposing no total stream lifetime.
+  Return deterministic empty 502/504 responses before the 30-second downstream loopback budget and
+  retain exact-origin redirects, Range-only forwarding, revocation, and secret isolation.
+- [x] Guarantee that validated opaque loopback tickets bypass ambient proxies for local and
+  AirPlay playback. `source-setup` accepts only HTTP loopback `/cast/<UUID[.extension]>` routes with
+  an explicit port and no user-info/query/fragment, installs `souphttpsrc`'s `direct://` resolver,
+  disables retries, verifies the properties, and posts a fixed error plus locks the source in NULL
+  if enforcement is unavailable. Ordinary files and radio retain their existing proxy policy.
+  Proxy and GStreamer telemetry now records only closed phase/domain/source categories, numeric
+  status/code, protected state, and bounded elapsed time; terminal watches stop after one error.
+  Remote connection flows use typed authentication/connection/timeout/response categories and no
+  longer log, display, or mislabel raw backend/server error strings.
+- [x] Add focused accepted-without-headers, refused-connect, stalled/failed/active-body,
+  upstream-status, exact-ticket predicate, source-signal, fixed-diagnostic, and typed remote-error
+  tests. An isolated child process initializes GStreamer with both proxy environment variables
+  poisoned and no bypass list, then proves the loopback fixture receives the ticket while the
+  ambient proxy receives nothing. Eleven focused additions cover this urgent slice.
+- [ ] Preserve addresses supplied by mDNS discovery for API and protected-media connection routing
+  without changing the URL hostname, HTTP `Host`, or TLS identity. Add injected stalled-DNS and
+  advertised-address/hostname regressions; do not globally disable proxies for the upstream server.
+- [ ] Run full fake Subsonic and DAAP streams through GStreamer (reusing these timeout/proxy
+  fixtures), confirm the packaged Windows source plugin enforces the same direct policy, and record
+  live packaged-Windows playback. Support a verified alternate HTTP source or continue to fail
+  closed if a package lacks `souphttpsrc`.
 
 Acceptance criteria: a protected remote load either begins playback or produces a phase-specific,
 URL-free failure before the downstream source times out; a loopback ticket never visits a configured
 external proxy; and logs can distinguish transport, upstream HTTP, decoder, and sink categories
-without exposing credentials or filesystem paths.
+without exposing credentials or filesystem paths. The urgent shared-path implementation and
+deterministic proxy proof are complete; retained mDNS routing and packaged end-to-end validation
+remain open, so P2.11 is not yet closed as a milestone.
 
 ## P3 — Architecture and integration coverage
 
@@ -1021,18 +1039,19 @@ by P2.6. PR #94's containerized Flatpak build proved the manifest-local source g
 permission policy, but a local installed interactive portal/physical-media smoke pass remains
 outstanding, as does the deliberately deferred live release-workflow run.
 
-Most recent milestone validation (2026-07-15, P2.5 legacy-root reauthorization): `cargo fmt`,
-`cargo check --all-targets`, and strict all-target/all-feature Clippy pass in debug and release.
-Both profiles pass 18 library plus 585 application tests (603 per profile). Twenty-eight focused
-tests cover preference intent/CAS behavior, exact receipt migration shape and partial-migration
-retry, component-aware path planning, marker success/mismatch, atomic identity/history/playlist
-preservation, collisions, unsafe paths, authority loss, ambiguous commit recovery, receipt-first
-stale-config recovery, malformed-ID quarantine, and later imported old-path evidence. All 13 locale
-catalogs parse after translating the new UI, `git diff --check` and AppStream validation pass, and
-`cargo audit` reports exactly the two accepted unmaintained warnings recorded under P0.8. The
-unchanged desktop validator diagnostic remains tracked under P2.6. PR #94's Flatpak CI is green;
-installed interactive reauthorization and physical-media behavior still require the open local
-smoke task.
+Most recent milestone validation (2026-07-15, P2.11 protected-playback urgent slice): `cargo fmt`,
+`cargo check --all-targets --all-features`, and strict all-target/all-feature Clippy pass in debug
+and release. Both profiles pass 18 library plus 596 application tests (614 per profile). Eleven
+focused additions cover accepted connections without headers, refused connections, preserved
+upstream statuses, failed/stalled/active response bodies, exact ticket-shape validation,
+`source-setup` enforcement, secret-free diagnostics, typed remote-error classification, and an
+isolated real-GStreamer child process whose poisoned ambient proxy receives no request while the
+loopback ticket fixture does. All 13 locale catalogs parse; `git diff --check`, AppStream
+validation, and the synchronized 0.5.0 release entry pass; and `cargo audit --no-fetch` reports
+exactly the two accepted unmaintained warnings recorded under P0.8. The unchanged desktop validator
+diagnostic remains tracked under P2.6. Retained mDNS address routing, packaged Windows/full-backend
+playback, interactive reauthorization, Flatpak portal behavior, and physical-media validation remain
+open local/integration tasks.
 
 **This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
 hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
@@ -1389,6 +1408,18 @@ Record scope or design decisions here so deferred work is explicit.
   Takeout data remain conversion inputs rather than partially supported formats; README provides
   field-level, official-source guidance and warns where either source lacks the local identity
   needed for safe matching.
+- 2026-07-15 — P2.11 treats repeated DAAP and Subsonic failures at exactly GStreamer's 15-second
+  HTTP-source timeout as a shared protected-playback defect, not a protocol-authentication defect.
+  The opaque loopback boundary remains necessary: handing backend requests directly to GStreamer
+  would reintroduce credential exposure. Instead, only exact app-issued loopback ticket shapes
+  receive a per-source direct resolver; normal internet media retains the user's proxy policy, and
+  the protected upstream fetch may still use a legitimate configured proxy. `souphttpsrc` needs
+  `direct://`, not an empty proxy property: under libsoup3 an empty property restores the default
+  system resolver. Connect, header, and per-body-read idle budgets are separate so startup and
+  wedges terminate before the downstream while healthy media has no total lifetime. Retaining
+  mDNS-advertised addresses is deliberately a follow-up because it must preserve hostname/Host/TLS
+  identity across discovery, source ownership, every backend API client, and protected media; it
+  is not approximated by globally disabling upstream proxies or rewriting URLs to an IP.
 
 - 2026-07-13 — Documentation audit against the committed tree. Every `[x]` in P1.1–P1.7 was
   verified against the source and none was overstated. The drift was everywhere else: CHANGELOG
@@ -1447,3 +1478,5 @@ Add one line per completed task:
 | 2026-07-15 | P2.4 native mount lifecycle | PR #93 | GIO main-thread mount inventory and live signals; best-available logical keys separate from native paths; synchronous confirmed-removal retirement; exact-intent relocation reactivation; bounded cancellable scans; and 26 focused tests. Physical-device validation remains open; Flatpak access follows under P2.5. |
 | 2026-07-15 | P2.5 Flatpak generation and access policy | PR #94 | Vendored checksum-pinned Cargo generator shared by local builds and CI; consistent manifest-local source generation; read-only standard external-media roots; reviewed GVfs bus access; portal-selected writable custom libraries; and a fail-closed permission policy test. Effective-write UX, installed interactive portal/physical-media smoke testing, and the deliberately deferred release workflow remain open. |
 | 2026-07-15 | P2.5 legacy-root reauthorization | PR #95 | Explicit portal reselection records an immutable OLD→NEW intent; a marker-backed authority lease and guarded atomic transaction preserve track identity/history and playlist links; a same-transaction receipt makes crash/ambiguous-commit recovery idempotent; and malformed, overlapping, colliding, or inconsistent states quarantine unsafe scopes. Effective-write UX and installed interactive smoke testing remain open. |
+| 2026-07-15 | P2.6 0.5.0 release metadata | Current branch (PR pending) | Added the missing AppStream 0.5.0 release entry, archived the shipped release in the changelog, and advanced Cargo/changelog development metadata to 0.5.1. The live release-workflow verification remains deliberately deferred. |
+| 2026-07-15 | P2.11 protected-playback urgent slice | Current branch (PR pending) | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 11 focused regressions including an isolated poisoned-proxy process. Retained mDNS routing and packaged full-backend Windows playback remain open. |
