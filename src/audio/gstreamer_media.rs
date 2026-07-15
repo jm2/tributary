@@ -65,7 +65,13 @@ impl GstreamerMediaTicket {
 struct ProxyState {
     runtime: Option<tokio::runtime::Handle>,
     active: Option<Arc<GstreamerMediaTicket>>,
+    /// Identity of the newest load or explicit revocation. An in-flight
+    /// server start may install its ticket only while it still owns this
+    /// generation.
+    generation: Arc<PreparationGeneration>,
 }
+
+struct PreparationGeneration;
 
 /// Stateful last-mile resolver shared by local and AirPlay outputs.
 pub(super) struct GstreamerMediaProxy {
@@ -78,13 +84,19 @@ impl GstreamerMediaProxy {
             state: Mutex::new(ProxyState {
                 runtime,
                 active: None,
+                generation: Arc::new(PreparationGeneration),
             }),
         }
     }
 
     /// Supply the application runtime used to host loopback media tickets.
     pub(super) fn set_runtime(&self, runtime: tokio::runtime::Handle) {
-        self.lock_state().runtime = Some(runtime);
+        let mut state = self.lock_state();
+        state.runtime = Some(runtime);
+        // A startup that captured the displaced handle must not install after
+        // this update. An already-active server remains valid and is still
+        // revoked through its ticket identity.
+        state.generation = Arc::new(PreparationGeneration);
     }
 
     /// Retire the previous load and prepare `raw_uri` for GStreamer.
@@ -95,24 +107,54 @@ impl GstreamerMediaProxy {
     /// runtime state, bind/client failure, or an invalid generated ticket all
     /// fail closed with the same URL-free category.
     pub(super) fn prepare(&self, raw_uri: &str) -> Result<PreparedGstreamerMedia, &'static str> {
-        let classification = classify_media_uri(raw_uri);
-        let mut state = self.lock_state();
+        self.prepare_with_server_start(raw_uri, |runtime| {
+            runtime.block_on(CastHttpServer::start_on(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                0,
+            ))))
+        })
+    }
 
-        if let Some(previous) = state.active.take() {
+    fn prepare_with_server_start<F>(
+        &self,
+        raw_uri: &str,
+        start_server: F,
+    ) -> Result<PreparedGstreamerMedia, &'static str>
+    where
+        F: FnOnce(&tokio::runtime::Handle) -> anyhow::Result<CastHttpServer>,
+    {
+        let classification = classify_media_uri(raw_uri);
+        let generation = Arc::new(PreparationGeneration);
+        let (previous, runtime) = {
+            let mut state = self.lock_state();
+            state.generation = Arc::clone(&generation);
+            let runtime = match &classification {
+                MediaUriSecurity::Protected(_) => state.runtime.clone(),
+                MediaUriSecurity::Direct | MediaUriSecurity::Reject => None,
+            };
+            (state.active.take(), runtime)
+        };
+
+        // Revocation and server startup may both touch runtime-owned state.
+        // Neither belongs under the proxy mutex: the generation above is the
+        // only synchronization needed to prevent an older load from winning
+        // after a newer load or Stop has already superseded it.
+        if let Some(previous) = previous {
             previous.revoke();
         }
 
         match classification {
-            MediaUriSecurity::Direct => Ok(PreparedGstreamerMedia::Direct(raw_uri.to_string())),
+            MediaUriSecurity::Direct => {
+                if self.is_current_generation(&generation) {
+                    Ok(PreparedGstreamerMedia::Direct(raw_uri.to_string()))
+                } else {
+                    Err(MEDIA_PREPARATION_FAILED)
+                }
+            }
             MediaUriSecurity::Reject => Err(MEDIA_PREPARATION_FAILED),
             MediaUriSecurity::Protected(upstream) => {
-                let runtime = state.runtime.as_ref().ok_or(MEDIA_PREPARATION_FAILED)?;
-                let server = runtime
-                    .block_on(CastHttpServer::start_on(SocketAddr::from((
-                        Ipv4Addr::LOCALHOST,
-                        0,
-                    ))))
-                    .map_err(|_| MEDIA_PREPARATION_FAILED)?;
+                let runtime = runtime.ok_or(MEDIA_PREPARATION_FAILED)?;
+                let server = start_server(&runtime).map_err(|_| MEDIA_PREPARATION_FAILED)?;
                 let uri = server.register_upstream(&upstream);
                 if !valid_loopback_ticket(server.addr(), &uri) {
                     server.revoke_upstreams();
@@ -120,7 +162,10 @@ impl GstreamerMediaProxy {
                 }
 
                 let ticket = Arc::new(GstreamerMediaTicket { server, uri });
-                state.active = Some(Arc::clone(&ticket));
+                if !self.install_if_current(&generation, &ticket) {
+                    ticket.revoke();
+                    return Err(MEDIA_PREPARATION_FAILED);
+                }
                 Ok(PreparedGstreamerMedia::Protected(ticket))
             }
         }
@@ -128,7 +173,13 @@ impl GstreamerMediaProxy {
 
     /// Revoke and release the current ticket, if any.
     pub(super) fn revoke(&self) {
-        let active = self.lock_state().active.take();
+        let active = {
+            let mut state = self.lock_state();
+            // Stop/teardown also supersedes a server start that has released
+            // the mutex but has not installed its ticket yet.
+            state.generation = Arc::new(PreparationGeneration);
+            state.active.take()
+        };
         if let Some(ticket) = active {
             ticket.revoke();
         }
@@ -147,6 +198,7 @@ impl GstreamerMediaProxy {
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, ticket))
             {
+                state.generation = Arc::new(PreparationGeneration);
                 state.active.take()
             } else {
                 None
@@ -166,6 +218,24 @@ impl GstreamerMediaProxy {
         self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn is_current_generation(&self, generation: &Arc<PreparationGeneration>) -> bool {
+        Arc::ptr_eq(&self.lock_state().generation, generation)
+    }
+
+    fn install_if_current(
+        &self,
+        generation: &Arc<PreparationGeneration>,
+        ticket: &Arc<GstreamerMediaTicket>,
+    ) -> bool {
+        let mut state = self.lock_state();
+        if !Arc::ptr_eq(&state.generation, generation) || state.active.is_some() {
+            return false;
+        }
+
+        state.active = Some(Arc::clone(ticket));
+        true
     }
 }
 
@@ -201,7 +271,9 @@ fn valid_loopback_ticket(addr: SocketAddr, candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::Duration;
 
     use axum::body::Body;
@@ -492,6 +564,131 @@ mod tests {
                 .windows(UPSTREAM_SECRET.len())
                 .any(|window| { window == UPSTREAM_SECRET.as_bytes() })));
         }
+    }
+
+    #[test]
+    fn delayed_startup_cannot_block_or_replace_a_newer_protected_load() {
+        let runtime = runtime();
+        let upstream = start_media_server(&runtime);
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let (startup_entered_tx, startup_entered_rx) = mpsc::channel();
+        let (release_startup_tx, release_startup_rx) = mpsc::channel();
+
+        let older_proxy = Arc::clone(&proxy);
+        let older_uri = format!(
+            "http://{}/first?api_key=older-inflight-secret",
+            upstream.addr
+        );
+        let older = thread::spawn(move || {
+            older_proxy.prepare_with_server_start(&older_uri, move |runtime| {
+                startup_entered_tx
+                    .send(())
+                    .expect("report delayed server startup");
+                release_startup_rx
+                    .recv()
+                    .expect("release delayed server startup");
+                runtime.block_on(CastHttpServer::start_on(SocketAddr::from((
+                    Ipv4Addr::LOCALHOST,
+                    0,
+                ))))
+            })
+        });
+        startup_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("older preparation reached server startup");
+
+        // A newer load must be able to acquire the proxy state while the old
+        // load is blocked in server startup. It becomes the sole generation
+        // allowed to install an active ticket.
+        let (newer_result_tx, newer_result_rx) = mpsc::channel();
+        let newer_proxy = Arc::clone(&proxy);
+        let newer_uri = format!(
+            "http://{}/second?api_key=newer-active-secret",
+            upstream.addr
+        );
+        let newer = thread::spawn(move || {
+            let result = newer_proxy.prepare(&newer_uri).map(|prepared| {
+                (
+                    prepared.uri().to_string(),
+                    prepared.ticket().expect("newer protected ticket"),
+                )
+            });
+            newer_result_tx
+                .send(result)
+                .expect("report newer preparation");
+        });
+
+        let (newer_ticket_uri, _newer_ticket) =
+            match newer_result_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(result) => result.expect("newer preparation succeeds without waiting"),
+                Err(error) => {
+                    let _ = release_startup_tx.send(());
+                    let _ = older.join();
+                    let _ = newer.join();
+                    panic!("newer preparation blocked behind server startup: {error}");
+                }
+            };
+        newer.join().expect("newer preparation thread");
+        assert_eq!(status(&newer_ticket_uri), StatusCode::OK);
+
+        release_startup_tx
+            .send(())
+            .expect("finish older server startup");
+        let older_result = older.join().expect("older preparation thread");
+        assert_eq!(older_result.err(), Some(MEDIA_PREPARATION_FAILED));
+        assert_eq!(status(&newer_ticket_uri), StatusCode::OK);
+    }
+
+    #[test]
+    fn revoke_does_not_wait_for_and_invalidates_an_inflight_startup() {
+        let runtime = runtime();
+        let upstream = start_media_server(&runtime);
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let (startup_entered_tx, startup_entered_rx) = mpsc::channel();
+        let (release_startup_tx, release_startup_rx) = mpsc::channel();
+
+        let preparing_proxy = Arc::clone(&proxy);
+        let protected_uri = format!(
+            "http://{}/first?api_key=revoked-inflight-secret",
+            upstream.addr
+        );
+        let preparing = thread::spawn(move || {
+            preparing_proxy.prepare_with_server_start(&protected_uri, move |runtime| {
+                startup_entered_tx
+                    .send(())
+                    .expect("report delayed server startup");
+                release_startup_rx
+                    .recv()
+                    .expect("release delayed server startup");
+                runtime.block_on(CastHttpServer::start_on(SocketAddr::from((
+                    Ipv4Addr::LOCALHOST,
+                    0,
+                ))))
+            })
+        });
+        startup_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("preparation reached server startup");
+
+        let (revoked_tx, revoked_rx) = mpsc::channel();
+        let revoking_proxy = Arc::clone(&proxy);
+        let revoking = thread::spawn(move || {
+            revoking_proxy.revoke();
+            revoked_tx.send(()).expect("report revocation");
+        });
+        if let Err(error) = revoked_rx.recv_timeout(Duration::from_secs(2)) {
+            let _ = release_startup_tx.send(());
+            let _ = preparing.join();
+            let _ = revoking.join();
+            panic!("revocation blocked behind server startup: {error}");
+        }
+        revoking.join().expect("revocation thread");
+
+        release_startup_tx
+            .send(())
+            .expect("finish revoked server startup");
+        let result = preparing.join().expect("preparation thread");
+        assert_eq!(result.err(), Some(MEDIA_PREPARATION_FAILED));
     }
 
     #[test]
