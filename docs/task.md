@@ -555,7 +555,7 @@ Existing rule JSON remains usable across the option removal.
   invalid or out-of-`u64` XSPF duration is a document parse error before the transaction. The
   completion alert shows all three counts; parse, database, worker, and export failures show
   actionable alerts rather than disappearing into a silent `Option` or log-only branch.
-- [x] Record implementation: branch `agent/p2-playlist-io-transaction`; PR pending. Focused coverage
+- [x] Record implementation: PR #90. Focused coverage
   adds 25 regressions for atomic replacement and cleanup, malformed or non-XSPF input, path-first
   and normalized metadata resolution, duration boundaries and ambiguity, transactional
   rollback/database errors, retained unmatched entries, migration round trips, and outcome counts.
@@ -1206,4 +1206,4 @@ Add one line per completed task:
 | 2026-07-13 | P1.8 | `eb0b9ca`, `fbaaa7f` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable song identity, shared-queue preservation, ownership preflight, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
 | 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, keeps the prior visible projection fresh while remote intent is pending, preserves valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; eight navigation and two engine tests cover the races and event ordering. |
 | 2026-07-15 | P2.1 | PR #89 | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
-| 2026-07-15 | P2.2 | branch `agent/p2-playlist-io-transaction`; PR pending | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
+| 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
