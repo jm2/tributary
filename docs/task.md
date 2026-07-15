@@ -29,7 +29,7 @@ Progress snapshot (2026-07-15), recounted from the literal P0–P3 task checkbox
 earlier numerator/denominator drift. The denominator excludes the two deferred P0.7 live-workflow
 verification boxes and the withdrawn P2.6 false finding; section-summary and global-validation
 gate boxes are not task progress:
-**133/213 (62.4%)** in-scope checklist items complete; **114/114 (100%)** across P0 and P1 after
+**137/213 (64.3%)** in-scope checklist items complete; **114/114 (100%)** across P0 and P1 after
 the same P0.7 exclusion. The release-workflow dry run remains deliberately deferred rather than
 being counted as unfinished P0 remediation.
 
@@ -485,11 +485,24 @@ Acceptance criteria: playlist-entry integrity does not depend on an upstream def
   strings on both sides — a shape the database never produces — which is precisely why these bugs
   survived. 10 focused tests now cover day containment, both boundary days, offset normalization,
   unparseable input, relative windows, and the overflow case.
-- [ ] Select/truncate by limit criteria before applying final compound sort.
-- [ ] Implement snapshot behavior for `live_updating = false` or remove the option.
-- [ ] Add combined rule/limit/sort tests.
-- [ ] Record implementation: date semantics in commit `93f6772`; 10 focused tests. Limit-versus-sort
-  interaction and `live_updating` remain open.
+- [x] Select/truncate by limit criteria before applying final compound sort. Rules first define the
+  candidate set; the limit's `selected_by` order then determines membership and capacity-prefix
+  truncation; the optional compound sort finally orders only that selected subset for display.
+- [x] Remove the nonfunctional `live_updating` option. It was persisted and shown in the editor but
+  was never read: checked and unchecked playlists both reevaluated from the current library on
+  every open/export. The editor and serialized rules no longer promise snapshots; legacy JSON and
+  the legacy non-null database column remain readable without a table rebuild, and saving rules
+  canonicalizes the compatibility column to the truthful always-dynamic value.
+- [x] Add combined rule/limit/sort tests. Focused coverage exercises filtering before membership
+  selection, item and capacity limits before presentation ordering, a randomly selected subset
+  with deterministic final ordering, compound direction/tie behavior, legacy rule JSON, and
+  end-to-end reevaluation of a legacy `live_updating = false` playlist.
+- [x] Record implementation: date semantics in commit `93f6772`; PR #89 completes limit/sort
+  ordering and removes the false snapshot option with six focused regressions.
+
+Acceptance criteria: limiting chooses the documented subset before the independent final sort,
+and the editor/persisted rule contract advertises only the always-current behavior it implements.
+Existing rule JSON remains usable across the option removal.
 
 ### P2.2 Make playlist import/export transactional and deterministic
 
@@ -761,9 +774,9 @@ Run before marking any milestone complete:
 `desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
 by P2.6. Packaging dry runs and the live manual release-workflow run remain outstanding.
 
-Most recent milestone validation (2026-07-15, P1.9 source-navigation generations): 18 library plus
-499 application tests passed in debug (517 total), and the release suite passed with the same
-517 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
+Most recent milestone validation (2026-07-15, P2.1 smart-playlist semantics): 18 library plus
+505 application tests passed in debug (523 total), and the release suite passed with the same
+523 tests; strict all-target Clippy passed in both profiles; formatting and `git diff --check`
 were clean; and `cargo audit` passed with exactly the two accepted unmaintained warnings recorded
 under P0.8.
 
@@ -1055,6 +1068,22 @@ Record scope or design decisions here so deferred work is explicit.
   valid cache/display; only a confirmed missing playlist is intentionally represented as empty.
   Eight pure navigation tests and two engine ordering/failure-path tests cover the resulting
   contract.
+- 2026-07-15 — P2.1 treats limit selection and final presentation ordering as separate phases.
+  Filtering first forms the candidate set. `SmartLimit.selected_by` then chooses which candidates
+  fit the item, time, or size cap; only that retained subset receives the optional compound sort.
+  Previously the limit's internal selection sort ran last: it chose the correct “top 25 most
+  played” membership, but replaced a requested artist/album/track presentation order with play
+  count order. With no compound order, the selection order remains the visible order; a random
+  limit chooses a random subset before a deterministic requested presentation sort.
+  The `live_updating` checkbox is removed rather than inventing snapshot semantics around a field
+  the evaluator never read. Unchecked playlists had always reevaluated dynamically, so removal
+  changes no stored playlist behavior and stops promising a feature that did not exist. Serde
+  continues accepting the now-unknown field in legacy rule JSON, the historical non-null SQLite
+  column remains for schema compatibility, and each subsequent rule save normalizes it to true.
+  A real snapshot mode would require transactional materialization, explicit initialized-empty
+  state, upgrade/backfill and live/snapshot transition rules, and reconciliation semantics; it can
+  be designed as a future feature rather than inferred from this legacy no-op bit. Five rule-engine
+  regressions plus one database-backed compatibility/reevaluation test cover the decision.
 
 - 2026-07-13 — Documentation audit against the committed tree. Every `[x]` in P1.1–P1.7 was
   verified against the source and none was overstated. The drift was everywhere else: CHANGELOG
@@ -1106,3 +1135,4 @@ Add one line per completed task:
 | 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |
 | 2026-07-13 | P1.8 | `eb0b9ca`, `fbaaa7f` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable song identity, shared-queue preservation, ownership preflight, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
 | 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, keeps the prior visible projection fresh while remote intent is pending, preserves valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; eight navigation and two engine tests cover the races and event ordering. |
+| 2026-07-15 | P2.1 | PR #89 | Smart-playlist limits choose and truncate their subset before optional compound presentation sorting; the never-enforced snapshot toggle is removed while legacy JSON/schema remain compatible and playlists explicitly reevaluate against the current library; six focused regressions cover the contract. |
