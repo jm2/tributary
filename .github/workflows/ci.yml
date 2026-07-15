@@ -12,8 +12,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  FLATPAK_CARGO_GENERATOR_COMMIT: 737c0085912f9f7dabf9341d4608e2a77a51a73a
-  FLATPAK_CARGO_GENERATOR_SHA256: b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c
 
 jobs:
   # ── Security audit ─────────────────────────────────────────────────────────
@@ -322,26 +320,17 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Test Flatpak permission policy
+        run: build-aux/flatpak/test-permissions.sh
+
       - name: Install Python dependencies
         run: |
-          pip3 install --requirement build-aux/flatpak/generator-requirements.txt \
+          python3 -m pip install --requirement build-aux/flatpak/generator-requirements.txt \
             --break-system-packages \
-            || pip3 install --requirement build-aux/flatpak/generator-requirements.txt
-
-      - name: Download flatpak-cargo-generator
-        run: |
-          mkdir -p build-aux/flatpak
-          curl --fail --show-error --silent --location \
-            --proto '=https' --tlsv1.2 \
-            --output build-aux/flatpak/flatpak-cargo-generator.py \
-            "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${FLATPAK_CARGO_GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py"
-          echo "${FLATPAK_CARGO_GENERATOR_SHA256}  build-aux/flatpak/flatpak-cargo-generator.py" \
-            | sha256sum --check --strict
+            || python3 -m pip install --requirement build-aux/flatpak/generator-requirements.txt
 
       - name: Generate cargo-sources.json
-        run: |
-          python3 build-aux/flatpak/flatpak-cargo-generator.py \
-            Cargo.lock -o build-aux/flatpak/cargo-sources.json
+        run: bash build-aux/flatpak/generate-cargo-sources.sh
 
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:

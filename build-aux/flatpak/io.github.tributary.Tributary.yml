@@ -14,13 +14,23 @@ finish-args:
   - --socket=pulseaudio
   # Network (for remote backends: Subsonic, Jellyfin, DAAP)
   - --share=network
-  # Read/write access to music library for local playback and tag editing
+  # The standard Music folder is the only library exposed read/write without
+  # an explicit chooser grant. GtkFileDialog uses the FileChooser/Documents
+  # portals to grant persistent access to any other user-selected folder.
   - --filesystem=xdg-music:rw
-  # Read access to home dir for other music locations
-  - --filesystem=home:ro
-  # D-Bus for MPRIS media keys
+  # Flatpak documents these as the conventional external-drive mount roots.
+  # Automatic device browsing needs only native-path reads; a user who wants
+  # tag editing can add a writable folder explicitly through GtkFileDialog.
+  - --filesystem=/media:ro
+  - --filesystem=/run/media:ro
+  - --filesystem=/mnt:ro
+  # GIO VolumeMonitor reaches the host GVfs daemons through this service
+  # namespace, whose methods are broader than mount listing alone. Tributary
+  # consumes only cached native mount metadata; xdg-run/gvfs{,d} grants are
+  # intentionally omitted, and file access uses the mounts above.
+  - --talk-name=org.gtk.vfs.*
+  # D-Bus ownership for MPRIS media keys
   - --own-name=org.mpris.MediaPlayer2.tributary
-  - --talk-name=org.freedesktop.DBus
   # System theme / icon access
   - --filesystem=xdg-data/themes:ro
   - --filesystem=xdg-data/icons:ro
@@ -49,4 +59,26 @@ modules:
     sources:
       - type: dir
         path: ../..
+        # Directory sources copy the working tree, not just tracked files.
+        # Exclude VCS/agent state and every known generated tree so a local
+        # host target directory cannot enter or influence the sandbox build.
+        skip:
+          - .git
+          - .agents
+          - .claude
+          - .codex
+          - .flatpak-builder
+          - .venv-flatpak
+          - build-dir
+          - cargo-sources.json
+          - coverage
+          - dist
+          - fuzz/artifacts
+          - fuzz/corpus
+          - fuzz/target
+          - manifests
+          - repo
+          - target
+          - tributary.flatpak
+          - build-aux/flatpak/cargo-sources.json
       - cargo-sources.json

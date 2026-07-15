@@ -224,35 +224,62 @@ This produces `dist/tributary-windows.zip` with the executable and all required 
 ### Flatpak (Linux)
 
 The manifest builds offline (`CARGO_NET_OFFLINE=true`) from a generated
-`build-aux/flatpak/cargo-sources.json`. That file is not checked in, so it must be generated
-before the first build — `flatpak-builder` will fail immediately without it.
+`build-aux/flatpak/cargo-sources.json`. The repository vendors the immutably pinned Cargo source
+generator, and the shared helper verifies its recorded checksum before writing the ignored source
+manifest beside the Flatpak manifest. Local builds and CI therefore run the same generator from the
+same location.
 
 ```bash
-# Install flatpak-builder if needed:
-sudo apt install flatpak-builder
+# Install the tools and configure Flathub for this user:
+sudo apt install flatpak flatpak-builder python3-venv
+flatpak remote-add --if-not-exists --user flathub \
+  https://dl.flathub.org/repo/flathub.flatpakrepo
 
-# Fetch the pinned generator (same commit and checksum CI uses) and its dependencies:
-pip3 install --requirement build-aux/flatpak/generator-requirements.txt
-GENERATOR_COMMIT=737c0085912f9f7dabf9341d4608e2a77a51a73a
-GENERATOR_SHA256=b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c
-curl --fail --show-error --silent --location --proto '=https' --tlsv1.2 \
-  --output build-aux/flatpak/flatpak-cargo-generator.py \
-  "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py"
-echo "${GENERATOR_SHA256}  build-aux/flatpak/flatpak-cargo-generator.py" | sha256sum --check --strict
+# Keep the generator dependencies isolated from the system Python:
+FLATPAK_VENV="${XDG_CACHE_HOME:-$HOME/.cache}/tributary-flatpak-venv"
+python3 -m venv "$FLATPAK_VENV"
+source "$FLATPAK_VENV/bin/activate"
+python3 -m pip install --requirement build-aux/flatpak/generator-requirements.txt
 
-# Generate the offline source manifest *next to the Flatpak manifest*:
-python3 build-aux/flatpak/flatpak-cargo-generator.py Cargo.lock \
-  -o build-aux/flatpak/cargo-sources.json
+# Verify the vendored pin and generate the offline source manifest:
+bash build-aux/flatpak/generate-cargo-sources.sh
 
 # Build and install locally:
-flatpak-builder --force-clean --repo=repo --install --user \
+flatpak-builder --user --install-deps-from=flathub --force-clean --repo=repo --install \
   build-dir build-aux/flatpak/io.github.tributary.Tributary.yml
 ```
 
-> `./scripts/build-linux.sh` does not yet perform these steps correctly — it invokes a generator
-> that is not vendored and writes `cargo-sources.json` to the repository root instead of beside
-> the manifest. Vendoring the generator so local and CI builds share one path is tracked as P2.5
-> in [`docs/task.md`](docs/task.md).
+`./scripts/build-linux.sh --flatpak` uses this same helper and enters the sandboxed build without
+first requiring a native Rust/GTK build. The manifest's directory source excludes known VCS,
+agent, and generated build/package paths—including `target/`, coverage, and stale source-manifest
+output—so those host artifacts are not copied into the SDK build. The local single-file bundle
+records Flathub as its runtime repository. The vendored file's
+immutable upstream revision, license, checksum, and update procedure are recorded in
+`build-aux/flatpak/flatpak-cargo-generator.PROVENANCE`.
+
+The sandbox deliberately does not expose the whole home directory. XDG Music is available
+read/write. A custom library selected explicitly in **Preferences → Library Folders** goes through
+GTK's [file-chooser portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.FileChooser.html),
+which requests a persistent read/write sandbox grant. Tag editing works when the selected directory
+is also writable under the host filesystem's ordinary permissions; a portal cannot make read-only
+storage writable.
+
+A custom path saved by an older Flatpak build as a direct host path may become unavailable under
+the narrower sandbox policy. Do not remove and re-add that root if preserving track IDs, history,
+and playlist links matters: when the portal exports a different path, the current engine sees it as
+a different root. An explicit identity-preserving reauthorization flow is tracked under P2.5.
+
+Following [Flatpak's external-drive guidance](https://docs.flatpak.org/en/latest/sandbox-permissions.html#external-drive-access),
+host-mounted media under `/media`, `/run/media`, and `/mnt` is exposed read-only for the automatic
+**Devices** inventory and playback. The `org.gtk.vfs.*` bus namespace makes the host GVfs service
+methods available to GIO; Tributary consumes its cached native mount inventory and does not expose
+the non-native GVfs filesystem sockets. It does not request raw USB-device access, the whole host
+filesystem, or a writable external-media root. To treat external media as a writable custom
+library, select that directory explicitly in Preferences and use its portal-backed library entry
+rather than the automatic Devices entry. The grant still cannot override a physically or
+host-permission read-only filesystem. The automatic
+Devices entry remains browse/play-only at the sandbox boundary; a tag save offered for one of its
+tracks will report the write failure instead of changing the file.
 
 ---
 
@@ -480,7 +507,11 @@ filesystems may share a UUID, Unix-device and root-URI fallbacks can change with
 assignment, and GIO's broad `can_unmount` signal can include a non-removable or native-path network
 mount when the backend supplies no class. Tributary does not mount unmounted volumes, eject
 devices, or browse MTP-only devices. Real USB add/change/unplug behavior still needs cross-platform
-hardware validation. Flatpak access also depends on the narrow permission or portal work tracked in
+hardware validation. In Flatpak, the inventory can still list an eligible native mount elsewhere,
+but automatic Devices file access is read-only and limited to `/media`, `/run/media`, and `/mnt`;
+an inaccessible listed root cannot be scanned or played. Writable custom libraries require
+explicit selection through the folder portal as described in [Flatpak (Linux)](#flatpak-linux).
+The remaining local sandbox and physical-device smoke pass is tracked in
 [P2.5](docs/task.md#p25-repair-flatpak-behavior-and-local-build-path).
 
 ### Connecting to Remote Servers

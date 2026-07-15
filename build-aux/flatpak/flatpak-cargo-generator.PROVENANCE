@@ -1,0 +1,24 @@
+Upstream repository: https://github.com/flatpak/flatpak-builder-tools
+Upstream path: cargo/flatpak-cargo-generator.py
+Upstream commit: 737c0085912f9f7dabf9341d4608e2a77a51a73a
+Immutable source URL: https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/737c0085912f9f7dabf9341d4608e2a77a51a73a/cargo/flatpak-cargo-generator.py
+SHA-256: b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c
+Upstream Git blob: b160088c572d039d028a6e850eb5e0ddde67164b
+License: MIT (declared by both the upstream source and cargo/pyproject.toml)
+License notice: LICENSE.flatpak-cargo-generator
+Vendoring policy: the Python source is stored byte-for-byte without local modifications.
+
+License evidence:
+- cargo/flatpak-cargo-generator.py declares __license__ = "MIT".
+- cargo/pyproject.toml declares license = {text = "MIT"}.
+- Upstream commit 9ee842a41dd04f73b15daa9d8233e7fb10307905 explicitly changed
+  the tool's license to MIT.
+The pinned upstream tree contains no repository-level or cargo-local LICENSE,
+COPYING, or NOTICE file; the adjacent notice supplies the standard terms without
+claiming that upstream distributed a standalone license file.
+
+To update it, select and review a new immutable upstream commit, replace the Python
+source exactly, review generator-requirements.txt against the upstream pyproject,
+recompute the SHA-256 sidecar, and update this provenance record and license notice
+in the same change. Until the deliberately deferred release workflow uses the shared
+helper, also synchronize and review its separate generator commit and checksum.

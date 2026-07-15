@@ -1,5 +1,6 @@
-# Runtime dependencies for the pinned flatpak-cargo-generator revision used
-# by CI and release builds. Keep these exact so generator execution does not
-# change without a reviewed repository update.
+# Exact direct dependencies for Tributary's JSON invocation of the vendored
+# flatpak-cargo-generator. The helper verifies them before execution. Pip still
+# resolves transitives, so this is not a complete or hash-locked environment.
+# PyYAML is optional upstream and omitted because Tributary never requests YAML.
 aiohttp==3.14.1
 tomlkit==0.15.0
