@@ -516,14 +516,14 @@ impl Drop for CastHttpServer {
 ///
 /// The allow-list is deliberate: the ticket path is otherwise a bare UUID, and
 /// only these fixed strings may ever be appended to it.
-fn upstream_media_extension(url: &Url) -> Option<&'static str> {
-    const AUDIO_EXTENSIONS: &[&str] = &[
-        "mp3", "flac", "ogg", "oga", "opus", "wav", "aac", "m4a", "aiff", "aif", "wma",
-    ];
+pub(super) const PROTECTED_TICKET_AUDIO_EXTENSIONS: &[&str] = &[
+    "mp3", "flac", "ogg", "oga", "opus", "wav", "aac", "m4a", "aiff", "aif", "wma",
+];
 
+fn upstream_media_extension(url: &Url) -> Option<&'static str> {
     let last_segment = url.path_segments()?.next_back()?;
     let (_, extension) = last_segment.rsplit_once('.')?;
-    AUDIO_EXTENSIONS
+    PROTECTED_TICKET_AUDIO_EXTENSIONS
         .iter()
         .find(|known| known.eq_ignore_ascii_case(extension))
         .copied()

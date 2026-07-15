@@ -851,7 +851,16 @@ fn is_protected_loopback_ticket_uri(candidate: &str) -> bool {
     let Some(route) = url.path().strip_prefix("/cast/") else {
         return false;
     };
-    let ticket_id = route.split_once('.').map_or(route, |(id, _)| id);
+    let (ticket_id, valid_extension) = match route.split_once('.') {
+        Some((id, extension)) => (
+            id,
+            !extension.contains('.')
+                && cast_http_server::PROTECTED_TICKET_AUDIO_EXTENSIONS.contains(&extension),
+        ),
+        None => (route, true),
+    };
+    let canonical_ticket_id = uuid::Uuid::parse_str(ticket_id)
+        .is_ok_and(|ticket| ticket.hyphenated().to_string() == ticket_id);
 
     url.scheme() == "http"
         && loopback
@@ -860,7 +869,8 @@ fn is_protected_loopback_ticket_uri(candidate: &str) -> bool {
         && url.password().is_none()
         && !route.is_empty()
         && !route.contains('/')
-        && uuid::Uuid::parse_str(ticket_id).is_ok()
+        && canonical_ticket_id
+        && valid_extension
         && url.query().is_none()
         && url.fragment().is_none()
 }
@@ -1157,6 +1167,10 @@ mod tests {
             format!("http://192.168.1.5:53123/cast/{ticket}"),
             format!("http://127.0.0.1:53123/radio/{ticket}"),
             "http://127.0.0.1:53123/cast/not-a-ticket".to_string(),
+            format!("http://127.0.0.1:53123/cast/{ticket}.exe"),
+            format!("http://127.0.0.1:53123/cast/{ticket}.flac.exe"),
+            format!("http://127.0.0.1:53123/cast/{ticket}.FLAC"),
+            "http://127.0.0.1:53123/cast/550e8400e29b41d4a716446655440000.flac".to_string(),
             format!("http://user@127.0.0.1:53123/cast/{ticket}"),
             format!("http://127.0.0.1:53123/cast/{ticket}?forward=1"),
             format!("http://127.0.0.1:53123/cast/{ticket}#fragment"),
