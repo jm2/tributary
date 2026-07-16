@@ -189,6 +189,13 @@ properties:
   searching: "Zoeken…"
   not_found: "Niet gevonden"
   mixed: "Gemengd"
+  write_checking: "Controleren of de geselecteerde bestanden kunnen worden bewerkt…"
+  write_saving: "Tagwijzigingen opslaan…"
+  write_ready: "De geselecteerde bestanden zijn momenteel beschrijfbaar."
+  write_unsupported: "Tagbewerking is niet beschikbaar omdat ten minste één geselecteerde bestandsindeling niet wordt ondersteund."
+  write_invalid_file: "Tagbewerking is niet beschikbaar omdat ten minste één geselecteerd nummer geen gewoon lokaal bestand is."
+  write_unavailable: "Tagbewerking is niet beschikbaar omdat ten minste één geselecteerd bestand of de map ervan alleen-lezen of niet beschikbaar is."
+  write_device_unavailable: "Dit apparaat is momenteel alleen-lezen of niet beschikbaar. Voeg in Flatpak de map toe als aangepaste bibliotheek in Voorkeuren om schrijftoegang aan te vragen."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

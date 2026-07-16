@@ -189,6 +189,13 @@ properties:
   searching: "Ricerca…"
   not_found: "Non trovato"
   mixed: "Misto"
+  write_checking: "Verifica della possibilità di modificare i file selezionati…"
+  write_saving: "Salvataggio delle modifiche ai tag…"
+  write_ready: "I file selezionati sono attualmente scrivibili."
+  write_unsupported: "La modifica dei tag non è disponibile perché almeno uno dei formati di file selezionati non è supportato."
+  write_invalid_file: "La modifica dei tag non è disponibile perché almeno un brano selezionato non è un normale file locale."
+  write_unavailable: "La modifica dei tag non è disponibile perché almeno un file selezionato o la relativa cartella è di sola lettura o non disponibile."
+  write_device_unavailable: "Questo dispositivo è attualmente di sola lettura o non disponibile. In Flatpak, aggiungi la sua cartella come libreria personalizzata nelle Preferenze per richiedere l’accesso in scrittura."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

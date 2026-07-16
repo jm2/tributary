@@ -11,11 +11,18 @@
 //! - **Nothing is written unless the whole edit is valid.** A malformed number
 //!   is rejected before the file is opened, so a bad Year cannot leave the file
 //!   rewritten-but-unchanged while the UI reports success.
-//! - **The temp file never outlives a failure.** It is owned by an RAII guard
-//!   that removes it on every error path, including a failed rename.
+//! - **Cleanup is attempted on every failure path.** The sibling is owned by
+//!   an RAII guard that calls `remove_file` after errors including a failed
+//!   rename. Cleanup itself remains fallible (and cannot run after process
+//!   termination), so scans and the watcher also exclude its exact reserved
+//!   filename shape.
 //! - **The temp path is unguessable and exclusively created** (`O_EXCL` via
 //!   `create_new`), so two concurrent saves to the same file cannot collide and
 //!   the copy cannot be redirected through a pre-planted symlink.
+//! - **A Windows copy is never exposed through an inherited DACL.** Its handle
+//!   denies competing opens from creation until the source DACL and protection
+//!   state are installed; a fresh exclusive write handle must then pass that
+//!   DACL before the first audio byte is copied.
 //! - **The replacement is durable**: the tagged copy is `fsync`ed before the
 //!   rename, so a crash cannot leave a truncated file in place of the original.
 
@@ -32,6 +39,23 @@ const TAG_WRITE_TEMP_PREFIX: &str = ".tributary-tag-";
 
 /// Formats whose tags Tributary can rewrite safely.
 const WRITABLE_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "ogg", "flac"];
+
+/// Why a file cannot currently enter the tag-write path.
+///
+/// This is deliberately a small, path-free category for UI decisions. The
+/// capability probe is only a point-in-time preflight; [`write_tags`] still
+/// treats every filesystem operation as fallible because a mount, portal
+/// grant, or ACL can change immediately afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagWritePreflightError {
+    /// The filename does not identify a format whose tags we can rewrite.
+    UnsupportedFormat,
+    /// The path is not an existing regular file (symlinks are not rewritten).
+    NotRegularFile,
+    /// The file cannot be read or its directory cannot host and remove the
+    /// private sibling required for an atomic replacement.
+    Unavailable,
+}
 
 /// Return whether `path` has the exact shape emitted for a tag-write sibling.
 ///
@@ -137,7 +161,117 @@ fn parse_tag_number(field: &str, raw: Option<&str>) -> Result<NumberEdit> {
     Ok(NumberEdit::Set(value))
 }
 
-/// A temp file that deletes itself unless it is explicitly persisted.
+/// A borrowed DACL plus the LocalAlloc-owned descriptor that contains it.
+///
+/// `GetSecurityInfo` returns the DACL as a pointer into `descriptor`; only the
+/// descriptor is freed, and it must outlive every use of the DACL pointer.
+#[cfg(target_os = "windows")]
+struct WindowsDacl {
+    descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    dacl: *mut windows_sys::Win32::Security::ACL,
+    protected: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsDacl {
+    /// Snapshot a file handle's DACL and inheritance-protection state.
+    fn read_from(file: &std::fs::File) -> std::io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            GetSecurityDescriptorControl, DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        };
+
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+        if descriptor.is_null() {
+            return Err(std::io::Error::other(
+                "GetSecurityInfo returned a null security descriptor",
+            ));
+        }
+
+        // Construct the owner immediately so a later validation error still
+        // releases the LocalAlloc allocation returned by GetSecurityInfo.
+        let mut snapshot = Self {
+            descriptor,
+            dacl,
+            protected: false,
+        };
+        let mut control = 0;
+        let mut revision = 0;
+        if unsafe { GetSecurityDescriptorControl(snapshot.descriptor, &mut control, &mut revision) }
+            == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        snapshot.protected = control & SE_DACL_PROTECTED != 0;
+        Ok(snapshot)
+    }
+
+    /// Install this exact DACL on an exclusively held destination handle.
+    fn apply_to(&self, file: &std::fs::File) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+            UNPROTECTED_DACL_SECURITY_INFORMATION,
+        };
+
+        let protection = if self.protected {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_DACL_SECURITY_INFORMATION
+        };
+        let status = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | protection,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                self.dacl,
+                std::ptr::null(),
+            )
+        };
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(status as i32))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsDacl {
+    fn drop(&mut self) {
+        // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
+        // The DACL pointer aliases it and is deliberately not freed separately.
+        unsafe {
+            windows_sys::Win32::Foundation::LocalFree(self.descriptor);
+        }
+    }
+}
+
+/// A temp file that attempts to delete itself unless it is explicitly persisted.
 ///
 /// The previous implementation cleaned up only when *tagging* failed; a failed
 /// `rename` escaped through `?` and orphaned the temp file next to the user's
@@ -174,11 +308,31 @@ impl TempFile {
             }
             let candidate = directory.join(candidate_name);
 
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                // A full source copy may exist here before final permissions
+                // are applied. Never let the process umask expose it to group
+                // or other users in a shared/searchable directory.
+                options.mode(0o600);
+            }
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+
+                use windows_sys::Win32::Foundation::GENERIC_WRITE;
+                use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+
+                // Set the source DACL through this handle before copying any
+                // bytes. Denying every share mode from the instant of creation
+                // prevents another process from retaining an inherited-ACL
+                // read handle across that transition.
+                options.access_mode(GENERIC_WRITE | WRITE_DAC).share_mode(0);
+            }
+
+            match options.open(&candidate) {
                 Ok(file) => {
                     return Ok((
                         Self {
@@ -207,6 +361,21 @@ impl TempFile {
         &self.path
     }
 
+    /// Reopen an already protected Windows sibling for the actual write.
+    ///
+    /// Closing the creation handle first makes access pass through the DACL we
+    /// just installed. The new handle remains exclusive while content is
+    /// copied, so a source DACL that denies a later write fails while the
+    /// sibling is still empty rather than after a full copy has been made.
+    #[cfg(target_os = "windows")]
+    fn reopen_exclusive_for_write(&self) -> std::io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).share_mode(0);
+        options.open(&self.path)
+    }
+
     /// Atomically move the temp file onto `target`, disarming the cleanup.
     ///
     /// On failure `self` is dropped, so the temp file is still removed.
@@ -215,6 +384,22 @@ impl TempFile {
             format!(
                 "Failed to atomically replace {} with the tagged copy",
                 target.display()
+            )
+        })?;
+        self.persisted = true;
+        Ok(())
+    }
+
+    /// Remove a probe sibling and disarm the best-effort drop cleanup.
+    ///
+    /// A capability check is successful only when cleanup succeeds. Returning
+    /// success while leaving a private sibling behind would make merely
+    /// opening Properties mutate the library indefinitely.
+    fn remove(mut self) -> Result<()> {
+        std::fs::remove_file(&self.path).with_context(|| {
+            format!(
+                "Failed to remove the tag-write probe beside {}",
+                self.path.display()
             )
         })?;
         self.persisted = true;
@@ -231,11 +416,92 @@ impl Drop for TempFile {
 }
 
 /// Returns `true` if the file extension is a format we can write tags to.
-pub fn is_writable(path: &Path) -> bool {
+///
+/// This says nothing about the current filesystem capability. Call
+/// [`preflight_tag_write`] before presenting a file as editable.
+pub fn supports_tag_writes(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| WRITABLE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// Validate the per-file portion of tag-write preflight without mutating the
+/// containing directory.
+///
+/// Batch callers can validate every distinct track, then call
+/// [`preflight_tag_write`] once per distinct parent directory to avoid
+/// needlessly flushing probe files for every row in a large selection.
+pub fn validate_tag_write_target(path: &Path) -> Result<(), TagWritePreflightError> {
+    if !supports_tag_writes(path) {
+        return Err(TagWritePreflightError::UnsupportedFormat);
+    }
+
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| TagWritePreflightError::Unavailable)?;
+    if !metadata.file_type().is_file() {
+        return Err(TagWritePreflightError::NotRegularFile);
+    }
+    #[cfg(target_os = "windows")]
+    if metadata.permissions().readonly() {
+        return Err(TagWritePreflightError::Unavailable);
+    }
+
+    // The real write copies from the source before replacing it. Prove that
+    // the same read is currently possible before touching the directory.
+    std::fs::File::open(path).map_err(|_| TagWritePreflightError::Unavailable)?;
+    Ok(())
+}
+
+/// Check whether the atomic tag writer can currently operate on `path`.
+///
+/// In addition to validating the input, this exclusively creates, flushes,
+/// replaces, and removes two empty private siblings beside the track. That is
+/// the only reliable cross-platform way to observe the directory capability
+/// the real writer needs: permission bits alone do not describe Flatpak
+/// read-only bind mounts, portal grants, ACLs, FUSE filesystems, or Windows
+/// access rules.
+///
+/// This performs blocking filesystem I/O and must not run on the GTK thread.
+pub fn preflight_tag_write(path: &Path) -> Result<(), TagWritePreflightError> {
+    validate_tag_write_target(path)?;
+
+    #[cfg(target_os = "windows")]
+    let source_dacl = {
+        let source = std::fs::File::open(path).map_err(|_| TagWritePreflightError::Unavailable)?;
+        WindowsDacl::read_from(&source).map_err(|_| TagWritePreflightError::Unavailable)?
+    };
+
+    // Rehearse the complete metadata-only shape of the atomic replacement:
+    // create two exclusive siblings, flush them, replace an existing sibling,
+    // and require explicit cleanup. The user's audio file is never modified.
+    let (replacement, replacement_file) =
+        TempFile::create_beside(path).map_err(|_| TagWritePreflightError::Unavailable)?;
+    #[cfg(target_os = "windows")]
+    let replacement_file = {
+        let dacl_result = source_dacl.apply_to(&replacement_file);
+        drop(replacement_file);
+        dacl_result.map_err(|_| TagWritePreflightError::Unavailable)?;
+        replacement
+            .reopen_exclusive_for_write()
+            .map_err(|_| TagWritePreflightError::Unavailable)?
+    };
+    let replacement_result = replacement_file.sync_all();
+    drop(replacement_file);
+    replacement_result.map_err(|_| TagWritePreflightError::Unavailable)?;
+
+    let (destination, destination_file) =
+        TempFile::create_beside(path).map_err(|_| TagWritePreflightError::Unavailable)?;
+    let destination_result = destination_file.sync_all();
+    drop(destination_file);
+    destination_result.map_err(|_| TagWritePreflightError::Unavailable)?;
+
+    replacement
+        .persist_to(destination.path())
+        .map_err(|_| TagWritePreflightError::Unavailable)?;
+    destination
+        .remove()
+        .map_err(|_| TagWritePreflightError::Unavailable)
 }
 
 /// Write tag edits to an audio file.
@@ -251,13 +517,21 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
     // rewritten for an edit we are going to silently discard.
     edits.validate()?;
 
-    if !is_writable(path) {
-        anyhow::bail!(
-            "Unsupported format for tag writing: {}",
-            path.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("unknown")
-        );
+    if let Err(failure) = validate_tag_write_target(path) {
+        match failure {
+            TagWritePreflightError::UnsupportedFormat => anyhow::bail!(
+                "Unsupported format for tag writing: {}",
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or("unknown")
+            ),
+            TagWritePreflightError::NotRegularFile => {
+                anyhow::bail!("The selected tag-write target is not a regular file")
+            }
+            TagWritePreflightError::Unavailable => {
+                anyhow::bail!("The selected tag-write target is unavailable or read-only")
+            }
+        }
     }
 
     // Copy the file to an exclusively created sibling, tag the copy, then
@@ -266,14 +540,38 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
     // file copy per save, which is fine for interactive tag editing.
     //
     // `temp` removes itself on every early return below.
-    let (temp, mut destination) = TempFile::create_beside(path)?;
-
     let mut source = std::fs::File::open(path)
         .with_context(|| format!("Failed to open {} for tag writing", path.display()))?;
-    std::io::copy(&mut source, &mut destination)
-        .with_context(|| format!("Failed to copy {} for tag writing", path.display()))?;
+    #[cfg(target_os = "windows")]
+    let source_dacl = WindowsDacl::read_from(&source)
+        .with_context(|| format!("Failed to read the Windows DACL of {}", path.display()))?;
+
+    let (temp, destination) = TempFile::create_beside(path)?;
+    #[cfg(target_os = "windows")]
+    let mut destination = {
+        let security_result = source_dacl.apply_to(&destination).with_context(|| {
+            format!(
+                "Failed to protect the tagged copy of {} with its original Windows DACL",
+                path.display()
+            )
+        });
+        drop(destination);
+        security_result?;
+        temp.reopen_exclusive_for_write().with_context(|| {
+            format!(
+                "The original Windows DACL of {} does not permit writing the tagged copy",
+                path.display()
+            )
+        })?
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut destination = destination;
+    let copy_result = std::io::copy(&mut source, &mut destination)
+        .map(|_| ())
+        .with_context(|| format!("Failed to copy {} for tag writing", path.display()));
     drop(source);
     drop(destination);
+    copy_result?;
 
     write_tags_to(temp.path(), edits)?;
 
@@ -287,7 +585,10 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
     flush_to_disk(temp.path())
         .with_context(|| format!("Failed to flush the tagged copy of {}", path.display()))?;
 
-    // Best-effort: match the permissions of the file being replaced.
+    // Best-effort: match the Unix permissions of the file being replaced.
+    // Windows installs the complete DACL before the first copied byte above;
+    // its std Permissions value represents only the DOS read-only attribute.
+    #[cfg(unix)]
     if let Ok(metadata) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(temp.path(), metadata.permissions());
     }
@@ -558,6 +859,180 @@ mod tests {
             directory.temp_files().is_empty(),
             "the temp file must be removed on the failure path"
         );
+    }
+
+    #[test]
+    fn a_capability_probe_checks_the_real_sibling_path_and_cleans_up() {
+        let directory = TestDirectory::new("preflight");
+        let track = directory.audio_file("song.FLAC", b"readable fixture bytes");
+
+        preflight_tag_write(&track).expect("a readable file in a writable directory is editable");
+
+        assert!(supports_tag_writes(&track));
+        assert!(
+            directory.temp_files().is_empty(),
+            "a successful capability probe must remove its private sibling"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_siblings_never_grant_group_or_other_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("private-mode");
+        let track = directory.path.join("song.flac");
+        let (temp, file) = TempFile::create_beside(&track).expect("create private sibling");
+        let mode = std::fs::metadata(temp.path())
+            .expect("read sibling metadata")
+            .permissions()
+            .mode();
+
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "writer-owned copies must not be readable or writable by group/other"
+        );
+        drop(file);
+        temp.remove().expect("remove private sibling");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn writer_siblings_install_the_source_dacl_while_exclusively_held() {
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+        let directory = TestDirectory::new("private-dacl");
+        let track = directory.audio_file("song.flac", b"readable fixture bytes");
+        let source = std::fs::File::open(&track).expect("open source");
+        let source_dacl = WindowsDacl::read_from(&source).expect("read source DACL");
+        let (temp, destination) = TempFile::create_beside(&track).expect("create private sibling");
+
+        source_dacl
+            .apply_to(&destination)
+            .expect("install source DACL");
+        let second_open = std::fs::File::open(temp.path())
+            .expect_err("the copy handle must deny every competing open");
+        assert_eq!(
+            second_open.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION as i32)
+        );
+
+        let installed_dacl = WindowsDacl::read_from(&destination).expect("read installed DACL");
+        assert_eq!(installed_dacl.protected, source_dacl.protected);
+        assert_eq!(
+            installed_dacl.dacl.is_null(),
+            source_dacl.dacl.is_null(),
+            "a NULL DACL must retain its original semantics"
+        );
+
+        drop(destination);
+        let reopened = temp
+            .reopen_exclusive_for_write()
+            .expect("installed source DACL must allow a fresh exclusive write handle");
+        assert_eq!(
+            reopened.metadata().expect("read sibling metadata").len(),
+            0,
+            "the DACL must be proven before the first content byte"
+        );
+        drop(reopened);
+        temp.remove().expect("remove private sibling");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_matches_effective_create_access_on_a_read_only_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("readonly-parent");
+        let track = directory.audio_file("song.flac", b"readable fixture bytes");
+        let original_permissions = std::fs::metadata(&directory.path)
+            .expect("read directory metadata")
+            .permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(0o500);
+        std::fs::set_permissions(&directory.path, read_only_permissions)
+            .expect("make parent read-only");
+
+        // A privileged or ACL-granted test process may still create here.
+        // Compare against the operation itself instead of guessing from mode
+        // bits—the same rule the production preflight follows.
+        let sentinel = directory.path.join("sentinel");
+        let effective_create = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sentinel)
+            .is_ok();
+        if effective_create {
+            std::fs::remove_file(&sentinel).expect("remove privileged sentinel");
+        }
+        let result = preflight_tag_write(&track);
+
+        std::fs::set_permissions(&directory.path, original_permissions)
+            .expect("restore directory permissions");
+        if effective_create {
+            assert!(result.is_ok(), "effective directory access should pass");
+        } else {
+            assert_eq!(result, Err(TagWritePreflightError::Unavailable));
+        }
+        assert!(directory.temp_files().is_empty());
+    }
+
+    #[test]
+    fn preflight_distinguishes_format_and_invalid_file_failures() {
+        let directory = TestDirectory::new("preflight-categories");
+        let unsupported = directory.audio_file("song.wav", b"wave bytes");
+        let missing = directory.path.join("missing.flac");
+        let directory_named_like_audio = directory.path.join("album.flac");
+        std::fs::create_dir(&directory_named_like_audio).expect("create directory fixture");
+
+        assert_eq!(
+            preflight_tag_write(&unsupported),
+            Err(TagWritePreflightError::UnsupportedFormat)
+        );
+        assert_eq!(
+            preflight_tag_write(&missing),
+            Err(TagWritePreflightError::Unavailable)
+        );
+        assert_eq!(
+            preflight_tag_write(&directory_named_like_audio),
+            Err(TagWritePreflightError::NotRegularFile)
+        );
+        assert!(directory.temp_files().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_never_replaces_a_symlink_track() {
+        let directory = TestDirectory::new("preflight-symlink");
+        let target = directory.audio_file("target.flac", b"target bytes");
+        let link = directory.path.join("linked.flac");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink fixture");
+
+        assert_eq!(
+            preflight_tag_write(&link),
+            Err(TagWritePreflightError::NotRegularFile)
+        );
+        assert!(link.is_symlink());
+        assert_eq!(std::fs::read(target).expect("read target"), b"target bytes");
+    }
+
+    #[test]
+    fn probe_cleanup_failure_is_reported_before_success() {
+        let directory = TestDirectory::new("preflight-cleanup-failure");
+        let track = directory.path.join("song.flac");
+        let (temp, file) = TempFile::create_beside(&track).expect("create private sibling");
+        let temp_path = temp.path().to_path_buf();
+        drop(file);
+
+        std::fs::remove_file(&temp_path).expect("remove probe file");
+        std::fs::create_dir(&temp_path).expect("replace probe file with directory fixture");
+        assert!(
+            temp.remove().is_err(),
+            "cleanup failure must not be reported as writable"
+        );
+
+        std::fs::remove_dir(&temp_path).expect("remove directory fixture");
     }
 
     #[test]

@@ -266,8 +266,9 @@ storage writable.
 
 A custom path saved by an older Flatpak build as a direct host path may become unavailable under
 the narrower sandbox policy. Do not remove and re-add that root if preserving track IDs, history,
-and playlist links matters: when the portal exports a different path, the current engine sees it as
-a different root. An explicit identity-preserving reauthorization flow is tracked under P2.5.
+and playlist links matters: use that root's **Reauthorize…** action in Preferences to select the
+same logical folder through the portal, confirm the identity-preserving move, and restart so the
+guarded relocation completes before scanning.
 
 Following [Flatpak's external-drive guidance](https://docs.flatpak.org/en/latest/sandbox-permissions.html#external-drive-access),
 host-mounted media under `/media`, `/run/media`, and `/mnt` is exposed read-only for the automatic
@@ -277,9 +278,10 @@ the non-native GVfs filesystem sockets. It does not request raw USB-device acces
 filesystem, or a writable external-media root. To treat external media as a writable custom
 library, select that directory explicitly in Preferences and use its portal-backed library entry
 rather than the automatic Devices entry. The grant still cannot override a physically or
-host-permission read-only filesystem. The automatic
-Devices entry remains browse/play-only at the sandbox boundary; a tag save offered for one of its
-tracks will report the write failure instead of changing the file.
+host-permission read-only filesystem. The automatic Devices entry remains browse/play-only at the
+sandbox boundary. Properties checks the selected files and their containing directory on a worker
+before enabling its editing controls, so a read-only automatic device is explained before Save and
+points to the custom-library flow that can request portal write access.
 
 ---
 
@@ -533,12 +535,23 @@ Right-click any local track and select **Properties…** to view and edit its me
 - **MusicBrainz Lookup** — In single-track mode, click "MusicBrainz Lookup" to search by title + artist. Results populate the form but are **not** saved automatically — you must click Save.
 
 All edits require an explicit **Save** click. Cancel discards all changes. Numeric edits are
-validated before a file is touched. Successful saves use an exclusively created, bounded
+validated before a file is touched. Before editing is enabled, a background capability check
+requires every exact selected path to be a supported, readable, non-symlink regular file and
+rehearses create, flush, replace, and cleanup using two empty writer-owned siblings once per containing
+directory. Malformed or mixed local/remote selections fail closed instead of silently editing only
+a subset, and duplicate playlist rows write their exact file only once. Save rechecks the complete
+selection before writing the first track; the result is necessarily point-in-time, so an unplug,
+permission change, full filesystem, or target-specific lock can still make the real operation fail
+safely. Successful saves use an exclusively created, bounded
 `.tributary-tag-<UUID>.<format>` sibling carrying only the case-normalized source format extension,
-flush it before atomic replacement, best-effort copy the original permissions, and remove the
-sibling on any failure. Local scans and the filesystem watcher recognize only that exact internal
-shape: an in-progress copy never appears as another library track, and final replacement refreshes
-the original path without losing its stable identity, history, or playlist links. Supported formats:
+flush it before atomic replacement, and remove the sibling on success or attempt removal on every
+failure path. Unix copies begin private at mode `0600` before receiving the source mode; on Windows,
+the source DACL is installed through an exclusive no-sharing handle before the first audio byte is
+copied, so a permissive parent-directory ACL cannot briefly expose the copy. Cleanup I/O and process
+termination remain fallible, so local scans and the filesystem watcher also recognize and exclude
+only that exact internal shape: an in-progress or residual copy never appears as another library
+track, and final replacement refreshes the original path without losing its stable identity,
+history, or playlist links. Supported formats:
 MP3 (ID3v2), M4A/AAC, OGG Vorbis, and FLAC.
 
 ### Playlists

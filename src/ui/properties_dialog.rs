@@ -13,19 +13,24 @@
 //! the MusicBrainz API and populates the form — but still requires the
 //! user to click Save.
 
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
 use tracing::{info, warn};
 
-use crate::local::tag_writer::{is_writable, TagEdits};
+use crate::local::tag_writer::{
+    preflight_tag_write, validate_tag_write_target, TagEdits, TagWritePreflightError,
+};
 
 /// Information about a track passed into the dialog.
 #[derive(Debug, Clone)]
 pub struct TrackInfo {
-    /// File URI (`file:///path/to/song.flac`).
-    pub uri: String,
+    /// Validated native path for this local track.
+    pub path: PathBuf,
     /// Current metadata values (for pre-populating the form).
     pub title: String,
     pub artist: String,
@@ -41,6 +46,169 @@ pub struct TrackInfo {
     pub duration: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagEditingAvailability {
+    Checking,
+    Saving,
+    Ready,
+    UnsupportedFormat,
+    InvalidFile,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TagEditingControls {
+    inputs_enabled: bool,
+    save_enabled: bool,
+    musicbrainz_enabled: bool,
+}
+
+impl TagEditingAvailability {
+    fn controls(self, is_batch: bool) -> TagEditingControls {
+        let ready = self == Self::Ready;
+        TagEditingControls {
+            inputs_enabled: ready,
+            save_enabled: ready,
+            musicbrainz_enabled: ready && !is_batch,
+        }
+    }
+
+    fn message(self, automatic_device: bool) -> String {
+        let key = match self {
+            Self::Checking => "properties.write_checking",
+            Self::Saving => "properties.write_saving",
+            Self::Ready => "properties.write_ready",
+            Self::UnsupportedFormat => "properties.write_unsupported",
+            Self::InvalidFile => "properties.write_invalid_file",
+            Self::Unavailable if automatic_device => "properties.write_device_unavailable",
+            Self::Unavailable => "properties.write_unavailable",
+        };
+        rust_i18n::t!(key).into_owned()
+    }
+}
+
+#[derive(Debug)]
+enum SaveOutcome {
+    Blocked(TagEditingAvailability),
+    Finished {
+        modified: usize,
+        failed: usize,
+        current_availability: TagEditingAvailability,
+    },
+}
+
+fn unique_track_paths(tracks: &[TrackInfo]) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    tracks
+        .iter()
+        .filter(|track| seen.insert(track.path.clone()))
+        .map(|track| track.path.clone())
+        .collect()
+}
+
+fn merge_preflight_failure(
+    current: TagEditingAvailability,
+    failure: TagWritePreflightError,
+) -> TagEditingAvailability {
+    let candidate = match failure {
+        TagWritePreflightError::UnsupportedFormat => TagEditingAvailability::UnsupportedFormat,
+        TagWritePreflightError::NotRegularFile => TagEditingAvailability::InvalidFile,
+        TagWritePreflightError::Unavailable => TagEditingAvailability::Unavailable,
+    };
+
+    // Report a deterministic, actionable reason independent of selection
+    // order. An unsupported format is most specific; a missing/non-file path
+    // is more specific than a generic access failure.
+    let priority = |availability| match availability {
+        TagEditingAvailability::UnsupportedFormat => 3,
+        TagEditingAvailability::InvalidFile => 2,
+        TagEditingAvailability::Unavailable => 1,
+        TagEditingAvailability::Checking
+        | TagEditingAvailability::Saving
+        | TagEditingAvailability::Ready => 0,
+    };
+    if priority(candidate) > priority(current) {
+        candidate
+    } else {
+        current
+    }
+}
+
+/// Probe a complete, exact-deduplicated selection on a worker thread.
+fn preflight_paths(paths: &[PathBuf]) -> TagEditingAvailability {
+    if paths.is_empty() {
+        return TagEditingAvailability::InvalidFile;
+    }
+
+    let validation = paths
+        .iter()
+        .fold(
+            TagEditingAvailability::Ready,
+            |result, path| match validate_tag_write_target(path) {
+                Ok(()) => result,
+                Err(failure) => merge_preflight_failure(result, failure),
+            },
+        );
+    if validation != TagEditingAvailability::Ready {
+        return validation;
+    }
+
+    // Directory mechanics are parent-scoped. Rehearse the flushed atomic
+    // replacement once per exact parent while retaining the per-file checks
+    // above (including Windows read-only attributes).
+    let mut parents = HashSet::new();
+    paths
+        .iter()
+        .fold(TagEditingAvailability::Ready, |result, path| {
+            let Some(parent) = path.parent() else {
+                return merge_preflight_failure(result, TagWritePreflightError::NotRegularFile);
+            };
+            if !parents.insert(parent.to_path_buf()) {
+                return result;
+            }
+            match preflight_tag_write(path) {
+                Ok(()) => result,
+                Err(failure) => merge_preflight_failure(result, failure),
+            }
+        })
+}
+
+fn apply_tag_editing_availability(
+    entries: &[(String, gtk::Entry)],
+    save_button: &gtk::Button,
+    musicbrainz_button: Option<&gtk::Button>,
+    capability_label: &gtk::Label,
+    availability: TagEditingAvailability,
+    is_batch: bool,
+    automatic_device: bool,
+) {
+    let controls = availability.controls(is_batch);
+    for (_, entry) in entries {
+        entry.set_sensitive(controls.inputs_enabled);
+    }
+    save_button.set_sensitive(controls.save_enabled);
+    if let Some(button) = musicbrainz_button {
+        button.set_label(rust_i18n::t!("properties.musicbrainz_lookup").as_ref());
+        button.set_sensitive(controls.musicbrainz_enabled);
+    }
+
+    let message = availability.message(automatic_device);
+    capability_label.set_label(&message);
+    let blocked = matches!(
+        availability,
+        TagEditingAvailability::UnsupportedFormat
+            | TagEditingAvailability::InvalidFile
+            | TagEditingAvailability::Unavailable
+    );
+    if blocked {
+        capability_label.add_css_class("error");
+        save_button.set_tooltip_text(Some(&message));
+    } else {
+        capability_label.remove_css_class("error");
+        save_button.set_tooltip_text(None);
+    }
+}
+
 /// Show the properties dialog for one or more tracks.
 ///
 /// On **Save**, changed tags are written to the files on a background
@@ -48,7 +216,11 @@ pub struct TrackInfo {
 /// open tracklist are refreshed asynchronously by the filesystem watcher
 /// for files inside a watched library folder. If any file fails to write,
 /// the user is notified and the dialog stays open so they can retry.
-pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackInfo]) {
+pub fn show_properties_dialog(
+    parent: &adw::ApplicationWindow,
+    tracks: &[TrackInfo],
+    automatic_device: bool,
+) {
     if tracks.is_empty() {
         return;
     }
@@ -65,6 +237,11 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
         .content_width(480)
         .content_height(if is_batch { 400 } else { 520 })
         .build();
+    let operation_generation = Rc::new(Cell::new(0u64));
+    let generation_for_close = operation_generation.clone();
+    dialog.connect_closed(move |_| {
+        generation_for_close.set(generation_for_close.get().wrapping_add(1));
+    });
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -93,17 +270,10 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
         .margin_bottom(12)
         .build();
 
-    // ── Collect file paths and check writability ─────────────────────
-    let file_paths: Vec<PathBuf> = tracks
-        .iter()
-        .filter_map(|t| {
-            url::Url::parse(&t.uri)
-                .ok()
-                .and_then(|u| u.to_file_path().ok())
-        })
-        .collect();
-
-    let all_writable = file_paths.iter().all(|p| is_writable(p));
+    // Repeated playlist entries may refer to the same file. Probe and write
+    // each exact path once while retaining every selected row for batch-field
+    // presentation.
+    let file_paths = unique_track_paths(tracks);
 
     // ── Helper to compute initial value for a field ──────────────────
     let field_value = |getter: fn(&TrackInfo) -> &str| -> String {
@@ -221,8 +391,24 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
         form.append(&info_group);
     }
 
+    for (_, entry) in &entries {
+        entry.set_sensitive(false);
+    }
+
+    let capability_label = gtk::Label::builder()
+        .label(TagEditingAvailability::Checking.message(automatic_device))
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .margin_start(16)
+        .margin_end(16)
+        .margin_top(8)
+        .build();
+
     scrolled.set_child(Some(&form));
     content.append(&scrolled);
+    content.append(&capability_label);
 
     // ── Button bar ───────────────────────────────────────────────────
     let button_bar = gtk::Box::builder()
@@ -235,13 +421,15 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
         .margin_bottom(12)
         .build();
 
-    // MusicBrainz button (single track only, writable files only)
-    if !is_batch && all_writable {
+    // MusicBrainz button (single track only). It remains disabled until the
+    // same capability check that gates editing has completed successfully.
+    let musicbrainz_button = if !is_batch {
         let mb_button = gtk::Button::builder()
-            .label("MusicBrainz Lookup")
+            .label(rust_i18n::t!("properties.musicbrainz_lookup").as_ref())
             .css_classes(["flat"])
             .halign(gtk::Align::Start)
             .hexpand(true)
+            .sensitive(false)
             .build();
 
         let title_for_mb = tracks[0].title.clone();
@@ -250,15 +438,22 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
             .iter()
             .map(|(name, entry)| ((*name).to_string(), entry.clone()))
             .collect();
+        let generation_for_mb = operation_generation.clone();
 
         mb_button.connect_clicked(move |btn| {
             btn.set_sensitive(false);
-            btn.set_label("Searching…");
+            btn.set_label(rust_i18n::t!("properties.searching").as_ref());
 
             let title = title_for_mb.clone();
             let artist = artist_for_mb.clone();
             let entries = entries_for_mb.clone();
             let btn = btn.clone();
+            let operation_generation = generation_for_mb.clone();
+            // Every lookup owns a distinct generation. In particular, a
+            // delayed "Not Found" label reset from the previous lookup must
+            // not overwrite a newer lookup's "Searching…" state.
+            let lookup_generation = operation_generation.get().wrapping_add(1);
+            operation_generation.set(lookup_generation);
 
             let (tx, rx) = async_channel::bounded::<Option<MusicBrainzResult>>(1);
 
@@ -268,7 +463,11 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
             });
 
             glib::MainContext::default().spawn_local(async move {
-                if let Ok(Some(result)) = rx.recv().await {
+                let result = rx.recv().await;
+                if operation_generation.get() != lookup_generation {
+                    return;
+                }
+                if let Ok(Some(result)) = result {
                     for (name, entry) in &entries {
                         match name.as_str() {
                             "title" if !result.title.is_empty() => {
@@ -289,34 +488,36 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
                             _ => {}
                         }
                     }
-                    btn.set_label("MusicBrainz Lookup");
+                    btn.set_label(rust_i18n::t!("properties.musicbrainz_lookup").as_ref());
                     btn.set_sensitive(true);
                 } else {
-                    btn.set_label("Not Found");
+                    btn.set_label(rust_i18n::t!("properties.not_found").as_ref());
                     btn.set_sensitive(true);
                     // Reset label after 2 seconds.
                     let btn = btn.clone();
+                    let operation_generation = operation_generation.clone();
                     glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
-                        btn.set_label("MusicBrainz Lookup");
+                        if operation_generation.get() == lookup_generation {
+                            btn.set_label(rust_i18n::t!("properties.musicbrainz_lookup").as_ref());
+                        }
                     });
                 }
             });
         });
 
         button_bar.append(&mb_button);
-    }
+        Some(mb_button)
+    } else {
+        None
+    };
 
     let cancel_button = gtk::Button::builder().label("Cancel").build();
 
     let save_button = gtk::Button::builder()
         .label("Save")
         .css_classes(["suggested-action"])
-        .sensitive(all_writable)
+        .sensitive(false)
         .build();
-
-    if !all_writable {
-        save_button.set_tooltip_text(Some("Some files are in a format that cannot be edited"));
-    }
 
     button_bar.append(&cancel_button);
     button_bar.append(&save_button);
@@ -347,13 +548,18 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
         .collect();
 
     let file_paths_for_save = file_paths.clone();
+    let entries_for_save_state = entries_for_save.clone();
+    let musicbrainz_for_save = musicbrainz_button.clone();
+    let capability_for_save = capability_label.clone();
+    let cancel_for_save = cancel_button.clone();
+    let generation_for_save = operation_generation.clone();
 
-    save_button.connect_clicked(move |_| {
+    save_button.connect_clicked(move |button| {
         // Build TagEdits from the form, only including changed fields.
         let mut edits = TagEdits::default();
         let mut any_changed = false;
 
-        for (name, entry) in &entries_for_save {
+        for (name, entry) in &entries_for_save_state {
             let current = entry.text().to_string();
             let original = initial_texts
                 .iter()
@@ -401,20 +607,41 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
             return;
         }
 
+        let save_generation = generation_for_save.get().wrapping_add(1);
+        generation_for_save.set(save_generation);
+        dialog_for_save.set_can_close(false);
+        cancel_for_save.set_sensitive(false);
+
+        apply_tag_editing_availability(
+            &entries_for_save_state,
+            button,
+            musicbrainz_for_save.as_ref(),
+            &capability_for_save,
+            TagEditingAvailability::Saving,
+            is_batch,
+            automatic_device,
+        );
+
         let paths = file_paths_for_save.clone();
 
-        // Write tags on a background thread, tracking both the files that
-        // were written and the ones that failed.
-        let (tx, rx) = async_channel::bounded::<(Vec<String>, Vec<String>)>(1);
+        // Re-probe the entire selection before the first write, then track
+        // both the files that were written and the ones that failed.
+        let (tx, rx) = async_channel::bounded::<SaveOutcome>(1);
         let edits = edits.clone();
 
         std::thread::spawn(move || {
-            let mut modified = Vec::new();
-            let mut failed = Vec::new();
+            let availability = preflight_paths(&paths);
+            if availability != TagEditingAvailability::Ready {
+                let _ = tx.send_blocking(SaveOutcome::Blocked(availability));
+                return;
+            }
+
+            let mut modified = 0usize;
+            let mut failed = 0usize;
             for path in &paths {
                 match crate::local::tag_writer::write_tags(path, &edits) {
                     Ok(()) => {
-                        modified.push(path.to_string_lossy().to_string());
+                        modified += 1;
                     }
                     Err(e) => {
                         warn!(
@@ -422,30 +649,84 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
                             error = %e,
                             "Failed to write tags"
                         );
-                        failed.push(path.to_string_lossy().to_string());
+                        failed += 1;
                     }
                 }
             }
-            let _ = tx.send_blocking((modified, failed));
+            let current_availability = if failed == 0 {
+                TagEditingAvailability::Ready
+            } else {
+                preflight_paths(&paths)
+            };
+            let _ = tx.send_blocking(SaveOutcome::Finished {
+                modified,
+                failed,
+                current_availability,
+            });
         });
 
         let dialog = dialog_for_save.clone();
         let parent = parent_for_save.clone();
+        let entries = entries_for_save_state.clone();
+        let save_button = button.clone();
+        let musicbrainz_button = musicbrainz_for_save.clone();
+        let capability_label = capability_for_save.clone();
+        let cancel_button = cancel_for_save.clone();
+        let operation_generation = generation_for_save.clone();
         glib::MainContext::default().spawn_local(async move {
-            if let Ok((modified, failed)) = rx.recv().await {
-                if !modified.is_empty() {
-                    info!(count = modified.len(), "Tags saved successfully");
+            let outcome = rx.recv().await;
+            if operation_generation.get() != save_generation {
+                return;
+            }
+
+            match outcome {
+                Ok(SaveOutcome::Blocked(availability)) => {
+                    dialog.set_can_close(true);
+                    cancel_button.set_sensitive(true);
+                    apply_tag_editing_availability(
+                        &entries,
+                        &save_button,
+                        musicbrainz_button.as_ref(),
+                        &capability_label,
+                        availability,
+                        is_batch,
+                        automatic_device,
+                    );
                 }
-                if failed.is_empty() {
-                    dialog.close();
-                } else {
+                Ok(SaveOutcome::Finished {
+                    modified,
+                    failed,
+                    current_availability,
+                }) => {
+                    if modified > 0 {
+                        info!(count = modified, "Tags saved successfully");
+                    }
+                    if failed == 0 {
+                        dialog.set_can_close(true);
+                        cancel_button.set_sensitive(true);
+                        dialog.close();
+                        return;
+                    }
+
+                    dialog.set_can_close(true);
+                    cancel_button.set_sensitive(true);
+
+                    apply_tag_editing_availability(
+                        &entries,
+                        &save_button,
+                        musicbrainz_button.as_ref(),
+                        &capability_label,
+                        current_availability,
+                        is_batch,
+                        automatic_device,
+                    );
+
                     // Surface the failure instead of closing silently, so the
                     // user knows the edit didn't fully apply. Keep the dialog
                     // open so they can retry.
-                    let total = modified.len() + failed.len();
+                    let total = modified + failed;
                     let body = format!(
-                        "{} of {total} file(s) could not be saved and were left unchanged.",
-                        failed.len()
+                        "{failed} of {total} file(s) could not be saved and were left unchanged."
                     );
                     let alert = adw::AlertDialog::builder()
                         .heading("Could Not Save Some Files")
@@ -454,8 +735,55 @@ pub fn show_properties_dialog(parent: &adw::ApplicationWindow, tracks: &[TrackIn
                     alert.add_response("ok", "OK");
                     alert.present(Some(&parent));
                 }
+                Err(_) => {
+                    dialog.set_can_close(true);
+                    cancel_button.set_sensitive(true);
+                    apply_tag_editing_availability(
+                        &entries,
+                        &save_button,
+                        musicbrainz_button.as_ref(),
+                        &capability_label,
+                        TagEditingAvailability::Unavailable,
+                        is_batch,
+                        automatic_device,
+                    );
+                }
             }
         });
+    });
+
+    // Filesystem probing can block on removable and network media, so the
+    // dialog starts fail-closed and the complete selection is checked on a
+    // worker. The result is advisory and is rechecked in the Save worker.
+    let (preflight_tx, preflight_rx) = async_channel::bounded(1);
+    let paths_for_preflight = file_paths;
+    std::thread::spawn(move || {
+        let _ = preflight_tx.send_blocking(preflight_paths(&paths_for_preflight));
+    });
+
+    let entries_for_preflight = entries_for_save;
+    let save_for_preflight = save_button;
+    let musicbrainz_for_preflight = musicbrainz_button;
+    let capability_for_preflight = capability_label;
+    let preflight_generation = operation_generation.get();
+    let generation_for_preflight = operation_generation;
+    glib::MainContext::default().spawn_local(async move {
+        let availability = preflight_rx
+            .recv()
+            .await
+            .unwrap_or(TagEditingAvailability::Unavailable);
+        if generation_for_preflight.get() != preflight_generation {
+            return;
+        }
+        apply_tag_editing_availability(
+            &entries_for_preflight,
+            &save_for_preflight,
+            musicbrainz_for_preflight.as_ref(),
+            &capability_for_preflight,
+            availability,
+            is_batch,
+            automatic_device,
+        );
     });
 
     dialog.present(Some(parent));
@@ -631,4 +959,130 @@ fn musicbrainz_lookup(title: &str, artist: &str) -> Option<MusicBrainzResult> {
         year,
         track_number,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(path: PathBuf) -> TrackInfo {
+        TrackInfo {
+            path,
+            title: "Title".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            genre: String::new(),
+            composer: String::new(),
+            year: String::new(),
+            track_number: String::new(),
+            disc_number: String::new(),
+            format: "FLAC".to_string(),
+            bitrate: String::new(),
+            sample_rate: String::new(),
+            duration: String::new(),
+        }
+    }
+
+    #[test]
+    fn repeated_playlist_rows_probe_and_write_one_exact_path() {
+        let first = PathBuf::from("/music/album/song.flac");
+        let second = PathBuf::from("/music/other.flac");
+        let tracks = vec![
+            track(first.clone()),
+            track(first.clone()),
+            track(second.clone()),
+        ];
+
+        assert_eq!(unique_track_paths(&tracks), vec![first, second]);
+    }
+
+    #[test]
+    fn availability_controls_are_fail_closed_until_ready() {
+        for availability in [
+            TagEditingAvailability::Checking,
+            TagEditingAvailability::Saving,
+            TagEditingAvailability::UnsupportedFormat,
+            TagEditingAvailability::InvalidFile,
+            TagEditingAvailability::Unavailable,
+        ] {
+            assert_eq!(
+                availability.controls(false),
+                TagEditingControls {
+                    inputs_enabled: false,
+                    save_enabled: false,
+                    musicbrainz_enabled: false,
+                }
+            );
+        }
+
+        assert_eq!(
+            TagEditingAvailability::Ready.controls(false),
+            TagEditingControls {
+                inputs_enabled: true,
+                save_enabled: true,
+                musicbrainz_enabled: true,
+            }
+        );
+        assert!(
+            !TagEditingAvailability::Ready
+                .controls(true)
+                .musicbrainz_enabled
+        );
+    }
+
+    #[test]
+    fn mixed_batch_failure_reason_is_deterministic() {
+        let failures = [
+            TagWritePreflightError::Unavailable,
+            TagWritePreflightError::UnsupportedFormat,
+            TagWritePreflightError::NotRegularFile,
+        ];
+
+        let forward = failures
+            .iter()
+            .copied()
+            .fold(TagEditingAvailability::Ready, merge_preflight_failure);
+        let reverse = failures
+            .iter()
+            .rev()
+            .copied()
+            .fold(TagEditingAvailability::Ready, merge_preflight_failure);
+
+        assert_eq!(forward, TagEditingAvailability::UnsupportedFormat);
+        assert_eq!(reverse, forward);
+    }
+
+    #[test]
+    fn empty_and_mixed_preflight_selections_fail_closed() {
+        assert_eq!(preflight_paths(&[]), TagEditingAvailability::InvalidFile);
+
+        let directory = tempfile::tempdir().expect("create preflight fixture");
+        let supported = directory.path().join("song.flac");
+        let unsupported = directory.path().join("song.wav");
+        std::fs::write(&supported, b"audio").expect("write supported fixture");
+        std::fs::write(&unsupported, b"audio").expect("write unsupported fixture");
+
+        assert_eq!(
+            preflight_paths(&[supported, unsupported]),
+            TagEditingAvailability::UnsupportedFormat
+        );
+        assert!(
+            std::fs::read_dir(directory.path())
+                .expect("read fixture")
+                .all(|entry| !crate::local::tag_writer::is_tag_write_temp_file(
+                    &entry.expect("directory entry").path()
+                )),
+            "a blocked batch must leave no private sibling"
+        );
+    }
+
+    #[test]
+    fn automatic_device_failure_has_specific_guidance() {
+        let generic = TagEditingAvailability::Unavailable.message(false);
+        let device = TagEditingAvailability::Unavailable.message(true);
+
+        assert_ne!(generic, device);
+        assert!(!generic.is_empty());
+        assert!(!device.is_empty());
+    }
 }

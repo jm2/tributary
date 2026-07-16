@@ -189,6 +189,13 @@ properties:
   searching: "搜尋中…"
   not_found: "找不到"
   mixed: "混合"
+  write_checking: "正在檢查所選檔案是否可編輯…"
+  write_saving: "正在儲存標籤變更…"
+  write_ready: "所選檔案目前可寫入。"
+  write_unsupported: "由於至少一種所選檔案格式不受支援，無法編輯標籤。"
+  write_invalid_file: "由於至少一首所選曲目不是一般的本機檔案，無法編輯標籤。"
+  write_unavailable: "由於至少一個所選檔案或其資料夾為唯讀或無法使用，無法編輯標籤。"
+  write_device_unavailable: "此裝置目前為唯讀或無法使用。在 Flatpak 中，請在「偏好設定」中將其資料夾新增為自訂音樂庫，以要求寫入權限。"
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
