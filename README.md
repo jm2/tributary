@@ -50,7 +50,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Audio output selector (local + MPD, iTunes AirPlay-style) | ✅ |
 | MPD output backend (sink-only, TCP with security hardening) | ✅ |
 | Output switching (click to swap local ↔ MPD) | ✅ |
-| AirPlay 1 (RAOP) output | ✅ Requires a working `raopsink` GStreamer element or `shairport-sync` on `PATH`; falls back automatically |
+| AirPlay 1 (RAOP) output | ✅ Requires GStreamer's `raopsink` element (ships in `gst-plugins-bad`); a missing element fails with an actionable install message |
 | AirPlay 2 / HomeKit output | ❌ Not yet supported — see [AirPlay 2 roadmap](#airplay-2-roadmap) below |
 | Chromecast output (Cast V2 — local files + remote sources) | ✅ |
 | Album artist sort (preference toggle) | ✅ |
@@ -688,7 +688,7 @@ Each of these has specifics (key exchange algorithms, audio codec, RTSP/HTTP ver
 
 Likely paths forward (each to be evaluated when the work begins):
 
-- **Subprocess delegation** to a maintained external tool, in the same spirit as the existing `shairport-sync` fallback on the RAOP path. Cheaper to integrate, but adds a runtime dependency outside the single-binary distribution model.
+- **Subprocess delegation** to a maintained external tool. Cheaper to integrate, but adds a runtime dependency outside the single-binary distribution model.
 - **A pure-Rust sender implementation**, either in-tree or as a contributed `gst-plugins-rs` element, so it can plug into the same pipeline pattern `raopsink` uses today. Higher engineering cost; cleanest distribution story.
 - **Wait for an upstream component** to mature to the point that one of the above becomes obviously preferable.
 

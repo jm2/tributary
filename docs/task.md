@@ -910,13 +910,26 @@ function opens by discarding the receiver the user selected —
 and then pipes PCM into `shairport-sync`, which is an AirPlay **receiver**, not a sender. It
 cannot transmit to the device that was clicked.
 
-- [ ] Either transmit to the *selected* receiver, or remove the fallback and surface an
+- [x] Either transmit to the *selected* receiver, or remove the fallback and surface an
   actionable "install `gst-plugins-bad` for AirPlay support" error instead of silently spawning a
-  subprocess that cannot work.
-- [ ] Move the `which` probe (`airplay_output.rs:298`), the subprocess spawn, and teardown off the
-  GTK main thread; they run synchronously under `load_uri` today.
-- [ ] Add a test proving a missing `raopsink` produces an actionable error rather than a silent
-  no-op stream.
+  subprocess that cannot work. The fallback is removed: `build_shairport_pipeline`, the `Session`
+  child-process/fd plumbing, and both `cfg` variants are gone. `open_prepared_session` now gates
+  every load on `ensure_raopsink`, whose failure is a localized message naming `raopsink` and
+  `gst-plugins-bad`, translated in all 13 catalogs
+  (`locales/*.yml` `errors.playback.airplay_raopsink_missing`). Because `PlayerEvent::Error`
+  messages were previously log-only — no user would ever have seen the guidance — the window's
+  error branch now also surfaces every player error as a toast; output failure messages were
+  already reduced to fixed, credential- and URL-free categories, so verbatim display is safe.
+- [x] Move the `which` probe (`airplay_output.rs:298`), the subprocess spawn, and teardown off the
+  GTK main thread; they run synchronously under `load_uri` today. Resolved by removal: there is no
+  subprocess left to probe, spawn, or tear down. The remaining teardown is a plain GStreamer
+  `set_state(Null)`, identical to the local output's lifecycle.
+- [x] Add a test proving a missing `raopsink` produces an actionable error rather than a silent
+  no-op stream. `a_missing_raopsink_is_refused_with_install_guidance` pins the refusal at the
+  policy seam (`ensure_raopsink(false)`), `a_missing_raopsink_load_fails_loudly_not_silently`
+  proves the load path emits `Error` (with the actionable message) then `Stopped` — never a
+  silent stream — and `raopsink_guidance_is_localized_for_every_catalog` proves every locale
+  names both `raopsink` and `gst-plugins-bad` without falling back to English.
 - [ ] Record implementation: _pending_
 
 Acceptance criteria: selecting an AirPlay receiver either plays to that receiver or fails with an
