@@ -268,6 +268,9 @@ jobs:
     # stalling to the 6-hour ceiling (as one CLANGARM64 run did).
     timeout-minutes: 45
     strategy:
+      # Preserve the independent result from each architecture when a runner,
+      # package mirror, or platform-specific test fails on the other one.
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64
@@ -300,6 +303,11 @@ jobs:
           msystem: ${{ matrix.msystem }}
           path-type: inherit
           update: true
+          # setup-msys2's optional package-cache cleanup intermittently fails
+          # at its paccache step on windows-11-arm after installation succeeds.
+          # Cargo keeps its separate cache below; only skip the flaky MSYS2
+          # package cache on that runner.
+          cache: ${{ matrix.arch != 'aarch64' }}
           install: >-
             ${{ matrix.pkg_prefix }}-gtk4
             ${{ matrix.pkg_prefix }}-libadwaita

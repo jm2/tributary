@@ -1040,12 +1040,14 @@ mod tests {
     use super::*;
 
     const PROXY_BYPASS_CHILD: &str = "TRIBUTARY_PROXY_BYPASS_CHILD";
+    const PROXY_BYPASS_CHILD_VALUE: &str = "tributary-proxy-bypass-child-v1";
 
     fn serve_one_test_request(
         listener: std::net::TcpListener,
         response: &'static [u8],
         observed: std::sync::mpsc::Sender<bool>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        timeout: Option<Duration>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -1053,8 +1055,8 @@ mod tests {
             listener
                 .set_nonblocking(true)
                 .expect("set test listener nonblocking");
-            let deadline = Instant::now() + Duration::from_secs(8);
-            while Instant::now() < deadline && !stop.load(std::sync::atomic::Ordering::Acquire) {
+            let deadline = timeout.map(|timeout| Instant::now() + timeout);
+            loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -1066,6 +1068,12 @@ mod tests {
                         return;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stop.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+                        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            break;
+                        }
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     Err(_) => break,
@@ -1076,9 +1084,10 @@ mod tests {
     }
 
     fn run_proxy_bypass_child() {
-        let target =
-            std::env::var("TRIBUTARY_PROXY_BYPASS_TARGET").expect("parent supplies target address");
-        let ticket = format!("http://{target}/cast/550e8400-e29b-41d4-a716-446655440000.flac");
+        let target = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind target listener");
+        let target_addr = target.local_addr().expect("target listener address");
+        let ticket = format!("http://{target_addr}/cast/550e8400-e29b-41d4-a716-446655440000.flac");
 
         gst::init().expect("GStreamer init");
         let source = gst::ElementFactory::make("souphttpsrc")
@@ -1105,12 +1114,27 @@ mod tests {
             .add_many([&source, &sink])
             .expect("assemble proxy bypass pipeline");
         source.link(&sink).expect("link proxy bypass pipeline");
+
+        // Start the bounded observation window only after process startup,
+        // GStreamer initialization, and plugin discovery have completed.
+        // Those operations can exceed several seconds on a cold Windows host.
+        let (target_tx, target_rx) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let target_thread = serve_one_test_request(
+            target,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\ntest",
+            target_tx,
+            std::sync::Arc::clone(&stop),
+            Some(Duration::from_secs(8)),
+        );
+
         pipeline
             .set_state(gst::State::Playing)
             .expect("start proxy bypass pipeline");
         let bus = pipeline.bus().expect("proxy bypass pipeline bus");
-        // The parent process, not the terminal message kind, proves the
-        // routing invariant by observing which listener receives the request.
+        // The target observation, not the terminal message kind, proves the
+        // request reached the intended fixture. The parent process separately
+        // proves that the poisoned proxy was never contacted.
         // Some packaged source/plugin combinations report a downstream error
         // after the complete HTTP body has already reached `fakesink`; treating
         // that as proxy use made this security regression flaky on Windows.
@@ -1121,6 +1145,20 @@ mod tests {
             )
             .expect("proxy bypass pipeline reaches a terminal state");
         let _ = pipeline.set_state(gst::State::Null);
+
+        // Do not cancel the target listener until it has recorded the route (or
+        // exhausted its own deadline). This avoids racing an accepted request
+        // during Windows process/thread teardown.
+        let target_observed = target_rx
+            .recv_timeout(Duration::from_secs(9))
+            .expect("target listener result");
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        target_thread.join().expect("target listener thread");
+
+        assert!(
+            target_observed,
+            "the loopback media fixture was not reached"
+        );
     }
 
     // ── slider_to_pipeline tests ────────────────────────────────────
@@ -1247,34 +1285,27 @@ mod tests {
 
     #[test]
     fn protected_loopback_source_bypasses_a_poisoned_ambient_proxy() {
-        if std::env::var_os(PROXY_BYPASS_CHILD).is_some() {
+        if std::env::var(PROXY_BYPASS_CHILD).as_deref() == Ok(PROXY_BYPASS_CHILD_VALUE) {
             run_proxy_bypass_child();
             return;
         }
 
-        let target = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .expect("bind target listener");
-        let target_addr = target.local_addr().expect("target listener address");
         let poison = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .expect("bind poison proxy listener");
         let poison_addr = poison.local_addr().expect("poison listener address");
-        let (target_tx, target_rx) = std::sync::mpsc::channel();
+        let proxy = format!("http://{poison_addr}");
         let (poison_tx, poison_rx) = std::sync::mpsc::channel();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let target_thread = serve_one_test_request(
-            target,
-            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\ntest",
-            target_tx,
-            std::sync::Arc::clone(&stop),
-        );
+        // The proxy fixture is stop-driven rather than deadline-driven so cold
+        // child startup and plugin discovery cannot make it disappear early.
         let poison_thread = serve_one_test_request(
             poison,
             b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             poison_tx,
             std::sync::Arc::clone(&stop),
+            None,
         );
 
-        let proxy = format!("http://{poison_addr}");
         let output =
             std::process::Command::new(std::env::current_exe().expect("current test executable"))
                 .args([
@@ -1282,8 +1313,7 @@ mod tests {
                     "audio::tests::protected_loopback_source_bypasses_a_poisoned_ambient_proxy",
                     "--nocapture",
                 ])
-                .env(PROXY_BYPASS_CHILD, "1")
-                .env("TRIBUTARY_PROXY_BYPASS_TARGET", target_addr.to_string())
+                .env(PROXY_BYPASS_CHILD, PROXY_BYPASS_CHILD_VALUE)
                 .env("http_proxy", &proxy)
                 .env("HTTP_PROXY", &proxy)
                 .env_remove("no_proxy")
@@ -1291,29 +1321,20 @@ mod tests {
                 .output()
                 .expect("run isolated proxy bypass child");
         stop.store(true, std::sync::atomic::Ordering::Release);
-
-        let target_observed = target_rx
-            .recv_timeout(Duration::from_secs(9))
-            .expect("target listener result");
         let poison_observed = poison_rx
             .recv_timeout(Duration::from_secs(9))
             .expect("poison listener result");
-        target_thread.join().expect("target listener thread");
         poison_thread.join().expect("poison listener thread");
 
+        assert!(
+            !poison_observed,
+            "the opaque loopback ticket reached the ambient proxy"
+        );
         assert!(
             output.status.success(),
             "isolated GStreamer child failed: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            target_observed,
-            "the loopback media fixture was not reached"
-        );
-        assert!(
-            !poison_observed,
-            "the opaque loopback ticket reached the ambient proxy"
         );
     }
 
