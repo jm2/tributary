@@ -847,30 +847,43 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   (`release.yml:500` seds `pkgver`). The checked-in literals are stale to a *reader* but never
   reach a package. Nothing to fix. Recorded rather than deleted, so the same wrong conclusion is
   not re-derived from reading the spec in isolation.
-- [ ] Raise GTK runtime minimum to 4.16.
-- [ ] Raise libadwaita runtime minimum to 1.6. Both minimums are currently under-declared as
+- [x] Raise GTK runtime minimum to 4.16.
+- [x] Raise libadwaita runtime minimum to 1.6. Both minimums were under-declared as
   `>= 4.14` / `>= 1.5` in `build-aux/rpm/tributary.spec:23-24`, in Cargo.toml's
   `generate-rpm.requires`, and in Cargo.toml's `deb.depends`, against a crate that pins `v4_16`
-  and `v1_6` (`Cargo.toml:12-13`). The shipped `.deb`/`.rpm` therefore install onto systems where
-  the binary cannot start.
-- [ ] Add `%U` or `%F` to the desktop `Exec` line (`data/io.github.tributary.Tributary.desktop:6`
-  is bare `Exec=tributary`). Until this lands, the "Linux file association" feature CHANGELOG
-  advertises for 0.5.0 does not work: the `MimeType` entry is present and the binary handles
-  opens, but the desktop entry never passes the URI.
-- [ ] Add the required `AudioVideo` desktop category.
+  and `v1_6` (`Cargo.toml:12-13`). All three now declare `>= 4.16` / `>= 1.6`, so the shipped
+  `.deb`/`.rpm` refuse to install onto systems where the binary cannot start.
+- [x] Add `%U` or `%F` to the desktop `Exec` line (`data/io.github.tributary.Tributary.desktop:6`
+  was bare `Exec=tributary`). Now `Exec=tributary %U`, so the "Linux file association" feature is
+  actually functional: the `MimeType` entry was present and the binary handles opens, but the
+  desktop entry never passed the URI.
+- [x] Add the required `AudioVideo` desktop category. `Audio`, `Music`, and `Player` are
+  additional categories that the spec requires to be accompanied by the `AudioVideo` main
+  category; `desktop-file-validate` now passes and runs in CI.
 - [x] Add the 0.5.0 AppStream release entry and synchronize post-release development metadata.
   The AppStream history now records the shipped 0.5.0 feature release dated 2026-05-08;
   `CHANGELOG.md` archives the same release and opens an Unreleased 0.5.1 section; and Cargo package
   metadata advances to 0.5.1. Implemented on the P2.11 protected-playback branch so this inherited
   partial update is explicit and independently reviewable rather than an undocumented side change.
 - [x] Update README Rust requirement from 1.80 to 1.85. Implemented in commit `e6c68bc`.
-- [ ] Add CI on the declared Rust 1.85 MSRV. Every toolchain in CI is
-  `dtolnay/rust-toolchain@stable`; nothing verifies that 1.85 still compiles.
-- [ ] Enforce the global validation gate in CI. It is currently a *local* gate: CI runs
-  `cargo test --release` only (`ci.yml:83`), never `cargo test --all-targets`, so a break that
-  only appears in debug (`debug_assert!`, overflow checks) ships. Nothing runs `appstreamcli` or
+- [x] Add CI on the declared Rust MSRV. Every toolchain in CI was
+  `dtolnay/rust-toolchain@stable`; nothing verified the declared MSRV still compiled — and it did
+  not: the locked graph refuses rustc 1.85 outright. The gtk-rs 0.11 release series (gtk4, glib,
+  gstreamer et al.) requires rustc **1.92**, with lesser floors from `time` (1.88), `ogg_pager`
+  (1.89), and the `icu_*` stack (1.86). The declared `rust-version` was a fiction from the moment
+  the gtk-rs 0.11 upgrade landed. `Cargo.toml` and the README now declare 1.92 (verified locally:
+  `cargo +1.85 check --locked` fails, `cargo +1.92 check --all-targets --locked` succeeds), and a
+  dedicated `MSRV (1.92)` CI job compile-proves it with `--locked` on every push/PR. The job's
+  toolchain pin and the `rust-version` field must move together.
+- [x] Enforce the global validation gate in CI. It was a *local* gate: CI ran
+  `cargo test --release` only, never `cargo test --all-targets`, so a break that
+  only appears in debug (`debug_assert!`, overflow checks) shipped. Nothing ran `appstreamcli` or
   `desktop-file-validate` in any workflow, and `fuzz/` is its own workspace so neither `fmt` nor
-  `clippy` ever covers it.
+  `clippy` ever covered it. CI now runs debug `cargo test --all-targets` and fuzz-workspace
+  `fmt --check` + `clippy --locked` on Linux x86_64, and a `Desktop Metadata` job validates the
+  desktop entry and AppStream metainfo on every push/PR. The fuzz lockfile had already drifted —
+  its `kstring 2.0.3` requires rustc 1.96, above even the corrected MSRV — and is resynced to the
+  main lock's 2.0.2; `--locked` keeps it from drifting silently again.
 - [x] Apply a redirect policy to the app's non-credential HTTP clients. Radio-Browser
   (`radio/client.rs`), IP geolocation, and MusicBrainz (`ui/properties_dialog.rs`) bypassed
   `http_security` entirely and ran reqwest defaults, so they sent a `Referer` and would follow an
@@ -1137,12 +1150,12 @@ the known `AudioVideo` category diagnostic tracked under P2.6. The installed int
 portal/physical-media smoke task, packaged Windows/full-backend playback, and physical-media
 validation remain open local/integration tasks; the release workflow remains deliberately deferred.
 
-**This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
-hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
-runs `cargo fmt --check`, both `clippy -D warnings` invocations, `cargo test --release`, and
-`cargo audit` — but **not** `cargo test --all-targets` (so a debug-only break ships), and no
-workflow runs `appstreamcli` or `desktop-file-validate` at all. `fuzz/` is a separate workspace
-and is covered by neither `fmt` nor `clippy`. Closing that gap is tracked under P2.6.
+**This gate is now enforced by CI** (P2.6, closed 2026-07-16): in addition to
+`cargo fmt --check`, both `clippy -D warnings` invocations, `cargo test --release`, and
+`cargo audit`, CI runs debug `cargo test --all-targets`, fuzz-workspace `fmt`/`clippy --locked`,
+`desktop-file-validate`, `appstreamcli validate --no-net`, and an `MSRV (1.92)` compile-proof.
+Checked boxes above still record the by-hand run before a milestone; the CI jobs are what catch
+regressions automatically.
 
 ## Decisions
 
