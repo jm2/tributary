@@ -889,8 +889,10 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   `http_security` entirely and ran reqwest defaults, so they sent a `Referer` and would follow an
   HTTPS→HTTP downgrade. They now use a shared public policy that still permits the cross-host
   mirror redirects those services depend on but refuses to be walked down to plaintext.
-- [ ] Record implementation: README MSRV correction in commit `e6c68bc` and non-credential
-  redirect policy in commit `8368a65`; packaging remains open.
+- [x] Record implementation: README MSRV correction in commit `e6c68bc` and non-credential
+  redirect policy in commit `8368a65`; the AppStream/CHANGELOG/version synchronization landed on
+  the P2.11 protected-playback branch; runtime minimums, desktop entry, the MSRV correction to
+  1.92, and CI gate enforcement in PR #100. P2.6 is complete.
 
 ### P2.7 Fix platform cache paths
 
