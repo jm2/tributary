@@ -113,6 +113,9 @@ souvlaki = "0.8"
 gdk4-win32 = "0.11"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+gdk-pixbuf = "0.22"
+
 # Stable filesystem IDs for removable/network library-root safety.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }

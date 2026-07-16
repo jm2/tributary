@@ -4809,6 +4809,7 @@ dependencies = [
  "dirs",
  "fastrand",
  "futures",
+ "gdk-pixbuf",
  "gdk4-win32",
  "gstreamer",
  "gtk4",
