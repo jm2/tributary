@@ -45,9 +45,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain (1.92)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: '1.92'
+        uses: dtolnay/rust-toolchain@1.92.0
 
       - name: Cache Cargo registry
         uses: actions/cache@v6
@@ -76,7 +74,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y appstream desktop-file-utils
 
       - name: Validate desktop entry
-        run: desktop-file-validate data/io.github.tributary.Tributary.desktop
+        run: |
+          if ! diagnostics="$(desktop-file-validate data/io.github.tributary.Tributary.desktop 2>&1)"; then
+            printf '%s\n' "$diagnostics"
+            exit 1
+          fi
+          if [ -n "$diagnostics" ]; then
+            printf '%s\n' "$diagnostics"
+            exit 1
+          fi
 
       - name: Validate AppStream metainfo
         run: appstreamcli validate --no-net data/io.github.tributary.Tributary.metainfo.xml
@@ -148,9 +154,11 @@ jobs:
       # pins the committed resolution.
       - name: Fuzz workspace fmt + clippy
         if: matrix.arch == 'x86_64'
+        env:
+          CARGO_TARGET_DIR: target
         run: |
-          cargo fmt --check --manifest-path fuzz/Cargo.toml
-          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+          cargo fmt --manifest-path fuzz/Cargo.toml --package tributary-fuzz -- --check
+          cargo clippy --manifest-path fuzz/Cargo.toml --package tributary-fuzz --all-targets --locked -- -D warnings
 
       - name: Code coverage
         if: matrix.arch == 'x86_64'

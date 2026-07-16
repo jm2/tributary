@@ -63,7 +63,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
-| macOS "Open With" file association | ✅ |
+| Linux and macOS file associations | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 

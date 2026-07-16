@@ -167,6 +167,7 @@ dbus = "*"
 [dev-dependencies]
 http = "1"
 proptest = "1"
+toml = "0.8"
 
 [profile.release]
 opt-level = 3
