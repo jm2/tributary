@@ -538,8 +538,9 @@ All edits require an explicit **Save** click. Cancel discards all changes. Numer
 validated before a file is touched. Before editing is enabled, a background capability check
 requires every exact selected path to be a supported, readable, non-symlink regular file and
 rehearses create, flush, replace, and cleanup using two empty writer-owned siblings once per containing
-directory. Malformed or mixed local/remote selections fail closed instead of silently editing only
-a subset, and duplicate playlist rows write their exact file only once. Save rechecks the complete
+directory, stopping after the first blocked directory. Malformed or mixed local/remote selections
+fail closed instead of silently editing only a subset, and duplicate playlist rows write their
+exact file only once. Save rechecks the complete
 selection before writing the first track; the result is necessarily point-in-time, so an unplug,
 permission change, full filesystem, or target-specific lock can still make the real operation fail
 safely. Successful saves use an exclusively created, bounded

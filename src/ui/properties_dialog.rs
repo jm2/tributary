@@ -134,6 +134,28 @@ fn merge_preflight_failure(
     }
 }
 
+fn preflight_distinct_parents(
+    paths: &[PathBuf],
+    mut probe: impl FnMut(&std::path::Path) -> Result<(), TagWritePreflightError>,
+) -> TagEditingAvailability {
+    let mut parents = HashSet::new();
+    for path in paths {
+        let Some(parent) = path.parent() else {
+            return TagEditingAvailability::InvalidFile;
+        };
+        if !parents.insert(parent.to_path_buf()) {
+            continue;
+        }
+        if let Err(failure) = probe(path) {
+            // Once the selection is blocked, probing later directories can no
+            // longer change the outcome and would only add blocking I/O and
+            // writer-sibling activity.
+            return merge_preflight_failure(TagEditingAvailability::Ready, failure);
+        }
+    }
+    TagEditingAvailability::Ready
+}
+
 /// Probe a complete, exact-deduplicated selection on a worker thread.
 fn preflight_paths(paths: &[PathBuf]) -> TagEditingAvailability {
     if paths.is_empty() {
@@ -156,21 +178,7 @@ fn preflight_paths(paths: &[PathBuf]) -> TagEditingAvailability {
     // Directory mechanics are parent-scoped. Rehearse the flushed atomic
     // replacement once per exact parent while retaining the per-file checks
     // above (including Windows read-only attributes).
-    let mut parents = HashSet::new();
-    paths
-        .iter()
-        .fold(TagEditingAvailability::Ready, |result, path| {
-            let Some(parent) = path.parent() else {
-                return merge_preflight_failure(result, TagWritePreflightError::NotRegularFile);
-            };
-            if !parents.insert(parent.to_path_buf()) {
-                return result;
-            }
-            match preflight_tag_write(path) {
-                Ok(()) => result,
-                Err(failure) => merge_preflight_failure(result, failure),
-            }
-        })
+    preflight_distinct_parents(paths, preflight_tag_write)
 }
 
 fn apply_tag_editing_availability(
@@ -1050,6 +1058,24 @@ mod tests {
 
         assert_eq!(forward, TagEditingAvailability::UnsupportedFormat);
         assert_eq!(reverse, forward);
+    }
+
+    #[test]
+    fn directory_preflight_stops_after_the_first_failure() {
+        let paths = vec![
+            PathBuf::from("/first/song.flac"),
+            PathBuf::from("/second/song.flac"),
+            PathBuf::from("/third/song.flac"),
+        ];
+        let mut probed = Vec::new();
+
+        let availability = preflight_distinct_parents(&paths, |path| {
+            probed.push(path.to_path_buf());
+            Err(TagWritePreflightError::Unavailable)
+        });
+
+        assert_eq!(availability, TagEditingAvailability::Unavailable);
+        assert_eq!(probed, vec![paths[0].clone()]);
     }
 
     #[test]
