@@ -82,23 +82,24 @@ fn desktop_value(key: &str) -> &str {
 }
 
 fn workflow_job<'a>(source: &'a str, name: &str) -> &'a str {
-    let marker = format!("  {name}:\n");
-    let (_, body) = source
-        .split_once(&marker)
-        .unwrap_or_else(|| panic!("workflow job {name} must exist"));
+    let marker = format!("  {name}:");
+    let mut body_start = None;
     let mut offset = 0;
 
-    for line in body.split_inclusive('\n') {
-        if offset > 0
-            && line.starts_with("  ")
-            && !line.starts_with("    ")
-            && line.trim_end().ends_with(':')
-        {
-            return &body[..offset];
+    for line in source.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        if let Some(start) = body_start {
+            if content.starts_with("  ") && !content.starts_with("    ") && content.ends_with(':') {
+                return &source[start..offset];
+            }
+        } else if content == marker {
+            body_start = Some(offset + line.len());
         }
         offset += line.len();
     }
-    body
+
+    let start = body_start.unwrap_or_else(|| panic!("workflow job {name} must exist"));
+    &source[start..]
 }
 
 #[test]
@@ -225,8 +226,14 @@ fn ci_compile_proves_the_exact_declared_msrv() {
         .as_str()
         .expect("package.rust-version must be a string");
     let msrv_job = workflow_job(CI_WORKFLOW, "msrv");
+    let crlf_workflow = CI_WORKFLOW.lines().collect::<Vec<_>>().join("\r\n");
+    let crlf_msrv_job = workflow_job(&crlf_workflow, "msrv");
 
     assert_eq!(rust_version, "1.92");
+    assert!(
+        crlf_msrv_job.contains("name: MSRV (1.92)"),
+        "CI workflow contract checks must accept Windows CRLF checkouts"
+    );
     assert!(
         msrv_job.contains("name: MSRV (1.92)"),
         "CI job name must expose the declared MSRV"

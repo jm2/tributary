@@ -891,6 +891,8 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   requirements, desktop launch field, category, and exact MSRV CI pin synchronized. The fuzz
   lockfile had already drifted — its `kstring 2.0.3` requires rustc 1.96, above even the corrected
   MSRV — and is resynced to the main lock's 2.0.2; `--locked` keeps it from drifting silently again.
+  Workflow-job inspection recognizes both LF and CRLF source and synthesizes a CRLF checkout in the
+  MSRV regression, preventing Windows line-ending conversion from hiding a real job.
   Windows architecture jobs use `fail-fast: false`, retaining both diagnostic results if one
   runner fails. The optional setup-msys2 package cache remains enabled on x86_64 but is disabled on
   `windows-11-arm`: its action-owned `paccache` cleanup intermittently exited 127 after successful
@@ -1167,18 +1169,21 @@ validation remain open local/integration tasks; the release workflow remains del
 
 PR #100 CI follow-up (2026-07-16): Windows x86_64 reproduced the protected-loopback regression's
 fixture failure twice while the isolated GStreamer child itself exited successfully. The original
-eight-second target-listener window began before child startup and cold plugin discovery; the
-failing job took 16.64 seconds, so the fixture could disappear before `souphttpsrc` opened. The
-child now owns the intended media listener and starts its bounded window only after GStreamer
-initialization, while the parent keeps the poisoned-proxy listener live until child completion and
-injects proxy variables through `Command` before process creation. This preserves the end-to-end
-target-hit/proxy-miss assertion without mutating a multithreaded Unix process environment. The
-exact test passes three consecutive debug and three consecutive release runs, all 147 audio tests
-pass, strict all-target and release Clippy pass, and the complete release
-all-target/all-feature suite passes 18 library, 646 application, and 8 metadata tests (672 total).
-Formatting and `git diff --check` also pass. Windows matrix jobs now retain both architecture
-results, and setup-msys2's optional package cache is disabled only on ARM after its action-owned
-cleanup intermittently failed.
+eight-second target-listener window began before child startup and cold plugin discovery, so the
+fixture could disappear before `souphttpsrc` opened. The child now owns the intended media listener
+and starts its bounded window only after GStreamer initialization, while the parent keeps the
+poisoned-proxy listener live until child completion and injects proxy variables through `Command`
+before process creation. This preserves the end-to-end target-hit/proxy-miss assertion without
+mutating a multithreaded Unix process environment. The next Windows run passed all 627 application
+tests, including that regression, then exposed an unrelated LF-only workflow-job parser in the
+metadata suite: a CRLF checkout made the real `msrv` job appear absent. Job extraction now operates
+on logical lines independent of the newline spelling and the MSRV test synthesizes CRLF input on
+every platform. The exact proxy test passes three consecutive debug and three consecutive release
+runs, all 147 audio tests pass, the focused CRLF metadata regression passes, strict all-target and
+release Clippy pass, and the complete release all-target/all-feature suite passes 18 library, 646
+application, and 8 metadata tests (672 total). Formatting and `git diff --check` also pass. Windows
+matrix jobs now retain both architecture results, and setup-msys2's optional package cache is
+disabled only on ARM after its action-owned cleanup intermittently failed.
 
 **This gate is now enforced by CI** (P2.6, closed 2026-07-16): in addition to
 `cargo fmt --check`, both `clippy -D warnings` invocations, `cargo test --release`, and
@@ -1619,7 +1624,7 @@ Add one line per completed task:
 | 2026-07-15 | P2.5 legacy-root reauthorization | PR #95 | Explicit portal reselection records an immutable OLD→NEW intent; a marker-backed authority lease and guarded atomic transaction preserve track identity/history and playlist links; a same-transaction receipt makes crash/ambiguous-commit recovery idempotent; and malformed, overlapping, colliding, or inconsistent states quarantine unsafe scopes. Effective-write UX follows in PR #98; installed interactive smoke testing remains open. |
 | 2026-07-15 | P2.5 effective tag-write capability | PR #98 | Properties checks every exact selected local path off GTK, independently proves each Windows file's DACL access, rehearses the writer's flushed atomic replacement once per parent, and stops at the first blocked target or directory. It exposes localized all-or-none capability state, exact-deduplicates repeated playlist paths, and rechecks before the first write. Unix siblings begin private and Windows siblings install the source DACL while exclusively held before copying content. Sixteen focused tests cover the slice across Unix and Windows; only installed interactive Flatpak/physical-media smoke validation remains open in P2.5. |
 | 2026-07-15 | P2.6 0.5.0 release metadata | PR #96 | Added the missing AppStream 0.5.0 release entry, archived the shipped release in the changelog, and advanced Cargo/changelog development metadata to 0.5.1. The live release-workflow verification remains deliberately deferred. |
-| 2026-07-16 | P2.6 packaging and CI completion | PR #100 | Debian, generated RPM, handwritten RPM, and Arch metadata now match the GTK 4.16/libadwaita 1.6 API floor; Linux desktop activation passes `%U` and declares `AudioVideo`; Cargo/README declare the proven Rust 1.92 floor; exact-MSRV, debug all-target, fuzz, desktop, and AppStream gates run in CI; and eight repository contract tests prevent the declarations from drifting independently. Windows matrix jobs retain both architecture results, the ARM runner bypasses setup-msys2's intermittently failing optional package-cache cleanup while retaining Cargo caching, and the poisoned-proxy regression keeps the parent proxy fixture alive through child completion while starting the child media listener's bounded window only after GStreamer initialization, so cold Windows plugin discovery cannot create a false negative. |
+| 2026-07-16 | P2.6 packaging and CI completion | PR #100 | Debian, generated RPM, handwritten RPM, and Arch metadata now match the GTK 4.16/libadwaita 1.6 API floor; Linux desktop activation passes `%U` and declares `AudioVideo`; Cargo/README declare the proven Rust 1.92 floor; exact-MSRV, debug all-target, fuzz, desktop, and AppStream gates run in CI; and eight repository contract tests prevent the declarations from drifting independently, including under a synthesized CRLF workflow checkout. Windows matrix jobs retain both architecture results, the ARM runner bypasses setup-msys2's intermittently failing optional package-cache cleanup while retaining Cargo caching, and the poisoned-proxy regression keeps the parent proxy fixture alive through child completion while starting the child media listener's bounded window only after GStreamer initialization, so cold Windows plugin discovery cannot create a false negative. |
 | 2026-07-16 | P2.9 | PR #99 | Removed the inoperative `shairport-sync` receiver fallback, moved the remaining capability refusal ahead of media preparation, localized actionable `raopsink`/`gst-plugins-bad` guidance, surfaced safe player errors in-app, and added focused missing-element/load-path regressions. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
