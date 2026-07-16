@@ -202,11 +202,6 @@ impl Player {
     pub fn new(
         rt_handle: tokio::runtime::Handle,
     ) -> anyhow::Result<(Self, async_channel::Receiver<PlayerEvent>)> {
-        // On Windows, point GStreamer at bundled plugins next to the executable
-        // before init() scans the plugin registry.
-        #[cfg(target_os = "windows")]
-        Self::set_bundled_plugin_path();
-
         gst::init()?;
         info!("GStreamer {}", gst::version_string());
 
@@ -700,60 +695,6 @@ impl Player {
 
             None
         });
-    }
-
-    /// On Windows, set `GST_PLUGIN_PATH` to the bundled `lib/gstreamer-1.0`
-    /// directory next to the executable, so GStreamer can find codec plugins
-    /// in a self-contained deployment.
-    ///
-    /// Does nothing if the variable is already set (user override) or if
-    /// the bundled directory does not exist (dev/MSYS2 environment).
-    #[cfg(target_os = "windows")]
-    fn set_bundled_plugin_path() {
-        use std::env;
-
-        if env::var_os("GST_PLUGIN_PATH").is_some() {
-            info!("GST_PLUGIN_PATH already set — skipping bundled plugin detection");
-            return;
-        }
-
-        let exe = match env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("Could not determine exe path: {e}");
-                return;
-            }
-        };
-        let Some(dir) = exe.parent() else { return };
-        let plugin_dir = dir.join("lib").join("gstreamer-1.0");
-
-        if plugin_dir.is_dir() {
-            let count = std::fs::read_dir(&plugin_dir)
-                .map(|rd| {
-                    rd.filter(|e| {
-                        e.as_ref()
-                            .is_ok_and(|e| e.path().extension().is_some_and(|ext| ext == "dll"))
-                    })
-                    .count()
-                })
-                .unwrap_or(0);
-
-            env::set_var("GST_PLUGIN_PATH", &plugin_dir);
-            // Force a fresh registry scan so stale system paths don't win.
-            let registry = dir.join("gst-registry.bin");
-            env::set_var("GST_REGISTRY", &registry);
-
-            info!(
-                path = %plugin_dir.display(),
-                plugins = count,
-                "Bundled GStreamer plugins detected"
-            );
-        } else {
-            info!(
-                path = %plugin_dir.display(),
-                "No bundled GStreamer plugin directory found — using system plugins"
-            );
-        }
     }
 
     /// Install a pad probe on `osxaudiosink` that caps the negotiated

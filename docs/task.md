@@ -31,9 +31,10 @@ has five independently verifiable tasks rather than the original three compound 
 denominator excludes the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**173/220 (78.6%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **56/76 P2**,
+**178/220 (80.9%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **61/76 P2**,
 and **3/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
-and the seven remaining P2.6 boxes closed by PR #100 since the prior snapshot. The release-workflow
+and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
+closed by this P2.7 pull request, since the earlier snapshot. The release-workflow
 dry run remains deliberately deferred rather than being counted as unfinished P0 remediation.
 
 ## P0 — Release blockers
@@ -910,11 +911,47 @@ sandbox-permission implementation; real-hardware validation is still outstanding
 
 ### P2.7 Fix platform cache paths
 
-- [ ] Store GStreamer registries in a per-user cache directory.
-- [ ] Avoid writes inside `/Applications` and Program Files.
-- [ ] Generate or patch the macOS pixbuf loader cache for the installed absolute bundle path.
-- [ ] Verify macOS signature integrity after first launch.
-- [ ] Record implementation: _pending_
+- [x] Store GStreamer registries in a per-user cache directory. Bundled Windows and macOS
+  startup now selects `dirs::cache_dir()/tributary/runtime/<platform>-<architecture>/<install
+  fingerprint>/gstreamer/registry.bin` before GTK or GStreamer initializes. Each explicit
+  environment override is preserved independently, including an intentionally empty value. If
+  Windows cannot establish the preferred cache, it leaves `GST_REGISTRY` unset for GStreamer's
+  normal user default and never falls back beside the executable.
+- [x] Avoid writes inside `/Applications` and Program Files. The Player's late Windows
+  executable-adjacent registry setup and the macOS launcher's bundle-local registry are removed.
+  Runtime cache roots are projected through their nearest existing canonical ancestor before any
+  directory creation, then canonicalized and checked again afterward; a direct or symlinked path
+  into the application install fails closed. Sixteen focused pure/static tests cover platform,
+  architecture, and install-path separation; false bundle shapes; explicit empty overrides;
+  absence of install-directory fallback; direct and symlinked cache containment; cache-directory
+  failure; malicious cache output; relocatable-helper normalization; atomic replacement; and
+  build-script ordering.
+- [x] Generate or patch the macOS pixbuf loader cache for the installed absolute bundle path. The
+  app bundles, fixes, and signs `gdk-pixbuf-query-loaders`, enumerates the exact absolute loader
+  modules after relocation, invokes the helper with that exact module directory, drains stdout
+  and stderr concurrently under a 15-second deadline and fixed bounds, and accepts only nonempty
+  UTF-8 output whose module/info/MIME/extension/signature record structure contains every expected
+  module exactly once. Standalone quoted metadata—including an empty MIME or extension list—is not
+  misclassified as a module. Exact absolute module records are retained; safe helper-relative
+  records are accepted only when they resolve against the signed helper's top level to the exact
+  expected loader set, then rewritten to C-escaped absolute installed paths. Traversal, malformed,
+  duplicate, incomplete, absolute-outside, and unmatched-relative records fail closed. Only
+  validated output atomically replaces a same-directory user-cache temporary after flush and
+  `fsync`; failures preserve the previous cache. The copied Homebrew cache is removed before
+  signing and is never patched in place.
+- [x] Verify macOS signature integrity after first launch. The packaging script makes component,
+  deep bundle signing, and `codesign --verify --deep --strict --verbose=2` fatal. It probes a
+  read-only signed copy relocated beneath a path containing spaces with a fresh explicit cache
+  root: real early setup must decode the bundled application PNG through GDK-Pixbuf, initialize
+  GStreamer, find bundled `playbin3`, create both user caches with current absolute bundle paths,
+  and create no cache in the `.app`. The launched copy and untouched packaged app then pass strict
+  deep verification, with no later packaged-app mutation before optional DMG creation.
+- [x] Record implementation: this P2.7 pull request. `src/platform_runtime.rs`
+  owns early bundle detection, override policy, cache derivation/containment, bounded pixbuf-cache
+  generation, atomic replacement, and the hidden packaging-only probe; `build-macos.sh` owns the
+  signed helper and post-sign acceptance sequence. Native macOS helper/signature/probe execution
+  and Windows bundle startup remain CI/platform validation because this branch was authored on
+  Linux; the Linux-available static and Rust gates cover their portable policy seams.
 
 ### P2.8 Bound Chromecast control I/O
 
@@ -1149,7 +1186,33 @@ PR #94's containerized Flatpak build proved the manifest-local source generation
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
 
-Most recent branch validation (2026-07-16, PR #100 P2.6 packaging/CI slice): exact Rust 1.92
+Most recent branch validation (2026-07-16, P2.7 platform-runtime slice): `cargo check
+--all-targets --all-features --locked`, strict debug all-target/all-feature Clippy, and strict
+release all-feature Clippy pass. Debug and release `cargo test --all-targets --all-features`
+each pass 18 library, 662 application, and 8 repository-metadata tests (688 total per profile);
+the application count includes 16 focused platform-runtime policy/static regressions. `cargo fmt
+--all -- --check`, `bash -n scripts/build-macos.sh`, and `git diff --check` also pass. The full
+test rerun required the ordinary host loopback namespace because the restricted command sandbox
+rejects local socket binds; the same tests pass there. `cargo audit --no-fetch` reports only the
+two already accepted unmaintained warnings. This Linux host cannot execute the
+target-gated Windows bundle startup or macOS `gdk-pixbuf-query-loaders`/GStreamer/signature probe.
+The portable cache-path tests derive absolute fixtures from the host's temporary directory, so
+Windows CI exercises the same containment and loader-validation assertions with native
+drive-qualified paths rather than failing early on Unix-shaped literals.
+The separate fuzz-workspace lockfile includes the new macOS-only direct dependency, and the exact
+CI `cargo fmt` plus strict all-target `cargo clippy --locked` fuzz gate passes against it.
+The first two native macOS packaging runs proved signing and bundle construction, then the original
+generic validator rejected a standalone quoted cache record without identifying it. Upstream's
+record grammar permits standalone quoted empty MIME and extension-list fields, so the validator now
+tracks module, info, MIME, extension, signature, and record-separator state rather than classifying
+every standalone quoted line as a module. It also normalizes only safe helper-relative records that
+resolve to the exact expected set, and reports a sanitized basename for any remaining unexpected
+module; focused regressions cover both contracts. Native macOS CI remains the authoritative
+confirmation.
+The macOS build job runs that signed relocated first-launch probe as part of packaging, while the
+Windows build job remains the platform compile/startup authority.
+
+Previous branch validation (2026-07-16, PR #100 P2.6 packaging/CI slice): exact Rust 1.92
 passes `cargo check --all-targets --locked`, while Rust 1.85 rejects the locked graph with the
 documented gtk-rs 1.92 floors. Strict debug all-feature and release Clippy pass; debug and release
 `cargo test --all-targets` each pass 18 library, 646 application, and 8 repository-metadata tests
@@ -1626,5 +1689,6 @@ Add one line per completed task:
 | 2026-07-15 | P2.6 0.5.0 release metadata | PR #96 | Added the missing AppStream 0.5.0 release entry, archived the shipped release in the changelog, and advanced Cargo/changelog development metadata to 0.5.1. The live release-workflow verification remains deliberately deferred. |
 | 2026-07-16 | P2.6 packaging and CI completion | PR #100 | Debian, generated RPM, handwritten RPM, and Arch metadata now match the GTK 4.16/libadwaita 1.6 API floor; Linux desktop activation passes `%U` and declares `AudioVideo`; Cargo/README declare the proven Rust 1.92 floor; exact-MSRV, debug all-target, fuzz, desktop, and AppStream gates run in CI; and eight repository contract tests prevent the declarations from drifting independently, including under a synthesized CRLF workflow checkout. Windows matrix jobs retain both architecture results, the ARM runner bypasses setup-msys2's intermittently failing optional package-cache cleanup while retaining Cargo caching, and the poisoned-proxy regression keeps the parent proxy fixture alive through child completion while starting the child media listener's bounded window only after GStreamer initialization, so cold Windows plugin discovery cannot create a false negative. |
 | 2026-07-16 | P2.9 | PR #99 | Removed the inoperative `shairport-sync` receiver fallback, moved the remaining capability refusal ahead of media preparation, localized actionable `raopsink`/`gst-plugins-bad` guidance, surfaced safe player errors in-app, and added focused missing-element/load-path regressions. |
+| 2026-07-16 | P2.7 platform runtime caches | PR #101 | Moved bundled GStreamer registries to install-keyed per-user caches before toolkit initialization, removed executable-adjacent fallback, added record-structured validation and exact absolute-path rewriting for the signed macOS pixbuf helper's generated cache, and made a path-with-spaces/read-only post-sign runtime probe plus final strict signature verification part of macOS packaging. Sixteen focused policy/static tests cover the portable contract, and the independent fuzz lock remains synchronized for CI's strict locked Clippy gate; native macOS and Windows execution remains CI/platform validation. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
