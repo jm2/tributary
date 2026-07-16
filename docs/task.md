@@ -930,7 +930,7 @@ cannot transmit to the device that was clicked.
   proves the load path emits `Error` (with the actionable message) then `Stopped` — never a
   silent stream — and `raopsink_guidance_is_localized_for_every_catalog` proves every locale
   names both `raopsink` and `gst-plugins-bad` without falling back to English.
-- [ ] Record implementation: _pending_
+- [x] Record implementation: PR #99.
 
 Acceptance criteria: selecting an AirPlay receiver either plays to that receiver or fails with an
 error that tells the user what to install.
