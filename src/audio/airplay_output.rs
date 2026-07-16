@@ -158,8 +158,14 @@ impl AirPlayOutput {
         // Tear down any previous session before starting a new one.
         self.close_session();
 
-        // Prepare exactly once so both the preferred and fallback pipelines
-        // receive the same credential-safe URI and own the same ticket.
+        // Refuse a missing transmitter before any per-track proxy work:
+        // otherwise a protected load would start a loopback route and mint
+        // a ticket only to revoke it, and a preparation failure would mask
+        // the actionable install guidance with its generic message.
+        Self::ensure_raopsink(Self::raopsink_available())?;
+
+        // Prepare exactly once so the pipeline receives the credential-safe
+        // URI and owns the ticket.
         let prepared = self
             .media_proxy
             .prepare(uri)
@@ -169,6 +175,8 @@ impl AirPlayOutput {
 
     fn open_resolved_session(&self, request: ResolvedHttpRequest) -> Result<(), String> {
         self.close_session();
+        // Same order as `open_session`: transmitter first, proxy work second.
+        Self::ensure_raopsink(Self::raopsink_available())?;
         let prepared = self
             .media_proxy
             .prepare_resolved(request)
@@ -218,7 +226,6 @@ impl AirPlayOutput {
         let volume = self.volume;
         let generation = self.event_generation();
 
-        Self::ensure_raopsink(Self::raopsink_available())?;
         let pipeline = Self::build_raop_pipeline(host, port, prepared_uri, volume)?;
         let bus_watch = match self.attach_bus_watch(&pipeline, generation, media_ticket.clone()) {
             Ok(watch) => watch,
@@ -649,17 +656,29 @@ mod tests {
     }
 
     #[test]
-    fn protected_load_without_runtime_fails_before_gstreamer() {
+    fn protected_load_fails_closed_before_any_pipeline_sees_the_secret() {
         const SECRET: &str = "airplay-secret-must-not-leak";
+
+        gst::init().expect("GStreamer init");
 
         let (tx, rx) = async_channel::unbounded();
         let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
         let generation = PlayerEventGeneration::from_raw(42);
         output.set_event_generation(generation);
 
-        // A protected URI requires the app runtime to mint its loopback
-        // ticket. With no runtime configured, preparation must fail before
-        // either AirPlay GStreamer pipeline is inspected or constructed.
+        // The transmitter gate runs before any per-track proxy work, so on
+        // a machine without `raopsink` the actionable install guidance wins.
+        // With `raopsink` registered, preparation is reached next and must
+        // fail — a protected URI requires the app runtime to mint its
+        // loopback ticket, and none is configured. Either way the failure
+        // is a fixed message and no pipeline is ever constructed around the
+        // credential-bearing URI.
+        let expected = if AirPlayOutput::raopsink_available() {
+            "AirPlay media preparation failed".to_string()
+        } else {
+            AirPlayOutput::raopsink_missing_message(&rust_i18n::locale())
+        };
+
         output.load_uri(&format!("https://music.test/stream?api_key={SECRET}"));
 
         assert!(matches!(
@@ -676,12 +695,12 @@ mod tests {
                 message,
             }) => {
                 assert_eq!(event_generation, generation);
-                assert_eq!(message, "AirPlay media preparation failed");
+                assert_eq!(message, expected);
                 assert!(!message.contains(SECRET));
                 assert!(!message.contains("api_key"));
                 assert!(!message.contains("music.test"));
             }
-            event => panic!("expected fixed preparation error, got {event:?}"),
+            event => panic!("expected fixed load error, got {event:?}"),
         }
 
         assert!(matches!(
