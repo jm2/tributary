@@ -222,6 +222,7 @@ errors:
     decoder_failed: "Si è verificato un errore nel decoder audio"
     audio_output_failed: "Si è verificato un errore nell’uscita audio"
     playback_failed: "La riproduzione audio non è riuscita"
+    airplay_raopsink_missing: "AirPlay richiede l'elemento raopsink di GStreamer: installa il pacchetto gst-plugins-bad e riavvia Tributary"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

@@ -1456,6 +1456,7 @@ pub fn build_window(
         let cv = column_view.clone();
         let buffering_tracker = buffering_tracker.clone();
         let clear_playback_ui = clear_playback_ui.clone();
+        let toast_overlay = toast_overlay.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -1624,6 +1625,13 @@ pub fn build_window(
 
                     PlayerEvent::Error { message, .. } => {
                         tracing::error!(error = %message, "Player error");
+                        // Show the failure to the user. Outputs reduce every
+                        // failure to a fixed category or fixed actionable
+                        // string before it can reach a player event — never
+                        // server text, a URL, or a credential — so the
+                        // message is safe to display verbatim. Without this,
+                        // a failed load is visible only in the logs.
+                        toast_overlay.add_toast(adw::Toast::new(&message));
                         // A protected resolver has already handed its request
                         // to the output at this point. If that load fails, keep
                         // the queue item but force the next Play through a new

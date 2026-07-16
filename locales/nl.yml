@@ -222,6 +222,7 @@ errors:
     decoder_failed: "De audiodecoder is mislukt"
     audio_output_failed: "De audio-uitvoer is mislukt"
     playback_failed: "Het afspelen van audio is mislukt"
+    airplay_raopsink_missing: "AirPlay vereist het GStreamer-element raopsink – installeer het pakket gst-plugins-bad en start Tributary opnieuw"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

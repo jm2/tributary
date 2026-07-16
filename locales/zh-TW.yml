@@ -222,6 +222,7 @@ errors:
     decoder_failed: "音訊解碼器發生錯誤"
     audio_output_failed: "音訊輸出失敗"
     playback_failed: "音訊播放失敗"
+    airplay_raopsink_missing: "AirPlay 需要 GStreamer 的 raopsink 元素。請安裝 gst-plugins-bad 套件，然後重新啟動 Tributary"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

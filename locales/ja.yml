@@ -222,6 +222,7 @@ errors:
     decoder_failed: "オーディオデコーダーでエラーが発生しました"
     audio_output_failed: "オーディオ出力に失敗しました"
     playback_failed: "オーディオ再生に失敗しました"
+    airplay_raopsink_missing: "AirPlay には GStreamer の raopsink エレメントが必要です。gst-plugins-bad パッケージをインストールしてから Tributary を再起動してください"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:
