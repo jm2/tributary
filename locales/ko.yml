@@ -189,6 +189,13 @@ properties:
   searching: "검색 중…"
   not_found: "찾을 수 없음"
   mixed: "혼합"
+  write_checking: "선택한 파일을 편집할 수 있는지 확인하는 중…"
+  write_saving: "태그 변경 사항을 저장하는 중…"
+  write_ready: "선택한 파일은 현재 쓰기 가능합니다."
+  write_unsupported: "선택한 파일 형식 중 하나 이상이 지원되지 않아 태그를 편집할 수 없습니다."
+  write_invalid_file: "선택한 트랙 중 하나 이상이 일반 로컬 파일이 아니어서 태그를 편집할 수 없습니다."
+  write_unavailable: "선택한 파일 또는 그 폴더 중 하나 이상이 읽기 전용이거나 사용할 수 없어 태그를 편집할 수 없습니다."
+  write_device_unavailable: "이 장치는 현재 읽기 전용이거나 사용할 수 없습니다. Flatpak에서는 쓰기 권한을 요청하려면 환경 설정에서 해당 폴더를 사용자 지정 라이브러리로 추가하세요."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

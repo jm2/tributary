@@ -31,7 +31,7 @@ has five independently verifiable tasks rather than the original three compound 
 denominator excludes the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**161/220 (73.2%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **44/76 P2**,
+**162/220 (73.6%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **45/76 P2**,
 and **3/30 P3** after those exclusions. The release-workflow dry run remains deliberately deferred
 rather than being counted as unfinished P0 remediation.
 
@@ -376,9 +376,9 @@ proxies. All ticket routes use OS-assigned ports and unguessable UUIDs.
   publishing an opaque reference that can only fail, and searches later media/part entries before
   declaring a track unplayable. Locator, bitrate, and format now come from the same selected media
   entry; 2 focused tests cover missing, empty, and later valid locators and metadata alignment.
-  The P2.11 retained-route follow-up on the current branch converts DAAP's live URL materialization
-  into a typed, private-query, lease-bearing request without changing its credential-free
-  catalogue reference; PR #97.
+  The P2.11 retained-route follow-up in PR #97 converts DAAP's live URL materialization into a
+  typed, private-query, lease-bearing request without changing its credential-free catalogue
+  reference.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
 device or daemon Tributary does not own, retained in a generic catalogue/UI value, or serialized
@@ -603,10 +603,12 @@ exists** in `src/local/tag_writer.rs`. The real defects are narrower and all rea
   nothing, and reported success. `TagEdits::validate` now rejects the whole edit before any file
   is opened, the dialog surfaces it while the user can still fix it, and the numeric entries
   declare `InputPurpose::Digits`.
-- [x] Guarantee cleanup on every failure path. A failed `fs::rename` escaped through `?` from
+- [x] Attempt cleanup on every failure path. A failed `fs::rename` escaped through `?` from
   inside the success arm, orphaning `<song>.mp3.tributary-tag-tmp` next to the user's music
-  forever. The temp file is now owned by an RAII guard that removes it unless it is explicitly
-  persisted, so a failed rename cleans up too.
+  forever. The temp file is now owned by an RAII guard that calls `remove_file` unless it is
+  explicitly persisted, including after a failed rename. Cleanup I/O and process termination are
+  inherently fallible, so the exact reserved name is also excluded from scans and watcher
+  admission rather than being described as an absolute deletion guarantee.
 - [x] Use an exclusively created random sibling temp path. The fixed `.tributary-tag-tmp` suffix
   created via `fs::copy` had no `O_EXCL` and no randomness, so two concurrent saves to the same
   file clobbered each other and the copy would follow a symlink planted at the predictable path.
@@ -621,10 +623,12 @@ exists** in `src/local/tag_writer.rs`. The real defects are narrower and all rea
   toward `is_empty()`, but `write_tags_to` never read it — the file was rewritten and the field
   ignored. It is now applied via `ItemKey::AlbumArtist`. (Still no widget sets it; implementing it
   removes the trap for whoever adds one.)
-- [x] Preserve permissions and define durability/fsync behavior accurately. Permissions are copied
-  on a best-effort basis from the file being replaced, and the tagged copy is `fsync`ed before the
-  rename, so a crash cannot leave a truncated file where the original was. The module doc now states
-  this rather than implying it.
+- [x] Preserve permissions and define durability/fsync behavior accurately. Unix siblings begin at
+  mode `0600` before receiving the source mode on a best-effort basis. Windows snapshots the source
+  DACL, creates the sibling through an exclusive no-sharing handle with `WRITE_DAC`, and installs
+  that DACL before copying the first audio byte, so a more permissive parent ACL cannot briefly
+  expose the copy. The tagged copy is `fsync`ed before the rename, so a crash cannot leave a
+  truncated file where the original was. The module doc states these guarantees accurately.
 - [x] Add focused failure, platform, and indexing tests: 10 regressions cover validation, a
   malformed number leaving the file byte-for-byte untouched with no temp behind, temp cleanup after
   a failed tag write, unsupported formats, temp-path uniqueness plus self-removal, and
@@ -646,13 +650,16 @@ exists** in `src/local/tag_writer.rs`. The real defects are narrower and all rea
   `tests/fixtures/audio/README.md` records the generation recipe, GPL-3.0-or-later/no-third-party-
   recording provenance, and SHA-256
   `c47ed5dbe255701328f28b58fbe7408a70ae2ad20057089b5393253a00eab946`.
-- [x] Record implementation: commits `6d0ec95` and `2d305e7` plus PR #91; 11 focused tests.
+- [x] Record implementation: commits `6d0ec95` and `2d305e7` plus PR #91 supplied the original 11
+  focused tests; PR #98 adds effective capability rehearsal, private Unix creation mode, and the
+  exclusive pre-content Windows DACL path and platform regression.
 
 Acceptance criteria: invalid edits leave the original byte-for-byte untouched, every failed save
-removes its temporary sibling, and a successful public tag write preserves readable audio while all
-declared fields round-trip without temporary-file residue. The private filename remains bounded for
-near-limit source names, and even a slow save cannot publish a temporary library row or replace the
-original track's stable identity, history, or playlist links.
+attempts to remove its temporary sibling, and a successful public tag write preserves readable
+audio while all declared fields round-trip without temporary-file residue. A cleanup failure cannot
+publish the exact reserved sibling as a library row. The writer-owned filename remains bounded for
+near-limit source names, and even a slow save cannot replace the original track's stable identity,
+history, or playlist links.
 
 ### P2.4 Make removable-media browsing safe and asynchronous
 
@@ -794,10 +801,28 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   compare-and-swap config cleanup installs NEW only for the request the engine processed. Twenty-
   eight focused preference, migration, path-planning, atomicity, marker, collision, crash-recovery,
   and quarantine tests cover the contract. Implementation merged in PR #95.
-- [ ] Surface effective write capability in track Properties. Automatic Devices roots are
-  read-only at the Flatpak sandbox boundary, but the dialog currently enables Save from format
-  support alone and reports the filesystem error only after an attempted write. Disable editing or
-  explain the limitation before Save when the selected source cannot be written.
+- [x] Surface effective write capability in track Properties. The dialog now starts fail-closed and
+  checks every exact-deduplicated selected path off the GTK thread: it must be a supported,
+  readable, non-symlink regular file, and two exclusively created empty writer-namespace siblings
+  rehearse flush, replace-over-existing, and explicit cleanup once per distinct parent directory,
+  stopping after the first blocked directory rather than touching later parents unnecessarily. On
+  Windows, every exact file separately installs its source DACL on an empty sibling and must reopen
+  it for the read/write/delete rights used later, so two files in one parent cannot incorrectly
+  share the first file's security evidence.
+  Mode bits and path prefixes are not treated as capability because they do not describe Flatpak
+  bind mounts, portal grants, ACLs, FUSE, or Windows access rules. A visible localized status in all
+  13 catalogs enables fields, MusicBrainz, and Save only for a wholly capable selection, with
+  automatic-device-specific Flatpak custom-library guidance on failure. Malformed or mixed
+  local/remote selections no longer silently admit only a valid subset; repeated playlist paths are
+  written once. Save repeats the whole check before the first write, invalidates a pending
+  MusicBrainz completion, and disables Cancel/header close until the worker returns; Unix siblings
+  begin at mode `0600` before a full source copy exists. Windows siblings remain exclusively held
+  while the source DACL is installed before the first copied byte, closing the equivalent
+  inherited-ACL exposure window. The writer remains the final fallible authority for state, space,
+  cleanup, sharing, and target-specific changes after preflight.
+  Sixteen focused writer, path-policy, batch, cleanup, permission/DACL, control-state, and
+  messaging tests cover the slice in PR #98 (15 run on Unix and the dedicated
+  exclusive-handle/DACL regression runs on Windows).
 - [ ] Run a local Flatpak build and smoke-test USB/custom-library behavior. This environment has
   Flatpak 1.18 but no `flatpak-builder` or installed builder runtime, and cannot provide the
   interactive portal plus physical removable-media pass. PR #94's containerized Flatpak job proved
@@ -808,8 +833,10 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   noninteractive branch passed the exact vendored checksum, Python and shell syntax, YAML parsing,
   the positive/negative permission-policy suite, cwd-independent generation from `/tmp` and `/`,
   nonempty JSON parsing, and byte-identical repeated generation. No repository-root
-  `cargo-sources.json` was created. The installed interactive portal/physical-media smoke task
-  above remains open, and the release workflow remains intentionally out of scope.
+  `cargo-sources.json` was created. PR #95 added identity-preserving legacy-root reauthorization;
+  PR #98 adds effective tag-write preflight and localized Properties gating. The
+  installed interactive portal/physical-media smoke task above remains open, and the release
+  workflow remains intentionally out of scope. Seven of eight P2.5 tasks are now closed.
 
 ### P2.6 Synchronize packaging metadata
 
@@ -1081,24 +1108,21 @@ by P2.6. PR #94's containerized Flatpak build proved the manifest-local source g
 permission policy, but a local installed interactive portal/physical-media smoke pass remains
 outstanding, as does the deliberately deferred live release-workflow run.
 
-Most recent branch validation (2026-07-15, P2.11 retained mDNS routing slice):
+Most recent branch validation (2026-07-15, PR #98 P2.5 effective tag-write capability slice):
 `cargo check --all-targets`, strict `cargo clippy --all-targets --all-features -- -D warnings`, and
 strict `cargo clippy --release -- -D warnings` pass. Debug and release
-`cargo test --all-targets` pass 18 library plus 628 application tests (646 per profile). The current
-diff adds 30 tests covering canonical/scoped exact-origin routes; bounded mDNS duplicate, update,
-removal, spelling, and cross-backend ownership; async and blocking stalled-resolver bypass with the
-original HTTP `Host`; explicit-proxy preservation; Subsonic, Jellyfin, Plex, and DAAP request
-propagation; Plex sign-in isolation; ephemeral source identity; and auth-attempt route snapshots,
-stale-guard release, and final-loss invalidation before queued network work begins. Existing DAAP
-lifecycle and cast-proxy integration regressions were strengthened to cover request revocation and
-routed end-to-end Host/auth/header/ticket behavior. The earlier urgent slice
-remains covered by its 13 proxy, timeout, diagnostic, translation, and real-GStreamer
-poisoned-proxy regressions. `cargo fmt --all -- --check`, every locale-catalog YAML parse,
+`cargo test --all-targets` pass 18 library plus 643 application tests (661 per Unix profile). The
+16 declared additions comprise 15 tests exercised on Unix and one Windows-only DACL regression,
+covering effective sibling create/flush/replace/cleanup and exclusive DACL installation; supported versus
+actual capability; missing, directory, symlink, cleanup-failure, read-only-parent, uppercase-format,
+and restrictive-mode behavior; exact local-URI admission and automatic-device source metadata;
+exact path deduplication; deterministic mixed-batch failure; and fail-closed control/localized-message
+state. `cargo fmt --all -- --check`, all 13 locale-catalog YAML parses and key parity,
 `git diff --check`, and AppStream validation pass; `cargo audit --no-fetch` passes with exactly the
 two accepted unmaintained warnings recorded under P0.8. `desktop-file-validate` still reports only
-the known `AudioVideo` category diagnostic tracked under P2.6. Packaged Windows/full-backend
-playback, interactive reauthorization, Flatpak portal behavior, and physical-media validation
-remain open local/integration tasks; the release workflow remains deliberately deferred.
+the known `AudioVideo` category diagnostic tracked under P2.6. The installed interactive Flatpak
+portal/physical-media smoke task, packaged Windows/full-backend playback, and physical-media
+validation remain open local/integration tasks; the release workflow remains deliberately deferred.
 
 **This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
 hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
@@ -1140,8 +1164,13 @@ Record scope or design decisions here so deferred work is explicit.
   ambiguous commit or failed config cleanup. Confirmed sources without a supported marker and
   markerless read-only destinations remain protected rather than guessed; a newly marked legacy
   source remains unconfirmed until the normal root-trust flow completes. The permission contract
-  is executable in CI; effective-write UX plus local interactive portal and physical-media smoke
-  testing remain required.
+  is executable in CI. Effective-write UX now uses the writer's actual sibling-create,
+  flush, replace, and cleanup mechanics on a worker rather than guessing from extensions, mode
+  bits, path prefixes, or cached mount metadata. Every selected file is validated, directory
+  rehearsal is deduplicated by exact parent, and the full selection is rechecked before the first
+  write; this is current mechanical capability, not library-root authorization or a promise that
+  later target-specific/space/mount state cannot change. Only the local installed interactive
+  portal and physical-media smoke test remains required for P2.5.
 - 2026-07-10 — P0.2 now fails closed for incomplete traversal, unavailable/replaced roots,
   nested mounts, mount-table failures, and ambiguous legacy databases. Legacy roots with
   existing metadata are intentionally not made deletion-authoritative from content heuristics;
@@ -1527,8 +1556,9 @@ Add one line per completed task:
 | 2026-07-15 | P2.2 | PR #90 | Atomic XSPF export, transactional and loss-preserving import, exact-path then ambiguity-safe normalized metadata matching, shared reconciliation semantics, explicit result counts/errors, and native-format conversion guidance. |
 | 2026-07-15 | P2.3 | `6d0ec95`, `2d305e7`, PR #91 | Numeric validation; bounded exclusive UUID-plus-format sibling files; exact scan/watcher exclusion and temp-to-original metadata refresh that preserve track identity, history, and playlist links; RAII cleanup; permission copying and pre-rename `fsync`; album-artist handling; and 11 focused tests including a public-API round trip against a generated silent FLAC fixture. |
 | 2026-07-15 | P2.4 native mount lifecycle | PR #93 | GIO main-thread mount inventory and live signals; best-available logical keys separate from native paths; synchronous confirmed-removal retirement; exact-intent relocation reactivation; bounded cancellable scans; and 26 focused tests. Physical-device validation remains open; Flatpak access follows under P2.5. |
-| 2026-07-15 | P2.5 Flatpak generation and access policy | PR #94 | Vendored checksum-pinned Cargo generator shared by local builds and CI; consistent manifest-local source generation; read-only standard external-media roots; reviewed GVfs bus access; portal-selected writable custom libraries; and a fail-closed permission policy test. Effective-write UX, installed interactive portal/physical-media smoke testing, and the deliberately deferred release workflow remain open. |
-| 2026-07-15 | P2.5 legacy-root reauthorization | PR #95 | Explicit portal reselection records an immutable OLD→NEW intent; a marker-backed authority lease and guarded atomic transaction preserve track identity/history and playlist links; a same-transaction receipt makes crash/ambiguous-commit recovery idempotent; and malformed, overlapping, colliding, or inconsistent states quarantine unsafe scopes. Effective-write UX and installed interactive smoke testing remain open. |
+| 2026-07-15 | P2.5 Flatpak generation and access policy | PR #94 | Vendored checksum-pinned Cargo generator shared by local builds and CI; consistent manifest-local source generation; read-only standard external-media roots; reviewed GVfs bus access; portal-selected writable custom libraries; and a fail-closed permission policy test. Later P2.5 slices closed effective-write UX and identity-preserving reauthorization; installed interactive portal/physical-media smoke testing and the deliberately deferred release workflow remain open. |
+| 2026-07-15 | P2.5 legacy-root reauthorization | PR #95 | Explicit portal reselection records an immutable OLD→NEW intent; a marker-backed authority lease and guarded atomic transaction preserve track identity/history and playlist links; a same-transaction receipt makes crash/ambiguous-commit recovery idempotent; and malformed, overlapping, colliding, or inconsistent states quarantine unsafe scopes. Effective-write UX follows in PR #98; installed interactive smoke testing remains open. |
+| 2026-07-15 | P2.5 effective tag-write capability | PR #98 | Properties checks every exact selected local path off GTK, independently proves each Windows file's DACL access, rehearses the writer's flushed atomic replacement once per parent, and stops at the first blocked target or directory. It exposes localized all-or-none capability state, exact-deduplicates repeated playlist paths, and rechecks before the first write. Unix siblings begin private and Windows siblings install the source DACL while exclusively held before copying content. Sixteen focused tests cover the slice across Unix and Windows; only installed interactive Flatpak/physical-media smoke validation remains open in P2.5. |
 | 2026-07-15 | P2.6 0.5.0 release metadata | PR #96 | Added the missing AppStream 0.5.0 release entry, archived the shipped release in the changelog, and advanced Cargo/changelog development metadata to 0.5.1. The live release-workflow verification remains deliberately deferred. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |

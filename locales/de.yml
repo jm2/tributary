@@ -189,6 +189,13 @@ properties:
   searching: "Suche…"
   not_found: "Nicht gefunden"
   mixed: "Gemischt"
+  write_checking: "Es wird geprüft, ob die ausgewählten Dateien bearbeitet werden können…"
+  write_saving: "Tag-Änderungen werden gespeichert…"
+  write_ready: "Die ausgewählten Dateien sind derzeit beschreibbar."
+  write_unsupported: "Die Tag-Bearbeitung ist nicht verfügbar, da mindestens ein ausgewähltes Dateiformat nicht unterstützt wird."
+  write_invalid_file: "Die Tag-Bearbeitung ist nicht verfügbar, da mindestens ein ausgewählter Titel keine reguläre lokale Datei ist."
+  write_unavailable: "Die Tag-Bearbeitung ist nicht verfügbar, da mindestens eine ausgewählte Datei oder ihr Ordner schreibgeschützt oder nicht verfügbar ist."
+  write_device_unavailable: "Dieses Gerät ist derzeit schreibgeschützt oder nicht verfügbar. Fügen Sie seinen Ordner in Flatpak unter Einstellungen als benutzerdefinierte Bibliothek hinzu, um Schreibzugriff anzufordern."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

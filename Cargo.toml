@@ -111,7 +111,7 @@ souvlaki = "0.8"
 # Windows-only: GDK4 Win32 backend (HWND extraction for souvlaki SMTC)
 [target.'cfg(target_os = "windows")'.dependencies]
 gdk4-win32 = "0.11"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
 
 # Stable filesystem IDs for removable/network library-root safety.
 [target.'cfg(unix)'.dependencies]
