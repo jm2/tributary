@@ -193,9 +193,9 @@ impl WindowsDacl {
                 DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut dacl,
+                &raw mut dacl,
                 std::ptr::null_mut(),
-                &mut descriptor,
+                &raw mut descriptor,
             )
         };
         if status != ERROR_SUCCESS {
@@ -216,8 +216,9 @@ impl WindowsDacl {
         };
         let mut control = 0;
         let mut revision = 0;
-        if unsafe { GetSecurityDescriptorControl(snapshot.descriptor, &mut control, &mut revision) }
-            == 0
+        if unsafe {
+            GetSecurityDescriptorControl(snapshot.descriptor, &raw mut control, &raw mut revision)
+        } == 0
         {
             return Err(std::io::Error::last_os_error());
         }
