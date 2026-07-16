@@ -368,11 +368,20 @@ impl TempFile {
     /// copied, so a source DACL that denies a later write fails while the
     /// sibling is still empty rather than after a full copy has been made.
     #[cfg(target_os = "windows")]
-    fn reopen_exclusive_for_write(&self) -> std::io::Result<std::fs::File> {
+    fn reopen_exclusive_for_tagging(&self) -> std::io::Result<std::fs::File> {
         use std::os::windows::fs::OpenOptionsExt;
 
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::DELETE;
+
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).share_mode(0);
+        // Lofty subsequently needs both read and write access. Proving both on
+        // the empty sibling also covers owner-relative ACE behavior after the
+        // source DACL is installed on this newly owned file. DELETE covers the
+        // access MoveFileExW needs when the sibling becomes the replacement.
+        options
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(0);
         options.open(&self.path)
     }
 
@@ -429,9 +438,9 @@ pub fn supports_tag_writes(path: &Path) -> bool {
 /// Validate the per-file portion of tag-write preflight without mutating the
 /// containing directory.
 ///
-/// Batch callers can validate every distinct track, then call
-/// [`preflight_tag_write`] once per distinct parent directory to avoid
-/// needlessly flushing probe files for every row in a large selection.
+/// Batch callers should validate every distinct track, run
+/// [`preflight_tag_write_target_access`] for every track, then call
+/// [`preflight_tag_write_directory`] once per distinct parent directory.
 pub fn validate_tag_write_target(path: &Path) -> Result<(), TagWritePreflightError> {
     if !supports_tag_writes(path) {
         return Err(TagWritePreflightError::UnsupportedFormat);
@@ -453,39 +462,75 @@ pub fn validate_tag_write_target(path: &Path) -> Result<(), TagWritePreflightErr
     Ok(())
 }
 
-/// Check whether the atomic tag writer can currently operate on `path`.
+/// Check file-specific access needed by the atomic tag writer.
 ///
-/// In addition to validating the input, this exclusively creates, flushes,
-/// replaces, and removes two empty private siblings beside the track. That is
-/// the only reliable cross-platform way to observe the directory capability
-/// the real writer needs: permission bits alone do not describe Flatpak
-/// read-only bind mounts, portal grants, ACLs, FUSE filesystems, or Windows
-/// access rules.
+/// On Windows, two files in one directory may have different DACLs. Apply this
+/// exact file's DACL to an empty, exclusively held sibling, close the
+/// privileged creation handle, and require a fresh ordinary read/write open
+/// through the installed DACL before removing the sibling. No content is ever
+/// copied into this probe. Other platforms need only the non-mutating target
+/// validation above because permissions are applied after tagging.
 ///
 /// This performs blocking filesystem I/O and must not run on the GTK thread.
-pub fn preflight_tag_write(path: &Path) -> Result<(), TagWritePreflightError> {
+pub fn preflight_tag_write_target_access(path: &Path) -> Result<(), TagWritePreflightError> {
     validate_tag_write_target(path)?;
 
     #[cfg(target_os = "windows")]
-    let source_dacl = {
-        let source = std::fs::File::open(path).map_err(|_| TagWritePreflightError::Unavailable)?;
-        WindowsDacl::read_from(&source).map_err(|_| TagWritePreflightError::Unavailable)?
-    };
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        use windows_sys::Win32::Foundation::GENERIC_READ;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let mut source_options = std::fs::OpenOptions::new();
+        source_options
+            .access_mode(GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        let source = source_options
+            .open(path)
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
+        let source_dacl =
+            WindowsDacl::read_from(&source).map_err(|_| TagWritePreflightError::Unavailable)?;
+        drop(source);
+
+        let (probe, creation_file) =
+            TempFile::create_beside(path).map_err(|_| TagWritePreflightError::Unavailable)?;
+        let dacl_result = source_dacl.apply_to(&creation_file);
+        drop(creation_file);
+        dacl_result.map_err(|_| TagWritePreflightError::Unavailable)?;
+
+        let tagging_file = probe
+            .reopen_exclusive_for_tagging()
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
+        drop(tagging_file);
+        probe
+            .remove()
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
+    }
+
+    Ok(())
+}
+
+/// Check the parent-directory mechanics needed by the atomic tag writer.
+///
+/// This exclusively creates, flushes, replaces, and removes two empty private
+/// siblings beside the track. Batch callers may run the file-specific access
+/// check above for every track, then run this once per distinct parent. That is
+/// the only reliable cross-platform way to observe directory capability:
+/// permission bits alone do not describe Flatpak read-only bind mounts, portal
+/// grants, ACLs, FUSE filesystems, or Windows access rules.
+///
+/// This performs blocking filesystem I/O and must not run on the GTK thread.
+pub fn preflight_tag_write_directory(path: &Path) -> Result<(), TagWritePreflightError> {
+    validate_tag_write_target(path)?;
 
     // Rehearse the complete metadata-only shape of the atomic replacement:
     // create two exclusive siblings, flush them, replace an existing sibling,
     // and require explicit cleanup. The user's audio file is never modified.
     let (replacement, replacement_file) =
         TempFile::create_beside(path).map_err(|_| TagWritePreflightError::Unavailable)?;
-    #[cfg(target_os = "windows")]
-    let replacement_file = {
-        let dacl_result = source_dacl.apply_to(&replacement_file);
-        drop(replacement_file);
-        dacl_result.map_err(|_| TagWritePreflightError::Unavailable)?;
-        replacement
-            .reopen_exclusive_for_write()
-            .map_err(|_| TagWritePreflightError::Unavailable)?
-    };
     let replacement_result = replacement_file.sync_all();
     drop(replacement_file);
     replacement_result.map_err(|_| TagWritePreflightError::Unavailable)?;
@@ -502,6 +547,12 @@ pub fn preflight_tag_write(path: &Path) -> Result<(), TagWritePreflightError> {
     destination
         .remove()
         .map_err(|_| TagWritePreflightError::Unavailable)
+}
+
+/// Check whether the complete atomic tag writer can currently operate.
+pub fn preflight_tag_write(path: &Path) -> Result<(), TagWritePreflightError> {
+    preflight_tag_write_target_access(path)?;
+    preflight_tag_write_directory(path)
 }
 
 /// Write tag edits to an audio file.
@@ -557,7 +608,7 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
         });
         drop(destination);
         security_result?;
-        temp.reopen_exclusive_for_write().with_context(|| {
+        temp.reopen_exclusive_for_tagging().with_context(|| {
             format!(
                 "The original Windows DACL of {} does not permit writing the tagged copy",
                 path.display()
@@ -928,7 +979,7 @@ mod tests {
 
         drop(destination);
         let reopened = temp
-            .reopen_exclusive_for_write()
+            .reopen_exclusive_for_tagging()
             .expect("installed source DACL must allow a fresh exclusive write handle");
         assert_eq!(
             reopened.metadata().expect("read sibling metadata").len(),

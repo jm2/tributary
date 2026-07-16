@@ -22,8 +22,10 @@ use adw::prelude::*;
 use gtk::glib;
 use tracing::{info, warn};
 
+#[cfg(target_os = "windows")]
+use crate::local::tag_writer::preflight_tag_write_target_access;
 use crate::local::tag_writer::{
-    preflight_tag_write, validate_tag_write_target, TagEdits, TagWritePreflightError,
+    preflight_tag_write_directory, validate_tag_write_target, TagEdits, TagWritePreflightError,
 };
 
 /// Information about a track passed into the dialog.
@@ -156,6 +158,19 @@ fn preflight_distinct_parents(
     TagEditingAvailability::Ready
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn preflight_each_target(
+    paths: &[PathBuf],
+    mut probe: impl FnMut(&std::path::Path) -> Result<(), TagWritePreflightError>,
+) -> TagEditingAvailability {
+    for path in paths {
+        if let Err(failure) = probe(path) {
+            return merge_preflight_failure(TagEditingAvailability::Ready, failure);
+        }
+    }
+    TagEditingAvailability::Ready
+}
+
 /// Probe a complete, exact-deduplicated selection on a worker thread.
 fn preflight_paths(paths: &[PathBuf]) -> TagEditingAvailability {
     if paths.is_empty() {
@@ -175,10 +190,21 @@ fn preflight_paths(paths: &[PathBuf]) -> TagEditingAvailability {
         return validation;
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        // Windows DACLs are file-specific even inside one directory. Rehearse
+        // the post-DACL read/write/delete reopen for every exact target before
+        // any Save can begin.
+        let target_access = preflight_each_target(paths, preflight_tag_write_target_access);
+        if target_access != TagEditingAvailability::Ready {
+            return target_access;
+        }
+    }
+
     // Directory mechanics are parent-scoped. Rehearse the flushed atomic
     // replacement once per exact parent while retaining the per-file checks
     // above (including Windows read-only attributes).
-    preflight_distinct_parents(paths, preflight_tag_write)
+    preflight_distinct_parents(paths, preflight_tag_write_directory)
 }
 
 fn apply_tag_editing_availability(
@@ -1076,6 +1102,28 @@ mod tests {
 
         assert_eq!(availability, TagEditingAvailability::Unavailable);
         assert_eq!(probed, vec![paths[0].clone()]);
+    }
+
+    #[test]
+    fn file_access_preflight_checks_each_same_parent_target_and_stops_on_failure() {
+        let paths = vec![
+            PathBuf::from("album/first.flac"),
+            PathBuf::from("album/second.flac"),
+            PathBuf::from("album/third.flac"),
+        ];
+        let mut probed = Vec::new();
+
+        let availability = preflight_each_target(&paths, |path| {
+            probed.push(path.to_path_buf());
+            if path == paths[1] {
+                Err(TagWritePreflightError::Unavailable)
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(availability, TagEditingAvailability::Unavailable);
+        assert_eq!(probed, paths[..2]);
     }
 
     #[test]

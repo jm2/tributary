@@ -547,9 +547,11 @@ safely. Successful saves use an exclusively created, bounded
 `.tributary-tag-<UUID>.<format>` sibling carrying only the case-normalized source format extension,
 flush it before atomic replacement, and remove the sibling on success or attempt removal on every
 failure path. Unix copies begin private at mode `0600` before receiving the source mode; on Windows,
-the source DACL is installed through an exclusive no-sharing handle before the first audio byte is
-copied, so a permissive parent-directory ACL cannot briefly expose the copy. Cleanup I/O and process
-termination remain fallible, so local scans and the filesystem watcher also recognize and exclude
+each file's source DACL is independently installed on an empty sibling and must permit a fresh
+read/write/delete handle before any batch write begins. The real copy follows the same exclusive
+no-sharing sequence before its first audio byte, so a permissive parent-directory ACL cannot briefly
+expose it. Cleanup I/O and process termination remain fallible, so local scans and the filesystem
+watcher also recognize and exclude
 only that exact internal shape: an in-progress or residual copy never appears as another library
 track, and final replacement refreshes the original path without losing its stable identity,
 history, or playlist links. Supported formats:
