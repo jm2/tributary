@@ -1172,8 +1172,8 @@ mod tests {
         let directory = TestDirectory::new("exclusive");
         let track = directory.path.join(format!("{}.FLAC", "x".repeat(220)));
 
-        let (first, _first_handle) = TempFile::create_beside(&track).expect("first temp");
-        let (second, _second_handle) = TempFile::create_beside(&track).expect("second temp");
+        let (first, first_handle) = TempFile::create_beside(&track).expect("first temp");
+        let (second, second_handle) = TempFile::create_beside(&track).expect("second temp");
 
         assert_ne!(first.path(), second.path());
         assert!(first.path().exists());
@@ -1190,10 +1190,21 @@ mod tests {
         );
 
         let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+        // Windows deliberately denies FILE_SHARE_DELETE while a tag-write
+        // sibling is open. Match every production cleanup path by releasing
+        // the exclusive handles before the TempFile guards remove their paths.
+        drop(first_handle);
+        drop(second_handle);
         drop(first);
+        drop(second);
         assert!(
             !first_path.exists(),
-            "an unpersisted temp file must remove itself"
+            "the first unpersisted temp file must remove itself"
+        );
+        assert!(
+            !second_path.exists(),
+            "the second unpersisted temp file must remove itself"
         );
     }
 }
