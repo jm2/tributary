@@ -12,7 +12,7 @@
 //! single [`async_channel`] carrying [`DiscoveryEvent`] messages.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr, SocketAddrV6, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::time::Duration;
 
 use tracing::{debug, info, warn};
@@ -779,6 +779,18 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
 
 // ── Chromecast mDNS event processing ────────────────────────────────────
 
+fn usable_chromecast_control_address(address: &SocketAddr) -> bool {
+    let SocketAddr::V4(address) = address else {
+        return false;
+    };
+    let ip = *address.ip();
+    address.port() != 0
+        && !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && ip != Ipv4Addr::BROADCAST
+}
+
 /// Process a Chromecast mDNS event.
 ///
 /// Chromecast devices use `_googlecast._tcp.local.` and store the
@@ -786,8 +798,9 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
 /// protocol port (typically 8009) comes from the SRV record.
 ///
 /// Unlike other mDNS services, Chromecast URLs are formatted as
-/// `cast://<host>:<port>` (not HTTP) because the output selector
-/// extracts host:port directly.
+/// `cast://<numeric-ip>:<port>` (not HTTP). The resolved mDNS address is
+/// retained instead of resolving the `.local` hostname again when playback
+/// starts, so Cast connection establishment can have a hard deadline.
 fn process_chromecast_event(
     event: mdns_sd::ServiceEvent,
     publications: &mut MdnsPublications,
@@ -798,8 +811,8 @@ fn process_chromecast_event(
     match event {
         mdns_sd::ServiceEvent::ServiceResolved(info) => {
             let host = info.get_hostname().trim_end_matches('.').to_string();
-            let port = info.get_port();
             let fullname = info.get_fullname().to_string();
+            let key = ServiceInstanceKey::new(service_type, &fullname);
 
             // Extract friendly name from the `fn` TXT record field.
             // Chromecast devices always publish this.  Fall back to the
@@ -815,9 +828,25 @@ fn process_chromecast_event(
                         .to_string()
                 });
 
+            // Chromecast media tickets are already served over Tributary's
+            // non-loopback LAN IPv4 listener. Retain a matching numeric
+            // control endpoint from the resolved mDNS record; falling back to
+            // the `.local` hostname here would put unbounded name resolution
+            // back inside the later connection attempt.
+            let addresses = advertised_socket_addrs(&info);
+            let Some(address) = addresses
+                .iter()
+                .copied()
+                .find(usable_chromecast_control_address)
+            else {
+                warn!(name = %name, "Chromecast has no advertised IPv4 control address");
+                publish_mdns_events(publications.remove(&key), tx);
+                return;
+            };
+
             // Use a cast:// URL scheme so the output selector can
             // distinguish Chromecast URLs from HTTP server URLs.
-            let url = format!("cast://{host}:{port}");
+            let url = format!("cast://{address}");
             let server = DiscoveredServer {
                 name,
                 url,
@@ -826,10 +855,10 @@ fn process_chromecast_event(
                 advertised_route: None,
             };
             let events = publications.upsert(
-                ServiceInstanceKey::new(service_type, &fullname),
+                key,
                 MdnsPublication {
                     server,
-                    advertised_addresses: Vec::new(),
+                    advertised_addresses: addresses,
                 },
             );
             publish_mdns_events(events, tx);
@@ -944,9 +973,10 @@ fn strip_avahi_name_suffix(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        process_mdns_event, strip_airplay_mac_prefix, strip_avahi_display_suffix,
-        strip_avahi_name_suffix, validate_jellyfin_discovery_address, DiscoveredServer,
-        DiscoveryEvent, MdnsPublication, MdnsPublications, PublishedOrigin, ServiceInstanceKey,
+        process_chromecast_event, process_mdns_event, strip_airplay_mac_prefix,
+        strip_avahi_display_suffix, strip_avahi_name_suffix, usable_chromecast_control_address,
+        validate_jellyfin_discovery_address, DiscoveredServer, DiscoveryEvent, MdnsPublication,
+        MdnsPublications, PublishedOrigin, ServiceInstanceKey, CHROMECAST_SERVICE,
         MAX_MDNS_INSTANCES_PER_ORIGIN, MAX_MDNS_PUBLICATIONS, SUBSONIC_SERVICE,
     };
 
@@ -986,12 +1016,129 @@ mod tests {
         events
     }
 
+    fn chromecast_resolved_event(
+        instance: &str,
+        host: &str,
+        addresses: &[&str],
+        port: u16,
+    ) -> mdns_sd::ServiceEvent {
+        let properties: &[(&str, &str)] = &[("fn", instance)];
+        let info = mdns_sd::ServiceInfo::new(
+            CHROMECAST_SERVICE,
+            instance,
+            host,
+            addresses,
+            port,
+            properties,
+        )
+        .expect("resolved Chromecast fixture");
+        mdns_sd::ServiceEvent::ServiceResolved(Box::new(info.as_resolved_service()))
+    }
+
+    fn process_chromecast(
+        publications: &mut MdnsPublications,
+        event: mdns_sd::ServiceEvent,
+    ) -> Vec<DiscoveryEvent> {
+        let (tx, rx) = async_channel::unbounded();
+        process_chromecast_event(event, publications, &tx);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
     fn found(events: &[DiscoveryEvent]) -> &super::DiscoveredServer {
         assert_eq!(events.len(), 1);
         let DiscoveryEvent::Found(server) = &events[0] else {
             panic!("expected one found event");
         };
         server
+    }
+
+    #[test]
+    fn chromecast_publication_uses_a_numeric_advertised_ipv4_endpoint() {
+        let mut publications = MdnsPublications::default();
+        let event = chromecast_resolved_event(
+            "Living Room",
+            "speaker.local.",
+            &["2001:db8::45", "192.0.2.45", "192.0.2.44"],
+            8009,
+        );
+
+        let events = process_chromecast(&mut publications, event);
+        let server = found(&events);
+        assert_eq!(server.url, "cast://192.0.2.44:8009");
+        assert!(!server.url.contains("speaker.local"));
+    }
+
+    #[test]
+    fn chromecast_publication_skips_unusable_ipv4_control_endpoints() {
+        let mut publications = MdnsPublications::default();
+        let event = chromecast_resolved_event(
+            "Living Room",
+            "speaker.local.",
+            &[
+                "0.0.0.0",
+                "127.0.0.1",
+                "224.0.0.1",
+                "255.255.255.255",
+                "192.0.2.45",
+            ],
+            8009,
+        );
+
+        let events = process_chromecast(&mut publications, event);
+        assert_eq!(found(&events).url, "cast://192.0.2.45:8009");
+        assert!(!usable_chromecast_control_address(
+            &"192.0.2.45:0".parse().expect("port-zero endpoint")
+        ));
+    }
+
+    #[test]
+    fn unusable_chromecast_update_retires_the_previous_ipv4_endpoint() {
+        let mut publications = MdnsPublications::default();
+        let initial =
+            chromecast_resolved_event("Living Room", "speaker.local.", &["192.0.2.44"], 8009);
+        assert!(matches!(
+            process_chromecast(&mut publications, initial).as_slice(),
+            [DiscoveryEvent::Found(server)] if server.url == "cast://192.0.2.44:8009"
+        ));
+
+        let update =
+            chromecast_resolved_event("Living Room", "speaker.local.", &["2001:db8::45"], 8009);
+        assert_eq!(
+            process_chromecast(&mut publications, update),
+            vec![DiscoveryEvent::Lost {
+                url: "cast://192.0.2.44:8009".to_string(),
+                service_type: "chromecast".to_string(),
+            }]
+        );
+        assert!(publications.by_instance.is_empty());
+    }
+
+    #[test]
+    fn chromecast_address_change_loses_old_endpoint_before_finding_new() {
+        let mut publications = MdnsPublications::default();
+        let initial =
+            chromecast_resolved_event("Living Room", "speaker.local.", &["192.0.2.44"], 8009);
+        let _ = process_chromecast(&mut publications, initial);
+
+        let replacement =
+            chromecast_resolved_event("Living Room", "speaker.local.", &["192.0.2.45"], 8009);
+        let events = process_chromecast(&mut publications, replacement);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            DiscoveryEvent::Lost {
+                url: "cast://192.0.2.44:8009".to_string(),
+                service_type: "chromecast".to_string(),
+            }
+        );
+        assert!(matches!(
+            &events[1],
+            DiscoveryEvent::Found(server) if server.url == "cast://192.0.2.45:8009"
+        ));
     }
 
     #[test]

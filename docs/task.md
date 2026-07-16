@@ -31,11 +31,12 @@ has five independently verifiable tasks rather than the original three compound 
 denominator excludes the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**178/220 (80.9%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **61/76 P2**,
+**182/220 (82.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **65/76 P2**,
 and **3/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
-closed by this P2.7 pull request, since the earlier snapshot. The release-workflow
-dry run remains deliberately deferred rather than being counted as unfinished P0 remediation.
+closed by PR #101 and the four P2.8 Chromecast-deadline boxes closed by PR #102, since the earlier
+snapshot. The release-workflow dry run remains deliberately deferred rather than being counted as
+unfinished P0 remediation.
 
 ## P0 — Release blockers
 
@@ -946,21 +947,50 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   GStreamer, find bundled `playbin3`, create both user caches with current absolute bundle paths,
   and create no cache in the `.app`. The launched copy and untouched packaged app then pass strict
   deep verification, with no later packaged-app mutation before optional DMG creation.
-- [x] Record implementation: this P2.7 pull request. `src/platform_runtime.rs`
+- [x] Record implementation: PR #101. `src/platform_runtime.rs`
   owns early bundle detection, override policy, cache derivation/containment, bounded pixbuf-cache
   generation, atomic replacement, and the hidden packaging-only probe; `build-macos.sh` owns the
-  signed helper and post-sign acceptance sequence. Native macOS helper/signature/probe execution
-  and Windows bundle startup remain CI/platform validation because this branch was authored on
-  Linux; the Linux-available static and Rust gates cover their portable policy seams.
+  signed helper and post-sign acceptance sequence. All 14 required checks passed on 2026-07-16,
+  including native macOS packaging, relocation/runtime-cache/signature probing and both Windows
+  architectures; the Linux-available static and Rust gates cover the same portable policy seams.
 
 ### P2.8 Bound Chromecast control I/O
 
-- [ ] Adopt an upstream `rust_cast` timeout/custom-stream API or maintain a narrowly audited fork.
-- [ ] Enforce connection, read, and write deadlines without moving a live non-`Send` Cast session
-  between threads.
-- [ ] Add a silent-receiver test proving a no-reply operation cannot pin Stop, replacement Load,
-  or Shutdown forever.
-- [ ] Record implementation: _pending_
+- [x] Adopt an upstream `rust_cast` timeout/custom-stream API or maintain a narrowly audited fork.
+  No fork or dependency change was needed: `rust_cast 0.21` publicly exposes its generic
+  `MessageManager<S: Read + Write>` and channel constructors even though its high-level
+  `CastDevice` hides the socket. Tributary composes those APIs over its own deadline-aware
+  `rustls::StreamOwned`.
+- [x] Enforce connection, read, and write deadlines without moving a live non-`Send` Cast session
+  between threads. Discovery now carries a deterministic numeric advertised IPv4 `SocketAddr`
+  into the output, rejecting port zero, unspecified, loopback, multicast, broadcast, and IPv6-only
+  endpoints instead of performing a later unbounded `.local` lookup. TCP connection attempts have
+  a 5-second deadline. Every TLS/protocol operation has one absolute 8-second budget across all
+  writes and reads plus a 2-second idle-I/O cap recalculated before each system call, so trickled
+  bytes cannot renew the total deadline. The `Rc`-backed manager and channels remain constructed,
+  used, and dropped on the existing dedicated FIFO worker. Transport, TLS, framing, decoding, and
+  timeout failures discard the desynchronized session immediately—even when the operation became
+  stale—while complete request-correlated protocol rejections retain synchronization for bounded
+  best-effort cleanup. Receiver-controlled error text remains outside logs and player events.
+- [x] Add a silent-receiver test proving a no-reply operation cannot pin Stop, replacement Load,
+  or Shutdown forever. Real loopback peers that accept TCP but never complete the TLS exchange
+  prove all three newer intents reach their fence or worker-exit acknowledgement within the short
+  test budget. A byte-trickling peer proves one absolute operation deadline, and fake-transport
+  regressions cover synchronized semantic cleanup, poisoned-session retirement, supersession
+  during a poisoned call, and closed error classification. Discovery regressions cover
+  deterministic numeric selection, unusable-address rejection, IPv6-only omission, and
+  Lost-before-Found publication when an address changes.
+- [x] Record implementation: PR #102; 12 focused deadline, silent-peer, cleanup/classification,
+  supersession, and discovery regressions. Debug and release full suites each pass 18 library, 674
+  application, and 8 repository-metadata tests (700 total per profile).
+
+Residual receiver-trust boundary: upstream `rust_cast 0.21` reads the peer-supplied unsigned
+32-bit Cast frame length and immediately calls `Vec::with_capacity(length as usize)` before
+reading or bounding the payload. The I/O deadlines prevent a silent or byte-trickling peer from
+hanging the worker, but a malicious or broken receiver can still provoke an allocation attempt
+approaching 4 GiB. A pre-allocation cap needs an upstream change or narrowly audited framing
+layer; that adversarial proof is retained in P3.4 rather than overstated as part of this deadline
+milestone.
 
 ### P2.9 Repair the AirPlay fallback path
 
@@ -1151,7 +1181,8 @@ closed. Packaged end-to-end validation remains open, so P2.11 is not yet closed 
 - [ ] Cover GTK list-item recycling and stale callback prevention.
 - [ ] Cover playback-session behavior across sorting/filtering/navigation.
 - [ ] Cover output transfer and reselect semantics.
-- [ ] Cover fake MPD and delayed Chromecast state machines.
+- [ ] Cover fake MPD and delayed/adversarial Chromecast state machines, including a cap applied
+  before allocating from a peer-advertised Cast frame length.
 - [ ] Cover stale album-art and source-result generations.
 - [ ] Add keyboard context-menu and slider accessibility checks.
 - [ ] Record implementation: _pending_
@@ -1186,7 +1217,19 @@ PR #94's containerized Flatpak build proved the manifest-local source generation
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
 
-Most recent branch validation (2026-07-16, P2.7 platform-runtime slice): `cargo check
+Most recent branch validation (2026-07-16, PR #102 P2.8 Chromecast-deadline slice): `cargo check
+--all-targets --all-features --locked`, strict debug and release all-target/all-feature Clippy,
+and `cargo test --all-targets --all-features --locked` in both debug and release pass. Each full
+test profile passes 18 library, 674 application, and 8 repository-metadata tests (700 total);
+12 focused regressions cover absolute trickle deadlines, real silent TLS peers with Stop,
+replacement Load, and Shutdown queued behind them, synchronized versus poisoned cleanup,
+supersession during poisoned I/O, deterministic numeric mDNS address selection, unusable and
+IPv6-only endpoints, and address replacement ordering. `cargo fmt --all -- --check` and
+`git diff --check` also pass. The loopback peers exercise the real TCP/rustls deadline transport
+without Chromecast hardware; live receiver compatibility remains useful field validation, not a
+prerequisite for the bounded-I/O contract. No dependency or lockfile changed.
+
+Previous branch validation (2026-07-16, PR #101 P2.7 platform-runtime slice): `cargo check
 --all-targets --all-features --locked`, strict debug all-target/all-feature Clippy, and strict
 release all-feature Clippy pass. Debug and release `cargo test --all-targets --all-features`
 each pass 18 library, 662 application, and 8 repository-metadata tests (688 total per profile);
@@ -1207,12 +1250,11 @@ record grammar permits standalone quoted empty MIME and extension-list fields, s
 tracks module, info, MIME, extension, signature, and record-separator state rather than classifying
 every standalone quoted line as a module. It also normalizes only safe helper-relative records that
 resolve to the exact expected set, and reports a sanitized basename for any remaining unexpected
-module; focused regressions cover both contracts. Native macOS CI remains the authoritative
-confirmation.
-The macOS build job runs that signed relocated first-launch probe as part of packaging, while the
-Windows build job remains the platform compile/startup authority.
+module; focused regressions cover both contracts. PR #101 then passed the signed relocated
+first-launch probe and strict post-launch verification in the native macOS packaging job, both
+Windows architecture jobs, and all other required checks.
 
-Previous branch validation (2026-07-16, PR #100 P2.6 packaging/CI slice): exact Rust 1.92
+Earlier branch validation (2026-07-16, PR #100 P2.6 packaging/CI slice): exact Rust 1.92
 passes `cargo check --all-targets --locked`, while Rust 1.85 rejects the locked graph with the
 documented gtk-rs 1.92 floors. Strict debug all-feature and release Clippy pass; debug and release
 `cargo test --all-targets` each pass 18 library, 646 application, and 8 repository-metadata tests
@@ -1521,7 +1563,7 @@ Record scope or design decisions here so deferred work is explicit.
   for a later usable locator, binding bitrate/format to the same selected media entry and
   preserving the resolver invariant that every published Plex track has a backend-private stream
   locator.
-- 2026-07-12 — P1.7 places the non-`Send` Cast device, application, media session, controls,
+- 2026-07-12 — P1.7 places the non-`Send` Cast transport, application, media session, controls,
   heartbeat, status polling, and teardown on one FIFO worker. Epoch checks bracket every Cast
   effect and event; ownership is recorded immediately after application launch and media load so
   superseded calls remain cleanable. Failures retire the session before publishing Stopped then
@@ -1529,10 +1571,20 @@ Record scope or design decisions here so deferred work is explicit.
   application after three attempts so a replacement load can reconnect. The legacy local-file
   resolver remains synchronous; P1.6's upstream ticket proxy does not change that local-path
   lookup behavior.
-  `rust_cast 0.21` uses blocking `TcpStream` calls, hides the socket, and offers no timeout or
-  custom-stream constructor, so cancellation can be checked only before and after an in-flight
-  call; hard receiver I/O deadlines require an upstream change or audited fork and are tracked as
-  P2.8 rather than overstated as part of P1.7.
+  `rust_cast 0.21`'s high-level `CastDevice` uses blocking `TcpStream` calls and hides the socket,
+  so P1.7 could check cancellation only before and after an in-flight call. Hard receiver I/O
+  deadlines were therefore tracked as P2.8 rather than overstated as part of P1.7; P2.8 later
+  closed the gap through the crate's public generic lower-level channel APIs.
+- 2026-07-16 — P2.8 uses the mDNS-advertised numeric IPv4 endpoint because the existing
+  Chromecast media-ticket listener is IPv4-only; accepting an IPv6-only control endpoint would
+  advertise media the receiver cannot fetch. The selected control endpoint rejects non-routable
+  values and address changes retire the old publication before a replacement appears. One
+  absolute deadline spans each high-level channel operation and every underlying TLS read/write,
+  while a shorter idle cap detects silence promptly. The `Rc` transport stays on its original
+  worker rather than crossing threads. A complete Cast rejection leaves framing synchronized and
+  permits bounded cleanup; any I/O, TLS, framing, parsing, decoding, or timeout failure drops the
+  connection immediately, including after supersession. Upstream's peer-sized frame allocation
+  remains a separate adversarial-framing follow-up under P3.4.
 - 2026-07-13 — P1.8 gives MPD one FIFO worker and one persistent TCP session per owned load.
   Stable `addid`/`playid` identity, authoritative status polling, and targeted `deleteid` cleanup
   distinguish explicit Stop and remote errors, classify stopped/no-current plus a retained owned ID
@@ -1689,6 +1741,7 @@ Add one line per completed task:
 | 2026-07-15 | P2.6 0.5.0 release metadata | PR #96 | Added the missing AppStream 0.5.0 release entry, archived the shipped release in the changelog, and advanced Cargo/changelog development metadata to 0.5.1. The live release-workflow verification remains deliberately deferred. |
 | 2026-07-16 | P2.6 packaging and CI completion | PR #100 | Debian, generated RPM, handwritten RPM, and Arch metadata now match the GTK 4.16/libadwaita 1.6 API floor; Linux desktop activation passes `%U` and declares `AudioVideo`; Cargo/README declare the proven Rust 1.92 floor; exact-MSRV, debug all-target, fuzz, desktop, and AppStream gates run in CI; and eight repository contract tests prevent the declarations from drifting independently, including under a synthesized CRLF workflow checkout. Windows matrix jobs retain both architecture results, the ARM runner bypasses setup-msys2's intermittently failing optional package-cache cleanup while retaining Cargo caching, and the poisoned-proxy regression keeps the parent proxy fixture alive through child completion while starting the child media listener's bounded window only after GStreamer initialization, so cold Windows plugin discovery cannot create a false negative. |
 | 2026-07-16 | P2.9 | PR #99 | Removed the inoperative `shairport-sync` receiver fallback, moved the remaining capability refusal ahead of media preparation, localized actionable `raopsink`/`gst-plugins-bad` guidance, surfaced safe player errors in-app, and added focused missing-element/load-path regressions. |
-| 2026-07-16 | P2.7 platform runtime caches | PR #101 | Moved bundled GStreamer registries to install-keyed per-user caches before toolkit initialization, removed executable-adjacent fallback, added record-structured validation and exact absolute-path rewriting for the signed macOS pixbuf helper's generated cache, and made a path-with-spaces/read-only post-sign runtime probe plus final strict signature verification part of macOS packaging. Sixteen focused policy/static tests cover the portable contract, and the independent fuzz lock remains synchronized for CI's strict locked Clippy gate; native macOS and Windows execution remains CI/platform validation. |
+| 2026-07-16 | P2.7 platform runtime caches | PR #101 | Moved bundled GStreamer registries to install-keyed per-user caches before toolkit initialization, removed executable-adjacent fallback, added record-structured validation and exact absolute-path rewriting for the signed macOS pixbuf helper's generated cache, and made a path-with-spaces/read-only post-sign runtime probe plus final strict signature verification part of macOS packaging. Sixteen focused policy/static tests cover the portable contract, the independent fuzz lock remains synchronized, and PR CI passed the native macOS relocation/signature probe plus both Windows architecture jobs. |
+| 2026-07-16 | P2.8 bounded Chromecast control | PR #102 | Rebuilt the public `rust_cast` channel graph over a worker-local deadline-aware TLS stream, retained deterministic usable numeric mDNS IPv4 endpoints, and bounded TCP connect, operation-wide, and idle read/write time without moving the `Rc` session across threads. Poisoned sessions are dropped immediately while synchronized semantic rejections retain bounded cleanup; 12 focused real-socket, trickle, lifecycle, classifier, supersession, and discovery regressions cover the contract. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
