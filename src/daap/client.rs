@@ -47,7 +47,7 @@ const MAX_ITEMS_BODY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// End-to-end and body-phase deadlines for finite DAAP requests.
 const CONTROL_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
-const ITEMS_RESPONSE_DEADLINE: Duration = Duration::from_secs(120);
+const ITEMS_RESPONSE_DEADLINE: Duration = Duration::from_mins(2);
 const PROBE_RESPONSE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Client version advertised to the DAAP server.

@@ -140,7 +140,7 @@ Pre-built packages for Linux (Flatpak, .deb, .rpm), macOS (.dmg), and Windows (.
 
 ### Prerequisites (all platforms)
 
-- [Rust 1.85+](https://rustup.rs) (stable toolchain) — this is the declared MSRV in `Cargo.toml`
+- [Rust 1.92+](https://rustup.rs) (stable toolchain) — this is the declared MSRV in `Cargo.toml`, set by the gtk-rs 0.11 release series and verified by a dedicated CI job
 - **GTK 4.16+** and **libadwaita 1.6+** — the crate compiles against these API levels, so older
   runtimes will fail to build, not merely fail at startup
 - `pkg-config`

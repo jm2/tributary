@@ -3570,7 +3570,7 @@ async fn initial_scan_with_root_trust_guards(
         }
 
         scanned += 1;
-        if scanned % 50 == 0 || scanned == total {
+        if scanned.is_multiple_of(50) || scanned == total {
             let _ = tx.send(LibraryEvent::ScanProgress(scanned, total)).await;
         }
     }

@@ -452,7 +452,7 @@ fn run_cast_worker<C>(
                     timing.cleanup_retry.saturating_sub(last_attempt.elapsed())
                 }),
             Some(session) if session.media_session_id.is_some() => timing.tick,
-            _ => Duration::from_secs(3600),
+            _ => Duration::from_hours(1),
         };
         match worker_rx.recv_timeout(wait) {
             Ok(command) => {
@@ -1994,8 +1994,8 @@ mod tests {
             Self::new_with_timing(
                 shared,
                 WorkerTiming {
-                    heartbeat: Duration::from_secs(3600),
-                    poll: Duration::from_secs(3600),
+                    heartbeat: Duration::from_hours(1),
+                    poll: Duration::from_hours(1),
                     cleanup_retry: Duration::from_millis(10),
                     tick: Duration::from_millis(10),
                 },
@@ -2429,10 +2429,10 @@ mod tests {
         let harness = Harness::new_with_timing(
             Arc::clone(&shared),
             WorkerTiming {
-                heartbeat: Duration::from_secs(3600),
-                poll: Duration::from_secs(3600),
+                heartbeat: Duration::from_hours(1),
+                poll: Duration::from_hours(1),
                 cleanup_retry: Duration::ZERO,
-                tick: Duration::from_secs(3600),
+                tick: Duration::from_hours(1),
             },
         );
         let owner = harness.next_owner(1);
@@ -2506,10 +2506,10 @@ mod tests {
         let harness = Harness::new_with_timing(
             Arc::clone(&shared),
             WorkerTiming {
-                heartbeat: Duration::from_secs(3600),
-                poll: Duration::from_secs(3600),
+                heartbeat: Duration::from_hours(1),
+                poll: Duration::from_hours(1),
                 cleanup_retry: Duration::ZERO,
-                tick: Duration::from_secs(3600),
+                tick: Duration::from_hours(1),
             },
         );
         let first = harness.next_owner(1);
@@ -2813,10 +2813,10 @@ mod tests {
         let harness = Harness::new_with_timing(
             Arc::clone(&shared),
             WorkerTiming {
-                heartbeat: Duration::from_secs(3600),
+                heartbeat: Duration::from_hours(1),
                 poll: Duration::ZERO,
                 cleanup_retry: Duration::from_millis(10),
-                tick: Duration::from_secs(3600),
+                tick: Duration::from_hours(1),
             },
         );
         let owner = harness.next_owner(1);

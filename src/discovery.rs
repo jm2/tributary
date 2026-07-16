@@ -270,7 +270,7 @@ const JELLYFIN_DISCOVERY_PORT: u16 = 7359;
 const JELLYFIN_DISCOVERY_MSG: &[u8] = b"Who is JellyfinServer?";
 
 /// Jellyfin UDP re-broadcast interval.
-const JELLYFIN_BROADCAST_INTERVAL: Duration = Duration::from_secs(60);
+const JELLYFIN_BROADCAST_INTERVAL: Duration = Duration::from_mins(1);
 /// Number of consecutive missed cycles before declaring a Jellyfin server lost.
 const JELLYFIN_MISS_THRESHOLD: u32 = 3;
 

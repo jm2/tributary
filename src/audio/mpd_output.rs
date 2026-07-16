@@ -994,7 +994,7 @@ fn run_mpd_worker<C>(
         let wait = if active.is_some() {
             timing.tick
         } else {
-            Duration::from_secs(3600)
+            Duration::from_hours(1)
         };
         match worker_rx.recv_timeout(wait) {
             Ok(command) => {
@@ -2726,7 +2726,7 @@ mod tests {
                 shared,
                 WorkerTiming {
                     operation: Duration::from_secs(2),
-                    poll: Duration::from_secs(3600),
+                    poll: Duration::from_hours(1),
                     tick: Duration::from_millis(10),
                 },
             )
@@ -2741,7 +2741,7 @@ mod tests {
                 shared,
                 WorkerTiming {
                     operation: Duration::from_secs(2),
-                    poll: Duration::from_secs(3600),
+                    poll: Duration::from_hours(1),
                     tick: Duration::from_millis(10),
                 },
                 proxy,

@@ -105,7 +105,7 @@ fn elapsed_millis(started_at: Instant) -> u64 {
 /// requests, pause, and seek must not let a compromised receiver extend a
 /// ticket forever. Explicit playback lifecycle revocation can only shorten
 /// this lifetime.
-const UPSTREAM_TICKET_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const UPSTREAM_TICKET_TTL: Duration = Duration::from_hours(24);
 
 #[derive(Clone, Copy)]
 struct UpstreamTimeouts {
@@ -1096,7 +1096,7 @@ mod tests {
             MediaSource::Local(PathBuf::from("/music/local.flac")),
         );
         let much_later = now
-            .checked_add(Duration::from_secs(365 * 24 * 60 * 60))
+            .checked_add(Duration::from_hours(365 * 24))
             .expect("one year later");
 
         assert!(matches!(
