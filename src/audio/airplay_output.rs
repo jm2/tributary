@@ -8,14 +8,16 @@
 //! # Implementation strategy
 //!
 //! We build a dedicated GStreamer pipeline per session and operate it
-//! independently of the main `playbin3`.  When an AirPlay output is
-//! selected and a URI is loaded:
+//! independently of the main `playbin3`:
+//! `uridecodebin ! audioconvert ! avenc_alac ! raopsink`.
 //!
-//!   1. Try a `raopsink` element if one is registered.  Pipeline:
-//!      `uridecodebin ! audioconvert ! avenc_alac ! raopsink`.
-//!   2. If `raopsink` isn't in the registry, fall back to spawning
-//!      `shairport-sync` in pipe mode and shovelling raw S16LE PCM at
-//!      its stdin via `fdsink`.
+//! `raopsink` is the only transmitter.  There is deliberately no
+//! fallback: the one this module used to have piped decoded PCM into a
+//! spawned `shairport-sync`, which is an AirPlay *receiver* — it
+//! ignored the device the user selected and could never reach it
+//! (review finding M3, tracker item P2.9).  A missing `raopsink` now
+//! fails the load with a localized error naming the package to
+//! install instead of silently spawning a subprocess that cannot work.
 //!
 //! A bus watch on the dedicated pipeline forwards EOS / errors / state
 //! changes into the same `PlayerEvent` channel the rest of the app
@@ -30,13 +32,13 @@
 //!   this output does not implement.  Such devices are filtered out
 //!   of the output selector by [`crate::ui::discovery_handler`] until
 //!   a sender-side AirPlay 2 implementation lands.
-//! - **Requires a working `raopsink` element or `shairport-sync` on
-//!   PATH.**  The exact packages that provide `raopsink` vary by
-//!   distro and aren't asserted here; the code probes the GStreamer
-//!   registry at runtime and falls back accordingly.
+//! - **Requires a working `raopsink` element.**  It ships in the
+//!   GStreamer "bad" plugins set (`gst-plugins-bad`); the exact
+//!   package name varies by distro.  The code probes the GStreamer
+//!   registry at runtime and surfaces an actionable error when the
+//!   element is absent.
 //! - **Seeking is not supported** for live RAOP streams.
 
-use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -52,21 +54,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::architecture::media::ResolvedHttpRequest;
 
-/// Active AirPlay session: the dedicated GStreamer pipeline plus, if we
-/// fell back to it, the `shairport-sync` child process.
+/// Active AirPlay session: the dedicated GStreamer RAOP pipeline.
 struct Session {
     pipeline: gst::Pipeline,
     /// Exact protected-media ticket owned by this session. Credential-free
     /// media has no ticket and retains its existing direct-URI behavior.
     media_ticket: Option<Arc<GstreamerMediaTicket>>,
-    /// Only `Some` when the shairport-sync fallback path is in use —
-    /// the child must outlive the pipeline and be killed on `stop()`.
-    sps_child: Option<Child>,
-    /// Owning handle to the pipe write-end fed to `fdsink fd=…` in the
-    /// shairport-sync fallback.  `fdsink` does not close a descriptor it
-    /// did not open, so we keep ownership here and let it close when the
-    /// session is dropped — otherwise every session would leak one fd.
-    _stdin_file: Option<std::fs::File>,
     /// Bus watch guard — dropping it removes the watch.
     _bus_watch: gst::bus::BusWatchGuard,
 }
@@ -165,8 +158,14 @@ impl AirPlayOutput {
         // Tear down any previous session before starting a new one.
         self.close_session();
 
-        // Prepare exactly once so both the preferred and fallback pipelines
-        // receive the same credential-safe URI and own the same ticket.
+        // Refuse a missing transmitter before any per-track proxy work:
+        // otherwise a protected load would start a loopback route and mint
+        // a ticket only to revoke it, and a preparation failure would mask
+        // the actionable install guidance with its generic message.
+        Self::ensure_raopsink(Self::raopsink_available())?;
+
+        // Prepare exactly once so the pipeline receives the credential-safe
+        // URI and owns the ticket.
         let prepared = self
             .media_proxy
             .prepare(uri)
@@ -176,6 +175,8 @@ impl AirPlayOutput {
 
     fn open_resolved_session(&self, request: ResolvedHttpRequest) -> Result<(), String> {
         self.close_session();
+        // Same order as `open_session`: transmitter first, proxy work second.
+        Self::ensure_raopsink(Self::raopsink_available())?;
         let prepared = self
             .media_proxy
             .prepare_resolved(request)
@@ -225,85 +226,69 @@ impl AirPlayOutput {
         let volume = self.volume;
         let generation = self.event_generation();
 
-        // Try GStreamer raopsink first.
-        match Self::build_raop_pipeline(host, port, prepared_uri, volume) {
-            Ok(pipeline) => {
-                let bus_watch =
-                    match self.attach_bus_watch(&pipeline, generation, media_ticket.clone()) {
-                        Ok(watch) => watch,
-                        Err(failure) => {
-                            let _ = pipeline.set_state(gst::State::Null);
-                            return Err(failure);
-                        }
-                    };
-                let mut session = Session {
-                    pipeline,
-                    media_ticket,
-                    sps_child: None,
-                    _stdin_file: None,
-                    _bus_watch: bus_watch,
-                };
-                if session.pipeline.set_state(gst::State::Paused).is_err() {
-                    Self::shutdown_session(&mut session);
-                    return Err("RAOP pipeline preroll failed".to_string());
-                }
-                info!(host = %host, port, "AirPlay: session opened via raopsink");
-                *self.session_lock() = Some(session);
-                Ok(())
+        let pipeline = Self::build_raop_pipeline(host, port, prepared_uri, volume)?;
+        let bus_watch = match self.attach_bus_watch(&pipeline, generation, media_ticket.clone()) {
+            Ok(watch) => watch,
+            Err(failure) => {
+                let _ = pipeline.set_state(gst::State::Null);
+                return Err(failure);
             }
-            Err(e1) => {
-                warn!(error = %e1, "raopsink unavailable, trying shairport-sync");
-                let (pipeline, sps_child, stdin_file) =
-                    Self::build_shairport_pipeline(host, port, prepared_uri)
-                        .map_err(|e2| format!("Both AirPlay paths failed: {e1}; {e2}"))?;
-                let bus_watch =
-                    match self.attach_bus_watch(&pipeline, generation, media_ticket.clone()) {
-                        Ok(watch) => watch,
-                        Err(failure) => {
-                            let _ = pipeline.set_state(gst::State::Null);
-                            let mut child = sps_child;
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Err(failure);
-                        }
-                    };
-                let mut session = Session {
-                    pipeline,
-                    media_ticket,
-                    sps_child: Some(sps_child),
-                    _stdin_file: Some(stdin_file),
-                    _bus_watch: bus_watch,
-                };
-                if session.pipeline.set_state(gst::State::Paused).is_err() {
-                    Self::shutdown_session(&mut session);
-                    return Err("shairport-sync pipeline preroll failed".to_string());
-                }
-                info!(host = %host, port, "AirPlay: session opened via shairport-sync");
-                *self.session_lock() = Some(session);
-                Ok(())
-            }
+        };
+        let session = Session {
+            pipeline,
+            media_ticket,
+            _bus_watch: bus_watch,
+        };
+        if session.pipeline.set_state(gst::State::Paused).is_err() {
+            let _ = session.pipeline.set_state(gst::State::Null);
+            return Err("RAOP pipeline preroll failed".to_string());
+        }
+        info!(host = %host, port, "AirPlay: session opened via raopsink");
+        *self.session_lock() = Some(session);
+        Ok(())
+    }
+
+    /// True when GStreamer's registry has a `raopsink` element to transmit
+    /// with. Requires an initialised GStreamer.
+    fn raopsink_available() -> bool {
+        gst::Registry::get()
+            .find_feature("raopsink", gst::ElementFactory::static_type())
+            .is_some()
+    }
+
+    /// Gate every load on the transmitter actually existing.
+    ///
+    /// There is deliberately no fallback here: the one this module used to
+    /// have piped PCM into `shairport-sync`, an AirPlay *receiver*, which
+    /// ignored the device the user selected and could never reach it. A
+    /// missing `raopsink` is a hard error that tells the user what to
+    /// install instead.
+    fn ensure_raopsink(available: bool) -> Result<(), String> {
+        if available {
+            Ok(())
+        } else {
+            Err(Self::raopsink_missing_message(&rust_i18n::locale()))
         }
     }
 
-    /// Tear down the active session — pipeline → Null, kill child if any.
+    /// Localized "install gst-plugins-bad" guidance. `raopsink` and
+    /// `gst-plugins-bad` are technical identifiers and stay untranslated
+    /// inside every catalog entry.
+    fn raopsink_missing_message(locale: &str) -> String {
+        rust_i18n::t!("errors.playback.airplay_raopsink_missing", locale = locale).into_owned()
+    }
+
+    /// Tear down the active session — pipeline → Null.
     fn close_session(&self) {
         let mut guard = self.session_lock();
-        if let Some(mut sess) = guard.take() {
+        if let Some(sess) = guard.take() {
             // Stop the pipeline before invalidating its loopback route. Doing
             // this in the opposite order can turn an intentional close into
             // a transient fetch error while GStreamer is still winding down.
-            Self::shutdown_session(&mut sess);
+            let _ = sess.pipeline.set_state(gst::State::Null);
             if let Some(ticket) = sess.media_ticket.as_ref() {
                 self.media_proxy.revoke_if_current(ticket);
             }
-        }
-    }
-
-    fn shutdown_session(session: &mut Session) {
-        let _ = session.pipeline.set_state(gst::State::Null);
-        if let Some(ref mut child) = session.sps_child {
-            let _ = child.kill();
-            let _ = child.wait();
         }
     }
 
@@ -378,21 +363,15 @@ impl AirPlayOutput {
         .map_err(|e| format!("Failed to attach bus watch: {e}"))
     }
 
-    /// Build a pipeline using GStreamer's `raopsink`, if it is registered.
+    /// Build a pipeline using GStreamer's `raopsink`. The caller has
+    /// already verified via [`Self::ensure_raopsink`] that the element
+    /// is registered.
     fn build_raop_pipeline(
         host: &str,
         port: u16,
         uri: &str,
         volume: f64,
     ) -> Result<gst::Pipeline, String> {
-        let registry = gst::Registry::get();
-        if registry
-            .find_feature("raopsink", gst::ElementFactory::static_type())
-            .is_none()
-        {
-            return Err("raopsink not found in GStreamer registry".to_string());
-        }
-
         let pipeline_str = format!(
             "uridecodebin name=decoder uri=\"{}\" ! audioconvert ! avenc_alac ! raopsink name=raop host={} port={}",
             uri.replace('"', "\\\""),
@@ -415,91 +394,6 @@ impl AirPlayOutput {
         super::Player::install_loopback_http_source_policy(&decoder);
 
         Ok(pipeline)
-    }
-
-    /// Fallback: pipe raw S16LE PCM into a `shairport-sync` subprocess.
-    #[cfg(unix)]
-    fn build_shairport_pipeline(
-        host: &str,
-        port: u16,
-        uri: &str,
-    ) -> Result<(gst::Pipeline, Child, std::fs::File), String> {
-        let _ = (host, port); // shairport-sync uses its own discovery.
-
-        // Locate shairport-sync.
-        let check = std::process::Command::new("which")
-            .arg("shairport-sync")
-            .output()
-            .map_err(|e| format!("Failed to invoke 'which': {e}"))?;
-        if !check.status.success() {
-            return Err("shairport-sync not found on PATH".to_string());
-        }
-
-        // Spawn shairport-sync reading PCM from stdin.
-        let mut child = std::process::Command::new("shairport-sync")
-            .args(["-o", "pipe", "--", "/dev/stdin"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn shairport-sync: {e}"))?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Failed to capture shairport-sync stdin".to_string())?;
-
-        // Reclaim ownership of the raw fd as a `File`: `into_raw_fd` releases
-        // Rust's ownership (so `ChildStdin`'s Drop won't close it), and
-        // `fdsink` never closes a descriptor it didn't open.  Wrapping it back
-        // in a `File` means the fd is closed when the session is dropped,
-        // rather than leaked once per shairport-sync session.
-        let stdin_file = {
-            use std::os::unix::io::{FromRawFd, IntoRawFd};
-            let raw = stdin.into_raw_fd();
-            // SAFETY: `raw` was just produced by `into_raw_fd`, which transfers
-            // ownership of a valid, open fd; we are the sole owner now.
-            unsafe { std::fs::File::from_raw_fd(raw) }
-        };
-        let fd = {
-            use std::os::unix::io::AsRawFd;
-            stdin_file.as_raw_fd()
-        };
-
-        let pipeline_str = format!(
-            "uridecodebin name=decoder uri=\"{}\" ! audioconvert ! audio/x-raw,format=S16LE,rate=44100,channels=2 ! fdsink fd={}",
-            uri.replace('"', "\\\""),
-            fd,
-        );
-
-        let element = gst::parse::launch(&pipeline_str).map_err(|_| {
-            let _ = child.kill();
-            let _ = child.wait();
-            "Failed to build shairport-sync pipeline".to_string()
-        })?;
-        let pipeline = element.downcast::<gst::Pipeline>().map_err(|_| {
-            let _ = child.kill();
-            let _ = child.wait();
-            "shairport-sync launch did not yield a Pipeline".to_string()
-        })?;
-        let Some(decoder) = pipeline.by_name("decoder") else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("shairport-sync pipeline has no URI decoder".to_string());
-        };
-        super::Player::install_loopback_http_source_policy(&decoder);
-
-        Ok((pipeline, child, stdin_file))
-    }
-
-    /// Windows fallback: shairport-sync pipe mode is Unix-only.
-    #[cfg(not(unix))]
-    fn build_shairport_pipeline(
-        _host: &str,
-        _port: u16,
-        _uri: &str,
-    ) -> Result<(gst::Pipeline, Child, std::fs::File), String> {
-        Err("shairport-sync pipe mode requires Unix".to_string())
     }
 
     /// Apply a state transition to the active pipeline, if any.
@@ -534,11 +428,8 @@ impl AudioOutput for AirPlayOutput {
     }
 
     fn supports_volume(&self) -> bool {
-        // The raopsink path forwards volume to the receiver; the
-        // shairport-sync fallback does not (it uses its own mixer).
-        // We always advertise support — the slider is still useful
-        // when raopsink is in use, and the receiver's hardware volume
-        // remains as a backstop in either case.
+        // raopsink forwards volume to the receiver, and the receiver's
+        // hardware volume remains as a backstop.
         true
     }
 
@@ -699,18 +590,95 @@ mod tests {
         assert_eq!(output.state(), PlayerState::Stopped);
     }
 
+    /// P2.9's core guarantee: a missing `raopsink` is refused with guidance
+    /// naming both the element and the package that provides it — never
+    /// routed to a fallback that cannot transmit.
     #[test]
-    fn protected_load_without_runtime_fails_before_gstreamer() {
+    fn a_missing_raopsink_is_refused_with_install_guidance() {
+        assert!(AirPlayOutput::ensure_raopsink(true).is_ok());
+
+        let error = AirPlayOutput::ensure_raopsink(false).unwrap_err();
+        assert!(error.contains("raopsink"), "{error}");
+        assert!(error.contains("gst-plugins-bad"), "{error}");
+    }
+
+    /// The guidance must be real in every catalog — present, mentioning the
+    /// exact technical identifiers, and not silently falling back to English.
+    #[test]
+    fn raopsink_guidance_is_localized_for_every_catalog() {
+        let english = AirPlayOutput::raopsink_missing_message("en");
+        assert!(!english.is_empty());
+
+        for locale in rust_i18n::available_locales!() {
+            let localized = AirPlayOutput::raopsink_missing_message(&locale);
+            assert!(localized.contains("raopsink"), "{locale}: {localized}");
+            assert!(
+                localized.contains("gst-plugins-bad"),
+                "{locale}: {localized}"
+            );
+            if locale != "en" {
+                assert_ne!(localized, english, "{locale} must not fall back to English");
+            }
+        }
+    }
+
+    /// A load without a transmitter must fail *loudly* — an `Error` event
+    /// carrying the actionable message followed by `Stopped` — never a
+    /// silent no-op stream.
+    #[test]
+    fn a_missing_raopsink_load_fails_loudly_not_silently() {
+        let (tx, rx) = async_channel::unbounded();
+        let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
+        let generation = PlayerEventGeneration::from_raw(7);
+        output.set_event_generation(generation);
+
+        output.finish_load(generation, AirPlayOutput::ensure_raopsink(false));
+
+        match rx.try_recv() {
+            Ok(PlayerEvent::Error {
+                generation: event_generation,
+                message,
+            }) => {
+                assert_eq!(event_generation, generation);
+                assert!(message.contains("raopsink"), "{message}");
+                assert!(message.contains("gst-plugins-bad"), "{message}");
+            }
+            event => panic!("expected actionable error, got {event:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PlayerEvent::StateChanged {
+                generation: event_generation,
+                state: PlayerState::Stopped,
+            }) if event_generation == generation
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn protected_load_fails_closed_before_any_pipeline_sees_the_secret() {
         const SECRET: &str = "airplay-secret-must-not-leak";
+
+        gst::init().expect("GStreamer init");
 
         let (tx, rx) = async_channel::unbounded();
         let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
         let generation = PlayerEventGeneration::from_raw(42);
         output.set_event_generation(generation);
 
-        // A protected URI requires the app runtime to mint its loopback
-        // ticket. With no runtime configured, preparation must fail before
-        // either AirPlay GStreamer pipeline is inspected or constructed.
+        // The transmitter gate runs before any per-track proxy work, so on
+        // a machine without `raopsink` the actionable install guidance wins.
+        // With `raopsink` registered, preparation is reached next and must
+        // fail — a protected URI requires the app runtime to mint its
+        // loopback ticket, and none is configured. Either way the failure
+        // is a fixed message and no pipeline is ever constructed around the
+        // credential-bearing URI.
+        let expected = if AirPlayOutput::raopsink_available() {
+            "AirPlay media preparation failed".to_string()
+        } else {
+            AirPlayOutput::raopsink_missing_message(&rust_i18n::locale())
+        };
+
         output.load_uri(&format!("https://music.test/stream?api_key={SECRET}"));
 
         assert!(matches!(
@@ -727,12 +695,12 @@ mod tests {
                 message,
             }) => {
                 assert_eq!(event_generation, generation);
-                assert_eq!(message, "AirPlay media preparation failed");
+                assert_eq!(message, expected);
                 assert!(!message.contains(SECRET));
                 assert!(!message.contains("api_key"));
                 assert!(!message.contains("music.test"));
             }
-            event => panic!("expected fixed preparation error, got {event:?}"),
+            event => panic!("expected fixed load error, got {event:?}"),
         }
 
         assert!(matches!(

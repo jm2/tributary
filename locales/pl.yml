@@ -222,6 +222,7 @@ errors:
     decoder_failed: "Wystąpił błąd dekodera dźwięku"
     audio_output_failed: "Wystąpił błąd wyjścia dźwięku"
     playback_failed: "Odtwarzanie dźwięku nie powiodło się"
+    airplay_raopsink_missing: "AirPlay wymaga elementu raopsink z GStreamera — zainstaluj pakiet gst-plugins-bad i uruchom Tributary ponownie"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:
