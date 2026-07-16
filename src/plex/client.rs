@@ -43,7 +43,7 @@ const MAX_API_BODY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// End-to-end and body-phase deadlines for each finite request class.
 const AUTH_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
-const API_RESPONSE_DEADLINE: Duration = Duration::from_secs(120);
+const API_RESPONSE_DEADLINE: Duration = Duration::from_mins(2);
 
 /// Holds credentials and a reusable `reqwest::Client` with the
 /// `X-Plex-Token` header pre-configured on every request.

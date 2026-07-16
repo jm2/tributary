@@ -25,15 +25,16 @@ Status summary:
 - [ ] P2 resilience and packaging complete
 - [ ] P3 architecture and integration coverage complete
 
-Progress snapshot (2026-07-15), recounted from the literal P0–P3 task checkboxes to correct the
+Progress snapshot (2026-07-16), recounted from the literal P0–P3 task checkboxes to correct the
 earlier numerator/denominator drift. The live protected-playback finding recorded under P2.11 now
 has five independently verifiable tasks rather than the original three compound boxes. The
 denominator excludes the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**162/220 (73.6%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **45/76 P2**,
-and **3/30 P3** after those exclusions. The release-workflow dry run remains deliberately deferred
-rather than being counted as unfinished P0 remediation.
+**173/220 (78.6%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **56/76 P2**,
+and **3/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+and the seven remaining P2.6 boxes closed by PR #100 since the prior snapshot. The release-workflow
+dry run remains deliberately deferred rather than being counted as unfinished P0 remediation.
 
 ## P0 — Release blockers
 
@@ -847,37 +848,65 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   (`release.yml:500` seds `pkgver`). The checked-in literals are stale to a *reader* but never
   reach a package. Nothing to fix. Recorded rather than deleted, so the same wrong conclusion is
   not re-derived from reading the spec in isolation.
-- [ ] Raise GTK runtime minimum to 4.16.
-- [ ] Raise libadwaita runtime minimum to 1.6. Both minimums are currently under-declared as
+- [x] Raise GTK runtime minimum to 4.16.
+- [x] Raise libadwaita runtime minimum to 1.6. Both minimums were under-declared as
   `>= 4.14` / `>= 1.5` in `build-aux/rpm/tributary.spec:23-24`, in Cargo.toml's
   `generate-rpm.requires`, and in Cargo.toml's `deb.depends`, against a crate that pins `v4_16`
-  and `v1_6` (`Cargo.toml:12-13`). The shipped `.deb`/`.rpm` therefore install onto systems where
-  the binary cannot start.
-- [ ] Add `%U` or `%F` to the desktop `Exec` line (`data/io.github.tributary.Tributary.desktop:6`
-  is bare `Exec=tributary`). Until this lands, the "Linux file association" feature CHANGELOG
-  advertises for 0.5.0 does not work: the `MimeType` entry is present and the binary handles
-  opens, but the desktop entry never passes the URI.
-- [ ] Add the required `AudioVideo` desktop category.
+  and `v1_6` (`Cargo.toml:13-14`); Arch's `PKGBUILD` declared neither floor. Debian, both RPM
+  paths, and Arch now declare GTK 4.16 / libadwaita 1.6 runtime minima, and the handwritten RPM
+  build requirements carry the same floors. The shipped native Linux packages therefore refuse
+  to install or build on systems where the binary cannot run.
+- [x] Add `%U` or `%F` to the desktop `Exec` line (`data/io.github.tributary.Tributary.desktop:6`
+  was bare `Exec=tributary`). Now `Exec=tributary %U`, so the "Linux file association" feature is
+  actually functional: the `MimeType` entry was present and the binary handles opens, but the
+  desktop entry never passed the URI.
+- [x] Add the required `AudioVideo` desktop category. `Audio`, `Music`, and `Player` are
+  additional categories that the spec requires to be accompanied by the `AudioVideo` main
+  category; `desktop-file-validate` now passes and runs in CI.
 - [x] Add the 0.5.0 AppStream release entry and synchronize post-release development metadata.
   The AppStream history now records the shipped 0.5.0 feature release dated 2026-05-08;
   `CHANGELOG.md` archives the same release and opens an Unreleased 0.5.1 section; and Cargo package
   metadata advances to 0.5.1. Implemented on the P2.11 protected-playback branch so this inherited
   partial update is explicit and independently reviewable rather than an undocumented side change.
-- [x] Update README Rust requirement from 1.80 to 1.85. Implemented in commit `e6c68bc`.
-- [ ] Add CI on the declared Rust 1.85 MSRV. Every toolchain in CI is
-  `dtolnay/rust-toolchain@stable`; nothing verifies that 1.85 still compiles.
-- [ ] Enforce the global validation gate in CI. It is currently a *local* gate: CI runs
-  `cargo test --release` only (`ci.yml:83`), never `cargo test --all-targets`, so a break that
-  only appears in debug (`debug_assert!`, overflow checks) ships. Nothing runs `appstreamcli` or
+- [x] Update the README Rust requirement from the obsolete 1.80 floor to the actual declared
+  MSRV. Commit `e6c68bc` first corrected it to 1.85; PR #100 corrects both README and Cargo to
+  1.92 after proving the current locked gtk-rs graph cannot compile on 1.85.
+- [x] Add CI on the declared Rust MSRV. Every toolchain in CI was
+  `dtolnay/rust-toolchain@stable`; nothing verified the declared MSRV still compiled — and it did
+  not: the locked graph refuses rustc 1.85 outright. The gtk-rs 0.11 release series (gtk4, glib,
+  gstreamer et al.) requires rustc **1.92**, with lesser floors from `time` (1.88), `ogg_pager`
+  (1.89), and the `icu_*` stack (1.86). The declared `rust-version` was a fiction from the moment
+  the gtk-rs 0.11 upgrade landed. `Cargo.toml` and the README now declare 1.92 (verified locally:
+  `cargo +1.85 check --locked` fails, `cargo +1.92 check --all-targets --locked` succeeds), and a
+  dedicated `MSRV (1.92)` CI job compile-proves it with `--locked` on every push/PR. The job's
+  toolchain pin and the `rust-version` field must move together.
+- [x] Enforce the global validation gate in CI. It was a *local* gate: CI ran
+  `cargo test --release` only, never `cargo test --all-targets`, so a break that
+  only appears in debug (`debug_assert!`, overflow checks) shipped. Nothing ran `appstreamcli` or
   `desktop-file-validate` in any workflow, and `fuzz/` is its own workspace so neither `fmt` nor
-  `clippy` ever covers it.
+  `clippy` ever covered it. CI now runs debug `cargo test --all-targets` and fuzz-workspace
+  `fmt --check` + `clippy --locked` on Linux x86_64, and a `Desktop Metadata` job requires both
+  a clean no-diagnostics desktop validation and valid AppStream metainfo on every push/PR. Eight
+  repository metadata regressions keep the Rust/API floors, Debian/generated-RPM/spec-RPM/Arch
+  requirements, desktop launch field, category, and exact MSRV CI pin synchronized. The fuzz
+  lockfile had already drifted — its `kstring 2.0.3` requires rustc 1.96, above even the corrected
+  MSRV — and is resynced to the main lock's 2.0.2; `--locked` keeps it from drifting silently again.
+  Workflow-job inspection recognizes both LF and CRLF source and synthesizes a CRLF checkout in the
+  MSRV regression, preventing Windows line-ending conversion from hiding a real job.
+  Windows architecture jobs use `fail-fast: false`, retaining both diagnostic results if one
+  runner fails. The optional setup-msys2 package cache remains enabled on x86_64 but is disabled on
+  `windows-11-arm`: its action-owned `paccache` cleanup intermittently exited 127 after successful
+  installation, while Cargo continues to use its separate architecture-specific cache.
 - [x] Apply a redirect policy to the app's non-credential HTTP clients. Radio-Browser
   (`radio/client.rs`), IP geolocation, and MusicBrainz (`ui/properties_dialog.rs`) bypassed
   `http_security` entirely and ran reqwest defaults, so they sent a `Referer` and would follow an
   HTTPS→HTTP downgrade. They now use a shared public policy that still permits the cross-host
   mirror redirects those services depend on but refuses to be walked down to plaintext.
-- [ ] Record implementation: README MSRV correction in commit `e6c68bc` and non-credential
-  redirect policy in commit `8368a65`; packaging remains open.
+- [x] Record implementation: README MSRV correction in commit `e6c68bc` and non-credential
+  redirect policy in commit `8368a65`; the AppStream/CHANGELOG/version synchronization landed on
+  the P2.11 protected-playback branch; runtime minimums, desktop entry, the MSRV correction to
+  1.92, CI gate enforcement, independent Windows matrix results, and the targeted ARM package-cache
+  workaround in PR #100. P2.6 is complete.
 
 ### P2.7 Fix platform cache paths
 
@@ -1108,41 +1137,63 @@ Run before marking any milestone complete:
 - [x] `cargo test --all-targets`
 - [x] `cargo test --release`
 - [x] `cargo audit`
-- [ ] `desktop-file-validate data/io.github.tributary.Tributary.desktop`
+- [x] `desktop-file-validate data/io.github.tributary.Tributary.desktop` with no diagnostics
 - [x] `appstreamcli validate --no-net data/io.github.tributary.Tributary.metainfo.xml`
 - [x] Targeted migration upgrade tests
 - [x] Targeted mock-network tests
 - [x] Targeted GTK/output lifecycle tests
-- [ ] Packaging dry runs for affected targets
+- [x] Packaging dry runs for affected targets
 - [x] Confirm `git diff --check` is clean
 
-`desktop-file-validate` still reports the pre-existing missing `AudioVideo` category tracked
-by P2.6. PR #94's containerized Flatpak build proved the manifest-local source generation and
-permission policy, but a local installed interactive portal/physical-media smoke pass remains
-outstanding, as does the deliberately deferred live release-workflow run.
+PR #94's containerized Flatpak build proved the manifest-local source generation and permission
+policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
+as does the deliberately deferred live release-workflow run.
 
-Most recent branch validation (2026-07-15, PR #98 P2.5 effective tag-write capability slice):
-`cargo check --all-targets`, strict `cargo clippy --all-targets --all-features -- -D warnings`, and
-strict `cargo clippy --release -- -D warnings` pass. Debug and release
-`cargo test --all-targets` pass 18 library plus 643 application tests (661 per Unix profile). The
-16 declared additions comprise 15 tests exercised on Unix and one Windows-only DACL regression,
-covering effective sibling create/flush/replace/cleanup and exclusive DACL installation; supported versus
-actual capability; missing, directory, symlink, cleanup-failure, read-only-parent, uppercase-format,
-and restrictive-mode behavior; exact local-URI admission and automatic-device source metadata;
-exact path deduplication; deterministic mixed-batch failure; and fail-closed control/localized-message
-state. `cargo fmt --all -- --check`, all 13 locale-catalog YAML parses and key parity,
-`git diff --check`, and AppStream validation pass; `cargo audit --no-fetch` passes with exactly the
-two accepted unmaintained warnings recorded under P0.8. `desktop-file-validate` still reports only
-the known `AudioVideo` category diagnostic tracked under P2.6. The installed interactive Flatpak
+Most recent branch validation (2026-07-16, PR #100 P2.6 packaging/CI slice): exact Rust 1.92
+passes `cargo check --all-targets --locked`, while Rust 1.85 rejects the locked graph with the
+documented gtk-rs 1.92 floors. Strict debug all-feature and release Clippy pass; debug and release
+`cargo test --all-targets` each pass 18 library, 646 application, and 8 repository-metadata tests
+(672 total per profile). The committed fuzz workspace passes format and strict Clippy with its
+lockfile; `cargo fmt --all -- --check`, `git diff --check`, AppStream, and no-diagnostics desktop
+validation pass; `cargo audit --no-fetch` reports only the two accepted unmaintained warnings
+recorded under P0.8. The eight metadata tests cover enabled GTK/libadwaita API features, Debian
+dependencies, generated and handwritten RPM runtime requirements, handwritten RPM build
+requirements, Arch dependencies, exact `%U` desktop launch, the `AudioVideo` main category, and
+synchronization of Cargo's MSRV with its exact CI toolchain. `rpmspec` parses both runtime/build
+requirements and `makepkg --printsrcinfo` emits the versioned Arch dependencies. Temporary
+`cargo-deb 3.7.0` and `cargo-generate-rpm 0.21.0` installs produced complete `.deb` and generated
+`.rpm` artifacts from the release binary; the Debian control archive and RPM query both contain
+the exact GTK 4.16/libadwaita 1.6 dependencies. The installed interactive Flatpak
 portal/physical-media smoke task, packaged Windows/full-backend playback, and physical-media
 validation remain open local/integration tasks; the release workflow remains deliberately deferred.
 
-**This gate is local, and CI does not enforce all of it.** Checked boxes mean the step was run by
-hand before a milestone, not that a regression would be caught automatically. As of 2026-07-13 CI
-runs `cargo fmt --check`, both `clippy -D warnings` invocations, `cargo test --release`, and
-`cargo audit` — but **not** `cargo test --all-targets` (so a debug-only break ships), and no
-workflow runs `appstreamcli` or `desktop-file-validate` at all. `fuzz/` is a separate workspace
-and is covered by neither `fmt` nor `clippy`. Closing that gap is tracked under P2.6.
+PR #100 CI follow-up (2026-07-16): Windows x86_64 reproduced the protected-loopback regression's
+fixture failure twice while the isolated GStreamer child itself exited successfully. The original
+eight-second target-listener window began before child startup and cold plugin discovery, so the
+fixture could disappear before `souphttpsrc` opened. The child now owns the intended media listener
+and starts its bounded window only after GStreamer initialization, while the parent keeps the
+poisoned-proxy listener live until child completion and injects proxy variables through `Command`
+before process creation. This preserves the end-to-end target-hit/proxy-miss assertion without
+mutating a multithreaded Unix process environment. The next Windows run passed all 627 application
+tests, including that regression, then exposed an unrelated LF-only workflow-job parser in the
+metadata suite: a CRLF checkout made the real `msrv` job appear absent. Job extraction now operates
+on logical lines independent of the newline spelling and the MSRV test synthesizes CRLF input on
+every platform. The exact proxy test passes three consecutive debug and three consecutive release
+runs, all 147 audio tests pass, the focused CRLF metadata regression passes, strict all-target and
+release Clippy pass, and the complete release all-target/all-feature suite passes 18 library, 646
+application, and 8 metadata tests (672 total). Formatting and `git diff --check` also pass. Windows
+matrix jobs now retain both architecture results, and setup-msys2's optional package cache is
+disabled only on ARM after its action-owned cleanup intermittently failed.
+
+**This gate is now enforced by CI** (P2.6, closed 2026-07-16): in addition to
+`cargo fmt --check`, both `clippy -D warnings` invocations, `cargo test --release`, and
+`cargo audit`, CI runs debug `cargo test --all-targets`, fuzz-workspace `fmt`/`clippy --locked`,
+strict no-diagnostics `desktop-file-validate`, `appstreamcli validate --no-net`, eight
+repository packaging/desktop/MSRV contract tests, and an `MSRV (1.92)` compile-proof.
+Checked boxes above still record the by-hand run before a milestone; the CI jobs are what catch
+regressions automatically. Windows x86_64 and ARM64 are allowed to finish independently, and only
+the ARM runner disables setup-msys2's optional package cache after its cleanup path intermittently
+failed following a successful install; the separate Cargo cache remains enabled.
 
 ## Decisions
 
@@ -1561,7 +1612,7 @@ Add one line per completed task:
 | 2026-07-15 | P1.6 Plex locator follow-up | PR #87 | Plex tracks without a non-empty media part are omitted before opaque-reference publication, while later valid media/part entries remain playable and supply their own bitrate/format; 2 focused tests cover the late PR #86 review finding and PR #87 metadata-alignment follow-up. |
 | 2026-07-12 | P1.7 | `60ee2af` | One worker owns the Cast session and serializes effects, authoritative state, cancellation, cleanup retries, and stale-event suppression. |
 | 2026-07-13 | P1.10 | `1c31b52` | Foreign keys, WAL, and busy timeout are set on every pooled connection instead of inherited from an sqlx default; 2 tests fail loudly if the pragma is ever lost. |
-| 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README now states the Rust 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. Packaging metadata remains open. |
+| 2026-07-13 | P2.6 (partial) | `e6c68bc`, `8368a65` | README first moved from Rust 1.80 to the then-declared 1.85 MSRV; Radio-Browser, geolocation, and MusicBrainz refuse HTTPS→HTTP redirect downgrades and send no `Referer`. The dependency graph later proved 1.85 fictional; PR #100 completes packaging and corrects the floor to 1.92. |
 | 2026-07-13 | P1.8 | `eb0b9ca`, `fbaaa7f` | One persistent FIFO MPD worker provides bounded post-resolution protocol I/O, stable song identity, shared-queue preservation, ownership preflight, explicit MPD mode reset, authoritative state/position/EOS, redaction, and poisoned-stream retirement. |
 | 2026-07-15 | P1.9 | PR #88 | Exact source-key/generation navigation prevents cross-source and same-key stale rendering, caches only the newest result per source, keeps the prior visible projection fresh while remote intent is pending, preserves valid caches across transient failures, and invalidates/reloads active playlists after reconciliation; eight navigation and two engine tests cover the races and event ordering. |
 | 2026-07-15 | P0.4 playback-start follow-up | PR #92 | Idle Play now releases the session read used to select `StartAt` before the arm installs its queue, preventing the live Windows DAAP `RefCell already borrowed` abort; the existing Stop-then-Play regression exercises the real `RefCell` boundary and immediate mutable replacement. |
@@ -1573,5 +1624,7 @@ Add one line per completed task:
 | 2026-07-15 | P2.5 legacy-root reauthorization | PR #95 | Explicit portal reselection records an immutable OLD→NEW intent; a marker-backed authority lease and guarded atomic transaction preserve track identity/history and playlist links; a same-transaction receipt makes crash/ambiguous-commit recovery idempotent; and malformed, overlapping, colliding, or inconsistent states quarantine unsafe scopes. Effective-write UX follows in PR #98; installed interactive smoke testing remains open. |
 | 2026-07-15 | P2.5 effective tag-write capability | PR #98 | Properties checks every exact selected local path off GTK, independently proves each Windows file's DACL access, rehearses the writer's flushed atomic replacement once per parent, and stops at the first blocked target or directory. It exposes localized all-or-none capability state, exact-deduplicates repeated playlist paths, and rechecks before the first write. Unix siblings begin private and Windows siblings install the source DACL while exclusively held before copying content. Sixteen focused tests cover the slice across Unix and Windows; only installed interactive Flatpak/physical-media smoke validation remains open in P2.5. |
 | 2026-07-15 | P2.6 0.5.0 release metadata | PR #96 | Added the missing AppStream 0.5.0 release entry, archived the shipped release in the changelog, and advanced Cargo/changelog development metadata to 0.5.1. The live release-workflow verification remains deliberately deferred. |
+| 2026-07-16 | P2.6 packaging and CI completion | PR #100 | Debian, generated RPM, handwritten RPM, and Arch metadata now match the GTK 4.16/libadwaita 1.6 API floor; Linux desktop activation passes `%U` and declares `AudioVideo`; Cargo/README declare the proven Rust 1.92 floor; exact-MSRV, debug all-target, fuzz, desktop, and AppStream gates run in CI; and eight repository contract tests prevent the declarations from drifting independently, including under a synthesized CRLF workflow checkout. Windows matrix jobs retain both architecture results, the ARM runner bypasses setup-msys2's intermittently failing optional package-cache cleanup while retaining Cargo caching, and the poisoned-proxy regression keeps the parent proxy fixture alive through child completion while starting the child media listener's bounded window only after GStreamer initialization, so cold Windows plugin discovery cannot create a false negative. |
+| 2026-07-16 | P2.9 | PR #99 | Removed the inoperative `shairport-sync` receiver fallback, moved the remaining capability refusal ahead of media preparation, localized actionable `raopsink`/`gst-plugins-bad` guidance, surfaced safe player errors in-app, and added focused missing-element/load-path regressions. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |

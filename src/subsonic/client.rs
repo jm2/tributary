@@ -38,7 +38,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_API_BODY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// End-to-end and body-phase deadline for finite API requests.
-const API_RESPONSE_DEADLINE: Duration = Duration::from_secs(120);
+const API_RESPONSE_DEADLINE: Duration = Duration::from_mins(2);
 
 /// Authentication mode used for API requests.
 #[derive(Clone)]

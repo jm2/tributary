@@ -25,6 +25,68 @@ jobs:
       - name: Run cargo audit
         run: cargo audit
 
+  # ── MSRV (minimum supported Rust version) ─────────────────────────────────
+  # Compile-proof for the `rust-version` declared in Cargo.toml. Keep the
+  # toolchain pin below in lockstep with that field: the gtk-rs 0.11 release
+  # series sets the current floor (rustc 1.92).
+  msrv:
+    name: MSRV (1.92)
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:41
+    steps:
+      - name: Install system dependencies (Fedora)
+        run: |
+          dnf install -y gcc gtk4-devel libadwaita-devel \
+            dbus-devel \
+            gstreamer1-devel gstreamer1-plugins-base-devel \
+            pkgconf-pkg-config git curl
+
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain (1.92)
+        uses: dtolnay/rust-toolchain@1.92.0
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: msrv-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: msrv-cargo-
+
+      - name: Check (MSRV, --all-targets, --locked)
+        run: cargo check --all-targets --locked
+
+  # ── Desktop metadata (AppStream + desktop entry) ──────────────────────────
+  # The packaging half of the global validation gate: these files ship in
+  # every Linux package and were previously only validated by hand.
+  desktop-metadata:
+    name: Desktop Metadata
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install validators
+        run: sudo apt-get update && sudo apt-get install -y appstream desktop-file-utils
+
+      - name: Validate desktop entry
+        run: |
+          if ! diagnostics="$(desktop-file-validate data/io.github.tributary.Tributary.desktop 2>&1)"; then
+            printf '%s\n' "$diagnostics"
+            exit 1
+          fi
+          if [ -n "$diagnostics" ]; then
+            printf '%s\n' "$diagnostics"
+            exit 1
+          fi
+
+      - name: Validate AppStream metainfo
+        run: appstreamcli validate --no-net data/io.github.tributary.Tributary.metainfo.xml
+
   # ── Linux (native binary + test) ──────────────────────────────────────────
   build-linux:
     name: Linux (${{ matrix.arch }})
@@ -41,7 +103,7 @@ jobs:
     steps:
       - name: Install system dependencies (Fedora)
         run: |
-          dnf install -y gcc gtk4-devel libadwaita-devel \
+          dnf install -y gcc gcc-c++ gtk4-devel libadwaita-devel \
             dbus-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel \
             gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free gstreamer1-libav \
@@ -79,6 +141,24 @@ jobs:
 
       - name: Run tests
         run: cargo test --release
+
+      # Debug-profile tests catch what release-only testing ships past:
+      # debug_assert! bodies and overflow checks are compiled out above.
+      - name: Run tests (debug, --all-targets)
+        if: matrix.arch == 'x86_64'
+        run: cargo test --all-targets
+
+      # The fuzz crate is its own workspace, so the main fmt/clippy passes
+      # never see it and its lockfile can drift (a drifted kstring once
+      # raised its effective MSRV past the toolchain unnoticed). --locked
+      # pins the committed resolution.
+      - name: Fuzz workspace fmt + clippy
+        if: matrix.arch == 'x86_64'
+        env:
+          CARGO_TARGET_DIR: target
+        run: |
+          cargo fmt --manifest-path fuzz/Cargo.toml --package tributary-fuzz -- --check
+          cargo clippy --manifest-path fuzz/Cargo.toml --package tributary-fuzz --all-targets --locked -- -D warnings
 
       - name: Code coverage
         if: matrix.arch == 'x86_64'
@@ -188,6 +268,9 @@ jobs:
     # stalling to the 6-hour ceiling (as one CLANGARM64 run did).
     timeout-minutes: 45
     strategy:
+      # Preserve the independent result from each architecture when a runner,
+      # package mirror, or platform-specific test fails on the other one.
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64
@@ -220,6 +303,11 @@ jobs:
           msystem: ${{ matrix.msystem }}
           path-type: inherit
           update: true
+          # setup-msys2's optional package-cache cleanup intermittently fails
+          # at its paccache step on windows-11-arm after installation succeeds.
+          # Cargo keeps its separate cache below; only skip the flaky MSYS2
+          # package cache on that runner.
+          cache: ${{ matrix.arch != 'aarch64' }}
           install: >-
             ${{ matrix.pkg_prefix }}-gtk4
             ${{ matrix.pkg_prefix }}-libadwaita
