@@ -26,7 +26,9 @@ use super::root_authority::{AbsenceProof, BoundDirectory, BoundFile, RootAuthori
 use super::tag_parser::{self, ParsedTrack};
 use super::tag_writer;
 use crate::architecture::models::Track;
-use crate::db::entities::{library_root, playlist_entry, root_reauthorization_receipt, track, unparseable_file};
+use crate::db::entities::{
+    library_root, playlist_entry, root_reauthorization_receipt, track, unparseable_file,
+};
 
 // ---------------------------------------------------------------------------
 // LibraryEvent — messages sent to GTK main thread
@@ -4785,23 +4787,6 @@ async fn reconcile_playlists_after_watcher_batch(
     super::playlist_manager::PlaylistManager::new(db.clone())
         .reconcile_all()
         .await
-}
-
-/// Finish the playlist work caused by one watcher batch, then tell the UI to
-/// rebuild any active projection. The notification is deliberately emitted
-/// even when reconciliation fails: the committed track mutation still needs
-/// to become visible, and a later batch or scan can retry orphan relinking.
-async fn settle_playlist_projections_after_watcher_batch(
-    db: &DatabaseConnection,
-    tx: &async_channel::Sender<LibraryEvent>,
-    upsert_committed: bool,
-    track_mutation_committed: bool,
-) -> Result<u32, sea_orm::DbErr> {
-    let result = reconcile_playlists_after_watcher_batch(db, upsert_committed).await;
-    if track_mutation_committed {
-        let _ = tx.send(LibraryEvent::PlaylistProjectionsInvalidated).await;
-    }
-    result
 }
 
 /// Finish the playlist work caused by one watcher batch, then tell the UI to
