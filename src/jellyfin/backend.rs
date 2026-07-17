@@ -607,6 +607,8 @@ fn jellyfin_item_to_track(
 
 #[cfg(test)]
 mod tests {
+    use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
+
     use super::*;
 
     #[test]
@@ -622,5 +624,103 @@ mod tests {
         let track = jellyfin_item_to_track(&item, Uuid::new_v4(), None, None);
         assert!(track.stream_url.is_none());
         assert!(track.cover_art_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_fixture_connects_and_loads_one_music_library() {
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/System/Ping").reply(MockResponse::text("Jellyfin Server")),
+            MockRoute::get("/Users/fixture-user/Views").reply(MockResponse::json(
+                serde_json::json!({
+                    "Items": [
+                        {"Id": "music-library", "Name": "Music", "CollectionType": "music"},
+                        {"Id": "movie-library", "Name": "Movies", "CollectionType": "movies"}
+                    ],
+                    "TotalRecordCount": 2
+                }),
+            )),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "Audio")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [{
+                        "Id": "track-1",
+                        "Name": "Fixture Song",
+                        "Type": "Audio",
+                        "Album": "Fixture Album",
+                        "AlbumId": "album-1",
+                        "AlbumArtist": "Fixture Artist",
+                        "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}],
+                        "IndexNumber": 3,
+                        "ParentIndexNumber": 1,
+                        "RunTimeTicks": 1_230_000_000,
+                        "Genres": ["Test"],
+                        "ProductionYear": 2026,
+                        "Container": "flac",
+                        "MediaSources": [{
+                            "Bitrate": 1_411_000,
+                            "MediaStreams": [{"Type": "Audio", "SampleRate": 48_000}]
+                        }],
+                        "UserData": {"PlayCount": 4}
+                    }],
+                    "TotalRecordCount": 1
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicAlbum")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [{
+                        "Id": "album-1",
+                        "Name": "Fixture Album",
+                        "Type": "MusicAlbum",
+                        "AlbumArtist": "Fixture Artist",
+                        "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}],
+                        "ProductionYear": 2026,
+                        "Genres": ["Test"],
+                        "ChildCount": 1,
+                        "RunTimeTicks": 1_230_000_000
+                    }],
+                    "TotalRecordCount": 1
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicArtist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [{
+                        "Id": "artist-1",
+                        "Name": "Fixture Artist",
+                        "Type": "MusicArtist"
+                    }],
+                    "TotalRecordCount": 1
+                }))),
+        ])
+        .await;
+        let token = Uuid::new_v4().to_string();
+
+        let backend =
+            JellyfinBackend::connect("fixture", &service.base_url(), &token, "fixture-user")
+                .await
+                .expect("connect Jellyfin fixture");
+
+        assert_eq!(backend.music_libraries().len(), 1);
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), 1);
+        assert_eq!(cache.tracks[0].title, "Fixture Song");
+        assert_eq!(cache.albums.len(), 1);
+        assert_eq!(cache.artists.len(), 1);
+        drop(cache);
+
+        let requests = service.requests();
+        assert_eq!(requests.len(), 5);
+        for request in requests {
+            let authorization = request
+                .headers
+                .get("x-emby-authorization")
+                .and_then(|value| value.to_str().ok())
+                .expect("Jellyfin fixture request authorization");
+            assert!(authorization.contains(&format!(r#"Token="{token}""#)));
+            assert!(request.body.is_empty());
+        }
+        service.finish().await;
     }
 }

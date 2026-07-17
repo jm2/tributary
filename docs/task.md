@@ -48,6 +48,11 @@ document already labels its diagram as intended and names the shipping abstracti
 P3.5 now reports every Linux-host source area in one pinned aggregate, keeps different native
 source sets as informational reports, and enforces the baseline accepted by two exact pinned PR
 executions in PR #111.
+The prepared P3.3 service-mock slices deliberately do not change this arithmetic yet: this branch
+adds the shared harness plus every non-DAAP success-path fixture, while the DAAP fixture remains on
+the separate prepared commit `6f6c9ac`. The compound service-mock checkbox can close only after both
+slices are integrated; the behavior-matrix and implementation-record boxes remain independently
+open.
 P2.10 is complete in PR #112. Legacy MPD outputs remain unconfirmed until the exact endpoint is
 re-added with the required localized checkbox; their public load boundary rejects playback before
 optimistic Buffering state, epoch advancement, worker enqueue/cleanup, MPD connection, MPD
@@ -1503,10 +1508,34 @@ values and invalid persisted `TrackId` fallback remain explicitly assigned to P3
 ### P3.3 Add network integration harnesses
 
 - [ ] Mock Subsonic, Jellyfin, Plex, DAAP, Radio-Browser, and geolocation services.
+  - Prepared non-DAAP slice: one shared loopback fixture matches concurrent requests by method,
+    exact path, and decoded query subset; queues bounded replies; records bounded bodies and
+    headers; treats an unexpected, ambiguous, over-count, or missing request as a test failure; and
+    performs explicit five-second graceful shutdown with abort-on-drop cleanup.
+  - Subsonic's existing live regression now uses that fixture and additionally proves every API
+    request carries the expected username, protocol/client/format values, salt, and correctly
+    derived token without the legacy plaintext parameter. New live tests connect complete Jellyfin
+    and Plex backends, prove their credential headers on all five expected requests, filter
+    non-music libraries, and map one track/album/artist catalogue despite Jellyfin's concurrent
+    item fetches. Radio-Browser proves its request contract and rejects a returned `file:` stream;
+    geolocation proves a valid first provider ends the cascade before either later endpoint is
+    contacted.
+  - DAAP remains untouched here. Its bounded endpoint-scripted fixture is prepared separately in
+    commit `6f6c9ac`; this compound box stays open until that change and this non-DAAP slice are both
+    integrated.
+  - Prepared-branch validation passes the five live service paths (four net-new tests plus the
+    migrated Subsonic regression), strict debug and release Clippy over every target/feature,
+    formatting, and diff hygiene. The complete locked debug and release suites each pass 18 library
+    tests, 735 application tests, and 10 repository metadata tests: 763 total.
 - [ ] Cover auth, redirect, timeout, body cap, pagination, partial failure, and reverse-proxy
   prefix behavior.
+  - The success fixtures above establish real request/response wiring only. They do not claim the
+    rejected/alternate-auth, redirect, deadline, oversized-response, multi-page, partial-failure,
+    or prefixed-origin cases required to close this behavior box.
 - [ ] Cover DAAP malformed nested containers and session expiration.
-- [ ] Record implementation: _pending_
+- [ ] Record implementation: _pending; prepared foundation is branch
+  `agent/p3.3-service-mocks` plus DAAP commit `6f6c9ac`, with no P3.3 checkbox or numerator change
+  until its compound dependencies are integrated and the remaining behavior matrix is complete._
 
 ### P3.4 Add UI/output integration harnesses
 
@@ -1904,6 +1933,17 @@ failed following a successful install; the separate Cargo cache remains enabled.
 ## Decisions
 
 Record scope or design decisions here so deferred work is explicit.
+
+- 2026-07-17 — P3.3 uses one deterministic keyed HTTP fixture rather than a FIFO script because
+  Jellyfin fetches three item classes concurrently and Subsonic performs bounded unordered library
+  walks. A route therefore keys method plus exact path plus a required decoded-query subset, while
+  tolerating unrelated generated authentication values. Each route owns a locked reply queue and
+  exact call count; the service separately records complete request metadata and all dispatch or
+  lifecycle failures. Explicit `finish` both bounds graceful shutdown and verifies no route was
+  missed, while `Drop` remains cleanup-only so panic unwinding cannot leak a server task. The first
+  slice intentionally tests only one successful production flow per non-DAAP service. It does not
+  silently convert that foundation into credit for P3.3's adversarial behavior matrix, and it does
+  not edit `src/daap/**` while the independently prepared DAAP work awaits integration.
 
 - 2026-07-17 — PR #112 completes P2.10 by requiring an explicit, persisted
   exclusive-control promise rather than pretending MPD offers an ownership lock or conditional
