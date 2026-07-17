@@ -6,13 +6,17 @@
 //! operation limits. URI-bearing commands and raw MPD errors are never logged
 //! or retained.
 
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use gtk::gio::prelude::*;
+use gtk::{gio, glib};
 use tracing::{debug, error, info};
 use url::Url;
 
@@ -34,6 +38,11 @@ const MAX_RESPONSE_LINES: usize = 256;
 const MAX_URI_BYTES: usize = 32 * 1024;
 const MAX_COMMAND_BYTES: usize = MAX_URI_BYTES + 128;
 const MAX_RESOLVED_ADDRESSES: usize = 32;
+const RESOLUTION_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_PENDING_RESOLVER_REQUESTS: usize = 64;
+const MAX_ACTIVE_MPD_RESOLUTIONS: usize = 8;
+const MAX_RESOLVER_REQUESTS_PER_TICK: usize = 16;
+const MAX_MPD_RESOLVER_HOST_BYTES: usize = 1024;
 /// One load-sized command plus a bounded burst of small playback controls.
 const MAX_PENDING_WORKER_COMMANDS: usize = 64;
 
@@ -765,7 +774,12 @@ enum DeleteOutcome {
 trait MpdConnector: Send + 'static {
     type Connection: MpdTransport + 'static;
 
-    fn connect(&mut self, deadline: OperationDeadline) -> MpdResult<Self::Connection>;
+    fn connect(
+        &mut self,
+        owner_epoch: u64,
+        intent_epoch: &AtomicU64,
+        deadline: OperationDeadline,
+    ) -> MpdResult<Self::Connection>;
 }
 
 trait MpdTransport {
@@ -801,14 +815,25 @@ struct MpdConnection {
 impl MpdConnector for MpdTcpConnector {
     type Connection = MpdConnection;
 
-    fn connect(&mut self, deadline: OperationDeadline) -> MpdResult<Self::Connection> {
-        MpdConnection::connect(&self.host, self.port, deadline)
+    fn connect(
+        &mut self,
+        owner_epoch: u64,
+        intent_epoch: &AtomicU64,
+        deadline: OperationDeadline,
+    ) -> MpdResult<Self::Connection> {
+        MpdConnection::connect(&self.host, self.port, owner_epoch, intent_epoch, deadline)
     }
 }
 
 impl MpdConnection {
-    fn connect(host: &str, port: u16, deadline: OperationDeadline) -> MpdResult<Self> {
-        let addresses = resolve_mpd_addresses(host, port)?;
+    fn connect(
+        host: &str,
+        port: u16,
+        owner_epoch: u64,
+        intent_epoch: &AtomicU64,
+        deadline: OperationDeadline,
+    ) -> MpdResult<Self> {
+        let addresses = resolve_mpd_addresses(host, port, owner_epoch, intent_epoch, deadline)?;
         Self::connect_addresses(addresses, deadline)
     }
 
@@ -1233,25 +1258,390 @@ fn parse_seconds(value: &str, operation: &'static str) -> MpdResult<u64> {
     Ok(milliseconds)
 }
 
-fn resolve_mpd_addresses(host: &str, port: u16) -> MpdResult<Vec<SocketAddr>> {
+static MPD_RESOLVER_SERVICE: OnceLock<MpdResult<MpdResolverService>> = OnceLock::new();
+
+struct MpdResolverService {
+    request_tx: mpsc::SyncSender<MpdResolverServiceRequest>,
+    context: glib::MainContext,
+}
+
+#[cfg(test)]
+type MpdResolverServiceJob = Box<dyn FnOnce(&glib::MainContext, usize) + Send + 'static>;
+
+enum MpdResolverServiceRequest {
+    Resolve(MpdResolverRequest),
+    #[cfg(test)]
+    Run(MpdResolverServiceJob),
+    #[cfg(test)]
+    Shutdown(mpsc::Sender<()>),
+}
+
+struct MpdResolverRequest {
+    host: String,
+    port: u16,
+    cancellable: gio::Cancellable,
+    result_tx: mpsc::Sender<MpdResult<Vec<SocketAddr>>>,
+}
+
+impl MpdResolverService {
+    fn shared() -> MpdResult<&'static Self> {
+        match MPD_RESOLVER_SERVICE.get_or_init(Self::start) {
+            Ok(service) => Ok(service),
+            Err(failure) => Err(*failure),
+        }
+    }
+
+    fn start() -> MpdResult<Self> {
+        let context = glib::MainContext::new();
+        let worker_context = context.clone();
+        let (request_tx, request_rx) = mpsc::sync_channel(MAX_PENDING_RESOLVER_REQUESTS);
+        std::thread::Builder::new()
+            .name("mpd-resolver".to_string())
+            .spawn(move || run_mpd_resolver_service(worker_context, request_rx))
+            .map_err(|error| opaque_mpd_failure("address resolution", error))?;
+        Ok(Self {
+            request_tx,
+            context,
+        })
+    }
+
+    fn submit(&self, request: MpdResolverServiceRequest) -> MpdResult<()> {
+        self.request_tx
+            .try_send(request)
+            .map_err(|error| opaque_mpd_failure("address resolution", error))?;
+        self.context.wakeup();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn shutdown_for_test(&self) {
+        let (done_tx, done_rx) = mpsc::channel();
+        self.submit(MpdResolverServiceRequest::Shutdown(done_tx))
+            .expect("submit resolver shutdown");
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("resolver service stopped");
+    }
+}
+
+fn run_mpd_resolver_service(
+    context: glib::MainContext,
+    request_rx: mpsc::Receiver<MpdResolverServiceRequest>,
+) {
+    let running = context.with_thread_default(|| {
+        let active_count = Rc::new(Cell::new(0));
+        let mut ingress_alive = true;
+        #[cfg(test)]
+        let mut shutdown_done: Option<mpsc::Sender<()>> = None;
+        'service: loop {
+            if !ingress_alive && active_count.get() == 0 {
+                #[cfg(test)]
+                if let Some(done_tx) = shutdown_done.take() {
+                    let _ = done_tx.send(());
+                }
+                break 'service;
+            }
+
+            let mut handled = 0;
+            while ingress_alive && handled < MAX_RESOLVER_REQUESTS_PER_TICK {
+                let request = match request_rx.try_recv() {
+                    Ok(request) => request,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        ingress_alive = false;
+                        break;
+                    }
+                };
+                handled += 1;
+                match request {
+                    MpdResolverServiceRequest::Resolve(request) => {
+                        start_mpd_resolution(request, Rc::clone(&active_count));
+                    }
+                    #[cfg(test)]
+                    MpdResolverServiceRequest::Run(job) => {
+                        job(&context, active_count.get());
+                    }
+                    #[cfg(test)]
+                    MpdResolverServiceRequest::Shutdown(done_tx) => {
+                        shutdown_done = Some(done_tx);
+                        ingress_alive = false;
+                    }
+                }
+            }
+            if !ingress_alive && active_count.get() == 0 {
+                #[cfg(test)]
+                if let Some(done_tx) = shutdown_done.take() {
+                    let _ = done_tx.send(());
+                }
+                break 'service;
+            }
+            // Request submission calls wakeup(), so this remains responsive
+            // while continuously dispatching async GIO completions on the
+            // one thread that created their gtk-rs callback guards.
+            let _ = context.iteration(handled == 0);
+        }
+    });
+    if let Err(context_error) = running {
+        error!(error = %context_error, "MPD resolver context stopped");
+    }
+}
+
+struct MpdResolverOperation {
+    enumerator: gio::SocketAddressEnumerator,
+    cancellable: gio::Cancellable,
+    result_tx: Option<mpsc::Sender<MpdResult<Vec<SocketAddr>>>>,
+    addresses: Vec<SocketAddr>,
+    active_lease: MpdResolverActiveLease,
+}
+
+struct MpdResolverActiveLease {
+    active_count: Rc<Cell<usize>>,
+    released: bool,
+}
+
+impl MpdResolverActiveLease {
+    fn acquire(active_count: Rc<Cell<usize>>) -> Option<Self> {
+        let active = active_count.get();
+        if active >= MAX_ACTIVE_MPD_RESOLUTIONS {
+            return None;
+        }
+        active_count.set(active + 1);
+        Some(Self {
+            active_count,
+            released: false,
+        })
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        let active = self.active_count.get();
+        debug_assert!(active > 0, "active MPD resolution count underflow");
+        self.active_count.set(active.saturating_sub(1));
+        self.released = true;
+    }
+}
+
+impl Drop for MpdResolverActiveLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn start_mpd_resolution(request: MpdResolverRequest, active_count: Rc<Cell<usize>>) {
+    if request.cancellable.is_cancelled() || !valid_mpd_resolver_host(&request.host) {
+        let _ = request
+            .result_tx
+            .send(Err(MpdFailure::new("address resolution")));
+        return;
+    }
+    let Some(active_lease) = MpdResolverActiveLease::acquire(active_count) else {
+        // Both queued requests and live GIO operations are hard-bounded.
+        // Overload therefore fails closed instead of creating an unbounded
+        // set of callbacks behind the resolver context.
+        let _ = request
+            .result_tx
+            .send(Err(MpdFailure::new("address resolution")));
+        return;
+    };
+    let connectable = gio::NetworkAddress::new(&request.host, request.port);
+    let operation = Rc::new(RefCell::new(MpdResolverOperation {
+        enumerator: connectable.enumerate(),
+        cancellable: request.cancellable,
+        result_tx: Some(request.result_tx),
+        addresses: Vec::new(),
+        active_lease,
+    }));
+    request_next_mpd_address(operation);
+}
+
+fn request_next_mpd_address(operation: Rc<RefCell<MpdResolverOperation>>) {
+    let (enumerator, cancellable) = {
+        let state = operation.borrow();
+        if state.cancellable.is_cancelled() {
+            drop(state);
+            finish_mpd_resolution(operation, Err(MpdFailure::new("address resolution")));
+            return;
+        }
+        (state.enumerator.clone(), state.cancellable.clone())
+    };
+    enumerator.next_async(Some(&cancellable), move |result| {
+        complete_mpd_address(operation, result);
+    });
+}
+
+fn complete_mpd_address(
+    operation: Rc<RefCell<MpdResolverOperation>>,
+    result: Result<Option<gio::SocketAddress>, glib::Error>,
+) {
+    let cancelled = operation.borrow().cancellable.is_cancelled();
+    if cancelled {
+        finish_mpd_resolution(operation, Err(MpdFailure::new("address resolution")));
+        return;
+    }
+
+    let address = match result {
+        Ok(Some(address)) => match gio_address_to_socket_addr(address) {
+            Ok(address) => address,
+            Err(failure) => {
+                finish_mpd_resolution(operation, Err(failure));
+                return;
+            }
+        },
+        Ok(None) => {
+            let result = {
+                let mut operation = operation.borrow_mut();
+                if operation.addresses.is_empty() {
+                    Err(MpdFailure::new("address resolution"))
+                } else {
+                    Ok(std::mem::take(&mut operation.addresses))
+                }
+            };
+            finish_mpd_resolution(operation, result);
+            return;
+        }
+        Err(error) => {
+            finish_mpd_resolution(
+                operation,
+                Err(opaque_mpd_failure("address resolution", error)),
+            );
+            return;
+        }
+    };
+
+    let full = retain_mpd_address(&mut operation.borrow_mut().addresses, address);
+    if full {
+        let addresses = std::mem::take(&mut operation.borrow_mut().addresses);
+        finish_mpd_resolution(operation, Ok(addresses));
+    } else {
+        request_next_mpd_address(operation);
+    }
+}
+
+fn finish_mpd_resolution(
+    operation: Rc<RefCell<MpdResolverOperation>>,
+    result: MpdResult<Vec<SocketAddr>>,
+) {
+    let result_tx = {
+        let mut operation = operation.borrow_mut();
+        operation.active_lease.release();
+        operation.result_tx.take()
+    };
+    if let Some(result_tx) = result_tx {
+        let _ = result_tx.send(result);
+    }
+}
+
+fn retain_mpd_address(addresses: &mut Vec<SocketAddr>, address: SocketAddr) -> bool {
+    if !addresses.contains(&address) {
+        addresses.push(address);
+    }
+    addresses.len() == MAX_RESOLVED_ADDRESSES
+}
+
+#[derive(Clone, Copy)]
+struct MpdResolutionScope<'a> {
+    owner_epoch: u64,
+    intent_epoch: &'a AtomicU64,
+    deadline: OperationDeadline,
+}
+
+impl MpdResolutionScope<'_> {
+    fn remaining(self) -> MpdResult<Duration> {
+        if self.intent_epoch.load(Ordering::SeqCst) != self.owner_epoch {
+            return Err(MpdFailure::new("address resolution"));
+        }
+        self.deadline.remaining("address resolution")
+    }
+}
+
+fn resolve_mpd_addresses(
+    host: &str,
+    port: u16,
+    owner_epoch: u64,
+    intent_epoch: &AtomicU64,
+    deadline: OperationDeadline,
+) -> MpdResult<Vec<SocketAddr>> {
     let host = strip_optional_ipv6_brackets(host);
-    let mut addresses = Vec::new();
-    for address in (host, port)
-        .to_socket_addrs()
-        .map_err(|error| opaque_mpd_failure("address resolution", error))?
-    {
-        if !addresses.contains(&address) {
-            addresses.push(address);
-            if addresses.len() == MAX_RESOLVED_ADDRESSES {
-                break;
+    let scope = MpdResolutionScope {
+        owner_epoch,
+        intent_epoch,
+        deadline,
+    };
+    scope.remaining()?;
+    if !valid_mpd_resolver_host(host) {
+        return Err(MpdFailure::new("address resolution"));
+    }
+
+    // Numeric hosts need neither the platform resolver nor a GLib main
+    // context. Scoped IPv6 literals that `IpAddr` does not accept continue
+    // through GIO, which preserves the native scope id in its result.
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(address, port)]);
+    }
+
+    let service = MpdResolverService::shared()?;
+    let cancellable = gio::Cancellable::new();
+    let (result_tx, result_rx) = mpsc::channel();
+    service.submit(MpdResolverServiceRequest::Resolve(MpdResolverRequest {
+        host: host.to_string(),
+        port,
+        cancellable: cancellable.clone(),
+        result_tx,
+    }))?;
+    wait_for_mpd_resolution(result_rx, &cancellable, scope)
+}
+
+fn valid_mpd_resolver_host(host: &str) -> bool {
+    !host.is_empty() && host.len() <= MAX_MPD_RESOLVER_HOST_BYTES && !host.contains('\0')
+}
+
+fn wait_for_mpd_resolution(
+    result_rx: mpsc::Receiver<MpdResult<Vec<SocketAddr>>>,
+    cancellable: &gio::Cancellable,
+    scope: MpdResolutionScope<'_>,
+) -> MpdResult<Vec<SocketAddr>> {
+    loop {
+        let remaining = match scope.remaining() {
+            Ok(remaining) => remaining,
+            Err(failure) => {
+                cancellable.cancel();
+                return Err(failure);
+            }
+        };
+        match result_rx.recv_timeout(remaining.min(RESOLUTION_CANCEL_POLL_INTERVAL)) {
+            Ok(result) => match scope.remaining() {
+                Ok(_) => return result,
+                Err(failure) => {
+                    cancellable.cancel();
+                    return Err(failure);
+                }
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                cancellable.cancel();
+                return Err(MpdFailure::new("address resolution"));
             }
         }
     }
-    if addresses.is_empty() {
-        Err(MpdFailure::new("address resolution"))
-    } else {
-        Ok(addresses)
-    }
+}
+
+fn gio_address_to_socket_addr(address: gio::SocketAddress) -> MpdResult<SocketAddr> {
+    let address = address
+        .downcast::<gio::InetSocketAddress>()
+        .map_err(|_| MpdFailure::new("address resolution"))?;
+    let inet_address = IpAddr::from(address.address());
+    let port = address.port();
+    Ok(match inet_address {
+        IpAddr::V4(ip) => SocketAddr::V4(SocketAddrV4::new(ip, port)),
+        IpAddr::V6(ip) => SocketAddr::V6(SocketAddrV6::new(
+            ip,
+            port,
+            address.flowinfo(),
+            address.scope_id(),
+        )),
+    })
 }
 
 fn strip_optional_ipv6_brackets(host: &str) -> &str {
@@ -1535,7 +1925,7 @@ fn handle_load<C>(
     if !is_current(owner, intent_epoch) {
         return;
     }
-    let connection = connector.connect(deadline);
+    let connection = connector.connect(owner.epoch, intent_epoch, deadline);
     let connection = match connection {
         Ok(connection) => connection,
         Err(failure) => {
@@ -2567,9 +2957,15 @@ impl MpdOutput {
     }
 
     pub fn probe(host: &str, port: u16) -> Result<String, String> {
-        let connection =
-            MpdConnection::connect(host, port, OperationDeadline::after(OPERATION_TIMEOUT))
-                .map_err(mpd_failure_message)?;
+        let probe_epoch = AtomicU64::new(0);
+        let connection = MpdConnection::connect(
+            host,
+            port,
+            0,
+            &probe_epoch,
+            OperationDeadline::after(OPERATION_TIMEOUT),
+        )
+        .map_err(mpd_failure_message)?;
         info!(version = %connection.version, "MPD probe successful");
         Ok(connection.version)
     }
@@ -2899,7 +3295,12 @@ mod tests {
     impl MpdConnector for FakeConnector {
         type Connection = FakeConnection;
 
-        fn connect(&mut self, _deadline: OperationDeadline) -> MpdResult<Self::Connection> {
+        fn connect(
+            &mut self,
+            _owner_epoch: u64,
+            _intent_epoch: &AtomicU64,
+            _deadline: OperationDeadline,
+        ) -> MpdResult<Self::Connection> {
             self.shared
                 .record(Point::Connect, Action::Point(Point::Connect))?;
             Ok(FakeConnection {
@@ -5434,12 +5835,385 @@ mod tests {
         }
     }
 
+    struct ResolverCallbackDropProbe {
+        dropped_tx: mpsc::Sender<std::thread::ThreadId>,
+    }
+
+    impl Drop for ResolverCallbackDropProbe {
+        fn drop(&mut self) {
+            let _ = self.dropped_tx.send(std::thread::current().id());
+        }
+    }
+
+    fn resolution_scope(
+        owner_epoch: u64,
+        intent_epoch: &AtomicU64,
+        duration: Duration,
+    ) -> MpdResolutionScope<'_> {
+        MpdResolutionScope {
+            owner_epoch,
+            intent_epoch,
+            deadline: OperationDeadline::after(duration),
+        }
+    }
+
     #[test]
-    fn raw_ipv6_host_resolves_without_manual_host_port_formatting() {
-        let addresses = resolve_mpd_addresses("::1", 6600).expect("IPv6 loopback resolves");
+    fn numeric_hosts_bypass_dns_and_preserve_raw_or_bracketed_ipv6() {
+        let intent_epoch = AtomicU64::new(7);
+        let addresses = resolve_mpd_addresses(
+            "::1",
+            6600,
+            7,
+            &intent_epoch,
+            OperationDeadline::after(Duration::from_secs(1)),
+        )
+        .expect("IPv6 loopback resolves");
         assert!(addresses.iter().any(SocketAddr::is_ipv6));
-        let bracketed = resolve_mpd_addresses("[::1]", 6600).expect("bracketed IPv6 resolves");
+        let bracketed = resolve_mpd_addresses(
+            "[::1]",
+            6600,
+            7,
+            &intent_epoch,
+            OperationDeadline::after(Duration::from_secs(1)),
+        )
+        .expect("bracketed IPv6 resolves");
         assert_eq!(addresses, bracketed);
+    }
+
+    #[test]
+    fn resolver_rejects_empty_nul_and_overlong_hosts_before_submission() {
+        let intent_epoch = AtomicU64::new(1);
+        for host in [
+            String::new(),
+            "invalid\0host".to_string(),
+            "a".repeat(MAX_MPD_RESOLVER_HOST_BYTES + 1),
+        ] {
+            assert!(resolve_mpd_addresses(
+                &host,
+                6600,
+                1,
+                &intent_epoch,
+                OperationDeadline::after(Duration::from_secs(1)),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn resolver_preserves_order_deduplicates_and_stops_at_address_cap() {
+        let expected = (1..=MAX_RESOLVED_ADDRESSES)
+            .map(|last| SocketAddr::from((Ipv4Addr::new(192, 0, 2, last as u8), 6600)))
+            .collect::<Vec<_>>();
+        let mut addresses = Vec::new();
+        assert!(!retain_mpd_address(&mut addresses, expected[0]));
+        assert!(!retain_mpd_address(&mut addresses, expected[0]));
+        for (index, address) in expected.iter().copied().enumerate().skip(1) {
+            assert_eq!(
+                retain_mpd_address(&mut addresses, address),
+                index + 1 == MAX_RESOLVED_ADDRESSES
+            );
+        }
+        assert_eq!(addresses, expected);
+    }
+
+    #[test]
+    fn resolver_deadline_cancels_inflight_gio_work() {
+        let (_held_result_tx, result_rx) = mpsc::channel();
+        let cancellable = gio::Cancellable::new();
+        let intent_epoch = AtomicU64::new(1);
+        let started = Instant::now();
+        let result = wait_for_mpd_resolution(
+            result_rx,
+            &cancellable,
+            resolution_scope(1, &intent_epoch, Duration::from_millis(25)),
+        );
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(cancellable.is_cancelled());
+    }
+
+    #[test]
+    fn resolver_result_disconnect_cancels_inflight_gio_work() {
+        let (result_tx, result_rx) = mpsc::channel();
+        drop(result_tx);
+        let cancellable = gio::Cancellable::new();
+        let intent_epoch = AtomicU64::new(1);
+
+        assert!(wait_for_mpd_resolution(
+            result_rx,
+            &cancellable,
+            resolution_scope(1, &intent_epoch, Duration::from_secs(1)),
+        )
+        .is_err());
+        assert!(cancellable.is_cancelled());
+    }
+
+    #[test]
+    fn newer_epoch_cancels_inflight_resolution_before_deadline() {
+        let (_held_result_tx, result_rx) = mpsc::channel();
+        let cancellable = gio::Cancellable::new();
+        let intent_epoch = AtomicU64::new(1);
+        let (replace_tx, replace_rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let worker_epoch = &intent_epoch;
+            scope.spawn(move || {
+                replace_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("resolution wait started");
+                worker_epoch.store(2, Ordering::SeqCst);
+            });
+            let started = Instant::now();
+            replace_tx.send(()).expect("replace playback epoch");
+            let result = wait_for_mpd_resolution(
+                result_rx,
+                &cancellable,
+                resolution_scope(1, &intent_epoch, Duration::from_secs(5)),
+            );
+            assert!(result.is_err());
+            assert!(started.elapsed() < Duration::from_secs(2));
+        });
+
+        assert!(cancellable.is_cancelled());
+    }
+
+    #[test]
+    fn resolver_service_dispatches_real_gio_on_its_private_context() {
+        let service = MpdResolverService::start().expect("resolver service starts");
+        let cancellable = gio::Cancellable::new();
+        let (result_tx, result_rx) = mpsc::channel();
+        service
+            .submit(MpdResolverServiceRequest::Resolve(MpdResolverRequest {
+                host: "127.0.0.1".to_string(),
+                port: 6600,
+                cancellable: cancellable.clone(),
+                result_tx,
+            }))
+            .expect("submit numeric GIO enumeration");
+        let intent_epoch = AtomicU64::new(1);
+        let addresses = wait_for_mpd_resolution(
+            result_rx,
+            &cancellable,
+            resolution_scope(1, &intent_epoch, Duration::from_secs(1)),
+        )
+        .expect("numeric GIO enumeration succeeds");
+        assert_eq!(
+            addresses,
+            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 6600))]
+        );
+        service.shutdown_for_test();
+    }
+
+    #[test]
+    fn resolver_service_caps_active_work_and_dispatches_under_queued_load() {
+        let service = MpdResolverService::start().expect("resolver service starts");
+        let (gate_armed_tx, gate_armed_rx) = mpsc::channel();
+        let (gate_release_tx, gate_release_rx) = mpsc::channel();
+        service
+            .submit(MpdResolverServiceRequest::Run(Box::new(
+                move |_context, active| {
+                    let _ = gate_armed_tx.send(active);
+                    let _ = gate_release_rx.recv_timeout(Duration::from_secs(2));
+                },
+            )))
+            .expect("submit service gate");
+        assert_eq!(
+            gate_armed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("resolver gate armed"),
+            0
+        );
+
+        let cancelled = gio::Cancellable::new();
+        cancelled.cancel();
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
+        service
+            .submit(MpdResolverServiceRequest::Resolve(MpdResolverRequest {
+                host: "127.0.0.1".to_string(),
+                port: 6600,
+                cancellable: cancelled,
+                result_tx: cancelled_tx,
+            }))
+            .expect("submit pre-cancelled resolution");
+
+        let submitted = MAX_ACTIVE_MPD_RESOLUTIONS + 4;
+        let mut result_receivers = Vec::new();
+        for _ in 0..submitted {
+            let (result_tx, result_rx) = mpsc::channel();
+            service
+                .submit(MpdResolverServiceRequest::Resolve(MpdResolverRequest {
+                    host: "127.0.0.1".to_string(),
+                    port: 6600,
+                    cancellable: gio::Cancellable::new(),
+                    result_tx,
+                }))
+                .expect("submit queued resolution");
+            result_receivers.push(result_rx);
+        }
+        // The first valid operation will occupy a slot, but its final send
+        // must not be required to release that slot.
+        drop(result_receivers.remove(0));
+
+        let (observed_tx, observed_rx) = mpsc::channel();
+        service
+            .submit(MpdResolverServiceRequest::Run(Box::new(
+                move |_context, active| {
+                    let _ = observed_tx.send(active);
+                },
+            )))
+            .expect("submit active-count observation");
+        gate_release_tx.send(()).expect("release resolver gate");
+        assert_eq!(
+            observed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("active count observed before dispatch"),
+            MAX_ACTIVE_MPD_RESOLUTIONS
+        );
+
+        assert!(cancelled_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pre-cancelled request rejected")
+            .is_err());
+        let mut succeeded = 0;
+        let mut rejected = 0;
+        for result_rx in result_receivers {
+            match result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("queued resolution completed")
+            {
+                Ok(_) => succeeded += 1,
+                Err(_) => rejected += 1,
+            }
+        }
+        assert_eq!(succeeded, MAX_ACTIVE_MPD_RESOLUTIONS - 1);
+        assert_eq!(rejected, submitted - MAX_ACTIVE_MPD_RESOLUTIONS);
+
+        let drain_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (active_tx, active_rx) = mpsc::channel();
+            service
+                .submit(MpdResolverServiceRequest::Run(Box::new(
+                    move |_context, active| {
+                        let _ = active_tx.send(active);
+                    },
+                )))
+                .expect("query active resolution count");
+            if active_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("active count query")
+                == 0
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < drain_deadline,
+                "active resolutions drained"
+            );
+        }
+
+        let (followup_tx, followup_rx) = mpsc::channel();
+        service
+            .submit(MpdResolverServiceRequest::Resolve(MpdResolverRequest {
+                host: "127.0.0.1".to_string(),
+                port: 6600,
+                cancellable: gio::Cancellable::new(),
+                result_tx: followup_tx,
+            }))
+            .expect("submit follow-up resolution");
+        assert!(followup_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("free slot accepts follow-up")
+            .is_ok());
+        service.shutdown_for_test();
+    }
+
+    #[test]
+    fn cancelled_service_callback_still_dispatches_and_drops_on_resolver_thread() {
+        let service = MpdResolverService::start().expect("resolver service starts");
+        let cancellable = gio::Cancellable::new();
+        let callback_cancellable = cancellable.clone();
+        let (armed_tx, armed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel::<()>();
+        let (dispatched_tx, dispatched_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+
+        service
+            .submit(MpdResolverServiceRequest::Run(Box::new(
+                move |_context, _active| {
+                    let service_thread = std::thread::current().id();
+                    let drop_probe = ResolverCallbackDropProbe { dropped_tx };
+                    let callback_cancel_state = callback_cancellable.clone();
+                    let connectable = gio::NetworkAddress::new("127.0.0.1", 6600);
+                    connectable.enumerate().next_async(
+                        Some(&callback_cancellable),
+                        move |_result| {
+                            let receiver_was_dropped = result_tx.send(()).is_err();
+                            let _ = dispatched_tx.send((
+                                std::thread::current().id(),
+                                receiver_was_dropped,
+                                callback_cancel_state.is_cancelled(),
+                            ));
+                            let _ = &drop_probe;
+                        },
+                    );
+                    let _ = armed_tx.send(service_thread);
+                    // Hold the service before its next context iteration so the
+                    // caller can cancel and retire the result receiver first.
+                    let _ = release_rx.recv_timeout(Duration::from_secs(1));
+                },
+            )))
+            .expect("submit resolver service test callback");
+
+        let service_thread = armed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("service callback armed");
+        drop(result_rx);
+        cancellable.cancel();
+        release_tx.send(()).expect("release resolver service");
+        let (callback_thread, receiver_was_dropped, callback_saw_cancel) = dispatched_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("late callback dispatched");
+        assert_eq!(callback_thread, service_thread);
+        assert!(receiver_was_dropped);
+        assert!(callback_saw_cancel);
+        assert_eq!(
+            dropped_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("callback resources dropped"),
+            service_thread
+        );
+        service.shutdown_for_test();
+    }
+
+    #[test]
+    fn gio_inet_addresses_convert_with_ipv6_flowinfo_and_scope() {
+        let ipv4: gio::InetSocketAddress = glib::Object::builder()
+            .property(
+                "address",
+                gio::InetAddress::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44))),
+            )
+            .property("port", 6600_u32)
+            .build();
+        assert_eq!(
+            gio_address_to_socket_addr(ipv4.upcast()).expect("IPv4 GIO address converts"),
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 44), 6600))
+        );
+
+        let ipv6: gio::InetSocketAddress = glib::Object::builder()
+            .property(
+                "address",
+                gio::InetAddress::from(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            )
+            .property("port", 6600_u32)
+            .property("flowinfo", 0x1234_u32)
+            .property("scope-id", 42_u32)
+            .build();
+        assert_eq!(
+            gio_address_to_socket_addr(ipv6.upcast()).expect("IPv6 GIO address converts"),
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 6600, 0x1234, 42,))
+        );
     }
 
     fn scripted_server(steps: Vec<(String, Vec<u8>)>) -> (SocketAddr, std::thread::JoinHandle<()>) {
@@ -5684,9 +6458,12 @@ mod tests {
     }
 
     fn connect_test(address: SocketAddr) -> MpdConnection {
+        let intent_epoch = AtomicU64::new(0);
         MpdConnection::connect(
             &address.ip().to_string(),
             address.port(),
+            0,
+            &intent_epoch,
             OperationDeadline::after(Duration::from_secs(2)),
         )
         .expect("connect to fake MPD server")
