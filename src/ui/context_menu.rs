@@ -1,23 +1,51 @@
-//! Right-click context menu on the tracklist ColumnView.
+//! Pointer and keyboard context menu on the tracklist `ColumnView`.
 //!
 //! Handles "Remove from Playlist", "Add to Playlist", and "Properties…"
-//! actions triggered from right-clicking selected tracks.
+//! actions triggered from right-clicking selected tracks or pressing the
+//! platform context-menu key / Shift+F10.
 
 use adw::prelude::*;
 use sea_orm::{EntityTrait, QueryFilter};
+use std::rc::Rc;
 
 use super::browser;
 use super::objects::{SourceObject, TrackObject};
 use super::tracklist;
 use super::window_state::WindowState;
 
-/// Wire the right-click context menu on the tracklist `ColumnView`.
+const CONTEXT_MENU_KEY_SHORTCUTS: &str = "Shift+F10 Menu";
+
+fn is_keyboard_context_menu_trigger(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
+    use gtk::gdk::ModifierType;
+
+    // Caps/Num lock state must not disable the standard shortcuts, while a
+    // Ctrl/Alt/Super chord must remain available to the desktop/application.
+    let disallowed = ModifierType::CONTROL_MASK
+        | ModifierType::ALT_MASK
+        | ModifierType::SUPER_MASK
+        | ModifierType::HYPER_MASK
+        | ModifierType::META_MASK;
+    if modifiers.intersects(disallowed) {
+        return false;
+    }
+
+    key == gtk::gdk::Key::Menu
+        || (key == gtk::gdk::Key::F10 && modifiers.contains(ModifierType::SHIFT_MASK))
+}
+
+fn expose_context_menu_accessibility(column_view: &gtk::ColumnView) {
+    column_view.update_property(&[
+        gtk::accessible::Property::HasPopup(true),
+        gtk::accessible::Property::KeyShortcuts(CONTEXT_MENU_KEY_SHORTCUTS),
+    ]);
+}
+
+/// Wire pointer and keyboard context-menu access on the tracklist.
 ///
-/// Adds a gesture controller that shows a popover menu with actions
-/// relevant to the current selection and source context.
+/// Right-click retains its exact pointer anchor. The Menu key and Shift+F10
+/// open the same selection-snapshotted action model relative to the focused
+/// tracklist, and are consumed only when a non-empty menu was opened.
 pub fn setup_context_menu(state: &WindowState) {
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(3); // right-click
     let sm = state.sort_model.clone();
     let sidebar_store = state.sidebar_store.clone();
     let active_source_key = state.active_source_key.clone();
@@ -30,88 +58,118 @@ pub fn setup_context_menu(state: &WindowState) {
     let browser_widget = state.browser_widget.clone();
     let browser_state = state.browser_state.clone();
 
-    gesture.connect_pressed(move |gesture, _n_press, x, y| {
-        let Some(widget) = gesture.widget() else {
-            return;
-        };
-        let Ok(cv) = widget.downcast::<gtk::ColumnView>() else {
-            return;
-        };
+    let popup_menu = Rc::new(
+        move |cv: &gtk::ColumnView, anchor: Option<gtk::gdk::Rectangle>| {
+            let active_key = active_source_key.borrow().clone();
+            let is_playlist_view = active_key.starts_with("playlist:");
 
-        let active_key = active_source_key.borrow().clone();
-        let is_playlist_view = active_key.starts_with("playlist:");
+            // Collect selected track URIs from the MultiSelection model.
+            let selection_model = cv.model();
+            let Some(sel) = selection_model.and_then(|m| m.downcast::<gtk::MultiSelection>().ok())
+            else {
+                return false;
+            };
 
-        // Collect selected track URIs from the MultiSelection model.
-        let selection_model = cv.model();
-        let Some(sel) = selection_model.and_then(|m| m.downcast::<gtk::MultiSelection>().ok())
-        else {
-            return;
-        };
+            let selected = sel.selection();
+            if selected.is_empty() {
+                return false;
+            }
 
-        let selected = sel.selection();
-        if selected.is_empty() {
-            return;
-        }
+            let menu = gtk::gio::Menu::new();
+            let action_group = gtk::gio::SimpleActionGroup::new();
 
-        let menu = gtk::gio::Menu::new();
-        let action_group = gtk::gio::SimpleActionGroup::new();
+            if is_playlist_view {
+                build_remove_from_playlist_action(
+                    &menu,
+                    &action_group,
+                    &active_key,
+                    &sm,
+                    &selected,
+                    &rt_handle,
+                    &track_store,
+                    &source_tracks,
+                    &source_navigation,
+                    &master_tracks,
+                    &status_label,
+                    &browser_widget,
+                    &browser_state,
+                );
+            } else {
+                build_add_to_playlist_actions(
+                    &menu,
+                    &action_group,
+                    &sidebar_store,
+                    &sm,
+                    &selected,
+                    &rt_handle,
+                );
+            }
 
-        if is_playlist_view {
-            build_remove_from_playlist_action(
-                &menu,
-                &action_group,
-                &active_key,
-                &sm,
-                &selected,
-                &rt_handle,
-                &track_store,
-                &source_tracks,
-                &source_navigation,
-                &master_tracks,
-                &status_label,
-                &browser_widget,
-                &browser_state,
-            );
-        } else {
-            build_add_to_playlist_actions(
-                &menu,
-                &action_group,
-                &sidebar_store,
-                &sm,
-                &selected,
-                &rt_handle,
-            );
-        }
+            // ── Properties… ──────────────────────────────────────────
+            let automatic_device = active_source_is_automatic_device(&sidebar_store, &active_key);
+            build_properties_action(&menu, &action_group, cv, &sm, &selected, automatic_device);
 
-        // ── Properties… ──────────────────────────────────────────
-        let automatic_device = active_source_is_automatic_device(&sidebar_store, &active_key);
-        build_properties_action(
-            &menu,
-            &action_group,
-            gesture,
-            &sm,
-            &selected,
-            automatic_device,
-        );
+            if menu.n_items() == 0 {
+                return false;
+            }
 
-        if menu.n_items() == 0 {
-            return;
-        }
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(cv);
+            popover.insert_action_group("tracklist-ctx", Some(&action_group));
+            if let Some(anchor) = anchor {
+                popover.set_pointing_to(Some(&anchor));
+            }
 
-        cv.insert_action_group("tracklist-ctx", Some(&action_group));
+            // Disable the internal ScrolledWindow that GTK4 PopoverMenu
+            // creates — it adds unnecessary scrollbars for small menus.
+            disable_popover_scrollbars(&popover);
 
-        let popover = gtk::PopoverMenu::from_model(Some(&menu));
-        popover.set_parent(&cv);
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            // Popovers created for a snapshot are one-shot. Explicitly detach the
+            // closed widget so repeated keyboard or pointer invocations do not
+            // retain obsolete action groups or captured selections.
+            popover.connect_closed(|popover| popover.unparent());
+            popover.popup();
+            true
+        },
+    );
 
-        // Disable the internal ScrolledWindow that GTK4 PopoverMenu
-        // creates — it adds unnecessary scrollbars for small menus.
-        disable_popover_scrollbars(&popover);
-
-        popover.popup();
-    });
-
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3); // right-click
+    {
+        let popup_menu = Rc::clone(&popup_menu);
+        gesture.connect_pressed(move |gesture, _n_press, x, y| {
+            let Some(cv) = gesture
+                .widget()
+                .and_then(|widget| widget.downcast::<gtk::ColumnView>().ok())
+            else {
+                return;
+            };
+            let anchor = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+            popup_menu(&cv, Some(anchor));
+        });
+    }
     state.column_view.add_controller(gesture);
+
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.connect_key_pressed(move |controller, key, _keycode, modifiers| {
+        if !is_keyboard_context_menu_trigger(key, modifiers) {
+            return gtk::glib::Propagation::Proceed;
+        }
+        let Some(cv) = controller
+            .widget()
+            .and_then(|widget| widget.downcast::<gtk::ColumnView>().ok())
+        else {
+            return gtk::glib::Propagation::Proceed;
+        };
+
+        if popup_menu(&cv, None) {
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    state.column_view.add_controller(key_controller);
+    expose_context_menu_accessibility(&state.column_view);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -386,7 +444,7 @@ fn build_add_to_playlist_actions(
 fn build_properties_action(
     menu: &gtk::gio::Menu,
     action_group: &gtk::gio::SimpleActionGroup,
-    gesture: &gtk::GestureClick,
+    column_view: &gtk::ColumnView,
     sm: &gtk::SortListModel,
     selected: &gtk::Bitset,
     automatic_device: bool,
@@ -436,10 +494,9 @@ fn build_properties_action(
     }
 
     let props_action = gtk::gio::SimpleAction::new("properties", None);
-    let win_for_props = gesture.widget().and_then(|w| {
-        w.root()
-            .and_then(|r| r.downcast::<adw::ApplicationWindow>().ok())
-    });
+    let win_for_props = column_view
+        .root()
+        .and_then(|root| root.downcast::<adw::ApplicationWindow>().ok());
 
     props_action.connect_activate(move |_, _| {
         let Some(ref win) = win_for_props else { return };
@@ -567,5 +624,46 @@ mod tests {
         assert!(!active_source_is_automatic_device(&store, "/media/player"));
         assert!(!active_source_is_automatic_device(&store, "device:opaque"));
         assert!(!active_source_is_automatic_device(&store, "local"));
+    }
+
+    #[test]
+    fn keyboard_context_menu_shortcuts_are_exact_and_do_not_shadow_plain_f10() {
+        use gtk::gdk::{Key, ModifierType};
+
+        assert!(is_keyboard_context_menu_trigger(
+            Key::Menu,
+            ModifierType::empty()
+        ));
+        assert!(is_keyboard_context_menu_trigger(
+            Key::Menu,
+            ModifierType::LOCK_MASK
+        ));
+        assert!(is_keyboard_context_menu_trigger(
+            Key::F10,
+            ModifierType::SHIFT_MASK
+        ));
+        assert!(is_keyboard_context_menu_trigger(
+            Key::F10,
+            ModifierType::SHIFT_MASK | ModifierType::LOCK_MASK
+        ));
+
+        assert!(!is_keyboard_context_menu_trigger(
+            Key::F10,
+            ModifierType::empty()
+        ));
+        assert!(!is_keyboard_context_menu_trigger(
+            Key::F10,
+            ModifierType::SHIFT_MASK | ModifierType::CONTROL_MASK
+        ));
+        assert!(!is_keyboard_context_menu_trigger(
+            Key::Menu,
+            ModifierType::ALT_MASK
+        ));
+        assert!(!is_keyboard_context_menu_trigger(
+            Key::F9,
+            ModifierType::SHIFT_MASK
+        ));
+
+        assert_eq!(CONTEXT_MENU_KEY_SHORTCUTS, "Shift+F10 Menu");
     }
 }

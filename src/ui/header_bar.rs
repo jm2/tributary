@@ -40,6 +40,25 @@ pub struct HeaderBarWidgets {
     pub output_list: gtk::ListBox,
 }
 
+fn slider_accessibility_labels(locale: &str) -> (String, String) {
+    (
+        rust_i18n::t!("header.playback_position", locale = locale).into_owned(),
+        rust_i18n::t!("header.volume", locale = locale).into_owned(),
+    )
+}
+
+fn expose_slider_accessibility(progress: &gtk::Scale, volume: &gtk::Scale, locale: &str) {
+    let (progress_label, volume_label) = slider_accessibility_labels(locale);
+    progress.update_property(&[
+        gtk::accessible::Property::Label(&progress_label),
+        gtk::accessible::Property::Orientation(gtk::Orientation::Horizontal),
+    ]);
+    volume.update_property(&[
+        gtk::accessible::Property::Label(&volume_label),
+        gtk::accessible::Property::Orientation(gtk::Orientation::Horizontal),
+    ]);
+}
+
 /// Build the full header bar and return all interactive widgets.
 pub fn build_header_bar() -> HeaderBarWidgets {
     // ── Left: Playback Controls ──────────────────────────────────────
@@ -208,6 +227,11 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         .adjustment(&volume_adj)
         .build();
 
+    // GtkScale exposes its native value/range and keyboard controls. Give
+    // each otherwise-unlabelled scale a stable, localized accessible name so
+    // assistive technology can distinguish playback position from volume.
+    expose_slider_accessibility(&progress, &volume_scale, &rust_i18n::locale());
+
     let volume_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(2)
@@ -346,4 +370,49 @@ pub fn build_output_row(name: &str, icon_name: &str, active: bool) -> gtk::Box {
     row.append(&label);
     row.append(&check);
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slider_accessibility_labels_exist_in_every_catalog() {
+        let expected = [
+            ("de", "Wiedergabeposition", "Lautstärke"),
+            ("en", "Playback position", "Volume"),
+            ("es", "Posición de reproducción", "Volumen"),
+            ("fr", "Position de lecture", "Volume"),
+            ("it", "Posizione di riproduzione", "Volume"),
+            ("ja", "再生位置", "音量"),
+            ("ko", "재생 위치", "음량"),
+            ("nl", "Afspeelpositie", "Volume"),
+            ("pl", "Pozycja odtwarzania", "Głośność"),
+            ("pt-BR", "Posição da reprodução", "Volume"),
+            ("ru", "Позиция воспроизведения", "Громкость"),
+            ("zh-CN", "播放位置", "音量"),
+            ("zh-TW", "播放位置", "音量"),
+        ];
+        let available = rust_i18n::available_locales!();
+        assert_eq!(available.len(), expected.len());
+
+        for (locale, expected_position, expected_volume) in expected {
+            assert!(
+                available
+                    .iter()
+                    .any(|candidate| candidate.as_ref() == locale),
+                "{locale} is missing from the available catalogs"
+            );
+            let labels = slider_accessibility_labels(locale);
+            assert_eq!(
+                labels,
+                (expected_position.into(), expected_volume.into()),
+                "missing or fallback accessibility label for {locale}"
+            );
+            assert_ne!(
+                labels.0, labels.1,
+                "the two sliders are indistinguishable for {locale}"
+            );
+        }
+    }
 }
