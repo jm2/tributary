@@ -1602,8 +1602,21 @@ service/DAAP foundation and is stacked on its PR #117 head pending publication.
 - [ ] Cover fake MPD and delayed/adversarial Chromecast state machines, including a cap applied
   before allocating from a peer-advertised Cast frame length.
 - [ ] Cover stale album-art and source-result generations.
-- [ ] Add keyboard context-menu and slider accessibility checks.
+- [x] Add keyboard context-menu and slider accessibility checks. Commit `f0446f3` routes Menu and
+  Shift+F10 through the exact right-click selection snapshot, consumes only a shortcut that opens a
+  non-empty menu, exposes the popup/shortcut properties on the track list, and explicitly labels
+  the position and volume sliders in all 13 catalogs. Focused tests cover accepted and rejected
+  modifier combinations, preserve plain F10 and unrelated chords, and reject missing/fallback or
+  indistinguishable slider names without requiring a display server.
 - [ ] Record implementation: _pending_
+
+The checked accessibility slice deliberately relies on `GtkScale` for slider focus, arrow/Page
+Up/Page Down/Home/End behavior, role, current value, and range, then supplies the application-owned
+localized name and horizontal orientation. The context menu retains one action group on the
+one-shot popover rather than on the long-lived list, so closing it releases the captured selection;
+keyboard activation and pointer activation cannot drift into separate action implementations.
+P3.4 as a whole remains open until the five broader lifecycle/state-machine harness boxes and its
+implementation record are complete.
 
 ### P3.5 Make coverage reporting representative
 
@@ -2033,6 +2046,14 @@ Record scope or design decisions here so deferred work is explicit.
   protocols. A Plex media path appends below the configured base and rejects normalization outside
   it, while a peer's path never enters the fixed error. This evidence closes the matrix and record
   boxes without claiming unsupported alternate-auth modes or every redundant pairing.
+
+- 2026-07-17 — The P3.4 accessibility slice uses GTK's standard Menu and Shift+F10 conventions and
+  the same one-shot, selection-snapshotted popover as right-click. A recognized shortcut propagates
+  when the view has no usable selection/menu, preventing Tributary from shadowing an ancestor or
+  desktop binding without performing an action. The track list publishes `has-popup` and both
+  shortcuts; each scale retains GTK's native slider behavior and publishes a localized name plus
+  horizontal orientation. Deterministic tests cover shortcut policy and all translation catalogs;
+  compositor-dependent synthetic key injection is left to future installed UI smoke coverage.
 
 - 2026-07-17 — PR #112 completes P2.10 by requiring an explicit, persisted
   exclusive-control promise rather than pretending MPD offers an ownership lock or conditional
