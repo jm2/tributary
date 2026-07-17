@@ -1352,10 +1352,12 @@ closed as a milestone.
   does not compare it with the base branch; ordinary PRs retain or raise it, while a decrease
   requires a dedicated measurement-definition change and rationale. Two complete local
   source-instrumentation runs measured 67.49% and 67.50% production lines after applying
-  cargo-llvm-cov's documented default omission of test-source files, yielding a provisional 67.3%
-  floor under that policy. The exact pinned cargo-llvm-cov
-  frontend and Rust 1.92 LLVM tools were not already installed locally and were deliberately not
-  downloaded, so this checkbox awaits the first successful exact PR-CI execution.
+  cargo-llvm-cov's documented default omission of test-source files. The first exact pinned run
+  (GitHub Actions run 29595891966) then passed all 746 tests, generated the 80-file HTML artifact,
+  and measured 67.03% lines (32,909/49,099), 66.84% functions (2,870/4,294), and 65.93% regions
+  (51,397/77,952). It failed solely because that exact denominator was below the provisional 67.3%
+  local floor. Applying the documented round-down-minus-0.1 policy yields 66.9%; the checkbox awaits
+  a second clean exact pinned run confirming that floor.
 - [ ] Record implementation: branch `agent/p3.5-coverage-ratchet`; final commit/PR and exact pinned
   CI acceptance pending.
 
@@ -1396,9 +1398,13 @@ Both shell helpers pass `bash -n`, the Windows helper parses without PowerShell 
 workflow parses as YAML, and `git diff --check` is clean. With cargo-llvm-cov and Rust 1.92's LLVM
 tools unavailable locally, two complete runs using the already-installed Rust/LLVM source
 instrumentation measured 67.49% and 67.50% production lines after cargo-llvm-cov's documented
-test-source omission. Their conservative 67.3% floor remains provisional until the exactly pinned
-PR-CI job executes successfully; no tool was installed or downloaded to manufacture local
-acceptance.
+test-source omission; no tool was installed or downloaded to manufacture local acceptance. The
+first exact pinned PR-CI run (29595891966) subsequently passed the same 746 tests and generated an
+80-file report covering the formerly excluded UI, remote backends, radio, migrations, desktop
+integration, and entry point. It measured 67.03% lines, 66.84% functions, and 65.93% regions, then
+failed only against the provisional 67.3% local floor. The checked-in floor is corrected to 66.9%
+under the documented policy, and CI now prints its exact summary while preserving the original
+test/threshold exit status; a second exact pinned run remains the final acceptance gate.
 
 Previous branch validation (2026-07-17, PR #110 packaged-Windows P2.11 slice before CI):
 `cargo check --all-targets --all-features --locked` and

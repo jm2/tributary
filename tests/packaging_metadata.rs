@@ -292,6 +292,13 @@ fn ci_coverage_is_pinned_comprehensive_and_threshold_gated() {
         "coverage must execute every host target and feature before enforcing the line floor"
     );
     assert!(
+        coverage_job.contains("coverage_status=0")
+            && coverage_job.contains("|| coverage_status=$?")
+            && coverage_job.contains("cargo llvm-cov report --summary-only")
+            && coverage_job.contains("exit \"$coverage_status\""),
+        "coverage must print the exact measured summary without masking the test or threshold status"
+    );
+    assert!(
         coverage_job.contains("coverage-baseline.txt"),
         "the CI threshold must come from the reviewed baseline file"
     );
