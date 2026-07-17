@@ -4944,7 +4944,9 @@ async fn process_directory_events(
                                 upsert_committed = true;
                                 // Clear any prior unparseable-file record now
                                 // that the file parsed successfully.
-                                if let Err(error) = delete_unparseable_file(db.as_ref(), &path_str).await {
+                                if let Err(error) =
+                                    delete_unparseable_file(db.as_ref(), &path_str).await
+                                {
                                     warn!(path = %path_str, %error, "Failed to clear unparseable-file record after successful parse");
                                 }
                                 let t = db_model_to_track(&model);

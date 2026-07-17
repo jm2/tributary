@@ -12,7 +12,10 @@ impl MigrationTrait for Migration {
         manager
             .rename_table(
                 Table::rename()
-                    .table(Alias::new("unparseable_file"), Alias::new("unparseable_files"))
+                    .table(
+                        Alias::new("unparseable_file"),
+                        Alias::new("unparseable_files"),
+                    )
                     .to_owned(),
             )
             .await
@@ -22,7 +25,10 @@ impl MigrationTrait for Migration {
         manager
             .rename_table(
                 Table::rename()
-                    .table(Alias::new("unparseable_files"), Alias::new("unparseable_file"))
+                    .table(
+                        Alias::new("unparseable_files"),
+                        Alias::new("unparseable_file"),
+                    )
                     .to_owned(),
             )
             .await
