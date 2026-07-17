@@ -79,12 +79,14 @@ settings can remain changed after playback.
 
 The confirmation is persisted in `outputs.json`. Entries saved by an older Tributary release have
 no confirmation and fail closed before any MPD connection, playback-state or option command, or
-protected-media ticket is created. Re-add the same host and port and select the exclusive-control
-checkbox to upgrade that entry in place; Tributary preserves its existing name and does not add a
-duplicate. If that legacy output was already selected, select its row again so the confirmed mode
-rebuilds the output before playback. If a foreign current song is nevertheless observed after
-confirmation, Tributary still relinquishes ownership and conservatively retains its queued ID
-rather than risking disruption of the foreign playback.
+protected-media ticket is created. The common gate also precedes cleanup and media-validation
+failures, so malformed, unsupported, or inactive media cannot bypass the same confirmation
+guidance. Re-add the same host and port and select the exclusive-control checkbox to upgrade that
+entry in place; Tributary preserves its existing name and does not add a duplicate. If that legacy
+output was already selected, select its row again so the confirmed mode rebuilds the output before
+playback. If a foreign current song is nevertheless observed after confirmation, Tributary still
+relinquishes ownership and conservatively retains its queued ID rather than risking disruption of
+the foreign playback.
 
 ## Architecture
 

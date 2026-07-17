@@ -42,12 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or Tributary instance shares the playback partition. The confirmation is persisted as an
   explicit mode and participates in output identity, so reselecting an upgraded active endpoint
   rebuilds it instead of being mistaken for a no-op. Legacy entries deserialize unconfirmed and
-  playback fails with localized re-add/confirm/reselect guidance before any MPD connection, MPD
-  state or option command, protected-media ticket, or queue mutation. Re-adding the exact host and
-  port with the checkbox upgrades that entry in place without renaming it, dropping siblings, or
-  creating a duplicate. Existing song-ID ownership checks remain in force: observing a foreign
-  current song violates the exclusive-control promise but still causes conservative
-  relinquishment/retention rather than a racy stop or delete.
+  every load intent fails with localized re-add/confirm/reselect guidance before cleanup, MPD
+  connection, MPD state or option commands, protected-media tickets, or queue mutation—even when
+  media was already rejected as malformed, unsupported, or inactive before worker dispatch.
+  Re-adding the exact host and port with the checkbox upgrades that entry in place without renaming
+  it, dropping siblings, or creating a duplicate. Existing song-ID ownership checks remain in
+  force: observing a foreign current song violates the exclusive-control promise but still causes
+  conservative relinquishment/retention rather than a racy stop or delete.
 - **Coverage is now representative and threshold-gated** — The sole comparable report moves to
   a dedicated Linux x86_64 job pinned to Rust 1.92.0, matching LLVM tools, cargo-llvm-cov 0.8.7,
   the committed dependency graph, every host target, and every feature. UI, Jellyfin, Plex,

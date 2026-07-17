@@ -116,6 +116,16 @@ enum CommandKind {
 }
 
 impl CommandKind {
+    fn is_load_intent(&self) -> bool {
+        matches!(
+            self,
+            Self::Load { .. }
+                | Self::ProtectedLoad { .. }
+                | Self::ResolvedLoad { .. }
+                | Self::RejectLoad { .. }
+        )
+    }
+
     fn is_transient_control(&self) -> bool {
         matches!(
             self,
@@ -1809,6 +1819,19 @@ fn run_mpd_worker<C>(
         };
         match worker_rx.recv_timeout(wait) {
             Ok(command) => {
+                // Apply the partition-ownership contract to every load intent,
+                // including media rejected before dispatch. This precedes
+                // cleanup as well as every connection, MPD, and proxy action.
+                if control_mode != MpdControlMode::Exclusive && command.kind.is_load_intent() {
+                    fail_current(
+                        command.owner,
+                        MpdFailure::exclusive_control_required(),
+                        &intent_epoch,
+                        &cache,
+                        &event_tx,
+                    );
+                    continue;
+                }
                 let poll_after = match command.kind {
                     CommandKind::Load { uri } => {
                         handle_load(
@@ -1816,7 +1839,6 @@ fn run_mpd_worker<C>(
                             &mut active,
                             command.owner,
                             MpdMedia::Direct(uri),
-                            control_mode,
                             &proxy,
                             &intent_epoch,
                             &cache,
@@ -1831,7 +1853,6 @@ fn run_mpd_worker<C>(
                             &mut active,
                             command.owner,
                             MpdMedia::Protected(MpdUpstream::Legacy(upstream)),
-                            control_mode,
                             &proxy,
                             &intent_epoch,
                             &cache,
@@ -1846,7 +1867,6 @@ fn run_mpd_worker<C>(
                             &mut active,
                             command.owner,
                             MpdMedia::Protected(MpdUpstream::Resolved(request)),
-                            control_mode,
                             &proxy,
                             &intent_epoch,
                             &cache,
@@ -1945,7 +1965,6 @@ fn handle_load<C>(
     active: &mut Option<WorkerSession<C::Connection>>,
     owner: CommandOwner,
     media: MpdMedia,
-    control_mode: MpdControlMode,
     proxy: &ProxyServices,
     intent_epoch: &AtomicU64,
     cache: &Mutex<MpdCache>,
@@ -1954,21 +1973,6 @@ fn handle_load<C>(
 ) where
     C: MpdConnector,
 {
-    // This gate intentionally precedes cleanup, Buffering publication,
-    // connection, partition-wide option resets, proxy tickets, and queue
-    // mutation. A legacy/unconfirmed saved endpoint therefore has no MPD or
-    // protected-media side effects; re-adding it with the explicit checkbox
-    // is the only supported upgrade path.
-    if control_mode != MpdControlMode::Exclusive {
-        fail_current(
-            owner,
-            MpdFailure::exclusive_control_required(),
-            intent_epoch,
-            cache,
-            event_tx,
-        );
-        return;
-    }
     match cleanup_session(active, owner, CleanupKind::Targeted, intent_epoch, timing) {
         CleanupOutcome::Completed => {}
         CleanupOutcome::Failed(failure) => {
@@ -3746,8 +3750,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unconfirmed_partition_rejects_load_before_any_connection_state_or_ticket_action() {
+    fn assert_unconfirmed_load_has_no_side_effect(kind: CommandKind) {
         let shared = FakeShared::new();
         let proxy_shared = FakeProxyShared::new();
         let runtime = tokio::runtime::Runtime::new().expect("test runtime");
@@ -3755,10 +3758,7 @@ mod tests {
         let harness = Harness::new_unconfirmed_with_proxy(Arc::clone(&shared), proxy);
         let owner = harness.next_owner(17);
 
-        harness.send(
-            owner,
-            protected_load("https://music.test/private.flac?token=must-not-leave"),
-        );
+        harness.send(owner, kind);
         harness.fence(owner);
 
         assert!(shared.actions().is_empty(), "no MPD operation is allowed");
@@ -3791,6 +3791,20 @@ mod tests {
             }
         )));
         harness.shutdown();
+    }
+
+    #[test]
+    fn unconfirmed_partition_rejects_load_before_any_connection_state_or_ticket_action() {
+        assert_unconfirmed_load_has_no_side_effect(protected_load(
+            "https://music.test/private.flac?token=must-not-leave",
+        ));
+    }
+
+    #[test]
+    fn unconfirmed_partition_rejects_preclassified_failure_before_cleanup() {
+        assert_unconfirmed_load_has_no_side_effect(CommandKind::RejectLoad {
+            failure: MpdFailure::new("media URI validation"),
+        });
     }
 
     #[test]
