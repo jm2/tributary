@@ -31,8 +31,8 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**209/223 (93.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
-and **19/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**211/223 (94.6%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
+and **21/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -1089,13 +1089,13 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   supersession, and discovery regressions. Debug and release full suites each pass 18 library, 674
   application, and 8 repository-metadata tests (700 total per profile).
 
-Residual receiver-trust boundary: upstream `rust_cast 0.21` reads the peer-supplied unsigned
-32-bit Cast frame length and immediately calls `Vec::with_capacity(length as usize)` before
-reading or bounding the payload. The I/O deadlines prevent a silent or byte-trickling peer from
-hanging the worker, but a malicious or broken receiver can still provoke an allocation attempt
-approaching 4 GiB. A pre-allocation cap needs an upstream change or narrowly audited framing
-layer; that adversarial proof is retained in P3.4 rather than overstated as part of this deadline
-milestone.
+P3.4 follow-up closure (2026-07-17): P2.8 correctly left the peer-sized allocation outside its
+deadline milestone because `rust_cast 0.21` reads the unsigned 32-bit length and immediately calls
+`Vec::with_capacity(length as usize)`. The focused P3.4 slice now installs a narrowly scoped
+plaintext framing guard between rustls and `rust_cast`: it withholds the complete four-byte header,
+rejects an advertised payload above 1 MiB before upstream can observe the header or allocate, and
+tracks an accepted payload to fail closed on truncation. The P2.8 deadline and session-retirement
+behavior remains unchanged; the completed compound P3.4 harness item records the adversarial proof.
 
 ### P2.9 Repair the AirPlay fallback path
 
@@ -1599,8 +1599,24 @@ service/DAAP foundation and is stacked on its PR #117 head pending publication.
 - [ ] Cover GTK list-item recycling and stale callback prevention.
 - [ ] Cover playback-session behavior across sorting/filtering/navigation.
 - [ ] Cover output transfer and reselect semantics.
-- [ ] Cover fake MPD and delayed/adversarial Chromecast state machines, including a cap applied
-  before allocating from a peer-advertised Cast frame length.
+- [x] Cover fake MPD and delayed/adversarial Chromecast state machines, including a cap applied
+  before allocating from a peer-advertised Cast frame length. The existing 83-test MPD harness
+  covers its ordered worker, ownership and targeted cleanup, held-ACK FIFO behavior, bounded and
+  cancellable resolution, slow-greeting address fallback, real IPv6, protocol bounds, terminal
+  proof, stale generations, and poisoned-session retirement. The existing delayed/fake/real-peer
+  Chromecast harness plus this slice totals 42 focused tests and covers ordered effects, stale
+  intents, synchronized cleanup, semantic and poisoned failures, silent TLS peers, absolute
+  trickle deadlines, Stop/replacement/Shutdown progress, protected request containment, and frame
+  adversaries. A framing-aware `Read + Write` adapter now sits above the worker-local rustls stream
+  and below the real `rust_cast 0.21` `MessageManager`. It buffers the complete big-endian header,
+  rejects lengths above 1 MiB before exposing any header byte to upstream's
+  `Vec::with_capacity(length)` path, passes accepted bytes and all writes through unchanged,
+  enforces the accepted payload boundary, and resets only after that exact payload completes. Four
+  real-manager regressions prove an oversized header is rejected without reading its sentinel
+  payload, an exactly 1 MiB valid protobuf frame is accepted, partial headers and payloads fail
+  with `UnexpectedEof`, and fragmented consecutive frames reset correctly while manager writes
+  retain their framing. The cap is deliberately generous because Cast V2 carries protobuf control
+  messages rather than media bytes.
 - [ ] Cover stale album-art and source-result generations.
 - [x] Add keyboard context-menu and slider accessibility checks. Commits `f0446f3` and `8945c97`
   route unmodified Menu and exact Shift+F10 through the right-click selection snapshot, consume
@@ -1611,14 +1627,15 @@ service/DAAP foundation and is stacked on its PR #117 head pending publication.
   popover-scoped action ownership. Focused tests reject Shift+Menu, plain F10, and unrelated
   chords, exercise that complete plan, and parse each YAML catalog to prove both keys exist rather
   than mistaking an English fallback for a valid translation.
-- [ ] Record implementation: _pending_
+- [ ] Record implementation: _pending; this section still has four open lifecycle harness items
+  plus this implementation record_
 
 The checked accessibility slice deliberately relies on `GtkScale` for slider focus, arrow/Page
 Up/Page Down/Home/End behavior, role, current value, and range, then supplies the application-owned
 localized name and horizontal orientation. The context menu retains one action group on the
 one-shot popover rather than on the long-lived list, so closing it releases the captured selection;
 keyboard activation and pointer activation cannot drift into separate action implementations.
-P3.4 as a whole remains open until the five broader lifecycle/state-machine harness boxes and its
+P3.4 as a whole remains open until the four broader lifecycle/state-machine harness boxes and its
 implementation record are complete.
 
 ### P3.5 Make coverage reporting representative
@@ -2384,8 +2401,9 @@ Record scope or design decisions here so deferred work is explicit.
   while a shorter idle cap detects silence promptly. The `Rc` transport stays on its original
   worker rather than crossing threads. A complete Cast rejection leaves framing synchronized and
   permits bounded cleanup; any I/O, TLS, framing, parsing, decoding, or timeout failure drops the
-  connection immediately, including after supersession. Upstream's peer-sized frame allocation
-  remains a separate adversarial-framing follow-up under P3.4.
+  connection immediately, including after supersession. P3.4's 2026-07-17 framing slice later
+  closed the separately tracked peer-sized allocation boundary with a 1 MiB pre-allocation cap
+  above rustls and four regressions through the real `rust_cast` message manager.
 - 2026-07-13 — P1.8 gives MPD one FIFO worker and one persistent TCP session per owned load.
   Stable `addid`/`playid` identity, authoritative status polling, and targeted `deleteid` cleanup
   distinguish explicit Stop and remote errors and detect an observed replacement queue. Loads
@@ -2663,3 +2681,4 @@ Add one line per completed task:
 | 2026-07-17 | P2.11 packaged-probe teardown hardening (follow-up) | PR #114 | Separates pre-NULL cancellation from final listener stop, keeps poison observation live through NULL, and drains/counts queued accepts before join. Only narrowly classified incomplete-header EOF/reset/abort outcomes may cancel; semantic request, accept, and response-write failures remain fatal even during teardown. Four Windows tests pin classification, synchronized clean-versus-malformed behavior, and the accepted/queued poison window. x86_64 runs the unit tests, while ARM64 compiles the code and executes the production probe during packaging. This hardens the already-complete packaged proof and leaves checklist arithmetic unchanged. |
 | 2026-07-17 | P2.11 Windows distribution-path repair (follow-up) | PR #115 | Resolves the caller-relative bundle immediately after creation through PowerShell's FileSystem provider and retains its physical `ProviderPath`, preventing `.NET` PE inspection from using a stale process working directory and preventing custom PSDrive names from escaping into native tools. Static ordering and live PowerShell regressions cover a changed `$PWD`, repository spaces, and custom FileSystem PSDrives. Full debug/release suites pass 761 tests per profile, all 30 focused platform-runtime tests pass in both profiles, and strict Clippy is clean. CI run 29615869107 passed every job, including both native finished bundles; the live packaged DAAP/Subsonic playback box remains open, so checklist arithmetic is unchanged. |
 | 2026-07-17 | P3.2 shared catalogue backend completion | PR #116 | Adds object-safe complete-track catalogue access and removes every backend-specific `all_tracks` bypass. Scanner snapshots construct `LocalBackend`; local, environment, manual, discovery, Subsonic, Jellyfin, Plex, and DAAP publication all enter one explicit `&dyn MediaBackend` adapter. Concrete authentication and protected-media/session retention intentionally remain under P3.1. The production passwordless DAAP catalogue-error branch logs out and invokes the paired user-error/GTK-cleanup helper; focused coverage pins that helper's paired emissions without claiming to synthesize a catalogue failure. Together with PR #114's aggregate work, this closes P3.2's final two boxes. Current-branch validation is recorded above. |
+| 2026-07-17 | P3.4 MPD/Chromecast integration harnesses (partial) | local branch; PR pending | Closes the compound receiver-state-machine item while leaving the rest of P3.4 open. The already-established 83-test fake/real-socket MPD harness and 38-test delayed/adversarial Chromecast harness are joined by a plaintext 1 MiB Cast frame guard immediately below the real `rust_cast` manager. Four new real-manager regressions prove pre-allocation oversized rejection without payload reads, exact-limit acceptance, truncated-header/payload failure, and consecutive-frame reset/write preservation, bringing the focused Chromecast module to 42 tests. |
