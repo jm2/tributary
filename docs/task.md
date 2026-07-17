@@ -82,6 +82,11 @@ before NULL, keeps both listeners observing through that transition, then separa
 drains queued accepts.
 Only incomplete-header EOF/reset/abort is cancellation; malformed requests and every other server
 failure remain fatal. A full replacement PR matrix remains pending.
+The first two-phase-probe head run, 29610563120, then stopped in x86_64 Windows strict Clippy
+before native tests or packaging because the listener function's newly separated lifecycle flags
+raised its parameter count from seven to eight. PR #114 now owns both flags in one shared lifecycle
+state, keeping cancellation and final stop semantically distinct while restoring the bounded
+function signature. A replacement native matrix remains pending.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1528,7 +1533,11 @@ semantic drift, synchronize on media acceptance, exercise the production begin/N
 require malformed input completed after cancellation begins to remain fatal, and prove the poison
 observer remains live until final stop drains queued accepts. Formatting and whitespace checks
 (`cargo fmt --all -- --check` and `git diff --check`) pass; no dependency, lockfile, README,
-checklist, or completion-count change is involved.
+checklist, or completion-count change is involved. Run 29610563120 passed its completed static,
+audit, metadata, coverage, Linux aarch64, and Flatpak siblings, but Windows x86_64 strict Clippy
+rejected the initial eight-parameter listener before native tests. The follow-up groups the two
+lifecycle atomics into one state object without weakening their separate meanings; its replacement
+native matrix is pending.
 
 Most recent accepted validation (2026-07-17, PR #112 P2.10 exclusive-control slice):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature

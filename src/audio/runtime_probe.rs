@@ -420,13 +420,17 @@ enum ServerKind {
 
 struct ProbeServer {
     address: SocketAddr,
-    cancellation_requested: Arc<AtomicBool>,
-    stop_requested: Arc<AtomicBool>,
+    lifecycle: Arc<ProbeServerLifecycle>,
     connections: Arc<AtomicUsize>,
     valid_gets: Arc<AtomicUsize>,
     failed: Arc<AtomicBool>,
     armed_at: Arc<OnceLock<Instant>>,
     thread: Option<JoinHandle<()>>,
+}
+
+struct ProbeServerLifecycle {
+    cancellation_requested: AtomicBool,
+    stop_requested: AtomicBool,
 }
 
 impl ProbeServer {
@@ -439,15 +443,16 @@ impl ProbeServer {
         let address = listener
             .local_addr()
             .map_err(|_| anyhow!("packaged audio probe could not inspect a loopback server"))?;
-        let cancellation_requested = Arc::new(AtomicBool::new(false));
-        let stop_requested = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(ProbeServerLifecycle {
+            cancellation_requested: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+        });
         let connections = Arc::new(AtomicUsize::new(0));
         let valid_gets = Arc::new(AtomicUsize::new(0));
         let failed = Arc::new(AtomicBool::new(false));
         let armed_at = Arc::new(OnceLock::new());
         let thread = {
-            let cancellation_requested = Arc::clone(&cancellation_requested);
-            let stop_requested = Arc::clone(&stop_requested);
+            let lifecycle = Arc::clone(&lifecycle);
             let connections = Arc::clone(&connections);
             let valid_gets = Arc::clone(&valid_gets);
             let failed = Arc::clone(&failed);
@@ -458,8 +463,7 @@ impl ProbeServer {
                     serve_probe_listener(
                         listener,
                         kind,
-                        &cancellation_requested,
-                        &stop_requested,
+                        &lifecycle,
                         &connections,
                         &valid_gets,
                         &failed,
@@ -470,8 +474,7 @@ impl ProbeServer {
         };
         Ok(Self {
             address,
-            cancellation_requested,
-            stop_requested,
+            lifecycle,
             connections,
             valid_gets,
             failed,
@@ -487,14 +490,16 @@ impl ProbeServer {
     }
 
     fn begin_teardown(&self) {
-        self.cancellation_requested.store(true, Ordering::SeqCst);
+        self.lifecycle
+            .cancellation_requested
+            .store(true, Ordering::SeqCst);
     }
 
     fn finish_teardown(&mut self) -> anyhow::Result<()> {
-        if !self.cancellation_requested.load(Ordering::SeqCst) {
+        if !self.lifecycle.cancellation_requested.load(Ordering::SeqCst) {
             bail!("packaged audio probe loopback server teardown was not requested");
         }
-        self.stop_requested.store(true, Ordering::SeqCst);
+        self.lifecycle.stop_requested.store(true, Ordering::SeqCst);
         if self
             .thread
             .take()
@@ -512,7 +517,7 @@ impl ProbeServer {
 impl Drop for ProbeServer {
     fn drop(&mut self) {
         self.begin_teardown();
-        self.stop_requested.store(true, Ordering::SeqCst);
+        self.lifecycle.stop_requested.store(true, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -522,8 +527,7 @@ impl Drop for ProbeServer {
 fn serve_probe_listener(
     listener: TcpListener,
     kind: ServerKind,
-    cancellation_requested: &AtomicBool,
-    stop_requested: &AtomicBool,
+    lifecycle: &ProbeServerLifecycle,
     connections: &AtomicUsize,
     valid_gets: &AtomicUsize,
     failed: &AtomicBool,
@@ -556,7 +560,7 @@ fn serve_probe_listener(
                             // visible. Only its incomplete-header
                             // EOF/reset/abort is expected; semantic request
                             // and response failures remain fatal below.
-                            if !cancellation_requested.load(Ordering::SeqCst) {
+                            if !lifecycle.cancellation_requested.load(Ordering::SeqCst) {
                                 failed.store(true, Ordering::SeqCst);
                                 return;
                             }
@@ -572,7 +576,7 @@ fn serve_probe_listener(
                 // Final stop is complete only after accept proves the
                 // platform queue is empty. This keeps the poison observer
                 // live through NULL teardown and counts racing connections.
-                if stop_requested.load(Ordering::SeqCst) {
+                if lifecycle.stop_requested.load(Ordering::SeqCst) {
                     return;
                 }
                 thread::sleep(Duration::from_millis(5));
