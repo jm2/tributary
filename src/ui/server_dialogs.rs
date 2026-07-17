@@ -252,7 +252,11 @@ fn add_saved_server_to(
 }
 
 /// Add a validated server to `servers.json` (dedup by canonical endpoint).
-pub fn add_saved_server(server_type: &str, name: &str, url: &str) -> Result<bool, &'static str> {
+pub fn add_saved_server(
+    server_type: &str,
+    name: &str,
+    url: &str,
+) -> Result<SavedServer, &'static str> {
     let Some(path) = servers_json_path() else {
         return Err(SAVED_SERVER_CONFIG_UNAVAILABLE);
     };
@@ -267,11 +271,20 @@ pub fn add_saved_server(server_type: &str, name: &str, url: &str) -> Result<bool
     if added {
         info!("Server added to servers.json");
     }
-    Ok(added)
+    let (_, canonical) =
+        validated_endpoint(server_type, url).ok_or("Unsupported remote server type")?;
+    servers
+        .into_iter()
+        .find(|server| {
+            server.server_type == server_type
+                && validated_endpoint(&server.server_type, &server.url)
+                    .is_some_and(|(_, existing)| existing == canonical)
+        })
+        .ok_or(SAVED_SERVER_CONFIG_UNAVAILABLE)
 }
 
-/// Remove a server from `servers.json` by URL.
-pub fn remove_saved_server(url: &str) {
+/// Remove a server from `servers.json` by stable source identity.
+pub fn remove_saved_server(source_id: SourceId) {
     let Some(path) = servers_json_path() else {
         return;
     };
@@ -280,7 +293,7 @@ pub fn remove_saved_server(url: &str) {
         SavedServerLoad::Quarantined => return,
     };
     let before = servers.len();
-    servers.retain(|s| s.url != url);
+    servers.retain(|server| server.source_id != source_id);
     if servers.len() != before {
         if save_servers_to(&path, &servers).is_ok() {
             info!("Server removed from servers.json");
@@ -483,15 +496,18 @@ pub fn show_add_server_dialog(
         // Validate before persistence, sidebar publication, connection state,
         // or URL-bearing logs. Rejected text may itself contain a credential,
         // so only the fixed validation message may cross this boundary.
-        if let Err(message) = add_saved_server(backend_type, &display_name, &url) {
-            tracing::warn!(error = message, "Manual server URL rejected");
-            let _ = engine_tx.try_send(LibraryEvent::Error(message.to_string()));
-            return;
-        }
+        let saved = match add_saved_server(backend_type, &display_name, &url) {
+            Ok(saved) => saved,
+            Err(message) => {
+                tracing::warn!(error = message, "Manual server URL rejected");
+                let _ = engine_tx.try_send(LibraryEvent::Error(message.to_string()));
+                return;
+            }
+        };
 
         // Add to sidebar as a manual server.
         let insert_pos = super::window::ensure_category_header_store(&store, backend_type);
-        let src = SourceObject::manual(&display_name, backend_type, &url);
+        let src = SourceObject::manual(&display_name, backend_type, &url, saved.source_id);
         src.set_connecting(true);
         store.insert(insert_pos, &src);
 
@@ -520,9 +536,10 @@ pub fn show_add_server_dialog(
         let server_url = url.clone();
         let server_name = display_name.clone();
         let backend_type = backend_type.to_string();
+        let source_id = saved.source_id;
 
         rt_handle.spawn(async move {
-            let Some(attempt) = crate::source_registry::begin_connect(server_url.clone()) else {
+            let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
                 tracing::debug!("Skipping manual remote connect during shutdown");
                 return;
             };
@@ -608,7 +625,7 @@ pub fn show_add_server_dialog(
                     );
                     let _ = engine_tx
                         .send(LibraryEvent::RemoteSync {
-                            source_key: server_url,
+                            source_id,
                             generation: source.generation(),
                             lease_key: source.lease_key(),
                             tracks,

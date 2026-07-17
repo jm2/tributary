@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use gtk::glib;
 use gtk::subclass::prelude::*;
 
-use crate::architecture::AdvertisedHttpRoute;
+use crate::architecture::{AdvertisedHttpRoute, SourceId};
 
 mod imp {
     use super::*;
@@ -26,6 +26,9 @@ mod imp {
         pub is_header: Cell<bool>,
         /// Base URL for remote servers (e.g. `https://music.example.com`).
         pub server_url: RefCell<String>,
+        /// Stable logical source identity. This is independent from the
+        /// endpoint and from the UI navigation/view key.
+        pub source_id: RefCell<String>,
         /// Ephemeral address route supplied by network discovery. This is
         /// deliberately separate from the persisted URL and logical source
         /// key; a connection generation snapshots it when authentication
@@ -82,6 +85,13 @@ impl SourceObject {
         obj.imp().icon_name.replace(icon_name.to_string());
         obj.imp().is_header.set(false);
         obj.imp().connected.set(true); // local sources are always "connected"
+        if backend_type == "local" {
+            obj.imp().source_id.replace(SourceId::local().to_string());
+        } else if backend_type.starts_with("radio-") {
+            obj.imp()
+                .source_id
+                .replace(SourceId::radio_browser().to_string());
+        }
         obj
     }
 
@@ -94,6 +104,11 @@ impl SourceObject {
             .icon_name
             .replace("network-server-symbolic".to_string());
         obj.imp().server_url.replace(server_url.to_string());
+        if let Ok(parsed) = crate::http_security::parse_base_url(server_url) {
+            if let Ok(source_id) = SourceId::remote(backend_type, &parsed) {
+                obj.imp().source_id.replace(source_id.to_string());
+            }
+        }
         obj.imp().is_header.set(false);
         obj.imp().connected.set(false);
         // Assume open until probed. forked-daapd / OwnTone / iTunes shares
@@ -125,6 +140,9 @@ impl SourceObject {
             .icon_name
             .replace("drive-removable-media-symbolic".to_string());
         obj.imp().source_key.replace(source_key.to_string());
+        if let Ok(source_id) = SourceId::removable(source_key) {
+            obj.imp().source_id.replace(source_id.to_string());
+        }
         obj.imp().device_mount_point.replace(Some(mount_point));
         obj.imp().is_header.set(false);
         obj.imp().connected.set(true);
@@ -149,6 +167,9 @@ impl SourceObject {
     pub fn server_url(&self) -> String {
         self.imp().server_url.borrow().clone()
     }
+    pub fn source_id(&self) -> Option<SourceId> {
+        self.imp().source_id.borrow().parse().ok()
+    }
     pub(crate) fn advertised_route(&self) -> Option<AdvertisedHttpRoute> {
         self.imp().advertised_route.borrow().clone()
     }
@@ -166,6 +187,10 @@ impl SourceObject {
 
     pub fn set_connected(&self, val: bool) {
         self.imp().connected.set(val);
+    }
+
+    pub fn set_source_id(&self, source_id: SourceId) {
+        self.imp().source_id.replace(source_id.to_string());
     }
 
     pub fn set_icon_name(&self, name: &str) {
@@ -231,8 +256,9 @@ impl SourceObject {
     /// Similar to `discovered()` but sets `manually_added = true` so the
     /// server is never auto-removed by discovery refresh and shows a
     /// trash/delete button in the sidebar.
-    pub fn manual(name: &str, backend_type: &str, server_url: &str) -> Self {
+    pub fn manual(name: &str, backend_type: &str, server_url: &str, source_id: SourceId) -> Self {
         let obj = Self::discovered(name, backend_type, server_url);
+        obj.set_source_id(source_id);
         obj.imp().manually_added.set(true);
         obj
     }
@@ -244,7 +270,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::SourceObject;
-    use crate::architecture::AdvertisedHttpRoute;
+    use crate::architecture::{AdvertisedHttpRoute, SourceId};
 
     #[test]
     fn discovered_route_is_ephemeral_and_does_not_change_source_identity() {
@@ -262,6 +288,8 @@ mod tests {
         assert_eq!(source.advertised_route(), Some(route));
         assert_eq!(source.name(), "Living Room");
         assert_eq!(source.server_url(), "http://mini-2.local:4533");
+        let expected_source_id = SourceId::remote("subsonic", &origin).expect("source ID");
+        assert_eq!(source.source_id(), Some(expected_source_id));
         assert!(source.source_key().is_empty());
         assert!(!source.manually_added());
         assert!(!source.connected());
@@ -270,6 +298,7 @@ mod tests {
         assert_eq!(source.advertised_route(), None);
         assert_eq!(source.name(), "Living Room");
         assert_eq!(source.server_url(), "http://mini-2.local:4533");
+        assert_eq!(source.source_id(), Some(expected_source_id));
     }
 
     #[test]
@@ -293,7 +322,24 @@ mod tests {
             "device:uuid:01234567-89ab-cdef-0123-456789abcdef"
         );
         assert_eq!(source.device_mount_point(), Some(mount_point));
+        assert_eq!(
+            source.source_id(),
+            Some(
+                SourceId::removable("device:uuid:01234567-89ab-cdef-0123-456789abcdef")
+                    .expect("source ID")
+            )
+        );
         assert!(source.server_url().is_empty());
+    }
+
+    #[test]
+    fn persisted_manual_identity_overrides_endpoint_derived_identity() {
+        let persisted = SourceId::random();
+        let source =
+            SourceObject::manual("Saved", "subsonic", "https://music.example.test", persisted);
+
+        assert_eq!(source.source_id(), Some(persisted));
+        assert!(source.manually_added());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
-use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest};
+use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest, TrackId};
 
 use super::api::{AlbumEntry, ArtistEntry, SongEntry};
 use super::client::SubsonicClient;
@@ -34,13 +34,10 @@ struct LibraryCache {
     tracks: Vec<Track>,
     albums: Vec<Album>,
     artists: Vec<Artist>,
-    /// Application track UUID → Subsonic song ID.
-    stream_locator_by_uuid: HashMap<Uuid, String>,
-    /// Application track UUID → Subsonic cover-art ID.
-    track_artwork_locator_by_uuid: HashMap<Uuid, String>,
-    /// Subsonic song ID (string) → Uuid we generated.
-    #[allow(dead_code)]
-    subsonic_id_to_uuid: HashMap<String, Uuid>,
+    /// Exact Subsonic song ID → stream locator.
+    stream_locator_by_track_id: HashMap<TrackId, String>,
+    /// Exact Subsonic song ID → cover-art ID.
+    track_artwork_locator_by_track_id: HashMap<TrackId, String>,
 }
 
 impl LibraryCache {
@@ -49,9 +46,8 @@ impl LibraryCache {
             tracks: Vec::new(),
             albums: Vec::new(),
             artists: Vec::new(),
-            stream_locator_by_uuid: HashMap::new(),
-            track_artwork_locator_by_uuid: HashMap::new(),
-            subsonic_id_to_uuid: HashMap::new(),
+            stream_locator_by_track_id: HashMap::new(),
+            track_artwork_locator_by_track_id: HashMap::new(),
         }
     }
 }
@@ -260,9 +256,9 @@ impl SubsonicBackend {
         let mut all_tracks = Vec::new();
         let mut all_albums = Vec::new();
         let mut all_artists = Vec::new();
-        let mut stream_locator_by_uuid = HashMap::new();
-        let mut track_artwork_locator_by_uuid = HashMap::new();
-        let mut subsonic_id_to_uuid = HashMap::new();
+        let mut stream_locator_by_track_id = HashMap::new();
+        let mut track_artwork_locator_by_track_id = HashMap::new();
+        let mut skipped_invalid_track_ids = 0usize;
 
         for (ai, (_, albums)) in artist_albums.iter().enumerate() {
             // A failed `getArtist` drops the artist entirely.
@@ -282,19 +278,26 @@ impl SubsonicBackend {
                 let album_uuid = deterministic_uuid(&api_album.id);
 
                 for song in songs {
+                    let Ok(track_id) = TrackId::remote(song.id.clone()) else {
+                        skipped_invalid_track_ids += 1;
+                        continue;
+                    };
                     let track_uuid = deterministic_uuid(&song.id);
-                    let track =
-                        song_to_track(song, track_uuid, Some(artist_uuid), Some(album_uuid));
+                    let track = song_to_track(
+                        song,
+                        track_id.clone(),
+                        track_uuid,
+                        Some(artist_uuid),
+                        Some(album_uuid),
+                    );
 
-                    stream_locator_by_uuid.insert(track_uuid, song.id.clone());
+                    stream_locator_by_track_id.insert(track_id.clone(), song.id.clone());
                     if let Some(cover_art_id) = &song.cover_art {
-                        track_artwork_locator_by_uuid.insert(track_uuid, cover_art_id.clone());
+                        track_artwork_locator_by_track_id.insert(track_id, cover_art_id.clone());
                     }
-                    subsonic_id_to_uuid.insert(song.id.clone(), track_uuid);
                     all_tracks.push(track);
+                    artist_track_count += 1;
                 }
-
-                artist_track_count += songs.len() as u32;
 
                 all_albums.push(album_entry_to_album(
                     api_album,
@@ -316,6 +319,7 @@ impl SubsonicBackend {
             artists = all_artists.len(),
             albums = all_albums.len(),
             tracks = all_tracks.len(),
+            skipped_invalid_track_ids,
             "Subsonic library loaded"
         );
 
@@ -324,9 +328,8 @@ impl SubsonicBackend {
             tracks: all_tracks,
             albums: all_albums,
             artists: all_artists,
-            stream_locator_by_uuid,
-            track_artwork_locator_by_uuid,
-            subsonic_id_to_uuid,
+            stream_locator_by_track_id,
+            track_artwork_locator_by_track_id,
         };
 
         Ok(())
@@ -406,14 +409,16 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
             tracks: sr
                 .song
                 .iter()
-                .map(|s| {
+                .filter_map(|s| {
+                    let track_id = TrackId::remote(s.id.clone()).ok()?;
                     let uuid = deterministic_uuid(&s.id);
-                    song_to_track(
+                    Some(song_to_track(
                         s,
+                        track_id,
                         uuid,
                         s.artist_id.as_deref().map(deterministic_uuid),
                         s.album_id.as_deref().map(deterministic_uuid),
-                    )
+                    ))
                 })
                 .collect(),
         };
@@ -423,14 +428,18 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
         // models so selecting one can still resolve at playback time.
         let mut cache = self.cache.write().await;
         for song in &sr.song {
-            let uuid = deterministic_uuid(&song.id);
-            cache.stream_locator_by_uuid.insert(uuid, song.id.clone());
+            let Ok(track_id) = TrackId::remote(song.id.clone()) else {
+                continue;
+            };
+            cache
+                .stream_locator_by_track_id
+                .insert(track_id.clone(), song.id.clone());
             if let Some(cover_art_id) = &song.cover_art {
                 cache
-                    .track_artwork_locator_by_uuid
-                    .insert(uuid, cover_art_id.clone());
+                    .track_artwork_locator_by_track_id
+                    .insert(track_id, cover_art_id.clone());
             } else {
-                cache.track_artwork_locator_by_uuid.remove(&uuid);
+                cache.track_artwork_locator_by_track_id.remove(&track_id);
             }
         }
 
@@ -499,27 +508,30 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
 
 #[async_trait]
 impl RemoteMediaResolver for SubsonicBackend {
-    async fn resolve_stream(&self, track_id: &Uuid) -> BackendResult<ResolvedHttpRequest> {
+    async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
         let song_id = self
             .cache
             .read()
             .await
-            .stream_locator_by_uuid
+            .stream_locator_by_track_id
             .get(track_id)
             .cloned()
             .ok_or_else(|| BackendError::NotFound {
                 entity_type: "track".into(),
-                id: *track_id,
+                id: deterministic_uuid(track_id.as_str()),
             })?;
         self.client.resolved_stream_request(&song_id)
     }
 
-    async fn resolve_artwork(&self, track_id: &Uuid) -> BackendResult<Option<ResolvedHttpRequest>> {
+    async fn resolve_artwork(
+        &self,
+        track_id: &TrackId,
+    ) -> BackendResult<Option<ResolvedHttpRequest>> {
         let cover_art_id = self
             .cache
             .read()
             .await
-            .track_artwork_locator_by_uuid
+            .track_artwork_locator_by_track_id
             .get(track_id)
             .cloned();
         cover_art_id
@@ -540,13 +552,14 @@ fn deterministic_uuid(subsonic_id: &str) -> Uuid {
 
 fn song_to_track(
     song: &SongEntry,
+    track_id: TrackId,
     id: Uuid,
     artist_id: Option<Uuid>,
     album_id: Option<Uuid>,
 ) -> Track {
     Track {
         id,
-        native_track_id: None,
+        native_track_id: Some(track_id),
         title: song.title.clone().unwrap_or_else(|| "Unknown".into()),
         artist_name: song.artist.clone().unwrap_or_else(|| "Unknown".into()),
         album_artist_name: None,
@@ -700,7 +713,13 @@ mod tests {
         }))
         .unwrap();
 
-        let track = song_to_track(&song, Uuid::new_v4(), None, None);
+        let track = song_to_track(
+            &song,
+            TrackId::remote("song-id").expect("track ID"),
+            Uuid::new_v4(),
+            None,
+            None,
+        );
         let album = album_entry_to_album(&album, Uuid::new_v4(), None);
 
         assert!(track.stream_url.is_none());
@@ -732,7 +751,7 @@ mod tests {
         )
         .await
         .expect("connect to fixture");
-        let shared_id = deterministic_uuid("shared-native-id");
+        let shared_id = TrackId::remote("shared-native-id").expect("track ID");
 
         let initial = backend
             .resolve_artwork(&shared_id)

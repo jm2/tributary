@@ -26,6 +26,7 @@ use super::root_authority::{AbsenceProof, BoundDirectory, BoundFile, RootAuthori
 use super::tag_parser::{self, ParsedTrack};
 use super::tag_writer;
 use crate::architecture::models::Track;
+use crate::architecture::SourceId;
 use crate::db::entities::{library_root, playlist_entry, root_reauthorization_receipt, track};
 
 /// Frozen namespace for projecting a legacy non-UUID SQLite track key into
@@ -46,9 +47,9 @@ const LOCAL_TRACK_COMPAT_NAMESPACE: Uuid =
 pub enum LibraryEvent {
     /// Complete library snapshot after initial scan.
     FullSync(Vec<Track>),
-    /// Tracks from a remote backend, keyed by source (e.g. server URL).
+    /// Tracks from a remote backend, keyed by stable logical source ID.
     RemoteSync {
-        source_key: String,
+        source_id: SourceId,
         /// Connection generation validated at the GTK publication boundary.
         generation: u64,
         /// Opaque registry lease used to synthesize credential-free media refs.
@@ -58,7 +59,7 @@ pub enum LibraryEvent {
     /// Tracks from a generation-scoped DAAP session. The GTK receiver
     /// validates this ownership token before publishing the tracks.
     DaapSync {
-        source_key: String,
+        source_id: SourceId,
         generation: u64,
         session_key: Uuid,
         tracks: Vec<Track>,
@@ -6176,7 +6177,7 @@ pub fn db_model_to_track(model: &track::Model) -> Track {
         // byte-for-byte `native_track_id` below.
         id: Uuid::parse_str(&model.id)
             .unwrap_or_else(|_| Uuid::new_v5(&LOCAL_TRACK_COMPAT_NAMESPACE, model.id.as_bytes())),
-        native_track_id: Some(model.id.clone()),
+        native_track_id: crate::architecture::TrackId::new(model.id.clone()).ok(),
         title: model.title.clone(),
         artist_name: model.artist_name.clone(),
         album_artist_name: model.album_artist_name.clone(),
@@ -11068,7 +11069,7 @@ mod tests {
         let track = db_model_to_track(&model);
 
         assert_eq!(
-            track.native_track_id.as_deref(),
+            track.native_track_id.as_ref().map(|id| id.as_str()),
             Some("550e8400-e29b-41d4-a716-446655440000")
         );
         assert_eq!(track.title, "Test Song");
@@ -11155,7 +11156,10 @@ mod tests {
         // compatibility projection is deterministic rather than random.
         let first = db_model_to_track(&model);
         let second = db_model_to_track(&model);
-        assert_eq!(first.native_track_id.as_deref(), Some("not-a-valid-uuid"));
+        assert_eq!(
+            first.native_track_id.as_ref().map(|id| id.as_str()),
+            Some("not-a-valid-uuid")
+        );
         assert_eq!(first.id, second.id);
         assert_eq!(
             first.id,

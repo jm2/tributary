@@ -54,11 +54,15 @@ fn sidebar_button_action(source: &SourceObject) -> Option<SidebarButtonAction> {
     }
 
     if source.backend_type() == "daap" && source.connected() {
-        return Some(SidebarButtonAction::Disconnect(source.server_url()));
+        return source
+            .source_id()
+            .map(|id| SidebarButtonAction::Disconnect(id.to_string()));
     }
 
     if source.manually_added() && (source.connected() || !source.server_url().is_empty()) {
-        return Some(SidebarButtonAction::Delete(source.server_url()));
+        return source
+            .source_id()
+            .map(|id| SidebarButtonAction::Delete(id.to_string()));
     }
 
     None
@@ -545,7 +549,12 @@ mod tests {
             emit_sidebar_button_action(action, &disconnect_tx, &delete_tx)
         };
 
-        let manual_a = SourceObject::manual("Manual A", "subsonic", "https://a.example");
+        let manual_a = SourceObject::manual(
+            "Manual A",
+            "subsonic",
+            "https://a.example",
+            crate::architecture::SourceId::random(),
+        );
         current.replace(Some(manual_a.clone()));
         assert!(!click());
         assert_eq!(delete_rx.try_recv().unwrap(), "https://a.example");

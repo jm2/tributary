@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
+use super::identity::TrackId;
+
 // ---------------------------------------------------------------------------
 // Primary Entities
 // ---------------------------------------------------------------------------
@@ -18,9 +20,8 @@ use uuid::Uuid;
 pub struct Track {
     /// Unique identifier (assigned by the originating backend).
     ///
-    /// This UUID remains the compatibility key used by the current remote
-    /// resolver API. Backends whose native identifier is not a UUID also set
-    /// `native_track_id`; queue identity prefers that exact value.
+    /// This UUID remains a compatibility key for album/search APIs. Playback
+    /// and queue ownership use the exact `native_track_id` below.
     pub id: Uuid,
 
     /// Exact backend-native track identifier, when the adapter can preserve
@@ -28,11 +29,11 @@ pub struct Track {
     ///
     /// Local-library rows use their SQLite `tracks.id` value byte-for-byte so
     /// legacy non-UUID keys remain stable across reads. This transitional
-    /// field can be removed together with `id` once every resolver consumes
-    /// the architecture-level `TrackId` newtype described by the source
-    /// lifecycle ADR.
+    /// The value is typed and bounded before an adapter publishes the row;
+    /// remote resolvers consume it directly without round-tripping through a
+    /// derived UUID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_track_id: Option<String>,
+    pub native_track_id: Option<TrackId>,
 
     /// Track title.
     pub title: String,

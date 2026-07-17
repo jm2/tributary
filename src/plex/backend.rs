@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
-use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest};
+use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest, TrackId};
 
 use super::api::{
     PlexAlbum, PlexAlbumsResponse, PlexArtist, PlexArtistsResponse, PlexIdentityResponse,
@@ -52,13 +52,10 @@ struct LibraryCache {
     tracks: Vec<Track>,
     albums: Vec<Album>,
     artists: Vec<Artist>,
-    /// Application track UUID → Plex media part key.
-    stream_locator_by_uuid: HashMap<Uuid, String>,
-    /// Application track UUID → Plex thumbnail path.
-    track_artwork_locator_by_uuid: HashMap<Uuid, String>,
-    /// Plex rating key → UUID we generated.
-    #[allow(dead_code)]
-    plex_id_to_uuid: HashMap<String, Uuid>,
+    /// Exact Plex rating key → media part key.
+    stream_locator_by_track_id: HashMap<TrackId, String>,
+    /// Exact Plex rating key → thumbnail path.
+    track_artwork_locator_by_track_id: HashMap<TrackId, String>,
 }
 
 impl LibraryCache {
@@ -67,9 +64,8 @@ impl LibraryCache {
             tracks: Vec::new(),
             albums: Vec::new(),
             artists: Vec::new(),
-            stream_locator_by_uuid: HashMap::new(),
-            track_artwork_locator_by_uuid: HashMap::new(),
-            plex_id_to_uuid: HashMap::new(),
+            stream_locator_by_track_id: HashMap::new(),
+            track_artwork_locator_by_track_id: HashMap::new(),
         }
     }
 }
@@ -178,9 +174,8 @@ impl PlexBackend {
         let mut all_albums = Vec::new();
         let mut all_artists = Vec::new();
         let mut skipped_unplayable_tracks = 0usize;
-        let mut stream_locator_by_uuid = HashMap::new();
-        let mut track_artwork_locator_by_uuid = HashMap::new();
-        let mut plex_id_to_uuid = HashMap::new();
+        let mut stream_locator_by_track_id = HashMap::new();
+        let mut track_artwork_locator_by_track_id = HashMap::new();
 
         for lib in &self.music_libraries {
             let section_endpoint = format!("library/sections/{}/all", lib.key);
@@ -251,16 +246,15 @@ impl PlexBackend {
 
             // ── Accumulate tracks (type=10) ─────────────────────────
             for plex_track in &tracks {
-                let Some((track_uuid, track, part_key)) = cacheable_plex_track(plex_track) else {
+                let Some((track_id, track, part_key)) = cacheable_plex_track(plex_track) else {
                     skipped_unplayable_tracks += 1;
                     continue;
                 };
 
-                stream_locator_by_uuid.insert(track_uuid, part_key);
+                stream_locator_by_track_id.insert(track_id.clone(), part_key);
                 if let Some(thumb_path) = &plex_track.thumb {
-                    track_artwork_locator_by_uuid.insert(track_uuid, thumb_path.clone());
+                    track_artwork_locator_by_track_id.insert(track_id, thumb_path.clone());
                 }
-                plex_id_to_uuid.insert(plex_track.rating_key.clone(), track_uuid);
                 all_tracks.push(track);
             }
 
@@ -324,9 +318,8 @@ impl PlexBackend {
             tracks: all_tracks,
             albums: all_albums,
             artists: all_artists,
-            stream_locator_by_uuid,
-            track_artwork_locator_by_uuid,
-            plex_id_to_uuid,
+            stream_locator_by_track_id,
+            track_artwork_locator_by_track_id,
         };
 
         Ok(())
@@ -538,27 +531,30 @@ impl crate::architecture::MediaBackend for PlexBackend {
 
 #[async_trait]
 impl RemoteMediaResolver for PlexBackend {
-    async fn resolve_stream(&self, track_id: &Uuid) -> BackendResult<ResolvedHttpRequest> {
+    async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
         let part_key = self
             .cache
             .read()
             .await
-            .stream_locator_by_uuid
+            .stream_locator_by_track_id
             .get(track_id)
             .cloned()
             .ok_or_else(|| BackendError::NotFound {
                 entity_type: "track".into(),
-                id: *track_id,
+                id: deterministic_uuid(track_id.as_str()),
             })?;
         self.client.resolved_stream_request(&part_key)
     }
 
-    async fn resolve_artwork(&self, track_id: &Uuid) -> BackendResult<Option<ResolvedHttpRequest>> {
+    async fn resolve_artwork(
+        &self,
+        track_id: &TrackId,
+    ) -> BackendResult<Option<ResolvedHttpRequest>> {
         let thumb_path = self
             .cache
             .read()
             .await
-            .track_artwork_locator_by_uuid
+            .track_artwork_locator_by_track_id
             .get(track_id)
             .cloned();
         thumb_path
@@ -589,21 +585,30 @@ fn plex_stream_source(plex: &PlexTrack) -> Option<(&PlexMedia, &str)> {
     })
 }
 
-fn cacheable_plex_track(plex: &PlexTrack) -> Option<(Uuid, Track, String)> {
+fn cacheable_plex_track(plex: &PlexTrack) -> Option<(TrackId, Track, String)> {
     let (media, stream_locator) = plex_stream_source(plex)?;
+    let track_id = TrackId::remote(plex.rating_key.clone()).ok()?;
     let track_uuid = deterministic_uuid(&plex.rating_key);
     let artist_id = plex
         .grandparent_rating_key
         .as_deref()
         .map(deterministic_uuid);
     let album_id = plex.parent_rating_key.as_deref().map(deterministic_uuid);
-    let track = plex_track_to_track(plex, media, track_uuid, artist_id, album_id);
-    Some((track_uuid, track, stream_locator.to_string()))
+    let track = plex_track_to_track(
+        plex,
+        media,
+        track_id.clone(),
+        track_uuid,
+        artist_id,
+        album_id,
+    );
+    Some((track_id, track, stream_locator.to_string()))
 }
 
 fn plex_track_to_track(
     plex: &PlexTrack,
     media: &PlexMedia,
+    track_id: TrackId,
     id: Uuid,
     artist_id: Option<Uuid>,
     album_id: Option<Uuid>,
@@ -616,7 +621,7 @@ fn plex_track_to_track(
 
     Track {
         id,
-        native_track_id: None,
+        native_track_id: Some(track_id),
         title: plex.title.clone().unwrap_or_else(|| "Unknown".into()),
         artist_name: plex
             .grandparent_title
@@ -663,7 +668,14 @@ mod tests {
         .unwrap();
 
         let media = track.media.first().unwrap();
-        let converted = plex_track_to_track(&track, media, Uuid::new_v4(), None, None);
+        let converted = plex_track_to_track(
+            &track,
+            media,
+            TrackId::remote("track-id").expect("track ID"),
+            Uuid::new_v4(),
+            None,
+            None,
+        );
         assert!(converted.stream_url.is_none());
         assert!(converted.cover_art_url.is_none());
     }
@@ -713,8 +725,9 @@ mod tests {
         );
         let (track_id, published, stream_locator) =
             cacheable_plex_track(&track).expect("track should be published");
-        assert_eq!(track_id, deterministic_uuid("track-id"));
-        assert_eq!(published.id, track_id);
+        assert_eq!(track_id.as_str(), "track-id");
+        assert_eq!(published.id, deterministic_uuid("track-id"));
+        assert_eq!(published.native_track_id.as_ref(), Some(&track_id));
         assert_eq!(published.bitrate_kbps, Some(1411));
         assert_eq!(published.format.as_deref(), Some("flac"));
         assert_eq!(stream_locator, "/library/parts/2/file.flac");

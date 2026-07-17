@@ -191,7 +191,11 @@ pub fn setup_discovery(
                         );
                         continue;
                     };
-                    let source_key = source.server_url();
+                    let Some(source_id) = source.source_id() else {
+                        tracing::warn!("Ignoring discovered source without stable identity");
+                        continue;
+                    };
+                    let source_key = source_id.to_string();
 
                     let lost_pending = pending_connection
                         .borrow()
@@ -214,13 +218,13 @@ pub fn setup_discovery(
                     // publish a library or issue playable requests.
                     invalidate_source_playback(&source_key);
                     if service_type == "daap" {
-                        if let Some(session) = crate::daap::release_source(&source_key) {
+                        if let Some(session) = crate::daap::release_source(source_id) {
                             rt_handle.spawn(async move {
                                 session.disconnect().await;
                             });
                         }
                     } else {
-                        crate::source_registry::release_source(&source_key);
+                        crate::source_registry::release_source(source_id);
                     }
 
                     info!(
@@ -557,7 +561,12 @@ mod tests {
     #[test]
     fn same_origin_cross_backend_alias_does_not_own_the_existing_row() {
         let store = gtk::gio::ListStore::new::<SourceObject>();
-        let source = SourceObject::manual("Subsonic", "subsonic", "http://mini.local:4533");
+        let source = SourceObject::manual(
+            "Subsonic",
+            "subsonic",
+            "http://mini.local:4533",
+            crate::architecture::SourceId::random(),
+        );
         store.append(&source);
 
         assert!(remote_source_at(&store, "http://mini.local:4533", "subsonic").is_some());
@@ -573,7 +582,12 @@ mod tests {
     #[test]
     fn root_url_spelling_matches_discovery_without_changing_the_owned_key() {
         let store = gtk::gio::ListStore::new::<SourceObject>();
-        let source = SourceObject::manual("DAAP", "daap", "HTTP://MINI.LOCAL:80/");
+        let source = SourceObject::manual(
+            "DAAP",
+            "daap",
+            "HTTP://MINI.LOCAL:80/",
+            crate::architecture::SourceId::random(),
+        );
         store.append(&source);
 
         let (_, owner) = remote_source_at(&store, "http://mini.local", "daap")

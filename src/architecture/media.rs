@@ -12,10 +12,10 @@ use std::sync::{
     Arc,
 };
 
+use super::identity::TrackId;
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use url::Url;
-use uuid::Uuid;
 
 use super::backend::BackendResult;
 
@@ -332,11 +332,14 @@ impl ResolvedHttpRequest {
 /// Playback-time resolver retained by a live remote source session.
 #[async_trait]
 pub trait RemoteMediaResolver: Send + Sync {
-    /// Resolve an application track UUID into a credential-isolated request.
-    async fn resolve_stream(&self, track_id: &Uuid) -> BackendResult<ResolvedHttpRequest>;
+    /// Resolve an exact backend-native track ID into a credential-isolated request.
+    async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest>;
 
-    /// Resolve artwork for an application track UUID, when available.
-    async fn resolve_artwork(&self, track_id: &Uuid) -> BackendResult<Option<ResolvedHttpRequest>>;
+    /// Resolve artwork for an exact backend-native track ID, when available.
+    async fn resolve_artwork(
+        &self,
+        track_id: &TrackId,
+    ) -> BackendResult<Option<ResolvedHttpRequest>>;
 }
 
 fn validate_endpoint(endpoint: &Url) -> BackendResult<()> {
@@ -397,6 +400,7 @@ fn is_allowed_required_header(name: &HeaderName) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn endpoint_rejects_embedded_credentials_and_unsafe_schemes() {

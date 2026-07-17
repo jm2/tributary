@@ -77,6 +77,13 @@ fn configured_server_url(variable: &'static str) -> Option<String> {
     }
 }
 
+fn remote_source_id(backend_type: &str, server_url: &str) -> crate::architecture::SourceId {
+    let parsed = crate::http_security::parse_base_url(server_url)
+        .expect("configured and discovered remote URLs are prevalidated");
+    crate::architecture::SourceId::remote(backend_type, &parsed)
+        .expect("supported remote backend produces a stable source ID")
+}
+
 /// Build and present the main Tributary window.
 pub fn build_window(
     app: &adw::Application,
@@ -131,7 +138,8 @@ pub fn build_window(
     let saved_servers = load_saved_servers();
     for entry in &saved_servers {
         ensure_category_header_vec(&mut sources, &entry.server_type);
-        let src = SourceObject::manual(&entry.name, &entry.server_type, &entry.url);
+        let src =
+            SourceObject::manual(&entry.name, &entry.server_type, &entry.url, entry.source_id);
         sources.push(src);
         info!(
             name = %entry.name,
@@ -501,9 +509,10 @@ pub fn build_window(
     // ── Start Subsonic backend if configured via env vars ──────────
     if let Some((url, user, pass)) = subsonic_env {
         let tx = engine_tx.clone();
+        let source_id = remote_source_id("subsonic", &url);
         rt_handle.spawn(async move {
             info!("Connecting to Subsonic server...");
-            let Some(attempt) = crate::source_registry::begin_connect(url.clone()) else {
+            let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
                 tracing::debug!("Skipping Subsonic connect during shutdown");
                 return;
             };
@@ -522,7 +531,7 @@ pub fn build_window(
                     info!(count = tracks.len(), "Subsonic library fetched");
                     let _ = tx
                         .send(LibraryEvent::RemoteSync {
-                            source_key: url.clone(),
+                            source_id,
                             generation: source.generation(),
                             lease_key: source.lease_key(),
                             tracks,
@@ -547,9 +556,10 @@ pub fn build_window(
     // ── Start Jellyfin backend if configured via env vars ──────────
     if let Some((url, api_key, user_id)) = jellyfin_env {
         let tx = engine_tx.clone();
+        let source_id = remote_source_id("jellyfin", &url);
         rt_handle.spawn(async move {
             info!("Connecting to Jellyfin server...");
-            let Some(attempt) = crate::source_registry::begin_connect(url.clone()) else {
+            let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
                 tracing::debug!("Skipping Jellyfin connect during shutdown");
                 return;
             };
@@ -570,7 +580,7 @@ pub fn build_window(
                     info!(count = tracks.len(), "Jellyfin library fetched");
                     let _ = tx
                         .send(LibraryEvent::RemoteSync {
-                            source_key: url.clone(),
+                            source_id,
                             generation: source.generation(),
                             lease_key: source.lease_key(),
                             tracks,
@@ -595,9 +605,10 @@ pub fn build_window(
     // ── Start Plex backend if configured via env vars ──────────────
     if let Some((url, token)) = plex_env {
         let tx = engine_tx.clone();
+        let source_id = remote_source_id("plex", &url);
         rt_handle.spawn(async move {
             info!("Connecting to Plex server...");
-            let Some(attempt) = crate::source_registry::begin_connect(url.clone()) else {
+            let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
                 tracing::debug!("Skipping Plex connect during shutdown");
                 return;
             };
@@ -616,7 +627,7 @@ pub fn build_window(
                     info!(count = tracks.len(), "Plex library fetched");
                     let _ = tx
                         .send(LibraryEvent::RemoteSync {
-                            source_key: url.clone(),
+                            source_id,
                             generation: source.generation(),
                             lease_key: source.lease_key(),
                             tracks,
@@ -641,9 +652,10 @@ pub fn build_window(
     // ── Start DAAP backend if configured via env vars ──────────────
     if let Some((url, password)) = daap_env {
         let tx = engine_tx.clone();
+        let source_id = remote_source_id("daap", &url);
         rt_handle.spawn(async move {
             info!("Connecting to DAAP server...");
-            let Some(attempt) = crate::daap::begin_connect(url.clone()) else {
+            let Some(attempt) = crate::daap::begin_connect(source_id) else {
                 tracing::debug!("Skipping DAAP connect during shutdown");
                 return;
             };
@@ -662,7 +674,7 @@ pub fn build_window(
                     info!(count = tracks.len(), "DAAP library fetched");
                     let _ = tx
                         .send(LibraryEvent::DaapSync {
-                            source_key: url.clone(),
+                            source_id,
                             generation: session.generation(),
                             session_key: session.session_key(),
                             tracks,
@@ -758,20 +770,24 @@ pub fn build_window(
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = delete_rx.recv().await {
                 info!("Manual server delete requested");
+                let Ok(source_id) = source_key.parse::<crate::architecture::SourceId>() else {
+                    tracing::warn!("Ignoring delete for invalid source identity");
+                    continue;
+                };
                 invalidate_source_playback(&source_key);
 
                 // A connected DAAP source normally uses the eject action,
                 // but deletion must still transfer and close ownership if a
                 // stale/rebound row emits delete instead.
-                if let Some(backend) = crate::daap::release_source(&source_key) {
+                if let Some(backend) = crate::daap::release_source(source_id) {
                     rt_handle.spawn(async move {
                         backend.disconnect().await;
                     });
                 }
-                crate::source_registry::release_source(&source_key);
+                crate::source_registry::release_source(source_id);
 
                 // Remove from servers.json.
-                remove_saved_server(&source_key);
+                remove_saved_server(source_id);
 
                 // Remove from source_tracks map.
                 source_tracks.borrow_mut().remove(&source_key);
@@ -779,7 +795,7 @@ pub fn build_window(
                 // Remove from sidebar.
                 for i in 0..sidebar_store.n_items() {
                     if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-                        if src.server_url() == source_key {
+                        if src.source_id() == Some(source_id) {
                             let backend = src.backend_type();
                             sidebar_store.remove(i);
                             let category = category_for_backend(&backend);
@@ -830,12 +846,16 @@ pub fn build_window(
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = disconnect_rx.recv().await {
                 info!("DAAP disconnect requested");
+                let Ok(source_id) = source_key.parse::<crate::architecture::SourceId>() else {
+                    tracing::warn!("Ignoring disconnect for invalid source identity");
+                    continue;
+                };
                 invalidate_source_playback(&source_key);
 
                 // Transfer ownership out of the live-session registry before
                 // updating the UI. This makes a subsequent fast reconnect
                 // independent of the old session's asynchronous logout.
-                if let Some(backend) = crate::daap::release_source(&source_key) {
+                if let Some(backend) = crate::daap::release_source(source_id) {
                     rt_handle.spawn(async move {
                         backend.disconnect().await;
                     });
@@ -850,7 +870,7 @@ pub fn build_window(
                 //    state instead of removing it entirely.
                 for i in 0..sidebar_store.n_items() {
                     if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-                        if src.server_url() == source_key {
+                        if src.source_id() == Some(source_id) {
                             src.set_connected(false);
                             src.set_connecting(false);
                             src.set_icon_name("network-server-symbolic");
@@ -1979,12 +1999,12 @@ fn setup_library_events(
             // boundary so an older session cannot repopulate the source.
             match &event {
                 LibraryEvent::RemoteSync {
-                    source_key,
+                    source_id,
                     generation,
                     lease_key,
                     ..
                 } if !crate::source_registry::is_current_source(
-                    source_key,
+                    *source_id,
                     *generation,
                     *lease_key,
                 ) =>
@@ -1997,11 +2017,11 @@ fn setup_library_events(
                     continue;
                 }
                 LibraryEvent::DaapSync {
-                    source_key,
+                    source_id,
                     generation,
                     session_key,
                     ..
-                } if !crate::daap::is_current_session(source_key, *generation, *session_key) => {
+                } if !crate::daap::is_current_session(*source_id, *generation, *session_key) => {
                     tracing::debug!(
                         generation,
                         %session_key,
@@ -2047,11 +2067,12 @@ fn setup_library_events(
                 }
 
                 LibraryEvent::RemoteSync {
-                    source_key,
+                    source_id,
                     generation: _,
                     lease_key,
                     tracks,
                 } => {
+                    let source_key = source_id.to_string();
                     let replaces_current_queue = {
                         let session = playback_session.borrow();
                         session.current_identity().is_some_and(|identity| {
@@ -2499,8 +2520,9 @@ fn setup_library_events(
                 }
 
                 LibraryEvent::DaapSync {
-                    source_key, tracks, ..
+                    source_id, tracks, ..
                 } => {
+                    let source_key = source_id.to_string();
                     // DAAP publishes one snapshot per retained session. A new
                     // snapshot for the same source therefore replaces the
                     // session embedded in any captured `daap://` queue refs.
@@ -2567,7 +2589,11 @@ fn publish_remote_library(
     let mut auto_selected = false;
     for i in 0..sidebar_store.n_items() {
         if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-            if src.server_url() == source_key && !src.connected() {
+            if src
+                .source_id()
+                .is_some_and(|id| id.to_string() == source_key)
+                && !src.connected()
+            {
                 src.set_connected(true);
                 src.set_connecting(false);
                 let src = src.clone();
@@ -2620,8 +2646,11 @@ fn arch_remote_track_to_object(
     track: &crate::architecture::models::Track,
     lease_key: uuid::Uuid,
 ) -> TrackObject {
-    let stream_reference = crate::source_registry::stream_reference(lease_key, track.id);
-    let artwork_reference = crate::source_registry::artwork_reference(lease_key, track.id);
+    let Some(track_id) = track.native_track_id.as_ref() else {
+        return track_to_object(track, "", None);
+    };
+    let stream_reference = crate::source_registry::stream_reference(lease_key, track_id);
+    let artwork_reference = crate::source_registry::artwork_reference(lease_key, track_id);
     track_to_object(track, &stream_reference, Some(&artwork_reference))
 }
 
@@ -2650,9 +2679,12 @@ fn track_to_object(
     );
 
     if let Some(native_track_id) = &t.native_track_id {
-        obj.set_track_id(native_track_id);
+        obj.set_track_id(native_track_id.as_str());
     } else {
-        obj.set_track_id(&t.id.to_string());
+        // A missing/invalid native identity is deliberately unplayable. Do
+        // not substitute the compatibility UUID: doing so silently routes a
+        // different identity through remote and playlist queues.
+        obj.set_track_id("");
     }
 
     if let Some(artwork_reference) = artwork_reference {
