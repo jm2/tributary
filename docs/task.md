@@ -60,12 +60,14 @@ boxes. Independent review clarified deterministic overlapping-radio locator owne
 exact versioned saved-source migration/quarantine boundary before the complete exact-toolchain and
 native/package matrix passed in runs 29605029668 and 29605032344; runtime implementation remains
 open.
-The bounded P3.2 local-aggregate slice closes its three identity/grouping/lookup boxes in
-`b067d18` and `5012b77`: local artist and album UUIDs are
+The bounded P3.2 local-aggregate slice accepted in PR #114 closes its three
+identity/grouping/lookup boxes: local artist and album UUIDs are
 stable, same-titled albums are disambiguated by effective album artist, and both formerly
 unsupported by-ID track methods now resolve compact keys before narrowed SQL queries. The common
 local integration boundary, invalid persisted `TrackId` fallback, and final P3.2 implementation
-record remain open; PR/CI acceptance for this slice is pending.
+record remain open. Static analysis passed in run 29607279056 and the complete exact-toolchain,
+coverage, audit, native, Flatpak, and package matrix passed in run 29607280861. The review window
+produced no code findings; Gemini posted only its service-sunset notice.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1356,21 +1358,21 @@ closed as a milestone.
 ### P3.2 Make the backend abstraction real and stable
 
 - [ ] Construct and use `LocalBackend` through the same integration boundary.
-- [x] Replace ephemeral album/artist UUIDs with stable identities. Commit `b067d18` derives local
+- [x] Replace ephemeral album/artist UUIDs with stable identities. PR #114 derives local
   artist and album UUIDv5 values under one private versioned namespace with distinct domains,
   component-count and length framing, and pinned golden values. Artist identity uses the exact
   stored performing-artist name; album identity uses the grouping key below. No case folding,
   trimming, Unicode normalization, year, or location enters the UUID. Every converted local
   `Track` carries matching aggregate IDs, while `Album.artist_id` deliberately remains `None`
   because a compilation album credit need not identify a performing-artist entity.
-- [x] Group local albums by a disambiguating key, not title alone. Commit `b067d18` groups by exact
+- [x] Group local albums by a disambiguating key, not title alone. PR #114 groups by exact
   `(album_title, effective_album_artist)`. Only a missing or Unicode-whitespace-only album-artist
   tag falls back to the exact track artist; every nonblank value, including case, normalization,
   and surrounding whitespace, is preserved. Album listings, per-artist album counts, track album
   IDs, and library album statistics share that key. SQL pre-aggregates exact metadata fragments;
   the final Rust fold groups compilation performers consistently and uses deterministic numeric
   and lexical minima for year and genre instead of SQLite bare-column selection.
-- [x] Implement or remove unsupported trait methods. Commits `b067d18` and `5012b77` implement
+- [x] Implement or remove unsupported trait methods. PR #114 implements
   `get_album_tracks` and `get_artist_tracks`. Each maps the UUID through compact distinct aggregate
   keys, returns an empty vector when no key exists, then queries full track models only for the
   exact album title or performing artist under deterministic ordering. Album results retain the
@@ -1382,12 +1384,13 @@ closed as a milestone.
   by concrete backend; and the local library bypasses `LocalBackend`. Implemented in `e6c68bc` and
   re-audited on the packaged-Windows probe branch. The P3.2 aggregate slice now documents the
   shipped stable-ID/grouping/lookup contract without implying that the integration seam exists.
-- [ ] Record implementation: the stable aggregate subset is implemented by `b067d18` and optimized
-  by `5012b77`, with four focused SQLite regressions and the complete 243-test local-module surface
-  passing. P3.2 remains incomplete until production constructs and uses `LocalBackend` through the
-  common boundary. Repairing or rejecting an invalid persisted local track UUID, instead of the
-  existing random conversion fallback, belongs with the typed `TrackId` migration in P3.1 and is
-  not silently broadened into this metadata-aggregate slice.
+- [ ] Record implementation: the stable aggregate subset is accepted in PR #114, with four focused
+  SQLite regressions, the complete 243-test local-module surface, the 759-test local debug suite,
+  and the complete static/native/package PR matrix passing. P3.2 remains incomplete until
+  production constructs and uses `LocalBackend` through the common boundary. Repairing or
+  rejecting an invalid persisted local track UUID, instead of the existing random conversion
+  fallback, belongs with the typed `TrackId` migration in P3.1 and is not silently broadened into
+  this metadata-aggregate slice.
 
 Acceptance criteria for this bounded slice: unchanged exact local metadata yields identical
 artist/album identities across queries and restarts; concatenation or artist/album domain
@@ -1497,7 +1500,7 @@ CodeQL and all three static-analysis jobs passed; final Codex review of `91536ab
 issues after both earlier findings were fixed and resolved. P2.10 is complete at 198/223 overall
 and 76/79 P2; P3.5's exact-toolchain acceptance remains recorded by PR #111.
 
-Most recent local branch validation (2026-07-17, P3.2 stable-local-aggregate slice before CI):
+Most recent accepted validation (2026-07-17, P3.2 stable-local-aggregate slice in PR #114):
 `cargo check --all-targets --all-features --locked`, strict
 `cargo clippy --all-targets --all-features --locked -- -D warnings`,
 `cargo fmt --all -- --check`, and `git diff --check` pass. Four focused SQLite backend tests cover
@@ -1509,9 +1512,12 @@ the `5012b77` follow-up replaced each full-table lookup with compact aggregate-k
 an exact title/artist SQL query. The complete current debug all-target/all-feature suite then passed
 18 library, 731 application, and 10 repository-metadata tests (759 total), in addition to the
 focused and local-module runs above. No dependency, schema, migration, or lockfile changed.
-Release-profile and PR-native validation remain for this slice's eventual PR; the four local
-backend regressions exercise only SQLite and do not claim the still-unused production
-`LocalBackend` integration boundary.
+Static analysis and CodeQL passed in run 29607279056. Run 29607280861 passed MSRV, audit, desktop
+metadata, representative coverage, Linux x86_64/aarch64, Flatpak, macOS aarch64, Windows
+x86_64/aarch64, package creation, and SHA256 checksums. The review window produced no actionable
+code comments; Gemini posted only its service-sunset notice. The four local backend regressions
+exercise only SQLite and do not claim the still-unused production `LocalBackend` integration
+boundary.
 
 Previous local branch validation (2026-07-17, P3.5 representative-coverage slice before CI):
 `cargo fmt --all -- --check`, strict all-target/all-feature Clippy in debug and release, and
@@ -2300,4 +2306,4 @@ Add one line per completed task:
 | 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
 | 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Native x86_64 and ARM64 CI both prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
 | 2026-07-17 | P3.1 source identity/lifecycle architecture | PR #113 | Records location-independent `(SourceId, TrackId)` media identity, an exact legacy-array-to-versioned-envelope saved-source migration with atomic replacement and fail-closed conflict quarantine, one registry-owned operation/session lifecycle, deterministic per-view radio locator ownership, playback-time locator resolution, exactly-once DAAP retirement, adapter-specific rules for every source kind, and staged completion tests. This closes only the two architecture decision boxes; runtime migration remains open. Independent review found and resolved two design ambiguities before the full exact-toolchain/native/package matrix passed in runs 29605029668 and 29605032344. |
-| 2026-07-17 | P3.2 stable local aggregates (partial) | `b067d18`, `5012b77` | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, and the 759-test debug repository suite cover the slice. The common `LocalBackend` integration seam, invalid persisted `TrackId` fallback, and final P3.2 record remain open; PR/CI acceptance is pending. |
+| 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the complete exact-toolchain/native/package PR matrix passed. The common `LocalBackend` integration seam, invalid persisted `TrackId` fallback, and final P3.2 record remain open. |
