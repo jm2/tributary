@@ -160,26 +160,63 @@ jobs:
           cargo fmt --manifest-path fuzz/Cargo.toml --package tributary-fuzz -- --check
           cargo clippy --manifest-path fuzz/Cargo.toml --package tributary-fuzz --all-targets --locked -- -D warnings
 
-      - name: Code coverage
-        if: matrix.arch == 'x86_64'
-        run: |
-          cargo install cargo-llvm-cov --locked
-          cargo llvm-cov --html --output-dir coverage \
-            --ignore-filename-regex '(ui/|jellyfin/|plex/|subsonic/|radio/|db/migration|desktop_integration/|main\.rs)'
-
-      - name: Upload coverage report
-        if: matrix.arch == 'x86_64'
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage-report
-          path: coverage/
-          if-no-files-found: warn
-
       - name: Upload Linux binary
         uses: actions/upload-artifact@v7
         with:
           name: tributary-linux-${{ matrix.arch }}
           path: target/release/tributary
+          if-no-files-found: error
+
+  # ── Representative line coverage + ratchet (Linux x86_64) ────────────────
+  # This is deliberately a separate, exactly pinned aggregate. Native jobs
+  # remain responsible for compiling and testing platform-only code, but they
+  # cannot produce one comparable cross-platform percentage.
+  coverage:
+    name: Coverage (Linux x86_64)
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:41
+    steps:
+      - name: Install system dependencies (Fedora)
+        run: |
+          dnf install -y gcc gcc-c++ gtk4-devel libadwaita-devel \
+            dbus-devel \
+            gstreamer1-devel gstreamer1-plugins-base-devel \
+            gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free gstreamer1-libav \
+            pkgconf-pkg-config git curl
+
+      - uses: actions/checkout@v7
+
+      - name: Install pinned coverage toolchain
+        uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: coverage-1.92.0-llvm-cov-0.8.7-${{ hashFiles('Cargo.lock') }}
+          restore-keys: coverage-1.92.0-llvm-cov-0.8.7-
+
+      - name: Install pinned cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+
+      - name: Run comprehensive coverage gate
+        run: |
+          minimum="$(tr -d '[:space:]' < coverage-baseline.txt)"
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --all-targets --all-features --locked --html --output-dir coverage --fail-under-lines "$minimum"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-linux-x86_64
+          path: coverage/
           if-no-files-found: error
 
   # ── macOS (.app + .dmg) ───────────────────────────────────────────────────

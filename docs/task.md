@@ -31,8 +31,8 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**192/223 (86.1%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **74/79 P2**,
-and **4/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**194/223 (87.0%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **74/79 P2**,
+and **6/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -44,6 +44,8 @@ Windows plugin/source-policy/decode proof is complete in PR #110 after successfu
 ARM64 package executions; live Windows DAAP and Subsonic playback remains open. The P3.2 README
 claim was re-audited and closed because the
 document already labels its diagram as intended and names the shipping abstraction gaps exactly.
+P3.5 now reports every Linux-host source area in one pinned aggregate and keeps different native
+source sets as informational reports; its exact-toolchain baseline acceptance still awaits PR CI.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1331,11 +1333,37 @@ closed as a milestone.
 
 ### P3.5 Make coverage reporting representative
 
-- [ ] Stop excluding all UI, remote backends, migrations, desktop integration, and `main.rs`
-  from the only coverage report.
-- [ ] Split pure unit and integration coverage if platform constraints require it.
-- [ ] Establish a documented baseline and ratchet policy.
-- [ ] Record implementation: _pending_
+- [x] Stop excluding all UI, remote backends, migrations, desktop integration, and `main.rs`
+  from the only coverage report. CI now runs one comprehensive Linux x86_64 aggregate over every
+  host target and feature; the active filename-exclusion regex is removed from CI and all three
+  developer build helpers. Repository contract tests fail if an exclusion returns or any helper
+  silently narrows the source set.
+- [x] Split pure unit and integration coverage if platform constraints require it. No split is
+  required inside the canonical Linux host: its unit, binary, repository integration, and
+  property-based suites run together. Developer helpers use their active compiler and other
+  architectures' conditional code cannot produce a comparable percentage on Linux x86_64, so
+  every helper summary is explicitly informational while native CI continues to compile and test
+  those source sets.
+- [ ] Establish a documented baseline and ratchet policy. The dedicated job pins Rust 1.92.0,
+  `llvm-tools-preview`, cargo-llvm-cov 0.8.7, `Cargo.lock`, all targets, and all features, then
+  enforces the reviewed numeric value in `coverage-baseline.txt`, attempts the HTML upload on every
+  outcome, and treats a missing artifact as an error. README documents the two-clean-run,
+  lower-result, round-down-minus-0.1 repository review policy. CI enforces the checked-in floor but
+  does not compare it with the base branch; ordinary PRs retain or raise it, while a decrease
+  requires a dedicated measurement-definition change and rationale. Two complete local
+  source-instrumentation runs measured 67.49% and 67.50% production lines after applying
+  cargo-llvm-cov's documented default omission of test-source files, yielding a provisional 67.3%
+  floor under that policy. The exact pinned cargo-llvm-cov
+  frontend and Rust 1.92 LLVM tools were not already installed locally and were deliberately not
+  downloaded, so this checkbox awaits the first successful exact PR-CI execution.
+- [ ] Record implementation: branch `agent/p3.5-coverage-ratchet`; final commit/PR and exact pinned
+  CI acceptance pending.
+
+Acceptance criteria: the sole comparable report includes every production source file compiled on
+Linux, uses a version-pinned compiler/frontend and locked Rust dependency inputs, fails below a
+reviewed nonzero line floor, and leaves an HTML artifact when the line threshold fails. Different
+platform source sets remain visible without being misrepresented as directly comparable
+percentages.
 
 ## Global validation gate
 
@@ -1359,7 +1387,20 @@ PR #94's containerized Flatpak build proved the manifest-local source generation
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
 
-Most recent branch validation (2026-07-17, PR #110 packaged-Windows P2.11 slice):
+Most recent local branch validation (2026-07-17, P3.5 representative-coverage slice before CI):
+`cargo fmt --all -- --check`, strict all-target/all-feature Clippy in debug and release, and
+`cargo test --all-targets --all-features --locked` in debug and release pass. Each profile passes
+18 library, 718 application, and 10 repository-metadata tests (746 total); the two new metadata
+tests pin the coverage job's toolchain, command, baseline, artifact, and every developer helper.
+Both shell helpers pass `bash -n`, the Windows helper parses without PowerShell AST errors, the CI
+workflow parses as YAML, and `git diff --check` is clean. With cargo-llvm-cov and Rust 1.92's LLVM
+tools unavailable locally, two complete runs using the already-installed Rust/LLVM source
+instrumentation measured 67.49% and 67.50% production lines after cargo-llvm-cov's documented
+test-source omission. Their conservative 67.3% floor remains provisional until the exactly pinned
+PR-CI job executes successfully; no tool was installed or downloaded to manufacture local
+acceptance.
+
+Previous branch validation (2026-07-17, PR #110 packaged-Windows P2.11 slice before CI):
 `cargo check --all-targets --all-features --locked` and
 `cargo test --all-targets --all-features --locked` pass in debug and release, as does strict
 all-target/all-feature Clippy in both profiles. Each full profile passes 18 library, 718
@@ -1547,7 +1588,8 @@ disabled only on ARM after its action-owned cleanup intermittently failed.
 `cargo fmt --check`, both `clippy -D warnings` invocations, `cargo test --release`, and
 `cargo audit`, CI runs debug `cargo test --all-targets`, fuzz-workspace `fmt`/`clippy --locked`,
 strict no-diagnostics `desktop-file-validate`, `appstreamcli validate --no-net`, eight
-repository packaging/desktop/MSRV contract tests, and an `MSRV (1.92)` compile-proof.
+repository packaging/desktop/MSRV contract tests, two representative-coverage contract tests,
+and an `MSRV (1.92)` compile-proof.
 Checked boxes above still record the by-hand run before a milestone; the CI jobs are what catch
 regressions automatically. Windows x86_64 and ARM64 are allowed to finish independently, and only
 the ARM runner disables setup-msys2's optional package cache after its cleanup path intermittently
@@ -1556,6 +1598,15 @@ failed following a successful install; the separate Cargo cache remains enabled.
 ## Decisions
 
 Record scope or design decisions here so deferred work is explicit.
+
+- 2026-07-17 — P3.5 uses one exactly pinned Linux x86_64 aggregate as the comparable coverage
+  threshold. Splitting unit and integration runs would fragment one host's denominator without
+  solving the actual platform mismatch, so every Linux host target and feature contributes to one
+  report. Every developer helper also stops excluding source areas but remains informational: it
+  uses the active compiler, and conditional compilation gives native platforms different
+  denominators. CI enforces only the value committed on the branch; the non-decrease ratchet is
+  repository review policy. Lowering the floor requires a dedicated measurement-definition change
+  that explains and remeasures a tool or source-set transition.
 
 - 2026-07-10 — Implemented P0.1, P0.3-P0.6, and P0.8 in PR #68. P0.7's
   workflow contract is implemented, but its live manual-dispatch acceptance test requires a

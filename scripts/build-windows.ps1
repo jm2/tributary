@@ -44,8 +44,9 @@
 
 .PARAMETER Coverage
     If specified, sets up the MSYS2 build environment and runs `cargo llvm-cov`
-    with the project's curated --ignore-filename-regex.  Installs cargo-llvm-cov
-    if it is not already present.
+    over every target and feature. Installs the pinned cargo-llvm-cov release if
+    it is not already present. This native-platform summary is informational;
+    the comparable coverage ratchet runs on Linux x86_64 in CI.
 
 .PARAMETER CargoUpdate
     If specified, sets up the MSYS2 build environment and runs `cargo update` with
@@ -278,7 +279,7 @@ if (-not (Test-Path $Msys2Root)) {
     Write-Err "MSYS2 not found at $Msys2Root. Install from https://www.msys2.org"
 }
 
-$cargoNeeded = (-not $NoCargoBuild) -or $Check -or $Clippy -or $Fmt -or $Test -or $Run -or $CargoUpdate
+$cargoNeeded = (-not $NoCargoBuild) -or $Check -or $Clippy -or $Fmt -or $Test -or $Run -or $Coverage -or $CargoUpdate
 if ($cargoNeeded -and -not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Err "cargo not found. Install Rustup from https://rustup.rs or winget install Rustlang.Rustup"
 }
@@ -389,21 +390,27 @@ if ($CargoUpdate) {
 }
 
 if ($Coverage) {
-    if (-not (Get-Command cargo-llvm-cov -ErrorAction SilentlyContinue)) {
-        Write-Info "Installing cargo-llvm-cov..."
-        cargo install cargo-llvm-cov --locked
+    $requiredCoverageVersion = "cargo-llvm-cov 0.8.7"
+    $installedCoverageVersion = ""
+    if (Get-Command cargo-llvm-cov -ErrorAction SilentlyContinue) {
+        $installedCoverageVersion = [string](cargo llvm-cov --version 2>$null | Select-Object -First 1)
+    }
+    if ($installedCoverageVersion -ne $requiredCoverageVersion) {
+        Write-Info "Installing cargo-llvm-cov 0.8.7..."
+        cargo install cargo-llvm-cov --version 0.8.7 --locked --force
         if ($LASTEXITCODE -ne 0) { Write-Err "Failed to install cargo-llvm-cov." }
     }
-    # cargo-llvm-cov requires the MSVC toolchain (LLVM source-based coverage
-    # only works with the MSVC backend).  Clear the MSYS2 compiler overrides
-    # so ring/cc-rs use the native MSVC tools instead of GNU ar/gcc.
-    Write-Info "Clearing MSYS2 compiler overrides for MSVC coverage build..."
-    $env:CC = $null
-    $env:CXX = $null
-    $env:AR = $null
-    $env:DLLTOOL = $null
-    Write-Info "Running code coverage (MSVC toolchain)..."
-    cargo llvm-cov --summary-only --ignore-filename-regex '(ui/|jellyfin/|plex/|subsonic/|radio/|db/migration|desktop_integration/|main\.rs)'
+    $installedCoverageVersion = [string](cargo llvm-cov --version 2>$null | Select-Object -First 1)
+    if ($installedCoverageVersion -ne $requiredCoverageVersion) {
+        Write-Err "cargo-llvm-cov 0.8.7 is required for reproducible coverage."
+    }
+    if (Get-Command rustup -ErrorAction SilentlyContinue) {
+        Write-Info "Ensuring llvm-tools-preview is installed..."
+        $null = rustup component add llvm-tools-preview 2>&1
+        if ($LASTEXITCODE -ne 0) { Write-Err "Failed to install llvm-tools-preview." }
+    }
+    Write-Info "Running comprehensive platform-native code coverage for $RustTarget..."
+    cargo llvm-cov --all-targets --all-features --locked --target $RustTarget --summary-only
     if ($LASTEXITCODE -ne 0) { Write-Err "cargo llvm-cov failed." }
     Write-Info "Coverage complete."
     exit 0
