@@ -2619,27 +2619,13 @@ fn publish_remote_library(
         *pending_connection.borrow_mut() = None;
     }
 
-    let mut auto_selected = false;
-    for i in 0..sidebar_store.n_items() {
-        if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-            if src
-                .source_id()
-                .is_some_and(|id| id.to_string() == source_key)
-                && !src.connected()
-            {
-                src.set_connected(true);
-                src.set_connecting(false);
-                let src = src.clone();
-                sidebar_store.remove(i);
-                sidebar_store.insert(i, &src);
-                if should_auto_select {
-                    sidebar_selection.set_selected(i);
-                    auto_selected = true;
-                }
-                break;
+    let auto_selected =
+        accept_remote_publication(sidebar_store, &source_key).is_some_and(|index| {
+            if should_auto_select {
+                sidebar_selection.set_selected(index);
             }
-        }
-    }
+            should_auto_select
+        });
 
     if !auto_selected
         && *active_source_key.borrow() == source_key
@@ -2655,6 +2641,39 @@ fn publish_remote_library(
             column_view,
         );
     }
+}
+
+/// Apply the sidebar state transition for an accepted remote publication.
+///
+/// A repeated Add, environment reconnect, or discovered-to-saved promotion
+/// can submit another connection for a row whose previous session is still
+/// marked connected. The accepted replacement publication still completes
+/// that operation, so it must always clear the transient spinner even though
+/// the durable connected state does not need to change.
+fn accept_remote_publication(sidebar_store: &gtk::gio::ListStore, source_key: &str) -> Option<u32> {
+    for index in 0..sidebar_store.n_items() {
+        let Some(source) = sidebar_store.item(index).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if source
+            .source_id()
+            .is_none_or(|id| id.to_string() != source_key)
+        {
+            continue;
+        }
+
+        if !source.connected() {
+            source.set_connected(true);
+        }
+        source.set_connecting(false);
+
+        // SourceObject fields are plain GTK-side state. Reinsert the same
+        // object so a bound sidebar row immediately drops its spinner.
+        sidebar_store.remove(index);
+        sidebar_store.insert(index, &source);
+        return Some(index);
+    }
+    None
 }
 
 /// Convert an architecture `Track` to a UI `TrackObject`.
@@ -2893,5 +2912,39 @@ mod identity_tests {
         assert_eq!(owners[0].source_id(), Some(persisted));
         assert!(owners[0].manually_added());
         assert!(owners[0].connecting());
+    }
+
+    #[test]
+    fn accepted_reconnect_clears_connecting_on_an_already_connected_owner() {
+        let persisted = SourceId::random();
+        let saved = SourceObject::manual(
+            "Saved",
+            "subsonic",
+            "HTTPS://MUSIC.EXAMPLE.TEST:443/base/",
+            persisted,
+        );
+        saved.set_connected(true);
+        let mut sources = vec![SourceObject::header("Subsonic"), saved.clone()];
+
+        let connection_source_id = upsert_environment_source(
+            &mut sources,
+            "Subsonic (env)",
+            "subsonic",
+            "https://music.example.test/base",
+        );
+
+        assert_eq!(connection_source_id, persisted);
+        assert!(saved.connected());
+        assert!(saved.connecting());
+
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        for source in sources {
+            store.append(&source);
+        }
+        let accepted_index = accept_remote_publication(&store, &persisted.to_string());
+
+        assert_eq!(accepted_index, Some(1));
+        assert!(saved.connected());
+        assert!(!saved.connecting());
     }
 }
