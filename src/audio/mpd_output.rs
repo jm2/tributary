@@ -6746,4 +6746,64 @@ mod tests {
         assert_eq!(connection.version, "OK MPD 0.24.0");
         server.join().expect("fake server stopped");
     }
+
+    #[test]
+    fn slow_first_greeting_preserves_budget_for_later_address() {
+        let slow_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind slow fake server");
+        let slow_address = slow_listener.local_addr().expect("slow server address");
+        let good_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind good fake server");
+        let good_address = good_listener.local_addr().expect("good server address");
+        let (slow_accepted_tx, slow_accepted_rx) = mpsc::channel();
+        let (release_slow_tx, release_slow_rx) = mpsc::channel();
+
+        let slow_server = std::thread::spawn(move || {
+            let (_stream, _) = slow_listener.accept().expect("accept slow client");
+            slow_accepted_tx.send(()).expect("report slow client");
+            let _ = release_slow_rx.recv_timeout(Duration::from_secs(3));
+        });
+        let good_server = std::thread::spawn(move || {
+            let (mut stream, _) = good_listener.accept().expect("accept fallback client");
+            stream.write_all(b"OK MPD 0.24.0\n").expect("greeting");
+        });
+
+        let connection = MpdConnection::connect_addresses(
+            vec![slow_address, good_address],
+            OperationDeadline::after(Duration::from_secs(2)),
+        )
+        .expect("silent first greeting leaves time for the second address");
+        assert_eq!(connection.version, "OK MPD 0.24.0");
+        slow_accepted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first address accepted the client");
+
+        release_slow_tx.send(()).expect("release slow server");
+        slow_server.join().expect("slow fake server stopped");
+        good_server.join().expect("good fake server stopped");
+    }
+
+    #[test]
+    fn real_ipv6_loopback_connects_and_reads_greeting_when_available() {
+        let Ok(listener) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+            // IPv6 can be disabled by the test host or container. Once this
+            // capability check succeeds, every later assertion is mandatory.
+            return;
+        };
+        let address = listener.local_addr().expect("IPv6 server address");
+        assert!(address.is_ipv6());
+        let server = std::thread::spawn(move || {
+            let (mut stream, peer) = listener.accept().expect("accept IPv6 client");
+            assert!(peer.is_ipv6());
+            stream.write_all(b"OK MPD 0.24.0\n").expect("greeting");
+        });
+
+        let connection = connect_test(address);
+        assert_eq!(connection.version, "OK MPD 0.24.0");
+        assert!(connection
+            .local_addr()
+            .expect("IPv6 client address")
+            .is_ipv6());
+        server.join().expect("IPv6 fake server stopped");
+    }
 }
