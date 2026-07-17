@@ -29,6 +29,11 @@ mod gstreamer_media;
 pub mod local_output;
 pub mod mpd_output;
 pub mod output;
+#[cfg(target_os = "windows")]
+mod runtime_probe;
+#[cfg(target_os = "windows")]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) use runtime_probe::run_packaged_windows_runtime_probe;
 #[cfg(test)]
 pub mod test_support;
 

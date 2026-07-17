@@ -10,7 +10,10 @@
     The root directory of the MSYS2 installation. Defaults to "C:\msys64".
 
 .PARAMETER SkipBundle
-    If specified, just compiles the binary without DLL bundling.
+    If specified by itself, just compiles the binary without DLL bundling,
+    the packaged-runtime probe, or zip creation. With -InnoSetup, skips the
+    build/bundle/probe steps and creates an installer from the existing dist
+    folder; that folder must therefore come from an already-probed bundle run.
 
 .PARAMETER NoCargoBuild
     If specified, skips the cargo build step (useful for CI).
@@ -84,6 +87,48 @@ function Write-Info { Write-Host "[tributary] $args" -ForegroundColor Green }
 function Write-Warn { Write-Host "[tributary] $args" -ForegroundColor Yellow }
 function Write-Err { Write-Host "[tributary] $args" -ForegroundColor Red; exit 1 }
 
+function Get-BoundedProbeDiagnostic {
+    param(
+        [string]$Path,
+        [string]$Label,
+        [int]$Limit = 32768
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return "" }
+
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $length = $stream.Length
+        $count = [int][Math]::Min([int64]$Limit, $length)
+        if ($length -gt $count) { $null = $stream.Seek(-$count, [System.IO.SeekOrigin]::End) }
+        $bytes = [byte[]]::new($count)
+        $offset = 0
+        while ($offset -lt $count) {
+            $read = $stream.Read($bytes, $offset, $count - $offset)
+            if ($read -eq 0) { break }
+            $offset += $read
+        }
+        $text = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $offset)
+        $prefix = if ($length -gt $count) { "[earlier $Label output truncated; showing final $count bytes]`n" } else { "" }
+        return "$prefix$text"
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Stop-ProbeProcessTree {
+    param([System.Diagnostics.Process]$Process)
+    if ($null -eq $Process -or $Process.HasExited) { return }
+    try {
+        $Process.Kill($true)
+    }
+    finally {
+        if (-not $Process.WaitForExit(10000)) {
+            throw "packaged runtime probe process tree did not terminate after Kill(true)"
+        }
+    }
+}
+
 # Auto-detect ARM64 when env vars are not explicitly set.
 $NativeArch = if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
     "arm64"
@@ -110,9 +155,11 @@ $MsysPath = Join-Path $Msys2Root $MsysEnv
 $DIST = "dist\tributary-windows"
 
 # ── Inno Setup only mode ─────────────────────────────────────────────────────
-# When -InnoSetup is passed with -SkipBundle, skip straight to installer creation
+# When -InnoSetup is passed with -SkipBundle, use an existing, already-probed
+# dist tree and skip straight to installer creation. This intentionally does
+# not claim to validate a tree that may have been changed since its bundle run.
 if ($InnoSetup -and $SkipBundle) {
-    Write-Info "Building Inno Setup installer..."
+    Write-Info "Building Inno Setup installer from the existing dist tree (bundle/runtime probe skipped)..."
 
     # Determine architecture for Inno Setup
     $InnoArch = if ($env:INNO_ARCH) { $env:INNO_ARCH } else { "x64" }
@@ -416,6 +463,18 @@ if (Test-Path $gstPluginSrc) {
     $totalCopied += $n
 }
 
+# gst-plugin-scanner is a required part of the packaged GStreamer runtime.
+# Always overwrite it: an incremental dist tree may have been produced for a
+# different architecture, and source timestamps cannot prove binary identity.
+$gstScannerSrc = Join-Path $MsysPath "libexec\gstreamer-1.0\gst-plugin-scanner.exe"
+$gstScannerDest = Join-Path $DIST "libexec\gstreamer-1.0\gst-plugin-scanner.exe"
+if (-not (Test-Path -LiteralPath $gstScannerSrc -PathType Leaf)) {
+    Write-Err "Required GStreamer plugin scanner not found at $gstScannerSrc"
+}
+New-Item -ItemType Directory -Force (Split-Path $gstScannerDest -Parent) | Out-Null
+Copy-Item -LiteralPath $gstScannerSrc -Destination $gstScannerDest -Force
+Write-Info "Bundled gst-plugin-scanner.exe (unconditional overwrite)."
+
 # Resolve all transitive dependencies for the EXE and Plugins.
 # Use the explicit MSYS2 path for ldd to ensure it exists in PowerShell.
 $ldd = Join-Path $Msys2Root "usr\bin\ldd.exe"
@@ -426,6 +485,7 @@ Write-Info "Resolving required DLLs for executable and plugins..."
 # Gather the exe and every single plugin dll we just copied.
 $binariesToScan = @(Join-Path $DIST (Split-Path $exePath -Leaf))
 $binariesToScan += Get-ChildItem -Path "$DIST\lib" -Recurse -Filter *.dll | Select-Object -ExpandProperty FullName
+$binariesToScan += $gstScannerDest
 
 foreach ($bin in $binariesToScan) {
     & $ldd $bin 2>$null | ForEach-Object {
@@ -496,6 +556,168 @@ if (Test-Path $schemasSrc) {
 }
 
 Write-Info "Total incremental sync: $totalCopied file(s) updated."
+
+# ── Packaged Runtime Probe ──────────────────────────────────────────────────
+# Run the bundled executable itself before archiving it. The child receives no
+# ambient GStreamer/GIO/proxy policy, can resolve DLLs only from the bundle and
+# Windows system directory, and must build a brand-new external registry in a
+# path containing spaces. The Rust probe writes its sentinel only after the
+# bundled plugin/scanner/origin and protected HTTP playback checks all pass.
+Write-Info "Running packaged Windows runtime probe..."
+$distFull = (Resolve-Path $DIST).Path
+$probeExe = Join-Path $distFull (Split-Path $exePath -Leaf)
+$probeWorkspace = Join-Path ([System.IO.Path]::GetTempPath()) ("Tributary Windows Runtime Probe With Spaces " + [Guid]::NewGuid().ToString("N"))
+$probeCache = Join-Path $probeWorkspace "Fresh Cache With Spaces"
+$probeStdout = Join-Path $probeWorkspace "stdout.log"
+$probeStderr = Join-Path $probeWorkspace "stderr.log"
+$probeSentinel = Join-Path $probeCache "tributary-platform-runtime-probe.ok"
+$expectedSentinel = [System.Text.Encoding]::UTF8.GetBytes("tributary-windows-runtime-probe-v1`n")
+$probeOutputLimit = 1MB
+$probeProcess = $null
+$stdoutStream = $null
+$stderrStream = $null
+$stdoutCopy = $null
+$stderrCopy = $null
+$probeFailure = $null
+
+try {
+    New-Item -ItemType Directory -Force $probeCache | Out-Null
+    try {
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $probeExe
+        $startInfo.WorkingDirectory = $distFull
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.ArgumentList.Add("--tributary-platform-runtime-probe")
+        $startInfo.ArgumentList.Add($probeCache)
+
+        # ProcessStartInfo begins with a copy of this process's environment.
+        # Remove every policy input the Rust probe refuses to inherit, plus all
+        # conventional proxy variables, using case-insensitive comparisons.
+        foreach ($key in @($startInfo.Environment.Keys)) {
+            $normalized = $key.ToUpperInvariant()
+            if ($normalized.StartsWith("GST_") -or
+                $normalized -eq "GIO_EXTRA_MODULES" -or
+                $normalized -eq "GIO_USE_PROXY_RESOLVER" -or
+                $normalized -match '^(HTTP|HTTPS|ALL|NO)_PROXY$') {
+                $null = $startInfo.Environment.Remove($key)
+            }
+            elseif ($normalized -eq "PATH") {
+                $null = $startInfo.Environment.Remove($key)
+            }
+        }
+        $system32 = Join-Path $env:SystemRoot "System32"
+        $startInfo.Environment["PATH"] = "$distFull$([System.IO.Path]::PathSeparator)$system32"
+
+        $probeProcess = [System.Diagnostics.Process]::new()
+        $probeProcess.StartInfo = $startInfo
+        $probeClock = [System.Diagnostics.Stopwatch]::StartNew()
+        if (-not $probeProcess.Start()) { throw "could not start the bundled executable" }
+
+        $stdoutStream = [System.IO.File]::Create($probeStdout)
+        $stderrStream = [System.IO.File]::Create($probeStderr)
+        $stdoutCopy = $probeProcess.StandardOutput.BaseStream.CopyToAsync($stdoutStream)
+        $stderrCopy = $probeProcess.StandardError.BaseStream.CopyToAsync($stderrStream)
+
+        while (-not $probeProcess.WaitForExit(50)) {
+            if ($probeClock.ElapsedMilliseconds -ge 90000) {
+                throw "packaged runtime probe exceeded its 90-second deadline"
+            }
+            $stdoutLength = $stdoutStream.Length
+            $stderrLength = $stderrStream.Length
+            if ($stdoutLength -gt $probeOutputLimit -or
+                $stderrLength -gt $probeOutputLimit -or
+                ($stdoutLength + $stderrLength) -gt $probeOutputLimit) {
+                throw "packaged runtime probe output crossed its 1 MiB flood threshold"
+            }
+        }
+        if ($probeClock.ElapsedMilliseconds -ge 90000) {
+            throw "packaged runtime probe exceeded its 90-second deadline"
+        }
+        # Flush redirected async readers before inspecting their tasks/files.
+        $probeProcess.WaitForExit()
+        if ($probeProcess.ExitCode -ne 0) {
+            throw "bundled executable exited with status $($probeProcess.ExitCode)"
+        }
+    }
+    catch {
+        $probeFailure = $_.Exception.Message
+    }
+    finally {
+        # Keep process-tree termination and redirected-stream cleanup nested so
+        # a timeout, kill failure, or copy failure cannot bypass final cleanup.
+        try {
+            Stop-ProbeProcessTree $probeProcess
+        }
+        catch {
+            if ($probeFailure) { $probeFailure += "; $($_.Exception.Message)" }
+            else { $probeFailure = $_.Exception.Message }
+        }
+        finally {
+            try {
+                $copyTasks = @($stdoutCopy, $stderrCopy) | Where-Object { $null -ne $_ }
+                if ($copyTasks.Count -gt 0) {
+                    if (-not [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]$copyTasks, 10000)) {
+                        throw "redirected output exceeded its 10-second drain deadline"
+                    }
+                }
+            }
+            catch {
+                if ($probeFailure) { $probeFailure += "; redirected output did not drain: $($_.Exception.Message)" }
+                else { $probeFailure = "redirected output did not drain: $($_.Exception.Message)" }
+            }
+            finally {
+                if ($null -ne $stdoutStream) { $stdoutStream.Dispose() }
+                if ($null -ne $stderrStream) { $stderrStream.Dispose() }
+                if ($null -ne $probeProcess) { $probeProcess.Dispose() }
+            }
+        }
+    }
+
+    # Recheck after both async pipe copies drain so output written between the
+    # final poll and process exit cannot evade the flood check. The async
+    # files may cross the threshold before the next poll, but diagnostics are
+    # always read back through the fixed-size tail helper above.
+    if ((Test-Path -LiteralPath $probeStdout -PathType Leaf) -and
+        (Test-Path -LiteralPath $probeStderr -PathType Leaf)) {
+        $stdoutLength = (Get-Item -LiteralPath $probeStdout).Length
+        $stderrLength = (Get-Item -LiteralPath $probeStderr).Length
+        if ($stdoutLength -gt $probeOutputLimit -or
+            $stderrLength -gt $probeOutputLimit -or
+            ($stdoutLength + $stderrLength) -gt $probeOutputLimit) {
+            if ($probeFailure) { $probeFailure += "; packaged runtime probe output crossed its 1 MiB flood threshold" }
+            else { $probeFailure = "packaged runtime probe output crossed its 1 MiB flood threshold" }
+        }
+    }
+
+    if (-not $probeFailure) {
+        if (-not (Test-Path -LiteralPath $probeSentinel -PathType Leaf)) {
+            $probeFailure = "bundled executable did not write the runtime-probe sentinel"
+        }
+        else {
+            $actualSentinel = [System.IO.File]::ReadAllBytes($probeSentinel)
+            if ([Convert]::ToBase64String($actualSentinel) -ne [Convert]::ToBase64String($expectedSentinel)) {
+                $probeFailure = "runtime-probe sentinel content was not exact"
+            }
+        }
+    }
+
+    if ($probeFailure) {
+        $stdoutDiagnostic = Get-BoundedProbeDiagnostic $probeStdout "stdout"
+        $stderrDiagnostic = Get-BoundedProbeDiagnostic $probeStderr "stderr"
+        $probeFailure += "`n--- bounded stdout ---`n$stdoutDiagnostic`n--- bounded stderr ---`n$stderrDiagnostic"
+    }
+}
+finally {
+    # Exception-safe cleanup includes the fresh cache, exact sentinel, and
+    # bounded diagnostic files; no probe state is shipped in the archive.
+    Remove-Item -LiteralPath $probeWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+if ($probeFailure) { Write-Err "Packaged Windows runtime probe failed: $probeFailure" }
+Write-Info "Packaged Windows runtime probe passed."
 
 # ── Zip Archive ──────────────────────────────────────────────────────────────
 Write-Info "Creating zip archive..."
