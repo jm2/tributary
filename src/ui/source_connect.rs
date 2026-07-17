@@ -680,6 +680,7 @@ pub fn setup_source_connect(state: &WindowState) {
                     u32,
                     String,
                     String,
+                    crate::architecture::TrackId,
                 );
                 let (scan_tx, scan_rx) =
                     async_channel::bounded::<ScanRow>(USB_SCAN_CHANNEL_CAPACITY);
@@ -695,6 +696,11 @@ pub fn setup_source_connect(state: &WindowState) {
                                 break;
                             }
                             let path = path.as_path();
+                            let Ok(track_id) =
+                                crate::architecture::TrackId::removable_relative(&mount, path)
+                            else {
+                                continue;
+                            };
                             if let Ok(parsed) = crate::local::tag_parser::parse_audio_file(path) {
                                 let uri = url::Url::from_file_path(path)
                                     .map(|u| u.to_string())
@@ -713,6 +719,7 @@ pub fn setup_source_connect(state: &WindowState) {
                                     parsed.sample_rate_hz.unwrap_or(0),
                                     parsed.format,
                                     uri,
+                                    track_id,
                                 );
                                 if scan_tx.send_blocking(row).is_err() {
                                     break;
@@ -757,6 +764,7 @@ pub fn setup_source_connect(state: &WindowState) {
                                     row.0, &row.1, row.2, &row.3, &row.4, &row.5, &row.6, row.7,
                                     &row.8, row.9, row.10, 0, &row.11, &row.12,
                                 );
+                                obj.set_track_id(row.13.as_str());
                                 objects.push(obj);
                             }
                             futures::future::Either::Left((Err(_), _)) => break,

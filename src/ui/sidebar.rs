@@ -549,15 +549,16 @@ mod tests {
             emit_sidebar_button_action(action, &disconnect_tx, &delete_tx)
         };
 
+        let manual_source_id = crate::architecture::SourceId::random();
         let manual_a = SourceObject::manual(
             "Manual A",
             "subsonic",
             "https://a.example",
-            crate::architecture::SourceId::random(),
+            manual_source_id,
         );
         current.replace(Some(manual_a.clone()));
         assert!(!click());
-        assert_eq!(delete_rx.try_recv().unwrap(), "https://a.example");
+        assert_eq!(delete_rx.try_recv().unwrap(), manual_source_id.to_string());
         assert_empty(&delete_rx);
         assert_empty(&disconnect_rx);
 
@@ -582,17 +583,21 @@ mod tests {
         manual_a.set_connecting(false);
         current.replace(Some(manual_a));
         assert!(!click());
-        assert_eq!(delete_rx.try_recv().unwrap(), "https://a.example");
+        assert_eq!(delete_rx.try_recv().unwrap(), manual_source_id.to_string());
         assert_empty(&delete_rx);
         assert_empty(&disconnect_rx);
 
         // Recycle the item for a different connected DAAP source. Only that
         // source's eject event is emitted; Manual A is never deleted again.
         let daap_b = SourceObject::discovered("DAAP B", "daap", "http://b.example:3689");
+        let daap_source_id = daap_b.source_id().expect("derived DAAP source ID");
         daap_b.set_connected(true);
         current.replace(Some(daap_b));
         assert!(!click());
-        assert_eq!(disconnect_rx.try_recv().unwrap(), "http://b.example:3689");
+        assert_eq!(
+            disconnect_rx.try_recv().unwrap(),
+            daap_source_id.to_string()
+        );
         assert_empty(&disconnect_rx);
         assert_empty(&delete_rx);
 

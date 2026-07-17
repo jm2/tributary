@@ -5,6 +5,7 @@
 //! changing them requires an explicit migration.
 
 use std::fmt;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -41,6 +42,11 @@ impl SourceId {
     /// session. Random assignment is always explicit at the caller.
     pub fn random() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// Fresh identity for one external-file playback session.
+    pub fn external() -> Self {
+        Self::random()
     }
 
     /// Stable identity of the built-in local library.
@@ -118,6 +124,60 @@ impl TrackId {
         Self::with_bound(value.into(), MAX_REMOTE_TRACK_ID_BYTES)
     }
 
+    /// Fresh identity for one external-file playback session.
+    pub fn external() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+
+    /// Lossless, mount-independent identity for one removable-source path.
+    ///
+    /// Native path code units are hex encoded after stripping the current
+    /// mount root. A remount may therefore change the playable locator while
+    /// preserving the same source-scoped track identity.
+    pub fn removable_relative(root: &Path, path: &Path) -> Result<Self, IdentityError> {
+        let relative = path.strip_prefix(root).map_err(|_| IdentityError::Track)?;
+        let mut normalized = PathBuf::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(value) => normalized.push(value),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(IdentityError::Track);
+                }
+            }
+        }
+        if normalized.as_os_str().is_empty() {
+            return Err(IdentityError::Track);
+        }
+
+        #[cfg(unix)]
+        let value = {
+            use std::os::unix::ffi::OsStrExt;
+            let bytes = normalized.as_os_str().as_bytes();
+            validate_encoded_length("unix:", bytes.len())?;
+            format!("unix:{}", encode_hex(bytes))
+        };
+        #[cfg(windows)]
+        let value = {
+            use std::os::windows::ffi::OsStrExt;
+            let bytes: Vec<u8> = normalized
+                .as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            validate_encoded_length("windows-utf16le:", bytes.len())?;
+            format!("windows-utf16le:{}", encode_hex(&bytes))
+        };
+        #[cfg(not(any(unix, windows)))]
+        let value = {
+            let bytes = normalized.to_str().ok_or(IdentityError::Track)?.as_bytes();
+            validate_encoded_length("portable-utf8:", bytes.len())?;
+            format!("portable-utf8:{}", encode_hex(bytes))
+        };
+
+        Self::new(value)
+    }
+
     fn with_bound(value: String, maximum: usize) -> Result<Self, IdentityError> {
         if value.is_empty() || value.len() > maximum {
             return Err(IdentityError::Track);
@@ -128,6 +188,27 @@ impl TrackId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn validate_encoded_length(prefix: &str, input_bytes: usize) -> Result<(), IdentityError> {
+    let encoded_bytes = input_bytes
+        .checked_mul(2)
+        .and_then(|length| length.checked_add(prefix.len()))
+        .ok_or(IdentityError::Track)?;
+    if encoded_bytes > MAX_TRACK_ID_BYTES {
+        return Err(IdentityError::Track);
+    }
+    Ok(())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 impl fmt::Debug for TrackId {
@@ -169,10 +250,29 @@ impl MediaKey {
 ///
 /// A view never changes `MediaKey`; it exists only for navigation,
 /// re-selection, and duplicate occurrence ownership.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum ViewOrigin {
     Playlist(String),
     Radio(String),
+}
+
+impl<'de> Deserialize<'de> for ViewOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum SerializedViewOrigin {
+            Playlist(String),
+            Radio(String),
+        }
+
+        match SerializedViewOrigin::deserialize(deserializer)? {
+            SerializedViewOrigin::Playlist(id) => Self::playlist(id),
+            SerializedViewOrigin::Radio(query) => Self::radio(query),
+        }
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl ViewOrigin {
@@ -305,5 +405,55 @@ mod tests {
         let first = MediaKey::new(SourceId::local(), track_id.clone());
         let second = MediaKey::new(SourceId::radio_browser(), track_id);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn removable_track_identity_ignores_the_current_mount_location() {
+        let relative = Path::new("Artist").join("Album").join("Track.flac");
+        let first = TrackId::removable_relative(
+            Path::new("/media/one"),
+            &Path::new("/media/one").join(&relative),
+        )
+        .expect("first identity");
+        let second = TrackId::removable_relative(
+            Path::new("/run/media/two"),
+            &Path::new("/run/media/two").join(&relative),
+        )
+        .expect("second identity");
+        assert_eq!(first, second);
+        assert!(TrackId::removable_relative(
+            Path::new("/media/one"),
+            Path::new("/outside/Track.flac")
+        )
+        .is_err());
+        assert_eq!(
+            TrackId::removable_relative(
+                Path::new("/media/one"),
+                Path::new("/media/one/./Artist/Album/Track.flac")
+            )
+            .expect("normalized identity"),
+            first
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removable_track_identity_preserves_non_utf8_native_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = Path::new("/media/device");
+        let path = root.join(std::ffi::OsString::from_vec(vec![b'a', 0xff, b'.', b'f']));
+        let identity = TrackId::removable_relative(root, &path).expect("native identity");
+        assert_eq!(identity.as_str(), "unix:61ff2e66");
+    }
+
+    #[test]
+    fn view_origin_deserialization_preserves_the_bound() {
+        let valid: ViewOrigin =
+            serde_json::from_str(r#"{"Playlist":"playlist-id"}"#).expect("valid view");
+        assert_eq!(valid, ViewOrigin::Playlist("playlist-id".to_string()));
+        assert!(serde_json::from_str::<ViewOrigin>(r#"{"Radio":""}"#).is_err());
+        let oversized = serde_json::json!({ "Playlist": "x".repeat(MAX_VIEW_ORIGIN_BYTES + 1) });
+        assert!(serde_json::from_value::<ViewOrigin>(oversized).is_err());
     }
 }

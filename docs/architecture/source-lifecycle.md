@@ -1,6 +1,6 @@
 # Source identity and lifecycle ownership
 
-- Status: Accepted in PR #113; implementation is incomplete
+- Status: Accepted in PR #113; stable-identity migration implemented, lifecycle consolidation incomplete
 - Decision date: 2026-07-17
 - Tracker: [P3.1](../task.md#p31-introduce-a-sourcesession-registry)
 - Review finding: [Architectural assessment](../../CODE_REVIEW_2026-07-10.md#architectural-assessment)
@@ -60,6 +60,12 @@ pretending that a playlist or query creates another copy of a track.
 A checked-in application UUID namespace is used only where a deterministic ID is required. The
 namespace and the canonical input strings become data-format constants once implemented; changing
 either requires a migration.
+
+The implementation freezes namespace `c931938b-1524-4c8f-b63a-abfa86ce36f1` and the canonical
+inputs in the table below. Regression fixtures pin the resulting local, Radio-Browser, and sample
+remote UUIDs. `TrackId` accepts at most 256 KiB of adapter-owned identity, while server-controlled
+remote IDs and `ViewOrigin` values use a 4 KiB ceiling. `TrackId` debug output reports only its byte
+length, so provider-controlled values do not enter diagnostics.
 
 | Source kind | `SourceId` rule | Stability boundary |
 |---|---|---|
@@ -141,6 +147,12 @@ native key because no platform-independent file ID is available; rename stabilit
 not promised. Its current source generation maps that key to a validated locator beneath the live
 mount. A stronger device-native file ID can replace that representation later without exposing an
 absolute path to generic state.
+
+The implemented removable spelling is frozen as `unix:<lowercase-hex-native-bytes>` on Unix and
+`windows-utf16le:<lowercase-hex-native-code-units>` on Windows after lexical removal of the live
+mount root. Empty, outside-root, parent, rooted, and prefixed relative values fail closed. This is
+lossless for non-UTF-8 Unix names and unpaired Windows code units, and the same relative spelling
+survives a changed mount point.
 
 Tributary treats a provider's native ID as authoritative only inside that source. If a server
 itself reuses or changes an ID, no metadata heuristic silently repairs the identity; a refresh
@@ -338,8 +350,25 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
 
 ## What is already implemented
 
+- `SourceId`, `TrackId`, `MediaKey`, and `ViewOrigin` are typed and bounded. The namespace,
+  built-in identities, canonical remote spelling, and removable-path encoding are frozen by
+  regression fixtures.
+- Saved sources use the strict version-1 envelope. Loading a legacy array derives deterministic
+  IDs, collapses canonical duplicates in file order, atomically replaces `servers.json` before
+  publication, and publishes nothing when validation or replacement fails. Malformed or unknown
+  version-1 data and endpoint/ID conflicts quarantine the complete unchanged file.
+- Saved remote rows retain random persisted `SourceId` values. Legacy, discovered, environment,
+  and unsaved remote endpoints use deterministic backend-plus-canonical-base-URL identity. The
+  same typed ID is carried through sidebar objects, connect generations, standard and DAAP
+  registries, sync events, navigation, disconnect, discovery loss, deletion, and shutdown.
+- Subsonic, Jellyfin, Plex, and DAAP catalogue rows preserve their exact bounded native song ID,
+  item `Id`, `ratingKey`, and decimal `miid`, respectively. Standard opaque playback references
+  encode that exact native ID and their resolvers look it up without a derived UUID compatibility
+  projection.
 - `PlaybackSession` captures immutable source/track identity, queue order, duplicate occurrence,
-  and playback event generation independently of GTK sorting/filtering.
+  and playback event generation independently of GTK sorting/filtering. Queue identity is a
+  `MediaKey`; playlists and radio queries retain a separate `ViewOrigin`, so local invalidation
+  retires every local projection while view-specific invalidation cannot retire a sibling view.
 - Standard remote sources have generation-owned resolvers, random media leases, playback-time
   protected request resolution, and synchronous revocation on replacement/release/shutdown.
 - DAAP has generation-owned retained sessions, credential-free references, explicit exactly-once
@@ -351,44 +380,44 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
   playlist queues no longer retain a file locator. Every queue load resolves that ID against the
   current row and checks the current file under a five-second budget before handing a URI to an
   output; stale generations cannot claim a later load.
-- Removable sources separate a best-available logical key from the mount path and retire scans,
-  cache, and playback on relocation/removal.
-- Radio rows use station UUIDs, and OS-opened files use a one-item external queue.
+- Removable sources derive `SourceId` from the best-available logical key and exact `TrackId` from
+  the losslessly encoded mount-relative native path. Relocation/removal still retires scans, cache,
+  and playback. Radio queues share the built-in Radio-Browser source and reject empty/oversized
+  station UUIDs instead of falling back to a stream URL. Each OS-opened file queue receives fresh,
+  independent random source and track identities.
 
-These are compatible foundations, not proof that the decision is complete. In particular, current
-remote `SourceId` values are still URLs, remote `TrackId` values are still derived UUIDs, the two
-remote registries remain siblings, and radio/removable/external queues still retain locations.
-Local and playlist GTK rows retain paths for non-playback UI operations, and the playback-time
-local resolver does not yet retain root/file authority through complete output consumption.
-Playlist queue identity also still puts the transitional `playlist:<id>` view key in
-`PlaybackIdentity.source_id` instead of carrying the local source plus a separate `ViewOrigin`;
-therefore generic local-source retirement does not yet retire a playlist-origin queue. Lifecycle
-failures also still cross several UI-owned paths.
+These are compatible foundations, not proof that the complete lifecycle decision is implemented.
+The standard and DAAP registries remain siblings, and connect/refresh/cancellation/failure
+publication still crosses UI-owned paths. Radio, removable, and external queue entries now have
+location-independent identity but retain their current locator until their registry adapters and
+at-use resolvers are implemented. Local and playlist GTK rows retain paths for non-playback UI
+operations, and the playback-time local resolver does not yet retain root/file authority through
+complete output consumption. Those lifecycle and authority items remain explicit P3.1 work.
 
 ## Deliberately deferred implementation details
 
-The identity and ownership invariants above are settled. Three representation details are chosen
-with the first implementation patch and then frozen by migration fixtures: the checked-in UUID
-namespace value, the exact non-lossy relative-path encoding for removable `TrackId`, and the
-per-adapter ID length bounds. The chosen bounds must admit every currently supported local path and
-provider fixture while bounding hostile catalogue input. The saved-source envelope, legacy-array
-reader, and whole-file conflict quarantine above are settled rather than deferred; they do not
-introduce a second saved-source database or persist credentials. Exact Rust trait names and
-event-channel shapes are internal implementation details so long as one registry enforces this
-contract.
+The identity and ownership invariants above are settled. The UUID namespace, canonical input
+strings, relative-path encoding, and ID bounds are now implemented format state and require an
+explicit migration if changed. The saved-source envelope, legacy-array reader, and whole-file
+conflict quarantine are also implemented; they do not introduce a second saved-source database or
+persist credentials. Exact lifecycle trait names and event-channel shapes remain internal
+implementation details so long as one registry ultimately enforces this contract.
 
 ## Implementation sequence
 
-1. Introduce `SourceId`, `TrackId`, `MediaKey`, `ViewOrigin`, typed lifecycle events, and the saved
-   remote-source schema migration without changing playback behavior.
-2. Preserve exact backend-native IDs in catalogue adapters and move the standard remote and DAAP
-   resolver contracts behind one registry entry abstraction.
-3. Replace URI-bearing queue/UI media fields with `MediaKey`; keep a temporary compatibility
-   adapter only at the output boundary.
-4. Add the local resolver and make local/playlist navigation, playback, artwork, and receiver loads
-   query by ID at use. Remove the random invalid-local-ID fallback.
-5. Move Radio-Browser query/locator ownership and removable scan/mount ownership into registry
-   adapters, then add the ephemeral external-file adapter.
+1. **Identity complete:** introduce `SourceId`, `TrackId`, `MediaKey`, `ViewOrigin`, and the saved
+   remote-source schema migration.
+2. **Identity complete, lifecycle open:** preserve exact backend-native IDs in catalogue adapters;
+   moving the standard remote and DAAP resolver contracts behind one registry entry remains open.
+3. **Identity complete, locator removal partial:** queues carry `MediaKey` and optional
+   `ViewOrigin`; remote protected references already resolve at use, while radio/removable/external
+   locators remain until their adapters land.
+4. **Resolution partial:** local/playlist playback queries the exact ID at use and the random
+   invalid-local-ID fallback is gone; retained root/file authority through complete output
+   consumption remains open.
+5. **Identity complete, lifecycle open:** Radio-Browser, removable media, and external files have
+   the specified source/track identity; moving their locator and retirement ownership into
+   registry adapters remains open.
 6. Move connection/refresh cancellation, sanitized failure state, and snapshot publication out of
    GTK callbacks. Remove URL-keyed lifecycle maps and the sibling DAAP registry only after race,
    migration, disconnect, and shutdown tests cover the unified path.

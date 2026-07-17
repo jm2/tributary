@@ -14,6 +14,7 @@ use adw::prelude::*;
 use gtk::glib;
 use tracing::warn;
 
+use crate::architecture::{MediaKey, SourceId, TrackId, ViewOrigin};
 use crate::audio::output::AudioOutput;
 use crate::audio::PlayerEventGeneration;
 use crate::ui::header_bar::RepeatMode;
@@ -31,11 +32,62 @@ pub const PLAYLIST_SOURCE_PREFIX: &str = "playlist:";
 /// Whether a queue source is backed by the local library database, and its
 /// track IDs are therefore library track IDs.
 ///
-/// Remote backends key tracks by their own native IDs, and external files and
-/// USB items fall back to their URI as an ID ([`TrackObject::track_id`]). A
+/// Remote backends key tracks by their own native IDs, removable tracks use a
+/// lossless mount-relative ID, and external sessions mint ephemeral IDs. A
 /// library update must never reinterpret one of those as one of its own.
-fn is_library_source(source_id: &str) -> bool {
-    source_id == LOCAL_SOURCE_KEY || source_id.starts_with(PLAYLIST_SOURCE_PREFIX)
+fn is_library_source(source_id: SourceId) -> bool {
+    source_id == SourceId::local()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueueView {
+    source_id: SourceId,
+    origin: Option<ViewOrigin>,
+}
+
+fn queue_view(source_key: &str) -> Option<QueueView> {
+    if source_key == LOCAL_SOURCE_KEY {
+        return Some(QueueView {
+            source_id: SourceId::local(),
+            origin: None,
+        });
+    }
+    if let Some(playlist_id) = source_key.strip_prefix(PLAYLIST_SOURCE_PREFIX) {
+        return Some(QueueView {
+            source_id: SourceId::local(),
+            origin: Some(ViewOrigin::playlist(playlist_id).ok()?),
+        });
+    }
+    if source_key.starts_with("radio-") {
+        return Some(QueueView {
+            source_id: SourceId::radio_browser(),
+            origin: Some(ViewOrigin::radio(source_key).ok()?),
+        });
+    }
+    if let Ok(source_id) = source_key.parse::<SourceId>() {
+        return Some(QueueView {
+            source_id,
+            origin: None,
+        });
+    }
+    Some(QueueView {
+        source_id: SourceId::removable(source_key).ok()?,
+        origin: None,
+    })
+}
+
+fn identity_belongs_to_source(identity: &PlaybackIdentity, source_key: &str) -> bool {
+    if source_key == LOCAL_SOURCE_KEY {
+        return identity.media_key.source_id == SourceId::local();
+    }
+    if let Some(playlist_id) = source_key.strip_prefix(PLAYLIST_SOURCE_PREFIX) {
+        return identity.view_origin == Some(ViewOrigin::Playlist(playlist_id.to_string()));
+    }
+    if source_key.starts_with("radio-") {
+        return identity.view_origin == Some(ViewOrigin::Radio(source_key.to_string()));
+    }
+    identity.view_origin.is_none()
+        && queue_view(source_key).is_some_and(|view| view.source_id == identity.media_key.source_id)
 }
 
 /// Overlay committed local-library URIs onto an existing playlist projection.
@@ -79,11 +131,20 @@ pub(super) fn refresh_projected_library_uris(
     refreshed
 }
 
-/// Stable identity of a track inside the source that supplied its queue.
+/// Stable media identity plus the view that supplied this queue occurrence.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PlaybackIdentity {
-    pub source_id: String,
-    pub track_id: String,
+    pub media_key: MediaKey,
+    pub view_origin: Option<ViewOrigin>,
+}
+
+impl PlaybackIdentity {
+    fn new(view: &QueueView, track_id: TrackId) -> Self {
+        Self {
+            media_key: MediaKey::new(view.source_id, track_id),
+            view_origin: view.origin.clone(),
+        }
+    }
 }
 
 /// A committed library change, addressed to the queue by stable track ID.
@@ -134,18 +195,16 @@ pub struct QueueItem {
 }
 
 impl QueueItem {
-    fn from_track(source_id: &str, track: &TrackObject, occurrence: usize) -> Self {
+    fn from_track(identity: PlaybackIdentity, track: &TrackObject, occurrence: usize) -> Self {
+        let is_library = is_library_source(identity.media_key.source_id);
         Self {
-            identity: PlaybackIdentity {
-                source_id: source_id.to_string(),
-                track_id: track.track_id(),
-            },
+            identity,
             occurrence,
             row_instance_id: Some(track.row_instance_id()),
             // Local and playlist queues retain identity, ordering, and a
             // metadata snapshot but no file locator. Every output load
             // resolves the exact database ID against the current row.
-            uri: if is_library_source(source_id) {
+            uri: if is_library {
                 String::new()
             } else {
                 track.uri()
@@ -158,10 +217,12 @@ impl QueueItem {
     }
 
     pub(crate) fn external(uri: String, title: String, artist: String, album: String) -> Self {
+        let source_id = SourceId::external();
+        let track_id = TrackId::external();
         Self {
             identity: PlaybackIdentity {
-                source_id: "external".to_string(),
-                track_id: uri.clone(),
+                media_key: MediaKey::new(source_id, track_id),
+                view_origin: None,
             },
             occurrence: 0,
             row_instance_id: None,
@@ -243,7 +304,7 @@ impl PlaybackSession {
     pub(crate) fn clear_if_source(&mut self, source_id: &str) -> bool {
         if self
             .current_identity()
-            .is_none_or(|identity| identity.source_id != source_id)
+            .is_none_or(|identity| !identity_belongs_to_source(identity, source_id))
         {
             return false;
         }
@@ -256,11 +317,11 @@ impl PlaybackSession {
     /// A full library snapshot can be very large. Publishing this small set
     /// lets the GTK receiver avoid cloning refresh metadata for tracks the
     /// queue does not own, while preserving source namespacing.
-    pub(crate) fn library_track_ids(&self) -> HashSet<&str> {
+    pub(crate) fn library_track_ids(&self) -> HashSet<&TrackId> {
         self.queue
             .iter()
-            .filter(|item| is_library_source(&item.identity.source_id))
-            .map(|item| item.identity.track_id.as_str())
+            .filter(|item| is_library_source(item.identity.media_key.source_id))
+            .map(|item| &item.identity.media_key.track_id)
             .collect()
     }
 
@@ -276,7 +337,7 @@ impl PlaybackSession {
     /// into, so identity — not position — is what an update may address.
     pub(crate) fn refresh_library_tracks(
         &mut self,
-        updates: &HashMap<String, QueueTrackRefresh>,
+        updates: &HashMap<TrackId, QueueTrackRefresh>,
     ) -> usize {
         if updates.is_empty() {
             return 0;
@@ -284,10 +345,10 @@ impl PlaybackSession {
 
         let mut refreshed = 0;
         for item in &mut self.queue {
-            if !is_library_source(&item.identity.source_id) {
+            if !is_library_source(item.identity.media_key.source_id) {
                 continue;
             }
-            let Some(update) = updates.get(&item.identity.track_id) else {
+            let Some(update) = updates.get(&item.identity.media_key.track_id) else {
                 continue;
             };
             if item.title == update.title
@@ -405,7 +466,7 @@ impl PlaybackSession {
             || self.resolution_failed
             || !self.accepts_event_generation(generation)
             || !self.current().is_some_and(|item| {
-                is_library_source(&item.identity.source_id)
+                is_library_source(item.identity.media_key.source_id)
                     || crate::source_registry::is_media_reference(item.uri())
                     || item.uri().starts_with("daap:")
             })
@@ -632,24 +693,28 @@ fn resolve_session_play_request(
 /// Captures the visible sorted model as an immutable playback queue, then
 /// starts the selected item. Later view mutations do not alter that queue.
 pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
-    let source_id = ctx.active_source_key.borrow().clone();
+    let source_key = ctx.active_source_key.borrow().clone();
+    let Some(view) = queue_view(&source_key) else {
+        warn!("Active source has no valid media identity");
+        return false;
+    };
     let mut selected_index = None;
     let mut queue = Vec::with_capacity(ctx.model.n_items() as usize);
-    let mut occurrences: HashMap<PlaybackIdentity, usize> = HashMap::new();
+    let mut occurrences: HashMap<MediaKey, usize> = HashMap::new();
 
     for model_index in 0..ctx.model.n_items() {
         let Some(track) = ctx.model.item(model_index).and_downcast::<TrackObject>() else {
             continue;
         };
+        let Ok(track_id) = TrackId::new(track.track_id()) else {
+            continue;
+        };
         if model_index == position {
             selected_index = Some(queue.len());
         }
-        let identity = PlaybackIdentity {
-            source_id: source_id.clone(),
-            track_id: track.track_id(),
-        };
-        let occurrence = occurrences.entry(identity).or_default();
-        queue.push(QueueItem::from_track(&source_id, &track, *occurrence));
+        let identity = PlaybackIdentity::new(&view, track_id);
+        let occurrence = occurrences.entry(identity.media_key.clone()).or_default();
+        queue.push(QueueItem::from_track(identity, &track, *occurrence));
         *occurrence += 1;
     }
 
@@ -657,7 +722,7 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         return false;
     };
     if queue[selected_index].uri.is_empty()
-        && !is_library_source(&queue[selected_index].identity.source_id)
+        && !is_library_source(queue[selected_index].identity.media_key.source_id)
     {
         warn!("Track has no playable URI");
         return false;
@@ -733,7 +798,7 @@ fn play_current(ctx: &PlaybackContext) -> bool {
     drop(session);
     if identity
         .as_ref()
-        .is_some_and(|identity| is_library_source(&identity.source_id))
+        .is_some_and(|identity| is_library_source(identity.media_key.source_id))
     {
         // Stop and supersede the prior output before beginning the async DB
         // lookup. Stop, Next, Previous, and replay all advance the generation,
@@ -745,12 +810,12 @@ fn play_current(ctx: &PlaybackContext) -> bool {
 
         let track_id = identity
             .as_ref()
-            .map(|identity| identity.track_id.clone())
-            .unwrap_or_default();
+            .map(|identity| identity.media_key.track_id.clone())
+            .expect("local queue item has an identity");
         let (resolved_tx, resolved_rx) = async_channel::bounded(1);
         ctx.rt_handle.spawn(async move {
             let resolved = match crate::db::connection::init_db().await {
-                Ok(db) => crate::local::resolver::resolve_track_uri(&db, &track_id).await,
+                Ok(db) => crate::local::resolver::resolve_track_uri(&db, track_id.as_str()).await,
                 Err(source) => {
                     Err(crate::local::resolver::LocalMediaResolutionError::Database { source })
                 }
@@ -887,10 +952,12 @@ fn update_now_playing_ui(
     // Scroll only when the queue's source and item are present in the current
     // view. Navigation still works when the user is viewing another source or
     // has filtered the playing item out.
-    if identity.is_some_and(|identity| *ctx.active_source_key.borrow() == identity.source_id) {
+    if identity.is_some_and(|identity| {
+        identity_belongs_to_source(identity, &ctx.active_source_key.borrow())
+    }) {
         if let Some(position) = find_queue_item_position(
             ctx.model.n_items(),
-            identity.map_or("", |identity| &identity.track_id),
+            identity.map_or("", |identity| identity.media_key.track_id.as_str()),
             item.occurrence,
             item.row_instance_id,
             |index| {
@@ -1090,14 +1157,16 @@ mod tests {
     use super::*;
 
     fn item(source: &str, id: &str) -> QueueItem {
+        let view = queue_view(source).expect("test source identity");
+        let identity = PlaybackIdentity::new(
+            &view,
+            TrackId::new(id.to_string()).expect("test track identity"),
+        );
         QueueItem {
-            identity: PlaybackIdentity {
-                source_id: source.to_string(),
-                track_id: id.to_string(),
-            },
+            identity,
             occurrence: 0,
             row_instance_id: None,
-            uri: if is_library_source(source) {
+            uri: if is_library_source(view.source_id) {
                 String::new()
             } else {
                 format!("https://media.invalid/{id}")
@@ -1127,8 +1196,42 @@ mod tests {
         session
             .queue
             .iter()
-            .map(|entry| entry.identity.track_id.clone())
+            .map(|entry| entry.identity.media_key.track_id.as_str().to_string())
             .collect()
+    }
+
+    fn library_ids(session: &PlaybackSession) -> HashSet<&str> {
+        session
+            .library_track_ids()
+            .into_iter()
+            .map(TrackId::as_str)
+            .collect()
+    }
+
+    fn current_id(session: &PlaybackSession) -> &str {
+        session
+            .current_identity()
+            .expect("current identity")
+            .media_key
+            .track_id
+            .as_str()
+    }
+
+    fn current_source(session: &PlaybackSession) -> SourceId {
+        session
+            .current_identity()
+            .expect("current identity")
+            .media_key
+            .source_id
+    }
+
+    fn item_from_row(source: &str, row: &TrackObject, occurrence: usize) -> QueueItem {
+        let view = queue_view(source).expect("test source identity");
+        let identity = PlaybackIdentity::new(
+            &view,
+            TrackId::new(row.track_id()).expect("test track identity"),
+        );
+        QueueItem::from_track(identity, row, occurrence)
     }
 
     fn refreshed_metadata() -> QueueTrackRefresh {
@@ -1141,7 +1244,10 @@ mod tests {
     }
 
     fn refresh(session: &mut PlaybackSession, track_id: &str, update: QueueTrackRefresh) -> usize {
-        session.refresh_library_tracks(&HashMap::from([(track_id.to_string(), update)]))
+        session.refresh_library_tracks(&HashMap::from([(
+            TrackId::new(track_id.to_string()).expect("test track identity"),
+            update,
+        )]))
     }
 
     #[test]
@@ -1192,7 +1298,7 @@ mod tests {
             0,
         ));
         assert_eq!(
-            session.library_track_ids(),
+            library_ids(&session),
             HashSet::from(["a"]),
             "duplicate playlist/local occurrences need one snapshot lookup"
         );
@@ -1222,7 +1328,7 @@ mod tests {
             0,
         ));
         assert_eq!(
-            session.library_track_ids(),
+            library_ids(&session),
             HashSet::from(["a"]),
             "only local-library sources participate in snapshot filtering"
         );
@@ -1241,12 +1347,26 @@ mod tests {
         let playlist = projected_row("legacy:local-id", "file:///music/captured.flac");
         let remote = projected_row("remote-id", "https://media.invalid/stream");
 
-        let local_item = QueueItem::from_track("local", &local, 0);
-        let playlist_item = QueueItem::from_track("playlist:favourites", &playlist, 0);
-        let remote_item = QueueItem::from_track("https://server.invalid", &remote, 0);
+        let local_item = item_from_row("local", &local, 0);
+        let playlist_item = item_from_row("playlist:favourites", &playlist, 0);
+        let remote_item = item_from_row("https://server.invalid", &remote, 0);
 
-        assert_eq!(local_item.identity.track_id, "legacy:local-id");
-        assert_eq!(playlist_item.identity.track_id, "legacy:local-id");
+        assert_eq!(
+            local_item.identity.media_key.track_id.as_str(),
+            "legacy:local-id"
+        );
+        assert_eq!(
+            playlist_item.identity.media_key.track_id.as_str(),
+            "legacy:local-id"
+        );
+        assert_eq!(
+            local_item.identity.media_key,
+            playlist_item.identity.media_key
+        );
+        assert_eq!(
+            playlist_item.identity.view_origin,
+            Some(ViewOrigin::Playlist("favourites".to_string()))
+        );
         assert!(local_item.uri.is_empty());
         assert!(playlist_item.uri.is_empty());
         assert_eq!(remote_item.uri, "https://media.invalid/stream");
@@ -1290,7 +1410,7 @@ mod tests {
         assert_eq!(ids(&session), ["a", "b", "c"]);
 
         assert_eq!(session.advance(RepeatMode::Off, false), Some(2));
-        assert_eq!(session.current_identity().unwrap().track_id, "c");
+        assert_eq!(current_id(&session), "c");
     }
 
     #[test]
@@ -1305,7 +1425,7 @@ mod tests {
         let filtered_view = ["a", "c"];
         assert!(!filtered_view.contains(&"b"));
         assert_eq!(session.advance(RepeatMode::Off, false), Some(1));
-        assert_eq!(session.current_identity().unwrap().track_id, "b");
+        assert_eq!(current_id(&session), "b");
     }
 
     #[test]
@@ -1315,11 +1435,11 @@ mod tests {
 
         let active_view_source = "remote-server";
         assert_ne!(
-            session.current_identity().unwrap().source_id,
-            active_view_source
+            current_source(&session),
+            SourceId::removable(active_view_source).expect("source ID")
         );
-        assert_eq!(session.current_identity().unwrap().source_id, "local");
-        assert_eq!(session.current_identity().unwrap().track_id, "track-a");
+        assert_eq!(current_source(&session), SourceId::local());
+        assert_eq!(current_id(&session), "track-a");
     }
 
     #[test]
@@ -1335,11 +1455,11 @@ mod tests {
         ));
 
         assert_eq!(session.advance(RepeatMode::Off, false), None);
-        assert_eq!(session.current_identity().unwrap().track_id, "c");
+        assert_eq!(current_id(&session), "c");
         assert_eq!(session.advance(RepeatMode::All, false), Some(0));
-        assert_eq!(session.current_identity().unwrap().track_id, "a");
+        assert_eq!(current_id(&session), "a");
         assert_eq!(session.previous(RepeatMode::All, false), Some(2));
-        assert_eq!(session.current_identity().unwrap().track_id, "c");
+        assert_eq!(current_id(&session), "c");
     }
 
     #[test]
@@ -1349,8 +1469,7 @@ mod tests {
         let mut repeat_one = PlaybackSession::default();
         assert!(repeat_one.replace_queue(queue.clone(), 1));
         // EOS repeat-one calls replay_current and does not move the cursor.
-        let replayed = repeat_one.current_identity().cloned();
-        assert_eq!(replayed.unwrap().track_id, "b");
+        assert_eq!(current_id(&repeat_one), "b");
 
         let mut repeat_off = PlaybackSession::default();
         assert!(repeat_off.replace_queue(queue.clone(), 1));
@@ -1359,7 +1478,7 @@ mod tests {
         let mut repeat_all = PlaybackSession::default();
         assert!(repeat_all.replace_queue(queue, 1));
         assert_eq!(repeat_all.advance(RepeatMode::All, false), Some(0));
-        assert_eq!(repeat_all.current_identity().unwrap().track_id, "a");
+        assert_eq!(current_id(&repeat_all), "a");
     }
 
     #[test]
@@ -1377,7 +1496,7 @@ mod tests {
         let mut visited = HashSet::from(["a".to_string()]);
         for _ in 0..2 {
             assert!(session.advance(RepeatMode::Off, true).is_some());
-            visited.insert(session.current_identity().unwrap().track_id.clone());
+            visited.insert(current_id(&session).to_string());
         }
         assert_eq!(visited, HashSet::from(["a".into(), "b".into(), "c".into()]));
         assert_eq!(session.advance(RepeatMode::Off, true), None);
@@ -1398,10 +1517,10 @@ mod tests {
             0,
         ));
         assert!(session.advance(RepeatMode::Off, true).is_some());
-        let previous_id = session.current_identity().unwrap().track_id.clone();
+        let previous_id = current_id(&session).to_string();
         assert!(session.advance(RepeatMode::Off, true).is_some());
         assert!(session.previous(RepeatMode::Off, true).is_some());
-        assert_eq!(session.current_identity().unwrap().track_id, previous_id);
+        assert_eq!(current_id(&session), previous_id);
     }
 
     #[test]
@@ -1413,8 +1532,20 @@ mod tests {
             "Artist".to_string(),
             "Album".to_string(),
         );
+        let first_source = external.identity.media_key.source_id;
+        let first_track = external.identity.media_key.track_id.clone();
+        let another = QueueItem::external(
+            "file:///tmp/example.flac".to_string(),
+            "Example".to_string(),
+            "Artist".to_string(),
+            "Album".to_string(),
+        );
+        assert_ne!(first_source, another.identity.media_key.source_id);
+        assert_ne!(first_track, another.identity.media_key.track_id);
+        assert_ne!(first_track.as_str(), first_source.to_string());
         assert!(session.replace_queue(vec![external], 0));
-        assert_eq!(session.current_identity().unwrap().source_id, "external");
+        assert_eq!(current_source(&session), first_source);
+        assert_ne!(current_source(&session), SourceId::local());
         assert_eq!(session.advance(RepeatMode::Off, false), None);
         assert_eq!(session.advance(RepeatMode::All, false), Some(0));
     }
@@ -1442,6 +1573,59 @@ mod tests {
         assert!(!session.accepts_event_generation(retired_generation));
         assert!(!session.has_current());
         assert!(session.queue.is_empty());
+    }
+
+    #[test]
+    fn playlist_view_origin_is_separate_from_local_media_identity() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item("playlist:favourites", "local-track")], 0));
+        let identity = session.current_identity().expect("identity");
+        assert_eq!(identity.media_key.source_id, SourceId::local());
+        assert_eq!(
+            identity.view_origin,
+            Some(ViewOrigin::Playlist("favourites".to_string()))
+        );
+
+        assert!(!session.clear_if_source("playlist:other"));
+        assert!(session.clear_if_source(LOCAL_SOURCE_KEY));
+        assert!(!session.has_current());
+
+        assert!(session.replace_queue(vec![item(LOCAL_SOURCE_KEY, "local-track")], 0));
+        assert!(!session.clear_if_source("playlist:favourites"));
+        assert!(session.has_current());
+    }
+
+    #[test]
+    fn radio_queries_share_media_namespace_but_not_view_ownership() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item("radio-topvote", "station-uuid")], 0));
+        let identity = session.current_identity().expect("identity");
+        assert_eq!(identity.media_key.source_id, SourceId::radio_browser());
+        assert_eq!(
+            identity.view_origin,
+            Some(ViewOrigin::Radio("radio-topvote".to_string()))
+        );
+        assert!(!session.clear_if_source("radio-nearme"));
+        assert!(session.clear_if_source("radio-topvote"));
+    }
+
+    #[test]
+    fn removable_queue_identity_is_namespaced_by_logical_device() {
+        let device = "device:uuid:01234567-89ab-cdef-0123-456789abcdef";
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![item(device, "unix:4172746973742f547261636b2e666c6163")],
+            0
+        ));
+        let identity = session.current_identity().expect("identity");
+        assert_eq!(
+            identity.media_key.source_id,
+            SourceId::removable(device).expect("device source ID")
+        );
+        assert_eq!(
+            identity.media_key.track_id.as_str(),
+            "unix:4172746973742f547261636b2e666c6163"
+        );
     }
 
     #[test]
@@ -1619,7 +1803,7 @@ mod tests {
         let mut session = PlaybackSession::default();
         assert!(session.replace_queue(vec![first, second], 1));
 
-        assert_eq!(session.current_identity().unwrap().track_id, "same-track");
+        assert_eq!(current_id(&session), "same-track");
         assert_eq!(session.current().map(|item| item.occurrence), Some(1));
         assert_eq!(
             find_queue_item_position(4, "same-track", 1, Some(22), |index| {

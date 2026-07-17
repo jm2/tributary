@@ -11,5 +11,5 @@ pub mod media;
 pub mod models;
 
 pub use backend::MediaBackend;
-pub use identity::{SourceId, TrackId};
+pub use identity::{MediaKey, SourceId, TrackId, ViewOrigin};
 pub use media::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest};

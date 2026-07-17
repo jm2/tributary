@@ -1916,8 +1916,10 @@ fn refresh_playback_queue(session: &Rc<RefCell<PlaybackSession>>, objects: &[Tra
         // owns.
         let mut updates = HashMap::with_capacity(queue_ids.len());
         for track in objects {
-            let track_id = track.track_id();
-            if queue_ids.contains(track_id.as_str()) {
+            let Ok(track_id) = crate::architecture::TrackId::new(track.track_id()) else {
+                continue;
+            };
+            if queue_ids.contains(&track_id) {
                 updates.insert(track_id, QueueTrackRefresh::from_track(track));
             }
         }
@@ -2076,7 +2078,7 @@ fn setup_library_events(
                     let replaces_current_queue = {
                         let session = playback_session.borrow();
                         session.current_identity().is_some_and(|identity| {
-                            identity.source_id.as_str() == source_key.as_str()
+                            identity.media_key.source_id == source_id
                                 && session.current().is_some_and(|item| {
                                     !crate::source_registry::stream_reference_uses_lease(
                                         item.uri(),

@@ -107,8 +107,9 @@ impl TrackObject {
     }
     /// Stable identifier used by playback sessions.
     ///
-    /// Architecture-backed tracks set their backend UUID explicitly.  UI-only
-    /// sources such as USB scans retain stable identity through their URI.
+    /// Architecture-backed tracks and UI adapters set their exact native ID
+    /// explicitly. The URI fallback exists only for legacy row constructors;
+    /// queue admission validates a non-empty bounded ID before publication.
     pub fn track_id(&self) -> String {
         let imp = self.imp();
         if imp.has_explicit_track_id.get() {
