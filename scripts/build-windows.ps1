@@ -742,6 +742,14 @@ function Add-PeImportDependencies {
 }
 
 New-Item -ItemType Directory -Force $DIST | Out-Null
+# Resolve the caller-relative distribution through PowerShell's FileSystem
+# provider before passing any bundle member to System.IO. PowerShell's
+# Set-Location does not update Environment.CurrentDirectory, so
+# Path.GetFullPath on the original relative value can point at a different,
+# nonexistent tree in an interactive shell. Resolve-Path follows $PWD, and
+# ProviderPath returns the physical path even when $PWD uses a custom
+# FileSystem PSDrive; repository paths containing spaces remain intact.
+$DIST = (Resolve-Path -LiteralPath $DIST).ProviderPath
 New-Item -ItemType Directory -Force "$DIST\lib" | Out-Null
 
 # Always copy the executable (just built).

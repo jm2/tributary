@@ -107,6 +107,15 @@ passed: all 718 x86_64 Windows application tests were green, both Windows archit
 their finished-distribution protected-playback probes, and every exact-toolchain, audit, metadata,
 coverage, Linux, Flatpak, macOS, package, and checksum sibling passed. No actionable automated
 review thread remains.
+The 2026-07-17 local `x86_64-pc-windows-gnullvm` follow-up exposed a build-helper-only path bug
+before the accepted packaged-runtime probe could start: PowerShell found the caller-relative Soup
+DLL beneath `$PWD`, but `.NET` expanded that same relative path beneath its unchanged process
+working directory. This follow-up resolves the created distribution through the
+PowerShell filesystem provider and retains its physical `ProviderPath` before constructing any
+PE-inspection target. It covers the location split, repository paths containing spaces, and custom
+FileSystem PSDrives whose provider-only names are unusable by `.NET` and external tools. This
+repairs the local path into the already-accepted automated proof; it does not close or alter the
+one remaining live-server box, so the literal progress count remains **203/223 (91.0%)**.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1341,7 +1350,7 @@ failed through the separately resolved media path—but did not prove DNS was th
   scanner, protected-loopback policy, real FLAC decode/EOS, poisoned-proxy, and alternate-source
   fail-closed checks. The intentionally deferred live release-workflow run is not required because
   CI invokes that same path on both supported architectures.
-  The pending follow-up PR hardens a plausible listener teardown race without changing this
+  PR #114 hardens a plausible listener teardown race without changing this
   completed checklist item. Production now publishes a narrow cancellation phase before
   `teardown_to_null` without stopping either listener. Both remain accepting throughout the NULL
   transition; afterward `finish_teardown` publishes a separate stop, counts every returned or queued
@@ -1359,6 +1368,17 @@ failed through the separately resolved media path—but did not prove DNS was th
   `29604363069`, job `87963920779`, passed the unchanged 498-target closure and packaged probe. Its
   fixed diagnostic does not prove that incomplete-header teardown caused the failed attempt. This
   adds neither a retry nor a weakened semantic-failure policy.
+  A later local
+  `x86_64-pc-windows-gnullvm` run reached the singleton Soup inspection and exposed a caller-path
+  regression before the probe: the relative distribution existed beneath PowerShell's `$PWD`, but
+  `Path.GetFullPath` used the unchanged process working directory and produced an absolute path to
+  a nonexistent DLL. The follow-up canonicalizes the created distribution with `Resolve-Path` and
+  retains its physical `ProviderPath` before any PE target is formed. A cross-platform contract
+  test pins that ordering, while a live PowerShell regression (when PowerShell is installed)
+  separates process cwd from a repository `$PWD` containing spaces and proves a custom FileSystem
+  PSDrive resolves to the same absolute, existing physical tree rather than leaking a drive name
+  that only PowerShell understands. This is a repair to the checked packaging implementation, not
+  a new checklist closure.
 - [ ] Record live playback from a packaged Windows artifact against the reported DAAP and Subsonic
   servers, including catalogue connection, protected-media startup, audible playback, and useful
   URL-free failure diagnostics if either server cannot play. The automated package probe cannot
@@ -1540,7 +1560,7 @@ PR #94's containerized Flatpak build proved the manifest-local source generation
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
 
-Current PR #114 follow-up validation (2026-07-17, P2.11 packaged-probe teardown hardening):
+Most recent accepted validation (2026-07-17, PR #114 P2.11 packaged-probe teardown hardening):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature
 Clippy, and `cargo test --all-targets --all-features --locked` pass in debug and release. Each full
 test profile passes 18 library, 731 application, and 10 repository-metadata tests (759 total), and
@@ -1572,8 +1592,22 @@ malformed fixture now half-closes its completed request before response drain to
 deterministic. Final static run 29613604485 and complete matrix 29613606936 passed every job,
 including all 718 x86_64 Windows application tests and both native finished-distribution probes.
 No actionable automated review thread remains; Gemini posted only its service-sunset notice.
+Current local branch validation (2026-07-17, P2.11 Windows distribution-path follow-up): the
+PowerShell helper parses without AST errors; strict all-target/all-feature Clippy passes in debug
+and release; and `cargo test --all-targets --all-features --locked` passes in debug and release.
+Each profile passes 18 library, 733 application, and 10 repository-metadata tests (761 total),
+including all 30 focused platform-runtime tests. The two net-new path regressions also pass
+independently. One static contract retains caller-relative
+`dist\tributary-windows` creation and requires physical-provider canonicalization before singleton
+Soup import inspection. The executable regression changes PowerShell `$PWD` to a repository path
+containing spaces while leaving the process working directory elsewhere, reproduces the old
+divergent `Path.GetFullPath` result, and proves the fixed path is absolute and existing. It then
+mounts that repository beneath a custom FileSystem PSDrive and proves `ProviderPath`, rather than
+the provider-only drive-qualified `Path`, reaches the same physical directory. Formatting and
+`git diff --check` pass. No dependency or lockfile changed, no checklist box moved, and native
+Windows bundle execution remains required in PR CI.
 
-Most recent accepted validation (2026-07-17, PR #112 P2.10 exclusive-control slice):
+Earlier accepted validation (2026-07-17, PR #112 P2.10 exclusive-control slice):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature
 Clippy, and `cargo test --all-targets --all-features --locked` pass in debug and release. Each full
 profile passes 18 library, 727 application, and 10 repository-metadata tests (755 total); all 83
@@ -1594,7 +1628,7 @@ CodeQL and all three static-analysis jobs passed; final Codex review of `91536ab
 issues after both earlier findings were fixed and resolved. P2.10 is complete at 198/223 overall
 and 76/79 P2; P3.5's exact-toolchain acceptance remains recorded by PR #111.
 
-Most recent accepted validation (2026-07-17, P3.2 stable-local-aggregate slice in PR #114):
+Accepted validation (same PR #114, P3.2 stable-local-aggregate slice):
 `cargo check --all-targets --all-features --locked`, strict
 `cargo clippy --all-targets --all-features --locked -- -D warnings`,
 `cargo fmt --all -- --check`, and `git diff --check` pass. Four focused SQLite backend tests cover
@@ -2316,7 +2350,7 @@ Record scope or design decisions here so deferred work is explicit.
   failure. A PR #112 ARM64 package attempt completed the same 498-target dependency closure and then
   reported only the probe's fixed loopback-server failure; a same-source main run passed the
   unchanged packaged probe. That evidence shows a transient result but cannot prove its root cause.
-  The pending follow-up therefore hardens one plausible race without retrying or broadening success:
+  PR #114 therefore hardens one plausible race without retrying or broadening success:
   production publishes cancellation before moving GStreamer to NULL but keeps both listeners live;
   final stop is separate and drains/counts queued accepts before join. Only an already-accepted
   incomplete-header EOF, connection-aborted, or connection-reset result may cancel once that phase
@@ -2324,6 +2358,18 @@ Record scope or design decisions here so deferred work is explicit.
   failure remain fatal regardless of teardown, while poison observation covers the entire NULL
   transition. Deterministic listener regressions preserve both sides and the observation window;
   P2.11 checklist arithmetic is unchanged.
+- 2026-07-17 — P2.11 resolves the completed Windows distribution through PowerShell's filesystem
+  provider before using `.NET` path APIs. PowerShell's provider-relative commands follow `$PWD`,
+  but `Environment.CurrentDirectory` remains at the process launch directory after `Set-Location`;
+  therefore `Test-Path dist\...\libgstsoup.dll` could succeed immediately before
+  `Path.GetFullPath` named a different, nonexistent tree. Retaining the caller-relative dist name
+  preserves local and CI output layout, while canonicalizing it immediately after creation gives
+  the Soup singleton, every copied plugin, the scanner, and all recursively copied runtimes one
+  absolute distribution root. `Resolve-Path -LiteralPath` is Windows PowerShell 5.1-compatible;
+  selecting its physical `ProviderPath` treats spaces as path data and prevents a custom FileSystem
+  PSDrive name from reaching `.NET` or an external executable. This fixes entry into the
+  already-required packaged probe and does not substitute for the open live DAAP/Subsonic playback
+  evidence.
 - 2026-07-15 — P2.11 treats repeated DAAP and Subsonic failures at exactly GStreamer's 15-second
   HTTP-source timeout as a shared protected-playback defect, not a protocol-authentication defect.
   The opaque loopback boundary remains necessary: handing backend requests directly to GStreamer
@@ -2415,5 +2461,6 @@ Add one line per completed task:
 | 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
 | 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Native x86_64 and ARM64 CI both prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
 | 2026-07-17 | P3.1 source identity/lifecycle architecture | PR #113 | Records location-independent `(SourceId, TrackId)` media identity, an exact legacy-array-to-versioned-envelope saved-source migration with atomic replacement and fail-closed conflict quarantine, one registry-owned operation/session lifecycle, deterministic per-view radio locator ownership, playback-time locator resolution, exactly-once DAAP retirement, adapter-specific rules for every source kind, and staged completion tests. This closes only the two architecture decision boxes; runtime migration remains open. Independent review found and resolved two design ambiguities before the full exact-toolchain/native/package matrix passed in runs 29605029668 and 29605032344. |
-| 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the implementation-head exact-toolchain/native/package matrix passed. A documentation rerun exposed and fixed a pre-existing terminal MPD enqueue/wake race; its replacement matrix remains pending. The common `LocalBackend` integration seam, invalid persisted `TrackId` fallback, and final P3.2 record remain open. |
+| 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the implementation-head exact-toolchain/native/package matrix passed. A documentation rerun exposed and fixed a pre-existing terminal MPD enqueue/wake race; replacement static run 29614521885 and complete matrix 29614525132 passed every job. The common `LocalBackend` integration seam, invalid persisted `TrackId` fallback, and final P3.2 record remain open. |
 | 2026-07-17 | P2.11 packaged-probe teardown hardening (follow-up) | PR #114 | Separates pre-NULL cancellation from final listener stop, keeps poison observation live through NULL, and drains/counts queued accepts before join. Only narrowly classified incomplete-header EOF/reset/abort outcomes may cancel; semantic request, accept, and response-write failures remain fatal even during teardown. Four Windows tests pin classification, synchronized clean-versus-malformed behavior, and the accepted/queued poison window. x86_64 runs the unit tests, while ARM64 compiles the code and executes the production probe during packaging. This hardens the already-complete packaged proof and leaves checklist arithmetic unchanged. |
+| 2026-07-17 | P2.11 Windows distribution-path repair (follow-up) | PR #115 | Resolves the caller-relative bundle immediately after creation through PowerShell's FileSystem provider and retains its physical `ProviderPath`, preventing `.NET` PE inspection from using a stale process working directory and preventing custom PSDrive names from escaping into native tools. Static ordering and live PowerShell regressions cover a changed `$PWD`, repository spaces, and custom FileSystem PSDrives. Full debug/release suites pass 761 tests per profile, all 30 focused platform-runtime tests pass in both profiles, and strict Clippy is clean; the live packaged DAAP/Subsonic playback box remains open, so checklist arithmetic is unchanged. |
