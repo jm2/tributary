@@ -219,7 +219,7 @@ pub fn update_album_art(image: &gtk::Image, uri: &str) {
             if !generation_is_current(generation) {
                 return;
             }
-            let bytes = glib::Bytes::from(&data);
+            let bytes = glib::Bytes::from_owned(data);
             if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
                 image.set_paintable(Some(&texture));
             }
@@ -510,6 +510,28 @@ fn build_resolved_art_request(
 fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, generation: u64) {
     let image = image.clone();
 
+    let reply_rx = enqueue_art_request(source, generation);
+
+    // Receive on the GTK main thread.
+    glib::MainContext::default().spawn_local(async move {
+        if let Ok(data) = reply_rx.recv().await {
+            // Double-check generation in case another track was selected
+            // while we were waiting for the channel.
+            if generation_is_current(generation) {
+                let bytes = glib::Bytes::from_owned(data);
+                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
+                    image.set_paintable(Some(&texture));
+                }
+            }
+        }
+    });
+}
+
+/// Submit one request through the production persistent worker and return its
+/// one-shot completion. Keeping this GTK-independent makes the full
+/// request/fetch/generation boundary deterministic under headless CI; the UI
+/// callback above adds the final generation check before mutating the widget.
+fn enqueue_art_request(source: ArtSource, generation: u64) -> async_channel::Receiver<Vec<u8>> {
     let (reply_tx, reply_rx) = async_channel::bounded::<Vec<u8>>(1);
 
     // Send the request to the persistent art worker thread.
@@ -526,19 +548,7 @@ fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, generation: u
         });
     }
 
-    // Receive on the GTK main thread.
-    glib::MainContext::default().spawn_local(async move {
-        if let Ok(data) = reply_rx.recv().await {
-            // Double-check generation in case another track was selected
-            // while we were waiting for the channel.
-            if generation_is_current(generation) {
-                let bytes = glib::Bytes::from(&data);
-                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
-                    image.set_paintable(Some(&texture));
-                }
-            }
-        }
-    });
+    reply_rx
 }
 
 #[cfg(test)]
@@ -546,15 +556,102 @@ mod generation_tests {
     use super::*;
 
     use reqwest::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION};
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::sync::{mpsc, Mutex};
+    use std::time::Duration;
+
+    static GENERATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn spawn_art_fixture(
+        body: &'static [u8],
+        before_response: impl FnOnce() + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind artwork fixture");
+        let address = listener.local_addr().expect("artwork fixture address");
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept artwork request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set artwork fixture read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("set artwork fixture write timeout");
+
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                assert_eq!(stream.read(&mut byte).expect("read artwork request"), 1);
+                request.push(byte[0]);
+                assert!(request.len() <= 16 * 1024, "artwork request header cap");
+            }
+            assert!(request.starts_with(b"GET /art HTTP/1.1\r\n"));
+
+            before_response();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .expect("write artwork response headers");
+            stream.write_all(body).expect("write artwork response body");
+        });
+        (format!("http://{address}/art"), thread)
+    }
 
     #[test]
     fn reset_invalidates_local_and_remote_artwork_results() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stale_generation = next_generation();
         assert!(generation_is_current(stale_generation));
 
         invalidate();
 
         assert!(!generation_is_current(stale_generation));
+    }
+
+    #[test]
+    fn delayed_worker_result_cannot_cross_a_newer_artwork_generation() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (request_seen_tx, request_seen_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (stale_url, stale_server) = spawn_art_fixture(b"stale-art", move || {
+            request_seen_tx.send(()).expect("report delayed request");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release delayed response");
+        });
+        let (current_url, current_server) = spawn_art_fixture(b"current-art", || {});
+
+        let stale_generation = next_generation();
+        let stale_reply = enqueue_art_request(ArtSource::Url(stale_url), stale_generation);
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("production worker started delayed request");
+
+        let current_generation = next_generation();
+        let current_reply = enqueue_art_request(ArtSource::Url(current_url), current_generation);
+        release_tx.send(()).expect("release stale response");
+
+        assert!(
+            stale_reply.recv_blocking().is_err(),
+            "the worker must close a stale request without publishing its bytes"
+        );
+        assert_eq!(
+            current_reply
+                .recv_blocking()
+                .expect("current artwork bytes"),
+            b"current-art"
+        );
+        assert!(generation_is_current(current_generation));
+
+        stale_server.join().expect("join delayed artwork fixture");
+        current_server.join().expect("join current artwork fixture");
     }
 
     #[test]

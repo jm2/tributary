@@ -1558,8 +1558,10 @@ fn enumerate_device_audio_files(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
 
     use url::Url;
 
@@ -1568,10 +1570,30 @@ mod tests {
     use crate::local::engine::LibraryEvent;
 
     use super::{
-        enumerate_device_audio_files, prepare_remote_auth_submission, remote_failure_category,
-        resolve_source_key, signal_passwordless_daap_failure, PendingConnection,
-        RemoteFailureCategory, SourceNavigation,
+        cache_source_completion, enumerate_device_audio_files, evict_source_completion,
+        prepare_remote_auth_submission, remote_failure_category, resolve_source_key,
+        signal_passwordless_daap_failure, PendingConnection, RemoteFailureCategory,
+        SourceNavigation, TrackObject,
     };
+
+    fn projected_track(label: &str) -> TrackObject {
+        TrackObject::new(
+            1,
+            label,
+            60,
+            "Fixture Artist",
+            "Fixture Album",
+            "Fixture Genre",
+            "",
+            2026,
+            "2026-07-17",
+            320,
+            48_000,
+            0,
+            "flac",
+            &format!("file:///fixture/{label}.flac"),
+        )
+    }
 
     #[test]
     fn explicit_source_identity_precedes_legacy_fallbacks() {
@@ -1586,6 +1608,56 @@ mod tests {
         assert_eq!(resolve_source_key("", "", "radio-topvote"), "radio-topvote");
         assert_eq!(resolve_source_key("", "", "local"), "local");
         assert_eq!(resolve_source_key("", "", ""), "local");
+    }
+
+    #[test]
+    fn production_completion_boundary_rejects_reversed_source_results() {
+        let navigation = Rc::new(RefCell::new(SourceNavigation::new("local")));
+        let source_tracks = Rc::new(RefCell::new(HashMap::new()));
+        let active_source_key = Rc::new(RefCell::new("local".to_string()));
+
+        let stale = navigation.borrow_mut().select("playlist:fixture");
+        navigation.borrow_mut().select("local");
+        let current = navigation.borrow_mut().select("playlist:fixture");
+        *active_source_key.borrow_mut() = "playlist:fixture".to_string();
+
+        assert!(cache_source_completion(
+            &navigation,
+            &current,
+            &source_tracks,
+            &[projected_track("current")],
+            &active_source_key,
+        ));
+        assert!(!cache_source_completion(
+            &navigation,
+            &stale,
+            &source_tracks,
+            &[projected_track("stale")],
+            &active_source_key,
+        ));
+        assert!(
+            !evict_source_completion(&navigation, &stale, &source_tracks, &active_source_key,),
+            "a stale missing-result callback must not evict the newer projection"
+        );
+        assert_eq!(
+            source_tracks.borrow()["playlist:fixture"][0].title(),
+            "current"
+        );
+
+        let background = navigation.borrow_mut().select("radio-topvote");
+        navigation.borrow_mut().select("local");
+        *active_source_key.borrow_mut() = "local".to_string();
+        assert!(!cache_source_completion(
+            &navigation,
+            &background,
+            &source_tracks,
+            &[projected_track("background")],
+            &active_source_key,
+        ));
+        assert_eq!(
+            source_tracks.borrow()["radio-topvote"][0].title(),
+            "background"
+        );
     }
 
     #[tokio::test]

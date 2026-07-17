@@ -31,6 +31,12 @@ const WORKER_TICK_MS: u64 = 100;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
+/// Cast V2 carries small protobuf control messages, never media payloads.
+///
+/// Keep a deliberately generous 1 MiB ceiling while rejecting a peer's
+/// advertised length before `rust_cast` can allocate from it. The upstream
+/// manager otherwise accepts the complete unsigned 32-bit range.
+const MAX_CAST_FRAME_BYTES: u32 = 1024 * 1024;
 
 const CAST_SENDER_ID: &str = "sender-0";
 const CAST_RECEIVER_ID: &str = "receiver-0";
@@ -223,7 +229,8 @@ struct RustCastConnector {
     timeouts: CastIoTimeouts,
 }
 
-type CastIo = rustls::StreamOwned<rustls::ClientConnection, DeadlineTcpStream>;
+type CastTlsStream = rustls::StreamOwned<rustls::ClientConnection, DeadlineTcpStream>;
+type CastIo = BoundedCastStream<CastTlsStream>;
 
 struct RustCastTransport {
     connection: rust_cast::channels::connection::ConnectionChannel<'static, CastIo>,
@@ -329,6 +336,141 @@ impl Write for DeadlineTcpStream {
     }
 }
 
+/// Plaintext Cast framing guard installed immediately above the TLS stream.
+///
+/// `rust_cast 0.21` reads a four-byte big-endian frame length and immediately
+/// calls `Vec::with_capacity(length)`. This adapter withholds that header until
+/// all four bytes have been received and the advertised length is within
+/// [`MAX_CAST_FRAME_BYTES`]. Accepted headers and payload bytes are then
+/// delivered unchanged. Tracking the remaining payload also makes a truncated
+/// frame an I/O error instead of allowing its bytes to be parsed as a complete
+/// message or the next frame header.
+struct BoundedCastStream<S> {
+    inner: S,
+    header: [u8; 4],
+    header_filled: usize,
+    header_delivered: usize,
+    payload_remaining: Option<u32>,
+    poisoned: bool,
+}
+
+impl<S> BoundedCastStream<S> {
+    const fn new(inner: S) -> Self {
+        Self {
+            inner,
+            header: [0; 4],
+            header_filled: 0,
+            header_delivered: 0,
+            payload_remaining: None,
+            poisoned: false,
+        }
+    }
+
+    fn reset_for_header(&mut self) {
+        self.header = [0; 4];
+        self.header_filled = 0;
+        self.header_delivered = 0;
+        self.payload_remaining = None;
+    }
+
+    fn framing_error(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, message)
+    }
+}
+
+impl<S: Read> Read for BoundedCastStream<S> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.poisoned {
+            return Err(Self::framing_error("Cast frame stream is desynchronized"));
+        }
+
+        loop {
+            if let Some(remaining) = self.payload_remaining {
+                if self.header_delivered < self.header.len() {
+                    let available = &self.header[self.header_delivered..];
+                    let copied = available.len().min(output.len());
+                    output[..copied].copy_from_slice(&available[..copied]);
+                    self.header_delivered += copied;
+                    return Ok(copied);
+                }
+
+                if remaining == 0 {
+                    self.reset_for_header();
+                    continue;
+                }
+
+                let allowed = usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(output.len());
+                let read_count = self.inner.read(&mut output[..allowed])?;
+                if read_count == 0 {
+                    self.poisoned = true;
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Cast frame ended before its advertised length",
+                    ));
+                }
+                let Ok(read) = u32::try_from(read_count) else {
+                    self.poisoned = true;
+                    return Err(Self::framing_error(
+                        "Cast frame reader exceeded the validated payload bound",
+                    ));
+                };
+                let Some(remaining) = remaining.checked_sub(read) else {
+                    self.poisoned = true;
+                    return Err(Self::framing_error(
+                        "Cast frame reader exceeded the advertised payload length",
+                    ));
+                };
+                self.payload_remaining = Some(remaining);
+                return Ok(read_count);
+            }
+
+            while self.header_filled < self.header.len() {
+                let read = self.inner.read(&mut self.header[self.header_filled..])?;
+                if read == 0 {
+                    if self.header_filled == 0 {
+                        return Ok(0);
+                    }
+                    self.poisoned = true;
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Cast frame ended inside its length header",
+                    ));
+                }
+                self.header_filled += read;
+            }
+
+            let advertised = u32::from_be_bytes(self.header);
+            if advertised > MAX_CAST_FRAME_BYTES {
+                self.poisoned = true;
+                return Err(Self::framing_error(
+                    "Cast frame exceeds the inbound control-message limit",
+                ));
+            }
+            self.header_delivered = 0;
+            self.payload_remaining = Some(advertised);
+        }
+    }
+}
+
+impl<S: Write> Write for BoundedCastStream<S> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        self.inner.write_vectored(buffers)
+    }
+}
+
 impl CastConnector for RustCastConnector {
     type Transport = RustCastTransport;
 
@@ -362,6 +504,10 @@ impl CastConnector for RustCastConnector {
                 deadline: Rc::clone(&deadline),
             },
         );
+        // Guard the decrypted Cast framing, not the encrypted TCP records, so
+        // the peer's advertised protobuf length is rejected before rust_cast
+        // sees the header and allocates its receive buffer.
+        let stream = BoundedCastStream::new(stream);
         let manager = Rc::new(rust_cast::message_manager::MessageManager::new(stream));
         let connection = rust_cast::channels::connection::ConnectionChannel::new(
             CAST_SENDER_ID,
@@ -1973,7 +2119,214 @@ fn guess_content_type(uri: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use rust_cast::message_manager::{CastMessage, CastMessagePayload, MessageManager};
+
     use super::*;
+
+    const TEST_CAST_NAMESPACE: &str = "urn:x-cast:tributary.test";
+
+    struct ObservedCastIo {
+        input: std::io::Cursor<Vec<u8>>,
+        max_read: usize,
+        forbid_read_at: Option<usize>,
+        forbidden_read: Arc<AtomicBool>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl ObservedCastIo {
+        fn reader(input: Vec<u8>, max_read: usize) -> Self {
+            Self {
+                input: std::io::Cursor::new(input),
+                max_read: max_read.max(1),
+                forbid_read_at: None,
+                forbidden_read: Arc::new(AtomicBool::new(false)),
+                written: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn oversized_peer(
+            input: Vec<u8>,
+            forbidden_read: Arc<AtomicBool>,
+            written: Arc<Mutex<Vec<u8>>>,
+        ) -> Self {
+            Self {
+                input: std::io::Cursor::new(input),
+                max_read: usize::MAX,
+                forbid_read_at: Some(4),
+                forbidden_read,
+                written,
+            }
+        }
+
+        fn writer(written: Arc<Mutex<Vec<u8>>>) -> Self {
+            Self {
+                input: std::io::Cursor::new(Vec::new()),
+                max_read: usize::MAX,
+                forbid_read_at: None,
+                forbidden_read: Arc::new(AtomicBool::new(false)),
+                written,
+            }
+        }
+    }
+
+    impl Read for ObservedCastIo {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let position = usize::try_from(self.input.position()).unwrap_or(usize::MAX);
+            if self
+                .forbid_read_at
+                .is_some_and(|forbidden| position >= forbidden)
+            {
+                self.forbidden_read.store(true, Ordering::SeqCst);
+                return Err(io::Error::other(
+                    "test peer payload was read after a rejected Cast header",
+                ));
+            }
+
+            let before_forbidden = self
+                .forbid_read_at
+                .map_or(usize::MAX, |forbidden| forbidden.saturating_sub(position));
+            let allowed = output.len().min(self.max_read).min(before_forbidden);
+            self.input.read(&mut output[..allowed])
+        }
+    }
+
+    impl Write for ObservedCastIo {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.written
+                .lock()
+                .expect("test Cast write lock")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn encode_cast_frame(payload: CastMessagePayload) -> Vec<u8> {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let stream = BoundedCastStream::new(ObservedCastIo::writer(Arc::clone(&written)));
+        MessageManager::new(stream)
+            .send(CastMessage {
+                namespace: TEST_CAST_NAMESPACE.to_string(),
+                source: CAST_RECEIVER_ID.to_string(),
+                destination: CAST_SENDER_ID.to_string(),
+                payload,
+            })
+            .expect("encode test Cast frame through the real message manager");
+
+        let frame = written.lock().expect("test Cast write lock").clone();
+        assert!(frame.len() >= 4);
+        assert_eq!(
+            usize::try_from(u32::from_be_bytes(frame[..4].try_into().unwrap())).unwrap(),
+            frame.len() - 4
+        );
+        frame
+    }
+
+    fn binary_frame_with_serialized_length(target: usize) -> (Vec<u8>, usize) {
+        let mut payload_len = target;
+        for _ in 0..8 {
+            let frame = encode_cast_frame(CastMessagePayload::Binary(vec![0x5a; payload_len]));
+            let serialized_len = frame.len() - 4;
+            match serialized_len.cmp(&target) {
+                std::cmp::Ordering::Equal => return (frame, payload_len),
+                std::cmp::Ordering::Greater => {
+                    payload_len = payload_len
+                        .checked_sub(serialized_len - target)
+                        .expect("test Cast envelope must fit below the frame limit");
+                }
+                std::cmp::Ordering::Less => payload_len += target - serialized_len,
+            }
+        }
+        panic!("could not construct an exact-boundary Cast frame");
+    }
+
+    #[test]
+    fn oversized_peer_frame_is_rejected_before_payload_read_or_allocation() {
+        let forbidden_read = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut input = (MAX_CAST_FRAME_BYTES + 1).to_be_bytes().to_vec();
+        input.push(0x5a);
+        let stream = BoundedCastStream::new(ObservedCastIo::oversized_peer(
+            input,
+            Arc::clone(&forbidden_read),
+            written,
+        ));
+
+        let error = MessageManager::new(stream)
+            .receive()
+            .expect_err("oversized Cast header must fail before rust_cast allocates");
+
+        assert!(matches!(
+            error,
+            rust_cast::errors::Error::Io(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert!(!forbidden_read.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn exact_maximum_cast_frame_is_accepted_by_the_real_message_manager() {
+        let target = usize::try_from(MAX_CAST_FRAME_BYTES).unwrap();
+        let (frame, payload_len) = binary_frame_with_serialized_length(target);
+        let stream = BoundedCastStream::new(ObservedCastIo::reader(frame, 8192));
+
+        let message = MessageManager::new(stream)
+            .receive()
+            .expect("the exact Cast frame limit remains usable");
+
+        assert!(matches!(
+            message.payload,
+            CastMessagePayload::Binary(payload) if payload.len() == payload_len
+        ));
+    }
+
+    #[test]
+    fn truncated_cast_headers_and_payloads_fail_closed() {
+        let header_stream = BoundedCastStream::new(ObservedCastIo::reader(vec![0, 0, 0], 1));
+        let header_error = MessageManager::new(header_stream)
+            .receive()
+            .expect_err("partial Cast frame header must fail");
+        assert!(matches!(
+            header_error,
+            rust_cast::errors::Error::Io(error)
+                if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        let mut payload_frame = encode_cast_frame(CastMessagePayload::String("truncated".into()));
+        payload_frame.pop();
+        let payload_stream = BoundedCastStream::new(ObservedCastIo::reader(payload_frame, 2));
+        let payload_error = MessageManager::new(payload_stream)
+            .receive()
+            .expect_err("partial Cast frame payload must fail");
+        assert!(matches!(
+            payload_error,
+            rust_cast::errors::Error::Io(error)
+                if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn consecutive_cast_frames_reset_framing_and_preserve_writes() {
+        let first = encode_cast_frame(CastMessagePayload::String("first".into()));
+        let second = encode_cast_frame(CastMessagePayload::String("second".into()));
+        let mut input = first;
+        input.extend_from_slice(&second);
+        let stream = BoundedCastStream::new(ObservedCastIo::reader(input, 1));
+        let manager = MessageManager::new(stream);
+
+        assert!(matches!(
+            manager.receive().expect("receive first Cast frame").payload,
+            CastMessagePayload::String(payload) if payload == "first"
+        ));
+        assert!(matches!(
+            manager.receive().expect("receive second Cast frame").payload,
+            CastMessagePayload::String(payload) if payload == "second"
+        ));
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Point {

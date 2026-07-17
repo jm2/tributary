@@ -31,8 +31,8 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**209/223 (93.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
-and **19/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**216/223 (96.9%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
+and **26/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -140,6 +140,17 @@ induce the catalogue failure itself. The source-lifecycle decision's historical 
 note and README now describe this shipped seam without overstating broader lifecycle convergence.
 Together with PR #114's aggregate identity, grouping, and by-ID methods, this closes P3.2's final
 two boxes and advances the literal count to **205/223 (91.9%)**.
+PR #119 combines the independently reviewed P3.4 slices and closes all seven boxes. It covers the
+production list-item action across recycling, immutable playback queues across sorted/filtered and
+replaced projections, transactional output transfer/reselection, the established 83-test MPD and
+delayed/adversarial Chromecast harnesses with a pre-allocation 1 MiB Cast frame cap, stale artwork
+and source-result generations, and pointer-free context-menu/slider accessibility in all 13
+catalogs. The final review also made wrong-type parked-output restoration fail before any playback
+mutation and proved the active output, queue, and generation remain unchanged.
+After rebasing over accepted PRs #117 and #118, the complete branch passes 20 library, 767
+application, and 10 repository-metadata tests (797) in both debug and release plus strict Clippy in
+both profiles. P3.4 is complete, advancing the literal total to **216/223 (96.9%)** and P3 to
+**26/30** without changing P0–P2.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1089,13 +1100,13 @@ sandbox-permission implementation; real-hardware validation is still outstanding
   supersession, and discovery regressions. Debug and release full suites each pass 18 library, 674
   application, and 8 repository-metadata tests (700 total per profile).
 
-Residual receiver-trust boundary: upstream `rust_cast 0.21` reads the peer-supplied unsigned
-32-bit Cast frame length and immediately calls `Vec::with_capacity(length as usize)` before
-reading or bounding the payload. The I/O deadlines prevent a silent or byte-trickling peer from
-hanging the worker, but a malicious or broken receiver can still provoke an allocation attempt
-approaching 4 GiB. A pre-allocation cap needs an upstream change or narrowly audited framing
-layer; that adversarial proof is retained in P3.4 rather than overstated as part of this deadline
-milestone.
+P3.4 follow-up closure (2026-07-17): P2.8 correctly left the peer-sized allocation outside its
+deadline milestone because `rust_cast 0.21` reads the unsigned 32-bit length and immediately calls
+`Vec::with_capacity(length as usize)`. The focused P3.4 slice now installs a narrowly scoped
+plaintext framing guard between rustls and `rust_cast`: it withholds the complete four-byte header,
+rejects an advertised payload above 1 MiB before upstream can observe the header or allocate, and
+tracks an accepted payload to fail closed on truncation. The P2.8 deadline and session-retirement
+behavior remains unchanged; the completed compound P3.4 harness item records the adversarial proof.
 
 ### P2.9 Repair the AirPlay fallback path
 
@@ -1592,18 +1603,87 @@ now-complete representative cross-service behavior matrix.
 Completion-branch validation: debug and release each pass 20 library, 757 application, and 10
 repository-metadata tests (787 per profile); strict all-target/all-feature Clippy passes in both
 profiles; formatting and whitespace checks pass. The behavior matrix adds 12 tests to the accepted
-service/DAAP foundation and is stacked on its PR #117 head pending publication.
+service/DAAP foundation and was accepted in PR #118 after rebasing onto PR #117.
 
 ### P3.4 Add UI/output integration harnesses
 
-- [ ] Cover GTK list-item recycling and stale callback prevention.
-- [ ] Cover playback-session behavior across sorting/filtering/navigation.
-- [ ] Cover output transfer and reselect semantics.
-- [ ] Cover fake MPD and delayed/adversarial Chromecast state machines, including a cap applied
-  before allocating from a peer-advertised Cast frame length.
-- [ ] Cover stale album-art and source-result generations.
-- [ ] Add keyboard context-menu and slider accessibility checks.
-- [ ] Record implementation: _pending_
+- [x] Cover GTK list-item recycling and stale callback prevention. Each sidebar row installs one
+  parameterized `GAction` during factory setup. `bind` replaces its immutable `(kind, source)`
+  target and `unbind` installs a no-authority target before hiding the button, so neither signal
+  accumulation nor a captured prior `SourceObject` can survive recycling. A display-independent
+  harness activates that exact production action across repeated manual-source binds, explicit
+  unbind, connecting/no-action state, a different connected DAAP source, and the Playlists header;
+  it proves one exact delete, disconnect, or menu action and no historical callback on each step.
+- [x] Cover playback-session behavior across sorting/filtering/navigation. Queue capture now has
+  one production `ListModel` boundary shared by every track-list start. Direct initial, Next,
+  Previous, EOS replay, and rejected-load retry take the URI from the session's current immutable
+  queue item, assign a fresh output-event generation, and retain a synchronously rejected item for
+  a newer retry. The headless harness captures local A/B/C at B, replaces the live projection with
+  descending C/B/A, filters B out, then navigates the projection to a remote source. It drives the
+  real session/output seam through B→C→B and proves identity remains local, the first B event is
+  stale after Next, the remote projection never retargets Previous, and Stop clears ownership
+  before invoking the output.
+- [x] Cover output transfer and reselect semantics. Output selection is now one validated slot
+  transaction: exact endpoint reselection returns before queue, generation, output, or parking
+  mutation; a real change validates the replacement's output type and the invariant that Local is
+  parked only while a remote target is active, clears session ownership before Stop, parks the
+  exact Local output, drops a displaced remote output, and restores Local without the former dummy
+  MPD worker. The fake-output harness proves current identity and generation survive reselection,
+  a Local→MPD transition rejects a stale Local event, a refused remote current-item load retries
+  the same URI under a newer generation, MPD→Chromecast stops/drops the displaced remote while
+  retaining parked Local, Chromecast→Local restores that exact instance, and a mismatched
+  replacement or wrong-type parked slot preserves the active output and queue unchanged.
+- [x] Cover fake MPD and delayed/adversarial Chromecast state machines, including a cap applied
+  before allocating from a peer-advertised Cast frame length. The existing 83-test MPD harness
+  covers its ordered worker, ownership and targeted cleanup, held-ACK FIFO behavior, bounded and
+  cancellable resolution, slow-greeting address fallback, real IPv6, protocol bounds, terminal
+  proof, stale generations, and poisoned-session retirement. The existing delayed/fake/real-peer
+  Chromecast harness plus this slice totals 42 focused tests and covers ordered effects, stale
+  intents, synchronized cleanup, semantic and poisoned failures, silent TLS peers, absolute
+  trickle deadlines, Stop/replacement/Shutdown progress, protected request containment, and frame
+  adversaries. A framing-aware `Read + Write` adapter now sits above the worker-local rustls stream
+  and below the real `rust_cast 0.21` `MessageManager`. It buffers the complete big-endian header,
+  rejects lengths above 1 MiB before exposing any header byte to upstream's
+  `Vec::with_capacity(length)` path, passes accepted bytes and all writes through unchanged,
+  enforces the accepted payload boundary, and resets only after that exact payload completes. Four
+  real-manager regressions prove an oversized header is rejected without reading its sentinel
+  payload, an exactly 1 MiB valid protobuf frame is accepted, partial headers and payloads fail
+  with `UnexpectedEof`, and fragmented consecutive frames reset correctly while manager writes
+  retain their framing. The cap is deliberately generous because Cast V2 carries protobuf control
+  messages rather than media bytes.
+- [x] Cover stale album-art and source-result generations. A bounded real-HTTP fixture pauses the
+  first request after the persistent production artwork worker has accepted it, queues a second
+  generation, then releases the old response. The old completion channel closes without bytes and
+  only the current body crosses the worker boundary; the existing GTK callback repeats the same
+  generation check before texture publication. A second harness drives the production source
+  cache/eviction boundary with reversed same-key completion order, proving a stale loaded or
+  missing result cannot replace or remove the newer projection, while the newest result for an
+  inactive source is cached without rendering. Accepted owned image buffers are transferred into
+  `glib::Bytes` without copying them a second time.
+- [x] Add keyboard context-menu and slider accessibility checks. This slice routes unmodified Menu
+  and exact Shift+F10 through the right-click selection snapshot, consumes
+  only a shortcut that opens a non-empty menu, exposes `has-popup` plus the standardized
+  `Shift+F10 ContextMenu` property on the track list, and explicitly labels and orients the position
+  and volume sliders in all 13 catalogs. A production-consumed interaction plan pins the bubbling
+  key controller, empty/non-empty propagation, immutable post-popup selection snapshot, and
+  popover-scoped action ownership. Focused tests reject Shift+Menu, plain F10, and unrelated
+  chords, ignore ambient CapsLock and legacy NumLock/Mod2 state, exercise that complete plan, and
+  parse each YAML catalog to prove both keys exist rather than mistaking an English fallback for a
+  valid translation.
+- [x] Record implementation: PR #119. The final lifecycle slice adds
+  two net-new application tests (three focused integration tests after replacing the old pure
+  output-decision assertion) and completes the production-boundary evidence recorded below. With
+  the earlier recycling, MPD/Chromecast, stale-result, and accessibility slices, all seven P3.4
+  checklist items are complete.
+
+The checked accessibility slice deliberately relies on `GtkScale` for slider focus, arrow/Page
+Up/Page Down/Home/End behavior, role, current value, and range, then supplies the application-owned
+localized name and horizontal orientation. The context menu retains one action group on the
+one-shot popover rather than on the long-lived list, so closing it releases the captured selection;
+keyboard activation and pointer activation cannot drift into separate action implementations.
+P3.4 is complete. Its deterministic tests deliberately stop at the headless production boundaries:
+compositor-dependent synthetic key injection, physical receiver behavior, and audible output remain
+installed/manual validation rather than being inferred from unit-process success.
 
 ### P3.5 Make coverage reporting representative
 
@@ -1716,7 +1796,61 @@ macOS, both native Windows builds and finished-distribution probes, packages, an
 CodeQL run 29615866970 passed every analysis. No actionable automated review thread remains;
 Gemini posted only its service-sunset notice.
 
-Current local branch validation (2026-07-17, P3.2 shared-catalogue completion): strict
+Final PR #119 branch validation (2026-07-17, complete P3.4 stack rebased onto PR #118): strict
+all-target/all-feature Clippy and `cargo test --all-targets --all-features --locked` pass in debug
+and release. Each full profile passes 20 library, 767 application, and 10 repository-metadata tests
+(797 total). Three focused lifecycle integration regressions pass directly in debug and in both full
+profiles; they replace one pure output-decision test and add two net-new application tests. The
+playback regression crosses the production `ListModel` capture, immutable queue cursor, direct
+`AudioOutput`, and Stop boundaries while the projection is reordered, filtered, and replaced by a
+different source. It proves exact current identity, B→C→B navigation from the original snapshot,
+per-load generation ownership, stale-event rejection, and clear-before-Stop cleanup without a GTK
+display or device. The output regression crosses the production target/output/session/parked-local
+transaction with recording Local, MPD, and Chromecast outputs. It proves reselection is a complete
+no-op, Local is parked and restored exactly, remote rejection remains retryable under a newer
+generation, remote-to-remote and remote-to-Local transfer clear before Stop and drop the displaced
+output, and a wrong-type replacement cannot mutate current playback. Output construction now uses
+the requested typed target directly
+and no longer creates a throwaway MPD worker merely to move Local into its parked slot. Formatting
+and `git diff --check` pass. Automated review additionally caught and the branch now covers ambient
+NumLock/legacy modifier bits in keyboard-menu matching, and artwork publication transfers its
+owned byte vectors into GLib without an avoidable full-buffer copy. These review fixes changed no
+dependency, lockfile, locale, protocol, schema, package version, packaging, or release-workflow
+file. These last two harness boxes plus the implementation
+record complete P3.4, advancing the literal total to **216/223 (96.9%)** and P3 to **26/30**.
+
+Pre-rebase parent validation (2026-07-17, P3.4 recycled-row/UI-generation slice):
+strict all-target/all-feature Clippy and `cargo test --all-targets --all-features --locked` pass in
+debug and release. Each full profile passes 18 library, 743 application, and 10
+repository-metadata tests (771 total). The three focused production-boundary regressions pass
+directly in debug: the exact row-lifetime `GAction` is driven across repeated bind/unbind targets;
+a synchronized loopback server holds and releases an in-flight persistent-worker artwork fetch
+across a newer request; and reversed same-key loaded/missing results cross the source-cache and
+eviction boundary without altering the newer projection. These replace the old closure-shaped
+sidebar model with the actual production dispatcher and add two net-new tests. The artwork fixture
+uses channel synchronization and bounded socket I/O rather than sleeps or elapsed-time thresholds,
+and the GTK-independent action core runs on every native headless test host. Formatting and
+`git diff --check` pass. No dependency, lockfile, locale, package version, protocol, packaging, or
+release-workflow file changed. Exactly the list-item recycling/stale-callback and stale
+artwork/source-result boxes closed at that staged point. PR #119's final validation and accepted
+aggregate arithmetic supersede this historical stack-local inventory.
+
+Pre-rebase base validation (2026-07-17, combined P3.4 accessibility/Cast slice): strict
+all-target/all-feature Clippy and `cargo test --all-targets --all-features --locked` pass in debug
+and release with two build jobs. Each full profile passes 18 library, 741 application, and 10
+repository-metadata tests (769 total). The six net-new focused regressions also pass directly: two
+pin the accepted/rejected Menu and Shift+F10 interaction plan plus exact slider labels in every
+source YAML catalog, and four exercise the real `rust_cast 0.21` manager at oversized, exact-limit,
+truncated, and consecutive-frame boundaries. Both full profiles include all 83 focused MPD tests
+and all 42 focused Chromecast tests. Independent review found no issue with the intended 1 MiB
+control-frame policy or its pre-allocation, deadline, and poisoned-session boundaries. Formatting
+and `git diff --check` pass. `serde_yaml`, already locked transitively, is now an explicit
+test-only dependency; no production dependency, package version, protocol schema, packaging, or
+release workflow changed. Exactly the keyboard/context-menu/slider accessibility box and the
+compound MPD/Chromecast harness box closed at that staged point. PR #119's final validation and
+accepted aggregate arithmetic supersede this historical stack-local inventory.
+
+Base local branch validation (2026-07-17, P3.2 shared-catalogue completion): strict
 all-target/all-feature Clippy and `cargo test --all-targets --all-features --locked` pass in debug
 and release. Each full profile passes 18 library, 735 application, and 10 repository-metadata tests
 (763 total). The trait-object catalogue spy and paired passwordless-DAAP error/cleanup helper tests
@@ -2033,6 +2167,31 @@ Record scope or design decisions here so deferred work is explicit.
   protocols. A Plex media path appends below the configured base and rejects normalization outside
   it, while a peer's path never enters the fixed error. This evidence closes the matrix and record
   boxes without claiming unsupported alternate-auth modes or every redundant pairing.
+
+- 2026-07-17 — The P3.4 accessibility slice uses GTK's unmodified Menu and exact Shift+F10
+  conventions and the same one-shot, selection-snapshotted popover as right-click. Shift+Menu,
+  plain F10, and unrelated chords propagate. A recognized shortcut also propagates when the view
+  has no usable selection/menu, preventing Tributary from shadowing an ancestor or desktop binding
+  without performing an action. The track list publishes `has-popup` and the standardized
+  `Shift+F10 ContextMenu` token; each scale retains GTK's native slider behavior and publishes a
+  localized name plus horizontal orientation. A production-consumed plan pins controller phase,
+  propagation, immutable selection ownership, popover action scope, and accessible properties;
+  the catalog test parses every source YAML file to distinguish a present translation from a
+  fallback. Compositor-dependent synthetic key injection remains future installed UI smoke
+  coverage.
+
+- 2026-07-17 — P3.4 treats output changes as an explicit clear-and-transfer policy, not seamless
+  migration of loaded media. The selected endpoint is part of output identity; selecting it again
+  is a complete no-op, while selecting another endpoint first validates the concrete output type
+  and Local/parked-slot invariant, invalidates the queue generation, stops the displaced output,
+  then parks/restores the exact Local instance or drops the old remote. An invalid replacement
+  leaves the current target, queue, and output intact. This makes the already-documented P0.4
+  “transfer or clear” choice executable at one boundary and avoids constructing the old throwaway
+  MPD worker merely to move Local. The playback lifecycle harness consumes the same generic
+  `ListModel` interface that production's `SortListModel` presents; it mutates a headless
+  `gio::ListStore` to represent sort, filter, and source-navigation projections because creating a
+  GTK sort model itself requires initialized display state. The assertion remains at the actual
+  queue-capture/direct-output boundary rather than duplicating session rules in a test-only model.
 
 - 2026-07-17 — PR #112 completes P2.10 by requiring an explicit, persisted
   exclusive-control promise rather than pretending MPD offers an ownership lock or conditional
@@ -2356,8 +2515,9 @@ Record scope or design decisions here so deferred work is explicit.
   while a shorter idle cap detects silence promptly. The `Rc` transport stays on its original
   worker rather than crossing threads. A complete Cast rejection leaves framing synchronized and
   permits bounded cleanup; any I/O, TLS, framing, parsing, decoding, or timeout failure drops the
-  connection immediately, including after supersession. Upstream's peer-sized frame allocation
-  remains a separate adversarial-framing follow-up under P3.4.
+  connection immediately, including after supersession. P3.4's 2026-07-17 framing slice later
+  closed the separately tracked peer-sized allocation boundary with a 1 MiB pre-allocation cap
+  above rustls and four regressions through the real `rust_cast` message manager.
 - 2026-07-13 — P1.8 gives MPD one FIFO worker and one persistent TCP session per owned load.
   Stable `addid`/`playid` identity, authoritative status polling, and targeted `deleteid` cleanup
   distinguish explicit Stop and remote errors and detect an observed replacement queue. Loads
@@ -2634,4 +2794,8 @@ Add one line per completed task:
 | 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the implementation-head exact-toolchain/native/package matrix passed. A documentation rerun exposed and fixed a pre-existing terminal MPD enqueue/wake race; replacement static run 29614521885 and complete matrix 29614525132 passed every job. At PR #114 the common `LocalBackend` catalogue seam and final P3.2 record remained open; the completion row below closes both, while invalid persisted `TrackId` repair remains P3.1 work. |
 | 2026-07-17 | P2.11 packaged-probe teardown hardening (follow-up) | PR #114 | Separates pre-NULL cancellation from final listener stop, keeps poison observation live through NULL, and drains/counts queued accepts before join. Only narrowly classified incomplete-header EOF/reset/abort outcomes may cancel; semantic request, accept, and response-write failures remain fatal even during teardown. Four Windows tests pin classification, synchronized clean-versus-malformed behavior, and the accepted/queued poison window. x86_64 runs the unit tests, while ARM64 compiles the code and executes the production probe during packaging. This hardens the already-complete packaged proof and leaves checklist arithmetic unchanged. |
 | 2026-07-17 | P2.11 Windows distribution-path repair (follow-up) | PR #115 | Resolves the caller-relative bundle immediately after creation through PowerShell's FileSystem provider and retains its physical `ProviderPath`, preventing `.NET` PE inspection from using a stale process working directory and preventing custom PSDrive names from escaping into native tools. Static ordering and live PowerShell regressions cover a changed `$PWD`, repository spaces, and custom FileSystem PSDrives. Full debug/release suites pass 761 tests per profile, all 30 focused platform-runtime tests pass in both profiles, and strict Clippy is clean. CI run 29615869107 passed every job, including both native finished bundles; the live packaged DAAP/Subsonic playback box remains open, so checklist arithmetic is unchanged. |
-| 2026-07-17 | P3.2 shared catalogue backend completion | PR #116 | Adds object-safe complete-track catalogue access and removes every backend-specific `all_tracks` bypass. Scanner snapshots construct `LocalBackend`; local, environment, manual, discovery, Subsonic, Jellyfin, Plex, and DAAP publication all enter one explicit `&dyn MediaBackend` adapter. Concrete authentication and protected-media/session retention intentionally remain under P3.1. The production passwordless DAAP catalogue-error branch logs out and invokes the paired user-error/GTK-cleanup helper; focused coverage pins that helper's paired emissions without claiming to synthesize a catalogue failure. Together with PR #114's aggregate work, this closes P3.2's final two boxes. Current-branch validation is recorded above. |
+| 2026-07-17 | P3.2 shared catalogue backend completion | PR #116 | Adds object-safe complete-track catalogue access and removes every backend-specific `all_tracks` bypass. Scanner snapshots construct `LocalBackend`; local, environment, manual, discovery, Subsonic, Jellyfin, Plex, and DAAP publication all enter one explicit `&dyn MediaBackend` adapter. Concrete authentication and protected-media/session retention intentionally remain under P3.1. The production passwordless DAAP catalogue-error branch logs out and invokes the paired user-error/GTK-cleanup helper; focused coverage pins that helper's paired emissions without claiming to synthesize a catalogue failure. Together with PR #114's aggregate work, this closes P3.2's final two boxes. Its base-branch validation is recorded above. |
+| 2026-07-17 | P3.4 keyboard/context-menu and slider accessibility (partial) | PR #119 | Closes the accessibility item within the combined P3.4 completion. Unmodified Menu and exact Shift+F10 share right-click's immutable selection snapshot and popover-owned actions, propagate when no menu can open, and publish the standardized popup shortcut. Position and volume scales retain GTK's native slider semantics while gaining distinct localized names in all 13 catalogs. Two focused regressions pin the production-consumed interaction/accessibility plans and parse every source YAML catalog. |
+| 2026-07-17 | P3.4 MPD/Chromecast integration harnesses (partial) | PR #119 | Closes the compound receiver-state-machine item within the combined P3.4 completion. The established 83-test fake/real-socket MPD harness and 38-test delayed/adversarial Chromecast harness are joined by a plaintext 1 MiB Cast frame guard immediately below the real `rust_cast` manager. Four new real-manager regressions prove pre-allocation oversized rejection without payload reads, exact-limit acceptance, truncated-header/payload failure, and consecutive-frame reset/write preservation, bringing the focused Chromecast module to 42 tests. |
+| 2026-07-17 | P3.4 recycled-row and UI-generation harnesses (partial) | PR #119 | Closes the GTK recycling/stale-callback and stale artwork/source-result boxes within the combined P3.4 completion. Sidebar setup installs one parameterized production `GAction`; factory bind replaces its typed current-source target and unbind revokes it. Its headless repeated-recycle harness proves no historical delete/disconnect/menu callback survives. A synchronized loopback fixture drives the real persistent artwork worker across an in-flight generation replacement, and the production source cache/eviction boundary rejects reversed same-key loaded and missing callbacks while retaining cache-only publication for an inactive newest request. |
+| 2026-07-17 | P3.4 playback/output lifecycle completion | PR #119 | Completes the playback-session, output-transfer/reselect, and final implementation-record boxes. Production now shares exact `ListModel` queue capture, current-item direct load/retry, and clear-before-Stop ownership boundaries; the headless harness survives sort/filter/source-projection replacement while preserving local B→C→B identity and rejecting stale events. A validated output-slot transaction makes exact reselection inert, parks/restores only an exact Local output, clears before stopping/dropping remote outputs, preserves playback on invalid or wrong-parked-type replacement, and removes the throwaway MPD parking worker. Recording Local/MPD/Chromecast outputs prove rejection retry, remote replacement, exact Local restoration, and complete cleanup. The final rebased branch passes 797 tests per profile and strict Clippy in both profiles. |
