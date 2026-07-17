@@ -364,13 +364,16 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
   IDs, collapses canonical duplicates in file order, atomically replaces `servers.json` before
   publication, and publishes nothing when validation or replacement fails. Malformed or unknown
   version-1 data, reserved nil/built-in identities, and endpoint/ID conflicts quarantine the
-  complete unchanged file. Repeated manual Add, discovered-to-saved promotion, and saved-plus-env
-  startup coalesce by canonical `(backend, endpoint)`; the persisted ID wins and only one sidebar
-  and registry owner is used.
-- Saved remote rows retain random persisted `SourceId` values. Legacy, discovered, environment,
-  and unsaved remote endpoints use deterministic backend-plus-canonical-base-URL identity. The
-  same typed ID is carried through sidebar objects, connect generations, standard and DAAP
-  registries, sync events, navigation, disconnect, discovery loss, deletion, and shutdown.
+  complete unchanged file. Repeated manual Add reuses the saved owner; discovered-to-saved
+  promotion persists the row's already-published ID before changing its presentation; and
+  saved-plus-env startup authenticates under the stored ID. Each path therefore keeps one
+  canonical `(backend, endpoint)` owner without transferring live ownership between IDs.
+- Brand-new manually saved remote rows receive random persisted `SourceId` values. Legacy,
+  discovered, environment, and unsaved remote endpoints use deterministic
+  backend-plus-canonical-base-URL identity; promoting a discovered/environment row persists that
+  existing deterministic ID. The same typed ID is carried through sidebar objects, connect
+  generations, standard and DAAP registries, sync events, navigation, disconnect, discovery loss,
+  deletion, and shutdown.
 - Subsonic, Jellyfin, Plex, and DAAP catalogue rows preserve their exact bounded native song ID,
   item `Id`, `ratingKey`, and decimal `miid`, respectively. Standard opaque playback references
   carry that exact native ID in a reversible, prefixed lowercase-hex segment (so `.` and `..`
@@ -405,8 +408,11 @@ location-independent identity but retain their current locator until their regis
 at-use resolvers are implemented. Local and playlist GTK rows retain paths for non-playback UI
 operations, and the playback-time local resolver does not yet retain root/file authority through
 complete output consumption. More precisely, it does not yet acquire the current authorized root,
-prove the resolved path is contained beneath it, or retain root/file authority while the output
-consumes the result. Those lifecycle and authority items remain explicit P3.1 work.
+prove the resolved path is contained beneath it, acquire exact file authority, or retain root/file
+authority while the output consumes the result. A row with both saved and discovered provenance
+also collapses them into one `manually_added` flag: Delete cannot yet demote it to a still-live
+discovery publication, and discovery loss retires live ownership even if the saved row remains.
+Those provenance, lifecycle, and authority items remain explicit P3.1 work.
 
 ## Deliberately deferred implementation details
 

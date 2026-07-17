@@ -230,16 +230,49 @@ fn source_owns_remote_endpoint(source: &SourceObject, server_type: &str, server_
     )
 }
 
+/// Return the one already-published identity for a canonical endpoint before
+/// persistence assigns ownership.
+///
+/// Promotion must persist this ID rather than minting a replacement: the
+/// existing value may already own navigation generations, cached tracks,
+/// pending authentication, playback, and a retained backend session. A
+/// missing, reserved, or duplicate live owner is not safe to promote.
+fn existing_source_id_for_endpoint(
+    store: &gtk::gio::ListStore,
+    server_type: &str,
+    server_url: &str,
+) -> Result<Option<SourceId>, &'static str> {
+    let mut owner = None;
+    for index in 0..store.n_items() {
+        let Some(source) = store.item(index).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if !source_owns_remote_endpoint(&source, server_type, server_url) {
+            continue;
+        }
+        if owner.is_some() {
+            return Err(SAVED_SERVER_CONFIG_UNAVAILABLE);
+        }
+        let source_id = source
+            .source_id()
+            .filter(|source_id| !source_id.is_reserved_remote())
+            .ok_or(SAVED_SERVER_CONFIG_UNAVAILABLE)?;
+        owner = Some(source_id);
+    }
+    Ok(owner)
+}
+
 /// Publish a saved source without allowing another sidebar row to own the
 /// same canonical `(backend, endpoint)` pair.
 ///
-/// A discovered row is promoted in place so its ephemeral advertised route
-/// survives. Re-adding an already-saved endpoint updates the same object and
-/// therefore leaves deletion keyed by one unambiguous persisted `SourceId`.
+/// A discovered row is promoted in place so its stable identity and ephemeral
+/// advertised route survive. Re-adding an already-saved endpoint updates the
+/// same object and therefore leaves deletion keyed by one unambiguous
+/// persisted `SourceId`.
 fn upsert_saved_source_in_store(
     store: &gtk::gio::ListStore,
     saved: &SavedServer,
-) -> (SourceObject, Option<SourceId>) {
+) -> Result<SourceObject, &'static str> {
     for index in 0..store.n_items() {
         let Some(source) = store.item(index).and_downcast::<SourceObject>() else {
             continue;
@@ -248,31 +281,27 @@ fn upsert_saved_source_in_store(
             continue;
         }
 
-        let replaced_source_id = source
-            .source_id()
-            .filter(|source_id| *source_id != saved.source_id);
+        if source.source_id() != Some(saved.source_id) {
+            return Err(SAVED_SERVER_CONFIG_UNAVAILABLE);
+        }
         source.set_name(&saved.name);
         source.set_server_url(&saved.url);
-        source.set_source_id(saved.source_id);
         source.set_manually_added(true);
         source.set_connecting(true);
-        if replaced_source_id.is_some() {
-            source.set_connected(false);
-        }
 
         // SourceObject fields are deliberately plain GTK-side state rather
         // than GObject properties. Reinsert the same object to refresh the
         // list-item binding without creating a second logical owner.
         store.remove(index);
         store.insert(index, &source);
-        return (source, replaced_source_id);
+        return Ok(source);
     }
 
     let insert_pos = super::window::ensure_category_header_store(store, &saved.server_type);
     let source = SourceObject::manual(&saved.name, &saved.server_type, &saved.url, saved.source_id);
     source.set_connecting(true);
     store.insert(insert_pos, &source);
-    (source, None)
+    Ok(source)
 }
 
 /// Save one complete v1 envelope through a same-directory atomic replacement.
@@ -306,6 +335,7 @@ fn add_saved_server_to(
     server_type: &str,
     name: &str,
     url: &str,
+    existing_source_id: Option<SourceId>,
 ) -> Result<bool, &'static str> {
     validate_remote_server_url(url)?;
     let Some((_, canonical)) = validated_endpoint(server_type, url) else {
@@ -318,20 +348,40 @@ fn add_saved_server_to(
         return Ok(false);
     }
 
+    let source_id = if let Some(source_id) = existing_source_id {
+        if source_id.is_reserved_remote()
+            || servers.iter().any(|server| server.source_id == source_id)
+        {
+            return Err(SAVED_SERVER_CONFIG_UNAVAILABLE);
+        }
+        source_id
+    } else {
+        loop {
+            let candidate = SourceId::random();
+            if !candidate.is_reserved_remote()
+                && !servers.iter().any(|server| server.source_id == candidate)
+            {
+                break candidate;
+            }
+        }
+    };
     servers.push(SavedServer {
         server_type: server_type.to_string(),
         name: name.to_string(),
         url: url.to_string(),
-        source_id: SourceId::random(),
+        source_id,
     });
     Ok(true)
 }
 
 /// Add a validated server to `servers.json` (dedup by canonical endpoint).
+/// An already-published owner is persisted verbatim instead of being
+/// reassigned during discovered/environment-to-saved promotion.
 pub fn add_saved_server(
     server_type: &str,
     name: &str,
     url: &str,
+    existing_source_id: Option<SourceId>,
 ) -> Result<SavedServer, &'static str> {
     let Some(path) = servers_json_path() else {
         return Err(SAVED_SERVER_CONFIG_UNAVAILABLE);
@@ -340,7 +390,7 @@ pub fn add_saved_server(
         SavedServerLoad::Ready(servers) => servers,
         SavedServerLoad::Quarantined => return Err(SAVED_SERVER_CONFIG_UNAVAILABLE),
     };
-    let added = add_saved_server_to(&mut servers, server_type, name, url)?;
+    let added = add_saved_server_to(&mut servers, server_type, name, url, existing_source_id)?;
     if added && save_servers_to(&path, &servers).is_err() {
         return Err(SAVED_SERVER_CONFIG_UNAVAILABLE);
     }
@@ -572,7 +622,18 @@ pub fn show_add_server_dialog(
         // Validate before persistence, sidebar publication, connection state,
         // or URL-bearing logs. Rejected text may itself contain a credential,
         // so only the fixed validation message may cross this boundary.
-        let saved = match add_saved_server(backend_type, &display_name, &url) {
+        let existing_source_id = match existing_source_id_for_endpoint(&store, backend_type, &url) {
+            Ok(source_id) => source_id,
+            Err(message) => {
+                tracing::warn!(
+                    error = message,
+                    "Manual server source ownership is unavailable"
+                );
+                let _ = engine_tx.try_send(LibraryEvent::Error(message.to_string()));
+                return;
+            }
+        };
+        let saved = match add_saved_server(backend_type, &display_name, &url, existing_source_id) {
             Ok(saved) => saved,
             Err(message) => {
                 tracing::warn!(error = message, "Manual server URL rejected");
@@ -581,13 +642,14 @@ pub fn show_add_server_dialog(
             }
         };
 
-        // Publish exactly one owner for this logical endpoint. If this is a
-        // discovered row, promotion adopts the persisted identity before the
-        // authenticated connection is started and retires its old ephemeral
-        // registry owner.
-        let (_source, replaced_source_id) = upsert_saved_source_in_store(&store, &saved);
-        if let Some(replaced_source_id) = replaced_source_id {
-            crate::source_registry::release_source(replaced_source_id);
+        // Publish exactly one owner for this logical endpoint. A discovered
+        // row's already-published identity was persisted above, so this path
+        // does not mutate or attempt to transfer any identity-keyed route,
+        // cache, navigation, playback, or registry state.
+        if let Err(message) = upsert_saved_source_in_store(&store, &saved) {
+            tracing::warn!(error = message, "Manual server source ownership changed");
+            let _ = engine_tx.try_send(LibraryEvent::Error(message.to_string()));
+            return;
         }
 
         // One-shot to clear spinner on failure.
@@ -945,21 +1007,24 @@ mod tests {
             &mut servers,
             "subsonic",
             "Home",
-            "HTTPS://MUSIC.EXAMPLE.TEST:443/base/"
+            "HTTPS://MUSIC.EXAMPLE.TEST:443/base/",
+            None,
         )
         .expect("valid server"));
         assert!(!add_saved_server_to(
             &mut servers,
             "subsonic",
             "Duplicate",
-            "https://music.example.test/base"
+            "https://music.example.test/base",
+            None,
         )
         .expect("duplicate server"));
         assert!(add_saved_server_to(
             &mut servers,
             "plex",
             "Other backend",
-            "https://music.example.test/base"
+            "https://music.example.test/base",
+            None,
         )
         .expect("distinct backend"));
         assert_eq!(servers.len(), 2);
@@ -980,13 +1045,13 @@ mod tests {
             source_id: SourceId::random(),
         };
 
-        let (first, first_replaced) = upsert_saved_source_in_store(&store, &saved);
+        let first = upsert_saved_source_in_store(&store, &saved).expect("first owner");
         let equivalent = SavedServer {
             name: "Ignored duplicate name".to_string(),
             url: "https://music.example.test/base".to_string(),
             ..saved.clone()
         };
-        let (second, second_replaced) = upsert_saved_source_in_store(&store, &equivalent);
+        let second = upsert_saved_source_in_store(&store, &equivalent).expect("existing owner");
 
         let owners: Vec<_> = (0..store.n_items())
             .filter_map(|index| store.item(index).and_downcast::<SourceObject>())
@@ -1001,12 +1066,10 @@ mod tests {
         assert_eq!(owners.len(), 1);
         assert_eq!(owners[0].source_id(), Some(saved.source_id));
         assert_eq!(first.source_id(), second.source_id());
-        assert_eq!(first_replaced, None);
-        assert_eq!(second_replaced, None);
     }
 
     #[test]
-    fn saving_a_discovered_endpoint_promotes_it_without_a_second_owner() {
+    fn saving_a_discovered_endpoint_persists_and_keeps_its_published_identity() {
         let store = gtk::gio::ListStore::new::<SourceObject>();
         let insert_pos = super::super::window::ensure_category_header_store(&store, "subsonic");
         let discovered = SourceObject::discovered(
@@ -1014,7 +1077,7 @@ mod tests {
             "subsonic",
             "HTTPS://MUSIC.EXAMPLE.TEST:443/base/",
         );
-        let old_source_id = discovered.source_id().expect("deterministic source ID");
+        let discovered_source_id = discovered.source_id().expect("deterministic source ID");
         let origin = url::Url::parse("https://music.example.test/base").expect("origin");
         let route = crate::architecture::AdvertisedHttpRoute::new(
             &origin,
@@ -1024,25 +1087,38 @@ mod tests {
         discovered.set_advertised_route(Some(route.clone()));
         store.insert(insert_pos, &discovered);
 
-        let saved = SavedServer {
-            server_type: "subsonic".to_string(),
-            name: "Saved name".to_string(),
-            url: "https://music.example.test/base".to_string(),
-            source_id: SourceId::random(),
-        };
-        let (promoted, replaced) = upsert_saved_source_in_store(&store, &saved);
+        let existing_source_id =
+            existing_source_id_for_endpoint(&store, "subsonic", "https://music.example.test/base")
+                .expect("unambiguous live owner");
+        assert_eq!(existing_source_id, Some(discovered_source_id));
+
+        let mut servers = Vec::new();
+        assert!(add_saved_server_to(
+            &mut servers,
+            "subsonic",
+            "Saved name",
+            "https://music.example.test/base",
+            existing_source_id,
+        )
+        .expect("save discovered owner"));
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("servers.json");
+        save_servers_to(&path, &servers).expect("persist saved owner");
+        let saved = loaded(&path).pop().expect("saved record");
+        assert_eq!(saved.source_id, discovered_source_id);
+
+        let promoted = upsert_saved_source_in_store(&store, &saved).expect("promote same owner");
 
         let owner_count = (0..store.n_items())
             .filter_map(|index| store.item(index).and_downcast::<SourceObject>())
             .filter(|source| source_owns_remote_endpoint(source, &saved.server_type, &saved.url))
             .count();
         assert_eq!(owner_count, 1);
-        assert_eq!(promoted.source_id(), Some(saved.source_id));
+        assert_eq!(promoted.source_id(), Some(discovered_source_id));
+        assert_eq!(discovered.source_id(), Some(discovered_source_id));
         assert_eq!(promoted.advertised_route(), Some(route));
         assert!(promoted.manually_added());
         assert!(promoted.connecting());
-        assert_eq!(replaced, Some(old_source_id));
-        assert_ne!(saved.source_id, SourceId::local());
     }
 
     #[test]
@@ -1061,7 +1137,7 @@ mod tests {
             format!("https://music.example.test?api_key={secret}"),
             format!("https://music.example.test#{secret}"),
         ] {
-            let result = add_saved_server_to(&mut servers, "subsonic", "Rejected", &rejected);
+            let result = add_saved_server_to(&mut servers, "subsonic", "Rejected", &rejected, None);
             assert!(result.is_err());
             assert_eq!(
                 serde_json::to_string(&servers).expect("serialize unchanged snapshot"),

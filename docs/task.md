@@ -70,9 +70,10 @@ through complete output consumption; centralized lifecycle/adapter locator owner
 separate work. Pre-publication independent review also tightened the
 runtime boundary: version-1 saved remotes cannot claim nil or built-in IDs; repeated Add,
 discovered-to-saved promotion, and saved-plus-environment startup coalesce one canonical
-`(backend, endpoint)` owner; environment connections use the persisted ID; and remote media
-references reversibly prefix/hex-encode native IDs so valid `.` and `..` values cannot be
-normalized as URL path segments.
+`(backend, endpoint)` owner by respectively reusing the saved ID, persisting the already-published
+discovered ID, or using the stored ID for environment auth; and remote media references reversibly
+prefix/hex-encode native IDs so valid `.` and `..` values cannot be normalized as URL path
+segments.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1327,15 +1328,18 @@ closed as a milestone.
 - [x] Define stable source IDs and backend-native track IDs. The frozen typed implementation and
   [source-lifecycle decision](architecture/source-lifecycle.md) now agree. The checked-in UUID
   namespace and canonical source spellings pin local, Radio-Browser, deterministic remote, and
-  removable `SourceId` values; saved remotes persist a random ID through the strict version-1
-  envelope and legacy arrays migrate atomically before publication or quarantine whole-file on
-  conflicts. Local rows retain exact SQLite IDs; Subsonic, Jellyfin, Plex, and DAAP retain exact
+  removable `SourceId` values; a new manual remote without a live owner persists a random ID,
+  while promotion persists the discovered/environment row's existing deterministic ID through the
+  strict version-1 envelope. Legacy arrays migrate atomically before publication or quarantine the
+  whole file on conflicts. Local rows retain exact SQLite IDs; Subsonic, Jellyfin, Plex, and DAAP retain exact
   bounded song ID, item `Id`, `ratingKey`, and decimal `miid`; radio retains a bounded
   `stationuuid`; removable paths use a lossless mount-relative native encoding; and external
   sessions receive independent random IDs. Queues use `MediaKey` plus a separate playlist/radio
   `ViewOrigin`, and hostile track values are bounded and redacted from debug output. Version-1
   saved input also rejects nil and built-in IDs, and every manual/discovered/environment path
   coalesces the same canonical `(backend, endpoint)` under one persisted-or-deterministic owner.
+  Promotion persists the discovered row's existing ID before changing its presentation, so it
+  never requires a partial transfer of live navigation, cache, playback, or registry ownership.
 - [x] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source. P1.6 now
   retains an `Arc<dyn RemoteMediaResolver>` behind an exact generation and random revocable lease
   for each standard remote source; the existing DAAP registry retains its stateful live backend.
@@ -1364,8 +1368,11 @@ closed as a milestone.
 - [ ] Centralize source refresh, cancellation, disconnect, and failure state. Generation/lease
   ownership and source-owned playback retirement are centralized, but environment startup,
   interactive auth, manual add, refresh publication, and UI failure handling remain separate
-  paths, and DAAP still has a sibling registry because it owns an explicit logout lifecycle. The
-  ADR defines the target state machine, operation generations, session epochs, and ownership.
+  paths, and DAAP still has a sibling registry because it owns an explicit logout lifecycle. A row
+  that is both discovered and saved also collapses both provenances into `manually_added`: Delete
+  cannot yet demote it to a still-live discovery publication, while discovery loss retires live
+  ownership even if the saved row remains. The ADR defines the target state machine, operation
+  generations, session epochs, provenance, and ownership.
 - [x] Decide how local, radio, and external-file sources fit the same lifecycle. Local is one
   always-registered source, playlists are local views, Radio-Browser is one stateless source whose
   feeds are views, removable filesystems are generation-owned sources keyed by their existing
@@ -1505,9 +1512,10 @@ Focused suites pass for identity encoding, saved-source migration/quarantine, so
 navigation, standard/DAAP registry ownership, exact native backend conversion/resolution,
 local-ID-at-use resolution, queue/view ownership, radio, removable scanning, and recycled sidebar
 actions. Independent review regressions additionally prove reserved saved IDs quarantine without
-letting a remote impersonate local, all three duplicate-owner paths coalesce to one stable ID, and
-stream plus artwork references round-trip exact `.` and `..` IDs without URL normalization. The
-first full debug run exposed one stale assertion that still expected a server URL from a sidebar
+letting a remote impersonate local; persistence adopts an existing discovered row's ID before its
+in-place promotion, repeated Add and saved-plus-env startup retain their persisted owner; and stream
+plus artwork references round-trip exact `.` and `..` IDs without URL normalization. The first
+full debug run exposed one stale assertion that still expected a server URL from a sidebar
 action after production moved to stable source ownership; the corrected regression now expects the
 persisted/derived `SourceId`, and the complete debug and release suites pass afterward.
 `cargo fmt --all -- --check` and `git diff --check` pass. No dependency or lockfile changed.
@@ -2286,4 +2294,4 @@ Add one line per completed task:
 | 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Native x86_64 and ARM64 CI both prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
 | 2026-07-17 | P3.1 source identity/lifecycle architecture | PR #113 | Records location-independent `(SourceId, TrackId)` media identity, an exact legacy-array-to-versioned-envelope saved-source migration with atomic replacement and fail-closed conflict quarantine, one registry-owned operation/session lifecycle, deterministic per-view radio locator ownership, playback-time locator resolution, exactly-once DAAP retirement, adapter-specific rules for every source kind, and staged completion tests. This closes only the two architecture decision boxes; runtime migration remains open. Independent review found and resolved two design ambiguities before the full exact-toolchain/native/package matrix passed in runs 29605029668 and 29605032344. |
 | 2026-07-17 | P3.1 exact local ID-at-use resolution (partial) | `81db425`, pending PR | Preserves each SQLite `tracks.id` byte-for-byte in local and playlist UI/queue identity, replaces random malformed-UUID fallback with a frozen deterministic compatibility projection, removes file locators from local/playlist queue items, and resolves the exact current database row plus five-second regular-file evidence before initial, newly navigated, repeated, or receiver-targeted output loads. Exact-generation completion suppresses stale async results and missing, empty, dead, timed-out, or deleted IDs never use metadata/path fallback. Focused resolver, queue, GObject, and model-conversion tests plus strict full debug/release suites cover the slice. Acquisition of the current root, containment proof, exact file authority, and retention through full output consumption remain open, so that compound task remains unchecked. |
-| 2026-07-17 | P3.1 stable identity runtime | `79b9d0c`, `9bf87db`, pending PR | Freezes typed source/media/view identity and a strict atomic saved-source migration; replaces URL ownership with persisted or deterministic `SourceId` across standard and DAAP flows; preserves exact bounded native IDs for every remote adapter; and adopts source-scoped `MediaKey` plus playlist/radio `ViewOrigin` in playback. Reserved nil/local/radio IDs quarantine hostile saved input; repeated Add, discovered-to-saved promotion, and saved-plus-env startup coalesce one canonical owner with the persisted ID winning; and a prefixed reversible segment round-trips even native `.`/`..` IDs through stream and artwork references. Removable rows use lossless mount-relative native identity, malformed radio IDs fail closed, and external sessions mint independent random IDs. Focused migration, registry, adapter, queue, removable, radio, and source-object regressions plus strict full debug/release validation cover the completed stable-ID compound box. Centralized lifecycle, nonlocal at-use locators, and acquisition/containment/retention of local root/file authority remain open. |
+| 2026-07-17 | P3.1 stable identity runtime | `79b9d0c`, `9bf87db`, `8232d90`, `432b66b`, pending PR | Freezes typed source/media/view identity and a strict atomic saved-source migration; replaces URL ownership with persisted or deterministic `SourceId` across standard and DAAP flows; preserves exact bounded native IDs for every remote adapter; and adopts source-scoped `MediaKey` plus playlist/radio `ViewOrigin` in playback. Reserved nil/local/radio IDs quarantine hostile saved input; repeated Add reuses the saved owner, discovered-to-saved promotion persists the already-published ID before changing presentation, and saved-plus-env startup authenticates under the stored ID; a prefixed reversible segment round-trips even native `.`/`..` IDs through stream and artwork references. Removable rows use lossless mount-relative native identity, malformed radio IDs fail closed, and external sessions mint independent random IDs. Focused migration, registry, adapter, queue, removable, radio, and source-object regressions plus strict full debug/release validation cover the completed stable-ID compound box. Centralized lifecycle/provenance, nonlocal at-use locators, and acquisition/containment/retention of local root/file authority remain open. |

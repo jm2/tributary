@@ -306,15 +306,16 @@ pub fn build_window(
     };
 
     // ── Connection guard ─────────────────────────────────────────────
-    // Tracks which server URL is currently being connected to, and the
-    // sidebar position that was active before the connection attempt.
+    // Tracks which stable source identity is currently being connected, and
+    // the sidebar position that was active before the connection attempt.
     // Used to (a) only auto-select on a remote sync if the source matches
     // the pending connection, and (b) revert the sidebar on failure.
     let pending_connection = Rc::new(RefCell::new(None));
     let pre_connect_selection: Rc<Cell<u32>> = Rc::new(Cell::new(1)); // default: local (index 1)
 
     // ── Per-source track storage ────────────────────────────────────
-    // Key: "local" for local filesystem, or server URL for remote.
+    // Key: "local" for the built-in local view, stable SourceId text for
+    // remotes, and the explicit view/device keys documented by WindowState.
     let source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>> =
         Rc::new(RefCell::new(HashMap::new()));
     let active_source_key: Rc<RefCell<String>> = Rc::new(RefCell::new("local".to_string()));

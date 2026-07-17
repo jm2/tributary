@@ -45,9 +45,10 @@ pub struct WindowState {
     /// Used by: discovery_handler, source_connect, context_menu, window.
     pub master_tracks: Rc<RefCell<Vec<TrackObject>>>,
 
-    /// Per-source track cache.  Key: `"local"` for local filesystem,
-    /// server URL for remote, `"playlist:<id>"` for playlists,
-    /// backend type string for radio.
+    /// Per-source/view track cache. Key: `"local"` for the built-in local
+    /// view, stable `SourceId` text for remotes, the removable source's
+    /// explicit logical key, `"playlist:<id>"` for playlists, or the backend
+    /// view key for radio.
     /// Used by: discovery_handler, source_connect, context_menu, window.
     pub source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
 

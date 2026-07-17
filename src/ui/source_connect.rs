@@ -516,9 +516,10 @@ pub fn setup_source_connect(state: &WindowState) {
 
         let backend_type = src.backend_type();
 
-        // Determine the source key. Device rows carry an explicit logical key;
-        // legacy/remote rows fall back to their server URL, while local static
-        // sources use the backend type so they do not collapse into "local".
+        // Determine the navigation/cache key. Device rows carry an explicit
+        // logical key and remote rows prefer their stable SourceId; only a
+        // malformed legacy remote row can fall back to its server URL. Local
+        // static sources retain the built-in "local" view key.
         let explicit_key = src.source_key();
         let stable_source_id = src.source_id().map(|id| id.to_string()).unwrap_or_default();
         let url = src.server_url();

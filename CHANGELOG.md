@@ -69,9 +69,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Sources and playback queues now use stable, location-independent media identity** — The
   accepted P3.1 contract is now backed by frozen `SourceId`, exact bounded backend-native
   `TrackId`, composite `MediaKey`, and separate playlist/radio `ViewOrigin` types. Saved remotes
-  receive random persisted source IDs; legacy, discovered, environment, and unsaved endpoints use
-  deterministic backend-plus-canonical-base-URL IDs; local, Radio-Browser, and removable logical
-  sources use pinned deterministic identities. Those typed IDs now travel through sidebar rows,
+  added without an existing live row receive random persisted source IDs; legacy, discovered,
+  environment, and unsaved endpoints use deterministic backend-plus-canonical-base-URL IDs, and
+  promotion persists that already-live deterministic ID. Local, Radio-Browser, and removable
+  logical sources use pinned deterministic identities. Those typed IDs now travel through sidebar rows,
   standard and DAAP connection ownership, sync events, navigation, disconnect, discovery loss,
   deletion, and playback instead of using a configured URL as generic ownership. Subsonic song
   IDs, Jellyfin item IDs, Plex rating keys, and decimal DAAP item IDs remain exact and
@@ -82,15 +83,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete migrated file atomically replaces `servers.json` before any row is published. Unknown
   versions, malformed or reserved nil/built-in identities, endpoint/ID conflicts, and failed
   replacement publish nothing and leave the original complete file unchanged for explicit
-  recovery. Repeated manual Add, discovered-to-saved promotion, and saved-plus-environment startup
-  coalesce one canonical `(backend, endpoint)` owner; the persisted ID wins, environment auth uses
-  that same ID, and deletion cannot target an ambiguous duplicate row. Playlist queues now carry
-  local media identity plus their playlist origin, overlapping radio feeds share station media
-  identity without sharing view ownership, removable tracks use a lossless native mount-relative
-  ID that survives a mount-point change, and each OS-opened file session mints independent random
-  source and track IDs. The standard and DAAP registries and UI-owned lifecycle paths remain to be
-  consolidated; radio, removable, and external queues still retain their current locator until
-  their at-use adapters land.
+  recovery. Repeated manual Add reuses the saved owner, discovered-to-saved promotion first
+  persists the row's already-published nonreserved ID, and saved-plus-environment startup uses the
+  stored ID for authentication; all three paths therefore keep one canonical `(backend, endpoint)`
+  owner without trying to transfer live UI, cache, playback, or registry state. Playlist queues
+  now carry local media identity plus their playlist origin, overlapping radio feeds share station
+  media identity without sharing view ownership, removable tracks use a lossless native
+  mount-relative ID that survives a mount-point change, and each OS-opened file session mints
+  independent random source and track IDs. The standard and DAAP registries and UI-owned lifecycle
+  paths remain to be consolidated; radio, removable, and external queues still retain their
+  current locator until their at-use adapters land.
 - **Minimum supported Rust version raised to 1.92** — Originally raised to 1.85 in this cycle, but the gtk-rs 0.11 release series (gtk4, glib, gstreamer) requires rustc 1.92, so 1.85 had been unbuildable fiction since that upgrade. The declaration now matches reality and a dedicated CI job compile-proves the MSRV against the committed lockfile on every push, so it cannot silently drift again.
 - **The local validation gate is now enforced by CI** — Debug-profile `cargo test --all-targets` (release-only testing compiled out `debug_assert!` bodies and overflow checks), fuzz-workspace `fmt`/`clippy` against its committed lockfile (which had already drifted past the supported toolchain unnoticed), strict no-diagnostics `desktop-file-validate`, and `appstreamcli validate` all run on every push and pull request. Repository-level tests also pin the Rust/API floor, native package requirements, desktop launch field, and main category together so those declarations cannot silently diverge again. Their workflow inspection is line-ending agnostic and explicitly exercises a synthesized CRLF checkout, so Windows cannot report a missing job merely because Git converted the YAML file. Windows architecture jobs now finish independently instead of matrix fail-fast cancelling the surviving diagnostic signal, and the ARM runner skips setup-msys2's optional package cache after its `paccache` cleanup intermittently failed even though package installation had succeeded; Cargo retains its separate architecture-specific cache.
 - **Flatpak source generation is consistent across local and CI builds** — The exact checksum-pinned `flatpak-cargo-generator` revision is now vendored with provenance, an MIT license notice, and update instructions. One repository-root-independent helper verifies those bytes, Python 3.9+, and the exact direct dependency versions before always generating `build-aux/flatpak/cargo-sources.json`; the Linux build helper and CI both call it instead of downloading the generator or writing the manifest to the wrong directory. The Python transitive dependency graph is not hash-locked. Local instructions keep those packages in an XDG cache virtual environment and configure Flathub. Flatpak-only mode now bypasses native Rust/GTK prerequisite checks, the directory source excludes known VCS/agent/generated state (including host `target/`), the builder installs the runtime, SDK, and Rust extension from Flathub, and the single-file bundle records that runtime repository. The release workflow remains deliberately unchanged for now and continues to download and verify the identical immutable generator revision before use.
@@ -170,11 +172,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity now spans standard remotes, DAAP, local/playlist views, Radio-Browser, removable media,
   and external files, but the standard and DAAP registries remain separate and environment,
   interactive, and manual connection/refresh/failure paths are still duplicated. Local and
-  playlist playback resolves the exact current database row by ID, but does not yet retain its
-  root/file authority through the output's complete consumption. Radio, removable, and external
-  queues have location-independent identity but still retain their current locator instead of
-  resolving it through a shared adapter at use. These are the remaining P3.1 items; they do not
-  reintroduce backend credentials into generic values.
+  playlist playback resolves the exact current database row by ID and checks regular-file metadata,
+  but does not yet acquire the currently authorized root, prove that the database path is contained
+  beneath it, acquire exact file authority, or retain root/file authority through the output's
+  complete consumption. A row that is both discovered and saved also has only one
+  `manually_added` flag: deleting the saved provenance cannot yet demote it back to a still-live
+  discovery publication, and discovery loss deliberately retires live ownership even when the
+  saved row remains. Radio, removable, and external queues have location-independent identity but
+  still retain their current locator instead of resolving it through a shared adapter at use.
+  Unified provenance and those lifecycle/authority items remain P3.1 work; they do not reintroduce
+  backend credentials into generic values.
 - **Credential-bearing media tickets remain replayable within their hard lifetime** — Each opaque output ticket is a bearer for one fixed media item and arbitrary byte ranges until the earlier of source-lease/lifecycle revocation or its absolute 24-hour expiry; it is not a one-shot token. Neither event cancels a response the proxy already admitted. Protected local/AirPlay tickets are reachable only through a dedicated loopback listener; a protected MPD load from an unspecified address, or a scoped/link-local IPv6 route, fails closed rather than exposing the upstream request. Local-file routes are separate session-lifetime capabilities because they front no backend credential.
 - **Live packaged-Windows protected-playback validation remains outstanding** — Fake DAAP and Subsonic streams traverse the complete production protected-player path through real GStreamer, and native x86_64 and ARM64 package jobs both prove their finished distribution supplies the selected HTTP source, scanner, decoder, required DLL closure, direct-loopback policy, alternate-source fail-closed path, and real FLAC decode to end-of-stream without borrowing the build host's runtime. That deterministic probe cannot establish compatibility with the reported live DAAP/Subsonic servers, `.local`/mDNS routing, TLS, physical audio output, firewall or endpoint-security policy, or the user's legitimate upstream proxy. Audible live playback from the packaged application remains to be recorded, and no automated result proves that DNS caused the original failures.
 
