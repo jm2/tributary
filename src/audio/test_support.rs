@@ -99,6 +99,7 @@ where
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
+    let _sentinel_guard = RemoveFileOnDrop(sentinel.clone());
     let mut child = Command::new(std::env::current_exe().expect("current test executable"));
     child
         .args([
@@ -135,7 +136,6 @@ where
             None => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = std::fs::remove_file(&sentinel);
                 panic!("isolated protected GStreamer test exceeded its process deadline");
             }
         }
@@ -143,11 +143,18 @@ where
 
     let sentinel_ok =
         std::fs::read(&sentinel).is_ok_and(|contents| contents == b"protected-gstreamer-ok");
-    let _ = std::fs::remove_file(&sentinel);
     assert!(
         status.success() && sentinel_ok,
         "isolated protected GStreamer test failed"
     );
+}
+
+struct RemoveFileOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 struct ExpectedRequest {
@@ -388,20 +395,28 @@ fn wait_for_generation_eos(
                 break;
             }
         }
-        while let Ok(event) = events.try_recv() {
-            if event.generation() != generation {
-                continue;
-            }
-            match event {
-                PlayerEvent::StateChanged {
-                    state: PlayerState::Buffering,
-                    ..
-                } => buffering = true,
-                PlayerEvent::TrackEnded { .. } => ended = true,
-                PlayerEvent::Error { .. } => {
-                    panic!("protected player emitted an error before end-of-stream");
+        loop {
+            match events.try_recv() {
+                Ok(event) => {
+                    if event.generation() != generation {
+                        continue;
+                    }
+                    match event {
+                        PlayerEvent::StateChanged {
+                            state: PlayerState::Buffering,
+                            ..
+                        } => buffering = true,
+                        PlayerEvent::TrackEnded { .. } => ended = true,
+                        PlayerEvent::Error { .. } => {
+                            panic!("protected player emitted an error before end-of-stream");
+                        }
+                        PlayerEvent::StateChanged { .. } | PlayerEvent::PositionChanged { .. } => {}
+                    }
                 }
-                PlayerEvent::StateChanged { .. } | PlayerEvent::PositionChanged { .. } => {}
+                Err(async_channel::TryRecvError::Empty) => break,
+                Err(async_channel::TryRecvError::Closed) => {
+                    panic!("player event channel closed unexpectedly");
+                }
             }
         }
         if !ended {

@@ -1319,7 +1319,9 @@ at least one body GET per backend. It separately observes the post-policy source
 proves the GStreamer URI remains an opaque loopback ticket with no private request value. Missing
 `playbin3`/`playbin`, `souphttpsrc`, `fakesink`, or FLAC decoding fails the child rather than
 silently skipping; per-load and absolute parent deadlines contain native hangs, and a success
-sentinel prevents an incorrect exact-test filter from passing with zero tests.
+sentinel prevents an incorrect exact-test filter from passing with zero tests. Automated-review
+follow-ups make sentinel cleanup panic-safe through an RAII guard and fail immediately if the
+player event channel closes unexpectedly instead of waiting for the case deadline.
 `cargo audit` finds no vulnerability and only the two tracked allowed unmaintained warnings;
 desktop and AppStream validation, `cargo fmt --all -- --check`, and `git diff --check` pass. No
 dependency or lockfile changed.
