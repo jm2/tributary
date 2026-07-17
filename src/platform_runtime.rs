@@ -1534,27 +1534,49 @@ mod tests {
     }
 
     #[test]
-    fn windows_script_computes_a_bounded_transitive_dll_closure() {
+    fn windows_script_computes_a_bounded_nonexecuting_pe_import_closure() {
         let script = include_str!("../scripts/build-windows.ps1");
         for fragment in [
             "$requiredSoupPluginName = \"libgstsoup.dll\"",
             "$requiredSoupRuntimeName = \"libsoup-3.0-0.dll\"",
             "Required souphttpsrc runtime is incomplete",
             "$PkgPrefix-libsoup3 packages",
-            "function Get-LddDependencyName",
-            "libfoo.dll => /clang64/bin/libfoo.dll (0x...)",
-            "/clangarm64/bin/foo.dll (0x...)",
-            "if ($Line -match '^\\s*(.+?\\.dll)\\s*=>')",
-            "elseif ($Line -match '^\\s*\"?(.+?\\.dll)\"?(?:\\s+\\(0x[0-9A-Fa-f]+\\))?\\s*$')",
+            "function Get-PeImportDependencyName",
+            "Name: libfoo.dll",
+            "--coff-imports includes ordinary and delay-load imports",
+            "if ($Line -notmatch '^\\s*Name:\\s*([^\\\\/:*?\"<>|\\x00-\\x1F]+\\.dll)\\s*$')",
+            "$peImportInspector = [System.IO.Path]::GetFullPath((Join-Path $MsysPath \"bin\\llvm-readobj.exe\"))",
+            "[System.IO.Path]::IsPathRooted($peImportInspector)",
+            "Required PE import inspector not found",
+            "$PkgPrefix-llvm package",
+            "function Invoke-BoundedPeImportBatch",
+            "PE import-inspection target must be an absolute existing DLL or EXE",
+            "Start-Process -FilePath $Inspector -ArgumentList $arguments",
+            "-RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath",
+            "while (-not $process.WaitForExit(50))",
+            "[System.IO.File]::ReadAllLines($stdoutPath)",
+            "Stop-BoundedProcessTree $process \"PE import inspector\"",
             "$maxDllScanTargets = 4096",
-            "$maxLddOutputLines = 131072",
+            "$maxPeInspectorOutputLines = 131072",
+            "$maxPeInspectorBatchTargets = 28",
+            "$maxPeInspectorArgumentCharacters = 24000",
+            "$maxPeInspectorBatchOutputBytes = 8388608",
+            "$peInspectorBatchDeadlineMs = 45000",
+            "$peInspectorClosureDeadlineMs = 300000",
             "$dllScanQueue = [System.Collections.Queue]::new()",
             "$knownDllScanTargets = @{}",
+            "Invoke-BoundedPeImportBatch `",
+            "$peImportInspector @($requiredSoupPluginFull)",
+            "$scannedDllTargets[$requiredSoupPluginFull] = $true",
             "while ($dllScanQueue.Count -gt 0)",
-            "$lddLines = @(& $ldd $bin 2>$null)",
-            "$lddExitCode = $LASTEXITCODE",
-            "if ([string]$line -match '=>\\s+not found')",
-            "Add-DllScanTarget $dllScanQueue $knownDllScanTargets $destPath $maxDllScanTargets",
+            "$roundTargets = @()",
+            "$batchTargets.Count -lt $maxPeInspectorBatchTargets",
+            "Add-PeImportDependencies $batchLines $batchNames",
+            "Add-DllScanTarget $Queue $Known $destPath $TargetLimit",
+            "if ($ClosureClock.ElapsedMilliseconds -ge $ClosureDeadlineMs)",
+            "Unresolved DLL import $dllName reported for $SourceLabel",
+            "$systemPath = Join-Path ([System.Environment]::SystemDirectory) $dllName",
+            "$isApiSet = $dllName -match '^(?i:api-ms-win-|ext-ms-win-)'",
             "$soupRuntimeDependencyObserved = $true",
             "if (-not $soupPluginScanned)",
             "if (-not $soupRuntimeDependencyObserved)",
@@ -1562,7 +1584,7 @@ mod tests {
         ] {
             assert!(
                 script.contains(fragment),
-                "missing bounded Windows DLL-closure contract: {fragment}"
+                "missing bounded Windows PE-import closure contract: {fragment}"
             );
         }
 
@@ -1570,7 +1592,7 @@ mod tests {
             .find("if (Copy-IfNewer $srcPath $destPath)")
             .expect("dependency copy");
         let enqueue = script[copy..]
-            .find("Add-DllScanTarget $dllScanQueue $knownDllScanTargets $destPath")
+            .find("Add-DllScanTarget $Queue $Known $destPath")
             .expect("copied dependency enqueue")
             + copy;
         let probe = script
@@ -1580,6 +1602,10 @@ mod tests {
         assert!(enqueue < probe);
         assert!(!script.contains("foreach ($bin in $binariesToScan)"));
         assert!(!script.contains("Get-ChildItem -Path \"$MsysPath\\bin\""));
+        assert!(!script.contains("Get-LddDependencyName"));
+        assert!(!script.contains("$ldd"));
+        assert!(!script.contains("ReadToEnd"));
+        assert!(!script.contains("DataReceived"));
     }
 
     #[test]

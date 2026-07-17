@@ -116,8 +116,11 @@ function Get-BoundedProbeDiagnostic {
     }
 }
 
-function Stop-ProbeProcessTree {
-    param([System.Diagnostics.Process]$Process)
+function Stop-BoundedProcessTree {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$Label
+    )
     if ($null -eq $Process -or $Process.HasExited) { return }
 
     # Process.Kill(bool) is unavailable in Windows PowerShell 5.1's .NET
@@ -188,11 +191,16 @@ function Stop-ProbeProcessTree {
     }
 
     if (-not $Process.WaitForExit(10000)) {
-        throw "packaged runtime probe process tree did not terminate within 10 seconds"
+        throw "$Label process tree did not terminate within 10 seconds"
     }
     if ($taskkillFailure) {
-        throw "packaged runtime probe required degraded termination: $taskkillFailure"
+        throw "$Label required degraded termination: $taskkillFailure"
     }
+}
+
+function Stop-ProbeProcessTree {
+    param([System.Diagnostics.Process]$Process)
+    Stop-BoundedProcessTree $Process "packaged runtime probe"
 }
 
 # Auto-detect ARM64 when env vars are not explicitly set.
@@ -523,27 +531,17 @@ function Sync-Directory {
     return $copied
 }
 
-# Extract one dependency basename from either common MSYS2 ldd form:
-#   libfoo.dll => /clang64/bin/libfoo.dll (0x...)
-#   /clangarm64/bin/foo.dll (0x...)
-# Reject path separators and other invalid Windows filename characters after
-# taking the leaf so ldd output can never redirect a copy outside MSYS2 bin.
-function Get-LddDependencyName {
+# Extract one dependency basename from llvm-readobj's PE import-table form:
+#   Import {
+#     Name: libfoo.dll
+#   }
+# --coff-imports includes ordinary and delay-load imports. Reject path
+# separators and other invalid filename characters so inspector output can
+# never redirect a copy outside the selected MSYS2 architecture's bin folder.
+function Get-PeImportDependencyName {
     param([string]$Line)
-    $candidate = $null
-    if ($Line -match '^\s*(.+?\.dll)\s*=>') {
-        $candidate = $matches[1]
-    }
-    elseif ($Line -match '^\s*"?(.+?\.dll)"?(?:\s+\(0x[0-9A-Fa-f]+\))?\s*$') {
-        $candidate = $matches[1]
-    }
-    if (-not $candidate) { return $null }
-
-    $candidate = $candidate.Trim().Trim([char]34).Replace([char]92, [char]47)
-    $slash = $candidate.LastIndexOf([char]47)
-    $leaf = if ($slash -ge 0) { $candidate.Substring($slash + 1) } else { $candidate }
-    if ($leaf -notmatch '^[^\\/:*?"<>|\x00-\x1F]+\.dll$') { return $null }
-    return $leaf
+    if ($Line -notmatch '^\s*Name:\s*([^\\/:*?"<>|\x00-\x1F]+\.dll)\s*$') { return $null }
+    return $matches[1]
 }
 
 function Add-DllScanTarget {
@@ -560,6 +558,180 @@ function Add-DllScanTarget {
     }
     $Known[$fullPath] = $true
     $Queue.Enqueue($fullPath)
+}
+
+# Inspect a bounded batch without ever loading or executing a target DLL.
+# Start-Process redirects both streams straight to files, avoiding deadlocks
+# from synchronous whole-stream pipe reads. File sizes
+# are polled while the process runs and checked again after exit; only then is
+# the capped stdout read into memory for parsing.
+function Invoke-BoundedPeImportBatch {
+    param(
+        [string]$Inspector,
+        [string[]]$Paths,
+        [System.Diagnostics.Stopwatch]$ClosureClock,
+        [int]$ClosureDeadlineMs,
+        [int]$ProcessDeadlineMs,
+        [int64]$OutputByteLimit,
+        [int]$ArgumentCharacterLimit
+    )
+    if ($Paths.Count -eq 0) { return @() }
+
+    $quotedPaths = @()
+    foreach ($path in $Paths) {
+        $extension = [System.IO.Path]::GetExtension($path)
+        if (-not [System.IO.Path]::IsPathRooted($path) -or
+            -not (Test-Path -LiteralPath $path -PathType Leaf) -or
+            ($extension -ine ".dll" -and $extension -ine ".exe")) {
+            throw "PE import-inspection target must be an absolute existing DLL or EXE"
+        }
+        if ($path.IndexOf([char]34) -ge 0 -or $path.IndexOf([char]13) -ge 0 -or
+            $path.IndexOf([char]10) -ge 0) {
+            throw "PE import-inspection path contains an unsupported quote or newline"
+        }
+        $quotedPaths += '"' + $path + '"'
+    }
+    $arguments = "--coff-imports " + ($quotedPaths -join " ")
+    if ($arguments.Length -gt $ArgumentCharacterLimit) {
+        throw "PE import-inspection batch exceeded its $ArgumentCharacterLimit-character command-line limit"
+    }
+
+    $batchNames = @($Paths | Select-Object -First 3 | ForEach-Object {
+        [System.IO.Path]::GetFileName($_)
+    })
+    $batchLabel = $batchNames -join ", "
+    if ($Paths.Count -gt $batchNames.Count) { $batchLabel += ", ..." }
+
+    $token = [Guid]::NewGuid().ToString("N")
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    $stdoutPath = Join-Path $tempRoot "tributary-readobj-$token.stdout"
+    $stderrPath = Join-Path $tempRoot "tributary-readobj-$token.stderr"
+    $process = $null
+    $processClock = [System.Diagnostics.Stopwatch]::StartNew()
+    $failure = $null
+    $diagnostic = ""
+    $stdoutLines = @()
+
+    try {
+        $process = Start-Process -FilePath $Inspector -ArgumentList $arguments `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
+            -NoNewWindow -PassThru
+
+        while (-not $process.WaitForExit(50)) {
+            $stdoutLength = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+                (Get-Item -LiteralPath $stdoutPath).Length
+            } else { 0 }
+            $stderrLength = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+                (Get-Item -LiteralPath $stderrPath).Length
+            } else { 0 }
+            if (($stdoutLength + $stderrLength) -gt $OutputByteLimit) {
+                throw "PE import inspector output crossed its $OutputByteLimit-byte batch limit ($batchLabel)"
+            }
+            if ($processClock.ElapsedMilliseconds -ge $ProcessDeadlineMs) {
+                throw "PE import inspector exceeded its $ProcessDeadlineMs-millisecond batch deadline ($batchLabel)"
+            }
+            if ($ClosureClock.ElapsedMilliseconds -ge $ClosureDeadlineMs) {
+                throw "PE import dependency closure exceeded its $ClosureDeadlineMs-millisecond deadline"
+            }
+        }
+
+        $stdoutLength = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+            (Get-Item -LiteralPath $stdoutPath).Length
+        } else { 0 }
+        $stderrLength = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+            (Get-Item -LiteralPath $stderrPath).Length
+        } else { 0 }
+        if (($stdoutLength + $stderrLength) -gt $OutputByteLimit) {
+            throw "PE import inspector output crossed its $OutputByteLimit-byte batch limit ($batchLabel)"
+        }
+        if ($processClock.ElapsedMilliseconds -ge $ProcessDeadlineMs) {
+            throw "PE import inspector exceeded its $ProcessDeadlineMs-millisecond batch deadline ($batchLabel)"
+        }
+        if ($ClosureClock.ElapsedMilliseconds -ge $ClosureDeadlineMs) {
+            throw "PE import dependency closure exceeded its $ClosureDeadlineMs-millisecond deadline"
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "PE import inspector exited with status $($process.ExitCode) ($batchLabel)"
+        }
+        $stdoutLines = @([System.IO.File]::ReadAllLines($stdoutPath))
+    }
+    catch {
+        $failure = $_.Exception.Message
+    }
+    finally {
+        try {
+            Stop-BoundedProcessTree $process "PE import inspector"
+        }
+        catch {
+            if ($failure) { $failure += "; $($_.Exception.Message)" }
+            else { $failure = $_.Exception.Message }
+        }
+        if ($failure) {
+            $diagnostic = Get-BoundedProbeDiagnostic $stderrPath "PE inspector stderr" 8192
+            if (-not $diagnostic) {
+                $diagnostic = Get-BoundedProbeDiagnostic $stdoutPath "PE inspector stdout" 8192
+            }
+        }
+        if ($null -ne $process) { $process.Dispose() }
+        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($failure) {
+        if ($diagnostic) { throw "$failure`n$diagnostic" }
+        throw $failure
+    }
+    return $stdoutLines
+}
+
+function Add-PeImportDependencies {
+    param(
+        [string[]]$Lines,
+        [string]$SourceLabel,
+        [string]$ArchitectureBin,
+        [string]$Distribution,
+        [System.Collections.Queue]$Queue,
+        [hashtable]$Known,
+        [int]$TargetLimit,
+        [ref]$OutputLineCount,
+        [int]$OutputLineLimit,
+        [ref]$CopiedCount,
+        [System.Diagnostics.Stopwatch]$ClosureClock,
+        [int]$ClosureDeadlineMs
+    )
+    foreach ($line in $Lines) {
+        if ($ClosureClock.ElapsedMilliseconds -ge $ClosureDeadlineMs) {
+            throw "PE import dependency closure exceeded its $ClosureDeadlineMs-millisecond deadline"
+        }
+        $OutputLineCount.Value = [int]$OutputLineCount.Value + 1
+        if ($OutputLineCount.Value -gt $OutputLineLimit) {
+            throw "PE import dependency closure exceeded its $OutputLineLimit-line safety limit"
+        }
+
+        $dllName = Get-PeImportDependencyName ([string]$line)
+        if (-not $dllName) { continue }
+
+        # Copy only exact imports that exist in the selected architecture's
+        # bin directory. Imports provided by Windows itself are intentionally
+        # not bundled; API-set contract names need not have a physical file.
+        $srcPath = Join-Path $ArchitectureBin $dllName
+        if (Test-Path -LiteralPath $srcPath -PathType Leaf) {
+            $destPath = Join-Path $Distribution $dllName
+            if (Copy-IfNewer $srcPath $destPath) {
+                Write-Host "  copied: $dllName"
+                $CopiedCount.Value = [int]$CopiedCount.Value + 1
+            }
+            if ($ClosureClock.ElapsedMilliseconds -ge $ClosureDeadlineMs) {
+                throw "PE import dependency closure exceeded its $ClosureDeadlineMs-millisecond deadline"
+            }
+            Add-DllScanTarget $Queue $Known $destPath $TargetLimit
+            continue
+        }
+
+        $systemPath = Join-Path ([System.Environment]::SystemDirectory) $dllName
+        $isApiSet = $dllName -match '^(?i:api-ms-win-|ext-ms-win-)'
+        if ($isApiSet -or (Test-Path -LiteralPath $systemPath -PathType Leaf)) { continue }
+        throw "Unresolved DLL import $dllName reported for $SourceLabel"
+    }
 }
 
 New-Item -ItemType Directory -Force $DIST | Out-Null
@@ -600,10 +772,16 @@ Remove-Item -LiteralPath $legacyGstScannerDest -Force -ErrorAction SilentlyConti
 Copy-Item -LiteralPath $gstScannerSrc -Destination $gstScannerDest -Force
 Write-Info "Bundled gst-plugin-scanner.exe (unconditional overwrite)."
 
-# Resolve all transitive dependencies for the EXE and Plugins.
-# Use the explicit MSYS2 path for ldd to ensure it exists in PowerShell.
-$ldd = Join-Path $Msys2Root "usr\bin\ldd.exe"
-if (-not (Test-Path $ldd)) { $ldd = "ldd" }
+# Resolve all transitive dependencies for the EXE and plugins without loading
+# them. MSYS2's ldd executes each target under its loader and can hang forever
+# on an otherwise optional plugin; llvm-readobj inspects the PE import table
+# as data. Require the selected architecture's exact tool rather than falling
+# back through PATH or borrowing an inspector from another architecture.
+$peImportInspector = [System.IO.Path]::GetFullPath((Join-Path $MsysPath "bin\llvm-readobj.exe"))
+if (-not [System.IO.Path]::IsPathRooted($peImportInspector) -or
+    -not (Test-Path -LiteralPath $peImportInspector -PathType Leaf)) {
+    Write-Err "Required PE import inspector not found at $peImportInspector. Install the matching $PkgPrefix-llvm package."
+}
 
 Write-Info "Resolving required DLLs for executable and plugins..."
 
@@ -616,7 +794,12 @@ if (-not (Test-Path -LiteralPath $requiredSoupPluginDest -PathType Leaf)) {
 }
 
 $maxDllScanTargets = 4096
-$maxLddOutputLines = 131072
+$maxPeInspectorOutputLines = 131072
+$maxPeInspectorBatchTargets = 28
+$maxPeInspectorArgumentCharacters = 24000
+$maxPeInspectorBatchOutputBytes = 8388608
+$peInspectorBatchDeadlineMs = 45000
+$peInspectorClosureDeadlineMs = 300000
 $dllScanQueue = [System.Collections.Queue]::new()
 $knownDllScanTargets = @{}
 $scannedDllTargets = @{}
@@ -632,60 +815,116 @@ $requiredSoupRuntimeDest = Join-Path $DIST $requiredSoupRuntimeName
 $requiredSoupRuntimeFull = [System.IO.Path]::GetFullPath($requiredSoupRuntimeDest)
 $soupPluginScanned = $false
 $soupRuntimeDependencyObserved = $false
-$lddOutputLineCount = 0
+$peInspectorOutputLineCount = 0
+$peInspectorClosureClock = [System.Diagnostics.Stopwatch]::StartNew()
 
-while ($dllScanQueue.Count -gt 0) {
-    $bin = [string]$dllScanQueue.Dequeue()
-    if ($scannedDllTargets.ContainsKey($bin)) { continue }
-    $scannedDllTargets[$bin] = $true
-    $isSoupPlugin = $bin -ieq $requiredSoupPluginFull
-    if ($isSoupPlugin) { $soupPluginScanned = $true }
-
-    $lddLines = @(& $ldd $bin 2>$null)
-    $lddExitCode = $LASTEXITCODE
-    if ($lddExitCode -ne 0) {
-        Write-Err "DLL dependency inspection failed for $([System.IO.Path]::GetFileName($bin)) (ldd status $lddExitCode)."
-    }
-
-    foreach ($line in $lddLines) {
-        $lddOutputLineCount++
-        if ($lddOutputLineCount -gt $maxLddOutputLines) {
-            Write-Err "DLL dependency closure exceeded its $maxLddOutputLines-line safety limit."
-        }
-
-        $dllName = Get-LddDependencyName ([string]$line)
-        if (-not $dllName) { continue }
-        if ([string]$line -match '=>\s+not found') {
-            Write-Err "Unresolved DLL dependency $dllName required by $([System.IO.Path]::GetFileName($bin))."
-        }
-        if ($isSoupPlugin -and $dllName -ieq $requiredSoupRuntimeName) {
+# Inspect Soup alone first. That singleton output proves libsoup is a direct
+# import of libgstsoup rather than merely an import of some unrelated member
+# in a multi-file batch. The same parser/copy path then seeds its transitives.
+Write-Host "  inspecting required Soup plugin imports..."
+try {
+    $soupInspectorLines = @(Invoke-BoundedPeImportBatch `
+        $peImportInspector @($requiredSoupPluginFull) $peInspectorClosureClock `
+        $peInspectorClosureDeadlineMs $peInspectorBatchDeadlineMs `
+        $maxPeInspectorBatchOutputBytes $maxPeInspectorArgumentCharacters)
+    foreach ($line in $soupInspectorLines) {
+        $dllName = Get-PeImportDependencyName ([string]$line)
+        if ($dllName -and $dllName -ieq $requiredSoupRuntimeName) {
             $soupRuntimeDependencyObserved = $true
         }
+    }
+    Add-PeImportDependencies $soupInspectorLines $requiredSoupPluginName `
+        (Join-Path $MsysPath "bin") $DIST $dllScanQueue $knownDllScanTargets `
+        $maxDllScanTargets ([ref]$peInspectorOutputLineCount) `
+        $maxPeInspectorOutputLines ([ref]$totalCopied) $peInspectorClosureClock `
+        $peInspectorClosureDeadlineMs
+    $scannedDllTargets[$requiredSoupPluginFull] = $true
+    $soupPluginScanned = $true
+}
+catch {
+    Write-Err "Required Soup plugin import inspection failed: $($_.Exception.Message)"
+}
 
-        # Copy only dependencies ldd identifies and that exist in the selected
-        # MSYS2 architecture's bin directory; do not sweep unrelated DLLs.
-        $srcPath = Join-Path $MsysPath "bin\$dllName"
-        if (Test-Path -LiteralPath $srcPath -PathType Leaf) {
-            $destPath = Join-Path $DIST $dllName
-            if (Copy-IfNewer $srcPath $destPath) {
-                Write-Host "  copied: $dllName"
-                $totalCopied++
+# Process a snapshot of each queue round in bounded batches. Dependencies
+# discovered in one round are enqueued for the next, so every copied MSYS2 DLL
+# is inspected exactly once and the queue reaches a true transitive closure.
+$peInspectorRound = 0
+while ($dllScanQueue.Count -gt 0) {
+    if ($peInspectorClosureClock.ElapsedMilliseconds -ge $peInspectorClosureDeadlineMs) {
+        Write-Err "PE import dependency closure exceeded its $peInspectorClosureDeadlineMs-millisecond deadline."
+    }
+    $peInspectorRound++
+    $roundTargets = @()
+    while ($dllScanQueue.Count -gt 0) {
+        $bin = [string]$dllScanQueue.Dequeue()
+        if ($scannedDllTargets.ContainsKey($bin)) { continue }
+        $scannedDllTargets[$bin] = $true
+        $roundTargets += $bin
+    }
+    if ($roundTargets.Count -eq 0) { continue }
+    Write-Host "  import round ${peInspectorRound}: $($roundTargets.Count) binary target(s)"
+
+    $offset = 0
+    $batchNumber = 0
+    while ($offset -lt $roundTargets.Count) {
+        $batchNumber++
+        $batchTargets = @()
+        $batchArgumentCharacters = "--coff-imports ".Length
+        while ($offset -lt $roundTargets.Count -and
+            $batchTargets.Count -lt $maxPeInspectorBatchTargets) {
+            $candidate = [string]$roundTargets[$offset]
+            $candidateCharacters = $candidate.Length + 3
+            if (($batchArgumentCharacters + $candidateCharacters) -gt $maxPeInspectorArgumentCharacters) {
+                if ($batchTargets.Count -eq 0) {
+                    Write-Err "PE import-inspection target exceeds the command-line safety limit: $([System.IO.Path]::GetFileName($candidate))"
+                }
+                break
             }
-            Add-DllScanTarget $dllScanQueue $knownDllScanTargets $destPath $maxDllScanTargets
+            $batchTargets += $candidate
+            $batchArgumentCharacters += $candidateCharacters
+            $offset++
+        }
+
+        Write-Host "    batch ${batchNumber}: $($batchTargets.Count) target(s)"
+        try {
+            $batchLines = @(Invoke-BoundedPeImportBatch `
+                $peImportInspector $batchTargets $peInspectorClosureClock `
+                $peInspectorClosureDeadlineMs $peInspectorBatchDeadlineMs `
+                $maxPeInspectorBatchOutputBytes $maxPeInspectorArgumentCharacters)
+            $batchNames = @($batchTargets | Select-Object -First 3 | ForEach-Object {
+                [System.IO.Path]::GetFileName($_)
+            }) -join ", "
+            if ($batchTargets.Count -gt 3) { $batchNames += ", ..." }
+            Add-PeImportDependencies $batchLines $batchNames `
+                (Join-Path $MsysPath "bin") $DIST $dllScanQueue $knownDllScanTargets `
+                $maxDllScanTargets ([ref]$peInspectorOutputLineCount) `
+                $maxPeInspectorOutputLines ([ref]$totalCopied) $peInspectorClosureClock `
+                $peInspectorClosureDeadlineMs
+            if ($peInspectorClosureClock.ElapsedMilliseconds -ge $peInspectorClosureDeadlineMs) {
+                throw "PE import dependency closure exceeded its $peInspectorClosureDeadlineMs-millisecond deadline"
+            }
+        }
+        catch {
+            Write-Err "DLL import inspection failed in round $peInspectorRound, batch ${batchNumber}: $($_.Exception.Message)"
         }
     }
+}
+if ($peInspectorClosureClock.ElapsedMilliseconds -ge $peInspectorClosureDeadlineMs) {
+    Write-Err "PE import dependency closure exceeded its $peInspectorClosureDeadlineMs-millisecond deadline."
 }
 
 if (-not $soupPluginScanned) {
-    Write-Err "Required souphttpsrc plugin was not inspected by the DLL dependency closure."
+    Write-Err "Required souphttpsrc plugin was not inspected by the PE import dependency closure."
 }
 if (-not $soupRuntimeDependencyObserved) {
-    Write-Err "Required souphttpsrc plugin did not report its $requiredSoupRuntimeName dependency."
+    Write-Err "Required souphttpsrc plugin did not directly import $requiredSoupRuntimeName."
 }
 if (-not (Test-Path -LiteralPath $requiredSoupRuntimeDest -PathType Leaf) -or
     -not $scannedDllTargets.ContainsKey($requiredSoupRuntimeFull)) {
-    Write-Err "Required souphttpsrc runtime dependency $requiredSoupRuntimeName was not copied and inspected."
+    Write-Err "Required souphttpsrc runtime dependency $requiredSoupRuntimeName was not copied and PE-inspected."
 }
+
+Write-Host "  dependency closure complete: $($scannedDllTargets.Count) binary target(s) in $peInspectorRound round(s)"
 
 Write-Info "Incremental sync: $totalCopied file(s) updated."
 
