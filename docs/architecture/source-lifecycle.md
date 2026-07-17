@@ -76,12 +76,39 @@ reverse-proxy path. Scheme and host case, default ports, and the optional traili
 segment are normalized; different non-default ports or non-empty base paths remain different
 sources. User-info, query, and fragment data are rejected rather than used in identity.
 
-Saved-source persistence gains a schema version and `source_id`. On upgrade, every valid record
-without an ID receives the deterministic legacy ID above and the complete file is atomically
-replaced before any row is published. A duplicate canonical `(backend, base URL)` must resolve to
-one ID; conflicting pre-existing IDs are quarantined for explicit repair instead of silently
-merging two identities. Changing an endpoint through a future explicit rebind retains the stored
-ID. Merely discovering a different URL never migrates identity by name or library similarity.
+Saved-source persistence replaces the legacy bare JSON array with this versioned envelope:
+
+```json
+{
+  "schema_version": 1,
+  "servers": [
+    {
+      "type": "subsonic",
+      "name": "Home",
+      "url": "https://music.example.test/",
+      "source_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}
+```
+
+The reader accepts exactly the legacy array as version 0 or the envelope version it implements;
+an unknown version, malformed root, or malformed version-1 identity publishes no saved rows and
+leaves the original bytes untouched. It reports only a fixed category and count, never row
+contents. On a version-0 upgrade, rows that fail the existing backend/URL validation are removed
+with the same count-only warning used today. Every remaining row receives the deterministic legacy
+ID above. Duplicate canonical `(backend, base URL)` rows collapse to their first file-order row and
+its display name because they describe one logical source. A duplicate canonical endpoint with
+different pre-existing IDs, or one `source_id` assigned to different canonical endpoints, instead
+quarantines the complete file: no row is published or rewritten until the user explicitly removes
+or rebinds the conflicting record. Quarantine is a loader state over the unchanged `servers.json`,
+not a second persistence store.
+
+The complete version-1 envelope is written to a same-directory temporary file and atomically
+replaces the legacy file before any migrated row is published. A write or replacement failure
+publishes nothing and preserves the last complete file. Changing an endpoint through a future
+explicit rebind retains the stored ID. Merely discovering a different URL never migrates identity
+by name or library similarity.
 
 The existing local `tracks.id` value is already the local backend's native `TrackId` and is kept
 byte-for-byte, including a legacy non-UUID string. The current random fallback in
@@ -274,9 +301,15 @@ Radio-Browser is one registered stateless source. Top Clicked, Top Voted, and Ne
 the geolocation/consent branch for Near Me, and each view retains its last successful snapshot
 during refresh. `TrackId` is the station UUID; the current station URL is a locator in the source
 adapter and resolves only when playback starts. The adapter retains a locator while at least one
-current view snapshot contains that station; once no view owns it, the station is unavailable
-rather than played from an old URL. The resolved public stream may remain direct because it carries
-no Tributary credential.
+current view snapshot contains that station. It retains contributions per `ViewOrigin`, tagged
+with the globally increasing operation generation that produced each accepted snapshot. If live
+views disagree about a station locator, resolution selects the contribution with the greatest
+accepted generation—therefore the newest initiated successful refresh, not whichever request
+completed last. Replacing or deleting a view snapshot removes that view's old contributions and
+recomputes the winner from the remaining views; a failed or superseded refresh leaves its prior
+accepted contribution intact. Once no current view owns the station, it is unavailable rather than
+played from an old URL. The resolved public stream may remain direct because it carries no
+Tributary credential.
 
 #### Removable media
 
@@ -328,10 +361,11 @@ The identity and ownership invariants above are settled. Three representation de
 with the first implementation patch and then frozen by migration fixtures: the checked-in UUID
 namespace value, the exact non-lossy relative-path encoding for removable `TrackId`, and the
 per-adapter ID length bounds. The chosen bounds must admit every currently supported local path and
-provider fixture while bounding hostile catalogue input. The saved-source migration extends the
-existing `servers.json` format with its schema version and `source_id`; it does not introduce a
-second saved-source database or persist credentials. Exact Rust trait names and event-channel
-shapes are internal implementation details so long as one registry enforces this contract.
+provider fixture while bounding hostile catalogue input. The saved-source envelope, legacy-array
+reader, and whole-file conflict quarantine above are settled rather than deferred; they do not
+introduce a second saved-source database or persist credentials. Exact Rust trait names and
+event-channel shapes are internal implementation details so long as one registry enforces this
+contract.
 
 ## Implementation sequence
 
