@@ -638,12 +638,8 @@ async fn proxy_upstream(
     };
     let mut request = http.get(upstream_url);
     if let UpstreamRequest::Resolved(resolved) = upstream_request {
-        for (name, value) in resolved.required_headers() {
-            request = request.header(name, value);
-        }
-        for (name, value) in resolved.sensitive_headers() {
-            request = request.header(name, value);
-        }
+        request = request.headers(resolved.required_headers().clone());
+        request = request.headers(resolved.sensitive_headers().clone());
     }
     if let Some(range) = receiver_headers.get(header::RANGE) {
         request = request.header(header::RANGE, range.clone());

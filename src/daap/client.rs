@@ -9,6 +9,7 @@
 //! 3. `GET /update` → revision-number
 //! 4. `GET /databases` → database-id
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, USER_AGENT};
@@ -414,7 +415,7 @@ impl DaapClient {
     fn resolved_media_request(&self, endpoint: Url) -> BackendResult<ResolvedHttpRequest> {
         let mut request = ResolvedHttpRequest::new(endpoint)?
             .with_private_query_pair("session-id", self.session_id.to_string())?;
-        for (name, value) in &daap_required_headers() {
+        for (name, value) in daap_required_headers() {
             request = request.with_required_header(name.clone(), value.clone())?;
         }
         if let Some(route) = &self.advertised_route {
@@ -519,7 +520,7 @@ fn build_http_client(
     origin: &Url,
     advertised_route: Option<&AdvertisedHttpRoute>,
 ) -> BackendResult<Client> {
-    let headers = daap_required_headers();
+    let headers = daap_required_headers().clone();
 
     let builder = authenticated_client_builder()
         .default_headers(headers)
@@ -538,23 +539,26 @@ fn build_http_client(
 ///
 /// Keeping one map for both paths prevents proxied playback from drifting
 /// away from the protocol identity used during the session handshake.
-fn daap_required_headers() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static(DMAP_CONTENT_TYPE));
-    headers.insert(
-        HeaderName::from_static("client-daap-version"),
-        HeaderValue::from_static(DAAP_VERSION),
-    );
-    headers.insert(
-        HeaderName::from_static("client-daap-access-index"),
-        HeaderValue::from_static("2"),
-    );
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_str(&format!("{CLIENT_NAME}/{CLIENT_VERSION}"))
-            .expect("package version forms a valid DAAP user agent"),
-    );
-    headers
+fn daap_required_headers() -> &'static HeaderMap {
+    static HEADERS: OnceLock<HeaderMap> = OnceLock::new();
+    HEADERS.get_or_init(|| {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static(DMAP_CONTENT_TYPE));
+        headers.insert(
+            HeaderName::from_static("client-daap-version"),
+            HeaderValue::from_static(DAAP_VERSION),
+        );
+        headers.insert(
+            HeaderName::from_static("client-daap-access-index"),
+            HeaderValue::from_static("2"),
+        );
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(&format!("{CLIENT_NAME}/{CLIENT_VERSION}"))
+                .expect("package version forms a valid DAAP user agent"),
+        );
+        headers
+    })
 }
 
 fn daap_request_error(context: &str, error: reqwest::Error) -> BackendError {
@@ -677,7 +681,7 @@ mod tests {
                 format!("http://music.test:3689{prefix}/databases/1/items/7.flac"),
                 "base URL: {base}"
             );
-            assert_eq!(stream.required_headers(), &daap_required_headers());
+            assert_eq!(stream.required_headers(), daap_required_headers());
 
             let artwork = client.cover_art_request(7).expect("artwork request");
             assert_eq!(
@@ -687,7 +691,7 @@ mod tests {
                 ),
                 "base URL: {base}"
             );
-            assert_eq!(artwork.required_headers(), &daap_required_headers());
+            assert_eq!(artwork.required_headers(), daap_required_headers());
 
             let malicious = client
                 .stream_request(7, "flac/../../logout")

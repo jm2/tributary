@@ -494,6 +494,7 @@ mod tests {
 
     #[test]
     fn api_and_media_paths_preserve_reverse_proxy_prefixes_exactly() {
+        let password = uuid::Uuid::new_v4().to_string();
         for (base, prefix) in [
             ("https://music.example.test", ""),
             ("https://music.example.test/share", "/share"),
@@ -503,7 +504,7 @@ mod tests {
                 "/tenant%2Fmusic",
             ),
         ] {
-            let mut client = SubsonicClient::new(base, "user", "password").expect("client");
+            let mut client = SubsonicClient::new(base, "user", &password).expect("client");
             client.auth = AuthMode::Token {
                 token: "fixed-token".to_string(),
                 salt: "fixed-salt".to_string(),
@@ -543,9 +544,10 @@ mod tests {
 
     #[tokio::test]
     async fn maps_http_200_failed_envelopes_to_typed_subsonic_errors() {
+        let password = uuid::Uuid::new_v4().to_string();
         for code in [40, 41, 70] {
             let (base_url, server) = spawn_failed_envelope(code);
-            let client = SubsonicClient::new(&base_url, "user", "password").expect("client");
+            let client = SubsonicClient::new(&base_url, "user", &password).expect("client");
             let error = client
                 .get("ping.view")
                 .await

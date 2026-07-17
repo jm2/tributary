@@ -1300,8 +1300,10 @@ artwork request materialization; typed Subsonic HTTP-200 failed-envelope mapping
 proxied protected upstream transport. The real loopback
 fixtures exercise the receiver-to-ticket-to-upstream boundary, including receiver-header
 filtering, private query application, advertised-route origin retention, and selected-proxy
-transport. `cargo fmt --all -- --check` and `git diff --check` pass. No dependency or lockfile
-changed.
+transport. Automated-review follow-ups apply each trusted header map with reqwest's replacement
+semantics, cache the immutable DAAP protocol map for process lifetime, and generate fixture
+passwords dynamically so code scanning does not mistake test literals for shipped credentials.
+`cargo fmt --all -- --check` and `git diff --check` pass. No dependency or lockfile changed.
 
 Previous branch validation (2026-07-16, PR #107 P2.10 real-socket coverage slice):
 `cargo check --all-targets --all-features --locked` and
