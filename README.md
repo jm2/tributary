@@ -109,6 +109,26 @@ conservatively retains its queued ID rather than risking disruption of the forei
 
 The diagram above is the **intended** architecture, and the remote backends (Subsonic, Jellyfin, Plex, DAAP) each implement the `MediaBackend` async trait. The trait is not yet the real seam, though: it is never used as a trait object, the UI still branches per backend when connecting a source, and the local library is queried directly through SQLite rather than through `LocalBackend`. Unifying them is tracked as P3.2 in [`docs/task.md`](docs/task.md).
 
+The local backend's aggregate contract is now stable even though that integration seam is not.
+Local artist and album IDs use a private, versioned UUIDv5 namespace with separate artist/album
+domains and length-framed exact metadata. An artist key is its stored performing-artist name; an
+album key is its stored title plus its effective album artist. A missing or Unicode-whitespace-only
+album-artist tag falls back to the performing artist, while every nonblank value is preserved
+exactly—case, normalization, and surrounding whitespace included. This keeps same-titled albums by
+different artists separate and groups compilation tracks that share an album artist. Local tracks
+carry those same aggregate IDs, and `LocalBackend` can resolve album/artist track lists; it resolves
+the compact metadata key first, then restricts SQLite to the exact album title or performing artist
+instead of loading all track models. Unknown aggregate IDs return an empty list.
+
+Album year and genre are deterministic numeric and lexical minima, respectively, when track tags
+disagree, rather than values from an arbitrary SQLite row. `Album.artist_id` deliberately remains
+empty because a compilation's album artist is not necessarily any performing-artist entity.
+Identity-bearing metadata edits therefore
+produce a new aggregate ID, and malformed persisted local track IDs still use the pre-existing
+random fallback during model conversion. Persisting/repairing invalid `TrackId` values, resolving
+local and playlist media by ID at use time, and routing the shipping local UI through
+`LocalBackend` remain tracked work; this aggregate slice does not claim those architecture changes.
+
 The P3.1 [source identity and lifecycle decision](docs/architecture/source-lifecycle.md)
 defines the seam beneath that intended backend diagram: stable `SourceId` plus backend-native
 `TrackId` identity, one generation/cancellation/failure owner, explicit DAAP shutdown, and
