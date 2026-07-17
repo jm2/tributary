@@ -4,6 +4,7 @@
 //! when the user clicks a row in the output selector popover.
 
 use std::cell::RefCell;
+use std::net::SocketAddr;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -24,7 +25,7 @@ pub enum OutputTarget {
     Local,
     Mpd { host: String, port: u16 },
     AirPlay { host: String, port: u16 },
-    Chromecast { host: String, port: u16 },
+    Chromecast { address: SocketAddr },
 }
 
 fn output_change_required(active: &OutputTarget, requested: &OutputTarget) -> bool {
@@ -135,6 +136,9 @@ pub fn setup_output_selector(
             let is_chromecast = row_icon_name == "video-display-symbolic";
 
             if is_chromecast {
+                let OutputTarget::Chromecast { address } = &requested_target else {
+                    return;
+                };
                 handle_chromecast_switch(
                     activated_row,
                     &active_output,
@@ -142,6 +146,7 @@ pub fn setup_output_selector(
                     &event_sender,
                     &volume_scale,
                     &rt_handle,
+                    *address,
                 );
             } else if is_airplay {
                 handle_airplay_switch(
@@ -189,8 +194,8 @@ fn target_for_row(
     let icon = row_icon_name(activated_row);
     let host_port = activated_row.widget_name().to_string();
     if icon == "video-display-symbolic" {
-        let (host, port) = parse_host_port(&host_port, 8009);
-        return Some(OutputTarget::Chromecast { host, port });
+        let address = host_port.parse().ok()?;
+        return Some(OutputTarget::Chromecast { address });
     }
     if icon == "network-wireless-symbolic" {
         let (host, port) = parse_host_port(&host_port, 7000);
@@ -229,6 +234,7 @@ fn handle_chromecast_switch(
     event_sender: &async_channel::Sender<PlayerEvent>,
     volume_scale: &gtk::Scale,
     rt_handle: &tokio::runtime::Handle,
+    address: SocketAddr,
 ) {
     let cast_name = activated_row
         .first_child()
@@ -242,9 +248,6 @@ fn handle_chromecast_switch(
         .map(|l| l.text().to_string())
         .unwrap_or_default();
 
-    let host_port = activated_row.widget_name().to_string();
-    let (host, port) = parse_host_port(&host_port, 8009);
-
     park_local_if_needed(active_output, parked_local, event_sender);
 
     // Seed the new output with the current slider value so selecting a device
@@ -252,8 +255,7 @@ fn handle_chromecast_switch(
     // authoritative and the device starts at the user's chosen level).
     let chromecast = ChromecastOutput::new(
         &cast_name,
-        &host,
-        port,
+        address,
         event_sender.clone(),
         volume_scale.value(),
     )
@@ -261,8 +263,7 @@ fn handle_chromecast_switch(
     *active_output.borrow_mut() = Box::new(chromecast);
     info!(
         name = %cast_name,
-        host = %host,
-        port,
+        %address,
         "Switched to Chromecast output"
     );
 
@@ -455,12 +456,10 @@ mod tests {
     #[test]
     fn endpoint_identity_distinguishes_real_output_changes() {
         let first = OutputTarget::Chromecast {
-            host: "192.0.2.10".to_string(),
-            port: 8009,
+            address: "192.0.2.10:8009".parse().unwrap(),
         };
         let second = OutputTarget::Chromecast {
-            host: "192.0.2.11".to_string(),
-            port: 8009,
+            address: "192.0.2.11:8009".parse().unwrap(),
         };
         assert!(output_change_required(&first, &second));
         assert!(output_change_required(&first, &OutputTarget::Local));
