@@ -6137,10 +6137,10 @@ where
 /// thread rebuilds from a snapshot in one pass, and the playback queue
 /// re-resolves its items by their stable track IDs.
 async fn send_library_snapshot(db: &DatabaseConnection, tx: &async_channel::Sender<LibraryEvent>) {
-    match track::Entity::find().all(db).await {
-        Ok(rows) => {
-            let all_tracks: Vec<Track> = rows.iter().map(db_model_to_track).collect();
-            let _ = tx.send(LibraryEvent::FullSync(all_tracks)).await;
+    let backend = super::backend::LocalBackend::new(db.clone());
+    match crate::architecture::load_track_catalog(&backend).await {
+        Ok(tracks) => {
+            let _ = tx.send(LibraryEvent::FullSync(tracks)).await;
         }
         Err(error) => warn!(%error, "Failed to load tracks for full sync"),
     }

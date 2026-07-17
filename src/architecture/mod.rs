@@ -9,5 +9,5 @@ pub mod error;
 pub mod media;
 pub mod models;
 
-pub use backend::MediaBackend;
+pub use backend::{load_track_catalog, MediaBackend};
 pub use media::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest};

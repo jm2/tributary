@@ -376,11 +376,15 @@ pub fn show_add_server_dialog(
                             .await
                             {
                                 Ok(backend) => {
-                                    let tracks = backend.all_tracks().await;
-                                    Ok(attempt
-                                        .retain(Arc::new(backend))
-                                        .filter(crate::source_registry::RetainedSource::is_current)
-                                        .map(|source| (tracks, source)))
+                                    match crate::architecture::load_track_catalog(&backend).await {
+                                        Ok(tracks) => Ok(attempt
+                                            .retain(Arc::new(backend))
+                                            .filter(
+                                                crate::source_registry::RetainedSource::is_current,
+                                            )
+                                            .map(|source| (tracks, source))),
+                                        Err(error) => Err((error, attempt.is_latest())),
+                                    }
                                 }
                                 Err(e) => Err((e, attempt.is_latest())),
                             }
@@ -397,11 +401,15 @@ pub fn show_add_server_dialog(
                             match crate::plex::PlexBackend::from_client(&server_name, client).await
                             {
                                 Ok(backend) => {
-                                    let tracks = backend.all_tracks().await;
-                                    Ok(attempt
-                                        .retain(Arc::new(backend))
-                                        .filter(crate::source_registry::RetainedSource::is_current)
-                                        .map(|source| (tracks, source)))
+                                    match crate::architecture::load_track_catalog(&backend).await {
+                                        Ok(tracks) => Ok(attempt
+                                            .retain(Arc::new(backend))
+                                            .filter(
+                                                crate::source_registry::RetainedSource::is_current,
+                                            )
+                                            .map(|source| (tracks, source))),
+                                        Err(error) => Err((error, attempt.is_latest())),
+                                    }
                                 }
                                 Err(e) => Err((e, attempt.is_latest())),
                             }
@@ -420,11 +428,13 @@ pub fn show_add_server_dialog(
                     .await
                     {
                         Ok(backend) => {
-                            let tracks = backend.all_tracks().await;
-                            Ok(attempt
-                                .retain(Arc::new(backend))
-                                .filter(crate::source_registry::RetainedSource::is_current)
-                                .map(|source| (tracks, source)))
+                            match crate::architecture::load_track_catalog(&backend).await {
+                                Ok(tracks) => Ok(attempt
+                                    .retain(Arc::new(backend))
+                                    .filter(crate::source_registry::RetainedSource::is_current)
+                                    .map(|source| (tracks, source))),
+                                Err(error) => Err((error, attempt.is_latest())),
+                            }
                         }
                         Err(e) => Err((e, attempt.is_latest())),
                     }

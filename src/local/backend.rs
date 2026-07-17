@@ -219,6 +219,14 @@ impl MediaBackend for LocalBackend {
         })
     }
 
+    async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
+        track::Entity::find()
+            .all(&self.db)
+            .await
+            .map(|rows| rows.iter().map(db_model_to_track).collect())
+            .map_err(|error| BackendError::Internal(error.into()))
+    }
+
     async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
         let mut grouped = BTreeMap::<(String, String), AlbumTotals>::new();
         for row in self.aggregate_fragments().await? {
