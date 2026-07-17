@@ -102,7 +102,11 @@ letting a fragmented header return `WouldBlock` before cancellation is published
 are now explicitly restored to blocking mode before their bounded read/write deadlines are
 installed, and any configuration failure remains fatal. The malformed fixture also half-closes its
 completed request before reading the response, making request completion deterministic without
-relaxing the server assertion. A replacement native matrix remains pending.
+relaxing the server assertion. Final static run 29613604485 and complete matrix 29613606936 then
+passed: all 718 x86_64 Windows application tests were green, both Windows architectures completed
+their finished-distribution protected-playback probes, and every exact-toolchain, audit, metadata,
+coverage, Linux, Flatpak, macOS, package, and checksum sibling passed. No actionable automated
+review thread remains.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1565,7 +1569,9 @@ listener now explicitly returns each accepted Winsock socket to blocking mode be
 its bounded read/write deadlines, so a fragmented header waits rather than spuriously returning
 `WouldBlock`; configuration, timeout, semantic-request, and response failures remain fatal. The
 malformed fixture now half-closes its completed request before response drain to make completion
-deterministic. A replacement native matrix is pending.
+deterministic. Final static run 29613604485 and complete matrix 29613606936 passed every job,
+including all 718 x86_64 Windows application tests and both native finished-distribution probes.
+No actionable automated review thread remains; Gemini posted only its service-sunset notice.
 
 Most recent accepted validation (2026-07-17, PR #112 P2.10 exclusive-control slice):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature
