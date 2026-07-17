@@ -29,6 +29,8 @@ mod gstreamer_media;
 pub mod local_output;
 pub mod mpd_output;
 pub mod output;
+#[cfg(test)]
+pub mod test_support;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

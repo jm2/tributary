@@ -622,6 +622,11 @@ fn unwrap_nested_container<'a>(
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
+    use crate::audio::test_support::{
+        assert_protected_stream_cases_play_to_eos, ProtectedStreamCase,
+    };
+    use crate::subsonic::SubsonicClient;
+
     use super::*;
 
     fn client(base_url: &str) -> DaapClient {
@@ -634,6 +639,98 @@ mod tests {
             http: build_http_client(&base_url, None).expect("DAAP client"),
             advertised_route: None,
         }
+    }
+
+    #[test]
+    fn protected_daap_and_subsonic_streams_play_to_eos() {
+        const EXACT_TEST_NAME: &str =
+            "daap::client::tests::protected_daap_and_subsonic_streams_play_to_eos";
+
+        assert_protected_stream_cases_play_to_eos(EXACT_TEST_NAME, |fixture_origin| {
+            let mut server_url = fixture_origin.clone();
+            server_url.set_path("/share/");
+
+            let daap_request = client(server_url.as_str())
+                .stream_request(7, "flac")
+                .expect("DAAP stream request");
+            assert_eq!(
+                daap_request.private_query_pairs(),
+                &[("session-id".to_string(), "42".to_string())]
+            );
+            assert!(daap_request.endpoint().query().is_none());
+            let daap_case =
+                ProtectedStreamCase::new(daap_request, "/share/databases/1/items/7.flac")
+                    .with_query_pair("session-id", "42")
+                    .with_required_header(
+                        ACCEPT,
+                        HeaderValue::from_static("application/x-dmap-tagged"),
+                    )
+                    .with_required_header(
+                        USER_AGENT,
+                        HeaderValue::from_str(&format!("Tributary/{CLIENT_VERSION}"))
+                            .expect("valid DAAP user agent"),
+                    )
+                    .with_required_header(
+                        HeaderName::from_static("client-daap-version"),
+                        HeaderValue::from_static("3.12"),
+                    )
+                    .with_required_header(
+                        HeaderName::from_static("client-daap-access-index"),
+                        HeaderValue::from_static("2"),
+                    )
+                    .with_forbidden_header(reqwest::header::AUTHORIZATION)
+                    .with_forbidden_header(reqwest::header::PROXY_AUTHORIZATION)
+                    .with_forbidden_header(reqwest::header::COOKIE)
+                    .with_forbidden_header(reqwest::header::REFERER)
+                    .with_private_value("session-id=42");
+
+            let username = uuid::Uuid::new_v4().to_string();
+            let password = uuid::Uuid::new_v4().to_string();
+            let song_id = format!("song-{}", uuid::Uuid::new_v4());
+            let subsonic_client = SubsonicClient::new(server_url.as_str(), &username, &password)
+                .expect("Subsonic client");
+            let subsonic_request = subsonic_client
+                .resolved_stream_request(&song_id)
+                .expect("Subsonic stream request");
+
+            let private_value = |key: &str| {
+                subsonic_request
+                    .private_query_pairs()
+                    .iter()
+                    .find_map(|(candidate, value)| (candidate == key).then(|| value.clone()))
+                    .unwrap_or_else(|| panic!("missing Subsonic {key} query value"))
+            };
+            let token = private_value("t");
+            let salt = private_value("s");
+            assert_eq!(private_value("u"), username);
+            for private_value in [&username, &password, &token, &salt] {
+                assert!(!subsonic_request.endpoint().as_str().contains(private_value));
+            }
+            assert!(!subsonic_request
+                .private_query_pairs()
+                .iter()
+                .any(|(_, value)| value.contains(&password)));
+
+            let subsonic_case =
+                ProtectedStreamCase::new(subsonic_request, "/share/rest/stream.view")
+                    .with_query_pair("id", song_id)
+                    .with_query_pair("v", "1.16.1")
+                    .with_query_pair("c", "Tributary")
+                    .with_query_pair("f", "json")
+                    .with_query_pair("u", username.clone())
+                    .with_query_pair("t", token.clone())
+                    .with_query_pair("s", salt.clone())
+                    .with_forbidden_header(reqwest::header::AUTHORIZATION)
+                    .with_forbidden_header(reqwest::header::PROXY_AUTHORIZATION)
+                    .with_forbidden_header(reqwest::header::COOKIE)
+                    .with_forbidden_header(reqwest::header::REFERER)
+                    .with_private_value(username)
+                    .with_private_value(token)
+                    .with_private_value(salt)
+                    .with_private_value(password);
+
+            vec![daap_case, subsonic_case]
+        });
     }
 
     #[test]

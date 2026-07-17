@@ -9,3 +9,6 @@ mod backend;
 mod client;
 
 pub use backend::SubsonicBackend;
+
+#[cfg(test)]
+pub use client::SubsonicClient;

@@ -25,13 +25,13 @@ Status summary:
 - [ ] P2 resilience and packaging complete
 - [ ] P3 architecture and integration coverage complete
 
-Progress snapshot (2026-07-16), recounted from the literal P0–P3 task checkboxes to correct the
+Progress snapshot (2026-07-17), recounted from the literal P0–P3 task checkboxes to correct the
 earlier numerator/denominator drift. The live protected-playback finding recorded under P2.11 now
-has six independently verifiable tasks rather than the original three compound boxes. The
+has seven independently verifiable tasks rather than the original three compound boxes. The
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**189/221 (85.5%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **72/77 P2**,
+**190/222 (85.6%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **73/78 P2**,
 and **3/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
@@ -39,8 +39,9 @@ ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress 
 PR #105, the cancellable resolver box implemented in PR #106, and the
 held-ACK/slow-greeting/real-IPv6 coverage box completed by PR #107, since the earlier snapshot. The
 deterministic protected-HTTP compatibility box under P2.11 is also complete in PR #108. The
-release-workflow dry run remains deliberately deferred rather than being counted as unfinished P0
-remediation.
+process-isolated real-GStreamer fake-backend box under P2.11 is complete in PR #109;
+packaged and live Windows proof remains open. The release-workflow dry run remains deliberately
+deferred rather than being counted as unfinished P0 remediation.
 
 ## P0 — Release blockers
 
@@ -1187,18 +1188,34 @@ failed through the separately resolved media path—but did not prove DNS was th
   Subsonic HTTP-200 fixture proves failed envelopes map to the existing typed authentication,
   token-fallback, and connection categories. Seven net-new regressions cover the path, encoding,
   header, artwork, envelope, and proxy contracts in PR #108.
-- [ ] Run full fake Subsonic and DAAP streams through GStreamer (reusing the timeout, proxy, and
-  compatibility fixtures), confirm the packaged Windows source plugin enforces the same direct
-  policy, and record live packaged-Windows playback. Support a verified alternate HTTP source or
-  continue to fail closed if a package lacks `souphttpsrc`.
+- [x] Run fake Subsonic and DAAP media through the production protected local-player pipeline.
+  One process-isolated regression constructs both production backend-shaped typed requests and
+  sends them sequentially through the real `Player`, app-owned per-load loopback proxy,
+  `souphttpsrc`, FLAC decoder, and `fakesink`. Each load must deliver a decoded audio buffer,
+  publish Buffering, and reach generation-owned end-of-stream without a player error. The upstream
+  fixture accepts normal GET, HEAD, and single/open/suffix byte-range semantics while proving
+  DAAP's exact reverse-proxy path, private session query, and four trusted protocol headers, plus
+  Subsonic's exact stream path and query multiset comprising public ID/version/client/format and
+  private username/token/salt fields. Both cases prove that the GStreamer-facing URI remains an
+  opaque loopback ticket with no private request material and that source setup selects
+  `souphttpsrc`, direct routing, zero retries, and the 30-second downstream timeout. Missing
+  player/source/sink/decoder support, a native hang, an unexpected request, a request mismatch, an
+  error, or absent EOS fails rather than silently skipping; the parent kills a stuck child at an
+  absolute deadline and requires a success sentinel so a misspelled libtest filter cannot pass
+  with zero tests. This exercises the build host's plugins, not the bundled Windows artifact.
+  Implemented in PR #109.
+- [ ] From a packaged Windows artifact, confirm the selected HTTP source enforces the same direct
+  loopback policy—or a verified alternate source/fail-closed path—and record live packaged-Windows
+  playback for the reported DAAP and Subsonic cases.
 
 Acceptance criteria: a protected remote load either begins playback or produces a phase-specific,
 URL-free failure before the downstream source times out; a loopback ticket never visits a configured
 external proxy; and logs can distinguish transport, upstream HTTP, decoder, and sink categories
 without exposing credentials or filesystem paths. The urgent shared-path implementation,
-deterministic proxy and compatibility proofs, and retained mDNS routing are complete: five of six
-P2.11 tasks are closed. Full fake-pipeline and packaged end-to-end validation remain open, so P2.11
-is not yet closed as a milestone.
+deterministic proxy and compatibility proofs, retained mDNS routing, and complete fake pipeline are
+implemented: six of seven P2.11 tasks are closed. The pipeline regression runs against the
+build-host GStreamer installation; packaged source-plugin enforcement and live packaged-Windows
+playback remain open, so P2.11 is not yet closed as a milestone.
 
 ## P3 — Architecture and integration coverage
 
@@ -1288,7 +1305,28 @@ PR #94's containerized Flatpak build proved the manifest-local source generation
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
 
-Most recent branch validation (2026-07-16, PR #108 P2.11 deterministic HTTP-compatibility slice):
+Most recent branch validation (2026-07-17, PR #109 P2.11 real-GStreamer fake-backend slice):
+`cargo check --all-targets --all-features --locked` and
+`cargo test --all-targets --all-features --locked` pass in debug and release, as does strict
+all-target/all-feature Clippy in both profiles. Each full profile passes 18 library, 706
+application, and 8 repository-metadata tests (732 total). The one net-new process-isolated
+regression builds real DAAP and Subsonic requests beneath a reverse-proxy prefix and sends both
+sequentially through the production `Player`, per-load app-owned proxy, `souphttpsrc`, FLAC decoder,
+and `fakesink` to a decoded-buffer handoff and exact-generation EOS. Its upstream fixture accepts
+ordinary and byte-range fetching while validating exact paths and query multisets, DAAP's four
+protocol headers, absence of `Authorization`, `Proxy-Authorization`, `Cookie`, and `Referer`, and
+at least one body GET per backend. It separately observes the post-policy source properties and
+proves the GStreamer URI remains an opaque loopback ticket with no private request value. Missing
+`playbin3`/`playbin`, `souphttpsrc`, `fakesink`, or FLAC decoding fails the child rather than
+silently skipping; per-load and absolute parent deadlines contain native hangs, and a success
+sentinel prevents an incorrect exact-test filter from passing with zero tests. Automated-review
+follow-ups make sentinel cleanup panic-safe through an RAII guard and fail immediately if the
+player event channel closes unexpectedly instead of waiting for the case deadline.
+`cargo audit` finds no vulnerability and only the two tracked allowed unmaintained warnings;
+desktop and AppStream validation, `cargo fmt --all -- --check`, and `git diff --check` pass. No
+dependency or lockfile changed.
+
+Previous branch validation (2026-07-16, PR #108 P2.11 deterministic HTTP-compatibility slice):
 `cargo check --all-targets --all-features --locked` and
 `cargo test --all-targets --all-features --locked` pass in debug and release, as does strict
 all-target/all-feature Clippy in both profiles. Each full profile passes 18 library, 705
@@ -1833,8 +1871,19 @@ Record scope or design decisions here so deferred work is explicit.
   stream and artwork fetches install trusted protocol state before authentication, while a
   playback receiver can still contribute only `Range`. Explicit upstream proxy selection remains
   supported and is now exercised at the actual asynchronous protected-fetch boundary. This
-  deterministic slice can close independently; fake full-pipeline, packaged source-plugin, and
-  live Windows playback evidence remain one open task rather than blocking code-proven fixes.
+  deterministic slice can close independently. At that point the fake full-pipeline, packaged
+  source-plugin, and live Windows playback proofs remained one compound task; the 2026-07-17
+  decision below splits and closes the fake proof while retaining packaged source-plugin and live
+  Windows evidence as the open task.
+- 2026-07-17 — P2.11 treats a process-isolated run through the real production `Player` as the
+  complete fake-backend pipeline proof. DAAP- and Subsonic-shaped requests therefore exercise the
+  same typed request builders, per-load app proxy, `souphttpsrc` policy, decoder, player bus watch,
+  generation ownership, and EOS handling as local playback, with only the physical audio sink
+  replaced by `fakesink`. Hard plugin requirements and parent/child deadlines turn missing or hung
+  native support into a failure rather than a skip. This closes an automatable pipeline task, not
+  the packaged-Windows task: Cargo tests use the build host's plugin registry and DLL/shared-library
+  set, so they cannot prove the bundled artifact selects the same source, carries every required
+  runtime file, or works with either reported live server.
 - 2026-07-15 — P2.11 treats repeated DAAP and Subsonic failures at exactly GStreamer's 15-second
   HTTP-source timeout as a shared protected-playback defect, not a protocol-authentication defect.
   The opaque loopback boundary remains necessary: handing backend requests directly to GStreamer
@@ -1921,4 +1970,5 @@ Add one line per completed task:
 | 2026-07-16 | P2.10 MPD real-socket coverage (partial) | PR #107 | Completes the compound socket-coverage item begun by PR #105's held-ACK FIFO peer. A channel-held silent first IPv4 greeting proves the shared absolute deadline preserves a fair slice for a later address without sleeps or elapsed-time thresholds. A real `::1` listener proves numeric resolution, connection, greeting, and IPv6 client/peer addresses; only an unavailable initial IPv6 bind skips that capability-specific case. Two net-new regressions bring the focused MPD suite to 79. Only exclusive-control/global-option semantics remain open. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
-| 2026-07-16 | P2.11 deterministic HTTP compatibility (partial) | PR #108 | Preserves exact escaped reverse-proxy prefixes across DAAP stream/artwork and Subsonic API/media construction, carries DAAP's four fixed protocol headers through a separate strict non-secret allowlist into protected stream and artwork fetches, retains receiver `Range` as the only forwarded header, proves existing typed Subsonic HTTP-200 failures, and exercises explicit upstream proxy selection at the asynchronous protected-fetch boundary. Seven net-new regressions cover the contracts; only full fake GStreamer, packaged source-policy, and live Windows playback validation remain open. |
+| 2026-07-16 | P2.11 deterministic HTTP compatibility (partial) | PR #108 | Preserves exact escaped reverse-proxy prefixes across DAAP stream/artwork and Subsonic API/media construction, carries DAAP's four fixed protocol headers through a separate strict non-secret allowlist into protected stream and artwork fetches, retains receiver `Range` as the only forwarded header, proves existing typed Subsonic HTTP-200 failures, and exercises explicit upstream proxy selection at the asynchronous protected-fetch boundary. Seven net-new regressions cover the contracts. At PR #108, full fake GStreamer, packaged source-policy, and live Windows playback validation remained open; the following slice closes the fake-GStreamer part. |
+| 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
