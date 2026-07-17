@@ -48,7 +48,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Network connection guard (prevents duplicate auth) | ✅ |
 | i18n/l10n framework (13 languages, auto locale detection) | ✅ |
 | Audio output selector (local + MPD, iTunes AirPlay-style) | ✅ |
-| MPD output backend (sink-only, TCP with security hardening) | ✅ |
+| MPD output backend (sink-only, TCP with security hardening) | ✅ Requires explicit exclusive-control confirmation |
 | Output switching (click to swap local ↔ MPD) | ✅ |
 | AirPlay 1 (RAOP) output | ✅ Requires GStreamer's `raopsink` element (ships in `gst-plugins-bad`); a missing element fails with an actionable install message |
 | AirPlay 2 / HomeKit output | ❌ Not yet supported — see [AirPlay 2 roadmap](#airplay-2-roadmap) below |
@@ -66,6 +66,28 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Linux and macOS file associations | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
+
+### MPD output safety
+
+MPD exposes pause, stop, and its `repeat`, `random`, `single`, and `consume` options as
+partition-wide commands; it does not provide an atomic “change this only if Tributary still owns
+the current song” operation. Tributary therefore plays through an MPD output only after **Add
+Output** confirms that this Tributary instance has exclusive control of that playback partition.
+Do not use another MPD controller or another Tributary instance against the same partition while
+it is configured as an output. Each load sets the four MPD options above to off, and those daemon
+settings can remain changed after playback.
+
+The confirmation is persisted in `outputs.json`. Entries saved by an older Tributary release have
+no confirmation and fail closed before optimistic Buffering state, output-epoch advancement,
+worker enqueue or cleanup, any MPD connection, playback-state or option command, or protected-media
+ticket. The worker independently repeats the gate, and malformed, unsupported, or inactive media
+cannot bypass the same confirmation guidance. A refused queue item remains retryable, so another
+Play re-shows the guidance rather than toggling an empty MPD session. Re-add the same host and port
+and select the exclusive-control checkbox to upgrade that entry in place; Tributary preserves its
+existing name and does not add a duplicate. If that legacy output was already selected, select its
+row again so the confirmed mode rebuilds the output before playback. If a foreign current song is
+nevertheless observed after confirmation, Tributary still relinquishes ownership and
+conservatively retains its queued ID rather than risking disruption of the foreign playback.
 
 ## Architecture
 

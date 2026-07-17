@@ -433,7 +433,7 @@ impl AudioOutput for AirPlayOutput {
         true
     }
 
-    fn load_uri(&self, uri: &str) {
+    fn load_uri(&self, uri: &str) -> bool {
         info!("AirPlay: loading URI");
         let generation = self.event_generation();
         let _ = self
@@ -441,15 +441,17 @@ impl AudioOutput for AirPlayOutput {
             .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
 
         self.finish_load(generation, self.open_session(uri));
+        true
     }
 
-    fn load_resolved(&self, request: ResolvedHttpRequest) {
+    fn load_resolved(&self, request: ResolvedHttpRequest) -> bool {
         info!("AirPlay: loading resolved media");
         let generation = self.event_generation();
         let _ = self
             .event_tx
             .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
         self.finish_load(generation, self.open_resolved_session(request));
+        true
     }
 
     fn set_event_generation(&self, generation: PlayerEventGeneration) {

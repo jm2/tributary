@@ -1846,7 +1846,7 @@ impl AudioOutput for ChromecastOutput {
         true
     }
 
-    fn load_uri(&self, uri: &str) {
+    fn load_uri(&self, uri: &str) -> bool {
         let owner = self.next_owner();
         let kind = match self.resolve_uri(uri) {
             Ok(uri) => CommandKind::Load {
@@ -1856,9 +1856,10 @@ impl AudioOutput for ChromecastOutput {
             Err(failure) => CommandKind::RejectLoad { failure },
         };
         let _ = self.enqueue(owner, kind);
+        true
     }
 
-    fn load_resolved(&self, request: ResolvedHttpRequest) {
+    fn load_resolved(&self, request: ResolvedHttpRequest) -> bool {
         let owner = self.next_owner();
         let kind = match self.resolve_request(request) {
             Ok(uri) => CommandKind::Load {
@@ -1868,6 +1869,7 @@ impl AudioOutput for ChromecastOutput {
             Err(failure) => CommandKind::RejectLoad { failure },
         };
         let _ = self.enqueue(owner, kind);
+        true
     }
 
     fn set_event_generation(&self, generation: PlayerEventGeneration) {

@@ -33,12 +33,14 @@ impl AudioOutput for LocalOutput {
         true
     }
 
-    fn load_uri(&self, uri: &str) {
+    fn load_uri(&self, uri: &str) -> bool {
         self.player.load_uri(uri);
+        true
     }
 
-    fn load_resolved(&self, request: ResolvedHttpRequest) {
+    fn load_resolved(&self, request: ResolvedHttpRequest) -> bool {
         self.player.load_resolved(request);
+        true
     }
 
     fn set_event_generation(&self, generation: PlayerEventGeneration) {

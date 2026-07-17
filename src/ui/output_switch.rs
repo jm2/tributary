@@ -12,7 +12,7 @@ use tracing::info;
 
 use crate::audio::airplay_output::AirPlayOutput;
 use crate::audio::chromecast_output::ChromecastOutput;
-use crate::audio::mpd_output::MpdOutput;
+use crate::audio::mpd_output::{MpdControlMode, MpdOutput};
 use crate::audio::output::AudioOutput;
 use crate::audio::PlayerEvent;
 
@@ -23,9 +23,18 @@ use super::playback::PlaybackSession;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputTarget {
     Local,
-    Mpd { host: String, port: u16 },
-    AirPlay { host: String, port: u16 },
-    Chromecast { address: SocketAddr },
+    Mpd {
+        host: String,
+        port: u16,
+        exclusive_control: bool,
+    },
+    AirPlay {
+        host: String,
+        port: u16,
+    },
+    Chromecast {
+        address: SocketAddr,
+    },
 }
 
 fn output_change_required(active: &OutputTarget, requested: &OutputTarget) -> bool {
@@ -207,6 +216,7 @@ fn target_for_row(
     saved.get(mpd_idx).map(|entry| OutputTarget::Mpd {
         host: entry.host.clone(),
         port: entry.port,
+        exclusive_control: entry.exclusive_control,
     })
 }
 
@@ -335,8 +345,14 @@ fn handle_mpd_switch(
     if let Some(entry) = saved.get(mpd_idx) {
         park_local_if_needed(active_output, parked_local, event_sender);
 
-        let mpd = MpdOutput::new(&entry.name, &entry.host, entry.port, event_sender.clone())
-            .with_runtime(rt_handle.clone());
+        let mpd = MpdOutput::new(
+            &entry.name,
+            &entry.host,
+            entry.port,
+            MpdControlMode::from(entry.exclusive_control),
+            event_sender.clone(),
+        )
+        .with_runtime(rt_handle.clone());
         *active_output.borrow_mut() = Box::new(mpd);
         info!(
             name = %entry.name,
@@ -391,6 +407,7 @@ fn park_local_if_needed(
             "_dummy",
             "127.0.0.1",
             1,
+            MpdControlMode::Unconfirmed,
             event_sender.clone(),
         ));
         let local = std::mem::replace(&mut *active_output.borrow_mut(), dummy);
@@ -449,8 +466,24 @@ mod tests {
         let current = OutputTarget::Mpd {
             host: "music.local".to_string(),
             port: 6600,
+            exclusive_control: true,
         };
         assert!(!output_change_required(&current, &current));
+    }
+
+    #[test]
+    fn approving_the_same_mpd_endpoint_is_a_real_output_change() {
+        let unconfirmed = OutputTarget::Mpd {
+            host: "music.local".to_string(),
+            port: 6600,
+            exclusive_control: false,
+        };
+        let exclusive = OutputTarget::Mpd {
+            host: "music.local".to_string(),
+            port: 6600,
+            exclusive_control: true,
+        };
+        assert!(output_change_required(&unconfirmed, &exclusive));
     }
 
     #[test]

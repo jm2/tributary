@@ -123,6 +123,8 @@ dialogs:
   output_name_placeholder: "MPD гостиная"
   output_host: "Хост"
   output_port: "Порт"
+  output_exclusive_control_warning: "Команды MPD паузы, остановки, повтора, случайного и одиночного воспроизведения и consume влияют на весь раздел воспроизведения. Не используйте его совместно с другим контроллером или экземпляром Tributary."
+  output_exclusive_control_confirmation: "Я подтверждаю, что Tributary имеет исключительный контроль над этим разделом воспроизведения MPD."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -223,6 +225,7 @@ errors:
     audio_output_failed: "Сбой аудиовыхода"
     playback_failed: "Сбой воспроизведения аудио"
     airplay_raopsink_missing: "Для AirPlay требуется элемент raopsink из GStreamer — установите пакет gst-plugins-bad и перезапустите Tributary"
+    mpd_exclusive_control_required: "Повторно добавьте этот выход MPD, подтвердите исключительный контроль раздела, затем снова выберите его перед воспроизведением"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

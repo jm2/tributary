@@ -123,6 +123,8 @@ dialogs:
   output_name_placeholder: "客廳 MPD"
   output_host: "主機"
   output_port: "連接埠"
+  output_exclusive_control_warning: "MPD 的暫停、停止、重複、隨機、單曲和 consume 指令會影響整個播放分割區。請勿與其他控制器或 Tributary 執行個體共用。"
+  output_exclusive_control_confirmation: "我確認 Tributary 獨佔控制此 MPD 播放分割區。"
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -223,6 +225,7 @@ errors:
     audio_output_failed: "音訊輸出失敗"
     playback_failed: "音訊播放失敗"
     airplay_raopsink_missing: "AirPlay 需要 GStreamer 的 raopsink 元素。請安裝 gst-plugins-bad 套件，然後重新啟動 Tributary"
+    mpd_exclusive_control_required: "請重新新增此 MPD 輸出，確認對分割區的獨佔控制，然後在播放前再次選取它"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:
