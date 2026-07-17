@@ -119,13 +119,79 @@ function Get-BoundedProbeDiagnostic {
 function Stop-ProbeProcessTree {
     param([System.Diagnostics.Process]$Process)
     if ($null -eq $Process -or $Process.HasExited) { return }
-    try {
-        $Process.Kill($true)
-    }
-    finally {
-        if (-not $Process.WaitForExit(10000)) {
-            throw "packaged runtime probe process tree did not terminate after Kill(true)"
+
+    # Process.Kill(bool) is unavailable in Windows PowerShell 5.1's .NET
+    # Framework. Prefer it when present; otherwise use the absolute inbox
+    # taskkill path so termination never depends on the sanitized PATH.
+    $killTreeMethod = $Process.GetType().GetMethods() |
+        Where-Object {
+            $_.Name -eq "Kill" -and
+            $_.GetParameters().Count -eq 1 -and
+            ($_.GetParameters())[0].ParameterType -eq [bool]
+        } |
+        Select-Object -First 1
+
+    $useTaskkill = $null -eq $killTreeMethod
+    if (-not $useTaskkill) {
+        try {
+            $null = $killTreeMethod.Invoke($Process, [object[]]@($true))
         }
+        catch {
+            # The process may have won the race and exited between HasExited
+            # and Invoke. Otherwise fall through to the PowerShell 5.1 path.
+            $useTaskkill = -not $Process.HasExited
+        }
+    }
+
+    $taskkillFailure = $null
+    if ($useTaskkill) {
+        $system32 = [System.Environment]::SystemDirectory
+        $taskkillPath = Join-Path $system32 "taskkill.exe"
+        $taskkillProcess = $null
+        try {
+            if (-not [System.IO.Path]::IsPathRooted($taskkillPath) -or
+                -not (Test-Path -LiteralPath $taskkillPath -PathType Leaf)) {
+                throw "absolute System32 taskkill.exe was not available"
+            }
+
+            $taskkillInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $taskkillInfo.FileName = $taskkillPath
+            $taskkillInfo.Arguments = "/PID $($Process.Id) /T /F"
+            $taskkillInfo.UseShellExecute = $false
+            $taskkillInfo.CreateNoWindow = $true
+            $taskkillProcess = [System.Diagnostics.Process]::new()
+            $taskkillProcess.StartInfo = $taskkillInfo
+            if (-not $taskkillProcess.Start()) {
+                throw "absolute System32 taskkill.exe could not start"
+            }
+            if (-not $taskkillProcess.WaitForExit(10000)) {
+                try { $taskkillProcess.Kill() } catch { }
+                $null = $taskkillProcess.WaitForExit(1000)
+                throw "absolute System32 taskkill.exe exceeded its 10-second deadline"
+            }
+            if ($taskkillProcess.ExitCode -ne 0 -and -not $Process.HasExited) {
+                throw "absolute System32 taskkill.exe could not terminate the probe tree"
+            }
+        }
+        catch {
+            $taskkillFailure = $_.Exception.Message
+            # This cannot guarantee descendant cleanup, but it prevents the
+            # packaged application itself from being orphaned if taskkill is
+            # unavailable or fails unexpectedly.
+            if (-not $Process.HasExited) {
+                try { $Process.Kill() } catch { }
+            }
+        }
+        finally {
+            if ($null -ne $taskkillProcess) { $taskkillProcess.Dispose() }
+        }
+    }
+
+    if (-not $Process.WaitForExit(10000)) {
+        throw "packaged runtime probe process tree did not terminate within 10 seconds"
+    }
+    if ($taskkillFailure) {
+        throw "packaged runtime probe required degraded termination: $taskkillFailure"
     }
 }
 
@@ -360,8 +426,24 @@ if ($missing.Count -gt 0) {
     Write-Err "Missing compile-time packages. In MSYS2 shell, run:`n  pacman -S $($missing -join ' ')"
 }
 
-# Runtime GStreamer plugins (warn only)
+# Runtime GStreamer plugins (Soup source required; additional codecs warn only)
 $gstPluginDir = Join-Path $MsysPath "lib\gstreamer-1.0"
+$requiredSoupPluginName = "libgstsoup.dll"
+$requiredSoupRuntimeName = "libsoup-3.0-0.dll"
+$requiredSoupPluginSrc = Join-Path $gstPluginDir $requiredSoupPluginName
+$requiredSoupRuntimeSrc = Join-Path $MsysPath "bin\$requiredSoupRuntimeName"
+$missingSoupRuntime = @()
+if (-not (Test-Path -LiteralPath $requiredSoupPluginSrc -PathType Leaf)) {
+    $missingSoupRuntime += "GStreamer Soup source plugin ($requiredSoupPluginName)"
+}
+if (-not (Test-Path -LiteralPath $requiredSoupRuntimeSrc -PathType Leaf)) {
+    $missingSoupRuntime += "Soup HTTP runtime ($requiredSoupRuntimeName)"
+}
+if ($missingSoupRuntime.Count -gt 0) {
+    Write-Err "Required souphttpsrc runtime is incomplete: $($missingSoupRuntime -join ', '). Install the matching $PkgPrefix-gst-plugins-good and $PkgPrefix-libsoup3 packages."
+}
+Write-Host "  [ok] souphttpsrc plugin and Soup runtime"
+
 $pluginWarnings = @()
 foreach ($plugin in @("gst-plugins-good", "gst-plugins-bad", "gst-libav")) {
     $pattern = switch ($plugin) {
@@ -441,6 +523,45 @@ function Sync-Directory {
     return $copied
 }
 
+# Extract one dependency basename from either common MSYS2 ldd form:
+#   libfoo.dll => /clang64/bin/libfoo.dll (0x...)
+#   /clangarm64/bin/foo.dll (0x...)
+# Reject path separators and other invalid Windows filename characters after
+# taking the leaf so ldd output can never redirect a copy outside MSYS2 bin.
+function Get-LddDependencyName {
+    param([string]$Line)
+    $candidate = $null
+    if ($Line -match '^\s*(.+?\.dll)\s*=>') {
+        $candidate = $matches[1]
+    }
+    elseif ($Line -match '^\s*"?(.+?\.dll)"?(?:\s+\(0x[0-9A-Fa-f]+\))?\s*$') {
+        $candidate = $matches[1]
+    }
+    if (-not $candidate) { return $null }
+
+    $candidate = $candidate.Trim().Trim([char]34).Replace([char]92, [char]47)
+    $slash = $candidate.LastIndexOf([char]47)
+    $leaf = if ($slash -ge 0) { $candidate.Substring($slash + 1) } else { $candidate }
+    if ($leaf -notmatch '^[^\\/:*?"<>|\x00-\x1F]+\.dll$') { return $null }
+    return $leaf
+}
+
+function Add-DllScanTarget {
+    param(
+        [System.Collections.Queue]$Queue,
+        [hashtable]$Known,
+        [string]$Path,
+        [int]$Limit
+    )
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if ($Known.ContainsKey($fullPath)) { return }
+    if ($Known.Count -ge $Limit) {
+        Write-Err "DLL dependency closure exceeded its $Limit-binary safety limit."
+    }
+    $Known[$fullPath] = $true
+    $Queue.Enqueue($fullPath)
+}
+
 New-Item -ItemType Directory -Force $DIST | Out-Null
 New-Item -ItemType Directory -Force "$DIST\lib" | Out-Null
 
@@ -466,12 +587,16 @@ if (Test-Path $gstPluginSrc) {
 # gst-plugin-scanner is a required part of the packaged GStreamer runtime.
 # Always overwrite it: an incremental dist tree may have been produced for a
 # different architecture, and source timestamps cannot prove binary identity.
+# Keep it beside Tributary and the root-level bundled DLLs so Windows can
+# resolve its dependencies during both normal launches and the isolated probe
+# without adding the bundle directory to PATH.
 $gstScannerSrc = Join-Path $MsysPath "libexec\gstreamer-1.0\gst-plugin-scanner.exe"
-$gstScannerDest = Join-Path $DIST "libexec\gstreamer-1.0\gst-plugin-scanner.exe"
+$gstScannerDest = Join-Path $DIST "gst-plugin-scanner.exe"
+$legacyGstScannerDest = Join-Path $DIST "libexec\gstreamer-1.0\gst-plugin-scanner.exe"
 if (-not (Test-Path -LiteralPath $gstScannerSrc -PathType Leaf)) {
     Write-Err "Required GStreamer plugin scanner not found at $gstScannerSrc"
 }
-New-Item -ItemType Directory -Force (Split-Path $gstScannerDest -Parent) | Out-Null
+Remove-Item -LiteralPath $legacyGstScannerDest -Force -ErrorAction SilentlyContinue
 Copy-Item -LiteralPath $gstScannerSrc -Destination $gstScannerDest -Force
 Write-Info "Bundled gst-plugin-scanner.exe (unconditional overwrite)."
 
@@ -482,28 +607,84 @@ if (-not (Test-Path $ldd)) { $ldd = "ldd" }
 
 Write-Info "Resolving required DLLs for executable and plugins..."
 
-# Gather the exe and every single plugin dll we just copied.
-$binariesToScan = @(Join-Path $DIST (Split-Path $exePath -Leaf))
-$binariesToScan += Get-ChildItem -Path "$DIST\lib" -Recurse -Filter *.dll | Select-Object -ExpandProperty FullName
-$binariesToScan += $gstScannerDest
+# Seed the dependency closure with Tributary, every copied plugin, and the
+# exact scanner. Every MSYS2 runtime DLL discovered below is copied to the
+# bundle root and enqueued in turn, so transitive dependencies reach closure.
+$requiredSoupPluginDest = Join-Path $DIST "lib\gstreamer-1.0\$requiredSoupPluginName"
+if (-not (Test-Path -LiteralPath $requiredSoupPluginDest -PathType Leaf)) {
+    Write-Err "Required souphttpsrc plugin was not copied into the Windows bundle."
+}
 
-foreach ($bin in $binariesToScan) {
-    & $ldd $bin 2>$null | ForEach-Object {
-        # Extract JUST the DLL filename from the left side of the `=>` operator.
-        if ($_ -match "^\s*(.+?\.dll)\s+=>") {
-            $dllName = $matches[1].Trim()
-            $srcPath = Join-Path $MsysPath "bin\$dllName"
-            
-            # If it exists in the MSYS2 bin folder, copy only if newer or missing.
-            if (Test-Path $srcPath) {
-                $destPath = Join-Path $DIST $dllName
-                if (Copy-IfNewer $srcPath $destPath) {
-                    Write-Host "  copied: $dllName"
-                    $totalCopied++
-                }
+$maxDllScanTargets = 4096
+$maxLddOutputLines = 131072
+$dllScanQueue = [System.Collections.Queue]::new()
+$knownDllScanTargets = @{}
+$scannedDllTargets = @{}
+$initialDllScanTargets = @(Join-Path $DIST (Split-Path $exePath -Leaf))
+$initialDllScanTargets += Get-ChildItem -Path "$DIST\lib" -Recurse -Filter *.dll | Select-Object -ExpandProperty FullName
+$initialDllScanTargets += $gstScannerDest
+foreach ($bin in $initialDllScanTargets) {
+    Add-DllScanTarget $dllScanQueue $knownDllScanTargets $bin $maxDllScanTargets
+}
+
+$requiredSoupPluginFull = [System.IO.Path]::GetFullPath($requiredSoupPluginDest)
+$requiredSoupRuntimeDest = Join-Path $DIST $requiredSoupRuntimeName
+$requiredSoupRuntimeFull = [System.IO.Path]::GetFullPath($requiredSoupRuntimeDest)
+$soupPluginScanned = $false
+$soupRuntimeDependencyObserved = $false
+$lddOutputLineCount = 0
+
+while ($dllScanQueue.Count -gt 0) {
+    $bin = [string]$dllScanQueue.Dequeue()
+    if ($scannedDllTargets.ContainsKey($bin)) { continue }
+    $scannedDllTargets[$bin] = $true
+    $isSoupPlugin = $bin -ieq $requiredSoupPluginFull
+    if ($isSoupPlugin) { $soupPluginScanned = $true }
+
+    $lddLines = @(& $ldd $bin 2>$null)
+    $lddExitCode = $LASTEXITCODE
+    if ($lddExitCode -ne 0) {
+        Write-Err "DLL dependency inspection failed for $([System.IO.Path]::GetFileName($bin)) (ldd status $lddExitCode)."
+    }
+
+    foreach ($line in $lddLines) {
+        $lddOutputLineCount++
+        if ($lddOutputLineCount -gt $maxLddOutputLines) {
+            Write-Err "DLL dependency closure exceeded its $maxLddOutputLines-line safety limit."
+        }
+
+        $dllName = Get-LddDependencyName ([string]$line)
+        if (-not $dllName) { continue }
+        if ([string]$line -match '=>\s+not found') {
+            Write-Err "Unresolved DLL dependency $dllName required by $([System.IO.Path]::GetFileName($bin))."
+        }
+        if ($isSoupPlugin -and $dllName -ieq $requiredSoupRuntimeName) {
+            $soupRuntimeDependencyObserved = $true
+        }
+
+        # Copy only dependencies ldd identifies and that exist in the selected
+        # MSYS2 architecture's bin directory; do not sweep unrelated DLLs.
+        $srcPath = Join-Path $MsysPath "bin\$dllName"
+        if (Test-Path -LiteralPath $srcPath -PathType Leaf) {
+            $destPath = Join-Path $DIST $dllName
+            if (Copy-IfNewer $srcPath $destPath) {
+                Write-Host "  copied: $dllName"
+                $totalCopied++
             }
+            Add-DllScanTarget $dllScanQueue $knownDllScanTargets $destPath $maxDllScanTargets
         }
     }
+}
+
+if (-not $soupPluginScanned) {
+    Write-Err "Required souphttpsrc plugin was not inspected by the DLL dependency closure."
+}
+if (-not $soupRuntimeDependencyObserved) {
+    Write-Err "Required souphttpsrc plugin did not report its $requiredSoupRuntimeName dependency."
+}
+if (-not (Test-Path -LiteralPath $requiredSoupRuntimeDest -PathType Leaf) -or
+    -not $scannedDllTargets.ContainsKey($requiredSoupRuntimeFull)) {
+    Write-Err "Required souphttpsrc runtime dependency $requiredSoupRuntimeName was not copied and inspected."
 }
 
 Write-Info "Incremental sync: $totalCopied file(s) updated."
@@ -559,10 +740,11 @@ Write-Info "Total incremental sync: $totalCopied file(s) updated."
 
 # ── Packaged Runtime Probe ──────────────────────────────────────────────────
 # Run the bundled executable itself before archiving it. The child receives no
-# ambient GStreamer/GIO/proxy policy, can resolve DLLs only from the bundle and
-# Windows system directory, and must build a brand-new external registry in a
-# path containing spaces. The Rust probe writes its sentinel only after the
-# bundled plugin/scanner/origin and protected HTTP playback checks all pass.
+# ambient GStreamer/GIO/proxy policy; Tributary and the scanner resolve bundled
+# DLLs from their own directory while PATH contains only Windows System32. The
+# probe must build a brand-new external registry in a path containing spaces.
+# The Rust probe writes its sentinel only after the bundled plugin/scanner/origin
+# and protected HTTP playback checks all pass.
 Write-Info "Running packaged Windows runtime probe..."
 $distFull = (Resolve-Path $DIST).Path
 $probeExe = Join-Path $distFull (Split-Path $exePath -Leaf)
@@ -590,26 +772,36 @@ try {
         $startInfo.CreateNoWindow = $true
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
-        $startInfo.ArgumentList.Add("--tributary-platform-runtime-probe")
-        $startInfo.ArgumentList.Add($probeCache)
+        if ($startInfo.PSObject.Properties.Name -contains "ArgumentList") {
+            $startInfo.ArgumentList.Add("--tributary-platform-runtime-probe")
+            $startInfo.ArgumentList.Add($probeCache)
+        }
+        else {
+            # Windows paths cannot contain a quote, but keep the fallback
+            # fail-closed if that invariant ever changes upstream.
+            if ($probeCache.IndexOf([char]34) -ge 0) {
+                throw "runtime probe cache path contains an unsupported quote"
+            }
+            $startInfo.Arguments = "--tributary-platform-runtime-probe `"$probeCache`""
+        }
 
         # ProcessStartInfo begins with a copy of this process's environment.
         # Remove every policy input the Rust probe refuses to inherit, plus all
         # conventional proxy variables, using case-insensitive comparisons.
-        foreach ($key in @($startInfo.Environment.Keys)) {
+        foreach ($key in @($startInfo.EnvironmentVariables.Keys)) {
             $normalized = $key.ToUpperInvariant()
             if ($normalized.StartsWith("GST_") -or
                 $normalized -eq "GIO_EXTRA_MODULES" -or
                 $normalized -eq "GIO_USE_PROXY_RESOLVER" -or
                 $normalized -match '^(HTTP|HTTPS|ALL|NO)_PROXY$') {
-                $null = $startInfo.Environment.Remove($key)
+                $null = $startInfo.EnvironmentVariables.Remove($key)
             }
             elseif ($normalized -eq "PATH") {
-                $null = $startInfo.Environment.Remove($key)
+                $null = $startInfo.EnvironmentVariables.Remove($key)
             }
         }
-        $system32 = Join-Path $env:SystemRoot "System32"
-        $startInfo.Environment["PATH"] = "$distFull$([System.IO.Path]::PathSeparator)$system32"
+        $system32 = [System.Environment]::SystemDirectory
+        $startInfo.EnvironmentVariables["PATH"] = $system32
 
         $probeProcess = [System.Diagnostics.Process]::new()
         $probeProcess.StartInfo = $startInfo

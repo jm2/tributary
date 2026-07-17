@@ -1210,10 +1210,16 @@ failed through the separately resolved media path—but did not prove DNS was th
   Implemented in PR #109.
 - [ ] Prove the packaged Windows artifact carries and selects the required GStreamer runtime and
   enforces the protected-loopback policy before it is archived. The bundler now copies the exact
-  architecture's `gst-plugin-scanner.exe`, scans the helper for transitive DLLs, and launches the
-  bundled `tributary.exe` from the completed distribution tree with a fresh external cache, a
-  bundle-and-Windows-only `PATH`, and ambient GStreamer, GIO proxy-resolver, and HTTP proxy state
-  removed. A hidden early-startup probe pins plugin discovery and the registry to the bundle,
+  architecture's `gst-plugin-scanner.exe`, places it beside Tributary and the root-level bundled
+  DLLs, and computes a bounded, deduplicated transitive DLL closure seeded by the app, scanner, and
+  every copied plugin. The closure accepts both arrow and ARM64 path-only `ldd` records, queues each
+  newly copied runtime, and explicitly requires the Soup plugin/runtime dependency to be observed,
+  copied, and inspected. It then launches the bundled `tributary.exe` from
+  the completed distribution tree with a fresh external cache, a System32-only `PATH`, and ambient
+  GStreamer, GIO proxy-resolver, and HTTP proxy state removed. Co-location makes the scanner's normal
+  Windows loader path identical in a user launch and the isolated probe rather than lending the
+  probe a bundle-root `PATH`. A hidden early-startup probe pins plugin discovery and the registry to
+  the bundle,
   rejects a missing scanner, non-bundle layout, inherited runtime override, nonempty/inside-install
   cache, external plugin provenance, or empty registry, and exits before GTK, configuration, or the
   database starts. Before GStreamer can fall back to in-process discovery, it also executes the
@@ -1230,9 +1236,10 @@ failed through the separately resolved media path—but did not prove DNS was th
   after cold GStreamer initialization and required-factory discovery; media, source, bus,
   connection, and teardown waits remain independently bounded. PowerShell applies the enclosing
   90-second process-tree deadline, a 1 MiB output-flood threshold with bounded diagnostic tails, an
-  exact success sentinel, and exception-safe cleanup. Both native Windows CI architectures and the
-  release bundle path invoke this same pre-archive script; the later installer-only step consumes
-  that already-probed tree.
+  exact success sentinel, and exception-safe cleanup. Process-tree termination and exact argument
+  passing feature-detect newer .NET APIs and retain bounded Windows PowerShell 5.1 fallbacks. Both
+  native Windows CI architectures and the release bundle path invoke this same pre-archive script;
+  the later installer-only step consumes that already-probed tree.
   Implementation is complete in PR #110; acceptance and this checkbox await successful
   execution in both native Windows PR jobs. The intentionally deferred live release-workflow run is
   not required because CI invokes the identical bundling/probe path on both supported architectures.
@@ -1347,16 +1354,19 @@ as does the deliberately deferred live release-workflow run.
 Most recent local branch validation (2026-07-17, PR #110 packaged-Windows P2.11 slice before CI):
 `cargo check --all-targets --all-features --locked` and
 `cargo test --all-targets --all-features --locked` pass in debug and release, as does strict
-all-target/all-feature Clippy in both profiles. Each full profile passes 18 library, 716
-application, and 8 repository-metadata tests (742 total); all 26 focused platform-runtime tests
+all-target/all-feature Clippy in both profiles. Each full profile passes 18 library, 718
+application, and 8 repository-metadata tests (744 total); all 28 focused platform-runtime tests
 also pass in debug and release. Three Windows-gated request-classification tests separately pass
 under a local test gate and will run natively in PR CI. The packaged probe directly preflights its
 exact scanner, builds a new external registry, verifies required factory/decoder provenance,
 decodes the real FLAC fixture through the production protected-source policy to a handoff and EOS,
 proves zero poisoned-proxy connections, and exercises the fixed alternate-source failure. Review
 hardening arms the listener window after cold discovery, makes every invalid media request fatal,
-and bounds scanner termination, process-tree termination, redirected-output drain, diagnostics,
-and overall execution. PowerShell parses without errors; `cargo audit` reports no vulnerability and
+co-locates the scanner with its shipped DLLs while removing probe-only DLL search help, retains
+Windows PowerShell 5.1 process/argument fallbacks, replaces the one-pass DLL parser after initial
+ARM64 CI exposed a missed path-only Soup dependency, and bounds the dependency closure, scanner
+termination, process-tree termination, redirected-output drain, diagnostics, and overall execution.
+PowerShell parses without errors; `cargo audit` reports no vulnerability and
 only the two tracked allowed unmaintained warnings; desktop and AppStream validation,
 `cargo fmt --all -- --check`, and `git diff --check` pass. No dependency or lockfile changed. The
 native x86_64 and ARM64 package executions remain the acceptance authority, so the tracker checkbox
@@ -1948,9 +1958,14 @@ Record scope or design decisions here so deferred work is explicit.
   decoder provenance beneath that tree, a decoded FLAC buffer and EOS through the production
   protected-ticket callback, no poisoned-proxy connection, and a fixed fail-closed result for an
   alternate source. Bundling `gst-plugin-scanner.exe` is part of that contract because allowing a
-  system helper would make the artifact appear complete only on the build host. The exact helper
-  is executed under a five-second deadline before GStreamer initialization so a missing dependent
-  DLL or wrong-architecture scanner cannot be hidden by in-process plugin discovery. The probe is
+  system helper would make the artifact appear complete only on the build host. The helper is kept
+  beside the packaged app and root-level DLL set, and the probe's `PATH` contains only System32, so
+  scanner loading has the same executable-directory dependency search available during an ordinary
+  user launch. Dependency collection is a bounded, deduplicated queue over the app, scanner, all
+  copied plugins, and every newly copied MSYS2 runtime; it recognizes both x86_64 arrow records and
+  ARM64 path-only `ldd` records. The exact helper is executed under a five-second deadline before GStreamer
+  initialization so a missing dependent DLL or wrong-architecture scanner cannot be hidden by
+  in-process plugin discovery. The probe is
   process-isolated, deadline-bounded, and sentinel-backed so a crash, skip, output flood, native
   hang, or zero-work exit cannot pass. Its listener deadlines arm only after cold plugin discovery,
   while the enclosing process deadline covers that startup; malformed or unwritable media requests
@@ -2045,4 +2060,4 @@ Add one line per completed task:
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
 | 2026-07-16 | P2.11 deterministic HTTP compatibility (partial) | PR #108 | Preserves exact escaped reverse-proxy prefixes across DAAP stream/artwork and Subsonic API/media construction, carries DAAP's four fixed protocol headers through a separate strict non-secret allowlist into protected stream and artwork fetches, retains receiver `Range` as the only forwarded header, proves existing typed Subsonic HTTP-200 failures, and exercises explicit upstream proxy selection at the asynchronous protected-fetch boundary. Seven net-new regressions cover the contracts. At PR #108, full fake GStreamer, packaged source-policy, and live Windows playback validation remained open; the following slice closes the fake-GStreamer part. |
 | 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
-| 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution bundles and dependency-scans its own GStreamer plugin scanner, directly preflights that exact helper, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Both native architectures must prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
+| 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded app/scanner/plugin DLL closure, co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Both native architectures must prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |

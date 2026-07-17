@@ -218,10 +218,11 @@ fn detect_windows_bundle(exe: &Path) -> Option<WindowsBundleLayout> {
         return None;
     }
     Some(WindowsBundleLayout {
-        scanner: install_root
-            .join("libexec")
-            .join("gstreamer-1.0")
-            .join("gst-plugin-scanner.exe"),
+        // Keep the scanner beside the application and its bundled DLLs. Windows
+        // searches an executable's own directory for its dependencies, so this
+        // works for both the isolated package probe and an ordinary user launch
+        // without adding the bundle to PATH.
+        scanner: install_root.join("gst-plugin-scanner.exe"),
         install_root,
         plugin_dir,
     })
@@ -1300,11 +1301,7 @@ mod tests {
         assert!(detect_windows_bundle(&exe).is_none());
         fs::create_dir_all(temp.path().join("lib/gstreamer-1.0")).unwrap();
         let layout = detect_windows_bundle(&exe).unwrap();
-        assert_eq!(
-            layout.scanner,
-            temp.path()
-                .join("libexec/gstreamer-1.0/gst-plugin-scanner.exe")
-        );
+        assert_eq!(layout.scanner, temp.path().join("gst-plugin-scanner.exe"));
     }
 
     fn cache_record(module_record: &str) -> String {
@@ -1511,11 +1508,15 @@ mod tests {
     #[test]
     fn windows_script_overwrites_and_dependency_scans_bundled_scanner() {
         let script = include_str!("../scripts/build-windows.ps1");
+        assert!(script.contains("$gstScannerDest = Join-Path $DIST \"gst-plugin-scanner.exe\""));
+        assert!(!script.contains(
+            "$gstScannerDest = Join-Path $DIST \"libexec\\gstreamer-1.0\\gst-plugin-scanner.exe\""
+        ));
         let scanner_copy = script
             .find("Copy-Item -LiteralPath $gstScannerSrc -Destination $gstScannerDest -Force")
             .expect("unconditional scanner copy");
         let scanner_scan = script
-            .find("$binariesToScan += $gstScannerDest")
+            .find("$initialDllScanTargets += $gstScannerDest")
             .expect("scanner dependency scan");
         let runtime_probe = script
             .find("Write-Info \"Running packaged Windows runtime probe...\"")
@@ -1527,6 +1528,58 @@ mod tests {
         assert!(scanner_scan < runtime_probe);
         assert!(runtime_probe < archive);
         assert!(!script.contains("Copy-IfNewer $gstScannerSrc"));
+        assert!(script.contains(
+            "Remove-Item -LiteralPath $legacyGstScannerDest -Force -ErrorAction SilentlyContinue"
+        ));
+    }
+
+    #[test]
+    fn windows_script_computes_a_bounded_transitive_dll_closure() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        for fragment in [
+            "$requiredSoupPluginName = \"libgstsoup.dll\"",
+            "$requiredSoupRuntimeName = \"libsoup-3.0-0.dll\"",
+            "Required souphttpsrc runtime is incomplete",
+            "$PkgPrefix-libsoup3 packages",
+            "function Get-LddDependencyName",
+            "libfoo.dll => /clang64/bin/libfoo.dll (0x...)",
+            "/clangarm64/bin/foo.dll (0x...)",
+            "if ($Line -match '^\\s*(.+?\\.dll)\\s*=>')",
+            "elseif ($Line -match '^\\s*\"?(.+?\\.dll)\"?(?:\\s+\\(0x[0-9A-Fa-f]+\\))?\\s*$')",
+            "$maxDllScanTargets = 4096",
+            "$maxLddOutputLines = 131072",
+            "$dllScanQueue = [System.Collections.Queue]::new()",
+            "$knownDllScanTargets = @{}",
+            "while ($dllScanQueue.Count -gt 0)",
+            "$lddLines = @(& $ldd $bin 2>$null)",
+            "$lddExitCode = $LASTEXITCODE",
+            "if ([string]$line -match '=>\\s+not found')",
+            "Add-DllScanTarget $dllScanQueue $knownDllScanTargets $destPath $maxDllScanTargets",
+            "$soupRuntimeDependencyObserved = $true",
+            "if (-not $soupPluginScanned)",
+            "if (-not $soupRuntimeDependencyObserved)",
+            "$scannedDllTargets.ContainsKey($requiredSoupRuntimeFull)",
+        ] {
+            assert!(
+                script.contains(fragment),
+                "missing bounded Windows DLL-closure contract: {fragment}"
+            );
+        }
+
+        let copy = script
+            .find("if (Copy-IfNewer $srcPath $destPath)")
+            .expect("dependency copy");
+        let enqueue = script[copy..]
+            .find("Add-DllScanTarget $dllScanQueue $knownDllScanTargets $destPath")
+            .expect("copied dependency enqueue")
+            + copy;
+        let probe = script
+            .find("Write-Info \"Running packaged Windows runtime probe...\"")
+            .expect("packaged runtime probe");
+        assert!(copy < enqueue);
+        assert!(enqueue < probe);
+        assert!(!script.contains("foreach ($bin in $binariesToScan)"));
+        assert!(!script.contains("Get-ChildItem -Path \"$MsysPath\\bin\""));
     }
 
     #[test]
@@ -1535,29 +1588,74 @@ mod tests {
         for fragment in [
             "$startInfo.ArgumentList.Add(\"--tributary-platform-runtime-probe\")",
             "$startInfo.ArgumentList.Add($probeCache)",
+            "$startInfo.PSObject.Properties.Name -contains \"ArgumentList\"",
+            "$probeCache.IndexOf([char]34)",
+            "$startInfo.Arguments = \"--tributary-platform-runtime-probe `\"$probeCache`\"\"",
             "Fresh Cache With Spaces",
+            "$startInfo.EnvironmentVariables.Keys",
+            "$startInfo.EnvironmentVariables.Remove($key)",
             "$normalized.StartsWith(\"GST_\")",
             "$normalized -eq \"GIO_EXTRA_MODULES\"",
             "$normalized -eq \"GIO_USE_PROXY_RESOLVER\"",
             "'^(HTTP|HTTPS|ALL|NO)_PROXY$'",
-            "$startInfo.Environment[\"PATH\"] = \"$distFull$([System.IO.Path]::PathSeparator)$system32\"",
+            "$system32 = [System.Environment]::SystemDirectory",
+            "$startInfo.EnvironmentVariables[\"PATH\"] = $system32",
             "$probeOutputLimit = 1MB",
             "$probeProcess.WaitForExit(50)",
             "$probeClock.ElapsedMilliseconds -ge 90000",
             "($stdoutLength + $stderrLength) -gt $probeOutputLimit",
-            "$Process.Kill($true)",
+            "$useTaskkill = $null -eq $killTreeMethod",
+            "$killTreeMethod.Invoke($Process, [object[]]@($true))",
+            "$taskkillPath = Join-Path $system32 \"taskkill.exe\"",
+            "[System.IO.Path]::IsPathRooted($taskkillPath)",
+            "$taskkillInfo.Arguments = \"/PID $($Process.Id) /T /F\"",
+            "$taskkillProcess.WaitForExit(10000)",
+            "try { $Process.Kill() } catch { }",
             "$Process.WaitForExit(10000)",
             "Get-BoundedProbeDiagnostic",
             "Remove-Item -LiteralPath $probeWorkspace -Recurse -Force",
         ] {
-            assert!(script.contains(fragment), "missing Windows probe policy: {fragment}");
+            assert!(
+                script.contains(fragment),
+                "missing Windows probe policy: {fragment}"
+            );
         }
+        assert!(!script.contains(
+            "$startInfo.EnvironmentVariables[\"PATH\"] = \"$distFull$([System.IO.Path]::PathSeparator)$system32\""
+        ));
+        assert!(!script.contains("$startInfo.Environment["));
+        assert!(!script.contains("$Process.Kill($true)"));
         assert!(script.contains(WINDOWS_PROBE_SENTINEL_NAME));
         assert!(script.contains(
             std::str::from_utf8(WINDOWS_PROBE_SENTINEL)
                 .unwrap()
                 .trim_end()
         ));
+    }
+
+    #[test]
+    fn windows_script_supports_windows_powershell_5_1_process_apis() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        for fragment in [
+            "$startInfo.PSObject.Properties.Name -contains \"ArgumentList\"",
+            "$probeCache.IndexOf([char]34)",
+            "$startInfo.Arguments = \"--tributary-platform-runtime-probe `\"$probeCache`\"\"",
+            "$startInfo.EnvironmentVariables.Keys",
+            "$startInfo.EnvironmentVariables.Remove($key)",
+            "$killTreeMethod.Invoke($Process, [object[]]@($true))",
+            "$taskkillPath = Join-Path $system32 \"taskkill.exe\"",
+            "[System.IO.Path]::IsPathRooted($taskkillPath)",
+            "$taskkillInfo.Arguments = \"/PID $($Process.Id) /T /F\"",
+            "$taskkillProcess.WaitForExit(10000)",
+            "$Process.WaitForExit(10000)",
+        ] {
+            assert!(
+                script.contains(fragment),
+                "missing Windows PowerShell 5.1 compatibility contract: {fragment}"
+            );
+        }
+        assert!(!script.contains("$startInfo.Environment["));
+        assert!(!script.contains("$Process.Kill($true)"));
     }
 
     #[test]
