@@ -123,6 +123,8 @@ dialogs:
   output_name_placeholder: "MPD sala de estar"
   output_host: "Host"
   output_port: "Porta"
+  output_exclusive_control_warning: "Os comandos MPD de pausar, parar, repetir, aleatório, único e consumir afetam toda a partição de reprodução. Não a compartilhe com outro controlador ou outra instância do Tributary."
+  output_exclusive_control_confirmation: "Confirmo que o Tributary tem controle exclusivo desta partição de reprodução MPD."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -223,6 +225,7 @@ errors:
     audio_output_failed: "Falha na saída de áudio"
     playback_failed: "Falha na reprodução de áudio"
     airplay_raopsink_missing: "O AirPlay requer o elemento raopsink do GStreamer — instale o pacote gst-plugins-bad e reinicie o Tributary"
+    mpd_exclusive_control_required: "Adicione novamente esta saída MPD, confirme o controle exclusivo da partição e selecione-a novamente antes da reprodução"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

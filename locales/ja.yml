@@ -123,6 +123,8 @@ dialogs:
   output_name_placeholder: "リビングルーム MPD"
   output_host: "ホスト"
   output_port: "ポート"
+  output_exclusive_control_warning: "MPD の一時停止、停止、リピート、ランダム、シングル、consume コマンドは再生パーティション全体に影響します。別のコントローラーや Tributary インスタンスと共有しないでください。"
+  output_exclusive_control_confirmation: "Tributary がこの MPD 再生パーティションを排他的に制御することを確認します。"
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -223,6 +225,7 @@ errors:
     audio_output_failed: "オーディオ出力に失敗しました"
     playback_failed: "オーディオ再生に失敗しました"
     airplay_raopsink_missing: "AirPlay には GStreamer の raopsink エレメントが必要です。gst-plugins-bad パッケージをインストールしてから Tributary を再起動してください"
+    mpd_exclusive_control_required: "この MPD 出力を再追加してパーティションの排他的制御を確認し、再生前にもう一度選択してください"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

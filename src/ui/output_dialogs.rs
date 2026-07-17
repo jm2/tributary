@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 /// A saved audio output entry in `outputs.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedOutput {
     /// Output type: `"mpd"` (extensible to `"airplay"` etc.).
     #[serde(rename = "type")]
@@ -18,6 +18,17 @@ pub struct SavedOutput {
     pub host: String,
     /// Port for MPD connections (typically 6600).
     pub port: u16,
+    /// Whether the user confirmed that Tributary exclusively controls this
+    /// MPD playback partition. Legacy entries deliberately default to false.
+    #[serde(default)]
+    pub exclusive_control: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedOutputUpsert {
+    Added,
+    Upgraded,
+    Unchanged,
 }
 
 /// Path to `outputs.json`: `<data_dir>/tributary/outputs.json`.
@@ -45,23 +56,72 @@ fn save_outputs(outputs: &[SavedOutput]) {
     }
 }
 
-/// Add an output to `outputs.json` (dedup by host:port).
-pub fn add_saved_output(output_type: &str, name: &str, host: &str, port: u16) {
-    let mut outputs = load_saved_outputs();
-    let key = format!("{host}:{port}");
-    if !outputs
-        .iter()
-        .any(|o| format!("{}:{}", o.host, o.port) == key)
+fn upsert_saved_output(
+    outputs: &mut Vec<SavedOutput>,
+    output_type: &str,
+    name: &str,
+    host: &str,
+    port: u16,
+    exclusive_control: bool,
+) -> SavedOutputUpsert {
+    if let Some(existing) = outputs
+        .iter_mut()
+        .find(|output| output.host == host && output.port == port)
     {
-        outputs.push(SavedOutput {
-            output_type: output_type.to_string(),
-            name: name.to_string(),
-            host: host.to_string(),
-            port,
-        });
-        save_outputs(&outputs);
-        info!(host = %host, port, "Output added to outputs.json");
+        // Re-adding a legacy endpoint is the explicit migration path. Preserve
+        // its existing type and display name so the already-rendered selector
+        // row remains an exact representation of the saved entry.
+        if exclusive_control && !existing.exclusive_control {
+            existing.exclusive_control = true;
+            return SavedOutputUpsert::Upgraded;
+        }
+        return SavedOutputUpsert::Unchanged;
     }
+
+    outputs.push(SavedOutput {
+        output_type: output_type.to_string(),
+        name: name.to_string(),
+        host: host.to_string(),
+        port,
+        exclusive_control,
+    });
+    SavedOutputUpsert::Added
+}
+
+/// Add or explicitly upgrade an output in `outputs.json` (dedup by host:port).
+pub fn add_saved_output(
+    output_type: &str,
+    name: &str,
+    host: &str,
+    port: u16,
+    exclusive_control: bool,
+) -> SavedOutputUpsert {
+    let mut outputs = load_saved_outputs();
+    let outcome = upsert_saved_output(
+        &mut outputs,
+        output_type,
+        name,
+        host,
+        port,
+        exclusive_control,
+    );
+    if !matches!(outcome, SavedOutputUpsert::Unchanged) {
+        save_outputs(&outputs);
+        info!(host = %host, port, ?outcome, "Output saved to outputs.json");
+    }
+    outcome
+}
+
+fn exclusive_control_warning(locale: &str) -> String {
+    rust_i18n::t!("dialogs.output_exclusive_control_warning", locale = locale).into_owned()
+}
+
+fn exclusive_control_confirmation(locale: &str) -> String {
+    rust_i18n::t!(
+        "dialogs.output_exclusive_control_confirmation",
+        locale = locale
+    )
+    .into_owned()
 }
 
 /// Remove an output from `outputs.json` by host:port.
@@ -115,6 +175,24 @@ pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk
     port_spin.set_value(6600.0);
     port_spin.set_hexpand(true);
 
+    let exclusive_warning = gtk::Label::builder()
+        .label(exclusive_control_warning(&rust_i18n::locale()))
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .max_width_chars(52)
+        .build();
+    let exclusive_confirmation_label = gtk::Label::builder()
+        .label(exclusive_control_confirmation(&rust_i18n::locale()))
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .max_width_chars(52)
+        .xalign(0.0)
+        .build();
+    let exclusive_confirmation = gtk::CheckButton::builder()
+        .child(&exclusive_confirmation_label)
+        .halign(gtk::Align::Start)
+        .build();
+
     // Use a GtkGrid for consistent label alignment.
     let grid = gtk::Grid::builder()
         .row_spacing(12)
@@ -144,16 +222,24 @@ pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk
     grid.attach(&host_entry, 1, 1, 1, 1);
     grid.attach(&port_label, 0, 2, 1, 1);
     grid.attach(&port_spin, 1, 2, 1, 1);
+    grid.attach(&exclusive_warning, 0, 3, 2, 1);
+    grid.attach(&exclusive_confirmation, 0, 4, 2, 1);
 
     dialog.set_extra_child(Some(&grid));
+    dialog.set_response_enabled("add", false);
+    let dialog_for_confirmation = dialog.clone();
+    exclusive_confirmation.connect_toggled(move |confirmation| {
+        dialog_for_confirmation.set_response_enabled("add", confirmation.is_active());
+    });
 
     let output_list = output_list.clone();
     let name_entry_c = name_entry.clone();
     let host_entry_c = host_entry.clone();
     let port_spin_c = port_spin.clone();
+    let exclusive_confirmation_c = exclusive_confirmation.clone();
 
     dialog.connect_response(None, move |_dialog, response| {
-        if response != "add" {
+        if response != "add" || !exclusive_confirmation_c.is_active() {
             return;
         }
 
@@ -187,15 +273,18 @@ pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk
                             version = %version,
                             "MPD output added successfully"
                         );
-                        add_saved_output("mpd", &name, &host, port);
+                        let outcome = add_saved_output("mpd", &name, &host, port, true);
 
-                        // Add row to the output selector popover.
-                        let row = super::header_bar::build_output_row(
-                            &name,
-                            "network-server-symbolic",
-                            false,
-                        );
-                        output_list.append(&row);
+                        // A legacy endpoint is upgraded in place; its row is
+                        // already present and retains its saved display name.
+                        if outcome == SavedOutputUpsert::Added {
+                            let row = super::header_bar::build_output_row(
+                                &name,
+                                "network-server-symbolic",
+                                false,
+                            );
+                            output_list.append(&row);
+                        }
                     }
                     Err(e) => {
                         warn!(
@@ -211,4 +300,77 @@ pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk
     });
 
     dialog.present(Some(window));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_output_defaults_to_unconfirmed_and_approved_output_serializes_mode() {
+        let legacy = r#"[{"type":"mpd","name":"Legacy","host":"mpd.local","port":6600}]"#;
+        let mut outputs: Vec<SavedOutput> = serde_json::from_str(legacy).expect("legacy JSON");
+        assert!(!outputs[0].exclusive_control);
+
+        assert_eq!(
+            upsert_saved_output(&mut outputs, "mpd", "Replacement", "mpd.local", 6600, true),
+            SavedOutputUpsert::Upgraded
+        );
+        let serialized = serde_json::to_string(&outputs).expect("approved JSON");
+        assert!(serialized.contains(r#""exclusive_control":true"#));
+    }
+
+    #[test]
+    fn endpoint_upsert_upgrades_in_place_without_renaming_or_dropping_siblings() {
+        let mut outputs = vec![
+            SavedOutput {
+                output_type: "mpd".to_string(),
+                name: "Living Room".to_string(),
+                host: "mpd.local".to_string(),
+                port: 6600,
+                exclusive_control: false,
+            },
+            SavedOutput {
+                output_type: "mpd".to_string(),
+                name: "Office".to_string(),
+                host: "office.local".to_string(),
+                port: 6601,
+                exclusive_control: true,
+            },
+        ];
+        let sibling = outputs[1].clone();
+
+        assert_eq!(
+            upsert_saved_output(&mut outputs, "mpd", "Renamed", "mpd.local", 6600, true),
+            SavedOutputUpsert::Upgraded
+        );
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].name, "Living Room");
+        assert!(outputs[0].exclusive_control);
+        assert_eq!(outputs[1], sibling);
+        assert_eq!(
+            upsert_saved_output(&mut outputs, "mpd", "Renamed", "mpd.local", 6600, true),
+            SavedOutputUpsert::Unchanged
+        );
+        assert_eq!(outputs.len(), 2);
+    }
+
+    #[test]
+    fn exclusive_control_warning_and_confirmation_are_localized_everywhere() {
+        let english_warning = exclusive_control_warning("en");
+        let english_confirmation = exclusive_control_confirmation("en");
+        for locale in rust_i18n::available_locales!() {
+            let warning = exclusive_control_warning(&locale);
+            let confirmation = exclusive_control_confirmation(&locale);
+            assert!(!warning.is_empty(), "{locale} warning");
+            assert!(!confirmation.is_empty(), "{locale} confirmation");
+            if locale != "en" {
+                assert_ne!(warning, english_warning, "{locale} warning fallback");
+                assert_ne!(
+                    confirmation, english_confirmation,
+                    "{locale} confirmation fallback"
+                );
+            }
+        }
+    }
 }

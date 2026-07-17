@@ -46,6 +46,26 @@ const MAX_MPD_RESOLVER_HOST_BYTES: usize = 1024;
 /// One load-sized command plus a bounded burst of small playback controls.
 const MAX_PENDING_WORKER_COMMANDS: usize = 64;
 
+/// Whether this output is allowed to issue MPD's partition-wide playback and
+/// option commands. MPD exposes no atomic ownership check for those commands,
+/// so playback remains fail-closed until the user explicitly confirms that no
+/// other controller or Tributary instance shares the partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MpdControlMode {
+    Unconfirmed,
+    Exclusive,
+}
+
+impl From<bool> for MpdControlMode {
+    fn from(exclusive_control: bool) -> Self {
+        if exclusive_control {
+            Self::Exclusive
+        } else {
+            Self::Unconfirmed
+        }
+    }
+}
+
 pub struct MpdOutput {
     #[allow(dead_code)]
     display_name: String,
@@ -412,6 +432,12 @@ struct MpdFailure {
     operation: &'static str,
     connection_usable: bool,
     ack_code: Option<MpdAckCode>,
+    user_message: Option<MpdUserMessage>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MpdUserMessage {
+    ExclusiveControlRequired,
 }
 
 impl MpdFailure {
@@ -420,6 +446,7 @@ impl MpdFailure {
             operation,
             connection_usable: false,
             ack_code: None,
+            user_message: None,
         }
     }
 
@@ -428,6 +455,7 @@ impl MpdFailure {
             operation,
             connection_usable: true,
             ack_code: None,
+            user_message: None,
         }
     }
 
@@ -436,6 +464,16 @@ impl MpdFailure {
             operation,
             connection_usable: true,
             ack_code,
+            user_message: None,
+        }
+    }
+
+    const fn exclusive_control_required() -> Self {
+        Self {
+            operation: "exclusive control confirmation",
+            connection_usable: false,
+            ack_code: None,
+            user_message: Some(MpdUserMessage::ExclusiveControlRequired),
         }
     }
 }
@@ -445,7 +483,20 @@ fn opaque_mpd_failure<E>(operation: &'static str, _error: E) -> MpdFailure {
 }
 
 fn mpd_failure_message(failure: MpdFailure) -> String {
-    format!("MPD {} failed", failure.operation)
+    match failure.user_message {
+        Some(MpdUserMessage::ExclusiveControlRequired) => {
+            mpd_exclusive_control_required_message(&rust_i18n::locale())
+        }
+        None => format!("MPD {} failed", failure.operation),
+    }
+}
+
+fn mpd_exclusive_control_required_message(locale: &str) -> String {
+    rust_i18n::t!(
+        "errors.playback.mpd_exclusive_control_required",
+        locale = locale
+    )
+    .into_owned()
 }
 
 type MpdResult<T> = Result<T, MpdFailure>;
@@ -1705,6 +1756,7 @@ enum MpdMedia {
 
 fn spawn_mpd_worker<C>(
     connector: C,
+    control_mode: MpdControlMode,
     intent_epoch: Arc<AtomicU64>,
     cache: Arc<Mutex<MpdCache>>,
     event_tx: async_channel::Sender<PlayerEvent>,
@@ -1721,6 +1773,7 @@ where
             run_mpd_worker(
                 connector,
                 worker_rx,
+                control_mode,
                 intent_epoch,
                 cache,
                 event_tx,
@@ -1734,9 +1787,11 @@ where
     worker_tx
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_mpd_worker<C>(
     mut connector: C,
     worker_rx: WorkerCommandReceiver,
+    control_mode: MpdControlMode,
     intent_epoch: Arc<AtomicU64>,
     cache: Arc<Mutex<MpdCache>>,
     event_tx: async_channel::Sender<PlayerEvent>,
@@ -1761,6 +1816,7 @@ fn run_mpd_worker<C>(
                             &mut active,
                             command.owner,
                             MpdMedia::Direct(uri),
+                            control_mode,
                             &proxy,
                             &intent_epoch,
                             &cache,
@@ -1775,6 +1831,7 @@ fn run_mpd_worker<C>(
                             &mut active,
                             command.owner,
                             MpdMedia::Protected(MpdUpstream::Legacy(upstream)),
+                            control_mode,
                             &proxy,
                             &intent_epoch,
                             &cache,
@@ -1789,6 +1846,7 @@ fn run_mpd_worker<C>(
                             &mut active,
                             command.owner,
                             MpdMedia::Protected(MpdUpstream::Resolved(request)),
+                            control_mode,
                             &proxy,
                             &intent_epoch,
                             &cache,
@@ -1887,6 +1945,7 @@ fn handle_load<C>(
     active: &mut Option<WorkerSession<C::Connection>>,
     owner: CommandOwner,
     media: MpdMedia,
+    control_mode: MpdControlMode,
     proxy: &ProxyServices,
     intent_epoch: &AtomicU64,
     cache: &Mutex<MpdCache>,
@@ -1895,6 +1954,21 @@ fn handle_load<C>(
 ) where
     C: MpdConnector,
 {
+    // This gate intentionally precedes cleanup, Buffering publication,
+    // connection, partition-wide option resets, proxy tickets, and queue
+    // mutation. A legacy/unconfirmed saved endpoint therefore has no MPD or
+    // protected-media side effects; re-adding it with the explicit checkbox
+    // is the only supported upgrade path.
+    if control_mode != MpdControlMode::Exclusive {
+        fail_current(
+            owner,
+            MpdFailure::exclusive_control_required(),
+            intent_epoch,
+            cache,
+            event_tx,
+        );
+        return;
+    }
     match cleanup_session(active, owner, CleanupKind::Targeted, intent_epoch, timing) {
         CleanupOutcome::Completed => {}
         CleanupOutcome::Failed(failure) => {
@@ -2766,10 +2840,10 @@ where
                     }
                 }
             }
-            // A foreign current id does not authorize either a global stop or
-            // a racy targeted delete. Another client could select our queued
-            // id between this status and deleteid, so deliberately retain it
-            // until exclusive-control work can make cleanup conditional.
+            // A foreign current id means the exclusive-control contract was
+            // violated. It still does not authorize either a global stop or a
+            // racy targeted delete: another client could select our queued id
+            // between this status and deleteid, so deliberately retain it.
             Ok(status) if status.song_id.is_some() => return CleanupOutcome::Completed,
             // No current id authorizes only the targeted cleanup below.
             Ok(_) => {}
@@ -2912,9 +2986,10 @@ impl MpdOutput {
         display_name: &str,
         host: &str,
         port: u16,
+        control_mode: MpdControlMode,
         event_tx: async_channel::Sender<PlayerEvent>,
     ) -> Self {
-        info!(host = %host, port, name = %display_name, "MPD output configured");
+        info!(host = %host, port, name = %display_name, ?control_mode, "MPD output configured");
         let intent_epoch = Arc::new(AtomicU64::new(0));
         let cache = Arc::new(Mutex::new(MpdCache::default()));
         let proxy = ProxyServices::production();
@@ -2923,6 +2998,7 @@ impl MpdOutput {
                 host: host.to_string(),
                 port,
             },
+            control_mode,
             Arc::clone(&intent_epoch),
             Arc::clone(&cache),
             event_tx.clone(),
@@ -3561,6 +3637,28 @@ mod tests {
             timing: WorkerTiming,
             proxy: ProxyServices,
         ) -> Self {
+            Self::new_with_mode_and_proxy(shared, timing, proxy, MpdControlMode::Exclusive)
+        }
+
+        fn new_unconfirmed_with_proxy(shared: Arc<FakeShared>, proxy: ProxyServices) -> Self {
+            Self::new_with_mode_and_proxy(
+                shared,
+                WorkerTiming {
+                    operation: Duration::from_secs(2),
+                    poll: Duration::from_hours(1),
+                    tick: Duration::from_millis(10),
+                },
+                proxy,
+                MpdControlMode::Unconfirmed,
+            )
+        }
+
+        fn new_with_mode_and_proxy(
+            shared: Arc<FakeShared>,
+            timing: WorkerTiming,
+            proxy: ProxyServices,
+            control_mode: MpdControlMode,
+        ) -> Self {
             let (tx, rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
             let epoch = Arc::new(AtomicU64::new(0));
             let cache = Arc::new(Mutex::new(MpdCache::default()));
@@ -3572,6 +3670,7 @@ mod tests {
                 run_mpd_worker(
                     FakeConnector { shared },
                     rx,
+                    control_mode,
                     epoch_for_worker,
                     cache_for_worker,
                     event_tx,
@@ -3644,6 +3743,66 @@ mod tests {
     fn protected_load(uri: &str) -> CommandKind {
         CommandKind::ProtectedLoad {
             upstream: Box::new(Url::parse(uri).expect("protected test URL")),
+        }
+    }
+
+    #[test]
+    fn unconfirmed_partition_rejects_load_before_any_connection_state_or_ticket_action() {
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_unconfirmed_with_proxy(Arc::clone(&shared), proxy);
+        let owner = harness.next_owner(17);
+
+        harness.send(
+            owner,
+            protected_load("https://music.test/private.flac?token=must-not-leave"),
+        );
+        harness.fence(owner);
+
+        assert!(shared.actions().is_empty(), "no MPD operation is allowed");
+        assert!(shared.added_uris().is_empty(), "no queue URI is allowed");
+        assert!(
+            proxy_shared
+                .starts
+                .lock()
+                .expect("proxy starts lock")
+                .is_empty(),
+            "no protected-media ticket is allowed"
+        );
+        assert_eq!(harness.cache().state, PlayerState::Stopped);
+        let events = harness.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { message, .. }
+            ] if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged {
+                state: PlayerState::Buffering | PlayerState::Playing | PlayerState::Paused,
+                ..
+            }
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn exclusive_control_requirement_is_localized_for_every_catalog() {
+        let english = mpd_exclusive_control_required_message("en");
+        assert!(!english.is_empty());
+        for locale in rust_i18n::available_locales!() {
+            let localized = mpd_exclusive_control_required_message(&locale);
+            assert!(!localized.is_empty(), "{locale}");
+            if locale != "en" {
+                assert_ne!(localized, english, "{locale} must not fall back to English");
+            }
         }
     }
 
@@ -6364,6 +6523,7 @@ mod tests {
                     port: address.port(),
                 },
                 worker_rx,
+                MpdControlMode::Exclusive,
                 worker_epoch,
                 worker_cache,
                 event_tx,

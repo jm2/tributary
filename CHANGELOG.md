@@ -35,6 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Credential-bearing media tickets now expire** — Every upstream proxy ticket has a hard, absolute, non-sliding 24-hour lifetime from registration in addition to earlier playback-lifecycle revocation. It is usable only before its monotonic deadline; a lookup at or after that boundary atomically removes it and returns the same 404 as an unknown or revoked route. GET and byte-range requests, pause, seek, and receiver status do not renew the deadline, so a compromised receiver cannot perpetuate the bearer. A response admitted before expiry may finish afterward, but every later lookup fails. Local-file routes retain their existing server-lifetime behavior because they front no backend credential.
 
 ### Changed
+- **MPD playback now requires explicit exclusive partition control** — MPD exposes pause, stop,
+  and its `repeat`, `random`, `single`, and `consume` settings as partition-wide mutations, with no
+  atomic command that can prove Tributary still owns the current song. The Add Output dialog now
+  explains that scope in every supported locale and requires confirmation that no other controller
+  or Tributary instance shares the playback partition. The confirmation is persisted as an
+  explicit mode and participates in output identity, so reselecting an upgraded active endpoint
+  rebuilds it instead of being mistaken for a no-op. Legacy entries deserialize unconfirmed and
+  playback fails with localized re-add/confirm/reselect guidance before any MPD connection, MPD
+  state or option command, protected-media ticket, or queue mutation. Re-adding the exact host and
+  port with the checkbox upgrades that entry in place without renaming it, dropping siblings, or
+  creating a duplicate. Existing song-ID ownership checks remain in force: observing a foreign
+  current song violates the exclusive-control promise but still causes conservative
+  relinquishment/retention rather than a racy stop or delete.
 - **Coverage is now representative and threshold-gated** — The sole comparable report moves to
   a dedicated Linux x86_64 job pinned to Rust 1.92.0, matching LLVM tools, cargo-llvm-cov 0.8.7,
   the committed dependency graph, every host target, and every feature. UI, Jellyfin, Plex,
