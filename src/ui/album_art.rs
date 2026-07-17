@@ -219,7 +219,7 @@ pub fn update_album_art(image: &gtk::Image, uri: &str) {
             if !generation_is_current(generation) {
                 return;
             }
-            let bytes = glib::Bytes::from(&data);
+            let bytes = glib::Bytes::from_owned(data);
             if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
                 image.set_paintable(Some(&texture));
             }
@@ -518,7 +518,7 @@ fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, generation: u
             // Double-check generation in case another track was selected
             // while we were waiting for the channel.
             if generation_is_current(generation) {
-                let bytes = glib::Bytes::from(&data);
+                let bytes = glib::Bytes::from_owned(data);
                 if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
                     image.set_paintable(Some(&texture));
                 }

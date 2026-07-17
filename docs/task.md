@@ -1658,7 +1658,8 @@ service/DAAP foundation and was accepted in PR #118 after rebasing onto PR #117.
   generation check before texture publication. A second harness drives the production source
   cache/eviction boundary with reversed same-key completion order, proving a stale loaded or
   missing result cannot replace or remove the newer projection, while the newest result for an
-  inactive source is cached without rendering.
+  inactive source is cached without rendering. Accepted owned image buffers are transferred into
+  `glib::Bytes` without copying them a second time.
 - [x] Add keyboard context-menu and slider accessibility checks. This slice routes unmodified Menu
   and exact Shift+F10 through the right-click selection snapshot, consumes
   only a shortcut that opens a non-empty menu, exposes `has-popup` plus the standardized
@@ -1666,8 +1667,9 @@ service/DAAP foundation and was accepted in PR #118 after rebasing onto PR #117.
   and volume sliders in all 13 catalogs. A production-consumed interaction plan pins the bubbling
   key controller, empty/non-empty propagation, immutable post-popup selection snapshot, and
   popover-scoped action ownership. Focused tests reject Shift+Menu, plain F10, and unrelated
-  chords, exercise that complete plan, and parse each YAML catalog to prove both keys exist rather
-  than mistaking an English fallback for a valid translation.
+  chords, ignore ambient CapsLock and legacy NumLock/Mod2 state, exercise that complete plan, and
+  parse each YAML catalog to prove both keys exist rather than mistaking an English fallback for a
+  valid translation.
 - [x] Record implementation: PR #119. The final lifecycle slice adds
   two net-new application tests (three focused integration tests after replacing the old pure
   output-decision assertion) and completes the production-boundary evidence recorded below. With
@@ -1810,8 +1812,11 @@ generation, remote-to-remote and remote-to-Local transfer clear before Stop and 
 output, and a wrong-type replacement cannot mutate current playback. Output construction now uses
 the requested typed target directly
 and no longer creates a throwaway MPD worker merely to move Local into its parked slot. Formatting
-and `git diff --check` pass. No dependency, lockfile, locale, protocol, schema, package version,
-packaging, or release-workflow file changed. These last two harness boxes plus the implementation
+and `git diff --check` pass. Automated review additionally caught and the branch now covers ambient
+NumLock/legacy modifier bits in keyboard-menu matching, and artwork publication transfers its
+owned byte vectors into GLib without an avoidable full-buffer copy. These review fixes changed no
+dependency, lockfile, locale, protocol, schema, package version, packaging, or release-workflow
+file. These last two harness boxes plus the implementation
 record complete P3.4, advancing the literal total to **216/223 (96.9%)** and P3 to **26/30**.
 
 Pre-rebase parent validation (2026-07-17, P3.4 recycled-row/UI-generation slice):

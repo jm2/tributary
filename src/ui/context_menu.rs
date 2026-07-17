@@ -98,10 +98,15 @@ fn keyboard_context_menu_propagation(
 fn is_keyboard_context_menu_trigger(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
     use gtk::gdk::ModifierType;
 
-    // Lock state is ambient, not a chord. After removing it, accept only the
-    // exact standard bindings: unmodified Menu or Shift+F10. In particular,
-    // Shift+Menu must remain available to an ancestor/application binding.
-    let effective = modifiers.difference(ModifierType::LOCK_MASK);
+    // Lock/legacy modifier state (for example NumLock's X11 Mod2 bit) is
+    // ambient, not a chord. Keep only modifiers that participate in shortcuts,
+    // then accept the exact standard bindings: unmodified Menu or Shift+F10.
+    // In particular, Shift+Menu remains available to an ancestor binding.
+    let effective = modifiers
+        & (ModifierType::SHIFT_MASK
+            | ModifierType::CONTROL_MASK
+            | ModifierType::ALT_MASK
+            | ModifierType::SUPER_MASK);
     (key == gtk::gdk::Key::Menu && effective.is_empty())
         || (key == gtk::gdk::Key::F10 && effective == ModifierType::SHIFT_MASK)
 }
@@ -728,6 +733,14 @@ mod tests {
         assert!(is_keyboard_context_menu_trigger(
             Key::F10,
             ModifierType::SHIFT_MASK | ModifierType::LOCK_MASK
+        ));
+        // GDK4 no longer names the legacy X11 Mod2 mask, but key state can
+        // still carry its raw bit while NumLock is active.
+        let ambient_mod2 = ModifierType::from_bits_retain(1 << 4);
+        assert!(is_keyboard_context_menu_trigger(Key::Menu, ambient_mod2));
+        assert!(is_keyboard_context_menu_trigger(
+            Key::F10,
+            ModifierType::SHIFT_MASK | ambient_mod2
         ));
 
         assert!(!is_keyboard_context_menu_trigger(

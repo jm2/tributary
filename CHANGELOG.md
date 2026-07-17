@@ -60,7 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into its parked slot; that worker is no longer created. Headless recording-output regressions
   exercise reorder/filter/source-navigation, B→C→B queue identity, stale events, rejected remote
   load retry, Local→MPD→Chromecast→Local replacement/restoration, invalid replacement, Stop/drop
-  cleanup, and exact reselection through the production seams. Together with the accessibility,
+  cleanup, and exact reselection through the production seams. Keyboard context-menu matching
+  now ignores ambient lock/legacy modifier state such as NumLock while continuing to reject real
+  Control, Alt, Super, and extra-Shift chords; owned local and remote artwork buffers also cross
+  into GLib without a redundant full-buffer copy. Together with the accessibility,
   Cast-frame, recycled-row, artwork, and source-generation harnesses, this completes all P3.4
   integration items; the final rebased branch passes 797 tests in each profile plus strict Clippy
   in debug and release.
