@@ -31,12 +31,13 @@ has five independently verifiable tasks rather than the original three compound 
 denominator excludes the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**187/220 (85.0%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **70/76 P2**,
+**188/220 (85.5%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **71/76 P2**,
 and **3/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
-PR #105, and the cancellable resolver box implemented in PR #106, since the earlier snapshot. The
+PR #105, the cancellable resolver box implemented in PR #106, and the
+held-ACK/slow-greeting/real-IPv6 coverage box completed by PR #107, since the earlier snapshot. The
 release-workflow dry run remains deliberately deferred rather than being counted as unfinished P0
 remediation.
 
@@ -1087,17 +1088,22 @@ error that tells the user what to install.
   also drops its old session before a replacement Load can target the retained ID. Automatic orphan
   removal remains deferred until the open exclusive-control configuration work can make that
   mutation safe.
-- [ ] Add held-ACK worker FIFO, slow-first-greeting fairness, and real IPv6 loopback coverage.
+- [x] Add held-ACK worker FIFO, slow-first-greeting fairness, and real IPv6 loopback coverage.
   PR #105 supplies the real-TCP held-ACK FIFO case: Pause's ACK is withheld while Seek, Play, and a
   fence enqueue promptly; no later protocol command is pipelined before the ACK, and the retained
-  controls execute in exact order after release. PR #106 strengthens raw/bracketed numeric IPv6
-  and GIO scope/flowinfo conversion coverage, but slow-first-greeting fairness and a real IPv6
-  listener remain open.
+  controls execute in exact order after release. PR #107 binds two IPv4 listeners and uses channels
+  to hold the first accepted connection silent—without sleeps or an elapsed-time threshold—then
+  proves the shared absolute deadline reserves enough of its budget to connect to and read the
+  second address's greeting. A second real-socket regression binds `::1` when the host supports it,
+  exercises numeric resolution through connection and greeting, and requires IPv6 client and peer
+  addresses once that initial capability check succeeds. PR #106's raw/bracketed numeric IPv6 and
+  GIO scope/flowinfo conversion coverage remains the lower-level complement.
 - [ ] Record implementation: partial slices now include PR #104's ACK/terminal/orphan semantics
   with seven regressions, PR #105's bounded ingress/held-ACK FIFO with six regressions, and PR #106's
-  cancellable bounded resolver with nine net-new regressions plus one expanded numeric-IPv6 case.
-  Exclusive-control/global-option, slow-first-greeting, and real-IPv6-listener items remain open
-  before P2.10 as a whole can be recorded complete.
+  cancellable bounded resolver with nine net-new regressions plus one expanded numeric-IPv6 case,
+  followed by PR #107's two real-socket fairness/IPv6 regressions. Only the
+  exclusive-control/global-option item remains open before P2.10 as a whole can be recorded
+  complete.
 
 ### P2.11 Bound protected remote-playback startup and expose safe diagnostics
 
@@ -1269,20 +1275,32 @@ PR #94's containerized Flatpak build proved the manifest-local source generation
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
 
-Most recent branch validation (2026-07-16, PR #106 P2.10 cancellable-resolver slice):
+Most recent branch validation (2026-07-16, PR #107 P2.10 real-socket coverage slice):
+`cargo check --all-targets --all-features --locked` and
+`cargo test --all-targets --all-features --locked` pass in debug and release, as does strict
+all-target/all-feature Clippy in both profiles. Each full profile passes 18 library, 698
+application, and 8 repository-metadata tests (724 total); all 79 focused MPD tests pass. Two
+net-new real-socket regressions prove a silent first greeting cannot consume the later address's
+fair share of one absolute deadline, and exercise numeric `::1` resolution, connection, greeting,
+and IPv6 client/peer addresses when the host can bind IPv6 loopback. The first test uses channels
+without sleeps or a fragile elapsed-time bound; the second skips only when the initial `::1` bind
+is unavailable and makes every subsequent assertion mandatory. `cargo fmt --all -- --check` and
+`git diff --check` pass. No dependency or lockfile changed.
+
+Previous branch validation (2026-07-16, PR #106 P2.10 cancellable-resolver slice):
 `cargo check --all-targets --all-features --locked` and
 `cargo test --all-targets --all-features --locked` pass in debug and release, as does strict
 all-target/all-feature Clippy in both profiles. Each full profile passes 18 library, 696
 application, and 8 repository-metadata tests (722 total); all 77 focused MPD tests pass. Nine
-net-new resolver regressions cover host-size and
-character admission, ordered deduplication and the 32-address cap, absolute-deadline cancellation,
-result-channel loss, lifecycle-epoch cancellation, real GIO dispatch on the private context,
-eight-operation saturation with callback progress and reusable capacity, late-callback
-send/drop thread ownership, and GIO IPv4/IPv6 conversion with flowinfo and scope. The existing
-raw/bracketed numeric-IPv6 case is expanded and renamed separately. `cargo fmt --all -- --check`
-and `git diff --check` pass. No dependency or lockfile changed.
+net-new resolver regressions cover host-size and character admission, ordered deduplication and
+the 32-address cap, absolute-deadline cancellation, result-channel loss, lifecycle-epoch
+cancellation, real GIO dispatch on the private context, eight-operation saturation with callback
+progress and reusable capacity, late-callback send/drop thread ownership, and GIO IPv4/IPv6
+conversion with flowinfo and scope. The existing raw/bracketed numeric-IPv6 case is expanded and
+renamed separately. `cargo fmt --all -- --check` and `git diff --check` pass. No dependency or
+lockfile changed.
 
-Previous branch validation (2026-07-16, PR #105 P2.10 bounded-ingress/held-ACK slice):
+Earlier branch validation (2026-07-16, PR #105 P2.10 bounded-ingress/held-ACK slice):
 `cargo check --all-targets --all-features --locked`, strict debug and release
 all-target/all-feature Clippy, and `cargo test --all-targets --all-features --locked` in debug and
 release pass. Each full profile passes 18 library, 687 application, and 8 repository-metadata tests
@@ -1696,8 +1714,8 @@ Record scope or design decisions here so deferred work is explicit.
   for a detectable exclusive-control mode. PR #105's bounded command ingress preserves exact FIFO
   below 64 pending commands, atomically replaces older-epoch backlog, and only under saturation
   folds adjacent same-epoch transient controls before deterministically evicting the oldest
-  remaining transient. A
-  capacity-one wake signal never carries commands and stale wake tokens cannot renew the worker's
+  remaining transient. A capacity-one wake signal never carries commands and stale wake tokens
+  cannot renew the worker's
   polling deadline. PR #106 replaces blocking standard-library name resolution with one
   process-lifetime resolver thread and private GLib main context. Its capacity-64, 1-KiB-host
   ingress admits at most 16 requests per context tick and eight active GIO enumerations, failing
@@ -1705,11 +1723,13 @@ Record scope or design decisions here so deferred work is explicit.
   deadline covers resolution, connection, and greeting; deadline, lifecycle supersession, and
   result-channel loss cancel GIO, and late callback sends and drops remain on the resolver thread.
   Numeric addresses bypass DNS, while enumerated IPv4/IPv6 results retain order, deduplicate to 32,
-  and preserve IPv6 flowinfo and scope. MPD still has no ID-scoped pause or conditional
-  compare-and-act, so another client can race between status revalidation and a global pause or
-  stop, and load-time option resets remain global and unguarded. Those remaining exclusivity,
-  slow-first-greeting, and real-IPv6-listener improvements stay tracked under P2.10 rather than
-  being overstated as part of P1.8.
+  and preserve IPv6 flowinfo and scope. PR #107 proves the per-address greeting deadline is fair to
+  a later resolved address after an accepted first peer stays silent, and exercises the complete
+  numeric `::1` resolution/connect/greeting path against a real listener when IPv6 loopback is
+  available. MPD still has no ID-scoped pause or conditional compare-and-act, so another client can
+  race between status revalidation and a global pause or stop, and load-time option resets remain
+  global and unguarded. That exclusive-control/global-option improvement is the only remaining
+  P2.10 behavior item and is not overstated as part of P1.8.
 - 2026-07-15 — P1.9 separates the source whose rows remain visible from the user's current
   navigation intent. Each selection advances one monotonic generation and records an exact
   `{source_key, generation}` request; completion has three explicit dispositions: ignore a
@@ -1850,8 +1870,9 @@ Add one line per completed task:
 | 2026-07-16 | P2.9 | PR #99 | Removed the inoperative `shairport-sync` receiver fallback, moved the remaining capability refusal ahead of media preparation, localized actionable `raopsink`/`gst-plugins-bad` guidance, surfaced safe player errors in-app, and added focused missing-element/load-path regressions. |
 | 2026-07-16 | P2.7 platform runtime caches | PR #101 | Moved bundled GStreamer registries to install-keyed per-user caches before toolkit initialization, removed executable-adjacent fallback, added record-structured validation and exact absolute-path rewriting for the signed macOS pixbuf helper's generated cache, and made a path-with-spaces/read-only post-sign runtime probe plus final strict signature verification part of macOS packaging. Sixteen focused policy/static tests cover the portable contract, the independent fuzz lock remains synchronized, and PR CI passed the native macOS relocation/signature probe plus both Windows architecture jobs. |
 | 2026-07-16 | P2.8 bounded Chromecast control | PR #102 | Rebuilt the public `rust_cast` channel graph over a worker-local deadline-aware TLS stream, retained deterministic usable numeric mDNS IPv4 endpoints, and bounded TCP connect, operation-wide, and idle read/write time without moving the `Rc` session across threads. Poisoned sessions are dropped immediately while synchronized semantic rejections retain bounded cleanup; 12 focused real-socket, trickle, lifecycle, classifier, supersession, and discovery regressions cover the contract. |
-| 2026-07-16 | P2.10 ACK/terminal/orphan semantics (partial) | PR #104 | Retains only correlated typed redacted MPD ACK codes and accepts only `NoExist` as proof that a targeted ID is already absent; malformed or mismatched ACK-like input poisons the connection. Successful targeted removal supplies the stopped/no-current completion proof shared by natural exhaustion and external Next, while an already-absent ID is ownership loss. After a foreign replacement is observed, polling, explicit Stop, and shutdown deliberately retain the queued ID because shared-mode revalidation cannot make deletion conditional; a stale foreign-status response also drops its old session before replacement Load can target that retained ID. Protected tickets are revoked, so a retained entry carries no backend credential. Seven new focused parser, real-socket, cleanup, terminal, foreign-owner, and stale-supersession regressions cover the slice; PR #105 and PR #106 follow with bounded command ingress and cancellable resolution, while exclusive-control/global-option and deeper socket coverage remain open. |
-| 2026-07-16 | P2.10 bounded MPD ingress (partial) | PR #105 | Replaces the unbounded worker channel with a capacity-64 epoch-aware deque plus a coalesced capacity-one wake signal. Below the cap commands remain exact FIFO; a newer lifecycle epoch atomically purges stale backlog, and only saturation folds adjacent same-epoch transient controls before deterministic oldest-transient eviction keeps the newest intent. Wake handling retains one absolute polling deadline, receiver loss clears pending work, and no enqueue waits on network I/O. Six regressions include a real held-ACK peer proving prompt enqueue, no command pipelining, and ordered Seek/Play execution after release. PR #106 follows with cancellable resolution; exclusive-control/global-option, slow-first-greeting, and real-IPv6-listener work remain open. |
-| 2026-07-16 | P2.10 cancellable MPD resolution (partial) | PR #106 | Replaces blocking `ToSocketAddrs` with a process-lifetime private-context GIO resolver. Capacity-64, 1-KiB-host ingress processes at most 16 requests per context tick and caps active operations at eight; overload fails closed and callbacks run between batches. One absolute load/probe deadline spans resolution, connection, and greeting, while lifecycle supersession or result loss cancels GIO and late callback sends/drops remain on the resolver thread. Numeric addresses bypass DNS; enumerated results preserve order and IPv6 flowinfo/scope while deduplicating to 32. Nine net-new regressions plus one expanded raw/bracketed IPv6 case cover the contract. Exclusive-control/global-option, slow-first-greeting, and real-IPv6-listener work remain open. |
+| 2026-07-16 | P2.10 ACK/terminal/orphan semantics (partial) | PR #104 | Retains only correlated typed redacted MPD ACK codes and accepts only `NoExist` as proof that a targeted ID is already absent; malformed or mismatched ACK-like input poisons the connection. Successful targeted removal supplies the stopped/no-current completion proof shared by natural exhaustion and external Next, while an already-absent ID is ownership loss. After a foreign replacement is observed, polling, explicit Stop, and shutdown deliberately retain the queued ID because shared-mode revalidation cannot make deletion conditional; a stale foreign-status response also drops its old session before replacement Load can target that retained ID. Protected tickets are revoked, so a retained entry carries no backend credential. Seven new focused parser, real-socket, cleanup, terminal, foreign-owner, and stale-supersession regressions cover the slice; PR #105 through PR #107 follow with bounded ingress, cancellable resolution, and deeper socket coverage. Only exclusive-control/global-option semantics remain open. |
+| 2026-07-16 | P2.10 bounded MPD ingress (partial) | PR #105 | Replaces the unbounded worker channel with a capacity-64 epoch-aware deque plus a coalesced capacity-one wake signal. Below the cap commands remain exact FIFO; a newer lifecycle epoch atomically purges stale backlog, and only saturation folds adjacent same-epoch transient controls before deterministic oldest-transient eviction keeps the newest intent. Wake handling retains one absolute polling deadline, receiver loss clears pending work, and no enqueue waits on network I/O. Six regressions include a real held-ACK peer proving prompt enqueue, no command pipelining, and ordered Seek/Play execution after release. PR #106 and PR #107 follow with cancellable resolution and slow-greeting/real-IPv6 coverage; only exclusive-control/global-option semantics remain open. |
+| 2026-07-16 | P2.10 cancellable MPD resolution (partial) | PR #106 | Replaces blocking `ToSocketAddrs` with a process-lifetime private-context GIO resolver. Capacity-64, 1-KiB-host ingress processes at most 16 requests per context tick and caps active operations at eight; overload fails closed and callbacks run between batches. One absolute load/probe deadline spans resolution, connection, and greeting, while lifecycle supersession or result loss cancels GIO and late callback sends/drops remain on the resolver thread. Numeric addresses bypass DNS; enumerated results preserve order and IPv6 flowinfo/scope while deduplicating to 32. Nine net-new regressions plus one expanded raw/bracketed IPv6 case cover the contract. PR #107 follows with slow-greeting/real-IPv6 socket coverage; only exclusive-control/global-option semantics remain open. |
+| 2026-07-16 | P2.10 MPD real-socket coverage (partial) | PR #107 | Completes the compound socket-coverage item begun by PR #105's held-ACK FIFO peer. A channel-held silent first IPv4 greeting proves the shared absolute deadline preserves a fair slice for a later address without sleeps or elapsed-time thresholds. A real `::1` listener proves numeric resolution, connection, greeting, and IPv6 client/peer addresses; only an unavailable initial IPv6 bind skips that capability-specific case. Two net-new regressions bring the focused MPD suite to 79. Only exclusive-control/global-option semantics remain open. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
