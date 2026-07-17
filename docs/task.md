@@ -1602,12 +1602,15 @@ service/DAAP foundation and is stacked on its PR #117 head pending publication.
 - [ ] Cover fake MPD and delayed/adversarial Chromecast state machines, including a cap applied
   before allocating from a peer-advertised Cast frame length.
 - [ ] Cover stale album-art and source-result generations.
-- [x] Add keyboard context-menu and slider accessibility checks. Commit `f0446f3` routes Menu and
-  Shift+F10 through the exact right-click selection snapshot, consumes only a shortcut that opens a
-  non-empty menu, exposes the popup/shortcut properties on the track list, and explicitly labels
-  the position and volume sliders in all 13 catalogs. Focused tests cover accepted and rejected
-  modifier combinations, preserve plain F10 and unrelated chords, and reject missing/fallback or
-  indistinguishable slider names without requiring a display server.
+- [x] Add keyboard context-menu and slider accessibility checks. Commits `f0446f3` and `8945c97`
+  route unmodified Menu and exact Shift+F10 through the right-click selection snapshot, consume
+  only a shortcut that opens a non-empty menu, expose `has-popup` plus the standardized
+  `Shift+F10 ContextMenu` property on the track list, and explicitly label and orient the position
+  and volume sliders in all 13 catalogs. A production-consumed interaction plan pins the bubbling
+  key controller, empty/non-empty propagation, immutable post-popup selection snapshot, and
+  popover-scoped action ownership. Focused tests reject Shift+Menu, plain F10, and unrelated
+  chords, exercise that complete plan, and parse each YAML catalog to prove both keys exist rather
+  than mistaking an English fallback for a valid translation.
 - [ ] Record implementation: _pending_
 
 The checked accessibility slice deliberately relies on `GtkScale` for slider focus, arrow/Page
@@ -2047,13 +2050,17 @@ Record scope or design decisions here so deferred work is explicit.
   it, while a peer's path never enters the fixed error. This evidence closes the matrix and record
   boxes without claiming unsupported alternate-auth modes or every redundant pairing.
 
-- 2026-07-17 — The P3.4 accessibility slice uses GTK's standard Menu and Shift+F10 conventions and
-  the same one-shot, selection-snapshotted popover as right-click. A recognized shortcut propagates
-  when the view has no usable selection/menu, preventing Tributary from shadowing an ancestor or
-  desktop binding without performing an action. The track list publishes `has-popup` and both
-  shortcuts; each scale retains GTK's native slider behavior and publishes a localized name plus
-  horizontal orientation. Deterministic tests cover shortcut policy and all translation catalogs;
-  compositor-dependent synthetic key injection is left to future installed UI smoke coverage.
+- 2026-07-17 — The P3.4 accessibility slice uses GTK's unmodified Menu and exact Shift+F10
+  conventions and the same one-shot, selection-snapshotted popover as right-click. Shift+Menu,
+  plain F10, and unrelated chords propagate. A recognized shortcut also propagates when the view
+  has no usable selection/menu, preventing Tributary from shadowing an ancestor or desktop binding
+  without performing an action. The track list publishes `has-popup` and the standardized
+  `Shift+F10 ContextMenu` token; each scale retains GTK's native slider behavior and publishes a
+  localized name plus horizontal orientation. A production-consumed plan pins controller phase,
+  propagation, immutable selection ownership, popover action scope, and accessible properties;
+  the catalog test parses every source YAML file to distinguish a present translation from a
+  fallback. Compositor-dependent synthetic key injection remains future installed UI smoke
+  coverage.
 
 - 2026-07-17 — PR #112 completes P2.10 by requiring an explicit, persisted
   exclusive-control promise rather than pretending MPD offers an ownership lock or conditional
