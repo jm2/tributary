@@ -74,11 +74,12 @@ the wake receiver dropped between protected deque insertion and wake publication
 command spuriously reported `Disconnected`. PR #114 now keeps the same short-held mutex across the
 nonblocking `try_send`, preserving the GTK no-wait boundary while making insertion/wake publication
 one linearized operation. All 83 focused MPD tests pass in debug and release. Replacement run
-29609489061 then passed the corrected Linux x86_64 suite, but its ARM64 package probe exposed a
-second pre-existing race: GStreamer could close an accepted media connection during transition to
-NULL before the listener's old single stop flag was published, so an expected incomplete header
-was misclassified as server corruption. PR #114 now publishes cancellation before NULL, keeps both
-listeners observing through that transition, then separately stops and drains queued accepts.
+29609489061 then passed the corrected Linux x86_64 suite, but both native Windows package probes
+exposed a second pre-existing race: GStreamer could close an accepted media connection during
+transition to NULL before the listener's old single stop flag was published, so an expected
+incomplete header was misclassified as server corruption. PR #114 now publishes cancellation
+before NULL, keeps both listeners observing through that transition, then separately stops and
+drains queued accepts.
 Only incomplete-header EOF/reset/abort is cancellation; malformed requests and every other server
 failure remain fatal. A full replacement PR matrix remains pending.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
@@ -1517,7 +1518,7 @@ as does the deliberately deferred live release-workflow run.
 Current PR #114 follow-up validation (2026-07-17, P2.11 packaged-probe teardown hardening):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature
 Clippy, and `cargo test --all-targets --all-features --locked` pass in debug and release. Each full
-test profile passes 18 library, 727 application, and 10 repository-metadata tests (755 total), and
+test profile passes 18 library, 731 application, and 10 repository-metadata tests (759 total), and
 all 28 focused platform-runtime tests pass in both profiles. The four new regressions live in the
 Windows-only packaged runtime module; this Linux validation parses and formats them but does not
 claim to compile or execute them. The x86_64 Windows job runs unit
