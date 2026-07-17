@@ -72,6 +72,7 @@ pub struct MpdOutput {
     event_tx: async_channel::Sender<PlayerEvent>,
     event_generation: AtomicU64,
     volume: f64,
+    control_mode: MpdControlMode,
     intent_epoch: Arc<AtomicU64>,
     cache: Arc<Mutex<MpdCache>>,
     proxy: ProxyServices,
@@ -3014,6 +3015,7 @@ impl MpdOutput {
             event_tx,
             event_generation: AtomicU64::new(0),
             volume: 1.0,
+            control_mode,
             intent_epoch,
             cache,
             proxy,
@@ -3093,6 +3095,25 @@ impl MpdOutput {
         cache.position_ms = None;
         owner
     }
+
+    fn ensure_load_allowed(&self) -> bool {
+        if self.control_mode == MpdControlMode::Exclusive {
+            return true;
+        }
+
+        // Reject at the public output boundary before begin_load can advance
+        // the epoch or publish optimistic Buffering state. The worker repeats
+        // the check as defense in depth for any future/internal caller that
+        // bypasses this boundary.
+        fail_current(
+            self.current_owner(),
+            MpdFailure::exclusive_control_required(),
+            &self.intent_epoch,
+            &self.cache,
+            &self.event_tx,
+        );
+        false
+    }
 }
 
 impl AudioOutput for MpdOutput {
@@ -3108,7 +3129,10 @@ impl AudioOutput for MpdOutput {
         false
     }
 
-    fn load_uri(&self, uri: &str) {
+    fn load_uri(&self, uri: &str) -> bool {
+        if !self.ensure_load_allowed() {
+            return false;
+        }
         let owner = self.begin_load();
         let kind = match encode_mpd_arg(uri) {
             Err(failure) => CommandKind::RejectLoad { failure },
@@ -3123,9 +3147,13 @@ impl AudioOutput for MpdOutput {
             },
         };
         self.enqueue(owner, kind);
+        true
     }
 
-    fn load_resolved(&self, request: ResolvedHttpRequest) {
+    fn load_resolved(&self, request: ResolvedHttpRequest) -> bool {
+        if !self.ensure_load_allowed() {
+            return false;
+        }
         let owner = self.begin_load();
         let kind = if request.is_active() {
             CommandKind::ResolvedLoad {
@@ -3137,6 +3165,7 @@ impl AudioOutput for MpdOutput {
             }
         };
         self.enqueue(owner, kind);
+        true
     }
 
     fn set_event_generation(&self, generation: PlayerEventGeneration) {
@@ -5756,6 +5785,59 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_public_loads_reject_before_begin_load_and_remain_retryable() {
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let intent_epoch = Arc::new(AtomicU64::new(0));
+        let cache = Arc::new(Mutex::new(MpdCache::default()));
+        let (worker_tx, worker_rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
+        let output = MpdOutput {
+            display_name: "legacy".to_string(),
+            event_tx,
+            event_generation: AtomicU64::new(9),
+            volume: 1.0,
+            control_mode: MpdControlMode::Unconfirmed,
+            intent_epoch: Arc::clone(&intent_epoch),
+            cache: Arc::clone(&cache),
+            proxy: ProxyServices::production(),
+            worker_tx,
+        };
+
+        assert!(!output.load_uri("file:///music/retry.flac"));
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/retry.flac").expect("resolved endpoint"),
+        )
+        .expect("active resolved request");
+        assert!(!output.load_resolved(request));
+
+        assert_eq!(intent_epoch.load(Ordering::SeqCst), 0);
+        let snapshot = *cache.lock().expect("cache lock");
+        assert_eq!(snapshot.state, PlayerState::Stopped);
+        assert_eq!(snapshot.position_ms, None);
+        assert!(
+            worker_rx.pop_pending().is_none(),
+            "rejected loads never reach the worker"
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                event_rx.try_recv(),
+                Ok(PlayerEvent::StateChanged {
+                    generation,
+                    state: PlayerState::Stopped,
+                }) if generation.as_raw() == 9
+            ));
+            assert!(matches!(
+                event_rx.try_recv(),
+                Ok(PlayerEvent::Error {
+                    generation,
+                    message,
+                }) if generation.as_raw() == 9
+                    && message == mpd_exclusive_control_required_message(&rust_i18n::locale())
+            ));
+        }
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn load_resets_cached_track_before_the_worker_receives_it() {
         let (event_tx, _event_rx) = async_channel::unbounded();
         let intent_epoch = Arc::new(AtomicU64::new(0));
@@ -5769,13 +5851,14 @@ mod tests {
             event_tx,
             event_generation: AtomicU64::new(7),
             volume: 1.0,
+            control_mode: MpdControlMode::Exclusive,
             intent_epoch: Arc::clone(&intent_epoch),
             cache: Arc::clone(&cache),
             proxy: ProxyServices::production(),
             worker_tx,
         };
 
-        output.load_uri("https://music.test/new");
+        assert!(output.load_uri("https://music.test/new"));
 
         let snapshot = *cache.lock().expect("cache lock");
         assert_eq!(snapshot.state, PlayerState::Buffering);
@@ -5802,13 +5885,14 @@ mod tests {
             event_tx,
             event_generation: AtomicU64::new(1),
             volume: 1.0,
+            control_mode: MpdControlMode::Exclusive,
             intent_epoch,
             cache,
             proxy: ProxyServices::production(),
             worker_tx,
         };
 
-        output.load_uri("https://music.test/stream?api_key=worker-secret");
+        assert!(output.load_uri("https://music.test/stream?api_key=worker-secret"));
         assert!(matches!(
             worker_rx
                 .recv_timeout(Duration::from_secs(2))
@@ -5818,7 +5902,7 @@ mod tests {
                 if upstream.as_str().contains("api_key=worker-secret")
         ));
 
-        output.load_uri("HTTPS://[malformed");
+        assert!(output.load_uri("HTTPS://[malformed"));
         assert!(matches!(
             worker_rx
                 .recv_timeout(Duration::from_secs(2))
@@ -5828,7 +5912,7 @@ mod tests {
                 if failure.operation == "media URI validation"
         ));
 
-        output.load_uri("Albums/Artist/track.flac");
+        assert!(output.load_uri("Albums/Artist/track.flac"));
         assert!(matches!(
             worker_rx
                 .recv_timeout(Duration::from_secs(2))
@@ -5847,6 +5931,7 @@ mod tests {
             event_tx,
             event_generation: AtomicU64::new(3),
             volume: 1.0,
+            control_mode: MpdControlMode::Exclusive,
             intent_epoch: Arc::new(AtomicU64::new(0)),
             cache: Arc::new(Mutex::new(MpdCache::default())),
             proxy: ProxyServices::production(),
@@ -5856,7 +5941,7 @@ mod tests {
             Url::parse("https://music.test/clean/track.flac?track=42").expect("clean endpoint");
         let request = ResolvedHttpRequest::new(endpoint.clone()).expect("resolved request");
 
-        output.load_resolved(request);
+        assert!(output.load_resolved(request));
 
         let command = worker_rx
             .recv_timeout(Duration::from_secs(2))

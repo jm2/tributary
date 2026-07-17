@@ -50,10 +50,11 @@ executions in PR #111.
 P2.10's final exclusive-control behavior is implemented on
 `agent/p2.10-mpd-exclusive` branch, but its two remaining boxes and the progress numerator stay
 open at this pre-CI stage. Legacy MPD outputs remain unconfirmed until the exact endpoint is
-re-added with the required localized checkbox; an unconfirmed worker rejects playback before any
-cleanup, MPD connection, MPD state/option command, protected-media ticket, or queue mutation,
-including for media rejected before worker dispatch. This branch builds on P3.5's accepted
-exact-toolchain baseline.
+re-added with the required localized checkbox; their public load boundary rejects playback before
+optimistic Buffering state, epoch advancement, worker enqueue/cleanup, MPD connection, MPD
+state/option commands, protected-media tickets, or queue mutation. The exact queue generation
+remains retryable, while a second worker gate covers internal callers and media rejected before
+dispatch. This branch builds on P3.5's accepted exact-toolchain baseline.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1086,13 +1087,17 @@ error that tells the user what to install.
   of appending a duplicate. The mode participates in `OutputTarget` identity, so false-to-true
   migration makes reselecting an already-active legacy endpoint reconstruct it rather than taking
   the same-host/port no-op path. The ordered worker receives a typed
-  Unconfirmed/Exclusive mode and rejects every unconfirmed load intent before cleanup, Buffering,
-  connection, partition-wide repeat/random/single/consume or playback-state commands, proxy-ticket
-  registration, queue insertion, play, or status. The common gate includes media already rejected
-  as malformed, unsupported, or inactive before worker dispatch and emits the same fixed localized
-  re-add/confirm/reselect guidance. Seven focused net-new tests cover legacy
+  Unconfirmed/Exclusive mode. The public output boundary rejects every unconfirmed load before
+  optimistic Buffering, output-epoch advancement, worker enqueue/cleanup, connection,
+  partition-wide repeat/random/single/consume or playback-state commands, proxy-ticket
+  registration, queue insertion, play, or status. Its synchronous acceptance result marks the
+  exact UI queue generation retryable without invalidating the queued error, so later Play reloads
+  and re-shows guidance rather than toggling an empty output. The worker independently repeats the
+  gate for every load intent, including media already rejected as malformed, unsupported, or
+  inactive before dispatch. Nine focused net-new tests cover legacy
   deserialization/approved serialization, exact upsert and sibling preservation, mode-sensitive
-  output identity, zero MPD and proxy action for protected and pre-rejected loads, and all-catalog
+  output identity, boundary/worker zero MPD and proxy action for direct, protected, resolved, and
+  pre-rejected loads, exact-generation retry behavior, and all-catalog
   warning/confirmation/failure localization.
 - [x] Retain only redacted ACK error codes so cleanup can distinguish a missing song ID from a
   permission or argument rejection without keeping server-controlled text. The response parser
@@ -1418,14 +1423,15 @@ as does the deliberately deferred live release-workflow run.
 Most recent local branch validation (2026-07-17, P2.10 exclusive-control slice stacked on P3.5,
 before PR CI): `cargo check --all-targets --all-features --locked`, strict all-target/all-feature
 Clippy, and `cargo test --all-targets --all-features --locked` pass in debug and release. Each full
-profile passes 18 library, 725 application, and 10 repository-metadata tests (753 total); all 82
-focused MPD tests pass. Seven net-new regressions cover legacy default-false deserialization and
+profile passes 18 library, 727 application, and 10 repository-metadata tests (755 total); all 83
+focused MPD tests pass. Nine net-new regressions cover legacy default-false deserialization and
 approved-mode serialization, exact in-place upgrade with name/sibling preservation, repeat-upsert
 deduplication, mode-sensitive output identity, worker-level zero-connection/state/ticket/queue
-action for protected and pre-rejected loads, and warning/confirmation/failure localization across
-all 13 catalogs. The first restricted
-release run denied every loopback bind at the test environment boundary; an immediate rerun with
-loopback access passed all 753 tests. `cargo audit` reports no vulnerability and only the two
+action for protected and pre-rejected loads, public-boundary refusal before Buffering/epoch/enqueue
+for direct and typed media, exact-generation retry state, and warning/confirmation/failure
+localization across all 13 catalogs. The first restricted release run denied every loopback bind at
+the test environment boundary; an immediate rerun with loopback access passed all 755 tests.
+`cargo audit` reports no vulnerability and only the two
 tracked allowed unmaintained warnings; desktop and AppStream validation,
 `cargo fmt --all -- --check`, and `git diff --check` pass. No dependency or lockfile changed. The
 P2.10 boxes and 196/223 progress snapshot remain deliberately open pending PR CI; P3.5's
@@ -1653,9 +1659,11 @@ Record scope or design decisions here so deferred work is explicit.
   repeat, random, single, and consume commands are global to the selected playback partition; a
   named partition can still be joined by another client and is not a lock. Legacy saved endpoints
   default to unconfirmed and cannot load until re-added with the required one-controller checkbox.
-  The worker owns the final common gate so an unconfirmed load—including a pre-dispatch media
-  rejection—cannot clean up, connect, issue MPD state/options, register a protected ticket, or
-  mutate the queue even if a caller bypasses GTK. Confirmation
+  The public output boundary rejects an unconfirmed load before Buffering, epoch advancement, or
+  worker enqueue and marks the exact UI generation retryable; the worker owns an independent final
+  gate so every load intent—including a pre-dispatch media rejection—cannot clean up, connect,
+  issue MPD state/options, register a protected ticket, or mutate the queue even if a caller
+  bypasses GTK. Confirmation
   authorizes the unavoidable global operations but does not weaken foreign-song defenses: an
   observed foreign ID proves the deployment promise was violated, and Tributary still relinquishes
   ownership without a racy stop or deletion.
@@ -1967,10 +1975,11 @@ Record scope or design decisions here so deferred work is explicit.
   or mismatched ACK-like input poisons the connection. MPD's index, echo, and free-form text are
   then discarded.
   P2.10's final slice makes shared/unconfirmed playback unsupported: the persisted mode defaults
-  false for legacy entries, and the worker rejects every load intent before cleanup, an MPD
-  connection, state or option command, or protected ticket, including media failures classified
-  before dispatch. Re-adding the exact endpoint with the required localized
-  checkbox upgrades it in place. If a foreign current song is later observed in confirmed
+  false for legacy entries. The public boundary refuses loads before Buffering, epoch advancement,
+  enqueue, or cleanup and retains a retryable UI generation; a defense-in-depth worker gate rejects
+  every load intent before an MPD connection, state or option command, or protected ticket,
+  including media failures classified before dispatch. Re-adding the exact endpoint with the
+  required localized checkbox upgrades it in place. If a foreign current song is later observed in confirmed
   exclusive mode, Tributary deliberately relinquishes the session without deleting its queued ID,
   including during explicit Stop and shutdown. Revalidation plus `deleteid` is not atomic, so the
   foreign client could select that ID between the two operations. A stale response that reports
@@ -2188,7 +2197,7 @@ Add one line per completed task:
 | 2026-07-16 | P2.10 bounded MPD ingress (partial) | PR #105 | Replaces the unbounded worker channel with a capacity-64 epoch-aware deque plus a coalesced capacity-one wake signal. Below the cap commands remain exact FIFO; a newer lifecycle epoch atomically purges stale backlog, and only saturation folds adjacent same-epoch transient controls before deterministic oldest-transient eviction keeps the newest intent. Wake handling retains one absolute polling deadline, receiver loss clears pending work, and no enqueue waits on network I/O. Six regressions include a real held-ACK peer proving prompt enqueue, no command pipelining, and ordered Seek/Play execution after release. PR #106 and PR #107 follow with cancellable resolution and slow-greeting/real-IPv6 coverage; only exclusive-control/global-option semantics remain open. |
 | 2026-07-16 | P2.10 cancellable MPD resolution (partial) | PR #106 | Replaces blocking `ToSocketAddrs` with a process-lifetime private-context GIO resolver. Capacity-64, 1-KiB-host ingress processes at most 16 requests per context tick and caps active operations at eight; overload fails closed and callbacks run between batches. One absolute load/probe deadline spans resolution, connection, and greeting, while lifecycle supersession or result loss cancels GIO and late callback sends/drops remain on the resolver thread. Numeric addresses bypass DNS; enumerated results preserve order and IPv6 flowinfo/scope while deduplicating to 32. Nine net-new regressions plus one expanded raw/bracketed IPv6 case cover the contract. PR #107 follows with slow-greeting/real-IPv6 socket coverage; only exclusive-control/global-option semantics remain open. |
 | 2026-07-16 | P2.10 MPD real-socket coverage (partial) | PR #107 | Completes the compound socket-coverage item begun by PR #105's held-ACK FIFO peer. A channel-held silent first IPv4 greeting proves the shared absolute deadline preserves a fair slice for a later address without sleeps or elapsed-time thresholds. A real `::1` listener proves numeric resolution, connection, greeting, and IPv6 client/peer addresses; only an unavailable initial IPv6 bind skips that capability-specific case. Two net-new regressions bring the focused MPD suite to 79. Only exclusive-control/global-option semantics remain open. |
-| 2026-07-17 | P2.10 MPD exclusive-control contract (pre-CI) | `agent/p2.10-mpd-exclusive` | Persists an explicit legacy-default-false mode; requires localized partition-wide warning and one-controller confirmation; upgrades an exact endpoint in place; makes mode part of output identity; and gates every unconfirmed load intent—including pre-dispatch media rejection—in the ordered worker before cleanup, MPD connection/state/options, protected tickets, or queue mutation. Foreign-ID relinquishment remains fail-safe even when the confirmed deployment promise is violated. Seven focused migration, upsert, identity, protected/pre-rejected zero-action, and localization tests cover the slice; both P2.10 boxes remain open until PR CI and the final PR record. |
+| 2026-07-17 | P2.10 MPD exclusive-control contract (pre-CI) | `agent/p2.10-mpd-exclusive` | Persists an explicit legacy-default-false mode; requires localized partition-wide warning and one-controller confirmation; upgrades an exact endpoint in place; makes mode part of output identity; refuses unconfirmed public loads before Buffering/epoch/enqueue while retaining retry state; and independently gates every load intent—including pre-dispatch rejection—in the worker before cleanup, MPD connection/state/options, protected tickets, or queue mutation. Foreign-ID relinquishment remains fail-safe even when the confirmed deployment promise is violated. Nine focused migration, upsert, identity, boundary/worker zero-action, retry, and localization tests cover the slice; both P2.10 boxes remain open until PR CI and the final PR record. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
 | 2026-07-16 | P2.11 deterministic HTTP compatibility (partial) | PR #108 | Preserves exact escaped reverse-proxy prefixes across DAAP stream/artwork and Subsonic API/media construction, carries DAAP's four fixed protocol headers through a separate strict non-secret allowlist into protected stream and artwork fetches, retains receiver `Range` as the only forwarded header, proves existing typed Subsonic HTTP-200 failures, and exercises explicit upstream proxy selection at the asynchronous protected-fetch boundary. Seven net-new regressions cover the contracts. At PR #108, full fake GStreamer, packaged source-policy, and live Windows playback validation remained open; the following slice closes the fake-GStreamer part. |

@@ -42,9 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or Tributary instance shares the playback partition. The confirmation is persisted as an
   explicit mode and participates in output identity, so reselecting an upgraded active endpoint
   rebuilds it instead of being mistaken for a no-op. Legacy entries deserialize unconfirmed and
-  every load intent fails with localized re-add/confirm/reselect guidance before cleanup, MPD
-  connection, MPD state or option commands, protected-media tickets, or queue mutation—even when
-  media was already rejected as malformed, unsupported, or inactive before worker dispatch.
+  every load intent fails with localized re-add/confirm/reselect guidance before optimistic
+  Buffering state, output-epoch advancement, worker enqueue/cleanup, MPD connection, MPD state or
+  option commands, protected-media tickets, or queue mutation—even when media was already rejected
+  as malformed, unsupported, or inactive. The synchronous refusal leaves the exact queue item
+  retryable, so another Play re-shows the guidance instead of toggling an empty MPD session; an
+  independent worker gate retains the same fail-closed contract for internal callers.
   Re-adding the exact host and port with the checkbox upgrades that entry in place without renaming
   it, dropping siblings, or creating a duplicate. Existing song-ID ownership checks remain in
   force: observing a foreign current song violates the exclusive-control promise but still causes

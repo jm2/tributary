@@ -76,7 +76,13 @@ pub trait AudioOutput {
     /// Implementations must classify it at this boundary: a supported
     /// credential-bearing URL may reach only Tributary's app-owned proxy, not
     /// a playback library, daemon, or receiver.
-    fn load_uri(&self, uri: &str);
+    ///
+    /// Returns `false` only when the output synchronously rejects the load
+    /// before starting it. Such a rejection must emit an actionable
+    /// [`PlayerEvent::Error`](super::PlayerEvent::Error); the caller keeps the
+    /// current queue item in a retryable state instead of treating it as
+    /// loaded media.
+    fn load_uri(&self, uri: &str) -> bool;
 
     /// Load one backend-resolved authenticated request and start playback.
     ///
@@ -84,7 +90,9 @@ pub trait AudioOutput {
     /// implementations must put the request behind an app-owned opaque ticket
     /// before invoking GStreamer, MPD, or a receiver. The endpoint and its
     /// authentication material must never fall through to a direct URI load.
-    fn load_resolved(&self, request: ResolvedHttpRequest);
+    /// The return value has the same synchronous-acceptance contract as
+    /// [`load_uri`](Self::load_uri).
+    fn load_resolved(&self, request: ResolvedHttpRequest) -> bool;
 
     /// Tag subsequent events with the playback load that owns them.
     ///

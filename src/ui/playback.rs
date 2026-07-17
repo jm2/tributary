@@ -200,9 +200,10 @@ pub struct PlaybackSession {
     /// Play/toggle requests are accepted as no-ops until the exact request is
     /// handed to the output, so they cannot revive a superseded track.
     pending_resolution: Option<PlayerEventGeneration>,
-    /// The current protected reference failed before reaching an output. A
-    /// later Play/Toggle retries resolution instead of issuing `play()` to an
-    /// output that has no loaded media.
+    /// The current item failed before reaching an output or was synchronously
+    /// rejected by it. A later Play/Toggle retries the load (and protected
+    /// resolution when applicable) instead of issuing `play()` to an output
+    /// that has no loaded media.
     resolution_failed: bool,
 }
 
@@ -379,6 +380,19 @@ impl PlaybackSession {
         true
     }
 
+    /// Retain a synchronously rejected item as an explicit retryable load.
+    ///
+    /// The generation remains current so the output's required actionable
+    /// error is still displayed. A later Play begins a fresh generation and
+    /// attempts the load again instead of toggling an empty output session.
+    fn mark_load_rejected(&mut self, generation: PlayerEventGeneration) -> bool {
+        if self.pending_resolution.is_some() || !self.accepts_event_generation(generation) {
+            return false;
+        }
+        self.resolution_failed = true;
+        true
+    }
+
     /// Turn a protected output failure into a fresh-resolution retry state.
     ///
     /// Resolution has already finished by the time `load_resolved` reaches an
@@ -388,6 +402,10 @@ impl PlaybackSession {
     /// generation also rejects any delayed state emitted by the failed load.
     pub(crate) fn mark_protected_load_failed(&mut self, generation: PlayerEventGeneration) -> bool {
         if self.pending_resolution.is_some()
+            // A synchronously rejected load is already retryable and never
+            // created output state to stop. Keep its generation current so
+            // the queued guidance remains visible without issuing cleanup.
+            || self.resolution_failed
             || !self.accepts_event_generation(generation)
             || !self.current().is_some_and(|item| {
                 crate::source_registry::is_media_reference(item.uri())
@@ -733,7 +751,11 @@ fn play_current(ctx: &PlaybackContext) -> bool {
             match resolved {
                 Ok(request) if request.is_active() => {
                     if session.borrow_mut().finish_pending_resolution(generation) {
-                        active_output.borrow().load_resolved(request);
+                        let accepted = active_output.borrow().load_resolved(request);
+                        if !accepted {
+                            let marked = session.borrow_mut().mark_load_rejected(generation);
+                            debug_assert!(marked, "current resolved load remains retryable");
+                        }
                     }
                 }
                 Ok(_) => {
@@ -771,7 +793,11 @@ fn play_current(ctx: &PlaybackContext) -> bool {
 
     let generation = ctx.session.borrow_mut().begin_event_generation();
     ctx.active_output.borrow().set_event_generation(generation);
-    ctx.active_output.borrow().load_uri(&playback_uri);
+    let accepted = ctx.active_output.borrow().load_uri(&playback_uri);
+    if !accepted {
+        let marked = ctx.session.borrow_mut().mark_load_rejected(generation);
+        debug_assert!(marked, "current direct load remains retryable");
+    }
     update_now_playing_ui(ctx, &item, identity.as_ref(), Some(&playback_uri));
 
     true
@@ -1421,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_output_error_retries_resolution_but_direct_error_does_not() {
+    fn accepted_protected_output_error_retries_resolution_but_direct_error_does_not() {
         let mut protected = PlaybackSession::default();
         assert!(protected.replace_queue(vec![protected_item("remote", "a")], 0));
         let failed_load = protected.begin_pending_resolution();
@@ -1448,6 +1474,27 @@ mod tests {
         assert!(!direct.mark_protected_load_failed(direct_load));
         assert!(!direct.resolution_failed);
         assert!(direct.accepts_event_generation(direct_load));
+    }
+
+    #[test]
+    fn synchronous_load_rejection_keeps_exact_direct_generation_retryable() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item("local", "a")], 0));
+        let rejected = session.begin_event_generation();
+
+        assert!(session.mark_load_rejected(rejected));
+        assert!(session.resolution_failed);
+        assert!(session.accepts_event_generation(rejected));
+        assert!(
+            !session.mark_protected_load_failed(rejected),
+            "synchronous refusal has no output state to stop"
+        );
+
+        let retry = session.begin_event_generation();
+        assert_ne!(retry, rejected);
+        assert!(!session.resolution_failed);
+        assert!(!session.mark_load_rejected(rejected));
+        assert!(session.mark_load_rejected(retry));
     }
 
     #[test]
