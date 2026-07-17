@@ -132,7 +132,7 @@ impl DaapClient {
         // The top-level node is typically `msrv` (server-info container).
         let server_info_children = unwrap_container(&nodes, b"msrv")?;
 
-        let status = dmap::find_u32(server_info_children, b"mstt").unwrap_or(0);
+        let status = unique_dmap_status(server_info_children)?.unwrap_or(0);
         if status != 200 {
             return Err(BackendError::ConnectionFailed {
                 message: format!("DAAP server-info returned status {status}"),
@@ -161,20 +161,7 @@ impl DaapClient {
             .await
             .map_err(|error| daap_request_error("DAAP login request failed", error))?;
 
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            || resp.status() == reqwest::StatusCode::FORBIDDEN
-        {
-            return Err(BackendError::AuthenticationFailed {
-                message: "DAAP login failed — check password".to_string(),
-            });
-        }
-
-        if !resp.status().is_success() {
-            return Err(BackendError::ConnectionFailed {
-                message: format!("DAAP login HTTP {}", resp.status()),
-                source: None,
-            });
-        }
+        ensure_http_status(resp.status(), "login", "DAAP login failed — check password")?;
 
         let bytes = read_limited(resp, MAX_CONTROL_BODY_BYTES, CONTROL_RESPONSE_DEADLINE)
             .await
@@ -182,6 +169,11 @@ impl DaapClient {
 
         let nodes = dmap::parse_dmap(&bytes)?;
         let login_children = unwrap_container(&nodes, b"mlog")?;
+        ensure_dmap_status(
+            login_children,
+            "login",
+            "DAAP login failed — check password",
+        )?;
 
         let session_id = dmap::find_u32(login_children, b"mlid").ok_or_else(|| {
             BackendError::AuthenticationFailed {
@@ -191,86 +183,111 @@ impl DaapClient {
 
         info!("DAAP login OK");
 
-        // ── Step C: Update ──────────────────────────────────────────
-        let update_url = format!(
-            "{}/update?session-id={}&revision-number=1",
-            base_url.as_str().trim_end_matches('/'),
-            session_id
-        );
-        debug!(url = %redact_url_secrets(&update_url), "DAAP: requesting update");
+        // Once login has minted a server-side session, every remaining
+        // handshake failure must close it. Keeping the session-bound steps in
+        // one result makes that cleanup cover HTTP, body, parse, and semantic
+        // failures without duplicating an easy-to-miss logout branch.
+        let session_details: BackendResult<(u32, u32)> = async {
+            // ── Step C: Update ──────────────────────────────────────
+            let update_url = format!(
+                "{}/update?session-id={}&revision-number=1",
+                base_url.as_str().trim_end_matches('/'),
+                session_id
+            );
+            debug!(url = %redact_url_secrets(&update_url), "DAAP: requesting update");
 
-        let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
-            http.get(&update_url)
-                .timeout(CONTROL_RESPONSE_DEADLINE)
-                .send()
+            let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
+                http.get(&update_url)
+                    .timeout(CONTROL_RESPONSE_DEADLINE)
+                    .send()
+                    .await
+                    .map_err(|error| daap_request_error("DAAP update request failed", error))?;
+
+            ensure_http_status(
+                resp.status(),
+                "update",
+                "DAAP session expired or unauthorized",
+            )?;
+
+            let bytes = read_limited(resp, MAX_CONTROL_BODY_BYTES, CONTROL_RESPONSE_DEADLINE)
                 .await
-                .map_err(|error| daap_request_error("DAAP update request failed", error))?;
+                .map_err(|error| daap_body_error("Failed to read update body", error))?;
 
-        if !resp.status().is_success() {
-            return Err(BackendError::ConnectionFailed {
-                message: format!("DAAP update HTTP {}", resp.status()),
-                source: None,
-            });
-        }
+            let nodes = dmap::parse_dmap(&bytes)?;
+            let update_children = unwrap_container(&nodes, b"mupd")?;
+            ensure_dmap_status(
+                update_children,
+                "update",
+                "DAAP session expired or unauthorized",
+            )?;
 
-        let bytes = read_limited(resp, MAX_CONTROL_BODY_BYTES, CONTROL_RESPONSE_DEADLINE)
-            .await
-            .map_err(|error| daap_body_error("Failed to read update body", error))?;
+            let revision = dmap::find_u32(update_children, b"musr").unwrap_or(1);
+            info!(revision, "DAAP update OK");
 
-        let nodes = dmap::parse_dmap(&bytes)?;
-        let update_children = unwrap_container(&nodes, b"mupd")?;
+            // ── Step D: Databases ───────────────────────────────────
+            let databases_url = format!(
+                "{}/databases?session-id={}&revision-number={}",
+                base_url.as_str().trim_end_matches('/'),
+                session_id,
+                revision
+            );
+            debug!(url = %redact_url_secrets(&databases_url), "DAAP: requesting databases");
 
-        let revision = dmap::find_u32(update_children, b"musr").unwrap_or(1);
-        info!(revision, "DAAP update OK");
+            let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
+                http.get(&databases_url)
+                    .timeout(CONTROL_RESPONSE_DEADLINE)
+                    .send()
+                    .await
+                    .map_err(|error| daap_request_error("DAAP databases request failed", error))?;
 
-        // ── Step D: Databases ───────────────────────────────────────
-        let databases_url = format!(
-            "{}/databases?session-id={}&revision-number={}",
-            base_url.as_str().trim_end_matches('/'),
-            session_id,
-            revision
-        );
-        debug!(url = %redact_url_secrets(&databases_url), "DAAP: requesting databases");
+            ensure_http_status(
+                resp.status(),
+                "databases",
+                "DAAP session expired or unauthorized",
+            )?;
 
-        let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
-            http.get(&databases_url)
-                .timeout(CONTROL_RESPONSE_DEADLINE)
-                .send()
+            let bytes = read_limited(resp, MAX_DATABASES_BODY_BYTES, CONTROL_RESPONSE_DEADLINE)
                 .await
-                .map_err(|error| daap_request_error("DAAP databases request failed", error))?;
+                .map_err(|error| daap_body_error("Failed to read databases body", error))?;
 
-        if !resp.status().is_success() {
-            return Err(BackendError::ConnectionFailed {
-                message: format!("DAAP databases HTTP {}", resp.status()),
-                source: None,
-            });
-        }
+            let nodes = dmap::parse_dmap(&bytes)?;
+            let avdb_children = unwrap_container(&nodes, b"avdb")?;
+            ensure_dmap_status(
+                avdb_children,
+                "databases",
+                "DAAP session expired or unauthorized",
+            )?;
+            let mlcl_children = unwrap_nested_container(avdb_children, b"mlcl")?;
+            let mlit_items = dmap::find_containers(mlcl_children, b"mlit");
 
-        let bytes = read_limited(resp, MAX_DATABASES_BODY_BYTES, CONTROL_RESPONSE_DEADLINE)
-            .await
-            .map_err(|error| daap_body_error("Failed to read databases body", error))?;
+            let first_db = mlit_items
+                .first()
+                .ok_or_else(|| BackendError::ConnectionFailed {
+                    message: "No DAAP databases found".to_string(),
+                    source: None,
+                })?;
 
-        let nodes = dmap::parse_dmap(&bytes)?;
-        let avdb_children = unwrap_container(&nodes, b"avdb")?;
-        let mlcl_children = unwrap_nested_container(avdb_children, b"mlcl")?;
-        let mlit_items = dmap::find_containers(mlcl_children, b"mlit");
-
-        let first_db = mlit_items
-            .first()
-            .ok_or_else(|| BackendError::ConnectionFailed {
-                message: "No DAAP databases found".to_string(),
-                source: None,
+            let database_id = dmap::find_u32(first_db, b"miid").ok_or_else(|| {
+                BackendError::ConnectionFailed {
+                    message: "DAAP database entry missing item id (miid)".to_string(),
+                    source: None,
+                }
             })?;
 
-        let database_id =
-            dmap::find_u32(first_db, b"miid").ok_or_else(|| BackendError::ConnectionFailed {
-                message: "DAAP database entry missing item id (miid)".to_string(),
-                source: None,
-            })?;
+            let db_name = dmap::find_string(first_db, b"minm")
+                .unwrap_or_else(|| format!("Database {database_id}"));
+            info!(database_id, name = %db_name, "DAAP database discovered");
+            Ok((revision, database_id))
+        }
+        .await;
 
-        let db_name = dmap::find_string(first_db, b"minm")
-            .unwrap_or_else(|| format!("Database {database_id}"));
-        info!(database_id, name = %db_name, "DAAP database discovered");
+        let (revision, database_id) = match session_details {
+            Ok(details) => details,
+            Err(error) => {
+                logout_session(&http, &base_url, session_id).await;
+                return Err(error);
+            }
+        };
 
         // ── Step E: Done ────────────────────────────────────────────
         info!(database_id, revision, "DAAP session established");
@@ -307,18 +324,11 @@ impl DaapClient {
                 .await
                 .map_err(|error| daap_request_error("DAAP items request failed", error))?;
 
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(BackendError::AuthenticationFailed {
-                message: "DAAP session expired or unauthorized".to_string(),
-            });
-        }
-
-        if !resp.status().is_success() {
-            return Err(BackendError::ConnectionFailed {
-                message: format!("DAAP items HTTP {}", resp.status()),
-                source: None,
-            });
-        }
+        ensure_http_status(
+            resp.status(),
+            "items",
+            "DAAP session expired or unauthorized",
+        )?;
 
         let bytes = read_limited(resp, MAX_ITEMS_BODY_BYTES, ITEMS_RESPONSE_DEADLINE)
             .await
@@ -328,6 +338,11 @@ impl DaapClient {
 
         // Top-level is `adbs` (database songs response).
         let adbs_children = unwrap_container(&nodes, b"adbs")?;
+        ensure_dmap_status(
+            adbs_children,
+            "items",
+            "DAAP session expired or unauthorized",
+        )?;
         let mlcl_children = unwrap_nested_container(adbs_children, b"mlcl")?;
 
         let mlit_items = dmap::find_containers(mlcl_children, b"mlit");
@@ -426,25 +441,7 @@ impl DaapClient {
 
     /// Send a best-effort logout request to end the DAAP session.
     pub async fn logout(&self) {
-        let url = format!(
-            "{}/logout?session-id={}",
-            self.base_url.as_str().trim_end_matches('/'),
-            self.session_id
-        );
-        match self
-            .http
-            .get(&url)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-        {
-            // lgtm[rs/cleartext-transmission] DAAP uses plaintext HTTP by design.
-            Ok(_) => info!("DAAP logout OK"),
-            Err(error) => {
-                let error = strip_request_url(error);
-                warn!(%error, "DAAP logout failed (best-effort)");
-            }
-        }
+        logout_session(&self.http, &self.base_url, self.session_id).await;
     }
 
     /// Probe a DAAP server's `/server-info` to check whether it requires
@@ -587,6 +584,48 @@ fn daap_body_error(context: &str, error: ResponseBodyError) -> BackendError {
     }
 }
 
+/// Classify the HTTP layer consistently for every DAAP route carrying an
+/// authentication attempt or active session identifier.
+fn ensure_http_status(
+    status: reqwest::StatusCode,
+    operation: &str,
+    authentication_message: &str,
+) -> BackendResult<()> {
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        return Err(BackendError::AuthenticationFailed {
+            message: authentication_message.to_string(),
+        });
+    }
+    if !status.is_success() {
+        return Err(BackendError::ConnectionFailed {
+            message: format!("DAAP {operation} HTTP {status}"),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+/// End one already-minted DAAP session without requiring the later update or
+/// database handshake fields. This covers both a fully constructed client and
+/// failures that occur after login but before `DaapClient` can be returned.
+async fn logout_session(http: &Client, base_url: &Url, session_id: u32) {
+    let url = format!(
+        "{}/logout?session-id={session_id}",
+        base_url.as_str().trim_end_matches('/')
+    );
+    match http.get(&url).timeout(Duration::from_secs(5)).send().await {
+        // lgtm[rs/cleartext-transmission] DAAP uses plaintext HTTP by design.
+        Ok(_) => info!("DAAP logout OK"),
+        Err(error) => {
+            let error = strip_request_url(error);
+            warn!(%error, "DAAP logout failed (best-effort)");
+        }
+    }
+}
+
 /// Unwrap the first top-level container node with the given tag,
 /// returning a reference to its children.
 fn unwrap_container<'a>(nodes: &'a [DmapNode], tag: &[u8; 4]) -> BackendResult<&'a [DmapNode]> {
@@ -618,6 +657,55 @@ fn unwrap_nested_container<'a>(
     unwrap_container(parent_children, tag)
 }
 
+/// Validate the common DMAP `mstt` status carried inside a successful HTTP
+/// response. DAAP implementations use HTTP 403 for an invalid session and
+/// also place HTTP-shaped status values in `mstt`; treating both forms alike
+/// prevents an expired session from being mistaken for an empty catalogue.
+/// Older peers sometimes omit `mstt`, so absence retains the existing
+/// endpoint-specific structural checks.
+fn ensure_dmap_status(
+    children: &[DmapNode],
+    operation: &str,
+    authentication_message: &str,
+) -> BackendResult<()> {
+    let Some(status) = unique_dmap_status(children)? else {
+        return Ok(());
+    };
+    match status {
+        200 => Ok(()),
+        401 | 403 => Err(BackendError::AuthenticationFailed {
+            message: authentication_message.to_string(),
+        }),
+        status => Err(BackendError::ConnectionFailed {
+            message: format!("DAAP {operation} returned status {status}"),
+            source: None,
+        }),
+    }
+}
+
+/// Return the one well-typed DMAP status, rejecting an ambiguous duplicate.
+/// Exact scalar width is enforced by the parser; the explicit value check
+/// keeps this helper fail-closed for directly constructed nodes as well.
+fn unique_dmap_status(children: &[DmapNode]) -> BackendResult<Option<u32>> {
+    let mut statuses = children.iter().filter(|node| &node.tag == b"mstt");
+    let Some(status) = statuses.next() else {
+        return Ok(None);
+    };
+    if statuses.next().is_some() {
+        return Err(BackendError::ParseError {
+            message: "Malformed DMAP data: duplicate response status".to_string(),
+            source: None,
+        });
+    }
+    let DmapValue::U32(status) = &status.data else {
+        return Err(BackendError::ParseError {
+            message: "Malformed DMAP data: response status has an invalid type".to_string(),
+            source: None,
+        });
+    };
+    Ok(Some(*status))
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
@@ -639,6 +727,48 @@ mod tests {
             http: build_http_client(&base_url, None).expect("DAAP client"),
             advertised_route: None,
         }
+    }
+
+    #[test]
+    fn dmap_status_is_compatible_when_absent_and_typed_when_present() {
+        let status_node = |status| DmapNode {
+            tag: *b"mstt",
+            data: DmapValue::U32(status),
+        };
+
+        assert!(ensure_dmap_status(&[], "items", "expired").is_ok());
+        assert!(ensure_dmap_status(&[status_node(200)], "items", "expired").is_ok());
+
+        for status in [401, 403] {
+            let error = ensure_dmap_status(&[status_node(status)], "items", "expired")
+                .expect_err("authentication status must fail");
+            assert!(matches!(
+                error,
+                BackendError::AuthenticationFailed { ref message } if message == "expired"
+            ));
+        }
+
+        let error = ensure_dmap_status(&[status_node(500)], "items", "expired")
+            .expect_err("non-authentication status must fail");
+        assert!(matches!(
+            error,
+            BackendError::ConnectionFailed {
+                ref message,
+                source: None
+            } if message == "DAAP items returned status 500"
+        ));
+
+        let error = ensure_dmap_status(&[status_node(200), status_node(403)], "items", "expired")
+            .expect_err("duplicate status must be rejected as ambiguous");
+        assert!(matches!(error, BackendError::ParseError { .. }));
+
+        let malformed_status = DmapNode {
+            tag: *b"mstt",
+            data: DmapValue::Raw(vec![0, 0, 0, 200]),
+        };
+        let error = ensure_dmap_status(&[malformed_status], "items", "expired")
+            .expect_err("wrong status type must fail closed");
+        assert!(matches!(error, BackendError::ParseError { .. }));
     }
 
     #[test]

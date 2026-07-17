@@ -53,6 +53,11 @@ impl RadioBrowserClient {
         Ok(Self { base_url, client })
     }
 
+    #[cfg(test)]
+    fn with_http_client(base_url: String, client: reqwest::Client) -> Self {
+        Self { base_url, client }
+    }
+
     /// Fetch top-clicked stations.
     pub async fn fetch_top_click(&self, limit: Option<u32>) -> Vec<RadioStation> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
@@ -207,9 +212,32 @@ pub async fn fetch_geolocation() -> Option<GeoLocation> {
         .build()
         .ok()?;
 
+    fetch_geolocation_with(&client, &GeolocationEndpoints::production()).await
+}
+
+struct GeolocationEndpoints<'a> {
+    ipapi_co: &'a str,
+    ipwhois: &'a str,
+    freeipapi: &'a str,
+}
+
+impl GeolocationEndpoints<'static> {
+    const fn production() -> Self {
+        Self {
+            ipapi_co: "https://ipapi.co/json/",
+            ipwhois: "https://ipwho.is/",
+            freeipapi: "https://freeipapi.com/api/json",
+        }
+    }
+}
+
+async fn fetch_geolocation_with(
+    client: &reqwest::Client,
+    endpoints: &GeolocationEndpoints<'_>,
+) -> Option<GeoLocation> {
     // ── Provider 1: ipapi.co ────────────────────────────────────────
     info!("Geolocation: trying ipapi.co (HTTPS)");
-    if let Some(geo) = try_ipapi_co(&client).await {
+    if let Some(geo) = try_ipapi_co(client, endpoints.ipapi_co).await {
         info!(
             lat = geo.latitude,
             lon = geo.longitude,
@@ -221,7 +249,7 @@ pub async fn fetch_geolocation() -> Option<GeoLocation> {
 
     // ── Provider 2: ipwho.is ────────────────────────────────────────
     info!("Geolocation: trying ipwho.is (HTTPS)");
-    if let Some(geo) = try_ipwhois(&client).await {
+    if let Some(geo) = try_ipwhois(client, endpoints.ipwhois).await {
         info!(
             lat = geo.latitude,
             lon = geo.longitude,
@@ -233,7 +261,7 @@ pub async fn fetch_geolocation() -> Option<GeoLocation> {
 
     // ── Provider 3: freeipapi.com ───────────────────────────────────
     info!("Geolocation: trying freeipapi.com (HTTPS)");
-    if let Some(geo) = try_freeipapi(&client).await {
+    if let Some(geo) = try_freeipapi(client, endpoints.freeipapi).await {
         info!(
             lat = geo.latitude,
             lon = geo.longitude,
@@ -248,9 +276,9 @@ pub async fn fetch_geolocation() -> Option<GeoLocation> {
 }
 
 /// Try ipapi.co geolocation.
-async fn try_ipapi_co(client: &reqwest::Client) -> Option<GeoLocation> {
+async fn try_ipapi_co(client: &reqwest::Client, endpoint: &str) -> Option<GeoLocation> {
     let resp = client
-        .get("https://ipapi.co/json/")
+        .get(endpoint)
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await
@@ -272,9 +300,9 @@ async fn try_ipapi_co(client: &reqwest::Client) -> Option<GeoLocation> {
 }
 
 /// Try ipwho.is geolocation.
-async fn try_ipwhois(client: &reqwest::Client) -> Option<GeoLocation> {
+async fn try_ipwhois(client: &reqwest::Client, endpoint: &str) -> Option<GeoLocation> {
     let resp = client
-        .get("https://ipwho.is/")
+        .get(endpoint)
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await
@@ -296,9 +324,9 @@ async fn try_ipwhois(client: &reqwest::Client) -> Option<GeoLocation> {
 }
 
 /// Try freeipapi.com geolocation.
-async fn try_freeipapi(client: &reqwest::Client) -> Option<GeoLocation> {
+async fn try_freeipapi(client: &reqwest::Client, endpoint: &str) -> Option<GeoLocation> {
     let resp = client
-        .get("https://freeipapi.com/api/json")
+        .get(endpoint)
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await
@@ -341,4 +369,87 @@ fn resolve_api_host() -> Option<String> {
         "DNS resolution succeeded, using known mirror"
     );
     Some(FALLBACK_API_HOST.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
+
+    use super::*;
+
+    fn fixture_client() -> reqwest::Client {
+        crate::http_security::public_client_builder()
+            .user_agent("Tributary/0.2")
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("build public fixture client")
+    }
+
+    #[tokio::test]
+    async fn radio_browser_fixture_returns_only_http_streams() {
+        let service = MockHttpService::start(vec![MockRoute::get("/json/stations/topclick")
+            .with_query("limit", "3")
+            .with_query("hidebroken", "true")
+            .reply(MockResponse::json(serde_json::json!([
+                {
+                    "stationuuid": "https-station",
+                    "name": "HTTPS Station",
+                    "url_resolved": "https://stream.example.test/live"
+                },
+                {
+                    "stationuuid": "http-station",
+                    "name": "HTTP Station",
+                    "url_resolved": "http://stream.example.test/live"
+                },
+                {
+                    "stationuuid": "file-station",
+                    "name": "File Station",
+                    "url_resolved": "file:///tmp/not-a-radio-stream"
+                }
+            ])))])
+        .await;
+        let client = RadioBrowserClient::with_http_client(service.base_url(), fixture_client());
+
+        let stations = client.fetch_top_click(Some(3)).await;
+
+        assert_eq!(stations.len(), 2);
+        assert_eq!(stations[0].stationuuid, "https-station");
+        assert_eq!(stations[1].stationuuid, "http-station");
+        let requests = service.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].body.is_empty());
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn geolocation_fixture_stops_after_first_valid_provider() {
+        let service = MockHttpService::start(vec![MockRoute::get("/ipapi").reply(
+            MockResponse::json(serde_json::json!({
+                "latitude": 39.7684,
+                "longitude": -86.1581,
+                "country_code": "US",
+                "region": "Indiana",
+                "error": false
+            })),
+        )])
+        .await;
+        let base_url = service.base_url();
+        let client = fixture_client();
+        let endpoints = GeolocationEndpoints {
+            ipapi_co: &format!("{base_url}/ipapi"),
+            ipwhois: &format!("{base_url}/ipwhois"),
+            freeipapi: &format!("{base_url}/freeipapi"),
+        };
+
+        let location = fetch_geolocation_with(&client, &endpoints)
+            .await
+            .expect("fixture geolocation");
+
+        assert!((location.latitude - 39.7684).abs() < 1e-9);
+        assert!((location.longitude + 86.1581).abs() < 1e-9);
+        assert_eq!(location.country_code, "US");
+        assert_eq!(location.region, "Indiana");
+        assert_eq!(service.requests().len(), 1);
+        service.finish().await;
+    }
 }

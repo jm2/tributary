@@ -646,6 +646,8 @@ fn plex_track_to_track(
 
 #[cfg(test)]
 mod tests {
+    use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
+
     use super::*;
 
     #[test]
@@ -716,5 +718,113 @@ mod tests {
         assert_eq!(published.bitrate_kbps, Some(1411));
         assert_eq!(published.format.as_deref(), Some("flac"));
         assert_eq!(stream_locator, "/library/parts/2/file.flac");
+    }
+
+    #[tokio::test]
+    async fn live_fixture_connects_and_loads_one_music_library() {
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/identity").reply(MockResponse::json(serde_json::json!({
+                "MediaContainer": {
+                    "machineIdentifier": "fixture-machine",
+                    "version": "1.0"
+                }
+            }))),
+            MockRoute::get("/library/sections").reply(MockResponse::json(serde_json::json!({
+                "MediaContainer": {
+                    "size": 2,
+                    "Directory": [
+                        {"key": "7", "title": "Music", "type": "artist", "uuid": "music-uuid"},
+                        {"key": "8", "title": "Movies", "type": "movie"}
+                    ]
+                }
+            }))),
+            MockRoute::get("/library/sections/7/all")
+                .with_query("type", "10")
+                .reply(MockResponse::json(serde_json::json!({
+                    "MediaContainer": {
+                        "size": 1,
+                        "totalSize": 1,
+                        "offset": 0,
+                        "Metadata": [{
+                            "ratingKey": "track-1",
+                            "title": "Fixture Song",
+                            "grandparentTitle": "Fixture Artist",
+                            "grandparentRatingKey": "artist-1",
+                            "parentTitle": "Fixture Album",
+                            "parentRatingKey": "album-1",
+                            "index": 3,
+                            "parentIndex": 1,
+                            "duration": 123_000,
+                            "year": 2026,
+                            "thumb": "/library/metadata/track-1/thumb",
+                            "Media": [{
+                                "bitrate": 1411,
+                                "audioCodec": "flac",
+                                "Part": [{"key": "/library/parts/track-1/file.flac"}]
+                            }]
+                        }]
+                    }
+                }))),
+            MockRoute::get("/library/sections/7/all")
+                .with_query("type", "9")
+                .reply(MockResponse::json(serde_json::json!({
+                    "MediaContainer": {
+                        "size": 1,
+                        "totalSize": 1,
+                        "offset": 0,
+                        "Metadata": [{
+                            "ratingKey": "album-1",
+                            "title": "Fixture Album",
+                            "parentTitle": "Fixture Artist",
+                            "parentRatingKey": "artist-1",
+                            "year": 2026,
+                            "leafCount": 1,
+                            "duration": 123_000,
+                            "Genre": [{"tag": "Test"}]
+                        }]
+                    }
+                }))),
+            MockRoute::get("/library/sections/7/all")
+                .with_query("type", "8")
+                .reply(MockResponse::json(serde_json::json!({
+                    "MediaContainer": {
+                        "size": 1,
+                        "totalSize": 1,
+                        "offset": 0,
+                        "Metadata": [{
+                            "ratingKey": "artist-1",
+                            "title": "Fixture Artist"
+                        }]
+                    }
+                }))),
+        ])
+        .await;
+        let token = Uuid::new_v4().to_string();
+
+        let backend = PlexBackend::connect("fixture", &service.base_url(), &token)
+            .await
+            .expect("connect Plex fixture");
+
+        assert_eq!(backend.music_libraries().len(), 1);
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), 1);
+        assert_eq!(cache.tracks[0].title, "Fixture Song");
+        assert_eq!(cache.albums.len(), 1);
+        assert_eq!(cache.artists.len(), 1);
+        drop(cache);
+
+        let requests = service.requests();
+        assert_eq!(requests.len(), 5);
+        for request in requests {
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-plex-token")
+                    .and_then(|value| value.to_str().ok()),
+                Some(token.as_str())
+            );
+            assert!(request.body.is_empty());
+        }
+        service.finish().await;
     }
 }
