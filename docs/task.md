@@ -1564,7 +1564,10 @@ control or catalogue route; once login yields a usable session ID, any later fai
 bounded logout before returning. This closes the DAAP malformed/session-expiration box without
 claiming the remaining cross-service behavior matrix.
 
-Combined-branch validation: pending rerun after integration.
+Combined-branch validation: debug and release each pass 20 library, 745 application, and 10
+repository-metadata tests (775 per profile); strict all-target/all-feature Clippy passes in both
+profiles; formatting and whitespace checks pass. The branch was then rebased onto the accepted
+PR #116 merge before publication.
 
 ### P3.4 Add UI/output integration harnesses
 
