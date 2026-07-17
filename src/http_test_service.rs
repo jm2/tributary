@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use axum::body::{to_bytes, Body};
+use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::Router;
@@ -41,6 +41,7 @@ pub struct MockResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: Vec<u8>,
+    delay: Duration,
 }
 
 impl MockResponse {
@@ -76,6 +77,7 @@ impl MockResponse {
             status,
             headers: HeaderMap::new(),
             body: Vec::new(),
+            delay: Duration::ZERO,
         }
     }
 
@@ -93,8 +95,28 @@ impl MockResponse {
         self
     }
 
+    /// Delays the response body after sending its headers.
+    ///
+    /// This is deliberately bounded by each test and lets production request
+    /// deadlines be exercised without a separate ad-hoc socket server.
+    #[must_use]
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
     fn into_response(self) -> Response<Body> {
-        let mut response = Response::new(Body::from(self.body));
+        let body = if self.delay.is_zero() {
+            Body::from(self.body)
+        } else {
+            let delay = self.delay;
+            let body = Bytes::from(self.body);
+            Body::from_stream(futures::stream::once(async move {
+                tokio::time::sleep(delay).await;
+                Ok::<_, std::convert::Infallible>(body)
+            }))
+        };
+        let mut response = Response::new(body);
         *response.status_mut() = self.status;
         *response.headers_mut() = self.headers;
         response

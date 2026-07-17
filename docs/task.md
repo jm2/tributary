@@ -31,8 +31,8 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**207/223 (92.8%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
-and **17/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**209/223 (93.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
+and **19/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -48,13 +48,17 @@ document already labels its diagram as intended and names the shipping abstracti
 P3.5 now reports every Linux-host source area in one pinned aggregate, keeps different native
 source sets as informational reports, and enforces the baseline accepted by two exact pinned PR
 executions in PR #111.
-This P3.3 integration combines the independently reviewed non-DAAP service fixture from
-`b80e534` with the independently reviewed DAAP adversarial fixture from `6f6c9ac`. Their source
-merges cleanly over the accepted P3.1/P3.2 predecessors, and both reviews reported no actionable
-findings. The combined coverage closes the all-services mock box and the DAAP
-malformed-container/session-expiration box. The cross-service auth, redirect, timeout, body-cap,
-pagination, partial-failure, and reverse-proxy-prefix matrix remains open, as does P3.3's final
-implementation record.
+P3.3 is complete after combining the independently reviewed non-DAAP service fixture from
+`b80e534`, the DAAP adversarial fixture from `6f6c9ac`, and this representative cross-service
+behavior matrix. The matrix exercises rejected authentication, credential-safe authenticated and
+public redirects, finite response deadlines, streaming response caps, Jellyfin and Plex
+pagination, Subsonic/Plex/geolocation partial failures, and root/trailing-slash/escaped
+reverse-proxy prefixes without claiming every Cartesian service/behavior pairing. It also fixed
+four production gaps exposed by those fixtures: Subsonic failed envelopes no longer retain a
+server-controlled message that could echo a secret; Radio-Browser and geolocation no longer accept
+a valid JSON body from a non-success HTTP response; Jellyfin and Plex no longer create doubled API
+paths beneath a trailing-slash prefix; and Plex stream/artwork requests no longer erase the
+configured prefix or allow normalized dot segments to escape it.
 P2.10 is complete in PR #112. Legacy MPD outputs remain unconfirmed until the exact endpoint is
 re-added with the required localized checkbox; their public load boundary rejects playback before
 optimistic Buffering state, epoch advancement, worker enqueue/cleanup, MPD connection, MPD
@@ -1526,13 +1530,34 @@ values and invalid persisted `TrackId` fallback remain explicitly assigned to P3
     tasks. Integrating that fixture with the five non-DAAP success fixtures closes this all-services
     box. Independent reviews of source commits `b80e534` and `6f6c9ac` reported no actionable
     findings.
-- [ ] Cover auth, redirect, timeout, body cap, pagination, partial failure, and reverse-proxy
+- [x] Cover auth, redirect, timeout, body cap, pagination, partial failure, and reverse-proxy
   prefix behavior.
-  - The five non-DAAP fixtures establish successful production request/response wiring only. DAAP
-    adds malformed-container and session-expiration adversarial coverage, but neither slice claims
-    the rejected/alternate-auth, redirect, deadline, oversized-response, multi-page,
-    partial-failure, or prefixed-origin cases across every named service required to close this
-    behavior box.
+  - This is a representative matrix, not a misleading Cartesian claim. Rejected token/password
+    authentication is driven through production Subsonic, Jellyfin, and Plex entry points with
+    typed errors that omit the submitted secrets even when Subsonic echoes one in its failed
+    envelope; DAAP's production session fixture separately covers HTTP and in-band session
+    rejection. Jellyfin follows a relative same-origin ping
+    redirect while retaining its required authorization and sending no `Referer`, Radio-Browser
+    follows its credential-free public redirect, and the shared policy regressions prove an
+    authenticated cross-origin redirect stops before the destination receives a credential.
+  - The keyed fixture can delay a response body without an unbounded peer. Radio-Browser and the
+    geolocation cascade use their production request/read paths with a test policy whose short
+    finite deadline and small streaming cap make late and oversized valid JSON fail quickly; the
+    production policy remains 15 seconds with its 8 MiB station and 256 KiB geolocation caps.
+    These regressions also exposed and fixed both paths accepting valid JSON from HTTP 5xx bodies.
+  - Jellyfin consumes a full 5,000-item page plus a final page, and Plex consumes a full 1,000-item
+    page plus a final page, through complete backend connections. Subsonic retains a healthy
+    artist/album/track while independently failed artist and album requests are skipped; Plex
+    publishes one complete healthy section while an unavailable section contributes nothing; and
+    geolocation advances past HTTP-error, oversized, and timed-out providers without publishing
+    their data.
+  - Complete backend fixtures use configured prefixes ending in `/` and prove API, pagination,
+    stream, and artwork paths. Existing Subsonic/DAAP exact-path regressions cover root, ordinary,
+    trailing-slash, and already-escaped bases. New Jellyfin/Plex regressions cover the same four
+    base shapes, while Plex also pins exact one-empty-segment behavior for root `//` and prefixed
+    `/share//` bases. Their API builders now remove only one trailing empty base segment; Plex's
+    server-issued media paths append below the configured base, preserve escaped bytes, and reject
+    normalized dot-segment escape with a fixed peer-path-free error.
 - [x] Cover DAAP malformed nested containers and session expiration. The DAAP socket fixture reads
   through `CRLFCRLF` in forced seven-byte fragments under a 16 KiB header cap and five-second
   deadline, and owns/cancels spawned handlers through a `JoinSet`. Nine catalogue cases cover a
@@ -1546,10 +1571,10 @@ values and invalid persisted `TrackId` fallback remain explicitly assigned to P3
   error. The tests drive `DaapBackend::connect` through a real connection attempt, prove the failed
   backend never enters the session registry and issues no stream/artwork request, and observe
   exactly one automatic bounded logout.
-- [ ] Record implementation: _the combined service harness and DAAP adversarial/session-expiration
-  slice are implemented in source commits `b80e534` and `6f6c9ac`; the cross-service behavior
-  matrix above remains incomplete, so P3.3 as a whole and its final implementation record remain
-  open._
+- [x] Record implementation: source commits `b80e534` and `6f6c9ac` provide the shared service and
+  DAAP foundations; this completion branch adds the representative behavior matrix and fixes the
+  Subsonic peer-message, Radio-Browser/geolocation status, and Jellyfin/Plex reverse-proxy findings
+  it exposed (PR #118).
 
 Protocol decision and compatibility boundary: GNOME's primary `libdmapsharing` implementation
 [returns HTTP 403 for an invalid DAAP session on database routes](https://gitlab.gnome.org/GNOME/libdmapsharing/-/blob/de7af2940a7cfbe626fa063dd89dab41e04170ce/libdmapsharing/dmap-share.c#L605-608),
@@ -1561,13 +1586,13 @@ an absent `mstt` on login or later session responses for older peers; server-inf
 pre-existing mandatory-success-status rule. A present status must be one exact-width U32 and unique
 within its response container. The shared HTTP classifier covers every post-login session-bound
 control or catalogue route; once login yields a usable session ID, any later failure attempts one
-bounded logout before returning. This closes the DAAP malformed/session-expiration box without
-claiming the remaining cross-service behavior matrix.
+bounded logout before returning. This closes the DAAP malformed/session-expiration portion of the
+now-complete representative cross-service behavior matrix.
 
-Combined-branch validation: debug and release each pass 20 library, 745 application, and 10
-repository-metadata tests (775 per profile); strict all-target/all-feature Clippy passes in both
-profiles; formatting and whitespace checks pass. The branch was then rebased onto the accepted
-PR #116 merge before publication.
+Completion-branch validation: debug and release each pass 20 library, 757 application, and 10
+repository-metadata tests (787 per profile); strict all-target/all-feature Clippy passes in both
+profiles; formatting and whitespace checks pass. The behavior matrix adds 12 tests to the accepted
+service/DAAP foundation and is stacked on its PR #117 head pending publication.
 
 ### P3.4 Add UI/output integration harnesses
 
@@ -1993,7 +2018,21 @@ Record scope or design decisions here so deferred work is explicit.
   bytes. The fixture proves the failed initial sync never enters the registry, issues no media
   request, and sends exactly one logout. This closes the DAAP
   malformed-container/session-expiration box and, alongside the non-DAAP fixture, the named
-  service-mock box; the broader P3.3 behavior matrix and final implementation record remain open.
+  service-mock box; at that slice, the broader P3.3 behavior matrix and final implementation
+  record remained open.
+
+- 2026-07-17 — P3.3's completion matrix is representative rather than the Cartesian product of
+  seven behaviors and six services. Each behavior crosses at least one complete production entry
+  point, each named service is covered where its protocol has that behavior, and common redirect
+  security remains pinned once at the shared client-policy boundary. Service-specific pagination
+  is covered independently for Jellyfin and Plex; partial-publication contracts are independently
+  covered for Subsonic and Plex; DAAP retains its raw DMAP/session harness; and public
+  Radio-Browser/geolocation paths cover redirects, finite deadlines, streaming caps, and provider
+  fallback. Test-only policies shorten time/size without substituting a different request or body
+  reader. Prefix tests cover API and protected-media construction for all four authenticated
+  protocols. A Plex media path appends below the configured base and rejects normalization outside
+  it, while a peer's path never enters the fixed error. This evidence closes the matrix and record
+  boxes without claiming unsupported alternate-auth modes or every redundant pairing.
 
 - 2026-07-17 — PR #112 completes P2.10 by requiring an explicit, persisted
   exclusive-control promise rather than pretending MPD offers an ownership lock or conditional
@@ -2585,6 +2624,7 @@ Add one line per completed task:
 | 2026-07-16 | P2.10 MPD real-socket coverage (partial) | PR #107 | Completes the compound socket-coverage item begun by PR #105's held-ACK FIFO peer. A channel-held silent first IPv4 greeting proves the shared absolute deadline preserves a fair slice for a later address without sleeps or elapsed-time thresholds. A real `::1` listener proves numeric resolution, connection, greeting, and IPv6 client/peer addresses; only an unavailable initial IPv6 bind skips that capability-specific case. Two net-new regressions bring the focused MPD suite to 79. Only exclusive-control/global-option semantics remain open. |
 | 2026-07-17 | P2.10 MPD exclusive-control contract | PR #112 | Persists an explicit legacy-default-false mode; requires localized partition-wide warning and one-controller confirmation; upgrades an exact endpoint in place; makes mode part of output identity; refuses unconfirmed public loads before Buffering/epoch/enqueue while retaining retry state; and independently gates every load intent—including pre-dispatch rejection—in the worker before cleanup, MPD connection/state/options, protected tickets, or queue mutation. Foreign-ID relinquishment remains fail-safe even when the confirmed deployment promise is violated. Nine focused migration, upsert, identity, boundary/worker zero-action, retry, and localization tests cover the final slice. Two actionable Codex findings were fixed and resolved; the final review and full native/package CI matrix passed. |
 | 2026-07-17 | P3.3 service fixtures and DAAP adversarial/session harness (partial) | `b80e534`, `6f6c9ac` | Adds one bounded keyed HTTP fixture for five non-DAAP production success paths and integrates DAAP's protocol-appropriate deadline/header-capped, fragmentation-forcing, endpoint-scripted raw-socket fixture with owned handlers. DAAP rejects nine wrong, truncated, over-deep, invalid-width, duplicate-status, or valid-prefix/malformed-remainder catalogue forms without registry publication or media access; shares HTTP 401/403 expiration handling across update/databases/items; classifies in-band 401/403 and non-auth `mstt`; and proves fixed diagnostics plus one automatic bounded logout after every post-login failure. Independent reviews found no actionable issues. This closes the named all-services mock and DAAP malformed/session-expiration boxes; the cross-service adversarial behavior matrix and final P3.3 implementation record remain open. |
+| 2026-07-17 | P3.3 cross-service behavior matrix (completion) | PR #118 | Adds bounded delayed-body behavior to the keyed fixture and a documented representative matrix for rejected authentication, authenticated/public redirects, deadline, streaming body cap, Jellyfin/Plex multi-page catalogues, Subsonic/Plex/geolocation partial failure, and all four authenticated protocols' reverse-proxy paths. The matrix strips server-controlled Subsonic failure text, fixes Radio-Browser/geolocation acceptance of non-success JSON, repairs trailing-slash Jellyfin/Plex API paths, and prevents Plex stream/artwork prefix erasure and dot-segment escape. Review additionally pinned root `//` and prefixed `/share//` to the same one-empty-segment rule across API and protected-media construction. Twelve new tests bring the completion branch to 787 tests per profile with strict debug/release Clippy, formatting, and whitespace checks. This closes P3.3's final behavior and implementation-record boxes. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
 | 2026-07-16 | P2.11 deterministic HTTP compatibility (partial) | PR #108 | Preserves exact escaped reverse-proxy prefixes across DAAP stream/artwork and Subsonic API/media construction, carries DAAP's four fixed protocol headers through a separate strict non-secret allowlist into protected stream and artwork fetches, retains receiver `Range` as the only forwarded header, proves existing typed Subsonic HTTP-200 failures, and exercises explicit upstream proxy selection at the asynchronous protected-fetch boundary. Seven net-new regressions cover the contracts. At PR #108, full fake GStreamer, packaged source-policy, and live Windows playback validation remained open; the following slice closes the fake-GStreamer part. |
