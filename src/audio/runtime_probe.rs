@@ -546,8 +546,17 @@ fn serve_probe_listener(
                 // Count every socket returned by accept, including one that
                 // was already queued when final stop became visible.
                 connections.fetch_add(1, Ordering::SeqCst);
-                let _ = stream.set_read_timeout(Some(CONNECTION_DEADLINE));
-                let _ = stream.set_write_timeout(Some(CONNECTION_DEADLINE));
+                // Winsock can inherit the listener's nonblocking mode onto
+                // accepted sockets. Restore blocking I/O before installing
+                // the bounded deadlines so a fragmented request waits for
+                // its next bytes instead of spuriously failing WouldBlock.
+                if stream.set_nonblocking(false).is_err()
+                    || stream.set_read_timeout(Some(CONNECTION_DEADLINE)).is_err()
+                    || stream.set_write_timeout(Some(CONNECTION_DEADLINE)).is_err()
+                {
+                    failed.store(true, Ordering::SeqCst);
+                    return;
+                }
                 if matches!(kind, ServerKind::Media) {
                     match serve_media(&mut stream) {
                         MediaRequestOutcome::ValidGet => {
@@ -960,6 +969,9 @@ mod tests {
         client
             .write_all(malformed.as_bytes())
             .expect("send malformed request");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("finish malformed request");
         let mut response = Vec::new();
         client
             .read_to_end(&mut response)

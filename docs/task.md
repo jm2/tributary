@@ -93,9 +93,16 @@ the ARM64 finished distribution also passed the production protected-playback pr
 native suite passed 717 of 718 application tests but showed that the regression fixture's plain
 client-socket drop did not deterministically establish its intended incomplete-header EOF on that
 Windows runner. The fixture now explicitly half-closes its write side after cancellation, using
-the same cross-platform EOF contract as the already-passing request-classification fixtures,
-without broadening which production I/O failures count as cancellation. A replacement native
-matrix remains pending.
+the same cross-platform EOF contract as the already-passing request-classification fixtures.
+Static run 29612456247 passed, but matrix 29612458758 then reproduced the teardown failure despite
+that explicit half-close; the malformed-request fixture also received a Windows response-drain
+abort (716 of 718 application tests passed). The remaining production cause was the listener's
+nonblocking mode: Winsock can retain it on an accepted socket,
+letting a fragmented header return `WouldBlock` before cancellation is published. Accepted sockets
+are now explicitly restored to blocking mode before their bounded read/write deadlines are
+installed, and any configuration failure remains fatal. The malformed fixture also half-closes its
+completed request before reading the response, making request completion deterministic without
+relaxing the server assertion. A replacement native matrix remains pending.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1551,8 +1558,14 @@ the ARM64 Windows production package probe;
 the x86_64 native suite passed 717 of 718 application tests but its plain client-socket drop did not
 deterministically deliver the intended incomplete-header EOF. That regression now explicitly
 half-closes the client write side after cancellation—the same EOF contract exercised by the
-already-passing request classifiers—while production timeout, semantic-request, and response
-failures remain fatal. Its replacement native matrix is pending.
+already-passing request classifiers. Static run 29612456247 passed, but matrix 29612458758 proved
+the half-close alone insufficient; the malformed fixture also received an abort while draining its
+response (716 of 718 application tests passed). The production
+listener now explicitly returns each accepted Winsock socket to blocking mode before installing
+its bounded read/write deadlines, so a fragmented header waits rather than spuriously returning
+`WouldBlock`; configuration, timeout, semantic-request, and response failures remain fatal. The
+malformed fixture now half-closes its completed request before response drain to make completion
+deterministic. A replacement native matrix is pending.
 
 Most recent accepted validation (2026-07-17, PR #112 P2.10 exclusive-control slice):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature
