@@ -602,8 +602,10 @@ async fn serve_media(
 ///
 /// The upstream URL is fixed at registration, so this cannot be driven to fetch
 /// an arbitrary target. Only `Range` is forwarded — none of the receiver's other
-/// headers reach the user's music server. Transport errors are classified
-/// without formatting them because a `reqwest` error may retain the complete
+/// headers reach the user's music server. Fixed protocol headers belong to the
+/// resolved request and are applied from its separate trusted allowlist.
+/// Transport errors are classified without formatting them because a
+/// `reqwest` error may retain the complete
 /// credential-bearing URL.
 async fn proxy_upstream(
     client: &UpstreamMediaClient,
@@ -636,9 +638,8 @@ async fn proxy_upstream(
     };
     let mut request = http.get(upstream_url);
     if let UpstreamRequest::Resolved(resolved) = upstream_request {
-        for (name, value) in resolved.sensitive_headers() {
-            request = request.header(name, value);
-        }
+        request = request.headers(resolved.required_headers().clone());
+        request = request.headers(resolved.sensitive_headers().clone());
     }
     if let Some(range) = receiver_headers.get(header::RANGE) {
         request = request.header(header::RANGE, range.clone());
@@ -938,7 +939,9 @@ mod tests {
     use axum::extract::OriginalUri;
     use axum::http::Uri;
     use futures::StreamExt;
-    use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, COOKIE, REFERER};
+    use reqwest::header::{
+        HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, COOKIE, REFERER, USER_AGENT,
+    };
 
     use crate::architecture::media::MediaLease;
 
@@ -1321,7 +1324,8 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let app = Router::new()
-            .route("/stream", get(capture_request))
+            .route("/reverse-proxy/library/stream", get(capture_request))
+            .route("/explicit-proxy/stream", get(capture_request))
             .with_state(tx);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1339,10 +1343,14 @@ mod tests {
         const PRIVATE_USER: &str = "proxy-user-value";
         const PRIVATE_PASSWORD: &str = "proxy-password-value";
         const EXPECTED_AUTH: &str = "Bearer request-owned-value";
+        const EXPECTED_ACCEPT: &str = "application/x-dmap-tagged";
+        const EXPECTED_USER_AGENT: &str = "Tributary/test-required-value";
+        const EXPECTED_DAAP_VERSION: &str = "3.12";
+        const EXPECTED_DAAP_ACCESS_INDEX: &str = "2";
 
         let (upstream_addr, mut captures, upstream_abort) = start_capture_server().await;
         let endpoint = Url::parse(&format!(
-            "http://{ADVERTISED_HOST}:{}/stream?track=42",
+            "http://{ADVERTISED_HOST}:{}/reverse-proxy/library/stream?track=42",
             upstream_addr.port()
         ))
         .expect("clean advertised endpoint");
@@ -1356,6 +1364,20 @@ mod tests {
         let lease = MediaLease::new();
         let request = ResolvedHttpRequest::new(endpoint)
             .expect("resolved request")
+            .with_required_header(ACCEPT, HeaderValue::from_static(EXPECTED_ACCEPT))
+            .expect("allowlisted Accept")
+            .with_required_header(USER_AGENT, HeaderValue::from_static(EXPECTED_USER_AGENT))
+            .expect("allowlisted User-Agent")
+            .with_required_header(
+                HeaderName::from_static("client-daap-version"),
+                HeaderValue::from_static(EXPECTED_DAAP_VERSION),
+            )
+            .expect("allowlisted DAAP version")
+            .with_required_header(
+                HeaderName::from_static("client-daap-access-index"),
+                HeaderValue::from_static(EXPECTED_DAAP_ACCESS_INDEX),
+            )
+            .expect("allowlisted DAAP access index")
             .with_sensitive_header(AUTHORIZATION, HeaderValue::from_static(EXPECTED_AUTH))
             .expect("allowlisted header")
             .with_private_query_pair("u", PRIVATE_USER)
@@ -1381,6 +1403,10 @@ mod tests {
         let response = reqwest::Client::new()
             .get(&ticket)
             .header(header::RANGE, "bytes=7-11")
+            .header(ACCEPT, "receiver/controlled")
+            .header(USER_AGENT, "Receiver/controlled")
+            .header("client-daap-version", "receiver-controlled")
+            .header("client-daap-access-index", "receiver-controlled")
             .header(COOKIE, "receiver-cookie-value")
             .header(REFERER, "https://receiver.invalid/")
             .header(AUTHORIZATION, "Bearer receiver-owned-value")
@@ -1403,6 +1429,11 @@ mod tests {
             .split('&')
             .collect();
         let expected_host = format!("{ADVERTISED_HOST}:{}", upstream_addr.port());
+        assert_eq!(
+            captured_uri.path(),
+            "/reverse-proxy/library/stream",
+            "the reverse-proxy base path must survive the protected fetch"
+        );
         assert_eq!(
             captured_headers
                 .get(header::HOST)
@@ -1430,6 +1461,24 @@ mod tests {
             captured_headers.get(AUTHORIZATION) == Some(&HeaderValue::from_static(EXPECTED_AUTH)),
             "request-owned authorization is applied upstream"
         );
+        for (name, expected) in [
+            (ACCEPT, EXPECTED_ACCEPT),
+            (USER_AGENT, EXPECTED_USER_AGENT),
+            (
+                HeaderName::from_static("client-daap-version"),
+                EXPECTED_DAAP_VERSION,
+            ),
+            (
+                HeaderName::from_static("client-daap-access-index"),
+                EXPECTED_DAAP_ACCESS_INDEX,
+            ),
+        ] {
+            assert_eq!(
+                captured_headers.get(&name),
+                Some(&HeaderValue::from_static(expected)),
+                "trusted request-required header must beat a receiver conflict"
+            );
+        }
         assert!(
             captured_headers.get(header::RANGE) == Some(&HeaderValue::from_static("bytes=7-11")),
             "receiver Range is forwarded"
@@ -1461,6 +1510,83 @@ mod tests {
         );
 
         upstream_abort.abort();
+    }
+
+    #[tokio::test]
+    async fn resolved_fetch_uses_an_explicit_upstream_http_proxy() {
+        const UPSTREAM_HOST: &str = "cast-explicit-upstream.invalid";
+
+        let (proxy_addr, mut captures, proxy_abort) = start_capture_server().await;
+        let endpoint = Url::parse(&format!(
+            "http://{UPSTREAM_HOST}/explicit-proxy/stream?track=77"
+        ))
+        .expect("clean upstream endpoint");
+        let request = ResolvedHttpRequest::new(endpoint)
+            .expect("resolved request")
+            .with_private_query_pair("session-id", "private-session")
+            .expect("private session")
+            .with_required_header(
+                USER_AGENT,
+                HeaderValue::from_static("Tributary/explicit-proxy-test"),
+            )
+            .expect("allowlisted User-Agent");
+
+        let proxy =
+            reqwest::Proxy::all(format!("http://{proxy_addr}")).expect("explicit local HTTP proxy");
+        let http = crate::http_security::authenticated_client_builder()
+            .proxy(proxy)
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .expect("explicit-proxy upstream client");
+        let client = UpstreamMediaClient {
+            http,
+            routed_http: Arc::new(DashMap::new()),
+            connect_timeout: Duration::from_secs(2),
+            timeouts: UpstreamTimeouts {
+                response_headers: Duration::from_secs(2),
+                body_idle: Duration::from_secs(2),
+            },
+        };
+        let mut receiver_headers = HeaderMap::new();
+        receiver_headers.insert(header::RANGE, HeaderValue::from_static("bytes=2-5"));
+
+        let response = proxy_upstream(
+            &client,
+            &UpstreamRequest::Resolved(Box::new(request)),
+            &receiver_headers,
+        )
+        .await;
+        assert!(response.status().is_success());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("proxied response body");
+        assert_eq!(body.as_ref(), b"media");
+
+        let (captured_uri, captured_headers) =
+            tokio::time::timeout(Duration::from_secs(2), captures.recv())
+                .await
+                .expect("explicit proxy capture timeout")
+                .expect("explicit proxy captured request");
+        assert_eq!(captured_uri.path(), "/explicit-proxy/stream");
+        assert_eq!(
+            captured_uri.query(),
+            Some("track=77&session-id=private-session")
+        );
+        assert_eq!(
+            captured_headers.get(header::HOST),
+            Some(&HeaderValue::from_static(UPSTREAM_HOST)),
+            "the selected proxy must retain the upstream HTTP origin"
+        );
+        assert_eq!(
+            captured_headers.get(USER_AGENT),
+            Some(&HeaderValue::from_static("Tributary/explicit-proxy-test"))
+        );
+        assert_eq!(
+            captured_headers.get(header::RANGE),
+            Some(&HeaderValue::from_static("bytes=2-5"))
+        );
+
+        proxy_abort.abort();
     }
 
     #[tokio::test]

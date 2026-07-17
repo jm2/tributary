@@ -125,16 +125,7 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
                                     }
                                 },
                             };
-                            let mut endpoint = resolved.endpoint().clone();
-                            {
-                                let mut query = endpoint.query_pairs_mut();
-                                for (key, value) in resolved.private_query_pairs() {
-                                    query.append_pair(key, value);
-                                }
-                            }
-                            client
-                                .get(endpoint)
-                                .headers(resolved.sensitive_headers().clone())
+                            build_resolved_art_request(&client, resolved)
                         }
                     };
 
@@ -492,6 +483,30 @@ fn build_routed_art_client(
     }
 }
 
+/// Build the exact protected artwork request at the last responsible moment.
+///
+/// Authentication query state and headers stay isolated on the resolved
+/// request until the worker has selected the exact-origin HTTP client. Fixed
+/// protocol headers are installed before sensitive authentication headers so
+/// the ordering matches protected stream requests.
+fn build_resolved_art_request(
+    client: &reqwest::blocking::Client,
+    resolved: &crate::architecture::media::ResolvedHttpRequest,
+) -> reqwest::blocking::RequestBuilder {
+    let mut endpoint = resolved.endpoint().clone();
+    {
+        let mut query = endpoint.query_pairs_mut();
+        for (key, value) in resolved.private_query_pairs() {
+            query.append_pair(key, value);
+        }
+    }
+
+    client
+        .get(endpoint)
+        .headers(resolved.required_headers().clone())
+        .headers(resolved.sensitive_headers().clone())
+}
+
 fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, generation: u64) {
     let image = image.clone();
 
@@ -530,6 +545,8 @@ fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, generation: u
 mod generation_tests {
     use super::*;
 
+    use reqwest::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION};
+
     #[test]
     fn reset_invalidates_local_and_remote_artwork_results() {
         let stale_generation = next_generation();
@@ -538,5 +555,49 @@ mod generation_tests {
         invalidate();
 
         assert!(!generation_is_current(stale_generation));
+    }
+
+    #[test]
+    fn resolved_art_request_preserves_endpoint_and_isolated_http_state() {
+        let required_name = HeaderName::from_static("client-daap-version");
+        let resolved = crate::architecture::media::ResolvedHttpRequest::new(
+            url::Url::parse("https://music.test/share/databases/1/items/42.mp3?format=original")
+                .unwrap(),
+        )
+        .unwrap()
+        .with_private_query_pair("session-id", "private-session")
+        .unwrap()
+        .with_required_header(
+            ACCEPT,
+            HeaderValue::from_static("application/x-dmap-tagged"),
+        )
+        .unwrap()
+        .with_required_header(required_name.clone(), HeaderValue::from_static("3.12"))
+        .unwrap()
+        .with_sensitive_header(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic private-authorization"),
+        )
+        .unwrap();
+
+        let request = build_resolved_art_request(&reqwest::blocking::Client::new(), &resolved)
+            .build()
+            .unwrap();
+
+        assert_eq!(request.url().path(), "/share/databases/1/items/42.mp3");
+        assert_eq!(
+            request.url().query(),
+            Some("format=original&session-id=private-session")
+        );
+        assert_eq!(
+            request.headers().get(ACCEPT).unwrap(),
+            "application/x-dmap-tagged"
+        );
+        assert_eq!(request.headers().get(&required_name).unwrap(), "3.12");
+        assert_eq!(
+            request.headers().get(AUTHORIZATION).unwrap(),
+            "Basic private-authorization"
+        );
+        assert_eq!(request.headers().len(), 3);
     }
 }

@@ -9,9 +9,10 @@
 //! 3. `GET /update` → revision-number
 //! 4. `GET /databases` → database-id
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, USER_AGENT};
 use reqwest::Client;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -21,8 +22,8 @@ use crate::architecture::error::BackendError;
 use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
-    apply_advertised_http_route, authenticated_client_builder, redact_url_secrets,
-    strip_request_url, validate_base_url,
+    append_base_path_segments, apply_advertised_http_route, authenticated_client_builder,
+    redact_url_secrets, strip_request_url, validate_base_url,
 };
 
 use super::dmap::{self, DmapNode, DmapValue};
@@ -372,16 +373,19 @@ impl DaapClient {
     /// `session-id` stays isolated until Tributary performs the request.
     pub(crate) fn cover_art_request(&self, song_id: u32) -> BackendResult<ResolvedHttpRequest> {
         let mut endpoint = self.base_url.clone();
-        endpoint
-            .path_segments_mut()
-            .expect("validated DAAP base URL supports path segments")
-            .clear()
-            .push("databases")
-            .push(&self.database_id.to_string())
-            .push("items")
-            .push(&song_id.to_string())
-            .push("extra_data")
-            .push("artwork");
+        let database_id = self.database_id.to_string();
+        let song_id = song_id.to_string();
+        append_base_path_segments(
+            &mut endpoint,
+            [
+                "databases",
+                database_id.as_str(),
+                "items",
+                song_id.as_str(),
+                "extra_data",
+                "artwork",
+            ],
+        );
         endpoint
             .query_pairs_mut()
             .append_pair("mw", "300")
@@ -400,20 +404,20 @@ impl DaapClient {
     ) -> BackendResult<ResolvedHttpRequest> {
         let mut endpoint = self.base_url.clone();
         let item = format!("{song_id}.{format}");
-        endpoint
-            .path_segments_mut()
-            .expect("validated DAAP base URL supports path segments")
-            .clear()
-            .push("databases")
-            .push(&self.database_id.to_string())
-            .push("items")
-            .push(&item);
+        let database_id = self.database_id.to_string();
+        append_base_path_segments(
+            &mut endpoint,
+            ["databases", database_id.as_str(), "items", item.as_str()],
+        );
         self.resolved_media_request(endpoint)
     }
 
     fn resolved_media_request(&self, endpoint: Url) -> BackendResult<ResolvedHttpRequest> {
         let mut request = ResolvedHttpRequest::new(endpoint)?
             .with_private_query_pair("session-id", self.session_id.to_string())?;
+        for (name, value) in daap_required_headers() {
+            request = request.with_required_header(name.clone(), value.clone())?;
+        }
         if let Some(route) = &self.advertised_route {
             request = request.with_advertised_route(route.clone())?;
         }
@@ -516,16 +520,9 @@ fn build_http_client(
     origin: &Url,
     advertised_route: Option<&AdvertisedHttpRoute>,
 ) -> BackendResult<Client> {
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static(DMAP_CONTENT_TYPE));
-    headers.insert(
-        "Client-DAAP-Version",
-        HeaderValue::from_static(DAAP_VERSION),
-    );
-    headers.insert("Client-DAAP-Access-Index", HeaderValue::from_static("2"));
+    let headers = daap_required_headers().clone();
 
     let builder = authenticated_client_builder()
-        .user_agent(format!("{CLIENT_NAME}/{CLIENT_VERSION}"))
         .default_headers(headers)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT);
@@ -536,6 +533,32 @@ fn build_http_client(
         })?
         .build()
         .map_err(|error| daap_request_error("Failed to build DAAP HTTP client", error))
+}
+
+/// Headers required by DAAP control and protected media requests alike.
+///
+/// Keeping one map for both paths prevents proxied playback from drifting
+/// away from the protocol identity used during the session handshake.
+fn daap_required_headers() -> &'static HeaderMap {
+    static HEADERS: OnceLock<HeaderMap> = OnceLock::new();
+    HEADERS.get_or_init(|| {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static(DMAP_CONTENT_TYPE));
+        headers.insert(
+            HeaderName::from_static("client-daap-version"),
+            HeaderValue::from_static(DAAP_VERSION),
+        );
+        headers.insert(
+            HeaderName::from_static("client-daap-access-index"),
+            HeaderValue::from_static("2"),
+        );
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(&format!("{CLIENT_NAME}/{CLIENT_VERSION}"))
+                .expect("package version forms a valid DAAP user agent"),
+        );
+        headers
+    })
 }
 
 fn daap_request_error(context: &str, error: reqwest::Error) -> BackendError {
@@ -601,6 +624,18 @@ mod tests {
 
     use super::*;
 
+    fn client(base_url: &str) -> DaapClient {
+        let base_url = Url::parse(base_url).expect("DAAP base URL");
+        DaapClient {
+            base_url: base_url.clone(),
+            session_id: 42,
+            revision: 2,
+            database_id: 1,
+            http: build_http_client(&base_url, None).expect("DAAP client"),
+            advertised_route: None,
+        }
+    }
+
     #[test]
     fn maps_response_body_deadline_to_timeout() {
         let error = daap_body_error(
@@ -629,6 +664,72 @@ mod tests {
             assert!(!rendered.contains("secret"));
             assert!(!rendered.contains(unsafe_url));
         }
+    }
+
+    #[test]
+    fn media_requests_preserve_root_and_reverse_proxy_base_paths_exactly() {
+        for (base, prefix) in [
+            ("http://music.test:3689", ""),
+            ("http://music.test:3689/share", "/share"),
+            ("http://music.test:3689/share/", "/share"),
+            ("http://music.test:3689/tenant%2Fmusic/", "/tenant%2Fmusic"),
+        ] {
+            let client = client(base);
+            let stream = client.stream_request(7, "flac").expect("stream request");
+            assert_eq!(
+                stream.endpoint().as_str(),
+                format!("http://music.test:3689{prefix}/databases/1/items/7.flac"),
+                "base URL: {base}"
+            );
+            assert_eq!(stream.required_headers(), daap_required_headers());
+
+            let artwork = client.cover_art_request(7).expect("artwork request");
+            assert_eq!(
+                artwork.endpoint().as_str(),
+                format!(
+                    "http://music.test:3689{prefix}/databases/1/items/7/extra_data/artwork?mw=300&mh=300"
+                ),
+                "base URL: {base}"
+            );
+            assert_eq!(artwork.required_headers(), daap_required_headers());
+
+            let malicious = client
+                .stream_request(7, "flac/../../logout")
+                .expect("untrusted format is one segment");
+            assert_eq!(
+                malicious.endpoint().as_str(),
+                format!(
+                    "http://music.test:3689{prefix}/databases/1/items/7.flac%2F..%2F..%2Flogout"
+                ),
+                "base URL: {base}"
+            );
+            assert!(!malicious.endpoint().as_str().contains("%252F"));
+        }
+    }
+
+    #[test]
+    fn required_header_map_has_the_exact_daap_protocol_identity() {
+        let headers = daap_required_headers();
+        assert_eq!(headers.len(), 4);
+        assert_eq!(
+            headers.get(ACCEPT),
+            Some(&HeaderValue::from_static("application/x-dmap-tagged"))
+        );
+        assert_eq!(
+            headers.get("client-daap-version"),
+            Some(&HeaderValue::from_static("3.12"))
+        );
+        assert_eq!(
+            headers.get("client-daap-access-index"),
+            Some(&HeaderValue::from_static("2"))
+        );
+        assert_eq!(
+            headers.get(USER_AGENT),
+            Some(
+                &HeaderValue::from_str(&format!("Tributary/{CLIENT_VERSION}"))
+                    .expect("valid user agent")
+            )
+        );
     }
 
     #[test]

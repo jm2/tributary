@@ -107,6 +107,20 @@ pub fn validate_base_url(url: &Url) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Append path segments to a validated hierarchical base URL.
+///
+/// Removing only a trailing empty segment makes `https://host`,
+/// `https://host/`, and a reverse-proxy prefix ending in `/` behave the same.
+/// Existing segments are left in place (and are therefore not decoded and
+/// re-encoded), while `url` applies the normal single-segment escaping rules
+/// to each appended value.
+pub fn append_base_path_segments<'a>(url: &mut Url, segments: impl IntoIterator<Item = &'a str>) {
+    url.path_segments_mut()
+        .expect("validated HTTP base URL supports path segments")
+        .pop_if_empty()
+        .extend(segments);
+}
+
 /// Parse and validate user/config supplied base-URL text before it is logged,
 /// persisted, or published as a source identity.
 ///
@@ -467,6 +481,33 @@ mod tests {
             assert_eq!(error, INVALID_BASE_URL);
             assert!(!error.contains("secret"));
             assert!(!error.contains(unsafe_text));
+        }
+    }
+
+    #[test]
+    fn appends_segments_without_losing_or_double_encoding_base_prefixes() {
+        for (base, expected) in [
+            (
+                "https://music.example.test",
+                "https://music.example.test/rest/ping.view",
+            ),
+            (
+                "https://music.example.test/share",
+                "https://music.example.test/share/rest/ping.view",
+            ),
+            (
+                "https://music.example.test/share/",
+                "https://music.example.test/share/rest/ping.view",
+            ),
+            (
+                "https://music.example.test/tenant%2Fmusic/",
+                "https://music.example.test/tenant%2Fmusic/rest/ping.view",
+            ),
+        ] {
+            let mut url = url(base);
+            append_base_path_segments(&mut url, ["rest", "ping.view"]);
+            assert_eq!(url.as_str(), expected, "base URL: {base}");
+            assert!(!url.as_str().contains("%252F"), "base URL: {base}");
         }
     }
 
