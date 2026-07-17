@@ -68,6 +68,13 @@ local integration boundary, invalid persisted `TrackId` fallback, and final P3.2
 record remain open. Static analysis passed in run 29607279056 and the complete exact-toolchain,
 coverage, audit, native, Flatpak, and package matrix passed in run 29607280861. The review window
 produced no code findings; Gemini posted only its service-sunset notice.
+The first documentation-head rerun, 29608292265, then exposed a pre-existing MPD worker-enqueue
+race: its release suite passed, but the debug suite observed terminal Shutdown already consumed and
+the wake receiver dropped between protected deque insertion and wake publication, so an accepted
+command spuriously reported `Disconnected`. PR #114 now keeps the same short-held mutex across the
+nonblocking `try_send`, preserving the GTK no-wait boundary while making insertion/wake publication
+one linearized operation. All 83 focused MPD tests pass in debug and release; final PR rerun is
+pending.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1088,7 +1095,11 @@ error that tells the user what to install.
   lifecycle or test barriers, then the oldest remaining transient is evicted if needed so the
   newest intent survives. Lifecycle commands advance the epoch and therefore cannot be crowded out.
   Stale wake tokens share one absolute receive deadline and cannot postpone authoritative polling;
-  receiver loss clears pending work and fails the current operation closed.
+  receiver loss clears pending work and fails the current operation closed. PR #114's CI follow-up
+  keeps the deque lock through the capacity-one channel's nonblocking wake publication. This closes
+  the terminal race in which the worker could consume Shutdown and drop its receiver after insertion
+  but before `try_send`, causing an accepted command to report `Disconnected`; it adds no blocking
+  operation or checklist credit.
 - [x] Eliminate the shared-partition race between ownership revalidation and MPD's global pause or
   stop commands, and the unguarded global side effects of load-time option resets, or require a
   detectable exclusive-control configuration. Accepted in PR #112:
@@ -1517,7 +1528,10 @@ metadata, representative coverage, Linux x86_64/aarch64, Flatpak, macOS aarch64,
 x86_64/aarch64, package creation, and SHA256 checksums. The review window produced no actionable
 code comments; Gemini posted only its service-sunset notice. The four local backend regressions
 exercise only SQLite and do not claim the still-unused production `LocalBackend` integration
-boundary.
+boundary. Documentation-head run 29608292265 passed release tests and every completed sibling but
+failed the debug Linux suite on the MPD terminal enqueue/wake race documented above. After the
+linearization fix, the failing regression and all 83 MPD tests pass in both debug and release;
+formatting and whitespace checks pass. A complete replacement PR matrix remains pending.
 
 Previous local branch validation (2026-07-17, P3.5 representative-coverage slice before CI):
 `cargo fmt --all -- --check`, strict all-target/all-feature Clippy in debug and release, and
@@ -2306,4 +2320,4 @@ Add one line per completed task:
 | 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
 | 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Native x86_64 and ARM64 CI both prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
 | 2026-07-17 | P3.1 source identity/lifecycle architecture | PR #113 | Records location-independent `(SourceId, TrackId)` media identity, an exact legacy-array-to-versioned-envelope saved-source migration with atomic replacement and fail-closed conflict quarantine, one registry-owned operation/session lifecycle, deterministic per-view radio locator ownership, playback-time locator resolution, exactly-once DAAP retirement, adapter-specific rules for every source kind, and staged completion tests. This closes only the two architecture decision boxes; runtime migration remains open. Independent review found and resolved two design ambiguities before the full exact-toolchain/native/package matrix passed in runs 29605029668 and 29605032344. |
-| 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the complete exact-toolchain/native/package PR matrix passed. The common `LocalBackend` integration seam, invalid persisted `TrackId` fallback, and final P3.2 record remain open. |
+| 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the implementation-head exact-toolchain/native/package matrix passed. A documentation rerun exposed and fixed a pre-existing terminal MPD enqueue/wake race; its replacement matrix remains pending. The common `LocalBackend` integration seam, invalid persisted `TrackId` fallback, and final P3.2 record remain open. |
