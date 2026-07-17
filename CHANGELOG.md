@@ -46,6 +46,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Credential-bearing media tickets now expire** — Every upstream proxy ticket has a hard, absolute, non-sliding 24-hour lifetime from registration in addition to earlier playback-lifecycle revocation. It is usable only before its monotonic deadline; a lookup at or after that boundary atomically removes it and returns the same 404 as an unknown or revoked route. GET and byte-range requests, pause, seek, and receiver status do not renew the deadline, so a compromised receiver cannot perpetuate the bearer. A response admitted before expiry may finish afterward, but every later lookup fails. Local-file routes retain their existing server-lifetime behavior because they front no backend credential.
 
 ### Changed
+- **Playback queues and output selection now share tested lifecycle boundaries** — Starting from
+  the track list captures its current sorted/filtered `ListModel` projection exactly once. Initial
+  direct playback, Next, Previous, EOS replay, and a retry after synchronous refusal now all hand the
+  session's current immutable item to the active output under a fresh event generation, while Stop
+  invalidates that ownership before it invokes the backend. Sorting, filtering, or navigating the
+  visible projection therefore cannot retarget the playing identity or make a stale output event
+  current. Output changes use one validated transaction: selecting the exact active endpoint is a
+  complete no-op; a real change clears generation ownership before stopping the displaced output,
+  parks and later restores the exact Local instance, and stops/drops replaced remote outputs. A
+  wrong-type replacement or inconsistent parking state leaves the current target, queue, and
+  output unchanged. The old switch path constructed a throwaway MPD worker solely to move Local
+  into its parked slot; that worker is no longer created. Headless recording-output regressions
+  exercise reorder/filter/source-navigation, B→C→B queue identity, stale events, rejected remote
+  load retry, Local→MPD→Chromecast→Local replacement/restoration, invalid replacement, Stop/drop
+  cleanup, and exact reselection through the production seams. Together with the accessibility,
+  Cast-frame, recycled-row, artwork, and source-generation harnesses, this completes all P3.4
+  integration items; the final rebased branch passes 797 tests in each profile plus strict Clippy
+  in debug and release.
 - **Local and remote track catalogues now share the backend abstraction** — `MediaBackend` now
   exposes one complete-track catalogue operation, and the only production publication adapter
   accepts `&dyn MediaBackend`. Scanner snapshots construct `LocalBackend` instead of querying the
