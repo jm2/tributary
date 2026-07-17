@@ -1,15 +1,19 @@
 //! `SourceObject` — GObject wrapper for sidebar media sources.
 //!
-//! Supports three kinds of row:
+//! Supports the sidebar's distinct row kinds:
 //! * **Header** — non-selectable category label (`is_header = true`)
 //! * **Discovered** — unauthenticated remote server (`server_url` set, `connected = false`)
 //! * **Connected** — active backend (`connected = true`)
 //! * **Local** — the local filesystem source (no `server_url`)
+//! * **Removable device** — logical source identity plus an owned native mount path
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 
 use gtk::glib;
 use gtk::subclass::prelude::*;
+
+use crate::architecture::AdvertisedHttpRoute;
 
 mod imp {
     use super::*;
@@ -22,6 +26,17 @@ mod imp {
         pub is_header: Cell<bool>,
         /// Base URL for remote servers (e.g. `https://music.example.com`).
         pub server_url: RefCell<String>,
+        /// Ephemeral address route supplied by network discovery. This is
+        /// deliberately separate from the persisted URL and logical source
+        /// key; a connection generation snapshots it when authentication
+        /// begins.
+        pub(super) advertised_route: RefCell<Option<AdvertisedHttpRoute>>,
+        /// Logical identity kept separate from location for sources such as a
+        /// removable filesystem remounted at a different path.
+        pub source_key: RefCell<String>,
+        /// Native mount path for a removable device. Kept as a `PathBuf` so
+        /// non-UTF-8 paths are never corrupted by a lossy string conversion.
+        pub device_mount_point: RefCell<Option<PathBuf>>,
         /// Whether this remote source has been authenticated and connected.
         pub connected: Cell<bool>,
         /// Whether an authentication attempt is in progress.
@@ -92,6 +107,31 @@ impl SourceObject {
         obj
     }
 
+    /// Create the non-selectable heading for removable-device rows.
+    pub fn device_header(name: &str) -> Self {
+        let obj = Self::header(name);
+        obj.imp()
+            .backend_type
+            .replace("usb-device-header".to_string());
+        obj
+    }
+
+    /// Create one mounted removable-device source.
+    pub fn removable_device(name: &str, source_key: &str, mount_point: PathBuf) -> Self {
+        let obj: Self = glib::Object::builder().build();
+        obj.imp().name.replace(name.to_string());
+        obj.imp().backend_type.replace("usb-device".to_string());
+        obj.imp()
+            .icon_name
+            .replace("drive-removable-media-symbolic".to_string());
+        obj.imp().source_key.replace(source_key.to_string());
+        obj.imp().device_mount_point.replace(Some(mount_point));
+        obj.imp().is_header.set(false);
+        obj.imp().connected.set(true);
+        obj.imp().requires_password.set(false);
+        obj
+    }
+
     // ── Getters ─────────────────────────────────────────────────────
 
     pub fn name(&self) -> String {
@@ -109,6 +149,15 @@ impl SourceObject {
     pub fn server_url(&self) -> String {
         self.imp().server_url.borrow().clone()
     }
+    pub(crate) fn advertised_route(&self) -> Option<AdvertisedHttpRoute> {
+        self.imp().advertised_route.borrow().clone()
+    }
+    pub fn source_key(&self) -> String {
+        self.imp().source_key.borrow().clone()
+    }
+    pub fn device_mount_point(&self) -> Option<PathBuf> {
+        self.imp().device_mount_point.borrow().clone()
+    }
     pub fn connected(&self) -> bool {
         self.imp().connected.get()
     }
@@ -121,6 +170,10 @@ impl SourceObject {
 
     pub fn set_icon_name(&self, name: &str) {
         self.imp().icon_name.replace(name.to_string());
+    }
+
+    pub(crate) fn set_advertised_route(&self, route: Option<AdvertisedHttpRoute>) {
+        self.imp().advertised_route.replace(route);
     }
 
     pub fn connecting(&self) -> bool {
@@ -182,5 +235,93 @@ impl SourceObject {
         let obj = Self::discovered(name, backend_type, server_url);
         obj.imp().manually_added.set(true);
         obj
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+
+    use super::SourceObject;
+    use crate::architecture::AdvertisedHttpRoute;
+
+    #[test]
+    fn discovered_route_is_ephemeral_and_does_not_change_source_identity() {
+        let source =
+            SourceObject::discovered("Living Room", "subsonic", "http://mini-2.local:4533");
+        let origin = url::Url::parse("http://mini-2.local:4533").expect("origin");
+        let route = AdvertisedHttpRoute::new(
+            &origin,
+            ["192.0.2.44:4533".parse::<SocketAddr>().expect("address")],
+        )
+        .expect("advertised route");
+
+        assert_eq!(source.advertised_route(), None);
+        source.set_advertised_route(Some(route.clone()));
+        assert_eq!(source.advertised_route(), Some(route));
+        assert_eq!(source.name(), "Living Room");
+        assert_eq!(source.server_url(), "http://mini-2.local:4533");
+        assert!(source.source_key().is_empty());
+        assert!(!source.manually_added());
+        assert!(!source.connected());
+
+        source.set_advertised_route(None);
+        assert_eq!(source.advertised_route(), None);
+        assert_eq!(source.name(), "Living Room");
+        assert_eq!(source.server_url(), "http://mini-2.local:4533");
+    }
+
+    #[test]
+    fn removable_device_preserves_identity_and_mount_path() {
+        let mount_point = PathBuf::from("/media/listener/MIXTAPE");
+        let source = SourceObject::removable_device(
+            "MIXTAPE",
+            "device:uuid:01234567-89ab-cdef-0123-456789abcdef",
+            mount_point.clone(),
+        );
+
+        assert_eq!(source.name(), "MIXTAPE");
+        assert_eq!(source.backend_type(), "usb-device");
+        assert_eq!(source.icon_name(), "drive-removable-media-symbolic");
+        assert!(!source.is_header());
+        assert!(source.connected());
+        assert!(!source.connecting());
+        assert!(!source.requires_password());
+        assert_eq!(
+            source.source_key(),
+            "device:uuid:01234567-89ab-cdef-0123-456789abcdef"
+        );
+        assert_eq!(source.device_mount_point(), Some(mount_point));
+        assert!(source.server_url().is_empty());
+    }
+
+    #[test]
+    fn device_header_is_explicitly_namespaced_and_non_selectable() {
+        let header = SourceObject::device_header("Devices");
+
+        assert_eq!(header.name(), "Devices");
+        assert_eq!(header.backend_type(), "usb-device-header");
+        assert!(header.is_header());
+        assert!(header.source_key().is_empty());
+        assert_eq!(header.device_mount_point(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removable_device_preserves_a_non_utf8_mount_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mount_point = PathBuf::from(OsString::from_vec(
+            b"/media/listener/non-utf8-\xff".to_vec(),
+        ));
+        let source = SourceObject::removable_device(
+            "Non-UTF-8 device",
+            "device:root:file:///media/listener/non-utf8",
+            mount_point.clone(),
+        );
+
+        assert_eq!(source.device_mount_point(), Some(mount_point));
     }
 }

@@ -18,9 +18,11 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
-    authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
+    apply_advertised_http_route, authenticated_client_builder, redact_url_secrets,
+    strip_request_url, validate_base_url,
 };
 
 use super::dmap::{self, DmapNode, DmapValue};
@@ -45,7 +47,7 @@ const MAX_ITEMS_BODY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// End-to-end and body-phase deadlines for finite DAAP requests.
 const CONTROL_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
-const ITEMS_RESPONSE_DEADLINE: Duration = Duration::from_secs(120);
+const ITEMS_RESPONSE_DEADLINE: Duration = Duration::from_mins(2);
 const PROBE_RESPONSE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Client version advertised to the DAAP server.
@@ -71,6 +73,7 @@ pub struct DaapClient {
     revision: u32,
     database_id: u32,
     http: Client,
+    advertised_route: Option<AdvertisedHttpRoute>,
 }
 
 impl DaapClient {
@@ -80,6 +83,17 @@ impl DaapClient {
     /// * `server_url` — Base URL (e.g. `http://192.168.1.50:3689`)
     /// * `password` — Optional share password (DAAP uses password-only auth)
     pub async fn connect(server_url: &str, password: Option<&str>) -> BackendResult<Self> {
+        Self::connect_with_route(server_url, password, None).await
+    }
+
+    /// Connect while preserving an mDNS-advertised direct route for this
+    /// exact DAAP origin. The URL hostname remains authoritative for HTTP and
+    /// TLS; only direct socket resolution uses the retained addresses.
+    pub(crate) async fn connect_with_route(
+        server_url: &str,
+        password: Option<&str>,
+        advertised_route: Option<AdvertisedHttpRoute>,
+    ) -> BackendResult<Self> {
         let base_url = Url::parse(server_url).map_err(|e| BackendError::ConnectionFailed {
             message: format!("Invalid DAAP server URL: {e}"),
             source: Some(Box::new(e)),
@@ -89,7 +103,7 @@ impl DaapClient {
             source: None,
         })?;
 
-        let http = build_http_client()?;
+        let http = build_http_client(&base_url, advertised_route.as_ref())?;
 
         // ── Step A: Server Info ─────────────────────────────────────
         let server_info_url = format!("{}/server-info", base_url.as_str().trim_end_matches('/'));
@@ -266,6 +280,7 @@ impl DaapClient {
             revision,
             database_id,
             http,
+            advertised_route,
         })
     }
 
@@ -350,39 +365,59 @@ impl DaapClient {
         Ok(())
     }
 
-    /// Construct a cover art URL for a track.
+    /// Construct a credential-isolated cover-art request for a track.
     ///
     /// DAAP serves artwork at `/databases/{db}/items/{id}/extra_data/artwork`.
-    /// The session-id is included as a query parameter.  `mw` and `mh`
-    /// request a maximum width/height so the server can down-scale.
-    pub fn cover_art_url(&self, song_id: u32) -> Url {
-        let path = format!(
-            "/databases/{}/items/{}/extra_data/artwork",
-            self.database_id, song_id
-        );
-        let mut url = self.base_url.clone();
-        url.set_path(&path);
-        url.query_pairs_mut()
-            .append_pair("session-id", &self.session_id.to_string())
+    /// `mw` and `mh` remain public request-shaping fields. The bearer
+    /// `session-id` stays isolated until Tributary performs the request.
+    pub(crate) fn cover_art_request(&self, song_id: u32) -> BackendResult<ResolvedHttpRequest> {
+        let mut endpoint = self.base_url.clone();
+        endpoint
+            .path_segments_mut()
+            .expect("validated DAAP base URL supports path segments")
+            .clear()
+            .push("databases")
+            .push(&self.database_id.to_string())
+            .push("items")
+            .push(&song_id.to_string())
+            .push("extra_data")
+            .push("artwork");
+        endpoint
+            .query_pairs_mut()
             .append_pair("mw", "300")
             .append_pair("mh", "300");
-        url
+        self.resolved_media_request(endpoint)
     }
 
-    /// Construct a streaming URL for a track.
+    /// Construct a credential-isolated streaming request for a track.
     ///
-    /// The URL includes the session-id as a query parameter so
-    /// GStreamer's `playbin3` can fetch audio without custom headers.
-    pub fn stream_url(&self, song_id: u32, format: &str) -> Url {
-        let path = format!(
-            "/databases/{}/items/{}.{}",
-            self.database_id, song_id, format
-        );
-        let mut url = self.base_url.clone();
-        url.set_path(&path);
-        url.query_pairs_mut()
-            .append_pair("session-id", &self.session_id.to_string());
-        url
+    /// The untrusted format is encoded as part of one path segment, and the
+    /// bearer `session-id` stays isolated until the app-owned fetch boundary.
+    pub(crate) fn stream_request(
+        &self,
+        song_id: u32,
+        format: &str,
+    ) -> BackendResult<ResolvedHttpRequest> {
+        let mut endpoint = self.base_url.clone();
+        let item = format!("{song_id}.{format}");
+        endpoint
+            .path_segments_mut()
+            .expect("validated DAAP base URL supports path segments")
+            .clear()
+            .push("databases")
+            .push(&self.database_id.to_string())
+            .push("items")
+            .push(&item);
+        self.resolved_media_request(endpoint)
+    }
+
+    fn resolved_media_request(&self, endpoint: Url) -> BackendResult<ResolvedHttpRequest> {
+        let mut request = ResolvedHttpRequest::new(endpoint)?
+            .with_private_query_pair("session-id", self.session_id.to_string())?;
+        if let Some(route) = &self.advertised_route {
+            request = request.with_advertised_route(route.clone())?;
+        }
+        Ok(request)
     }
 
     /// Send a best-effort logout request to end the DAAP session.
@@ -414,9 +449,17 @@ impl DaapClient {
     /// Returns `Some(false)` for open shares (msau == 0 or absent),
     /// `Some(true)` for password-protected shares, or `None` on error.
     pub async fn probe_requires_password(server_url: &str) -> Option<bool> {
-        let http = build_http_client().ok()?;
+        Self::probe_requires_password_with_route(server_url, None).await
+    }
+
+    /// Probe through the exact mDNS-advertised route, when one is available.
+    pub(crate) async fn probe_requires_password_with_route(
+        server_url: &str,
+        advertised_route: Option<AdvertisedHttpRoute>,
+    ) -> Option<bool> {
         let base_url = Url::parse(server_url).ok()?;
         validate_base_url(&base_url).ok()?;
+        let http = build_http_client(&base_url, advertised_route.as_ref()).ok()?;
         let url = format!("{}/server-info", base_url.as_str().trim_end_matches('/'));
         // Cap the probe at 5s — a malicious or hung DAAP server should
         // not be able to stall the discovery flow forever. The shared
@@ -469,7 +512,10 @@ impl DaapClient {
 // ── Internal helpers ────────────────────────────────────────────────────
 
 /// Build a `reqwest::Client` with DAAP-required default headers.
-fn build_http_client() -> BackendResult<Client> {
+fn build_http_client(
+    origin: &Url,
+    advertised_route: Option<&AdvertisedHttpRoute>,
+) -> BackendResult<Client> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static(DMAP_CONTENT_TYPE));
     headers.insert(
@@ -478,11 +524,16 @@ fn build_http_client() -> BackendResult<Client> {
     );
     headers.insert("Client-DAAP-Access-Index", HeaderValue::from_static("2"));
 
-    authenticated_client_builder()
+    let builder = authenticated_client_builder()
         .user_agent(format!("{CLIENT_NAME}/{CLIENT_VERSION}"))
         .default_headers(headers)
         .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_TIMEOUT)
+        .read_timeout(READ_TIMEOUT);
+    apply_advertised_http_route(builder, origin, advertised_route)
+        .map_err(|message| BackendError::ConnectionFailed {
+            message: message.to_string(),
+            source: None,
+        })?
         .build()
         .map_err(|error| daap_request_error("Failed to build DAAP HTTP client", error))
 }
@@ -546,6 +597,8 @@ fn unwrap_nested_container<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
     use super::*;
 
     #[test]
@@ -576,5 +629,48 @@ mod tests {
             assert!(!rendered.contains("secret"));
             assert!(!rendered.contains(unsafe_url));
         }
+    }
+
+    #[test]
+    fn media_requests_keep_session_id_private_and_preserve_advertised_hostname() {
+        let base_url = Url::parse("http://mini.local:3689").expect("DAAP origin");
+        let route = AdvertisedHttpRoute::new(
+            &base_url,
+            [SocketAddr::from((Ipv4Addr::new(192, 0, 2, 40), 9999))],
+        )
+        .expect("advertised route");
+        let client = DaapClient {
+            base_url: base_url.clone(),
+            session_id: 42,
+            revision: 2,
+            database_id: 1,
+            http: build_http_client(&base_url, Some(&route)).expect("routed client"),
+            advertised_route: Some(route.clone()),
+        };
+
+        let stream = client
+            .stream_request(7, "flac/../../logout")
+            .expect("stream request");
+        assert_eq!(stream.endpoint().host_str(), Some("mini.local"));
+        assert_eq!(stream.endpoint().port(), Some(3689));
+        assert!(stream.endpoint().query().is_none());
+        assert!(!stream.endpoint().path().contains("/logout"));
+        assert_eq!(stream.advertised_route(), Some(&route));
+        assert_eq!(
+            stream.private_query_pairs(),
+            &[("session-id".to_string(), "42".to_string())]
+        );
+
+        let artwork = client.cover_art_request(7).expect("artwork request");
+        assert_eq!(artwork.endpoint().host_str(), Some("mini.local"));
+        assert_eq!(
+            artwork.endpoint().query_pairs().collect::<Vec<_>>(),
+            [("mw".into(), "300".into()), ("mh".into(), "300".into())]
+        );
+        assert_eq!(artwork.advertised_route(), Some(&route));
+        assert_eq!(
+            artwork.private_query_pairs(),
+            &[("session-id".to_string(), "42".to_string())]
+        );
     }
 }

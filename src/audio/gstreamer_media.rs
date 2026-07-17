@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use url::{Host, Url};
 
-use super::cast_http_server::CastHttpServer;
+use super::cast_http_server::{CastHttpServer, UpstreamMediaClient};
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::http_security::{classify_media_uri, MediaUriSecurity};
 
@@ -77,16 +77,24 @@ struct PreparationGeneration;
 /// Stateful last-mile resolver shared by local and AirPlay outputs.
 pub(super) struct GstreamerMediaProxy {
     state: Mutex<ProxyState>,
+    /// Credential-free HTTP transport shared by every per-load ticket server
+    /// owned by this output. Credentials remain request-scoped while the
+    /// origin connection pool survives track changes.
+    upstream: Option<UpstreamMediaClient>,
 }
 
 impl GstreamerMediaProxy {
     pub(super) fn new(runtime: Option<tokio::runtime::Handle>) -> Self {
+        let upstream = UpstreamMediaClient::new().map_err(|_| {
+            tracing::error!("Failed to build protected media transport");
+        });
         Self {
             state: Mutex::new(ProxyState {
                 runtime,
                 active: None,
                 generation: Arc::new(PreparationGeneration),
             }),
+            upstream: upstream.ok(),
         }
     }
 
@@ -108,11 +116,13 @@ impl GstreamerMediaProxy {
     /// runtime state, bind/client failure, or an invalid generated ticket all
     /// fail closed with the same URL-free category.
     pub(super) fn prepare(&self, raw_uri: &str) -> Result<PreparedGstreamerMedia, &'static str> {
-        self.prepare_with_server_start(raw_uri, |runtime| {
-            runtime.block_on(CastHttpServer::start_on(SocketAddr::from((
-                Ipv4Addr::LOCALHOST,
-                0,
-            ))))
+        let upstream = self.upstream.clone();
+        self.prepare_with_server_start(raw_uri, move |runtime| {
+            let upstream = upstream.ok_or_else(|| anyhow::anyhow!(MEDIA_PREPARATION_FAILED))?;
+            runtime.block_on(CastHttpServer::start_on_with_upstream_client(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                upstream,
+            ))
         })
     }
 
@@ -126,11 +136,13 @@ impl GstreamerMediaProxy {
         &self,
         request: ResolvedHttpRequest,
     ) -> Result<PreparedGstreamerMedia, &'static str> {
-        self.prepare_resolved_with_server_start(request, |runtime| {
-            runtime.block_on(CastHttpServer::start_on(SocketAddr::from((
-                Ipv4Addr::LOCALHOST,
-                0,
-            ))))
+        let upstream = self.upstream.clone();
+        self.prepare_resolved_with_server_start(request, move |runtime| {
+            let upstream = upstream.ok_or_else(|| anyhow::anyhow!(MEDIA_PREPARATION_FAILED))?;
+            runtime.block_on(CastHttpServer::start_on_with_upstream_client(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                upstream,
+            ))
         })
     }
 

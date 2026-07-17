@@ -13,6 +13,7 @@ use tracing::info;
 use super::browser;
 use super::objects::TrackObject;
 use super::preferences;
+use super::source_navigation::{SourceNavigation, SourceRequest};
 
 /// Columns to show when viewing radio stations.
 const RADIO_VISIBLE_COLUMNS: &[&str] = &["Title", "Artist", "Album", "Genre", "Bitrate", "Format"];
@@ -106,6 +107,8 @@ pub fn handle_radio_nearme(
     status_label: gtk::Label,
     column_view: gtk::ColumnView,
     active_source_key: Rc<RefCell<String>>,
+    source_navigation: Rc<RefCell<SourceNavigation>>,
+    request: SourceRequest,
     sidebar_selection: gtk::SingleSelection,
     source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
 ) {
@@ -123,11 +126,15 @@ pub fn handle_radio_nearme(
                 status_label,
                 column_view,
                 active_source_key,
+                source_navigation,
+                request,
+                source_tracks,
             );
         }
         Some(false) => {
             // Previously declined — switch back to local.
             info!("Location declined previously, switching to local");
+            source_navigation.borrow_mut().select("local");
             *active_source_key.borrow_mut() = "local".to_string();
             sidebar_selection.set_selected(1);
 
@@ -177,6 +184,8 @@ pub fn handle_radio_nearme(
             let status_label = status_label.clone();
             let column_view = column_view.clone();
             let active_source_key = active_source_key.clone();
+            let source_navigation = source_navigation.clone();
+            let request = request.clone();
             let sidebar_selection = sidebar_selection.clone();
             let source_tracks = source_tracks.clone();
 
@@ -190,6 +199,14 @@ pub fn handle_radio_nearme(
                     }
                     info!("Location enabled by user");
 
+                    if !source_navigation.borrow().is_current(&request) {
+                        tracing::debug!(
+                            generation = request.generation(),
+                            "Ignoring stale Near Me consent response"
+                        );
+                        return;
+                    }
+
                     fetch_and_display_nearme(
                         rt_handle.clone(),
                         track_store.clone(),
@@ -199,6 +216,9 @@ pub fn handle_radio_nearme(
                         status_label.clone(),
                         column_view.clone(),
                         active_source_key.clone(),
+                        source_navigation.clone(),
+                        request.clone(),
+                        source_tracks.clone(),
                     );
                 } else {
                     // Save decline.
@@ -209,6 +229,15 @@ pub fn handle_radio_nearme(
                     }
                     info!("Location declined by user, switching to local");
 
+                    if !source_navigation.borrow().is_current(&request) {
+                        tracing::debug!(
+                            generation = request.generation(),
+                            "Stale Near Me decline saved without changing navigation"
+                        );
+                        return;
+                    }
+
+                    source_navigation.borrow_mut().select("local");
                     *active_source_key.borrow_mut() = "local".to_string();
                     sidebar_selection.set_selected(1);
 
@@ -258,6 +287,9 @@ fn fetch_and_display_nearme(
     status_label: gtk::Label,
     column_view: gtk::ColumnView,
     active_source_key: Rc<RefCell<String>>,
+    source_navigation: Rc<RefCell<SourceNavigation>>,
+    request: SourceRequest,
+    source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
 ) {
     let (stations_tx, stations_rx) = async_channel::bounded::<String>(1);
 
@@ -341,26 +373,27 @@ fn fetch_and_display_nearme(
 
     glib::MainContext::default().spawn_local(async move {
         if let Ok(json) = stations_rx.recv().await {
-            // Geolocation plus three Radio-Browser tiers takes seconds. If the
-            // user gave up and picked another source in the meantime, this
-            // result is stale: rendering it would replace their library view
-            // with radio stations while the sidebar still highlights Local.
-            if *active_source_key.borrow() != NEARME_SOURCE_KEY {
-                return;
-            }
             let stations: Vec<crate::radio::RadioStation> =
                 serde_json::from_str(&json).unwrap_or_default();
             let objects: Vec<TrackObject> =
                 stations.iter().map(radio_station_to_track_object).collect();
-            super::window::display_tracks(
+            if super::source_connect::cache_source_completion(
+                &source_navigation,
+                &request,
+                &source_tracks,
                 &objects,
-                &track_store,
-                &master_tracks,
-                &browser_widget,
-                &browser_state,
-                &status_label,
-                &column_view,
-            );
+                &active_source_key,
+            ) {
+                super::window::display_tracks(
+                    &objects,
+                    &track_store,
+                    &master_tracks,
+                    &browser_widget,
+                    &browser_state,
+                    &status_label,
+                    &column_view,
+                );
+            }
         }
     });
 }

@@ -456,15 +456,14 @@ pub fn show_add_server_dialog(
                     "Ignoring superseded manual remote connection failure"
                 ),
                 Err((e, true)) => {
+                    let category = super::source_connect::remote_failure_category(&e);
                     tracing::error!(
                         backend = %backend_type,
-                        error = %e,
-                        "Manual server auth failed"
+                        category = category.as_str(),
+                        "Manual remote source failed"
                     );
                     let _ = engine_tx
-                        .send(LibraryEvent::Error(format!(
-                            "{backend_type} auth failed: {e}"
-                        )))
+                        .send(LibraryEvent::Error(category.user_message(&backend_type)))
                         .await;
                     let _ = fail_tx.send(()).await;
                 }

@@ -11,14 +11,25 @@
 //! All discovered servers are streamed to the GTK main thread via a
 //! single [`async_channel`] carrying [`DiscoveryEvent`] messages.
 
-use std::collections::{HashMap, HashSet};
-use std::net::UdpSocket;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
+use crate::architecture::AdvertisedHttpRoute;
+
+/// Bound unauthenticated mDNS state and per-event aggregation work.
+///
+/// These limits are intentionally far above a plausible home network while
+/// preventing a service-announcement flood from growing memory without bound
+/// or turning repeated origin aggregation into quadratic work.
+const MAX_MDNS_PUBLICATIONS: usize = 512;
+const MAX_MDNS_INSTANCES_PER_ORIGIN: usize = 32;
+const MAX_MDNS_ADDRESSES_PER_ROUTE: usize = 16;
+
 /// A server found via network discovery.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DiscoveredServer {
     /// Human-readable display name from the discovery response.
     pub name: String,
@@ -30,10 +41,15 @@ pub struct DiscoveredServer {
     /// `Some(true)` = password required, `Some(false)` = open,
     /// `None` = unknown (probe not yet completed or not applicable).
     pub requires_password: Option<bool>,
+    /// Ephemeral direct-connection route advertised with this service.
+    ///
+    /// The URL remains hostname-based so HTTP `Host` and TLS identity are
+    /// unchanged. This route is never persisted or used as source identity.
+    pub(crate) advertised_route: Option<AdvertisedHttpRoute>,
 }
 
 /// Events sent from the discovery background threads to the GTK main thread.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DiscoveryEvent {
     /// A new server was found on the network.
     Found(DiscoveredServer),
@@ -44,6 +60,196 @@ pub enum DiscoveryEvent {
         /// The backend type (`"subsonic"`, `"jellyfin"`, `"plex"`, `"daap"`).
         service_type: String,
     },
+}
+
+/// Exact identity of one mDNS service publication.
+///
+/// A service instance name and its SRV hostname are separate DNS names. The
+/// exact fullname is therefore the only sound key for matching a later
+/// `ServiceRemoved` event; substring-matching the hostname can remove an
+/// unrelated service.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct ServiceInstanceKey {
+    service_type: String,
+    fullname: String,
+}
+
+impl ServiceInstanceKey {
+    fn new(service_type: &str, fullname: &str) -> Self {
+        Self {
+            service_type: service_type.to_string(),
+            fullname: fullname.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct PublishedOrigin {
+    service_type: String,
+    url: String,
+}
+
+impl PublishedOrigin {
+    fn of(server: &DiscoveredServer) -> Self {
+        Self {
+            service_type: server.service_type.clone(),
+            url: server.url.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MdnsPublication {
+    server: DiscoveredServer,
+    advertised_addresses: Vec<SocketAddr>,
+}
+
+/// Live mDNS publications keyed by exact service identity.
+///
+/// Several service instances may legitimately publish the same HTTP origin.
+/// The UI still owns one URL-keyed source row, so this state aggregates their
+/// addresses and emits `Lost` only after the final retained matching instance
+/// leaves. Retention limits are documented below.
+#[derive(Default)]
+struct MdnsPublications {
+    by_instance: HashMap<ServiceInstanceKey, MdnsPublication>,
+    by_origin: HashMap<PublishedOrigin, BTreeSet<ServiceInstanceKey>>,
+}
+
+impl MdnsPublications {
+    #[cfg(target_os = "macos")]
+    fn is_empty(&self) -> bool {
+        self.by_instance.is_empty()
+    }
+
+    fn upsert(
+        &mut self,
+        key: ServiceInstanceKey,
+        publication: MdnsPublication,
+    ) -> Vec<DiscoveryEvent> {
+        let mut affected = BTreeSet::new();
+        if let Some(previous) = self.by_instance.get(&key) {
+            affected.insert(PublishedOrigin::of(&previous.server));
+        }
+        let new_origin = PublishedOrigin::of(&publication.server);
+        affected.insert(new_origin.clone());
+
+        let before = self.snapshot(&affected);
+
+        // Remove an earlier version before applying the caps. Updating an
+        // existing instance is always admitted at the same origin because its
+        // removal frees exactly one slot. If an instance moves into an already
+        // saturated origin, its old publication is still retired rather than
+        // retained under an address it no longer advertises.
+        if let Some(previous) = self.by_instance.remove(&key) {
+            self.remove_origin_index(&PublishedOrigin::of(&previous.server), &key);
+        }
+        let origin_len = self.by_origin.get(&new_origin).map_or(0, BTreeSet::len);
+        if self.by_instance.len() < MAX_MDNS_PUBLICATIONS
+            && origin_len < MAX_MDNS_INSTANCES_PER_ORIGIN
+        {
+            self.by_origin
+                .entry(new_origin)
+                .or_default()
+                .insert(key.clone());
+            self.by_instance.insert(key, publication);
+        }
+
+        let after = self.snapshot(&affected);
+        Self::changes(affected, &before, &after)
+    }
+
+    fn contains(&self, key: &ServiceInstanceKey) -> bool {
+        self.by_instance.contains_key(key)
+    }
+
+    fn remove(&mut self, key: &ServiceInstanceKey) -> Vec<DiscoveryEvent> {
+        let Some(publication) = self.by_instance.get(key) else {
+            return Vec::new();
+        };
+        let affected = BTreeSet::from([PublishedOrigin::of(&publication.server)]);
+        let before = self.snapshot(&affected);
+        let publication = self
+            .by_instance
+            .remove(key)
+            .expect("publication existence checked above");
+        self.remove_origin_index(&PublishedOrigin::of(&publication.server), key);
+        let after = self.snapshot(&affected);
+        Self::changes(affected, &before, &after)
+    }
+
+    fn remove_origin_index(&mut self, origin: &PublishedOrigin, key: &ServiceInstanceKey) {
+        let remove_origin = self.by_origin.get_mut(origin).is_some_and(|instances| {
+            instances.remove(key);
+            instances.is_empty()
+        });
+        if remove_origin {
+            self.by_origin.remove(origin);
+        }
+    }
+
+    fn snapshot(
+        &self,
+        origins: &BTreeSet<PublishedOrigin>,
+    ) -> HashMap<PublishedOrigin, DiscoveredServer> {
+        origins
+            .iter()
+            .filter_map(|origin| {
+                self.aggregate(origin)
+                    .map(|server| (origin.clone(), server))
+            })
+            .collect()
+    }
+
+    fn aggregate(&self, origin: &PublishedOrigin) -> Option<DiscoveredServer> {
+        let instances = self.by_origin.get(origin)?;
+        let representative = self.by_instance.get(instances.first()?)?;
+        let mut server = representative.server.clone();
+        let mut addresses = BTreeSet::new();
+        for key in instances {
+            let Some(publication) = self.by_instance.get(key) else {
+                continue;
+            };
+            for address in &publication.advertised_addresses {
+                addresses.insert(*address);
+                if addresses.len() > MAX_MDNS_ADDRESSES_PER_ROUTE {
+                    addresses.pop_last();
+                }
+            }
+        }
+        server.advertised_route = advertised_http_route(&server.url, addresses);
+        Some(server)
+    }
+
+    fn changes(
+        origins: BTreeSet<PublishedOrigin>,
+        before: &HashMap<PublishedOrigin, DiscoveredServer>,
+        after: &HashMap<PublishedOrigin, DiscoveredServer>,
+    ) -> Vec<DiscoveryEvent> {
+        let mut events = Vec::new();
+
+        // Retire an old URL before publishing a replacement so GTK cannot
+        // momentarily retain two owners for one exact service instance.
+        for origin in &origins {
+            if before.contains_key(origin) && !after.contains_key(origin) {
+                events.push(DiscoveryEvent::Lost {
+                    url: origin.url.clone(),
+                    service_type: origin.service_type.clone(),
+                });
+            }
+        }
+
+        for origin in origins {
+            let Some(current) = after.get(&origin) else {
+                continue;
+            };
+            if before.get(&origin) != Some(current) {
+                events.push(DiscoveryEvent::Found(current.clone()));
+            }
+        }
+
+        events
+    }
 }
 
 /// mDNS service types we browse for.
@@ -64,7 +270,7 @@ const JELLYFIN_DISCOVERY_PORT: u16 = 7359;
 const JELLYFIN_DISCOVERY_MSG: &[u8] = b"Who is JellyfinServer?";
 
 /// Jellyfin UDP re-broadcast interval.
-const JELLYFIN_BROADCAST_INTERVAL: Duration = Duration::from_secs(60);
+const JELLYFIN_BROADCAST_INTERVAL: Duration = Duration::from_mins(1);
 /// Number of consecutive missed cycles before declaring a Jellyfin server lost.
 const JELLYFIN_MISS_THRESHOLD: u32 = 3;
 
@@ -171,8 +377,7 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
 
     info!("mDNS discovery started for Subsonic + Plex + DAAP + AirPlay + AirPlay2 + Chromecast");
 
-    // `seen` maps `key` → `url` so we can reconstruct the URL on removal.
-    let mut seen: HashMap<String, String> = HashMap::new();
+    let mut publications = MdnsPublications::default();
 
     // ── macOS re-browse support ──────────────────────────────────────
     // On macOS, the first launch triggers a Local Network permission
@@ -197,28 +402,28 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
         if let Some(ref rx) = subsonic_rx {
             while let Ok(event) = rx.try_recv() {
                 got_event = true;
-                process_mdns_event(event, "subsonic", &mut seen, &tx);
+                process_mdns_event(event, "subsonic", &mut publications, &tx);
             }
         }
 
         if let Some(ref rx) = plex_rx {
             while let Ok(event) = rx.try_recv() {
                 got_event = true;
-                process_mdns_event(event, "plex", &mut seen, &tx);
+                process_mdns_event(event, "plex", &mut publications, &tx);
             }
         }
 
         if let Some(ref rx) = daap_rx {
             while let Ok(event) = rx.try_recv() {
                 got_event = true;
-                process_mdns_event(event, "daap", &mut seen, &tx);
+                process_mdns_event(event, "daap", &mut publications, &tx);
             }
         }
 
         if let Some(ref rx) = raop_rx {
             while let Ok(event) = rx.try_recv() {
                 got_event = true;
-                process_mdns_event(event, "airplay", &mut seen, &tx);
+                process_mdns_event(event, "airplay", &mut publications, &tx);
             }
         }
 
@@ -233,14 +438,14 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
                 // popover, since the current sender path only speaks
                 // RAOP.  When AirPlay 2 sender support lands, this is
                 // the channel where it will plug in.
-                process_mdns_event(event, "airplay2", &mut seen, &tx);
+                process_mdns_event(event, "airplay2", &mut publications, &tx);
             }
         }
 
         if let Some(ref rx) = chromecast_rx {
             while let Ok(event) = rx.try_recv() {
                 got_event = true;
-                process_chromecast_event(event, &mut seen, &tx);
+                process_chromecast_event(event, &mut publications, &tx);
             }
         }
 
@@ -249,7 +454,7 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
         // needs fresh browse() calls to discover services.
         #[cfg(target_os = "macos")]
         {
-            if seen.is_empty()
+            if publications.is_empty()
                 && rebrowse_attempts < REBROWSE_MAX_ATTEMPTS
                 && last_rebrowse.elapsed() >= REBROWSE_INTERVAL
             {
@@ -282,26 +487,14 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
 fn process_mdns_event(
     event: mdns_sd::ServiceEvent,
     service_type: &str,
-    seen: &mut HashMap<String, String>,
+    publications: &mut MdnsPublications,
     tx: &async_channel::Sender<DiscoveryEvent>,
 ) {
     match event {
         mdns_sd::ServiceEvent::ServiceResolved(info) => {
-            let raw_host = info.get_hostname().trim_end_matches('.').to_string();
+            let host = info.get_hostname().trim_end_matches('.').to_string();
             let port = info.get_port();
-
-            // Strip Avahi conflict-resolution suffix (e.g., "myhost-2" → "myhost").
-            // Avahi appends "-N" when it discovers a naming conflict during late
-            // service registration.  We normalise to the base hostname so the
-            // dedup key matches the original and the duplicate is silently dropped.
-            let host = strip_avahi_suffix(&raw_host);
-
-            let key = format!("{service_type}:{host}:{port}");
-
-            if seen.contains_key(&key) {
-                debug!(key, "mDNS: duplicate, skipping");
-                return;
-            }
+            let fullname = info.get_fullname().to_string();
 
             let raw_name = info
                 .get_property_val_str("name")
@@ -344,82 +537,43 @@ fn process_mdns_event(
                 "http"
             };
 
-            let url = if port == 80 || port == 443 {
+            let default_port =
+                (scheme == "http" && port == 80) || (scheme == "https" && port == 443);
+            let url = if default_port {
                 format!("{scheme}://{host}")
             } else {
                 format!("{scheme}://{host}:{port}")
             };
-
-            seen.insert(key.clone(), url.clone());
-
-            info!(
-                name = %name,
-                url = %url,
-                backend = %service_type,
-                "mDNS: server discovered"
-            );
-
-            let _ = tx.try_send(DiscoveryEvent::Found(DiscoveredServer {
+            let addresses = advertised_socket_addrs(&info);
+            let server = DiscoveredServer {
                 name,
+                advertised_route: advertised_http_route(&url, addresses.clone()),
                 url,
                 service_type: service_type.to_string(),
                 requires_password: None,
-            }));
+            };
+            let events = publications.upsert(
+                ServiceInstanceKey::new(service_type, &fullname),
+                MdnsPublication {
+                    server,
+                    advertised_addresses: addresses,
+                },
+            );
+            publish_mdns_events(events, tx);
         }
 
         mdns_sd::ServiceEvent::ServiceRemoved(_svc_type, fullname) => {
-            // The fullname looks like "MyServer._subsonic._tcp.local."
-            // We need to find the matching key in our `seen` map.
-            // Extract the instance name (everything before the first service type segment).
-            let instance = fullname.split('.').next().unwrap_or("").to_string();
-
-            // Find and remove the matching entry from `seen`.
-            let mut removed_url = None;
-            let mut removed_key = None;
-            for (key, url) in seen.iter() {
-                if key.starts_with(&format!("{service_type}:")) {
-                    // Check if this key's host portion matches the instance name,
-                    // or just match by prefix since we may not have the exact host.
-                    // The fullname contains the instance name which was used as the
-                    // display name or host. Try to match by checking if the key
-                    // contains relevant info.
-                    //
-                    // More robust: iterate all keys for this service_type and
-                    // check if the fullname contains the host from the key.
-                    let key_host = key
-                        .strip_prefix(&format!("{service_type}:"))
-                        .unwrap_or("")
-                        .split(':')
-                        .next()
-                        .unwrap_or("");
-                    if fullname.contains(key_host) || instance == key_host {
-                        removed_url = Some(url.clone());
-                        removed_key = Some(key.clone());
-                        break;
-                    }
-                }
-            }
-
-            if let (Some(key), Some(url)) = (removed_key, removed_url) {
-                seen.remove(&key);
-
-                info!(
-                    url = %url,
-                    backend = %service_type,
-                    fullname = %fullname,
-                    "mDNS: server removed"
-                );
-
-                let _ = tx.try_send(DiscoveryEvent::Lost {
-                    url,
-                    service_type: service_type.to_string(),
-                });
-            } else {
+            let key = ServiceInstanceKey::new(service_type, &fullname);
+            let was_known = publications.contains(&key);
+            let events = publications.remove(&key);
+            if !was_known {
                 debug!(
                     fullname = %fullname,
                     backend = %service_type,
                     "mDNS: ServiceRemoved for unknown service, ignoring"
                 );
+            } else {
+                publish_mdns_events(events, tx);
             }
         }
 
@@ -428,6 +582,60 @@ fn process_mdns_event(
         }
 
         _ => {}
+    }
+}
+
+fn advertised_socket_addrs(info: &mdns_sd::ResolvedService) -> Vec<SocketAddr> {
+    let port = info.get_port();
+    let mut addresses: Vec<_> = info
+        .get_addresses()
+        .iter()
+        .filter_map(|scoped| match scoped {
+            mdns_sd::ScopedIp::V4(address) => {
+                Some(SocketAddr::new(IpAddr::V4(*address.addr()), port))
+            }
+            mdns_sd::ScopedIp::V6(address) => {
+                let ip = *address.addr();
+                let scope_id = if ip.is_unicast_link_local() {
+                    address.scope_id().index
+                } else {
+                    0
+                };
+                Some(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope_id)))
+            }
+            _ => None,
+        })
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses.truncate(MAX_MDNS_ADDRESSES_PER_ROUTE);
+    addresses
+}
+
+fn advertised_http_route(
+    server_url: &str,
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> Option<AdvertisedHttpRoute> {
+    let origin = url::Url::parse(server_url).ok()?;
+    AdvertisedHttpRoute::new(&origin, addresses)
+}
+
+fn publish_mdns_events(events: Vec<DiscoveryEvent>, tx: &async_channel::Sender<DiscoveryEvent>) {
+    for event in events {
+        match &event {
+            DiscoveryEvent::Found(server) => info!(
+                name = %server.name,
+                url = %server.url,
+                backend = %server.service_type,
+                "mDNS: server discovered or updated"
+            ),
+            DiscoveryEvent::Lost { url, service_type } => info!(
+                url = %url,
+                backend = %service_type,
+                "mDNS: server removed"
+            ),
+        }
+        let _ = tx.try_send(event);
     }
 }
 
@@ -520,6 +728,7 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
                             url: discovery.address.clone(),
                             service_type: "jellyfin".to_string(),
                             requires_password: None,
+                            advertised_route: None,
                         }));
                     }
 
@@ -570,6 +779,18 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
 
 // ── Chromecast mDNS event processing ────────────────────────────────────
 
+fn usable_chromecast_control_address(address: &SocketAddr) -> bool {
+    let SocketAddr::V4(address) = address else {
+        return false;
+    };
+    let ip = *address.ip();
+    address.port() != 0
+        && !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && ip != Ipv4Addr::BROADCAST
+}
+
 /// Process a Chromecast mDNS event.
 ///
 /// Chromecast devices use `_googlecast._tcp.local.` and store the
@@ -577,27 +798,21 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
 /// protocol port (typically 8009) comes from the SRV record.
 ///
 /// Unlike other mDNS services, Chromecast URLs are formatted as
-/// `cast://<host>:<port>` (not HTTP) because the output selector
-/// extracts host:port directly.
+/// `cast://<numeric-ip>:<port>` (not HTTP). The resolved mDNS address is
+/// retained instead of resolving the `.local` hostname again when playback
+/// starts, so Cast connection establishment can have a hard deadline.
 fn process_chromecast_event(
     event: mdns_sd::ServiceEvent,
-    seen: &mut HashMap<String, String>,
+    publications: &mut MdnsPublications,
     tx: &async_channel::Sender<DiscoveryEvent>,
 ) {
     let service_type = "chromecast";
 
     match event {
         mdns_sd::ServiceEvent::ServiceResolved(info) => {
-            let raw_host = info.get_hostname().trim_end_matches('.').to_string();
-            let port = info.get_port();
-            let host = strip_avahi_suffix(&raw_host);
-
-            let key = format!("{service_type}:{host}:{port}");
-
-            if seen.contains_key(&key) {
-                debug!(key, "mDNS: Chromecast duplicate, skipping");
-                return;
-            }
+            let host = info.get_hostname().trim_end_matches('.').to_string();
+            let fullname = info.get_fullname().to_string();
+            let key = ServiceInstanceKey::new(service_type, &fullname);
 
             // Extract friendly name from the `fn` TXT record field.
             // Chromecast devices always publish this.  Fall back to the
@@ -613,65 +828,53 @@ fn process_chromecast_event(
                         .to_string()
                 });
 
+            // Chromecast media tickets are already served over Tributary's
+            // non-loopback LAN IPv4 listener. Retain a matching numeric
+            // control endpoint from the resolved mDNS record; falling back to
+            // the `.local` hostname here would put unbounded name resolution
+            // back inside the later connection attempt.
+            let addresses = advertised_socket_addrs(&info);
+            let Some(address) = addresses
+                .iter()
+                .copied()
+                .find(usable_chromecast_control_address)
+            else {
+                warn!(name = %name, "Chromecast has no advertised IPv4 control address");
+                publish_mdns_events(publications.remove(&key), tx);
+                return;
+            };
+
             // Use a cast:// URL scheme so the output selector can
             // distinguish Chromecast URLs from HTTP server URLs.
-            let url = format!("cast://{host}:{port}");
-
-            seen.insert(key.clone(), url.clone());
-
-            info!(
-                name = %name,
-                url = %url,
-                "mDNS: Chromecast device discovered"
-            );
-
-            let _ = tx.try_send(DiscoveryEvent::Found(DiscoveredServer {
+            let url = format!("cast://{address}");
+            let server = DiscoveredServer {
                 name,
                 url,
                 service_type: service_type.to_string(),
                 requires_password: None,
-            }));
+                advertised_route: None,
+            };
+            let events = publications.upsert(
+                key,
+                MdnsPublication {
+                    server,
+                    advertised_addresses: addresses,
+                },
+            );
+            publish_mdns_events(events, tx);
         }
 
         mdns_sd::ServiceEvent::ServiceRemoved(_svc_type, fullname) => {
-            let instance = fullname.split('.').next().unwrap_or("").to_string();
-
-            let mut removed_url = None;
-            let mut removed_key = None;
-            for (key, url) in seen.iter() {
-                if key.starts_with(&format!("{service_type}:")) {
-                    let key_host = key
-                        .strip_prefix(&format!("{service_type}:"))
-                        .unwrap_or("")
-                        .split(':')
-                        .next()
-                        .unwrap_or("");
-                    if fullname.contains(key_host) || instance == key_host {
-                        removed_url = Some(url.clone());
-                        removed_key = Some(key.clone());
-                        break;
-                    }
-                }
-            }
-
-            if let (Some(key), Some(url)) = (removed_key, removed_url) {
-                seen.remove(&key);
-
-                info!(
-                    url = %url,
-                    fullname = %fullname,
-                    "mDNS: Chromecast device removed"
-                );
-
-                let _ = tx.try_send(DiscoveryEvent::Lost {
-                    url,
-                    service_type: service_type.to_string(),
-                });
-            } else {
+            let key = ServiceInstanceKey::new(service_type, &fullname);
+            let was_known = publications.contains(&key);
+            let events = publications.remove(&key);
+            if !was_known {
                 debug!(
                     fullname = %fullname,
                     "mDNS: Chromecast ServiceRemoved for unknown device, ignoring"
                 );
+            } else {
+                publish_mdns_events(events, tx);
             }
         }
 
@@ -708,18 +911,19 @@ fn strip_airplay_mac_prefix(name: &str) -> String {
 
 // ── Avahi hostname helpers ──────────────────────────────────────────────
 
-/// Strip the Avahi conflict-resolution suffix from a hostname.
+/// Strip an Avahi conflict-resolution suffix from display text.
 ///
 /// When Avahi detects a naming conflict during late service registration
-/// it appends `-2`, `-3`, etc. to the hostname.  This function strips
-/// that suffix so we can dedup against the original hostname.
+/// it appends `-2`, `-3`, etc. This is presentation-only: connection URLs
+/// retain the authoritative SRV hostname so DNS, `Host`, and TLS identity all
+/// refer to the service that was actually advertised.
 ///
 /// Examples:
 /// - `"myhost-2"` → `"myhost"`
 /// - `"myhost-12"` → `"myhost"`
 /// - `"myhost"` → `"myhost"` (unchanged)
 /// - `"my-host"` → `"my-host"` (unchanged — no trailing digits)
-fn strip_avahi_suffix(hostname: &str) -> String {
+fn strip_avahi_display_suffix(hostname: &str) -> String {
     // Match the pattern: ends with "-" followed by one or more digits.
     if let Some(dash_pos) = hostname.rfind('-') {
         let suffix = &hostname[dash_pos + 1..];
@@ -756,22 +960,414 @@ fn strip_avahi_name_suffix(name: &str) -> String {
             }
 
             // Avahi conflict pattern: hostname with -N suffix inside parens.
-            let cleaned = strip_avahi_suffix(inside);
+            let cleaned = strip_avahi_display_suffix(inside);
             if cleaned != inside {
                 return format!("{}({}){}", &name[..open], cleaned, &name[close + 1..]);
             }
         }
     }
     // Fall back to stripping the bare name (Avahi -N on hostname).
-    strip_avahi_suffix(name)
+    strip_avahi_display_suffix(name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        strip_airplay_mac_prefix, strip_avahi_name_suffix, strip_avahi_suffix,
-        validate_jellyfin_discovery_address,
+        process_chromecast_event, process_mdns_event, strip_airplay_mac_prefix,
+        strip_avahi_display_suffix, strip_avahi_name_suffix, usable_chromecast_control_address,
+        validate_jellyfin_discovery_address, DiscoveredServer, DiscoveryEvent, MdnsPublication,
+        MdnsPublications, PublishedOrigin, ServiceInstanceKey, CHROMECAST_SERVICE,
+        MAX_MDNS_INSTANCES_PER_ORIGIN, MAX_MDNS_PUBLICATIONS, SUBSONIC_SERVICE,
     };
+
+    fn resolved_event(
+        instance: &str,
+        host: &str,
+        addresses: &[&str],
+        port: u16,
+        properties: &[(&str, &str)],
+    ) -> (mdns_sd::ServiceEvent, String) {
+        let info = mdns_sd::ServiceInfo::new(
+            SUBSONIC_SERVICE,
+            instance,
+            host,
+            addresses,
+            port,
+            properties,
+        )
+        .expect("resolved service fixture");
+        let fullname = info.get_fullname().to_string();
+        (
+            mdns_sd::ServiceEvent::ServiceResolved(Box::new(info.as_resolved_service())),
+            fullname,
+        )
+    }
+
+    fn process(
+        publications: &mut MdnsPublications,
+        event: mdns_sd::ServiceEvent,
+    ) -> Vec<DiscoveryEvent> {
+        let (tx, rx) = async_channel::unbounded();
+        process_mdns_event(event, "subsonic", publications, &tx);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn chromecast_resolved_event(
+        instance: &str,
+        host: &str,
+        addresses: &[&str],
+        port: u16,
+    ) -> mdns_sd::ServiceEvent {
+        let properties: &[(&str, &str)] = &[("fn", instance)];
+        let info = mdns_sd::ServiceInfo::new(
+            CHROMECAST_SERVICE,
+            instance,
+            host,
+            addresses,
+            port,
+            properties,
+        )
+        .expect("resolved Chromecast fixture");
+        mdns_sd::ServiceEvent::ServiceResolved(Box::new(info.as_resolved_service()))
+    }
+
+    fn process_chromecast(
+        publications: &mut MdnsPublications,
+        event: mdns_sd::ServiceEvent,
+    ) -> Vec<DiscoveryEvent> {
+        let (tx, rx) = async_channel::unbounded();
+        process_chromecast_event(event, publications, &tx);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn found(events: &[DiscoveryEvent]) -> &super::DiscoveredServer {
+        assert_eq!(events.len(), 1);
+        let DiscoveryEvent::Found(server) = &events[0] else {
+            panic!("expected one found event");
+        };
+        server
+    }
+
+    #[test]
+    fn chromecast_publication_uses_a_numeric_advertised_ipv4_endpoint() {
+        let mut publications = MdnsPublications::default();
+        let event = chromecast_resolved_event(
+            "Living Room",
+            "speaker.local.",
+            &["2001:db8::45", "192.0.2.45", "192.0.2.44"],
+            8009,
+        );
+
+        let events = process_chromecast(&mut publications, event);
+        let server = found(&events);
+        assert_eq!(server.url, "cast://192.0.2.44:8009");
+        assert!(!server.url.contains("speaker.local"));
+    }
+
+    #[test]
+    fn chromecast_publication_skips_unusable_ipv4_control_endpoints() {
+        let mut publications = MdnsPublications::default();
+        let event = chromecast_resolved_event(
+            "Living Room",
+            "speaker.local.",
+            &[
+                "0.0.0.0",
+                "127.0.0.1",
+                "224.0.0.1",
+                "255.255.255.255",
+                "192.0.2.45",
+            ],
+            8009,
+        );
+
+        let events = process_chromecast(&mut publications, event);
+        assert_eq!(found(&events).url, "cast://192.0.2.45:8009");
+        assert!(!usable_chromecast_control_address(
+            &"192.0.2.45:0".parse().expect("port-zero endpoint")
+        ));
+    }
+
+    #[test]
+    fn unusable_chromecast_update_retires_the_previous_ipv4_endpoint() {
+        let mut publications = MdnsPublications::default();
+        let initial =
+            chromecast_resolved_event("Living Room", "speaker.local.", &["192.0.2.44"], 8009);
+        assert!(matches!(
+            process_chromecast(&mut publications, initial).as_slice(),
+            [DiscoveryEvent::Found(server)] if server.url == "cast://192.0.2.44:8009"
+        ));
+
+        let update =
+            chromecast_resolved_event("Living Room", "speaker.local.", &["2001:db8::45"], 8009);
+        assert_eq!(
+            process_chromecast(&mut publications, update),
+            vec![DiscoveryEvent::Lost {
+                url: "cast://192.0.2.44:8009".to_string(),
+                service_type: "chromecast".to_string(),
+            }]
+        );
+        assert!(publications.by_instance.is_empty());
+    }
+
+    #[test]
+    fn chromecast_address_change_loses_old_endpoint_before_finding_new() {
+        let mut publications = MdnsPublications::default();
+        let initial =
+            chromecast_resolved_event("Living Room", "speaker.local.", &["192.0.2.44"], 8009);
+        let _ = process_chromecast(&mut publications, initial);
+
+        let replacement =
+            chromecast_resolved_event("Living Room", "speaker.local.", &["192.0.2.45"], 8009);
+        let events = process_chromecast(&mut publications, replacement);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            DiscoveryEvent::Lost {
+                url: "cast://192.0.2.44:8009".to_string(),
+                service_type: "chromecast".to_string(),
+            }
+        );
+        assert!(matches!(
+            &events[1],
+            DiscoveryEvent::Found(server) if server.url == "cast://192.0.2.45:8009"
+        ));
+    }
+
+    #[test]
+    fn connection_hostname_keeps_conflict_suffix_while_display_is_cleaned() {
+        let mut publications = MdnsPublications::default();
+        let (event, _) = resolved_event(
+            "Navidrome",
+            "mini-2.local.",
+            &["192.0.2.45", "2001:db8::45", "192.0.2.44"],
+            4533,
+            &[("name", "Navidrome (mini-2)")],
+        );
+
+        let events = process(&mut publications, event);
+        let server = found(&events);
+        assert_eq!(server.name, "Navidrome (mini)");
+        assert_eq!(server.url, "http://mini-2.local:4533");
+        let route = server.advertised_route.as_ref().expect("advertised route");
+        assert_eq!(route.hostname(), "mini-2.local");
+        assert_eq!(
+            route.addresses(),
+            [
+                "192.0.2.44:4533".parse().unwrap(),
+                "192.0.2.45:4533".parse().unwrap(),
+                "[2001:db8::45]:4533".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn default_port_is_omitted_only_for_the_selected_scheme() {
+        let mut publications = MdnsPublications::default();
+        let (https_on_eighty, _) = resolved_event(
+            "HTTPS-on-80",
+            "secure.local.",
+            &["192.0.2.80"],
+            80,
+            &[("https", "true")],
+        );
+        assert_eq!(
+            found(&process(&mut publications, https_on_eighty)).url,
+            "https://secure.local:80"
+        );
+
+        let (https_default, _) =
+            resolved_event("HTTPS", "secure-default.local.", &["192.0.2.43"], 443, &[]);
+        assert_eq!(
+            found(&process(&mut publications, https_default)).url,
+            "https://secure-default.local"
+        );
+
+        let (http_default, _) = resolved_event("HTTP", "plain.local.", &["192.0.2.80"], 80, &[]);
+        assert_eq!(
+            found(&process(&mut publications, http_default)).url,
+            "http://plain.local"
+        );
+    }
+
+    #[test]
+    fn address_update_emits_found_without_lost_and_identical_repeat_is_quiet() {
+        let mut publications = MdnsPublications::default();
+        let (initial, _) = resolved_event("Mini", "mini.local.", &["192.0.2.10"], 4533, &[]);
+        assert!(matches!(
+            process(&mut publications, initial).as_slice(),
+            [DiscoveryEvent::Found(_)]
+        ));
+
+        let (updated, _) = resolved_event(
+            "Mini",
+            "mini.local.",
+            &["192.0.2.12", "192.0.2.11"],
+            4533,
+            &[],
+        );
+        let updated_events = process(&mut publications, updated.clone());
+        let server = found(&updated_events);
+        assert_eq!(server.url, "http://mini.local:4533");
+        assert_eq!(
+            server
+                .advertised_route
+                .as_ref()
+                .expect("updated route")
+                .addresses(),
+            [
+                "192.0.2.11:4533".parse().unwrap(),
+                "192.0.2.12:4533".parse().unwrap(),
+            ]
+        );
+        assert!(process(&mut publications, updated).is_empty());
+    }
+
+    #[test]
+    fn one_instance_origin_change_loses_old_before_finding_new() {
+        let mut publications = MdnsPublications::default();
+        let (initial, _) = resolved_event("Mini", "old.local.", &["192.0.2.10"], 4533, &[]);
+        let _ = process(&mut publications, initial);
+
+        let (replacement, _) = resolved_event("Mini", "new.local.", &["192.0.2.11"], 4534, &[]);
+        let events = process(&mut publications, replacement);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            DiscoveryEvent::Lost {
+                url: "http://old.local:4533".to_string(),
+                service_type: "subsonic".to_string(),
+            }
+        );
+        assert!(matches!(
+            &events[1],
+            DiscoveryEvent::Found(server) if server.url == "http://new.local:4534"
+        ));
+    }
+
+    #[test]
+    fn exact_instance_removal_updates_duplicates_then_loses_final_origin() {
+        let mut publications = MdnsPublications::default();
+        let (first, first_fullname) =
+            resolved_event("First", "mini.local.", &["192.0.2.10"], 4533, &[]);
+        let (second, second_fullname) =
+            resolved_event("Second", "mini.local.", &["192.0.2.11"], 4533, &[]);
+        let _ = process(&mut publications, first);
+        let aggregate = process(&mut publications, second);
+        assert_eq!(
+            found(&aggregate)
+                .advertised_route
+                .as_ref()
+                .expect("aggregate route")
+                .addresses(),
+            [
+                "192.0.2.10:4533".parse().unwrap(),
+                "192.0.2.11:4533".parse().unwrap(),
+            ]
+        );
+
+        let unknown = mdns_sd::ServiceEvent::ServiceRemoved(
+            SUBSONIC_SERVICE.to_string(),
+            "Unknown._subsonic._tcp.local.".to_string(),
+        );
+        assert!(process(&mut publications, unknown).is_empty());
+
+        let remove_first =
+            mdns_sd::ServiceEvent::ServiceRemoved(SUBSONIC_SERVICE.to_string(), first_fullname);
+        let remaining = process(&mut publications, remove_first);
+        assert_eq!(
+            found(&remaining)
+                .advertised_route
+                .as_ref()
+                .expect("remaining route")
+                .addresses(),
+            ["192.0.2.11:4533".parse().unwrap()]
+        );
+
+        let remove_second =
+            mdns_sd::ServiceEvent::ServiceRemoved(SUBSONIC_SERVICE.to_string(), second_fullname);
+        assert_eq!(
+            process(&mut publications, remove_second),
+            [DiscoveryEvent::Lost {
+                url: "http://mini.local:4533".to_string(),
+                service_type: "subsonic".to_string(),
+            }]
+        );
+    }
+
+    fn bounded_publication(
+        instance: usize,
+        origin: usize,
+    ) -> (ServiceInstanceKey, MdnsPublication) {
+        let url = format!("http://host-{origin}.local:4533");
+        (
+            ServiceInstanceKey::new(
+                "subsonic",
+                &format!("Instance-{instance}._subsonic._tcp.local."),
+            ),
+            MdnsPublication {
+                server: DiscoveredServer {
+                    name: format!("Instance {instance}"),
+                    url,
+                    service_type: "subsonic".to_string(),
+                    requires_password: None,
+                    advertised_route: None,
+                },
+                advertised_addresses: vec!["192.0.2.1:4533".parse().unwrap()],
+            },
+        )
+    }
+
+    #[test]
+    fn unauthenticated_publication_state_and_per_origin_work_are_bounded() {
+        let mut publications = MdnsPublications::default();
+
+        for instance in 0..(MAX_MDNS_INSTANCES_PER_ORIGIN + 8) {
+            let (key, publication) = bounded_publication(instance, 0);
+            let _ = publications.upsert(key, publication);
+        }
+        let crowded_origin = PublishedOrigin {
+            service_type: "subsonic".to_string(),
+            url: "http://host-0.local:4533".to_string(),
+        };
+        assert_eq!(
+            publications.by_instance.len(),
+            MAX_MDNS_INSTANCES_PER_ORIGIN
+        );
+        assert_eq!(
+            publications
+                .by_origin
+                .get(&crowded_origin)
+                .expect("origin index")
+                .len(),
+            MAX_MDNS_INSTANCES_PER_ORIGIN
+        );
+
+        for origin in 1..(MAX_MDNS_PUBLICATIONS + 16) {
+            let (key, publication) = bounded_publication(origin + 10_000, origin);
+            let _ = publications.upsert(key, publication);
+        }
+        assert_eq!(publications.by_instance.len(), MAX_MDNS_PUBLICATIONS);
+        assert!(publications
+            .by_origin
+            .values()
+            .all(|instances| instances.len() <= MAX_MDNS_INSTANCES_PER_ORIGIN));
+        assert_eq!(
+            publications
+                .by_origin
+                .values()
+                .map(std::collections::BTreeSet::len)
+                .sum::<usize>(),
+            publications.by_instance.len()
+        );
+    }
 
     #[test]
     fn jellyfin_discovery_accepts_only_safe_http_base_urls() {
@@ -804,14 +1400,14 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_avahi_suffix() {
-        assert_eq!(strip_avahi_suffix("myhost-2"), "myhost");
-        assert_eq!(strip_avahi_suffix("myhost-12"), "myhost");
-        assert_eq!(strip_avahi_suffix("myhost"), "myhost");
-        assert_eq!(strip_avahi_suffix("my-host"), "my-host");
-        assert_eq!(strip_avahi_suffix("my-host-3"), "my-host");
-        assert_eq!(strip_avahi_suffix("host-1"), "host-1"); // -1 is not a conflict suffix
-        assert_eq!(strip_avahi_suffix("host-0"), "host-0"); // -0 is not a conflict suffix
+    fn test_strip_avahi_display_suffix() {
+        assert_eq!(strip_avahi_display_suffix("myhost-2"), "myhost");
+        assert_eq!(strip_avahi_display_suffix("myhost-12"), "myhost");
+        assert_eq!(strip_avahi_display_suffix("myhost"), "myhost");
+        assert_eq!(strip_avahi_display_suffix("my-host"), "my-host");
+        assert_eq!(strip_avahi_display_suffix("my-host-3"), "my-host");
+        assert_eq!(strip_avahi_display_suffix("host-1"), "host-1"); // -1 is not a conflict suffix
+        assert_eq!(strip_avahi_display_suffix("host-0"), "host-0"); // -0 is not a conflict suffix
     }
 
     #[test]

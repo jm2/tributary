@@ -63,6 +63,7 @@ pub(crate) mod http_security;
 mod jellyfin;
 #[allow(dead_code)]
 mod local;
+mod platform_runtime;
 #[allow(dead_code)]
 mod plex;
 mod radio;
@@ -110,13 +111,16 @@ fn main() {
         }
     }
 
-    // ── macOS .app bundle environment setup ──────────────────────────
-    // When launched from a .app bundle (e.g. Finder / Launchpad), the
-    // working directory is unpredictable and LSEnvironment relative
-    // paths don't resolve correctly.  Detect the bundle at runtime and
-    // set absolute paths so GTK/Adwaita can find icons, schemas, etc.
-    #[cfg(target_os = "macos")]
-    setup_macos_bundle_env();
+    // Bundled toolkit paths and writable runtime caches must be configured
+    // before GTK or GStreamer observes the process environment.
+    match platform_runtime::configure_before_toolkit() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("Tributary platform runtime setup failed: {error:#}");
+            std::process::exit(1);
+        }
+    }
 
     // ── WSL: force GL renderer to avoid broken Vulkan/dzn ────────────
     // WSL's Dozen (dzn) Vulkan driver is often incomplete and causes
@@ -338,128 +342,4 @@ fn main() {
     // Run the GTK main loop.  This blocks until the last window closes.
     let exit_code = app.run();
     std::process::exit(exit_code.into());
-}
-
-// ── macOS .app bundle environment ───────────────────────────────────────
-
-/// Detect whether we are running inside a `.app` bundle and, if so,
-/// set the environment variables that GTK4, libadwaita, GDK-Pixbuf,
-/// and GStreamer need to find their bundled resources.
-///
-/// The `.app` layout is:
-/// ```text
-/// Tributary.app/
-///   Contents/
-///     MacOS/Tributary          ← executable
-///     Resources/
-///       share/icons/…          ← icon themes (hicolor, Adwaita)
-///       share/glib-2.0/schemas ← compiled GSettings schemas
-///       lib/gdk-pixbuf-2.0/…   ← pixbuf loaders
-///       lib/gstreamer-1.0/…    ← GStreamer plugins
-/// ```
-///
-/// `LSEnvironment` in `Info.plist` uses relative paths which only work
-/// when the working directory happens to be `Contents/MacOS`.  macOS
-/// does **not** guarantee that — Finder typically sets it to `/`.
-/// This function computes absolute paths from `current_exe()`.
-#[cfg(target_os = "macos")]
-fn setup_macos_bundle_env() {
-    use std::env;
-    use std::path::PathBuf;
-
-    let Ok(exe) = env::current_exe() else { return };
-
-    // Canonicalise symlinks so we get the real path inside the bundle.
-    let exe = exe.canonicalize().unwrap_or(exe);
-
-    // Check we're inside a .app bundle:
-    //   …/Tributary.app/Contents/MacOS/Tributary
-    let Some(macos_dir) = exe.parent() else {
-        return;
-    };
-    let Some(contents_dir) = macos_dir.parent() else {
-        return;
-    };
-
-    // Verify the directory structure looks like a .app bundle.
-    if !macos_dir.ends_with("Contents/MacOS") {
-        return; // Not running from a .app bundle — nothing to do.
-    }
-
-    let resources_dir = contents_dir.join("Resources");
-    if !resources_dir.is_dir() {
-        return; // No Resources directory — probably a dev build.
-    }
-
-    // Helper: always set the var when inside a .app bundle.
-    // We unconditionally override because LSEnvironment (if present in
-    // Info.plist) may have set these to broken relative paths.  The
-    // absolute paths we compute here are authoritative.
-    let set_bundle_var = |key: &str, value: PathBuf| {
-        if value.exists() {
-            env::set_var(key, &value);
-        }
-    };
-
-    // XDG_DATA_DIRS — GTK and Adwaita look here for icon themes.
-    let share_dir = resources_dir.join("share");
-    set_bundle_var("XDG_DATA_DIRS", share_dir.clone());
-
-    // GSETTINGS_SCHEMA_DIR — compiled GSettings schemas.
-    let schemas_dir = share_dir.join("glib-2.0").join("schemas");
-    set_bundle_var("GSETTINGS_SCHEMA_DIR", schemas_dir);
-
-    // GDK_PIXBUF_MODULE_FILE — pixbuf loader cache.
-    let pixbuf_cache = resources_dir
-        .join("lib")
-        .join("gdk-pixbuf-2.0")
-        .join("2.10.0")
-        .join("loaders.cache");
-    set_bundle_var("GDK_PIXBUF_MODULE_FILE", pixbuf_cache);
-
-    // GST_PLUGIN_PATH — bundled GStreamer plugins.
-    let gst_plugins = resources_dir.join("lib").join("gstreamer-1.0");
-    set_bundle_var("GST_PLUGIN_PATH", gst_plugins.clone());
-
-    // Prevent GStreamer from also scanning system plugin paths which
-    // may contain incompatible versions.
-    if gst_plugins.is_dir() {
-        env::set_var("GST_PLUGIN_SYSTEM_PATH", "");
-        // Force a fresh registry scan so stale system paths don't win.
-        let registry = macos_dir.join("gst-registry.bin");
-        env::set_var("GST_REGISTRY", &registry);
-
-        // Delete any stale registry that shipped with the bundle.
-        // The CI builder generates a registry containing /opt/homebrew/
-        // paths.  On the user's machine those paths don't exist, so
-        // GStreamer finds zero decoder plugins (→ "not-negotiated").
-        // We detect staleness by checking whether the registry mentions
-        // our current plugin directory; if not, we delete it so
-        // gst::init() rescans the bundled plugins.
-        if registry.is_file() {
-            let is_stale = std::fs::read(&registry)
-                .map(|bytes| {
-                    let needle = gst_plugins.to_string_lossy();
-                    // Binary file — search for the path as raw bytes.
-                    !bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
-                })
-                .unwrap_or(true); // If unreadable, treat as stale.
-            if is_stale {
-                let _ = std::fs::remove_file(&registry);
-            }
-        }
-    }
-
-    // GST_PLUGIN_SCANNER — bundled helper binary that scans plugins.
-    // Without this, GStreamer uses the system's gst-plugin-scanner which
-    // loads the system libgstreamer, causing duplicate ObjC class conflicts
-    // (GstCocoaApplicationDelegate) and crashes.
-    let gst_scanner = macos_dir.join("gst-plugin-scanner");
-    if gst_scanner.is_file() {
-        env::set_var("GST_PLUGIN_SCANNER", &gst_scanner);
-    }
-
-    // GTK_PATH — helps GTK find the bundled IM modules / print backends.
-    let gtk_path = resources_dir.join("lib").join("gtk-4.0");
-    set_bundle_var("GTK_PATH", gtk_path);
 }

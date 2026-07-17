@@ -5,7 +5,11 @@
 
 use adw::prelude::*;
 use gtk::glib;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 use crate::local::engine::LibraryEvent;
@@ -17,6 +21,9 @@ use super::radio::{
     apply_radio_columns, handle_radio_nearme, is_radio_backend, radio_station_to_track_object,
 };
 use super::server_dialogs::{show_auth_dialog, validate_remote_server_url};
+use super::source_navigation::{
+    CompletionDisposition, PendingConnection, SourceNavigation, SourceRequest,
+};
 use super::tracklist;
 use super::window::{arch_track_to_object, display_tracks};
 use super::window_state::WindowState;
@@ -34,6 +41,403 @@ enum RemoteLibrarySnapshot {
     },
 }
 
+/// Registry ownership minted synchronously before a remote task is queued.
+///
+/// Discovery loss can run on the GTK loop immediately after this callback
+/// returns. Registering the attempt first lets that loss invalidate the exact
+/// generation even when Tokio has not polled the network future yet.
+enum RemoteConnectionAttempt {
+    Standard(crate::source_registry::ConnectionAttempt),
+    Daap(crate::daap::session::ConnectionAttempt),
+}
+
+impl RemoteConnectionAttempt {
+    fn is_latest(&self) -> bool {
+        match self {
+            Self::Standard(attempt) => attempt.is_latest(),
+            Self::Daap(attempt) => attempt.is_latest(),
+        }
+    }
+
+    fn into_standard(self) -> crate::source_registry::ConnectionAttempt {
+        match self {
+            Self::Standard(attempt) => attempt,
+            Self::Daap(_) => unreachable!("standard backend received a DAAP connection attempt"),
+        }
+    }
+
+    fn into_daap(self) -> crate::daap::session::ConnectionAttempt {
+        match self {
+            Self::Daap(attempt) => attempt,
+            Self::Standard(_) => {
+                unreachable!("DAAP backend received a standard connection attempt")
+            }
+        }
+    }
+}
+
+fn begin_remote_connection(
+    backend_type: &str,
+    source_key: String,
+) -> Option<RemoteConnectionAttempt> {
+    if backend_type == "daap" {
+        crate::daap::begin_connect(source_key).map(RemoteConnectionAttempt::Daap)
+    } else {
+        crate::source_registry::begin_connect(source_key).map(RemoteConnectionAttempt::Standard)
+    }
+}
+
+enum PlaylistLoadOutcome {
+    Loaded(Vec<crate::architecture::models::Track>),
+    Missing,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RemoteFailureCategory {
+    Authentication,
+    Connection,
+    Timeout,
+    Response,
+    AuthenticationMethod,
+    Backend,
+}
+
+impl RemoteFailureCategory {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Connection => "connection",
+            Self::Timeout => "timeout",
+            Self::Response => "response",
+            Self::AuthenticationMethod => "authentication-method",
+            Self::Backend => "backend",
+        }
+    }
+
+    pub(super) fn log_message(self) -> &'static str {
+        match self {
+            Self::Authentication => "Remote authentication rejected",
+            Self::Connection => "Remote connection failed",
+            Self::Timeout => "Remote connection timed out",
+            Self::Response => "Remote response failed",
+            Self::AuthenticationMethod => "Remote authentication method failed",
+            Self::Backend => "Remote source failed",
+        }
+    }
+
+    pub(super) fn user_message(self, backend_type: &str) -> String {
+        let locale = rust_i18n::locale();
+        self.user_message_for_locale(backend_type, &locale)
+    }
+
+    fn user_message_for_locale(self, backend_type: &str, locale: &str) -> String {
+        match self {
+            Self::Authentication => rust_i18n::t!(
+                "errors.remote.authentication_rejected",
+                locale = locale,
+                backend = backend_type
+            ),
+            Self::Connection => rust_i18n::t!(
+                "errors.remote.connection_failed",
+                locale = locale,
+                backend = backend_type
+            ),
+            Self::Timeout => rust_i18n::t!(
+                "errors.remote.connection_timed_out",
+                locale = locale,
+                backend = backend_type
+            ),
+            Self::Response => rust_i18n::t!(
+                "errors.remote.invalid_response",
+                locale = locale,
+                backend = backend_type
+            ),
+            Self::AuthenticationMethod => rust_i18n::t!(
+                "errors.remote.authentication_method_unsupported",
+                locale = locale,
+                backend = backend_type
+            ),
+            Self::Backend => rust_i18n::t!(
+                "errors.remote.source_failed",
+                locale = locale,
+                backend = backend_type
+            ),
+        }
+        .into_owned()
+    }
+}
+
+pub(super) fn remote_failure_category(
+    error: &crate::architecture::error::BackendError,
+) -> RemoteFailureCategory {
+    use crate::architecture::error::BackendError;
+
+    match error {
+        BackendError::AuthenticationFailed { .. } => RemoteFailureCategory::Authentication,
+        BackendError::ConnectionFailed { .. } | BackendError::Io(_) => {
+            RemoteFailureCategory::Connection
+        }
+        BackendError::Timeout { .. } => RemoteFailureCategory::Timeout,
+        BackendError::ParseError { .. } => RemoteFailureCategory::Response,
+        BackendError::TokenAuthNotSupported { .. } => RemoteFailureCategory::AuthenticationMethod,
+        BackendError::NotFound { .. }
+        | BackendError::Unsupported { .. }
+        | BackendError::Internal(_) => RemoteFailureCategory::Backend,
+    }
+}
+
+/// Bound parsed USB rows so a fast filesystem cannot grow memory without
+/// limit while GTK is busy. Closing the receiver wakes a blocked producer.
+const USB_SCAN_CHANNEL_CAPACITY: usize = 64;
+
+/// Poll exact navigation ownership even while no scan row is arriving. This
+/// lets unplug/supersession close the bounded channel promptly; the filesystem
+/// walk itself can still remain blocked in the kernel until that call returns.
+const USB_SCAN_CANCELLATION_POLL: Duration = Duration::from_millis(50);
+
+fn resolve_source_key(explicit_key: &str, server_url: &str, backend_type: &str) -> String {
+    if !explicit_key.is_empty() {
+        explicit_key.to_string()
+    } else if !server_url.is_empty() {
+        server_url.to_string()
+    } else if backend_type == "local" || backend_type.is_empty() {
+        "local".to_string()
+    } else {
+        backend_type.to_string()
+    }
+}
+
+/// Admit one authentication-dialog submission against the exact live intent.
+///
+/// Dialogs can outlive navigation changes and mDNS route updates or removal.
+/// The submitted credentials therefore gain authority only when the original
+/// pending request is still current and the exact source row still exists.
+/// Every rejected submission clears only the pending request it owns, leaving
+/// a newer connection attempt untouched.
+fn prepare_remote_auth_submission(
+    pending_connection: &RefCell<Option<PendingConnection>>,
+    source_navigation: &SourceNavigation,
+    connection_request: &SourceRequest,
+    sidebar_store: &gtk::gio::ListStore,
+    server_url: &str,
+    backend_type: &str,
+) -> Option<(u32, SourceObject)> {
+    let owns_pending = pending_connection
+        .borrow()
+        .as_ref()
+        .is_some_and(|pending| pending.request() == connection_request);
+    if !owns_pending {
+        return None;
+    }
+
+    let current_source = source_navigation
+        .is_current(connection_request)
+        .then(|| {
+            super::discovery_handler::remote_source_at(sidebar_store, server_url, backend_type)
+        })
+        .flatten()
+        .filter(|(_, source)| !source.connected() && !source.connecting());
+
+    if current_source.is_none() {
+        *pending_connection.borrow_mut() = None;
+    }
+    current_source
+}
+
+fn restore_pending_selection(
+    sidebar_store: &gtk::gio::ListStore,
+    selection: &gtk::SingleSelection,
+    pending_source_key: &str,
+    fallback_position: u32,
+) {
+    let position = (0..sidebar_store.n_items())
+        .find(|position| {
+            sidebar_store
+                .item(*position)
+                .and_downcast_ref::<SourceObject>()
+                .is_some_and(|source| source.server_url() == pending_source_key)
+        })
+        .unwrap_or(fallback_position);
+    if selection.selected() != position {
+        selection.set_selected(position);
+    }
+}
+
+/// Cache a completed source load if it is still the newest request for that
+/// source, and report whether it also owns the visible projection.
+pub(super) fn cache_source_completion(
+    navigation: &Rc<RefCell<SourceNavigation>>,
+    request: &SourceRequest,
+    source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    objects: &[TrackObject],
+    active_source_key: &Rc<RefCell<String>>,
+) -> bool {
+    match navigation.borrow().completion(request) {
+        CompletionDisposition::Ignore => false,
+        CompletionDisposition::CacheOnly => {
+            source_tracks
+                .borrow_mut()
+                .insert(request.source_key().to_string(), objects.to_vec());
+            false
+        }
+        CompletionDisposition::CacheAndRender => {
+            source_tracks
+                .borrow_mut()
+                .insert(request.source_key().to_string(), objects.to_vec());
+            *active_source_key.borrow() == request.source_key()
+        }
+    }
+}
+
+fn evict_source_completion(
+    navigation: &Rc<RefCell<SourceNavigation>>,
+    request: &SourceRequest,
+    source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    active_source_key: &Rc<RefCell<String>>,
+) -> bool {
+    match navigation.borrow().completion(request) {
+        CompletionDisposition::Ignore => false,
+        CompletionDisposition::CacheOnly => {
+            source_tracks.borrow_mut().remove(request.source_key());
+            false
+        }
+        CompletionDisposition::CacheAndRender => {
+            source_tracks.borrow_mut().remove(request.source_key());
+            *active_source_key.borrow() == request.source_key()
+        }
+    }
+}
+
+/// Load and publish a playlist through the same generation-owned path used by
+/// both explicit navigation and post-reconciliation refreshes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn load_playlist_source(
+    rt_handle: tokio::runtime::Handle,
+    playlist_id: String,
+    request: SourceRequest,
+    navigation: Rc<RefCell<SourceNavigation>>,
+    source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    active_source_key: Rc<RefCell<String>>,
+    track_store: gtk::gio::ListStore,
+    master_tracks: Rc<RefCell<Vec<TrackObject>>>,
+    browser_widget: gtk::Box,
+    browser_state: super::browser::BrowserState,
+    status_label: gtk::Label,
+    column_view: gtk::ColumnView,
+) {
+    let (tracks_tx, tracks_rx) = async_channel::bounded::<PlaylistLoadOutcome>(1);
+
+    rt_handle.spawn(async move {
+        let outcome = match crate::db::connection::init_db().await {
+            Ok(db) => {
+                let manager = crate::local::playlist_manager::PlaylistManager::new(db);
+                match manager.get_playlist(&playlist_id).await {
+                    Ok(Some(playlist)) => {
+                        let models = if playlist.is_smart {
+                            manager.evaluate_smart_playlist(&playlist_id).await
+                        } else {
+                            manager.get_playlist_tracks(&playlist_id).await
+                        };
+                        match models {
+                            Ok(models) => PlaylistLoadOutcome::Loaded(
+                                models
+                                    .iter()
+                                    .map(crate::local::engine::db_model_to_track)
+                                    .collect(),
+                            ),
+                            Err(error) => {
+                                tracing::warn!(%error, "Failed to load playlist tracks");
+                                PlaylistLoadOutcome::Failed
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::debug!("Playlist disappeared before its tracks were loaded");
+                        PlaylistLoadOutcome::Missing
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Failed to identify playlist type");
+                        PlaylistLoadOutcome::Failed
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "Failed to open DB for playlist");
+                PlaylistLoadOutcome::Failed
+            }
+        };
+        let _ = tracks_tx.send(outcome).await;
+    });
+
+    glib::MainContext::default().spawn_local(async move {
+        let Ok(outcome) = tracks_rx.recv().await else {
+            return;
+        };
+        let tracks = match outcome {
+            PlaylistLoadOutcome::Loaded(tracks) => tracks,
+            PlaylistLoadOutcome::Missing => {
+                if evict_source_completion(
+                    &navigation,
+                    &request,
+                    &source_tracks,
+                    &active_source_key,
+                ) {
+                    display_tracks(
+                        &[],
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
+                }
+                return;
+            }
+            PlaylistLoadOutcome::Failed => {
+                // A transient database/query failure is not an empty playlist.
+                // Preserve the last successful cache and visible stale-while-
+                // revalidate snapshot for a later retry.
+                return;
+            }
+        };
+        let objects: Vec<TrackObject> = tracks.iter().map(arch_track_to_object).collect();
+
+        // A paired rename may commit while this database result is in flight.
+        // Overlay the latest committed local paths at the GTK publication
+        // boundary so either callback order converges on the live URI.
+        if let Some(local_tracks) = source_tracks.borrow().get("local") {
+            refresh_projected_library_uris(&objects, local_tracks);
+        }
+
+        let should_render = cache_source_completion(
+            &navigation,
+            &request,
+            &source_tracks,
+            &objects,
+            &active_source_key,
+        );
+        if should_render {
+            display_tracks(
+                &objects,
+                &track_store,
+                &master_tracks,
+                &browser_widget,
+                &browser_state,
+                &status_label,
+                &column_view,
+            );
+        } else {
+            tracing::debug!(
+                source = %request.source_key(),
+                generation = request.generation(),
+                "Playlist result cached or ignored without rendering"
+            );
+        }
+    });
+}
+
 /// Wire the sidebar selection-changed signal.
 ///
 /// This function owns all the logic for switching between sources when
@@ -49,6 +453,7 @@ pub fn setup_source_connect(state: &WindowState) {
     let master_tracks = state.master_tracks.clone();
     let source_tracks = state.source_tracks.clone();
     let active_source_key = state.active_source_key.clone();
+    let source_navigation = state.source_navigation.clone();
     let browser_widget = state.browser_widget.clone();
     let browser_state = state.browser_state.clone();
     let status_label = state.status_label.clone();
@@ -74,15 +479,21 @@ pub fn setup_source_connect(state: &WindowState) {
         // tasks when the user clicks a server that is still connecting
         // (applies to all network sources: Subsonic, Jellyfin, Plex, DAAP).
         if pending_connection.borrow().is_some() {
-            let pending_url = pending_connection.borrow().clone();
-            if let Some(ref pu) = pending_url {
+            let pending = pending_connection.borrow().clone();
+            if let Some(pending) = pending {
                 // If clicking the same server that's already connecting, just ignore.
-                if src.server_url() == *pu {
+                if src.server_url() == pending.source_key() {
                     return;
                 }
                 // If clicking a different server while one is connecting,
                 // also ignore — let the first connection finish first.
                 if src.connecting() || (!src.connected() && !src.server_url().is_empty()) {
+                    restore_pending_selection(
+                        &sidebar_store,
+                        sel,
+                        pending.source_key(),
+                        pre_connect_selection.get(),
+                    );
                     return;
                 }
             }
@@ -90,22 +501,18 @@ pub fn setup_source_connect(state: &WindowState) {
 
         let backend_type = src.backend_type();
 
-        // Determine the source key.
-        // Remote sources use their server URL; local sources with a
-        // specific backend_type (radio, playlist) use that type as
-        // the key so they don't all collapse into "local".
+        // Determine the source key. Device rows carry an explicit logical key;
+        // legacy/remote rows fall back to their server URL, while local static
+        // sources use the backend type so they do not collapse into "local".
+        let explicit_key = src.source_key();
         let url = src.server_url();
-        let key = if !url.is_empty() {
-            url.clone()
-        } else if backend_type == "local" || backend_type.is_empty() {
-            "local".to_string()
-        } else {
-            backend_type.clone()
-        };
+        let key = resolve_source_key(&explicit_key, &url, &backend_type);
 
         // ── Local source: switch to local view ───────────────────
         if key == "local" {
+            source_navigation.borrow_mut().select("local");
             *active_source_key.borrow_mut() = "local".to_string();
+            pre_connect_selection.set(sel.selected());
 
             // Restore music column layout if coming from radio.
             apply_radio_columns(&column_view, false);
@@ -137,7 +544,11 @@ pub fn setup_source_connect(state: &WindowState) {
 
             let playlist_source_key =
                 format!("{}{playlist_id}", super::playback::PLAYLIST_SOURCE_PREFIX);
+            let request = source_navigation
+                .borrow_mut()
+                .select(playlist_source_key.clone());
             *active_source_key.borrow_mut() = playlist_source_key.clone();
+            pre_connect_selection.set(sel.selected());
 
             // Restore music column layout (not radio).
             apply_radio_columns(&column_view, false);
@@ -148,98 +559,43 @@ pub fn setup_source_connect(state: &WindowState) {
             preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
             drop(cfg);
 
-            let is_smart = backend_type == "smart-playlist";
-            let rt_handle = rt_handle.clone();
-            let track_store = track_store.clone();
-            let master_tracks = master_tracks.clone();
-            let browser_widget = browser_widget.clone();
-            let browser_state = browser_state.clone();
-            let status_label = status_label.clone();
-            let column_view = column_view.clone();
-            let pid = playlist_id.clone();
-            let source_tracks_for_load = source_tracks.clone();
-            let active_source_key_for_load = active_source_key.clone();
-            let requested_source_key = playlist_source_key;
+            let cached = source_tracks.borrow().get(&playlist_source_key).cloned();
+            display_tracks(
+                cached.as_deref().unwrap_or_default(),
+                &track_store,
+                &master_tracks,
+                &browser_widget,
+                &browser_state,
+                &status_label,
+                &column_view,
+            );
 
-            let (tracks_tx, tracks_rx) = async_channel::bounded::<String>(1);
-
-            rt_handle.spawn(async move {
-                match crate::db::connection::init_db().await {
-                    Ok(db) => {
-                        let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
-                        let tracks = if is_smart {
-                            mgr.evaluate_smart_playlist(&pid).await
-                        } else {
-                            mgr.get_playlist_tracks(&pid).await
-                        };
-                        match tracks {
-                            Ok(models) => {
-                                let arch_tracks: Vec<crate::architecture::models::Track> = models
-                                    .iter()
-                                    .map(crate::local::engine::db_model_to_track)
-                                    .collect();
-                                let json = serde_json::to_string(&arch_tracks).unwrap_or_default();
-                                let _ = tracks_tx.send(json).await;
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Failed to load playlist tracks");
-                                let _ = tracks_tx.send("[]".to_string()).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to open DB for playlist");
-                        let _ = tracks_tx.send("[]".to_string()).await;
-                    }
-                }
-            });
-
-            glib::MainContext::default().spawn_local(async move {
-                if let Ok(json) = tracks_rx.recv().await {
-                    let tracks: Vec<crate::architecture::models::Track> =
-                        serde_json::from_str(&json).unwrap_or_default();
-                    let objects: Vec<TrackObject> =
-                        tracks.iter().map(arch_track_to_object).collect();
-
-                    // A paired rename may commit while this database result is
-                    // in flight. Overlay the latest committed local paths at
-                    // the GTK publication boundary so either callback order
-                    // converges on the live URI.
-                    if let Some(local_tracks) = source_tracks_for_load.borrow().get("local") {
-                        refresh_projected_library_uris(&objects, local_tracks);
-                    }
-
-                    // A slow playlist query must never replace a source the
-                    // user selected while it was running.
-                    if *active_source_key_for_load.borrow() != requested_source_key {
-                        tracing::debug!(
-                            source = %requested_source_key,
-                            "Ignoring playlist result for an inactive source"
-                        );
-                        return;
-                    }
-                    display_tracks(
-                        &objects,
-                        &track_store,
-                        &master_tracks,
-                        &browser_widget,
-                        &browser_state,
-                        &status_label,
-                        &column_view,
-                    );
-                }
-            });
+            load_playlist_source(
+                rt_handle.clone(),
+                playlist_id,
+                request,
+                source_navigation.clone(),
+                source_tracks.clone(),
+                active_source_key.clone(),
+                track_store.clone(),
+                master_tracks.clone(),
+                browser_widget.clone(),
+                browser_state.clone(),
+                status_label.clone(),
+                column_view.clone(),
+            );
             return;
         }
 
         // ── USB device source: scan and display music files ──────
         if backend_type == "usb-device" {
-            let mount_point = src.server_url();
-            if mount_point.is_empty() {
+            let Some(mount_point) = src.device_mount_point() else {
                 return;
-            }
+            };
 
+            let request = source_navigation.borrow_mut().select(key.clone());
             *active_source_key.borrow_mut() = key.clone();
+            pre_connect_selection.set(sel.selected());
 
             // Restore music column layout if coming from radio.
             apply_radio_columns(&column_view, false);
@@ -263,9 +619,22 @@ pub fn setup_source_connect(state: &WindowState) {
                     &column_view,
                 );
             } else {
+                // The source identity changes immediately, so its projection
+                // must change with it. Leaving the previous source's rows in
+                // place would let a click queue those tracks under this USB
+                // source key while a large device scan is still running.
+                display_tracks(
+                    &[],
+                    &track_store,
+                    &master_tracks,
+                    &browser_widget,
+                    &browser_state,
+                    &status_label,
+                    &column_view,
+                );
+
                 // Scan on a background thread to avoid blocking UI.
-                let mount = mount_point.clone();
-                let source_key = key.clone();
+                let mount = mount_point;
                 let track_store = track_store.clone();
                 let master_tracks = master_tracks.clone();
                 let source_tracks = source_tracks.clone();
@@ -274,6 +643,8 @@ pub fn setup_source_connect(state: &WindowState) {
                 let status_label = status_label.clone();
                 let column_view = column_view.clone();
                 let active_source_key = active_source_key.clone();
+                let source_navigation = source_navigation.clone();
+                let request = request.clone();
 
                 // Serialisable track data for cross-thread transfer.
                 // TrackObject is a GObject (not Send), so we send
@@ -294,57 +665,105 @@ pub fn setup_source_connect(state: &WindowState) {
                     String,
                     String,
                 );
-                let (scan_tx, scan_rx) = async_channel::unbounded::<ScanRow>();
+                let (scan_tx, scan_rx) =
+                    async_channel::bounded::<ScanRow>(USB_SCAN_CHANNEL_CAPACITY);
 
-                // Background thread: walk the device filesystem.
-                std::thread::spawn(move || {
-                    let mount_path = std::path::Path::new(&mount);
-                    for path in enumerate_device_audio_files(mount_path) {
-                        let path = path.as_path();
-                        if let Ok(parsed) = crate::local::tag_parser::parse_audio_file(path) {
-                            let uri = url::Url::from_file_path(path)
-                                .map(|u| u.to_string())
-                                .unwrap_or_default();
-                            let row: ScanRow = (
-                                parsed.track_number.unwrap_or(0),
-                                parsed.title,
-                                parsed.duration_secs.unwrap_or(0),
-                                parsed.artist_name,
-                                parsed.album_title,
-                                parsed.genre.unwrap_or_else(|| "Unknown".to_string()),
-                                parsed.composer.unwrap_or_default(),
-                                parsed.year.unwrap_or(0),
-                                parsed.date_modified.format("%Y-%m-%d").to_string(),
-                                parsed.bitrate_kbps.unwrap_or(0),
-                                parsed.sample_rate_hz.unwrap_or(0),
-                                parsed.format,
-                                uri,
-                            );
-                            let _ = scan_tx.try_send(row);
+                // Background thread: stream the device filesystem into a
+                // bounded channel. A superseded/unplugged receiver closes the
+                // channel, waking send_blocking and stopping the producer.
+                if let Err(error) = std::thread::Builder::new()
+                    .name("usb-scan".to_string())
+                    .spawn(move || {
+                        for path in enumerate_device_audio_files(&mount) {
+                            if scan_tx.is_closed() {
+                                break;
+                            }
+                            let path = path.as_path();
+                            if let Ok(parsed) = crate::local::tag_parser::parse_audio_file(path) {
+                                let uri = url::Url::from_file_path(path)
+                                    .map(|u| u.to_string())
+                                    .unwrap_or_default();
+                                let row: ScanRow = (
+                                    parsed.track_number.unwrap_or(0),
+                                    parsed.title,
+                                    parsed.duration_secs.unwrap_or(0),
+                                    parsed.artist_name,
+                                    parsed.album_title,
+                                    parsed.genre.unwrap_or_else(|| "Unknown".to_string()),
+                                    parsed.composer.unwrap_or_default(),
+                                    parsed.year.unwrap_or(0),
+                                    parsed.date_modified.format("%Y-%m-%d").to_string(),
+                                    parsed.bitrate_kbps.unwrap_or(0),
+                                    parsed.sample_rate_hz.unwrap_or(0),
+                                    parsed.format,
+                                    uri,
+                                );
+                                if scan_tx.send_blocking(row).is_err() {
+                                    break;
+                                }
+                            }
                         }
-                    }
-                    // Close the sender to signal completion.
-                    drop(scan_tx);
-                });
+                    })
+                {
+                    tracing::warn!(%error, "Failed to start USB device scan worker");
+                    // The failed spawn drops its closure and sender, so the
+                    // channel is closed explicitly and this request remains
+                    // uncached, allowing a later selection to retry.
+                    scan_rx.close();
+                    return;
+                }
 
                 // Collect results on the GTK main thread.
                 glib::MainContext::default().spawn_local(async move {
                     let mut objects = Vec::new();
-                    while let Ok(row) = scan_rx.recv().await {
-                        let obj = TrackObject::new(
-                            row.0, &row.1, row.2, &row.3, &row.4, &row.5, &row.6, row.7, &row.8,
-                            row.9, row.10, 0, &row.11, &row.12,
-                        );
-                        objects.push(obj);
+                    loop {
+                        if source_navigation.borrow().completion(&request)
+                            == CompletionDisposition::Ignore
+                        {
+                            scan_rx.close();
+                            return;
+                        }
+
+                        let receive = scan_rx.recv();
+                        futures::pin_mut!(receive);
+                        let cancellation_poll = glib::timeout_future(USB_SCAN_CANCELLATION_POLL);
+                        match futures::future::select(receive, cancellation_poll).await {
+                            futures::future::Either::Left((Ok(row), _)) => {
+                                // Ownership may have changed while recv was
+                                // ready but before GTK resumed this task.
+                                if source_navigation.borrow().completion(&request)
+                                    == CompletionDisposition::Ignore
+                                {
+                                    scan_rx.close();
+                                    return;
+                                }
+                                let obj = TrackObject::new(
+                                    row.0, &row.1, row.2, &row.3, &row.4, &row.5, &row.6, row.7,
+                                    &row.8, row.9, row.10, 0, &row.11, &row.12,
+                                );
+                                objects.push(obj);
+                            }
+                            futures::future::Either::Left((Err(_), _)) => break,
+                            futures::future::Either::Right(((), _)) => {}
+                        }
                     }
 
-                    // Store for future source switches.
-                    source_tracks
-                        .borrow_mut()
-                        .insert(source_key.clone(), objects.clone());
+                    if source_navigation.borrow().completion(&request)
+                        == CompletionDisposition::Ignore
+                    {
+                        scan_rx.close();
+                        return;
+                    }
 
-                    // Display if still the active source.
-                    if *active_source_key.borrow() == source_key {
+                    let should_render = cache_source_completion(
+                        &source_navigation,
+                        &request,
+                        &source_tracks,
+                        &objects,
+                        &active_source_key,
+                    );
+
+                    if should_render {
                         display_tracks(
                             &objects,
                             &track_store,
@@ -362,18 +781,32 @@ pub fn setup_source_connect(state: &WindowState) {
 
         // ── Radio source: fetch stations ────────────────────────
         if is_radio_backend(&backend_type) {
+            let request = source_navigation.borrow_mut().select(backend_type.clone());
             *active_source_key.borrow_mut() = backend_type.clone();
+            pre_connect_selection.set(sel.selected());
 
             // Switch to radio column layout.
             apply_radio_columns(&column_view, true);
             // Hide browser for radio.
             browser_widget.set_visible(false);
 
-            // Clear the tracklist immediately so local songs don't
-            // show while radio stations are loading asynchronously.
-            track_store.remove_all();
-            tracklist::update_status(&status_label, &[]);
-            *master_tracks.borrow_mut() = Vec::new();
+            // Show a prior completed result while refreshing. If this source
+            // has never loaded, clear the old source immediately.
+            if let Some(cached) = source_tracks.borrow().get(&backend_type).cloned() {
+                display_tracks(
+                    &cached,
+                    &track_store,
+                    &master_tracks,
+                    &browser_widget,
+                    &browser_state,
+                    &status_label,
+                    &column_view,
+                );
+            } else {
+                track_store.remove_all();
+                tracklist::update_status(&status_label, &[]);
+                *master_tracks.borrow_mut() = Vec::new();
+            }
 
             // Handle "Stations Near Me" with geo consent.
             if backend_type == super::radio::NEARME_SOURCE_KEY {
@@ -386,6 +819,7 @@ pub fn setup_source_connect(state: &WindowState) {
                 let status_label = status_label.clone();
                 let column_view = column_view.clone();
                 let active_source_key = active_source_key.clone();
+                let source_navigation = source_navigation.clone();
                 let sidebar_selection = sel.clone();
                 let source_tracks = source_tracks.clone();
                 let win = win.clone();
@@ -401,6 +835,8 @@ pub fn setup_source_connect(state: &WindowState) {
                     status_label,
                     column_view,
                     active_source_key,
+                    source_navigation,
+                    request,
                     sidebar_selection,
                     source_tracks,
                 );
@@ -415,7 +851,8 @@ pub fn setup_source_connect(state: &WindowState) {
                 let status_label = status_label.clone();
                 let column_view = column_view.clone();
                 let active_source_key = active_source_key.clone();
-                let requested_source_key = backend_type.clone();
+                let source_navigation = source_navigation.clone();
+                let source_tracks = source_tracks.clone();
 
                 let (stations_tx, stations_rx) = async_channel::bounded::<String>(1);
 
@@ -434,25 +871,27 @@ pub fn setup_source_connect(state: &WindowState) {
 
                 glib::MainContext::default().spawn_local(async move {
                     if let Ok(json) = stations_rx.recv().await {
-                        // The fetch takes seconds. If the user has since picked
-                        // another source, this result is stale and must not
-                        // overwrite whatever they are looking at now.
-                        if *active_source_key.borrow() != requested_source_key {
-                            return;
-                        }
                         let stations: Vec<crate::radio::RadioStation> =
                             serde_json::from_str(&json).unwrap_or_default();
                         let objects: Vec<TrackObject> =
                             stations.iter().map(radio_station_to_track_object).collect();
-                        display_tracks(
+                        if cache_source_completion(
+                            &source_navigation,
+                            &request,
+                            &source_tracks,
                             &objects,
-                            &track_store,
-                            &master_tracks,
-                            &browser_widget,
-                            &browser_state,
-                            &status_label,
-                            &column_view,
-                        );
+                            &active_source_key,
+                        ) {
+                            display_tracks(
+                                &objects,
+                                &track_store,
+                                &master_tracks,
+                                &browser_widget,
+                                &browser_state,
+                                &status_label,
+                                &column_view,
+                            );
+                        }
                     }
                 });
             }
@@ -461,7 +900,9 @@ pub fn setup_source_connect(state: &WindowState) {
 
         // ── Connected source: switch view ───────────────────────
         if src.connected() {
+            source_navigation.borrow_mut().select(key.clone());
             *active_source_key.borrow_mut() = key.clone();
+            pre_connect_selection.set(sel.selected());
 
             // Restore music column layout if coming from radio.
             apply_radio_columns(&column_view, false);
@@ -490,6 +931,7 @@ pub fn setup_source_connect(state: &WindowState) {
         // ── Discovered (unauthenticated) ────────────────────────
         let server_name = src.name();
         let server_url = src.server_url();
+        let advertised_route = src.advertised_route();
         let engine_tx = engine_tx.clone();
         let rt_handle = rt_handle.clone();
         let win = win.clone();
@@ -512,12 +954,25 @@ pub fn setup_source_connect(state: &WindowState) {
             return;
         }
 
+        // Backend/session generations protect remote ownership, but they do
+        // not say whether the user still wants this pending connection to
+        // change the selected source when it completes.
+        let connection_request = source_navigation.borrow_mut().select(server_url.clone());
+
         // For passwordless DAAP servers, bypass the dialog entirely
         // and connect directly.
         if backend_type == "daap" && !requires_password {
-            // Save the current selection so we can revert on failure.
-            pre_connect_selection.set(selected_pos);
-            *pending_connection.borrow_mut() = Some(url_for_closure.clone());
+            // Mint ownership before queuing the task. A final mDNS Lost event
+            // can now invalidate this generation even if Tokio has not yet
+            // started the handshake.
+            let Some(attempt) = crate::daap::begin_connect(url_for_closure.clone()) else {
+                tracing::debug!("Skipping DAAP connect during shutdown");
+                return;
+            };
+            *pending_connection.borrow_mut() = Some(PendingConnection::new(
+                url_for_closure.clone(),
+                connection_request.clone(),
+            ));
 
             // Mark as connecting → spinner in sidebar.
             if let Some(src) = sidebar_store
@@ -540,60 +995,91 @@ pub fn setup_source_connect(state: &WindowState) {
             let sel_for_fail = sel.clone();
             let pre_sel = pre_connect_selection.get();
             let pending_for_fail = pending_connection.clone();
+            let navigation_for_fail = source_navigation.clone();
+            let request_for_fail = connection_request.clone();
+            let url_for_fail = url_for_closure.clone();
             glib::MainContext::default().spawn_local(async move {
                 if fail_rx.recv().await.is_ok() {
-                    if let Some(src) = sidebar_store_for_fail
-                        .item(selected_pos)
-                        .and_downcast_ref::<SourceObject>()
-                    {
-                        src.set_connecting(false);
-                        let src = src.clone();
-                        sidebar_store_for_fail.remove(selected_pos);
-                        sidebar_store_for_fail.insert(selected_pos, &src);
+                    let owns_pending = pending_for_fail
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|pending| pending.request() == &request_for_fail);
+                    if owns_pending {
+                        if let Some((position, source)) =
+                            super::discovery_handler::remote_source_at(
+                                &sidebar_store_for_fail,
+                                &url_for_fail,
+                                "daap",
+                            )
+                        {
+                            source.set_connecting(false);
+                            sidebar_store_for_fail.remove(position);
+                            sidebar_store_for_fail.insert(position, &source);
+                        }
+                        *pending_for_fail.borrow_mut() = None;
+                        if navigation_for_fail.borrow().is_current(&request_for_fail) {
+                            sel_for_fail.set_selected(pre_sel);
+                        }
                     }
-                    // Revert sidebar to the previous selection.
-                    sel_for_fail.set_selected(pre_sel);
-                    // Clear the pending connection guard.
-                    *pending_for_fail.borrow_mut() = None;
                 }
             });
 
             let sidebar_store_for_auth = sidebar_store.clone();
             let sel_for_auth = sel.clone();
             let pending_for_auth = pending_connection.clone();
+            let navigation_for_auth = source_navigation.clone();
+            let request_for_auth = connection_request.clone();
+            let url_for_auth = url_for_closure.clone();
             glib::MainContext::default().spawn_local(async move {
                 if auth_needed_rx.recv().await.is_ok() {
-                    // Clear connecting state and flip requires_password so the
-                    // re-fired selection lands in the auth-dialog branch.
-                    if let Some(src) = sidebar_store_for_auth
-                        .item(selected_pos)
-                        .and_downcast_ref::<SourceObject>()
-                    {
-                        src.set_connecting(false);
-                        src.set_requires_password(true);
-                        let src = src.clone();
-                        sidebar_store_for_auth.remove(selected_pos);
-                        sidebar_store_for_auth.insert(selected_pos, &src);
+                    let owns_pending = pending_for_auth
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|pending| pending.request() == &request_for_auth);
+                    if owns_pending {
+                        let Some((position, source)) = super::discovery_handler::remote_source_at(
+                            &sidebar_store_for_auth,
+                            &url_for_auth,
+                            "daap",
+                        ) else {
+                            *pending_for_auth.borrow_mut() = None;
+                            return;
+                        };
+                        // Clear connecting state and flip requires_password so
+                        // the re-fired selection lands in the dialog branch.
+                        source.set_connecting(false);
+                        source.set_requires_password(true);
+                        sidebar_store_for_auth.remove(position);
+                        sidebar_store_for_auth.insert(position, &source);
+                        *pending_for_auth.borrow_mut() = None;
+                        if navigation_for_auth.borrow().is_current(&request_for_auth) {
+                            // Setting the same position is a no-op in
+                            // GtkSingleSelection, so deselect then reselect.
+                            sel_for_auth.set_selected(gtk::INVALID_LIST_POSITION);
+                            sel_for_auth.set_selected(position);
+                        }
                     }
-                    // Drop the pending guard and re-fire selection-changed.
-                    // Setting the same position is a no-op in GtkSingleSelection,
-                    // so deselect (INVALID_LIST_POSITION) then reselect.
-                    *pending_for_auth.borrow_mut() = None;
-                    sel_for_auth.set_selected(gtk::INVALID_LIST_POSITION);
-                    sel_for_auth.set_selected(selected_pos);
                 }
             });
 
             let engine_tx = engine_tx.clone();
             let server_url = url_for_closure.clone();
             let server_name = name_for_closure.clone();
+            let advertised_route = advertised_route.clone();
             rt_handle.spawn(async move {
                 info!("Connecting to passwordless DAAP server...");
-                let Some(attempt) = crate::daap::begin_connect(server_url.clone()) else {
-                    tracing::debug!("Skipping DAAP connect during shutdown");
+                if !attempt.is_latest() {
+                    tracing::debug!("Skipping withdrawn DAAP connection attempt");
                     return;
-                };
-                match crate::daap::DaapBackend::connect(&server_name, &server_url, None).await {
+                }
+                match crate::daap::DaapBackend::connect_with_route(
+                    &server_name,
+                    &server_url,
+                    None,
+                    advertised_route,
+                )
+                .await
+                {
                     Ok(backend) => {
                         let Some(session) = attempt.retain(backend).await else {
                             tracing::debug!("DAAP connect was superseded");
@@ -629,9 +1115,13 @@ pub fn setup_source_connect(state: &WindowState) {
                             tracing::debug!("Ignoring superseded DAAP connection failure");
                             return;
                         }
-                        tracing::error!(error = %e, "DAAP connection failed");
+                        let category = remote_failure_category(&e);
+                        tracing::error!(
+                            category = category.as_str(),
+                            "Passwordless DAAP connection failed"
+                        );
                         let _ = engine_tx
-                            .send(LibraryEvent::Error(format!("DAAP auth failed: {e}")))
+                            .send(LibraryEvent::Error(category.user_message("DAAP")))
                             .await;
                         let _ = fail_tx.send(()).await;
                     }
@@ -646,8 +1136,10 @@ pub fn setup_source_connect(state: &WindowState) {
         // shown so a second sidebar click while the dialog is open is
         // ignored at the top of this handler. The submit closure and
         // the cancel callback below clear it when appropriate.
-        *pending_connection.borrow_mut() = Some(url_for_closure.clone());
-        pre_connect_selection.set(selected_pos);
+        *pending_connection.borrow_mut() = Some(PendingConnection::new(
+            url_for_closure.clone(),
+            connection_request.clone(),
+        ));
 
         // Clone Rc's before moving into the auth dialog closure so
         // the outer `Fn` closure can be called multiple times.
@@ -658,9 +1150,26 @@ pub fn setup_source_connect(state: &WindowState) {
         // If the user cancels / escapes the auth dialog, drop the
         // pending-connection guard so the next sidebar click works.
         let pending_for_cancel = pending_connection.clone();
+        let navigation_for_cancel = source_navigation.clone();
+        let request_for_cancel = connection_request.clone();
+        let sel_for_cancel = sel.clone();
+        let pre_sel_for_cancel = pre_connect_selection.get();
         let on_cancel = move || {
-            *pending_for_cancel.borrow_mut() = None;
+            let owns_pending = pending_for_cancel
+                .borrow()
+                .as_ref()
+                .is_some_and(|pending| pending.request() == &request_for_cancel);
+            if owns_pending {
+                *pending_for_cancel.borrow_mut() = None;
+                if navigation_for_cancel
+                    .borrow()
+                    .is_current(&request_for_cancel)
+                {
+                    sel_for_cancel.set_selected(pre_sel_for_cancel);
+                }
+            }
         };
+        let navigation_for_submit = source_navigation.clone();
 
         show_auth_dialog(
             &win,
@@ -672,62 +1181,99 @@ pub fn setup_source_connect(state: &WindowState) {
                 let server_url = url_for_closure.clone();
                 let server_name = name_for_closure.clone();
                 let backend_type = backend_type.clone();
+                let connection_request = connection_request.clone();
+
+                // Discovery may update or withdraw the route while the user
+                // is typing. A dialog response owns no authority by itself:
+                // require the original pending/navigation intent and snapshot
+                // the exact current row only at submission time.
+                let Some((current_pos, submitted_source)) = prepare_remote_auth_submission(
+                    &pending_for_auth,
+                    &navigation_for_submit.borrow(),
+                    &connection_request,
+                    &sidebar_store,
+                    &server_url,
+                    &backend_type,
+                ) else {
+                    tracing::debug!(
+                        "Ignoring stale, withdrawn, or duplicate authentication submission"
+                    );
+                    return;
+                };
+                let advertised_route = submitted_source.advertised_route();
+                let Some(connection_attempt) =
+                    begin_remote_connection(&backend_type, server_url.clone())
+                else {
+                    // Controlled shutdown closed the registry. The submission
+                    // still owns this exact pending guard, so release it
+                    // without touching a newer attempt.
+                    *pending_for_auth.borrow_mut() = None;
+                    tracing::debug!("Skipping remote connect during shutdown");
+                    return;
+                };
 
                 // Mark as connecting → spinner in sidebar.
-                if let Some(src) = sidebar_store
-                    .item(selected_pos)
-                    .and_downcast_ref::<SourceObject>()
-                {
-                    src.set_connecting(true);
-                    let src = src.clone();
-                    sidebar_store.remove(selected_pos);
-                    sidebar_store.insert(selected_pos, &src);
-                }
-                // Save the current selection so we can revert on failure.
-                pre_connect_for_auth.set(selected_pos);
-                *pending_for_auth.borrow_mut() = Some(server_url.clone());
+                submitted_source.set_connecting(true);
+                sidebar_store.remove(current_pos);
+                sidebar_store.insert(current_pos, &submitted_source);
 
                 // One-shot to signal failure back to the main thread so we
                 // can clear the spinner (GObjects are not Send).
                 let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
                 let sidebar_store_for_fail = sidebar_store.clone();
+                let backend_for_fail = backend_type.clone();
+                let url_for_fail = server_url.clone();
                 let sel_for_fail = sel_for_auth.clone();
                 let pre_sel = pre_connect_for_auth.get();
                 let pending_for_fail = pending_for_auth.clone();
+                let navigation_for_fail = navigation_for_submit.clone();
+                let request_for_fail = connection_request.clone();
                 glib::MainContext::default().spawn_local(async move {
                     if fail_rx.recv().await.is_ok() {
-                        if let Some(src) = sidebar_store_for_fail
-                            .item(selected_pos)
-                            .and_downcast_ref::<SourceObject>()
-                        {
-                            src.set_connecting(false);
-                            let src = src.clone();
-                            sidebar_store_for_fail.remove(selected_pos);
-                            sidebar_store_for_fail.insert(selected_pos, &src);
+                        let owns_pending = pending_for_fail
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|pending| pending.request() == &request_for_fail);
+                        if owns_pending {
+                            if let Some((position, source)) =
+                                super::discovery_handler::remote_source_at(
+                                    &sidebar_store_for_fail,
+                                    &url_for_fail,
+                                    &backend_for_fail,
+                                )
+                            {
+                                source.set_connecting(false);
+                                sidebar_store_for_fail.remove(position);
+                                sidebar_store_for_fail.insert(position, &source);
+                            }
+                            *pending_for_fail.borrow_mut() = None;
+                            if navigation_for_fail.borrow().is_current(&request_for_fail) {
+                                sel_for_fail.set_selected(pre_sel);
+                            }
                         }
-                        // Revert sidebar to the previous selection.
-                        sel_for_fail.set_selected(pre_sel);
-                        // Clear the pending connection guard.
-                        *pending_for_fail.borrow_mut() = None;
                     }
                 });
 
                 rt_handle.spawn(async move {
+                    if !connection_attempt.is_latest() {
+                        tracing::debug!(
+                            backend = %backend_type,
+                            "Skipping withdrawn remote connection attempt"
+                        );
+                        return;
+                    }
                     let result: Result<
                         Option<RemoteLibrarySnapshot>,
                         crate::architecture::error::BackendError,
                     > = match backend_type.as_str() {
                         "jellyfin" => {
                             info!("Authenticating with Jellyfin...");
-                            let Some(attempt) =
-                                crate::source_registry::begin_connect(server_url.clone())
-                            else {
-                                return;
-                            };
-                            match crate::jellyfin::client::JellyfinClient::authenticate(
+                            let attempt = connection_attempt.into_standard();
+                            match crate::jellyfin::client::JellyfinClient::authenticate_with_route(
                                 &server_url,
                                 &user,
                                 &pass,
+                                advertised_route.clone(),
                             )
                             .await
                             {
@@ -762,15 +1308,12 @@ pub fn setup_source_connect(state: &WindowState) {
                         }
                         "plex" => {
                             info!("Authenticating with Plex...");
-                            let Some(attempt) =
-                                crate::source_registry::begin_connect(server_url.clone())
-                            else {
-                                return;
-                            };
-                            match crate::plex::client::PlexClient::authenticate(
+                            let attempt = connection_attempt.into_standard();
+                            match crate::plex::client::PlexClient::authenticate_with_route(
                                 &server_url,
                                 &user,
                                 &pass,
+                                advertised_route.clone(),
                             )
                             .await
                             {
@@ -810,48 +1353,44 @@ pub fn setup_source_connect(state: &WindowState) {
                             } else {
                                 Some(pass.as_str())
                             };
-                            match crate::daap::begin_connect(server_url.clone()) {
-                                None => Ok(None),
-                                Some(attempt) => match crate::daap::DaapBackend::connect(
-                                    &server_name,
-                                    &server_url,
-                                    password,
-                                )
-                                .await
-                                {
-                                    Ok(backend) => match attempt.retain(backend).await {
-                                        Some(session) => {
-                                            let tracks = session.all_tracks().await;
-                                            if session.is_current() {
-                                                Ok(Some(RemoteLibrarySnapshot::Daap {
-                                                    tracks,
-                                                    generation: session.generation(),
-                                                    session_key: session.session_key(),
-                                                }))
-                                            } else {
-                                                Ok(None)
-                                            }
+                            let attempt = connection_attempt.into_daap();
+                            match crate::daap::DaapBackend::connect_with_route(
+                                &server_name,
+                                &server_url,
+                                password,
+                                advertised_route.clone(),
+                            )
+                            .await
+                            {
+                                Ok(backend) => match attempt.retain(backend).await {
+                                    Some(session) => {
+                                        let tracks = session.all_tracks().await;
+                                        if session.is_current() {
+                                            Ok(Some(RemoteLibrarySnapshot::Daap {
+                                                tracks,
+                                                generation: session.generation(),
+                                                session_key: session.session_key(),
+                                            }))
+                                        } else {
+                                            Ok(None)
                                         }
-                                        None => Ok(None),
-                                    },
-                                    Err(_) if !attempt.is_latest() => Ok(None),
-                                    Err(error) => Err(error),
+                                    }
+                                    None => Ok(None),
                                 },
+                                Err(_) if !attempt.is_latest() => Ok(None),
+                                Err(error) => Err(error),
                             }
                         }
                         _ => {
                             // Default: Subsonic
                             info!("Authenticating with Subsonic...");
-                            let Some(attempt) =
-                                crate::source_registry::begin_connect(server_url.clone())
-                            else {
-                                return;
-                            };
-                            match crate::subsonic::SubsonicBackend::connect(
+                            let attempt = connection_attempt.into_standard();
+                            match crate::subsonic::SubsonicBackend::connect_with_route(
                                 &server_name,
                                 &server_url,
                                 &user,
                                 &pass,
+                                advertised_route.clone(),
                             )
                             .await
                             {
@@ -921,15 +1460,15 @@ pub fn setup_source_connect(state: &WindowState) {
                             "Remote connection was superseded or shutdown-gated"
                         ),
                         Err(e) => {
+                            let category = remote_failure_category(&e);
                             tracing::error!(
                                 backend = %backend_type,
-                                error = %e,
-                                "Authentication failed"
+                                category = category.as_str(),
+                                "{}",
+                                category.log_message()
                             );
                             let _ = engine_tx
-                                .send(LibraryEvent::Error(format!(
-                                    "{backend_type} auth failed: {e}"
-                                )))
+                                .send(LibraryEvent::Error(category.user_message(&backend_type)))
                                 .await;
                             let _ = fail_tx.send(()).await;
                         }
@@ -951,7 +1490,9 @@ pub fn setup_source_connect(state: &WindowState) {
 ///
 /// This matches the policy the library scanner already applies in
 /// `local::engine`.
-fn enumerate_device_audio_files(mount: &std::path::Path) -> Vec<std::path::PathBuf> {
+fn enumerate_device_audio_files(
+    mount: &std::path::Path,
+) -> impl Iterator<Item = std::path::PathBuf> {
     walkdir::WalkDir::new(mount)
         .follow_links(false)
         .into_iter()
@@ -959,14 +1500,200 @@ fn enumerate_device_audio_files(mount: &std::path::Path) -> Vec<std::path::PathB
         .filter(|entry| entry.file_type().is_file())
         .map(walkdir::DirEntry::into_path)
         .filter(|path| crate::local::tag_parser::is_audio_file(path))
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
 
-    use super::enumerate_device_audio_files;
+    use url::Url;
+
+    use crate::architecture::error::BackendError;
+    use crate::architecture::AdvertisedHttpRoute;
+
+    use super::{
+        enumerate_device_audio_files, prepare_remote_auth_submission, remote_failure_category,
+        resolve_source_key, PendingConnection, RemoteFailureCategory, SourceNavigation,
+    };
+
+    #[test]
+    fn explicit_source_identity_precedes_legacy_fallbacks() {
+        assert_eq!(
+            resolve_source_key("device:uuid:123", "file:///legacy", "usb-device"),
+            "device:uuid:123"
+        );
+        assert_eq!(
+            resolve_source_key("", "https://music.example.test", "subsonic"),
+            "https://music.example.test"
+        );
+        assert_eq!(resolve_source_key("", "", "radio-topvote"), "radio-topvote");
+        assert_eq!(resolve_source_key("", "", "local"), "local");
+        assert_eq!(resolve_source_key("", "", ""), "local");
+    }
+
+    fn advertised_route(address: &str) -> AdvertisedHttpRoute {
+        AdvertisedHttpRoute::new(
+            &Url::parse("http://mini.local:4533").expect("route origin"),
+            [address.parse::<SocketAddr>().expect("route address")],
+        )
+        .expect("advertised route")
+    }
+
+    #[test]
+    fn auth_submission_snapshots_the_current_discovery_route() {
+        let store = gtk::gio::ListStore::new::<super::SourceObject>();
+        let source = super::SourceObject::manual("Subsonic", "subsonic", "http://mini.local:4533");
+        source.set_advertised_route(Some(advertised_route("127.0.0.1:1")));
+        store.append(&source);
+
+        let mut navigation = SourceNavigation::new("local");
+        let request = navigation.select("http://mini.local:4533");
+        let pending = RefCell::new(Some(PendingConnection::new(
+            "http://mini.local:4533",
+            request.clone(),
+        )));
+
+        let refreshed_route = advertised_route("127.0.0.2:2");
+        source.set_advertised_route(Some(refreshed_route.clone()));
+        let (_, admitted) = prepare_remote_auth_submission(
+            &pending,
+            &navigation,
+            &request,
+            &store,
+            "HTTP://MINI.LOCAL:4533/",
+            "subsonic",
+        )
+        .expect("current submission");
+
+        assert_eq!(admitted.advertised_route(), Some(refreshed_route));
+        assert!(pending.borrow().is_some());
+    }
+
+    #[test]
+    fn stale_or_withdrawn_auth_submission_releases_only_its_own_guard() {
+        let store = gtk::gio::ListStore::new::<super::SourceObject>();
+        let mut navigation = SourceNavigation::new("local");
+        let stale = navigation.select("http://mini.local:4533");
+        let pending = RefCell::new(Some(PendingConnection::new(
+            "http://mini.local:4533",
+            stale.clone(),
+        )));
+        navigation.select("local");
+
+        assert!(prepare_remote_auth_submission(
+            &pending,
+            &navigation,
+            &stale,
+            &store,
+            "http://mini.local:4533",
+            "subsonic",
+        )
+        .is_none());
+        assert!(pending.borrow().is_none());
+
+        let old = navigation.select("http://mini.local:4533");
+        let newer = navigation.select("http://mini.local:4533");
+        *pending.borrow_mut() = Some(PendingConnection::new(
+            "http://mini.local:4533",
+            newer.clone(),
+        ));
+        assert!(prepare_remote_auth_submission(
+            &pending,
+            &navigation,
+            &old,
+            &store,
+            "http://mini.local:4533",
+            "subsonic",
+        )
+        .is_none());
+        assert_eq!(
+            pending.borrow().as_ref().map(PendingConnection::request),
+            Some(&newer)
+        );
+
+        assert!(prepare_remote_auth_submission(
+            &pending,
+            &navigation,
+            &newer,
+            &store,
+            "http://mini.local:4533",
+            "subsonic",
+        )
+        .is_none());
+        assert!(pending.borrow().is_none());
+    }
+
+    #[test]
+    fn remote_failures_have_typed_secret_free_categories_and_messages() {
+        const SECRET: &str = "server-supplied-secret";
+        let connection = BackendError::ConnectionFailed {
+            message: SECRET.to_string(),
+            source: None,
+        };
+        let cases = [
+            (connection, RemoteFailureCategory::Connection),
+            (
+                BackendError::Timeout { duration_secs: 10 },
+                RemoteFailureCategory::Timeout,
+            ),
+            (
+                BackendError::AuthenticationFailed {
+                    message: SECRET.to_string(),
+                },
+                RemoteFailureCategory::Authentication,
+            ),
+            (
+                BackendError::ParseError {
+                    message: SECRET.to_string(),
+                    source: None,
+                },
+                RemoteFailureCategory::Response,
+            ),
+        ];
+        for (error, expected) in cases {
+            let category = remote_failure_category(&error);
+            assert_eq!(category, expected);
+            assert!(!category.as_str().contains(SECRET));
+            assert!(!category.log_message().contains(SECRET));
+            assert!(!category.user_message("Subsonic").contains(SECRET));
+        }
+    }
+
+    #[test]
+    fn remote_failure_messages_are_localized_for_every_catalog() {
+        const BACKEND: &str = "TestBackend";
+        let categories = [
+            RemoteFailureCategory::Authentication,
+            RemoteFailureCategory::Connection,
+            RemoteFailureCategory::Timeout,
+            RemoteFailureCategory::Response,
+            RemoteFailureCategory::AuthenticationMethod,
+            RemoteFailureCategory::Backend,
+        ];
+
+        for category in categories {
+            let english = category.user_message_for_locale(BACKEND, "en");
+            assert!(english.contains(BACKEND));
+            assert!(!english.contains("%{backend}"));
+
+            for locale in rust_i18n::available_locales!() {
+                let localized = category.user_message_for_locale(BACKEND, &locale);
+                assert!(
+                    localized.contains(BACKEND),
+                    "{locale} must interpolate the backend name for {category:?}"
+                );
+                assert!(!localized.contains("%{backend}"));
+                if locale != "en" {
+                    assert_ne!(
+                        localized, english,
+                        "{locale} must not fall back to English for {category:?}"
+                    );
+                }
+            }
+        }
+    }
 
     struct TestTree {
         path: PathBuf,
@@ -1032,8 +1759,19 @@ mod tests {
         device.audio("Album/cover.jpg");
         device.audio("notes.txt");
 
-        let found = enumerate_device_audio_files(device.path());
+        let found: Vec<_> = enumerate_device_audio_files(device.path()).collect();
         assert_eq!(file_names(&found), vec!["root.mp3", "track.flac"]);
+    }
+
+    #[test]
+    fn device_audio_enumeration_is_lazy() {
+        let device = TestTree::new("lazy");
+        let track = device.audio("removed-before-poll.mp3");
+        let mut paths = enumerate_device_audio_files(device.path());
+
+        std::fs::remove_file(track).expect("remove track before polling iterator");
+
+        assert_eq!(paths.next(), None);
     }
 
     /// The P2.4 defect: the walk followed symlinks, so a stick containing
@@ -1055,7 +1793,7 @@ mod tests {
         )
         .expect("link a file off-device");
 
-        let found = enumerate_device_audio_files(device.path());
+        let found: Vec<_> = enumerate_device_audio_files(device.path()).collect();
 
         assert_eq!(
             file_names(&found),

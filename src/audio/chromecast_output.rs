@@ -1,13 +1,17 @@
 //! Chromecast audio output using one ordered Cast V2 worker/session.
 //!
 //! Chromecast devices are discovered via `_googlecast._tcp.local.` and are
-//! controlled with `rust_cast`. The crate's `CastDevice` is deliberately
-//! non-`Send`, so it is constructed, retained, used, and dropped entirely on
-//! one dedicated OS thread. Every load/control/poll enters that worker's FIFO
-//! command stream.
+//! controlled with `rust_cast`. Its `Rc`-backed message manager and channel
+//! graph remain deliberately non-`Send`, so the transport is constructed,
+//! retained, used, and dropped entirely on one dedicated OS thread. Every
+//! load/control/poll enters that worker's FIFO command stream.
 
+use std::cell::Cell;
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,6 +28,12 @@ const POSITION_POLL_INTERVAL_SECS: u64 = 1;
 const CLEANUP_RETRY_INTERVAL_SECS: u64 = 1;
 const MAX_CLEANUP_ATTEMPTS: u8 = 3;
 const WORKER_TICK_MS: u64 = 100;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const IO_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
+
+const CAST_SENDER_ID: &str = "sender-0";
+const CAST_RECEIVER_ID: &str = "receiver-0";
 
 /// Chromecast audio output — streams to a Cast V2 device.
 pub struct ChromecastOutput {
@@ -99,16 +109,50 @@ impl WorkerTiming {
 #[derive(Debug, Clone, Copy)]
 struct CastFailure {
     operation: &'static str,
+    connection_usable: bool,
 }
 
 impl CastFailure {
     const fn new(operation: &'static str) -> Self {
-        Self { operation }
+        Self {
+            operation,
+            connection_usable: false,
+        }
+    }
+
+    const fn synchronized(operation: &'static str) -> Self {
+        Self {
+            operation,
+            connection_usable: true,
+        }
     }
 }
 
 fn opaque_cast_failure<E>(operation: &'static str, _error: E) -> CastFailure {
     CastFailure::new(operation)
+}
+
+fn rust_cast_failure(operation: &'static str, error: rust_cast::errors::Error) -> CastFailure {
+    match error {
+        // rust_cast reports request-correlated Cast protocol rejections (for
+        // example LOAD_FAILED, LOAD_CANCELLED, INVALID_REQUEST, and invalid
+        // player state) as Internal. Those responses consume a complete Cast
+        // frame, so the stream remains synchronized and remote cleanup is
+        // still safe. Namespace errors are likewise rejected before I/O.
+        rust_cast::errors::Error::Internal(_) | rust_cast::errors::Error::Namespace(_) => {
+            CastFailure::synchronized(operation)
+        }
+        // Any transport, framing, decoding, or deadline error may leave a
+        // partial request or response on the stream. Fail closed instead of
+        // issuing cleanup commands on an indeterminate protocol state.
+        rust_cast::errors::Error::Io(_)
+        | rust_cast::errors::Error::Protobuf(_)
+        | rust_cast::errors::Error::Serialization(_)
+        | rust_cast::errors::Error::Parsing(_)
+        | rust_cast::errors::Error::Dns(_)
+        | rust_cast::errors::Error::Tls(_)
+        | rust_cast::errors::Error::Timeout(_) => CastFailure::new(operation),
+    }
 }
 
 type CastResult<T> = Result<T, CastFailure>;
@@ -175,12 +219,114 @@ trait CastTransport {
 }
 
 struct RustCastConnector {
-    host: String,
-    port: u16,
+    address: SocketAddr,
+    timeouts: CastIoTimeouts,
 }
 
+type CastIo = rustls::StreamOwned<rustls::ClientConnection, DeadlineTcpStream>;
+
 struct RustCastTransport {
-    device: rust_cast::CastDevice<'static>,
+    connection: rust_cast::channels::connection::ConnectionChannel<'static, CastIo>,
+    heartbeat: rust_cast::channels::heartbeat::HeartbeatChannel<'static, CastIo>,
+    media: rust_cast::channels::media::MediaChannel<'static, CastIo>,
+    receiver: rust_cast::channels::receiver::ReceiverChannel<'static, CastIo>,
+    deadline: Rc<DeadlineState>,
+    operation_timeout: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct CastIoTimeouts {
+    connect: Duration,
+    operation: Duration,
+    idle: Duration,
+}
+
+impl CastIoTimeouts {
+    const fn production() -> Self {
+        Self {
+            connect: CONNECT_TIMEOUT,
+            operation: OPERATION_TIMEOUT,
+            idle: IO_IDLE_TIMEOUT,
+        }
+    }
+}
+
+struct DeadlineState {
+    end: Cell<Option<Instant>>,
+    idle: Duration,
+}
+
+impl DeadlineState {
+    fn new(idle: Duration) -> Self {
+        Self {
+            end: Cell::new(None),
+            idle,
+        }
+    }
+
+    fn arm(self: &Rc<Self>, duration: Duration) -> DeadlineGuard {
+        let end = Instant::now()
+            .checked_add(duration)
+            .unwrap_or_else(Instant::now);
+        self.end.set(Some(end));
+        DeadlineGuard {
+            state: Rc::clone(self),
+        }
+    }
+
+    fn io_timeout(&self) -> io::Result<Duration> {
+        let Some(end) = self.end.get() else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Chromecast I/O attempted without a deadline",
+            ));
+        };
+        let remaining = end.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Chromecast operation deadline elapsed",
+            ));
+        }
+        Ok(remaining.min(self.idle))
+    }
+}
+
+struct DeadlineGuard {
+    state: Rc<DeadlineState>,
+}
+
+impl Drop for DeadlineGuard {
+    fn drop(&mut self) {
+        self.state.end.set(None);
+    }
+}
+
+struct DeadlineTcpStream {
+    stream: TcpStream,
+    deadline: Rc<DeadlineState>,
+}
+
+impl Read for DeadlineTcpStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let timeout = self.deadline.io_timeout()?;
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.read(buffer)
+    }
+}
+
+impl Write for DeadlineTcpStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let timeout = self.deadline.io_timeout()?;
+        self.stream.set_write_timeout(Some(timeout))?;
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let timeout = self.deadline.io_timeout()?;
+        self.stream.set_write_timeout(Some(timeout))?;
+        self.stream.flush()
+    }
 }
 
 impl CastConnector for RustCastConnector {
@@ -190,61 +336,117 @@ impl CastConnector for RustCastConnector {
         // Cast devices use self-signed certificates with no verifiable host.
         // This is inherent to Cast V2 and leaves the control channel exposed
         // to endpoint impersonation on a hostile LAN (tracked in P1.6).
-        let device: rust_cast::CastDevice<'static> =
-            rust_cast::CastDevice::connect_without_host_verification(self.host.clone(), self.port)
-                .map_err(|error| opaque_cast_failure("TLS connection", error))?;
-        Ok(RustCastTransport { device })
+        let stream = TcpStream::connect_timeout(&self.address, self.timeouts.connect)
+            .map_err(|error| opaque_cast_failure("TCP connection", error))?;
+        let _ = stream.set_nodelay(true);
+
+        let mut config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(rust_cast::NoCertificateVerification {}))
+            .with_no_client_auth();
+        config.key_log = Arc::new(rustls::KeyLogFile::new());
+        let server_name = rustls::pki_types::ServerName::IpAddress(self.address.ip().into());
+        let connection = rustls::ClientConnection::new(Arc::new(config), server_name)
+            .map_err(|error| opaque_cast_failure("TLS connection", error))?;
+
+        // rust_cast's high-level CastDevice constructor hides its TcpStream,
+        // but its public channel layer accepts any Read + Write transport.
+        // Compose those channels over our deadline-enforcing stream so one
+        // worker-owned, deliberately non-Send session retains absolute I/O
+        // deadlines for every protocol operation.
+        let deadline = Rc::new(DeadlineState::new(self.timeouts.idle));
+        let stream = rustls::StreamOwned::new(
+            connection,
+            DeadlineTcpStream {
+                stream,
+                deadline: Rc::clone(&deadline),
+            },
+        );
+        let manager = Rc::new(rust_cast::message_manager::MessageManager::new(stream));
+        let connection = rust_cast::channels::connection::ConnectionChannel::new(
+            CAST_SENDER_ID,
+            Rc::clone(&manager),
+        );
+        let heartbeat = rust_cast::channels::heartbeat::HeartbeatChannel::new(
+            CAST_SENDER_ID,
+            CAST_RECEIVER_ID,
+            Rc::clone(&manager),
+        );
+        let media =
+            rust_cast::channels::media::MediaChannel::new(CAST_SENDER_ID, Rc::clone(&manager));
+        let receiver = rust_cast::channels::receiver::ReceiverChannel::new(
+            CAST_SENDER_ID,
+            CAST_RECEIVER_ID,
+            manager,
+        );
+        Ok(RustCastTransport {
+            connection,
+            heartbeat,
+            media,
+            receiver,
+            deadline,
+            operation_timeout: self.timeouts.operation,
+        })
+    }
+}
+
+impl RustCastTransport {
+    fn with_deadline<T>(
+        &self,
+        operation: &'static str,
+        call: impl FnOnce(&Self) -> Result<T, rust_cast::errors::Error>,
+    ) -> CastResult<T> {
+        let _guard = self.deadline.arm(self.operation_timeout);
+        call(self).map_err(|error| rust_cast_failure(operation, error))
     }
 }
 
 impl CastTransport for RustCastTransport {
     fn connect_receiver(&mut self) -> CastResult<()> {
-        self.device
-            .connection
-            .connect("receiver-0")
-            .map_err(|error| opaque_cast_failure("receiver channel connection", error))
+        self.with_deadline("receiver channel connection", |transport| {
+            transport.connection.connect(CAST_RECEIVER_ID)
+        })
     }
 
     fn set_volume(&mut self, level: f64) -> CastResult<()> {
-        self.device
-            .receiver
-            .set_volume(level.clamp(0.0, 1.0) as f32)
-            .map(|_| ())
-            .map_err(|error| opaque_cast_failure("volume update", error))
+        self.with_deadline("volume update", |transport| {
+            transport
+                .receiver
+                .set_volume(level.clamp(0.0, 1.0) as f32)
+                .map(|_| ())
+        })
     }
 
     fn launch_receiver(&mut self) -> CastResult<AppSession> {
         use rust_cast::channels::receiver::CastDeviceApp;
 
-        self.device
-            .receiver
-            .launch_app(&CastDeviceApp::DefaultMediaReceiver)
-            .map(|app| AppSession {
-                transport_id: app.transport_id,
-                session_id: app.session_id,
-            })
-            .map_err(|error| opaque_cast_failure("receiver launch", error))
+        self.with_deadline("receiver launch", |transport| {
+            transport
+                .receiver
+                .launch_app(&CastDeviceApp::DefaultMediaReceiver)
+                .map(|app| AppSession {
+                    transport_id: app.transport_id,
+                    session_id: app.session_id,
+                })
+        })
     }
 
     fn connect_app(&mut self, app: &AppSession) -> CastResult<()> {
-        self.device
-            .connection
-            .connect(app.transport_id.clone())
-            .map_err(|error| opaque_cast_failure("application channel connection", error))
+        self.with_deadline("application channel connection", |transport| {
+            transport.connection.connect(app.transport_id.clone())
+        })
     }
 
     fn disconnect_app(&mut self, app: &AppSession) -> CastResult<()> {
-        self.device
-            .connection
-            .disconnect(app.transport_id.clone())
-            .map_err(|error| opaque_cast_failure("application channel disconnection", error))
+        self.with_deadline("application channel disconnection", |transport| {
+            transport.connection.disconnect(app.transport_id.clone())
+        })
     }
 
     fn stop_app(&mut self, app: &AppSession) -> CastResult<()> {
-        self.device
-            .receiver
-            .stop_app(app.session_id.clone())
-            .map_err(|error| opaque_cast_failure("receiver application stop", error))
+        self.with_deadline("receiver application stop", |transport| {
+            transport.receiver.stop_app(app.session_id.clone())
+        })
     }
 
     fn load(&mut self, app: &AppSession, uri: &str) -> CastResult<CastStatusSnapshot> {
@@ -262,27 +464,30 @@ impl CastTransport for RustCastTransport {
             duration: None,
             metadata: None,
         };
-        self.device
-            .media
-            .load(app.transport_id.clone(), app.session_id.clone(), &media)
-            .map(snapshot_from_status)
-            .map_err(|error| opaque_cast_failure("media load", error))
+        self.with_deadline("media load", |transport| {
+            transport
+                .media
+                .load(app.transport_id.clone(), app.session_id.clone(), &media)
+                .map(snapshot_from_status)
+        })
     }
 
     fn play(&mut self, app: &AppSession, media_session_id: i32) -> CastResult<()> {
-        self.device
-            .media
-            .play(app.transport_id.clone(), media_session_id)
-            .map(|_| ())
-            .map_err(|error| opaque_cast_failure("play command", error))
+        self.with_deadline("play command", |transport| {
+            transport
+                .media
+                .play(app.transport_id.clone(), media_session_id)
+                .map(|_| ())
+        })
     }
 
     fn pause(&mut self, app: &AppSession, media_session_id: i32) -> CastResult<()> {
-        self.device
-            .media
-            .pause(app.transport_id.clone(), media_session_id)
-            .map(|_| ())
-            .map_err(|error| opaque_cast_failure("pause command", error))
+        self.with_deadline("pause command", |transport| {
+            transport
+                .media
+                .pause(app.transport_id.clone(), media_session_id)
+                .map(|_| ())
+        })
     }
 
     fn seek(
@@ -292,31 +497,30 @@ impl CastTransport for RustCastTransport {
         position_ms: u64,
     ) -> CastResult<()> {
         let seconds = (position_ms as f64 / 1000.0).min(f32::MAX as f64) as f32;
-        self.device
-            .media
-            .seek(
-                app.transport_id.clone(),
-                media_session_id,
-                Some(seconds),
-                None,
-            )
-            .map(|_| ())
-            .map_err(|error| opaque_cast_failure("seek command", error))
+        self.with_deadline("seek command", |transport| {
+            transport
+                .media
+                .seek(
+                    app.transport_id.clone(),
+                    media_session_id,
+                    Some(seconds),
+                    None,
+                )
+                .map(|_| ())
+        })
     }
 
     fn stop(&mut self, app: &AppSession, media_session_id: i32) -> CastResult<()> {
-        self.device
-            .media
-            .stop(app.transport_id.clone(), media_session_id)
-            .map(|_| ())
-            .map_err(|error| opaque_cast_failure("stop command", error))
+        self.with_deadline("stop command", |transport| {
+            transport
+                .media
+                .stop(app.transport_id.clone(), media_session_id)
+                .map(|_| ())
+        })
     }
 
     fn heartbeat(&mut self) -> CastResult<()> {
-        self.device
-            .heartbeat
-            .ping()
-            .map_err(|error| opaque_cast_failure("heartbeat", error))
+        self.with_deadline("heartbeat", |transport| transport.heartbeat.ping())
     }
 
     fn status(
@@ -324,11 +528,12 @@ impl CastTransport for RustCastTransport {
         app: &AppSession,
         media_session_id: i32,
     ) -> CastResult<CastStatusSnapshot> {
-        self.device
-            .media
-            .get_status(app.transport_id.clone(), Some(media_session_id))
-            .map(snapshot_from_status)
-            .map_err(|error| opaque_cast_failure("status poll", error))
+        self.with_deadline("status poll", |transport| {
+            transport
+                .media
+                .get_status(app.transport_id.clone(), Some(media_session_id))
+                .map(snapshot_from_status)
+        })
     }
 }
 
@@ -452,7 +657,7 @@ fn run_cast_worker<C>(
                     timing.cleanup_retry.saturating_sub(last_attempt.elapsed())
                 }),
             Some(session) if session.media_session_id.is_some() => timing.tick,
-            _ => Duration::from_secs(3600),
+            _ => Duration::from_hours(1),
         };
         match worker_rx.recv_timeout(wait) {
             Ok(command) => {
@@ -709,7 +914,7 @@ fn handle_load<C>(
             .expect("launched session recorded")
             .app_connected = true;
     }
-    if !is_current(owner, intent_epoch) {
+    if discard_poisoned_session_if_stale(active, &result, owner, intent_epoch) {
         return;
     }
     if let Err(failure) = result {
@@ -743,7 +948,7 @@ fn handle_load<C>(
                 .media_session_id = Some(media_session_id);
         }
     }
-    if !is_current(owner, intent_epoch) {
+    if discard_poisoned_session_if_stale(active, &loaded, owner, intent_epoch) {
         return;
     }
     let loaded = match loaded {
@@ -764,7 +969,7 @@ fn handle_load<C>(
         cleanup_then_fail(
             active,
             owner,
-            CastFailure::new("media session creation"),
+            CastFailure::synchronized("media session creation"),
             intent_epoch,
             current_state,
             event_tx,
@@ -806,7 +1011,7 @@ fn handle_load<C>(
             cleanup_then_fail(
                 active,
                 owner,
-                CastFailure::new("media startup"),
+                CastFailure::synchronized("media startup"),
                 intent_epoch,
                 current_state,
                 event_tx,
@@ -817,7 +1022,7 @@ fn handle_load<C>(
             cleanup_then_fail(
                 active,
                 owner,
-                CastFailure::new("media startup"),
+                CastFailure::synchronized("media startup"),
                 intent_epoch,
                 current_state,
                 event_tx,
@@ -869,13 +1074,46 @@ fn cleanup_then_fail<T>(
 ) where
     T: CastTransport,
 {
-    if let Some(session) = active.as_mut() {
-        session.retired = true;
+    if failure.connection_usable {
+        if let Some(session) = active.as_mut() {
+            session.retired = true;
+        }
+        let _ = cleanup_session(active, owner, intent_epoch);
+    } else {
+        // A timeout, partial frame, TLS error, or malformed response can leave
+        // unread bytes or a half-written request on the Cast stream. Drop the
+        // session immediately instead of multiplying one deadline across
+        // cleanup calls on a protocol state that is no longer synchronized.
+        active.take();
     }
-    let _ = cleanup_session(active, owner, intent_epoch);
     if is_current(owner, intent_epoch) {
         fail_cast(owner, failure, intent_epoch, current_state, event_tx);
     }
+}
+
+/// Return whether an in-flight operation was superseded, dropping a session
+/// that the completed operation proved can no longer be used safely.
+///
+/// A newer intent may arrive while blocking Cast I/O is still within its
+/// deadline. Keeping a stream that then reports a transport/protocol failure
+/// would make the newer intent spend another full operation budget attempting
+/// cleanup on a desynchronized connection.
+fn discard_poisoned_session_if_stale<T, U>(
+    active: &mut Option<WorkerSession<T>>,
+    result: &CastResult<U>,
+    owner: CommandOwner,
+    intent_epoch: &AtomicU64,
+) -> bool {
+    if is_current(owner, intent_epoch) {
+        return false;
+    }
+    if result
+        .as_ref()
+        .is_err_and(|failure| !failure.connection_usable)
+    {
+        active.take();
+    }
+    true
 }
 
 fn handle_control<T>(
@@ -936,7 +1174,7 @@ fn handle_control<T>(
         _ => return,
     };
 
-    if !is_current(owner, intent_epoch) {
+    if discard_poisoned_session_if_stale(active, &result, owner, intent_epoch) {
         return;
     }
     if let Err(failure) = result {
@@ -990,7 +1228,7 @@ fn poll_active<T>(
             .expect("active session checked")
             .transport
             .heartbeat();
-        if !is_current(owner, intent_epoch) {
+        if discard_poisoned_session_if_stale(active, &result, owner, intent_epoch) {
             return;
         }
         if let Err(failure) = result {
@@ -1022,7 +1260,7 @@ fn poll_active<T>(
         let session = active.as_mut().expect("active session checked");
         session.transport.status(&session.app, media_session_id)
     };
-    if !is_current(owner, intent_epoch) {
+    if discard_poisoned_session_if_stale(active, &status, owner, intent_epoch) {
         return;
     }
     let status = match status {
@@ -1090,7 +1328,7 @@ fn poll_active<T>(
             cleanup_then_fail(
                 active,
                 owner,
-                CastFailure::new("remote playback"),
+                CastFailure::synchronized("remote playback"),
                 intent_epoch,
                 current_state,
                 event_tx,
@@ -1145,7 +1383,8 @@ where
     if let Some(media_session_id) = session.media_session_id {
         match session.transport.stop(&session.app, media_session_id) {
             Ok(()) => session.media_session_id = None,
-            Err(failure) => first_failure = Some(failure),
+            Err(failure) if failure.connection_usable => first_failure = Some(failure),
+            Err(failure) => return CleanupOutcome::Failed(failure),
         }
         if !is_current(owner, intent_epoch) {
             *active = Some(session);
@@ -1156,9 +1395,10 @@ where
     if session.app_connected {
         match session.transport.disconnect_app(&session.app) {
             Ok(()) => session.app_connected = false,
-            Err(failure) => {
+            Err(failure) if failure.connection_usable => {
                 first_failure.get_or_insert(failure);
             }
+            Err(failure) => return CleanupOutcome::Failed(failure),
         }
         if !is_current(owner, intent_epoch) {
             *active = Some(session);
@@ -1169,15 +1409,17 @@ where
     let app_stop = session.transport.stop_app(&session.app);
     if let Err(failure) = app_stop {
         first_failure.get_or_insert(failure);
-        session.last_cleanup_attempt = Some(Instant::now());
-        session.cleanup_attempts = session.cleanup_attempts.saturating_add(1);
-        if session.cleanup_attempts < MAX_CLEANUP_ATTEMPTS {
-            *active = Some(session);
-        } else {
-            error!(
-                attempts = MAX_CLEANUP_ATTEMPTS,
-                "Abandoning unreachable Chromecast receiver application"
-            );
+        if failure.connection_usable {
+            session.last_cleanup_attempt = Some(Instant::now());
+            session.cleanup_attempts = session.cleanup_attempts.saturating_add(1);
+            if session.cleanup_attempts < MAX_CLEANUP_ATTEMPTS {
+                *active = Some(session);
+            } else {
+                error!(
+                    attempts = MAX_CLEANUP_ATTEMPTS,
+                    "Abandoning unreachable Chromecast receiver application"
+                );
+            }
         }
     }
     if !is_current(owner, intent_epoch) {
@@ -1222,10 +1464,21 @@ where
 {
     if let Some(mut session) = active.take() {
         if let Some(media_session_id) = session.media_session_id {
-            let _ = session.transport.stop(&session.app, media_session_id);
+            if session
+                .transport
+                .stop(&session.app, media_session_id)
+                .is_err_and(|failure| !failure.connection_usable)
+            {
+                return;
+            }
         }
-        if session.app_connected {
-            let _ = session.transport.disconnect_app(&session.app);
+        if session.app_connected
+            && session
+                .transport
+                .disconnect_app(&session.app)
+                .is_err_and(|failure| !failure.connection_usable)
+        {
+            return;
         }
         let _ = session.transport.stop_app(&session.app);
     }
@@ -1395,18 +1648,17 @@ fn classify_cast_uri(uri: &str) -> CastMedia {
 impl ChromecastOutput {
     pub fn new(
         display_name: &str,
-        host: &str,
-        port: u16,
+        address: SocketAddr,
         event_tx: async_channel::Sender<PlayerEvent>,
         initial_volume: f64,
     ) -> Self {
-        info!(host = %host, port, name = %display_name, "Chromecast output configured");
+        info!(%address, name = %display_name, "Chromecast output configured");
         let current_state = Arc::new(Mutex::new(PlayerState::Stopped));
         let intent_epoch = Arc::new(AtomicU64::new(0));
         let worker_tx = spawn_cast_worker(
             RustCastConnector {
-                host: host.to_string(),
-                port,
+                address,
+                timeouts: CastIoTimeouts::production(),
             },
             Arc::clone(&intent_epoch),
             Arc::clone(&current_state),
@@ -1757,6 +2009,7 @@ mod tests {
         actions: Mutex<Vec<Action>>,
         gate: Mutex<Option<Gate>>,
         fail_at: Mutex<Option<Point>>,
+        poison_at: Mutex<Option<Point>>,
         fail_once_at: Mutex<Option<Point>>,
         notification: Mutex<Option<(Point, mpsc::Sender<()>)>>,
         load_statuses: Mutex<VecDeque<CastStatusSnapshot>>,
@@ -1769,6 +2022,7 @@ mod tests {
                 actions: Mutex::new(Vec::new()),
                 gate: Mutex::new(None),
                 fail_at: Mutex::new(None),
+                poison_at: Mutex::new(None),
                 fail_once_at: Mutex::new(None),
                 notification: Mutex::new(None),
                 load_statuses: Mutex::new(VecDeque::new()),
@@ -1815,8 +2069,11 @@ mod tests {
                     .recv_timeout(Duration::from_secs(2))
                     .map_err(|_| CastFailure::new("test gate release"))?;
             }
-            if self.fail_at.lock().expect("failure lock").as_ref() == Some(&point) {
+            if self.poison_at.lock().expect("poison lock").as_ref() == Some(&point) {
                 return Err(CastFailure::new(point.operation()));
+            }
+            if self.fail_at.lock().expect("failure lock").as_ref() == Some(&point) {
+                return Err(CastFailure::synchronized(point.operation()));
             }
             let fail_once = {
                 let mut fail_once_at = self.fail_once_at.lock().expect("one-shot failure lock");
@@ -1828,7 +2085,7 @@ mod tests {
                 }
             };
             if fail_once {
-                return Err(CastFailure::new(point.operation()));
+                return Err(CastFailure::synchronized(point.operation()));
             }
             Ok(())
         }
@@ -1994,8 +2251,8 @@ mod tests {
             Self::new_with_timing(
                 shared,
                 WorkerTiming {
-                    heartbeat: Duration::from_secs(3600),
-                    poll: Duration::from_secs(3600),
+                    heartbeat: Duration::from_hours(1),
+                    poll: Duration::from_hours(1),
                     cleanup_retry: Duration::from_millis(10),
                     tick: Duration::from_millis(10),
                 },
@@ -2003,6 +2260,13 @@ mod tests {
         }
 
         fn new_with_timing(shared: Arc<FakeShared>, timing: WorkerTiming) -> Self {
+            Self::new_with_connector(FakeConnector { shared }, timing)
+        }
+
+        fn new_with_connector<C>(connector: C, timing: WorkerTiming) -> Self
+        where
+            C: CastConnector,
+        {
             let (tx, rx) = mpsc::channel();
             let epoch = Arc::new(AtomicU64::new(0));
             let state = Arc::new(Mutex::new(PlayerState::Stopped));
@@ -2011,7 +2275,7 @@ mod tests {
             let state_for_worker = Arc::clone(&state);
             let worker = std::thread::spawn(move || {
                 run_cast_worker(
-                    FakeConnector { shared },
+                    connector,
                     rx,
                     epoch_for_worker,
                     state_for_worker,
@@ -2065,6 +2329,207 @@ mod tests {
                 .join()
                 .expect("worker stopped");
         }
+    }
+
+    struct SilentCastServer {
+        address: SocketAddr,
+        accepted: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl SilentCastServer {
+        fn start(expected_connections: usize) -> Self {
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("bind silent Cast server");
+            let address = listener.local_addr().expect("silent Cast address");
+            let (accepted_tx, accepted) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut streams = Vec::with_capacity(expected_connections);
+                for _ in 0..expected_connections {
+                    let (stream, _) = listener.accept().expect("accept Cast client");
+                    streams.push(stream);
+                    accepted_tx.send(()).expect("report accepted Cast client");
+                }
+                assert_eq!(streams.len(), expected_connections);
+                let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            });
+            Self {
+                address,
+                accepted,
+                release,
+                worker: Some(worker),
+            }
+        }
+
+        fn wait_for_connection(&self) {
+            self.accepted
+                .recv_timeout(Duration::from_secs(2))
+                .expect("silent Cast connection accepted");
+        }
+
+        fn finish(mut self) {
+            let _ = self.release.send(());
+            self.worker
+                .take()
+                .expect("silent server worker")
+                .join()
+                .expect("silent server stopped");
+        }
+    }
+
+    fn short_io_connector(address: SocketAddr) -> RustCastConnector {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        RustCastConnector {
+            address,
+            timeouts: CastIoTimeouts {
+                connect: Duration::from_millis(250),
+                operation: Duration::from_millis(75),
+                idle: Duration::from_millis(50),
+            },
+        }
+    }
+
+    fn quiet_worker_timing() -> WorkerTiming {
+        WorkerTiming {
+            heartbeat: Duration::from_hours(1),
+            poll: Duration::from_hours(1),
+            cleanup_retry: Duration::from_millis(10),
+            tick: Duration::from_millis(10),
+        }
+    }
+
+    #[test]
+    fn trickled_bytes_cannot_extend_the_absolute_io_deadline() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind trickle server");
+        let address = listener.local_addr().expect("trickle server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept trickle client");
+            for byte in 0_u8..32 {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        });
+        let state = Rc::new(DeadlineState::new(Duration::from_secs(1)));
+        let mut stream = DeadlineTcpStream {
+            stream: TcpStream::connect(address).expect("connect trickle client"),
+            deadline: Rc::clone(&state),
+        };
+        let started = Instant::now();
+        let _guard = state.arm(Duration::from_millis(75));
+        let mut bytes = [0_u8; 32];
+        assert!(stream.read_exact(&mut bytes).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(stream);
+        server.join().expect("trickle server stopped");
+    }
+
+    #[test]
+    fn silent_receiver_cannot_pin_stop() {
+        let server = SilentCastServer::start(1);
+        let harness =
+            Harness::new_with_connector(short_io_connector(server.address), quiet_worker_timing());
+        let load = harness.next_owner(1);
+        harness.send(
+            load,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        server.wait_for_connection();
+
+        let stop = harness.next_owner(2);
+        harness.send(stop, CommandKind::Stop);
+        harness.fence(stop);
+        assert!(harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged { generation, state: PlayerState::Stopped }
+                if *generation == PlayerEventGeneration::from_raw(2)
+        )));
+
+        harness.shutdown();
+        server.finish();
+    }
+
+    #[test]
+    fn silent_receiver_cannot_pin_replacement_load() {
+        let server = SilentCastServer::start(2);
+        let harness =
+            Harness::new_with_connector(short_io_connector(server.address), quiet_worker_timing());
+        let first = harness.next_owner(1);
+        harness.send(
+            first,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        server.wait_for_connection();
+
+        let replacement = harness.next_owner(2);
+        harness.send(
+            replacement,
+            CommandKind::Load {
+                uri: "https://music.test/b".to_string(),
+                volume: 0.5,
+            },
+        );
+        server.wait_for_connection();
+        harness.fence(replacement);
+        assert!(harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::Error { generation, .. }
+                if *generation == PlayerEventGeneration::from_raw(2)
+        )));
+
+        harness.shutdown();
+        server.finish();
+    }
+
+    #[test]
+    fn silent_receiver_cannot_pin_shutdown() {
+        let server = SilentCastServer::start(1);
+        let mut harness =
+            Harness::new_with_connector(short_io_connector(server.address), quiet_worker_timing());
+        let load = harness.next_owner(1);
+        harness.send(
+            load,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        server.wait_for_connection();
+
+        let shutdown = harness.next_owner(2);
+        harness.send(shutdown, CommandKind::Shutdown);
+        let started = Instant::now();
+        while !harness
+            .worker
+            .as_ref()
+            .expect("worker handle")
+            .is_finished()
+            && started.elapsed() < Duration::from_secs(1)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(harness
+            .worker
+            .as_ref()
+            .expect("worker handle")
+            .is_finished());
+        harness
+            .worker
+            .take()
+            .expect("worker handle")
+            .join()
+            .expect("worker stopped");
+        server.finish();
     }
 
     #[test]
@@ -2382,6 +2847,114 @@ mod tests {
     }
 
     #[test]
+    fn semantic_load_failure_disconnects_and_stops_the_receiver_app() {
+        let shared = FakeShared::new();
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Load);
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+
+        assert!(shared.actions().ends_with(&[
+            Action::Point(Point::Load),
+            Action::Point(Point::AppDisconnect),
+            Action::Point(Point::AppStop),
+        ]));
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Buffering,
+                    ..
+                },
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn poisoned_control_failure_drops_the_session_without_protocol_cleanup() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+        *shared.poison_at.lock().expect("poison lock") = Some(Point::Pause);
+
+        harness.send(owner, CommandKind::Pause);
+        harness.fence(owner);
+
+        assert_eq!(shared.actions(), vec![Action::Point(Point::Pause)]);
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn superseded_poisoned_control_drops_without_delaying_the_new_intent() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let first = harness.next_owner(1);
+        harness.send(
+            first,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(first);
+        shared.clear_actions();
+        let _ = harness.events();
+        *shared.poison_at.lock().expect("poison lock") = Some(Point::Pause);
+        let (entered, release) = shared.install_gate(Point::Pause);
+
+        harness.send(first, CommandKind::Pause);
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pause entered");
+        let stop = harness.next_owner(2);
+        harness.send(stop, CommandKind::Stop);
+        release.send(()).expect("release pause");
+        harness.fence(stop);
+
+        assert_eq!(shared.actions(), vec![Action::Point(Point::Pause)]);
+        assert!(!harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::Error { generation, .. }
+                if *generation == PlayerEventGeneration::from_raw(1)
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
     fn explicit_stop_failure_is_reported_after_best_effort_cleanup() {
         let shared = FakeShared::new();
         let harness = Harness::new(Arc::clone(&shared));
@@ -2429,10 +3002,10 @@ mod tests {
         let harness = Harness::new_with_timing(
             Arc::clone(&shared),
             WorkerTiming {
-                heartbeat: Duration::from_secs(3600),
-                poll: Duration::from_secs(3600),
+                heartbeat: Duration::from_hours(1),
+                poll: Duration::from_hours(1),
                 cleanup_retry: Duration::ZERO,
-                tick: Duration::from_secs(3600),
+                tick: Duration::from_hours(1),
             },
         );
         let owner = harness.next_owner(1);
@@ -2506,10 +3079,10 @@ mod tests {
         let harness = Harness::new_with_timing(
             Arc::clone(&shared),
             WorkerTiming {
-                heartbeat: Duration::from_secs(3600),
-                poll: Duration::from_secs(3600),
+                heartbeat: Duration::from_hours(1),
+                poll: Duration::from_hours(1),
                 cleanup_retry: Duration::ZERO,
-                tick: Duration::from_secs(3600),
+                tick: Duration::from_hours(1),
             },
         );
         let first = harness.next_owner(1);
@@ -2813,10 +3386,10 @@ mod tests {
         let harness = Harness::new_with_timing(
             Arc::clone(&shared),
             WorkerTiming {
-                heartbeat: Duration::from_secs(3600),
+                heartbeat: Duration::from_hours(1),
                 poll: Duration::ZERO,
                 cleanup_retry: Duration::from_millis(10),
-                tick: Duration::from_secs(3600),
+                tick: Duration::from_hours(1),
             },
         );
         let owner = harness.next_owner(1);
@@ -2861,9 +3434,37 @@ mod tests {
     }
 
     #[test]
+    fn rust_cast_error_classification_preserves_only_synchronized_failures() {
+        let semantic = rust_cast_failure(
+            "media load",
+            rust_cast::errors::Error::Internal("Failed to load media.".to_string()),
+        );
+        let timeout = rust_cast_failure(
+            "media load",
+            rust_cast::errors::Error::Timeout("response deadline elapsed".to_string()),
+        );
+        let io = rust_cast_failure(
+            "media load",
+            rust_cast::errors::Error::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "partial Cast frame",
+            )),
+        );
+
+        assert!(semantic.connection_usable);
+        assert!(!timeout.connection_usable);
+        assert!(!io.connection_usable);
+    }
+
+    #[test]
     fn invalid_local_uri_error_is_secret_free() {
         let (event_tx, events) = async_channel::unbounded();
-        let output = ChromecastOutput::new("Living Room", "127.0.0.1", 8009, event_tx, 1.0);
+        let output = ChromecastOutput::new(
+            "Living Room",
+            "127.0.0.1:8009".parse().unwrap(),
+            event_tx,
+            1.0,
+        );
         output.load_uri("file://[cast-secret-token");
         let owner = output.current_owner();
         let (done_tx, done_rx) = mpsc::channel();
@@ -2887,7 +3488,12 @@ mod tests {
     fn typed_request_resolution_cannot_fall_through_to_a_direct_cast_load() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime");
         let (event_tx, _events) = async_channel::unbounded();
-        let output = ChromecastOutput::new("Living Room", "127.0.0.1", 8009, event_tx, 1.0);
+        let output = ChromecastOutput::new(
+            "Living Room",
+            "127.0.0.1:8009".parse().unwrap(),
+            event_tx,
+            1.0,
+        );
         *output.cast_server.lock().expect("cast server lock") = Some(
             runtime
                 .block_on(CastHttpServer::start_on(std::net::SocketAddr::from((
@@ -3033,7 +3639,8 @@ mod tests {
     #[test]
     fn test_chromecast_output_name_type_volume_and_initial_state() {
         let (tx, _rx) = async_channel::unbounded();
-        let mut output = ChromecastOutput::new("Living Room", "127.0.0.1", 8009, tx, 1.0);
+        let mut output =
+            ChromecastOutput::new("Living Room", "127.0.0.1:8009".parse().unwrap(), tx, 1.0);
         assert_eq!(output.name(), "Living Room");
         assert_eq!(output.output_type(), OutputType::Chromecast);
         assert!(output.supports_volume());

@@ -34,3 +34,4 @@ fuzz/corpus/
 
 # Winget manifests
 /manifests/
+fuzz/target/

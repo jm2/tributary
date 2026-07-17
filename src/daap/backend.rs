@@ -3,8 +3,8 @@
 //! All metadata is held in memory — nothing touches the local SQLite DB.
 //! The full library is fetched during [`DaapBackend::connect`] and
 //! cached for fast browsing. Cached tracks contain credential-free
-//! `daap://` references; the live retained session resolves those to
-//! authenticated HTTP URLs immediately before media is consumed.
+//! `daap://` references; the live retained session resolves those to typed,
+//! credential-isolated HTTP requests immediately before media is consumed.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -17,7 +17,9 @@ use uuid::Uuid;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::architecture::media::{MediaLease, ResolvedHttpRequest};
 use crate::architecture::models::*;
+use crate::architecture::AdvertisedHttpRoute;
 
 use super::client::DaapClient;
 use super::dmap;
@@ -66,6 +68,9 @@ pub struct DaapBackend {
     session_key: Uuid,
     /// Shared exactly-once state for explicit disconnect and controlled shutdown.
     disconnect: std::sync::Arc<DisconnectLifecycle>,
+    /// Revokes every already-issued stream/artwork request as soon as this
+    /// stateful DAAP session loses ownership.
+    media_lease: MediaLease,
 }
 
 const SESSION_CONNECTED: u8 = 0;
@@ -90,7 +95,18 @@ impl DaapBackend {
         server_url: &str,
         password: Option<&str>,
     ) -> BackendResult<Self> {
-        let client = DaapClient::connect(server_url, password).await?;
+        Self::connect_with_route(name, server_url, password, None).await
+    }
+
+    /// Connect through a retained mDNS route without replacing the advertised
+    /// hostname in the DAAP origin.
+    pub(crate) async fn connect_with_route(
+        name: &str,
+        server_url: &str,
+        password: Option<&str>,
+        advertised_route: Option<AdvertisedHttpRoute>,
+    ) -> BackendResult<Self> {
+        let client = DaapClient::connect_with_route(server_url, password, advertised_route).await?;
 
         let backend = Self {
             display_name: name.to_string(),
@@ -101,6 +117,7 @@ impl DaapBackend {
                 state: AtomicU8::new(SESSION_CONNECTED),
                 complete: Notify::new(),
             }),
+            media_lease: MediaLease::new(),
         };
 
         if let Err(error) = backend.refresh_library().await {
@@ -283,6 +300,7 @@ impl DaapBackend {
     /// explicit disconnects and shutdown races wait for that owner and then
     /// return `false` without issuing another request.
     pub async fn disconnect(&self) -> bool {
+        self.media_lease.revoke();
         let owns_logout = self
             .disconnect
             .state
@@ -325,24 +343,38 @@ impl DaapBackend {
         self.session_key
     }
 
-    /// Resolve one stream URL from the current live session.
-    pub(super) fn stream_url_for_item(&self, song_id: u32, format: &str) -> BackendResult<Url> {
+    /// Resolve one stream request from the current live session.
+    pub(super) fn stream_request_for_item(
+        &self,
+        song_id: u32,
+        format: &str,
+    ) -> BackendResult<ResolvedHttpRequest> {
         self.ensure_connected()?;
-        Ok(self.client.stream_url(song_id, format))
+        self.client
+            .stream_request(song_id, format)
+            .map(|request| request.with_lease(self.media_lease.clone()))
     }
 
-    /// Resolve one artwork URL from the current live session.
-    pub(super) fn artwork_url_for_item(&self, song_id: u32) -> BackendResult<Url> {
+    /// Resolve one artwork request from the current live session.
+    pub(super) fn artwork_request_for_item(
+        &self,
+        song_id: u32,
+    ) -> BackendResult<ResolvedHttpRequest> {
         self.ensure_connected()?;
-        Ok(self.client.cover_art_url(song_id))
+        self.client
+            .cover_art_request(song_id)
+            .map(|request| request.with_lease(self.media_lease.clone()))
     }
 
     /// Resolve a cached application track ID for DAAP lifecycle tests.
     ///
     /// Production playback resolves the opaque `daap://` reference through
-    /// the retained session registry instead of exposing this direct URL.
+    /// the retained session registry instead of exposing bearer query state.
     #[cfg(test)]
-    pub(super) async fn stream_url_for_track(&self, track_id: &Uuid) -> BackendResult<Url> {
+    pub(super) async fn stream_request_for_track(
+        &self,
+        track_id: &Uuid,
+    ) -> BackendResult<ResolvedHttpRequest> {
         let cache = self.cache.read().await;
         let song_id =
             cache
@@ -354,7 +386,11 @@ impl DaapBackend {
                 })?;
         let idx = cache.track_by_uuid[track_id];
         let format = cache.tracks[idx].format.as_deref().unwrap_or("mp3");
-        self.stream_url_for_item(*song_id, format)
+        self.stream_request_for_item(*song_id, format)
+    }
+
+    pub(super) fn revoke_media(&self) {
+        self.media_lease.revoke();
     }
 
     fn ensure_connected(&self) -> BackendResult<()> {

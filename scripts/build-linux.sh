@@ -3,6 +3,10 @@
 # Tributary — Linux release build helper
 set -euo pipefail
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
 print_usage() {
   cat <<'EOF'
 Tributary — Linux build helper.
@@ -20,8 +24,10 @@ Quick-exit modes (run one task and exit):
                     via [lints.clippy] in Cargo.toml.
   --coverage        Run `cargo llvm-cov` summary (installs cargo-llvm-cov if needed).
 
-Packaging (after the release build):
-  --flatpak         Build a Flatpak bundle (requires flatpak-builder, python3).
+Packaging:
+  --flatpak         Build a Flatpak bundle (requires flatpak, flatpak-builder,
+                    Python generator dependencies, and a user Flathub remote;
+                    does not require host Rust/GTK development packages).
   --deb             Build a .deb package via cargo-deb.
   --rpm             Build an .rpm package via cargo-generate-rpm.
   --arch-pkg        Build an Arch .pkg.tar.zst via makepkg.
@@ -59,6 +65,40 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()  { echo -e "${GREEN}[tributary]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[tributary]${NC} $*"; }
 error() { echo -e "${RED}[tributary]${NC} $*" >&2; exit 1; }
+
+if { $CHECK || $FMT || $CLIPPY || $COVERAGE; } && \
+   { $FLATPAK || $DEB || $RPM || $ARCH_PKG; }; then
+  error "Quick-exit and packaging modes cannot be combined"
+fi
+
+build_flatpak() {
+  command -v flatpak         &>/dev/null || error "flatpak not found. Install: sudo apt install flatpak"
+  command -v flatpak-builder &>/dev/null || error "flatpak-builder not found. Install: sudo apt install flatpak-builder"
+  command -v python3          &>/dev/null || error "python3 not found (required to generate cargo sources)"
+  if ! flatpak remote-list --user --columns=name | grep -Fxq flathub; then
+    error "Flathub user remote not found. Run: flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo"
+  fi
+
+  local manifest="build-aux/flatpak/io.github.tributary.Tributary.yml"
+  info "Generating cargo-sources.json..."
+  bash build-aux/flatpak/generate-cargo-sources.sh
+
+  info "Building Flatpak bundle..."
+  flatpak-builder --user --install-deps-from=flathub --force-clean \
+    --repo=repo build-dir "$manifest"
+  flatpak build-bundle repo tributary.flatpak io.github.tributary.Tributary \
+    --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
+  info "Flatpak bundle: $(pwd)/tributary.flatpak"
+}
+
+# A Flatpak build is self-contained in its SDK. Run it before host dependency
+# checks so --flatpak works on a clean machine without native GTK/Rust headers.
+if $FLATPAK; then
+  build_flatpak
+  if ! $DEB && ! $RPM && ! $ARCH_PKG; then
+    exit 0
+  fi
+fi
 
 # ── Dependency Checks ────────────────────────────────────────────────────────
 info "Checking build dependencies..."
@@ -129,21 +169,6 @@ ICON_PREFIX="${DESTDIR:-/usr/local}/share/icons/hicolor"
 if [[ -d "data/icons/hicolor" ]]; then
   info "To install icons system-wide, run:"
   info "  sudo cp -r data/icons/hicolor/* /usr/local/share/icons/hicolor/"
-fi
-
-# ── Flatpak Bundle (optional) ────────────────────────────────────────────────
-if $FLATPAK; then
-  command -v flatpak-builder &>/dev/null || error "flatpak-builder not found. Install: sudo apt install flatpak-builder"
-  command -v python3          &>/dev/null || error "python3 not found (required to generate cargo sources)"
-
-  MANIFEST="build-aux/flatpak/io.github.tributary.Tributary.yml"
-  info "Generating cargo-sources.json..."
-  python3 build-aux/flatpak/flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json
-
-  info "Building Flatpak bundle..."
-  flatpak-builder --force-clean --repo=repo build-dir "$MANIFEST"
-  flatpak build-bundle repo tributary.flatpak io.github.tributary.Tributary
-  info "Flatpak bundle: $(pwd)/tributary.flatpak"
 fi
 
 # ── Debian Package (optional) ────────────────────────────────────────────────

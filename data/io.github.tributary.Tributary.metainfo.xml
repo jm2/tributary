@@ -44,6 +44,19 @@
   </screenshots>
 
   <releases>
+    <release version="0.5.0" date="2026-05-08">
+      <description>
+        <p>Feature release:</p>
+        <ul>
+          <li>Scan and watch multiple music library folders</li>
+          <li>Import and export XSPF playlists</li>
+          <li>Default smart playlists seeded on first launch</li>
+          <li>Stream local files to Chromecast over a LAN-only server</li>
+          <li>Remember window size and position across restarts</li>
+          <li>Windows 11 Snap Layout support and file-type associations on macOS and Linux</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.1" date="2026-04-23">
       <description>
         <p>Bug fix release for macOS:</p>

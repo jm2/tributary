@@ -85,10 +85,53 @@ enum CommandKind {
     Fence(mpsc::Sender<()>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MpdAckCode {
+    NotList,
+    Argument,
+    Password,
+    Permission,
+    Unknown,
+    NoExist,
+    PlaylistMax,
+    System,
+    PlaylistLoad,
+    UpdateAlready,
+    PlayerSync,
+    Exist,
+}
+
+impl MpdAckCode {
+    const fn from_raw(code: u16) -> Option<Self> {
+        match code {
+            1 => Some(Self::NotList),
+            2 => Some(Self::Argument),
+            3 => Some(Self::Password),
+            4 => Some(Self::Permission),
+            5 => Some(Self::Unknown),
+            50 => Some(Self::NoExist),
+            51 => Some(Self::PlaylistMax),
+            52 => Some(Self::System),
+            53 => Some(Self::PlaylistLoad),
+            54 => Some(Self::UpdateAlready),
+            55 => Some(Self::PlayerSync),
+            56 => Some(Self::Exist),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedMpdAck {
+    Known(MpdAckCode),
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MpdFailure {
     operation: &'static str,
     connection_usable: bool,
+    ack_code: Option<MpdAckCode>,
 }
 
 impl MpdFailure {
@@ -96,6 +139,7 @@ impl MpdFailure {
         Self {
             operation,
             connection_usable: false,
+            ack_code: None,
         }
     }
 
@@ -103,6 +147,15 @@ impl MpdFailure {
         Self {
             operation,
             connection_usable: true,
+            ack_code: None,
+        }
+    }
+
+    const fn ack(operation: &'static str, ack_code: Option<MpdAckCode>) -> Self {
+        Self {
+            operation,
+            connection_usable: true,
+            ack_code,
         }
     }
 }
@@ -432,6 +485,12 @@ struct MpdStatus {
     has_error: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteOutcome {
+    Removed,
+    AlreadyAbsent,
+}
+
 trait MpdConnector: Send + 'static {
     type Connection: MpdTransport + 'static;
 
@@ -455,7 +514,7 @@ trait MpdTransport {
         deadline: OperationDeadline,
     ) -> MpdResult<()>;
     fn status(&mut self, deadline: OperationDeadline) -> MpdResult<MpdStatus>;
-    fn delete_id(&mut self, song_id: u64, deadline: OperationDeadline) -> MpdResult<()>;
+    fn delete_id(&mut self, song_id: u64, deadline: OperationDeadline) -> MpdResult<DeleteOutcome>;
 }
 
 struct MpdTcpConnector {
@@ -610,6 +669,35 @@ impl MpdConnection {
         deadline.remaining(operation).map(|_| ())
     }
 
+    /// Parse only MPD's fixed numeric ACK category.
+    ///
+    /// The command-list offset, command name, and human-readable message are
+    /// server-controlled and may contain credentials echoed from a rejected
+    /// command. Validate their framing, then discard them immediately.
+    fn parse_ack_code(line: &str, expected_command: &str) -> Option<ParsedMpdAck> {
+        let framed = line.strip_prefix("ACK [")?;
+        let (code, framed) = framed.split_once('@')?;
+        let (command_index, framed) = framed.split_once("] {")?;
+        let (command, _message) = framed.split_once("} ")?;
+        if code.is_empty()
+            || command_index != "0"
+            || command.is_empty()
+            || command != expected_command
+            || !code.bytes().all(|byte| byte.is_ascii_digit())
+            || command
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'{' | b'}'))
+        {
+            return None;
+        }
+        Some(
+            code.parse::<u16>()
+                .ok()
+                .and_then(MpdAckCode::from_raw)
+                .map_or(ParsedMpdAck::Unknown, ParsedMpdAck::Known),
+        )
+    }
+
     fn response<T>(
         &mut self,
         command: &str,
@@ -633,9 +721,17 @@ impl MpdConnection {
                 return Ok(output);
             }
             if line == "ACK" || line.starts_with("ACK ") {
-                // ACK is a complete MPD response terminator, so the session
-                // remains synchronized even though the command failed.
-                return Err(MpdFailure::synchronized(operation));
+                // Only a structurally valid ACK for this exact single command
+                // proves that the response was consumed and the session is
+                // still synchronized. Keep only its fixed numeric category;
+                // never retain the command echo or human-readable text.
+                let expected_command = command.split_ascii_whitespace().next().unwrap_or_default();
+                let ack_code = match Self::parse_ack_code(&line, expected_command) {
+                    Some(ParsedMpdAck::Known(code)) => Some(code),
+                    Some(ParsedMpdAck::Unknown) => None,
+                    None => return Err(MpdFailure::new(operation)),
+                };
+                return Err(MpdFailure::ack(operation, ack_code));
             }
             parse(&mut output, &line)?;
         }
@@ -737,8 +833,15 @@ impl MpdTransport for MpdConnection {
         raw.finish()
     }
 
-    fn delete_id(&mut self, song_id: u64, deadline: OperationDeadline) -> MpdResult<()> {
-        self.response_none(&format!("deleteid {song_id}"), deadline, "queue ownership")
+    fn delete_id(&mut self, song_id: u64, deadline: OperationDeadline) -> MpdResult<DeleteOutcome> {
+        match self.response_none(&format!("deleteid {song_id}"), deadline, "queue ownership") {
+            Ok(()) => Ok(DeleteOutcome::Removed),
+            Err(MpdFailure {
+                ack_code: Some(MpdAckCode::NoExist),
+                ..
+            }) => Ok(DeleteOutcome::AlreadyAbsent),
+            Err(failure) => Err(failure),
+        }
     }
 }
 
@@ -994,7 +1097,7 @@ fn run_mpd_worker<C>(
         let wait = if active.is_some() {
             timing.tick
         } else {
-            Duration::from_secs(3600)
+            Duration::from_hours(1)
         };
         match worker_rx.recv_timeout(wait) {
             Ok(command) => {
@@ -1345,7 +1448,7 @@ fn handle_load<C>(
         .expect("connected MPD session recorded")
         .connection
         .status(deadline);
-    if retire_poisoned_if_stale(&status, active, owner, intent_epoch) {
+    if retire_status_if_stale(&status, active, owner, intent_epoch) {
         return;
     }
     match status {
@@ -1420,6 +1523,31 @@ fn retire_poisoned_if_stale<T, C>(
     true
 }
 
+fn status_observes_foreign_song(status: &MpdStatus, song_id: u64) -> bool {
+    status.song_id.is_some() && status.song_id != Some(song_id)
+}
+
+fn retire_status_if_stale<C>(
+    result: &MpdResult<MpdStatus>,
+    active: &mut Option<WorkerSession<C>>,
+    owner: CommandOwner,
+    intent_epoch: &AtomicU64,
+) -> bool {
+    if is_current(owner, intent_epoch) {
+        return false;
+    }
+    let observed_foreign = result.as_ref().is_ok_and(|status| {
+        active
+            .as_ref()
+            .and_then(|session| session.song_id)
+            .is_some_and(|song_id| status_observes_foreign_song(status, song_id))
+    });
+    if observed_foreign || matches!(result, Err(failure) if !failure.connection_usable) {
+        active.take();
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cleanup_then_fail<C>(
     active: &mut Option<WorkerSession<C>>,
@@ -1453,9 +1581,12 @@ fn relinquish_then_fail<C>(
     cache: &Mutex<MpdCache>,
     event_tx: &async_channel::Sender<PlayerEvent>,
 ) {
-    // Closing the client connection is the only safe action after a status
-    // proves that the stable queue id no longer belongs to this session.
-    // Global stop/clear commands would destroy the foreign replacement queue.
+    // Closing the client connection is the only race-free action after a
+    // status proves that another song owns the shared player. Deliberately
+    // retain our stable queue id: MPD has no conditional delete, so another
+    // client could start that id between our status and deleteid calls. A
+    // global stop/clear would more directly destroy the foreign replacement.
+    // Exclusive-partition work may make orphan cleanup safe later.
     active.take();
     if is_current(owner, intent_epoch) {
         fail_current(owner, failure, intent_epoch, cache, event_tx);
@@ -1488,7 +1619,7 @@ fn delete_owned_then_fail<C>(
             )
         },
     );
-    let failure = if require_delete_proof && removed.is_err() {
+    let failure = if require_delete_proof && !matches!(removed, Ok(DeleteOutcome::Removed)) {
         MpdFailure::new("remote playback ownership")
     } else {
         failure
@@ -1535,7 +1666,7 @@ fn handle_control<C>(
         .expect("active MPD session checked")
         .connection
         .status(deadline);
-    if retire_poisoned_if_stale(&status, active, owner, intent_epoch) {
+    if retire_status_if_stale(&status, active, owner, intent_epoch) {
         return;
     }
     match status {
@@ -1614,7 +1745,7 @@ fn handle_control<C>(
         .expect("active MPD session checked")
         .connection
         .status(deadline);
-    if retire_poisoned_if_stale(&status, active, owner, intent_epoch) {
+    if retire_status_if_stale(&status, active, owner, intent_epoch) {
         return;
     }
     match status {
@@ -1667,7 +1798,7 @@ fn poll_active<C>(
         .expect("active MPD session checked")
         .connection
         .status(timing.deadline());
-    if retire_poisoned_if_stale(&status, active, owner, intent_epoch) {
+    if retire_status_if_stale(&status, active, owner, intent_epoch) {
         return;
     }
     if let Some(session) = active.as_mut() {
@@ -1802,9 +1933,11 @@ fn apply_authoritative_status<C>(
 
     // At the natural end of the queue MPD clears its current pointer and
     // omits songid even with consume disabled. A successful play ACK plus an
-    // atomic deleteid of our retained stable entry is the completion proof.
-    // This works for unknown-duration and very short streams too. An external
-    // queue clear makes deleteid fail, and a foreign replacement is untouched.
+    // atomic deleteid that actually removes our retained stable entry is the
+    // completion proof. An external Next at the queue boundary has the same
+    // observable proof and deliberately shares TrackEnded semantics. An
+    // external clear/delete instead returns NoExist and is ownership loss.
+    // This remains reliable for unknown-duration and very short streams.
     if !session.observed_active {
         relinquish_then_fail(
             active,
@@ -1824,21 +1957,24 @@ fn apply_authoritative_status<C>(
         .connection
         .delete_id(song_id, ownership_deadline);
     if !is_current(owner, intent_epoch) {
-        // deleteid is terminal for this old ownership claim: OK removed our
-        // entry and ACK/error means it cannot safely authorize global cleanup.
+        // Every delete outcome is terminal for this superseded ownership
+        // claim; never issue a global command or restore the old session.
         active.take();
         return;
     }
-    if removed.is_err() {
-        relinquish_then_fail(
-            active,
-            owner,
-            MpdFailure::new("remote playback ownership"),
-            intent_epoch,
-            cache,
-            event_tx,
-        );
-        return;
+    match removed {
+        Ok(DeleteOutcome::Removed) => {}
+        Ok(DeleteOutcome::AlreadyAbsent) | Err(_) => {
+            relinquish_then_fail(
+                active,
+                owner,
+                MpdFailure::new("remote playback ownership"),
+                intent_epoch,
+                cache,
+                event_tx,
+            );
+            return;
+        }
     }
 
     active.take().expect("active MPD session checked");
@@ -1944,11 +2080,11 @@ where
     if kind == CleanupKind::StopOwned {
         let status = session.connection.status(deadline);
         if !is_current(owner, intent_epoch) {
-            if status
-                .as_ref()
-                .err()
-                .is_none_or(|failure| failure.connection_usable)
-            {
+            let can_restore = match &status {
+                Ok(status) => !status_observes_foreign_song(status, song_id),
+                Err(failure) => failure.connection_usable,
+            };
+            if can_restore {
                 *active = Some(session);
             }
             return CleanupOutcome::Stale;
@@ -1977,8 +2113,12 @@ where
                     }
                 }
             }
-            // A foreign or missing current id does not authorize a global
-            // stop. Targeting our stable queue id below remains safe.
+            // A foreign current id does not authorize either a global stop or
+            // a racy targeted delete. Another client could select our queued
+            // id between this status and deleteid, so deliberately retain it
+            // until exclusive-control work can make cleanup conditional.
+            Ok(status) if status.song_id.is_some() => return CleanupOutcome::Completed,
+            // No current id authorizes only the targeted cleanup below.
             Ok(_) => {}
             Err(status_failure) if status_failure.connection_usable => {
                 // The stream is synchronized, so a targeted delete is safe,
@@ -1995,16 +2135,14 @@ where
     }
     let removed = session.connection.delete_id(song_id, deadline);
     if !is_current(owner, intent_epoch) {
-        // OK removed the entry and ACK means it was already absent. Either is
-        // terminal for the superseded ownership claim, so never restore it.
+        // Removed, already absent, rejected, or poisoned are all terminal for
+        // the superseded ownership claim, so never restore it.
         return CleanupOutcome::Stale;
     }
     match removed {
-        Ok(())
-        | Err(MpdFailure {
-            connection_usable: true,
-            ..
-        }) => failure.map_or(CleanupOutcome::Completed, CleanupOutcome::Failed),
+        Ok(DeleteOutcome::Removed | DeleteOutcome::AlreadyAbsent) => {
+            failure.map_or(CleanupOutcome::Completed, CleanupOutcome::Failed)
+        }
         Err(delete_failure) => CleanupOutcome::Failed(failure.unwrap_or(delete_failure)),
     }
 }
@@ -2032,6 +2170,9 @@ where
                         .is_none_or(|failure| failure.connection_usable)
                 }
             }
+            // A foreign current id makes even targeted deletion racy: another
+            // client can select our id after this observation.
+            Ok(status) if status.song_id.is_some() => false,
             Ok(_) => true,
             Err(failure) => failure.connection_usable,
         };
@@ -2372,7 +2513,7 @@ mod tests {
         fail_at: Mutex<Option<Point>>,
         poison_at: Mutex<Option<Point>>,
         statuses: Mutex<VecDeque<MpdStatus>>,
-        ownership: Mutex<VecDeque<bool>>,
+        delete_results: Mutex<VecDeque<MpdResult<DeleteOutcome>>>,
         local_addr: Mutex<SocketAddr>,
         fail_local_addr: AtomicBool,
     }
@@ -2386,7 +2527,7 @@ mod tests {
                 fail_at: Mutex::new(None),
                 poison_at: Mutex::new(None),
                 statuses: Mutex::new(VecDeque::new()),
-                ownership: Mutex::new(VecDeque::new()),
+                delete_results: Mutex::new(VecDeque::new()),
                 local_addr: Mutex::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 45_000))),
                 fail_local_addr: AtomicBool::new(false),
             })
@@ -2563,21 +2704,19 @@ mod tests {
                 .unwrap_or_else(|| playing_status(0, 10_000)))
         }
 
-        fn delete_id(&mut self, song_id: u64, _deadline: OperationDeadline) -> MpdResult<()> {
+        fn delete_id(
+            &mut self,
+            song_id: u64,
+            _deadline: OperationDeadline,
+        ) -> MpdResult<DeleteOutcome> {
             self.shared
                 .record(Point::Ownership, Action::Delete(song_id))?;
-            if self
-                .shared
-                .ownership
+            self.shared
+                .delete_results
                 .lock()
-                .expect("ownership lock")
+                .expect("delete results lock")
                 .pop_front()
-                .unwrap_or(true)
-            {
-                Ok(())
-            } else {
-                Err(MpdFailure::synchronized("queue ownership"))
-            }
+                .unwrap_or(Ok(DeleteOutcome::Removed))
         }
     }
 
@@ -2726,7 +2865,7 @@ mod tests {
                 shared,
                 WorkerTiming {
                     operation: Duration::from_secs(2),
-                    poll: Duration::from_secs(3600),
+                    poll: Duration::from_hours(1),
                     tick: Duration::from_millis(10),
                 },
             )
@@ -2741,7 +2880,7 @@ mod tests {
                 shared,
                 WorkerTiming {
                     operation: Duration::from_secs(2),
-                    poll: Duration::from_secs(3600),
+                    poll: Duration::from_hours(1),
                     tick: Duration::from_millis(10),
                 },
                 proxy,
@@ -3664,20 +3803,12 @@ mod tests {
             .lock()
             .expect("statuses lock")
             .push_back(foreign);
-        shared
-            .ownership
-            .lock()
-            .expect("ownership lock")
-            .push_back(false);
 
         let stop = harness.next_owner(2);
         harness.send(stop, CommandKind::Stop);
         harness.fence(stop);
 
-        assert_eq!(
-            shared.actions(),
-            vec![Action::Point(Point::Status), Action::Delete(42)]
-        );
+        assert_eq!(shared.actions(), vec![Action::Point(Point::Status)]);
         assert!(matches!(
             harness.events().as_slice(),
             [PlayerEvent::StateChanged {
@@ -3686,6 +3817,57 @@ mod tests {
             }]
         ));
         harness.shutdown();
+    }
+
+    #[test]
+    fn explicit_stop_does_not_treat_argument_or_permission_ack_as_absence() {
+        for ack_code in [MpdAckCode::Argument, MpdAckCode::Permission] {
+            let shared = FakeShared::new();
+            let harness = Harness::new(Arc::clone(&shared));
+            let load = harness.next_owner(1);
+            harness.send(
+                load,
+                CommandKind::Load {
+                    uri: "https://music.test/a".to_string(),
+                },
+            );
+            harness.fence(load);
+            shared.clear_actions();
+            let _ = harness.events();
+
+            let mut no_current = stopped_status(1_000, 10_000);
+            no_current.song_id = None;
+            shared
+                .statuses
+                .lock()
+                .expect("statuses lock")
+                .push_back(no_current);
+            shared
+                .delete_results
+                .lock()
+                .expect("delete results lock")
+                .push_back(Err(MpdFailure::ack("queue ownership", Some(ack_code))));
+
+            let stop = harness.next_owner(2);
+            harness.send(stop, CommandKind::Stop);
+            harness.fence(stop);
+
+            assert_eq!(
+                shared.actions(),
+                vec![Action::Point(Point::Status), Action::Delete(42)]
+            );
+            assert!(matches!(
+                harness.events().as_slice(),
+                [
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    },
+                    PlayerEvent::Error { .. }
+                ]
+            ));
+            harness.shutdown();
+        }
     }
 
     #[test]
@@ -3703,10 +3885,10 @@ mod tests {
         shared.clear_actions();
         let _ = harness.events();
         shared
-            .ownership
+            .delete_results
             .lock()
-            .expect("ownership lock")
-            .push_back(false);
+            .expect("delete results lock")
+            .push_back(Ok(DeleteOutcome::AlreadyAbsent));
 
         let second = harness.next_owner(2);
         harness.send(
@@ -3777,6 +3959,53 @@ mod tests {
         let events = harness.events();
         assert!(matches!(
             events.as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::TrackEnded { .. }
+            ]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn external_next_at_queue_end_shares_natural_completion_semantics() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+            },
+        );
+        harness.fence(owner);
+        let _ = harness.events();
+        shared.clear_actions();
+
+        // With consume disabled, both natural exhaustion and an external
+        // Next at the queue boundary leave no current pointer while retaining
+        // our stable id. MPD exposes no discriminator, so both advance the
+        // Tributary queue once targeted deletion proves the id still existed.
+        let mut externally_advanced = stopped_status(1_000, 10_000);
+        externally_advanced.song_id = None;
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(externally_advanced);
+
+        harness.send(owner, CommandKind::PollNow);
+        harness.fence(owner);
+
+        assert_eq!(
+            shared.actions(),
+            vec![Action::Point(Point::Status), Action::Delete(42)]
+        );
+        assert!(matches!(
+            harness.events().as_slice(),
             [
                 PlayerEvent::StateChanged {
                     state: PlayerState::Stopped,
@@ -3895,7 +4124,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_successor_is_ownership_loss_not_end_of_track() {
+    fn foreign_successor_deliberately_retains_owned_entry_without_global_side_effects() {
         let shared = FakeShared::new();
         shared
             .statuses
@@ -3924,6 +4153,9 @@ mod tests {
         harness.send(owner, CommandKind::PollNow);
         harness.fence(owner);
 
+        // Neither a global Stop nor even targeted deleteid is conditional on
+        // the foreign song remaining current. Retain our orphan rather than
+        // race another client's next command.
         assert_eq!(shared.actions(), vec![Action::Point(Point::Status)]);
         let events = harness.events();
         assert!(matches!(
@@ -3943,59 +4175,71 @@ mod tests {
     }
 
     #[test]
-    fn missing_song_id_near_end_is_not_attributed_as_completion() {
-        let shared = FakeShared::new();
-        shared
-            .statuses
-            .lock()
-            .expect("statuses lock")
-            .push_back(playing_status(9_500, 10_000));
-        let harness = Harness::new(Arc::clone(&shared));
-        let owner = harness.next_owner(1);
-        harness.send(
-            owner,
-            CommandKind::Load {
-                uri: "https://music.test/a".to_string(),
-            },
-        );
-        harness.fence(owner);
-        let _ = harness.events();
-        shared.clear_actions();
-        let mut missing = stopped_status(10_000, 10_000);
-        missing.song_id = None;
-        shared
-            .statuses
-            .lock()
-            .expect("statuses lock")
-            .push_back(missing);
-        shared
-            .ownership
-            .lock()
-            .expect("ownership lock")
-            .push_back(false);
-
-        harness.send(owner, CommandKind::PollNow);
-        harness.fence(owner);
-
-        assert_eq!(
-            shared.actions(),
-            vec![Action::Point(Point::Status), Action::Delete(42)]
-        );
-        let events = harness.events();
-        assert!(matches!(
-            events.as_slice(),
-            [
-                PlayerEvent::StateChanged {
-                    state: PlayerState::Stopped,
-                    ..
+    fn external_queue_loss_or_rejected_delete_is_not_completion() {
+        for delete_result in [
+            Ok(DeleteOutcome::AlreadyAbsent),
+            Err(MpdFailure::ack(
+                "queue ownership",
+                Some(MpdAckCode::Argument),
+            )),
+            Err(MpdFailure::ack(
+                "queue ownership",
+                Some(MpdAckCode::Permission),
+            )),
+        ] {
+            let shared = FakeShared::new();
+            shared
+                .statuses
+                .lock()
+                .expect("statuses lock")
+                .push_back(playing_status(9_500, 10_000));
+            let harness = Harness::new(Arc::clone(&shared));
+            let owner = harness.next_owner(1);
+            harness.send(
+                owner,
+                CommandKind::Load {
+                    uri: "https://music.test/a".to_string(),
                 },
-                PlayerEvent::Error { .. }
-            ]
-        ));
-        assert!(!events
-            .iter()
-            .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })));
-        harness.shutdown();
+            );
+            harness.fence(owner);
+            let _ = harness.events();
+            shared.clear_actions();
+            let mut missing = stopped_status(10_000, 10_000);
+            missing.song_id = None;
+            shared
+                .statuses
+                .lock()
+                .expect("statuses lock")
+                .push_back(missing);
+            shared
+                .delete_results
+                .lock()
+                .expect("delete results lock")
+                .push_back(delete_result);
+
+            harness.send(owner, CommandKind::PollNow);
+            harness.fence(owner);
+
+            assert_eq!(
+                shared.actions(),
+                vec![Action::Point(Point::Status), Action::Delete(42)]
+            );
+            let events = harness.events();
+            assert!(matches!(
+                events.as_slice(),
+                [
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    },
+                    PlayerEvent::Error { .. }
+                ]
+            ));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })));
+            harness.shutdown();
+        }
     }
 
     #[test]
@@ -4108,10 +4352,10 @@ mod tests {
             .expect("statuses lock")
             .push_back(failed);
         shared
-            .ownership
+            .delete_results
             .lock()
-            .expect("ownership lock")
-            .push_back(false);
+            .expect("delete results lock")
+            .push_back(Ok(DeleteOutcome::AlreadyAbsent));
 
         harness.send(owner, CommandKind::PollNow);
         harness.fence(owner);
@@ -4294,6 +4538,63 @@ mod tests {
     }
 
     #[test]
+    fn stale_foreign_status_before_replacement_load_does_not_delete_the_old_id() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let first = harness.next_owner(1);
+        harness.send(
+            first,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+            },
+        );
+        harness.fence(first);
+        let _ = harness.events();
+        shared.clear_actions();
+
+        let mut foreign = playing_status(1_000, 10_000);
+        foreign.song_id = Some(99);
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(foreign);
+        let (entered, release) = shared.install_gate(Point::Status);
+        harness.send(first, CommandKind::PollNow);
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("old status entered");
+
+        let second = harness.next_owner(2);
+        harness.send(
+            second,
+            CommandKind::Load {
+                uri: "https://music.test/b".to_string(),
+            },
+        );
+        release.send(()).expect("release old status");
+        harness.fence(second);
+
+        let actions = shared.actions();
+        assert_eq!(actions.first(), Some(&Action::Point(Point::Status)));
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Delete(42))),
+            "stale foreign ownership proof must retain the old queue id: {actions:?}"
+        );
+        assert!(actions.contains(&Action::Point(Point::Connect)));
+        assert!(harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged {
+                generation,
+                state: PlayerState::Playing,
+            } if *generation == PlayerEventGeneration::from_raw(2)
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
     fn shutdown_cleans_active_session_without_events() {
         let shared = FakeShared::new();
         let mut harness = Harness::new(Arc::clone(&shared));
@@ -4324,6 +4625,41 @@ mod tests {
                 Action::Delete(42),
             ]
         );
+        assert!(harness.events().is_empty());
+    }
+
+    #[test]
+    fn shutdown_retains_owned_entry_when_a_foreign_song_is_current() {
+        let shared = FakeShared::new();
+        let mut harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+        let mut foreign = playing_status(1_000, 10_000);
+        foreign.song_id = Some(99);
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(foreign);
+
+        let shutdown = harness.next_owner(2);
+        harness.send(shutdown, CommandKind::Shutdown);
+        harness
+            .worker
+            .take()
+            .expect("worker handle")
+            .join()
+            .expect("worker stopped");
+
+        assert_eq!(shared.actions(), vec![Action::Point(Point::Status)]);
         assert!(harness.events().is_empty());
     }
 
@@ -4523,6 +4859,57 @@ mod tests {
     }
 
     #[test]
+    fn ack_parser_retains_only_official_codes_from_strict_frames() {
+        for (raw, expected) in [
+            (1, MpdAckCode::NotList),
+            (2, MpdAckCode::Argument),
+            (3, MpdAckCode::Password),
+            (4, MpdAckCode::Permission),
+            (5, MpdAckCode::Unknown),
+            (50, MpdAckCode::NoExist),
+            (51, MpdAckCode::PlaylistMax),
+            (52, MpdAckCode::System),
+            (53, MpdAckCode::PlaylistLoad),
+            (54, MpdAckCode::UpdateAlready),
+            (55, MpdAckCode::PlayerSync),
+            (56, MpdAckCode::Exist),
+        ] {
+            let line =
+                format!("ACK [{raw}@0] {{deleteid}} https://music.test/a?token=server-secret");
+            assert_eq!(
+                MpdConnection::parse_ack_code(&line, "deleteid"),
+                Some(ParsedMpdAck::Known(expected))
+            );
+        }
+
+        for malformed_or_mismatched in [
+            "ACK",
+            "ACK [50@0] {deleteid}",
+            "ACK [50@x] {deleteid} missing",
+            "ACK [x@0] {deleteid} missing",
+            "ACK [50@0] {delete id} missing",
+            "ACK [50@1] {deleteid} wrong command index",
+            "ACK [50@0] {addid} wrong command",
+        ] {
+            assert_eq!(
+                MpdConnection::parse_ack_code(malformed_or_mismatched, "deleteid"),
+                None,
+                "{malformed_or_mismatched}"
+            );
+        }
+        for future_code in [
+            "ACK [57@0] {deleteid} future code",
+            "ACK [65536@0] {deleteid} oversized code",
+        ] {
+            assert_eq!(
+                MpdConnection::parse_ack_code(future_code, "deleteid"),
+                Some(ParsedMpdAck::Unknown),
+                "{future_code}"
+            );
+        }
+    }
+
+    #[test]
     fn raw_ipv6_host_resolves_without_manual_host_port_formatting() {
         let addresses = resolve_mpd_addresses("::1", 6600).expect("IPv6 loopback resolves");
         assert!(addresses.iter().any(SocketAddr::is_ipv6));
@@ -4599,9 +4986,12 @@ mod tests {
         assert_eq!(status.song_id, Some(42));
         assert_eq!(status.position_ms, Some(1_250));
         assert_eq!(status.duration_ms, 125_750);
-        connection
-            .delete_id(id, deadline)
-            .expect("targeted delete succeeds");
+        assert_eq!(
+            connection
+                .delete_id(id, deadline)
+                .expect("targeted delete succeeds"),
+            DeleteOutcome::Removed
+        );
         server.join().expect("fake server stopped");
     }
 
@@ -4616,11 +5006,88 @@ mod tests {
         let failure = connection
             .add_id(secret_uri, OperationDeadline::after(Duration::from_secs(2)))
             .expect_err("ACK rejected");
+        assert_eq!(failure.ack_code, Some(MpdAckCode::NoExist));
+        let debug = format!("{failure:?}");
         let message = mpd_failure_message(failure);
         assert_eq!(message, "MPD media add failed");
+        assert!(!debug.contains("api_key"));
+        assert!(!debug.contains("secret-token"));
         assert!(!message.contains("api_key"));
         assert!(!message.contains("secret-token"));
         server.join().expect("fake server stopped");
+    }
+
+    #[test]
+    fn targeted_delete_distinguishes_absence_from_argument_and_permission_rejections() {
+        let (address, server) = scripted_server(vec![
+            ("deleteid 41".to_string(), b"OK\n".to_vec()),
+            (
+                "deleteid 42".to_string(),
+                b"ACK [50@0] {deleteid} No such song\n".to_vec(),
+            ),
+            (
+                "deleteid 43".to_string(),
+                b"ACK [2@0] {deleteid} Bad argument\n".to_vec(),
+            ),
+            (
+                "deleteid 44".to_string(),
+                b"ACK [4@0] {deleteid} Permission denied\n".to_vec(),
+            ),
+            (
+                "deleteid 45".to_string(),
+                b"ACK [57@0] {deleteid} Future error\n".to_vec(),
+            ),
+        ]);
+        let mut connection = connect_test(address);
+        let deadline = OperationDeadline::after(Duration::from_secs(2));
+
+        assert_eq!(
+            connection.delete_id(41, deadline).expect("delete succeeds"),
+            DeleteOutcome::Removed
+        );
+        assert_eq!(
+            connection
+                .delete_id(42, deadline)
+                .expect("missing id is classified"),
+            DeleteOutcome::AlreadyAbsent
+        );
+        let argument = connection
+            .delete_id(43, deadline)
+            .expect_err("argument rejection is not absence");
+        assert!(argument.connection_usable);
+        assert_eq!(argument.ack_code, Some(MpdAckCode::Argument));
+        let permission = connection
+            .delete_id(44, deadline)
+            .expect_err("permission rejection is not absence");
+        assert!(permission.connection_usable);
+        assert_eq!(permission.ack_code, Some(MpdAckCode::Permission));
+        let unknown = connection
+            .delete_id(45, deadline)
+            .expect_err("unknown rejection is not absence");
+        assert!(unknown.connection_usable);
+        assert_eq!(unknown.ack_code, None);
+        server.join().expect("fake server stopped");
+    }
+
+    #[test]
+    fn malformed_or_mismatched_ack_poisons_the_connection() {
+        for (song_id, response) in [
+            (41, "ACK\n"),
+            (42, "ACK [50@1] {deleteid} wrong index\n"),
+            (43, "ACK [50@0] {addid} wrong command\n"),
+        ] {
+            let (address, server) = scripted_server(vec![(
+                format!("deleteid {song_id}"),
+                response.as_bytes().to_vec(),
+            )]);
+            let mut connection = connect_test(address);
+            let failure = connection
+                .delete_id(song_id, OperationDeadline::after(Duration::from_secs(2)))
+                .expect_err("uncorrelated ACK must fail closed");
+            assert!(!failure.connection_usable);
+            assert_eq!(failure.ack_code, None);
+            server.join().expect("fake server stopped");
+        }
     }
 
     #[test]

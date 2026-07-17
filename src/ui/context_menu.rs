@@ -24,6 +24,7 @@ pub fn setup_context_menu(state: &WindowState) {
     let rt_handle = state.rt_handle.clone();
     let track_store = state.track_store.clone();
     let source_tracks = state.source_tracks.clone();
+    let source_navigation = state.source_navigation.clone();
     let master_tracks = state.master_tracks.clone();
     let status_label = state.status_label.clone();
     let browser_widget = state.browser_widget.clone();
@@ -65,6 +66,7 @@ pub fn setup_context_menu(state: &WindowState) {
                 &rt_handle,
                 &track_store,
                 &source_tracks,
+                &source_navigation,
                 &master_tracks,
                 &status_label,
                 &browser_widget,
@@ -82,7 +84,15 @@ pub fn setup_context_menu(state: &WindowState) {
         }
 
         // ── Properties… ──────────────────────────────────────────
-        build_properties_action(&menu, &action_group, gesture, &sm, &selected);
+        let automatic_device = active_source_is_automatic_device(&sidebar_store, &active_key);
+        build_properties_action(
+            &menu,
+            &action_group,
+            gesture,
+            &sm,
+            &selected,
+            automatic_device,
+        );
 
         if menu.n_items() == 0 {
             return;
@@ -121,6 +131,7 @@ fn build_remove_from_playlist_action(
     source_tracks: &std::rc::Rc<
         std::cell::RefCell<std::collections::HashMap<String, Vec<TrackObject>>>,
     >,
+    source_navigation: &std::rc::Rc<std::cell::RefCell<super::source_navigation::SourceNavigation>>,
     master_tracks: &std::rc::Rc<std::cell::RefCell<Vec<TrackObject>>>,
     status_label: &gtk::Label,
     browser_widget: &gtk::Box,
@@ -133,6 +144,7 @@ fn build_remove_from_playlist_action(
     let rt = rt_handle.clone();
     let track_store = track_store.clone();
     let source_tracks = source_tracks.clone();
+    let source_navigation = source_navigation.clone();
     let master_tracks = master_tracks.clone();
     let status_label = status_label.clone();
     let browser_widget = browser_widget.clone();
@@ -149,11 +161,20 @@ fn build_remove_from_playlist_action(
         let uris = uris.clone();
         let track_store = track_store.clone();
         let source_tracks = source_tracks.clone();
+        let source_navigation = source_navigation.clone();
         let master_tracks = master_tracks.clone();
         let status_label = status_label.clone();
         let browser_widget = browser_widget.clone();
         let browser_state = browser_state.clone();
         let active_key = active_key.clone();
+
+        // A popover action can outlive the rows it was built for. It must not
+        // mutate another source, and an already-running refresh must not put
+        // the just-removed entry back afterward.
+        if !source_navigation.borrow().is_key(&active_key) {
+            return;
+        }
+        source_navigation.borrow_mut().select(active_key.clone());
 
         // Remove from the visible store immediately. Honour the per-URI
         // selection count so that selecting one of N duplicate rows removes
@@ -368,10 +389,53 @@ fn build_properties_action(
     gesture: &gtk::GestureClick,
     sm: &gtk::SortListModel,
     selected: &gtk::Bitset,
+    automatic_device: bool,
 ) {
+    // Snapshot the exact selection while building the menu. Properties is an
+    // all-or-none local-file operation: silently dropping a malformed or
+    // remote row would let a batch edit only an unexpected subset.
+    let mut track_infos = Vec::new();
+    let mut pos = 0u32;
+    while pos < sm.n_items() {
+        if selected.contains(pos) {
+            let Some(item) = sm.item(pos) else { return };
+            let Some(track) = item.downcast_ref::<TrackObject>() else {
+                return;
+            };
+            let Some(path) = local_file_path(&track.uri()) else {
+                return;
+            };
+            track_infos.push(super::properties_dialog::TrackInfo {
+                path,
+                title: track.title(),
+                artist: track.artist(),
+                album: track.album(),
+                genre: track.genre(),
+                composer: track.composer(),
+                year: track.year_display(),
+                track_number: if track.track_number() > 0 {
+                    track.track_number().to_string()
+                } else {
+                    String::new()
+                },
+                disc_number: if track.disc_number() > 0 {
+                    track.disc_number().to_string()
+                } else {
+                    String::new()
+                },
+                format: track.format(),
+                bitrate: track.bitrate_display(),
+                sample_rate: track.sample_rate_display(),
+                duration: track.duration_display(),
+            });
+        }
+        pos += 1;
+    }
+    if track_infos.is_empty() {
+        return;
+    }
+
     let props_action = gtk::gio::SimpleAction::new("properties", None);
-    let sm_for_props = sm.clone();
-    let selected_for_props = selected.clone();
     let win_for_props = gesture.widget().and_then(|w| {
         w.root()
             .and_then(|r| r.downcast::<adw::ApplicationWindow>().ok())
@@ -379,52 +443,7 @@ fn build_properties_action(
 
     props_action.connect_activate(move |_, _| {
         let Some(ref win) = win_for_props else { return };
-
-        // Collect TrackInfo for selected tracks.
-        let mut track_infos = Vec::new();
-        let mut pos = 0u32;
-        while pos < sm_for_props.n_items() {
-            if selected_for_props.contains(pos) {
-                if let Some(item) = sm_for_props.item(pos) {
-                    if let Some(track) = item.downcast_ref::<TrackObject>() {
-                        let uri = track.uri();
-                        // Only show properties for local file:// tracks.
-                        if uri.starts_with("file://") {
-                            track_infos.push(super::properties_dialog::TrackInfo {
-                                uri,
-                                title: track.title(),
-                                artist: track.artist(),
-                                album: track.album(),
-                                genre: track.genre(),
-                                composer: track.composer(),
-                                year: track.year_display(),
-                                track_number: if track.track_number() > 0 {
-                                    track.track_number().to_string()
-                                } else {
-                                    String::new()
-                                },
-                                disc_number: if track.disc_number() > 0 {
-                                    track.disc_number().to_string()
-                                } else {
-                                    String::new()
-                                },
-                                format: track.format(),
-                                bitrate: track.bitrate_display(),
-                                sample_rate: track.sample_rate_display(),
-                                duration: track.duration_display(),
-                            });
-                        }
-                    }
-                }
-            }
-            pos += 1;
-        }
-
-        if track_infos.is_empty() {
-            return;
-        }
-
-        super::properties_dialog::show_properties_dialog(win, &track_infos);
+        super::properties_dialog::show_properties_dialog(win, &track_infos, automatic_device);
     });
 
     action_group.add_action(&props_action);
@@ -434,6 +453,29 @@ fn build_properties_action(
 // ═══════════════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════
+
+fn local_file_path(uri: &str) -> Option<std::path::PathBuf> {
+    let url = url::Url::parse(uri).ok()?;
+    (url.scheme() == "file")
+        .then(|| url.to_file_path().ok())
+        .flatten()
+}
+
+/// Match the active logical source against exact sidebar metadata. Opaque
+/// source keys and mount-path spellings are not type information.
+fn active_source_is_automatic_device(
+    sidebar_store: &gtk::gio::ListStore,
+    active_source_key: &str,
+) -> bool {
+    (0..sidebar_store.n_items()).any(|position| {
+        sidebar_store
+            .item(position)
+            .and_downcast::<SourceObject>()
+            .is_some_and(|source| {
+                source.backend_type() == "usb-device" && source.source_key() == active_source_key
+            })
+    })
+}
 
 /// Build a map of `uri -> number of selected rows with that uri`.
 ///
@@ -483,4 +525,47 @@ fn disable_popover_scrollbars(popover: &gtk::PopoverMenu) {
         }
     }
     walk(popover.upcast_ref::<gtk::Widget>());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn properties_path_conversion_is_local_and_fail_closed() {
+        let path = std::env::temp_dir().join("tributary properties fixture.flac");
+        let uri = url::Url::from_file_path(&path)
+            .expect("absolute fixture path")
+            .to_string();
+
+        assert_eq!(local_file_path(&uri), Some(path));
+        assert_eq!(local_file_path("https://example.test/song.flac"), None);
+        assert_eq!(local_file_path("file://%"), None);
+        assert_eq!(local_file_path("not a URI"), None);
+    }
+
+    #[test]
+    fn automatic_device_context_uses_exact_source_metadata() {
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        store.append(&SourceObject::source(
+            "Local",
+            "local",
+            "folder-music-symbolic",
+        ));
+        store.append(&SourceObject::removable_device(
+            "Player",
+            "device:opaque-id",
+            PathBuf::from("/media/player"),
+        ));
+
+        assert!(active_source_is_automatic_device(
+            &store,
+            "device:opaque-id"
+        ));
+        assert!(!active_source_is_automatic_device(&store, "/media/player"));
+        assert!(!active_source_is_automatic_device(&store, "device:opaque"));
+        assert!(!active_source_is_automatic_device(&store, "local"));
+    }
 }

@@ -1,10 +1,10 @@
 //! Ownership registry for live DAAP sessions.
 //!
-//! DAAP is stateful: media URLs remain authorized only while the backend
+//! DAAP is stateful: media requests remain authorized only while the backend
 //! that owns the login session is alive. The UI retains connected backends
 //! here and stores credential-free `daap://` references in its track models.
-//! Those references are resolved to authenticated HTTP URLs only when media
-//! is about to be consumed.
+//! Those references are resolved to credential-isolated, revocable HTTP
+//! requests only when media is about to be consumed.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::architecture::ResolvedHttpRequest;
 
 use super::DaapBackend;
 
@@ -103,6 +104,7 @@ impl ConnectionAttempt {
                     },
                 );
                 if let Some(previous) = &replaced {
+                    previous.backend.revoke_media();
                     sessions.by_session.remove(&previous.backend.session_key());
                     sessions.retiring.insert(
                         previous.backend.session_key(),
@@ -243,6 +245,7 @@ pub fn release_source(source_key: &str) -> Option<ReleasedSession> {
         let mut sessions = lock_registry();
         sessions.latest_generation.remove(source_key);
         let entry = sessions.by_source.remove(source_key)?;
+        entry.backend.revoke_media();
         sessions.by_session.remove(&entry.backend.session_key());
         sessions
             .retiring
@@ -278,6 +281,7 @@ pub fn begin_shutdown() {
             sessions.by_session.clear();
             let active = std::mem::take(&mut sessions.by_source);
             for entry in active.into_values() {
+                entry.backend.revoke_media();
                 sessions
                     .retiring
                     .insert(entry.backend.session_key(), entry.backend);
@@ -336,12 +340,39 @@ async fn disconnect_tracked(backend: Arc<DaapBackend>) -> bool {
     disconnected
 }
 
-/// Resolve a credential-free DAAP media reference through its retained live
-/// session. Non-DAAP URLs are returned as `None` so callers can pass them
-/// through unchanged.
-pub fn resolve_media_url(reference: &Url) -> BackendResult<Option<Url>> {
-    if reference.scheme() != "daap" {
-        return Ok(None);
+/// Return true for DAAP-owned references, including malformed values that
+/// must fail closed instead of reaching GStreamer as ordinary URIs.
+pub fn is_media_reference(reference: &str) -> bool {
+    reference
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("daap"))
+}
+
+/// Resolve a credential-free DAAP stream reference through its retained live
+/// session into a typed request whose bearer state stays isolated.
+pub fn resolve_stream_reference(reference: &str) -> BackendResult<ResolvedHttpRequest> {
+    resolve_media_reference(reference, "stream")
+}
+
+/// Resolve a credential-free DAAP artwork reference through its retained live
+/// session into a typed request whose bearer state stays isolated.
+pub fn resolve_artwork_reference(reference: &str) -> BackendResult<ResolvedHttpRequest> {
+    resolve_media_reference(reference, "artwork")
+}
+
+fn resolve_media_reference(
+    reference: &str,
+    expected_kind: &str,
+) -> BackendResult<ResolvedHttpRequest> {
+    let reference =
+        Url::parse(reference).map_err(|_| invalid_reference("malformed reference URL"))?;
+    if reference.scheme() != "daap"
+        || !reference.username().is_empty()
+        || reference.password().is_some()
+        || reference.port().is_some()
+        || reference.fragment().is_some()
+    {
+        return Err(invalid_reference("invalid reference authority"));
     }
 
     let session_key = reference
@@ -364,6 +395,9 @@ pub fn resolve_media_url(reference: &Url) -> BackendResult<Option<Url>> {
     if segments.next().is_some() {
         return Err(invalid_reference("unexpected media path component"));
     }
+    if kind != expected_kind {
+        return Err(invalid_reference("media reference has the wrong kind"));
+    }
 
     let backend = lock_registry()
         .by_session
@@ -374,16 +408,26 @@ pub fn resolve_media_url(reference: &Url) -> BackendResult<Option<Url>> {
             source: None,
         })?;
 
-    match kind {
+    match expected_kind {
         "stream" => {
-            let format = reference
-                .query_pairs()
-                .find_map(|(key, value)| (key == "format").then(|| value.into_owned()))
+            let query_pairs: Vec<_> = reference.query_pairs().collect();
+            if query_pairs.len() != 1 || query_pairs[0].0 != "format" {
+                return Err(invalid_reference("unexpected stream query state"));
+            }
+            let format = query_pairs
+                .into_iter()
+                .next()
+                .map(|(_, value)| value.into_owned())
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| invalid_reference("missing stream format"))?;
-            backend.stream_url_for_item(song_id, &format).map(Some)
+            backend.stream_request_for_item(song_id, &format)
         }
-        "artwork" => backend.artwork_url_for_item(song_id).map(Some),
+        "artwork" => {
+            if reference.query().is_some() {
+                return Err(invalid_reference("unexpected artwork query state"));
+            }
+            backend.artwork_request_for_item(song_id)
+        }
         _ => Err(invalid_reference("unknown media kind")),
     }
 }
@@ -487,6 +531,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovery_loss_invalidates_an_attempt_before_handshake_start() {
+        let _registry_guard = REGISTRY_TEST_LOCK.lock().await;
+        reset_registry().await;
+        let source_key = "queued-daap-then-lost";
+        let attempt = begin_connect(source_key.to_string()).expect("queued DAAP attempt");
+
+        // No session exists to return, but release still removes the current
+        // generation. A queued task that begins afterward must fail closed.
+        assert!(release_source(source_key).is_none());
+        assert!(!attempt.is_latest());
+        drop(attempt);
+        assert!(!lock_registry()
+            .pending_attempts
+            .iter()
+            .any(|(key, _)| key == source_key));
+        reset_registry().await;
+    }
+
+    #[tokio::test]
     async fn lifecycle_retains_session_resolves_media_and_logs_out_once() {
         let _registry_guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry().await;
@@ -510,11 +573,15 @@ mod tests {
         assert!(!stream_reference.as_str().contains("session-id"));
 
         let direct_stream = backend
-            .stream_url_for_track(&tracks[0].id)
+            .stream_request_for_track(&tracks[0].id)
             .await
-            .expect("resolve backend stream URL");
-        assert_eq!(direct_stream.scheme(), "http");
-        assert!(direct_stream.as_str().contains("session-id=42"));
+            .expect("resolve backend stream request");
+        assert_eq!(direct_stream.endpoint().scheme(), "http");
+        assert!(!direct_stream.endpoint().as_str().contains("session-id"));
+        assert_eq!(
+            direct_stream.private_query_pairs(),
+            &[("session-id".to_string(), "42".to_string())]
+        );
         let retained = begin_connect(server.base_url.clone())
             .expect("open connection gate")
             .retain(backend)
@@ -526,17 +593,18 @@ mod tests {
         drop(retained);
 
         // The registry, rather than a temporary sync task, owns the backend.
-        let stream_url = resolve_media_url(stream_reference)
-            .expect("resolve stream reference")
-            .expect("DAAP URL");
+        let stream_request =
+            resolve_stream_reference(stream_reference.as_str()).expect("resolve stream reference");
+        assert!(stream_request.is_active());
+        assert!(!stream_request.endpoint().as_str().contains("session-id"));
         assert_eq!(
-            stream_url
-                .query_pairs()
-                .find(|(key, _)| key == "session-id")
-                .unwrap()
-                .1,
-            "42"
+            stream_request.private_query_pairs(),
+            &[("session-id".to_string(), "42".to_string())]
         );
+        let mut stream_url = stream_request.endpoint().clone();
+        for (key, value) in stream_request.private_query_pairs() {
+            stream_url.query_pairs_mut().append_pair(key, value);
+        }
         let body = reqwest::get(stream_url)
             .await
             .expect("play mock stream")
@@ -545,10 +613,13 @@ mod tests {
             .expect("read mock stream");
         assert_eq!(body.as_ref(), b"mock audio");
 
-        let artwork_url = resolve_media_url(artwork_reference)
-            .expect("resolve artwork reference")
-            .expect("DAAP URL");
-        assert!(artwork_url.as_str().contains("session-id=42"));
+        let artwork_request = resolve_artwork_reference(artwork_reference.as_str())
+            .expect("resolve artwork reference");
+        assert!(!artwork_request.endpoint().as_str().contains("session-id"));
+        assert_eq!(
+            artwork_request.private_query_pairs(),
+            &[("session-id".to_string(), "42".to_string())]
+        );
 
         let owned = release_source(&server.base_url).expect("retained source");
         assert!(!is_current_session(
@@ -556,7 +627,9 @@ mod tests {
             generation,
             session_key
         ));
-        assert!(resolve_media_url(stream_reference).is_err());
+        assert!(!stream_request.is_active());
+        assert!(!artwork_request.is_active());
+        assert!(resolve_stream_reference(stream_reference.as_str()).is_err());
         assert!(owned.disconnect().await);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -696,7 +769,7 @@ mod tests {
             queued_generation,
             queued_session_key
         ));
-        assert!(resolve_media_url(&queued_reference).is_err());
+        assert!(resolve_stream_reference(queued_reference.as_str()).is_err());
         assert!(is_current_session(
             &source_key,
             second.generation(),

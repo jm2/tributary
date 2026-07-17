@@ -10,6 +10,8 @@ use adw::prelude::*;
 use gtk::glib;
 use tracing::info;
 
+use crate::architecture::AdvertisedHttpRoute;
+
 use super::header_bar;
 use super::objects::SourceObject;
 use super::window;
@@ -27,6 +29,7 @@ pub fn setup_discovery(
     let rt_handle = state.rt_handle.clone();
     let source_tracks = state.source_tracks.clone();
     let active_source_key = state.active_source_key.clone();
+    let source_navigation = state.source_navigation.clone();
     let sidebar_selection = state.sidebar_selection.clone();
     let track_store = state.track_store.clone();
     let master_tracks = state.master_tracks.clone();
@@ -73,19 +76,54 @@ pub fn setup_discovery(
                     // producers already construct or validate safe base URLs;
                     // this second check prevents a future producer from
                     // publishing user-info/query credentials to a row or log.
-                    if let Err(error) = crate::http_security::parse_base_url(&server.url) {
-                        tracing::warn!(error, "Ignoring discovered server with invalid URL");
-                        continue;
-                    }
+                    let parsed_url = match crate::http_security::parse_base_url(&server.url) {
+                        Ok(url) => url,
+                        Err(error) => {
+                            tracing::warn!(error, "Ignoring discovered server with invalid URL");
+                            continue;
+                        }
+                    };
+                    let advertised_route = match server.advertised_route.clone() {
+                        Some(route) if route.matches_origin(&parsed_url) => Some(route),
+                        Some(_) => {
+                            tracing::warn!(
+                                "Ignoring advertised route that does not match its server origin"
+                            );
+                            None
+                        }
+                        None => None,
+                    };
 
-                    // Dedup: check if this URL is already in the sidebar.
-                    let already_exists = (0..store.n_items()).any(|i| {
-                        store
-                            .item(i)
-                            .and_downcast_ref::<SourceObject>()
-                            .is_some_and(|s| s.server_url() == server.url)
-                    });
-                    if already_exists {
+                    // A URL remains the logical source key. An updated mDNS
+                    // publication refreshes only this row's ephemeral route;
+                    // an already-connected backend retains the immutable route
+                    // snapshot owned by its current generation.
+                    let existing = remote_source_for_url(&store, &server.url);
+                    if let Some(source) = existing {
+                        if source.backend_type() != server.service_type {
+                            tracing::warn!(
+                                backend = %server.service_type,
+                                "Ignoring discovered server whose URL is already owned by another backend"
+                            );
+                            continue;
+                        }
+                        let route_changed = source.advertised_route() != advertised_route;
+                        source.set_advertised_route(advertised_route.clone());
+                        if let Some(requires_password) = server.requires_password {
+                            source.set_requires_password(requires_password);
+                        }
+                        if route_changed
+                            && !source.connected()
+                            && server.service_type == "daap"
+                            && server.requires_password.is_none()
+                        {
+                            probe_daap_password(
+                                &rt_handle,
+                                &store,
+                                &server.url,
+                                advertised_route,
+                            );
+                        }
                         continue;
                     }
 
@@ -100,6 +138,7 @@ pub fn setup_discovery(
                         window::ensure_category_header_store(&store, &server.service_type);
                     let src =
                         SourceObject::discovered(&server.name, &server.service_type, &server.url);
+                    src.set_advertised_route(advertised_route.clone());
 
                     // Apply requires_password if already known from discovery.
                     if let Some(rp) = server.requires_password {
@@ -111,15 +150,16 @@ pub fn setup_discovery(
                     // For DAAP servers, probe whether a password is required
                     // in the background and update the sidebar item.
                     if server.service_type == "daap" && server.requires_password.is_none() {
-                        probe_daap_password(&rt_handle, &store, &server.url);
+                        probe_daap_password(
+                            &rt_handle,
+                            &store,
+                            &server.url,
+                            advertised_route,
+                        );
                     }
                 }
 
                 crate::discovery::DiscoveryEvent::Lost { url, service_type } => {
-                    if pending_connection.borrow().as_deref() == Some(url.as_str()) {
-                        *pending_connection.borrow_mut() = None;
-                    }
-
                     // ── Chromecast devices: remove from output selector ──
                     if service_type == "chromecast" {
                         handle_chromecast_lost(&output_list, &url);
@@ -138,17 +178,49 @@ pub fn setup_discovery(
                         continue;
                     }
 
-                    // mDNS disappearance invalidates a DAAP session even for
-                    // manually saved rows. Transfer ownership immediately so
-                    // queued sync work is generation-rejected and logout is
-                    // tracked by controlled shutdown.
+                    // URL keys cannot represent two backend protocols at the
+                    // same origin. A cross-backend mDNS alias is rejected on
+                    // Found above, and its Lost event must not retire the row,
+                    // registry, or credentials owned by the accepted backend.
+                    let Some((source_index, source)) =
+                        remote_source_at(&store, &url, &service_type)
+                    else {
+                        tracing::debug!(
+                            backend = %service_type,
+                            "Ignoring lost server event that does not own a sidebar source"
+                        );
+                        continue;
+                    };
+                    let source_key = source.server_url();
+
+                    let lost_pending = pending_connection
+                        .borrow()
+                        .as_ref()
+                        .filter(|pending| pending.source_key() == source_key)
+                        .cloned();
+                    if let Some(pending) = lost_pending {
+                        *pending_connection.borrow_mut() = None;
+                        if source_navigation.borrow().is_current(pending.request()) {
+                            source_navigation
+                                .borrow_mut()
+                                .select(active_source_key.borrow().clone());
+                        }
+                    }
+
+                    // Final-instance disappearance invalidates pending and
+                    // active ownership even when a manually saved row remains
+                    // visible. A task that already captured the old route may
+                    // finish its network I/O, but its generation can no longer
+                    // publish a library or issue playable requests.
+                    invalidate_source_playback(&source_key);
                     if service_type == "daap" {
-                        invalidate_source_playback(&url);
-                        if let Some(session) = crate::daap::release_source(&url) {
+                        if let Some(session) = crate::daap::release_source(&source_key) {
                             rt_handle.spawn(async move {
                                 session.disconnect().await;
                             });
                         }
+                    } else {
+                        crate::source_registry::release_source(&source_key);
                     }
 
                     info!(
@@ -156,83 +228,66 @@ pub fn setup_discovery(
                         "Handling lost server discovery event"
                     );
 
-                    // Find the sidebar entry for this URL.
-                    for i in 0..store.n_items() {
-                        if let Some(src) = store.item(i).and_downcast_ref::<SourceObject>() {
-                            if src.server_url() == url {
-                                // Never auto-remove manually-added servers.
-                                if src.manually_added() {
-                                    if service_type == "daap" {
-                                        let was_active = *active_source_key.borrow() == url;
-                                        source_tracks.borrow_mut().remove(&url);
-                                        src.set_connected(false);
-                                        src.set_connecting(false);
-                                        src.set_icon_name("network-server-symbolic");
-                                        let src = src.clone();
-                                        store.remove(i);
-                                        store.insert(i, &src);
+                    source.set_advertised_route(None);
+                    let was_active = *active_source_key.borrow() == source_key;
 
-                                        if was_active {
-                                            *active_source_key.borrow_mut() = "local".to_string();
-                                            sidebar_selection.set_selected(1);
-                                            let st = source_tracks.borrow();
-                                            let local_tracks =
-                                                st.get("local").cloned().unwrap_or_default();
-                                            window::display_tracks(
-                                                &local_tracks,
-                                                &track_store,
-                                                &master_tracks,
-                                                &browser_widget,
-                                                &browser_state,
-                                                &status_label,
-                                                &column_view,
-                                            );
-                                        }
-                                    }
-                                    break;
-                                }
-                                // If connected and still the active source,
-                                // switch to local before removing.
-                                let was_active = *active_source_key.borrow() == url;
+                    // Never auto-remove manually-added servers.
+                    if source.manually_added() {
+                        source_tracks.borrow_mut().remove(&source_key);
+                        source.set_connected(false);
+                        source.set_connecting(false);
+                        source.set_icon_name("network-server-symbolic");
+                        store.remove(source_index);
+                        store.insert(source_index, &source);
 
-                                if service_type != "daap" {
-                                    invalidate_source_playback(&url);
-                                    crate::source_registry::release_source(&url);
-                                }
-
-                                if src.connected() {
-                                    // Remove from source_tracks map.
-                                    source_tracks.borrow_mut().remove(&url);
-                                }
-
-                                // Remove the sidebar entry.
-                                store.remove(i);
-
-                                // Clean up empty category header.
-                                let category = window::category_for_backend(&service_type);
-                                window::remove_empty_category_header(&store, category);
-
-                                // If this was the active source, switch to local.
-                                if was_active {
-                                    *active_source_key.borrow_mut() = "local".to_string();
-                                    sidebar_selection.set_selected(1);
-
-                                    let st = source_tracks.borrow();
-                                    let local_tracks = st.get("local").cloned().unwrap_or_default();
-                                    window::display_tracks(
-                                        &local_tracks,
-                                        &track_store,
-                                        &master_tracks,
-                                        &browser_widget,
-                                        &browser_state,
-                                        &status_label,
-                                        &column_view,
-                                    );
-                                }
-
-                                break;
-                            }
+                        if was_active {
+                            source_navigation.borrow_mut().select("local");
+                            *active_source_key.borrow_mut() = "local".to_string();
+                            sidebar_selection.set_selected(1);
+                            let st = source_tracks.borrow();
+                            let local_tracks = st.get("local").cloned().unwrap_or_default();
+                            window::display_tracks(
+                                &local_tracks,
+                                &track_store,
+                                &master_tracks,
+                                &browser_widget,
+                                &browser_state,
+                                &status_label,
+                                &column_view,
+                            );
                         }
+                        continue;
+                    }
+
+                    if source.connected() {
+                        // Remove from source_tracks map.
+                        source_tracks.borrow_mut().remove(&source_key);
+                    }
+
+                    // Remove the sidebar entry.
+                    store.remove(source_index);
+
+                    // Clean up empty category header.
+                    let category = window::category_for_backend(&service_type);
+                    window::remove_empty_category_header(&store, category);
+
+                    // If this was the active source, switch to local.
+                    if was_active {
+                        source_navigation.borrow_mut().select("local");
+                        *active_source_key.borrow_mut() = "local".to_string();
+                        sidebar_selection.set_selected(1);
+
+                        let st = source_tracks.borrow();
+                        let local_tracks = st.get("local").cloned().unwrap_or_default();
+                        window::display_tracks(
+                            &local_tracks,
+                            &track_store,
+                            &master_tracks,
+                            &browser_widget,
+                            &browser_state,
+                            &status_label,
+                            &column_view,
+                        );
                     }
                 }
             }
@@ -373,6 +428,39 @@ fn handle_airplay_lost(output_list: &gtk::ListBox, url: &str) {
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════
 
+fn remote_source_for_url(store: &gtk::gio::ListStore, server_url: &str) -> Option<SourceObject> {
+    (0..store.n_items()).find_map(|index| {
+        store
+            .item(index)
+            .and_downcast::<SourceObject>()
+            .filter(|source| same_remote_server_url(&source.server_url(), server_url))
+    })
+}
+
+pub(super) fn remote_source_at(
+    store: &gtk::gio::ListStore,
+    server_url: &str,
+    backend_type: &str,
+) -> Option<(u32, SourceObject)> {
+    (0..store.n_items()).find_map(|index| {
+        store
+            .item(index)
+            .and_downcast::<SourceObject>()
+            .filter(|source| {
+                same_remote_server_url(&source.server_url(), server_url)
+                    && source.backend_type() == backend_type
+            })
+            .map(|source| (index, source))
+    })
+}
+
+fn same_remote_server_url(left: &str, right: &str) -> bool {
+    crate::http_security::parse_base_url(left)
+        .ok()
+        .zip(crate::http_security::parse_base_url(right).ok())
+        .is_some_and(|(left, right)| left == right)
+}
+
 /// Check if a device with the given name already exists in the output list.
 fn is_device_in_output_list(output_list: &gtk::ListBox, name: &str) -> bool {
     let mut child = output_list.first_child();
@@ -410,18 +498,35 @@ fn propagate_widget_name(output_list: &gtk::ListBox) {
     }
 }
 
+fn accepts_daap_probe_result(
+    source: &SourceObject,
+    probe_server_url: &str,
+    advertised_route: &Option<AdvertisedHttpRoute>,
+) -> bool {
+    source.backend_type() == "daap"
+        && same_remote_server_url(&source.server_url(), probe_server_url)
+        && source.advertised_route() == *advertised_route
+        && !source.connected()
+}
+
 /// Probe whether a DAAP server requires a password, updating the sidebar item.
 fn probe_daap_password(
     rt_handle: &tokio::runtime::Handle,
     store: &gtk::gio::ListStore,
     server_url: &str,
+    advertised_route: Option<AdvertisedHttpRoute>,
 ) {
     let probe_url = server_url.to_string();
+    let route_for_probe = advertised_route.clone();
     let store = store.clone();
     let (probe_tx, probe_rx) = async_channel::bounded::<Option<bool>>(1);
 
     rt_handle.spawn(async move {
-        let result = crate::daap::client::DaapClient::probe_requires_password(&probe_url).await;
+        let result = crate::daap::client::DaapClient::probe_requires_password_with_route(
+            &probe_url,
+            route_for_probe,
+        )
+        .await;
         let _ = probe_tx.send(result).await;
     });
 
@@ -431,7 +536,7 @@ fn probe_daap_password(
             // Find the source in the store and update it.
             for i in 0..store.n_items() {
                 if let Some(src) = store.item(i).and_downcast_ref::<SourceObject>() {
-                    if src.server_url() == probe_server_url && !src.connected() {
+                    if accepts_daap_probe_result(src, &probe_server_url, &advertised_route) {
                         src.set_requires_password(requires_pw);
                         // Force rebind by remove + re-insert.
                         let src = src.clone();
@@ -443,4 +548,49 @@ fn probe_daap_password(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_origin_cross_backend_alias_does_not_own_the_existing_row() {
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        let source = SourceObject::manual("Subsonic", "subsonic", "http://mini.local:4533");
+        store.append(&source);
+
+        assert!(remote_source_at(&store, "http://mini.local:4533", "subsonic").is_some());
+        assert!(remote_source_at(&store, "http://mini.local:4533", "daap").is_none());
+        assert_eq!(
+            remote_source_for_url(&store, "http://mini.local:4533")
+                .expect("URL owner")
+                .backend_type(),
+            "subsonic"
+        );
+    }
+
+    #[test]
+    fn root_url_spelling_matches_discovery_without_changing_the_owned_key() {
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        let source = SourceObject::manual("DAAP", "daap", "HTTP://MINI.LOCAL:80/");
+        store.append(&source);
+
+        let (_, owner) = remote_source_at(&store, "http://mini.local", "daap")
+            .expect("canonical root URL owner");
+        assert_eq!(owner.server_url(), "HTTP://MINI.LOCAL:80/");
+        assert!(accepts_daap_probe_result(
+            &owner,
+            "http://mini.local",
+            &None
+        ));
+        assert!(same_remote_server_url(
+            "http://mini.local/base",
+            "http://MINI.local:80/base"
+        ));
+        assert!(!same_remote_server_url(
+            "http://mini.local/base",
+            "http://mini.local/other"
+        ));
+    }
 }

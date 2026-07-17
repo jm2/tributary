@@ -9,8 +9,12 @@
 
 use reqwest::Url;
 
+use crate::architecture::AdvertisedHttpRoute;
+
 const MAX_REDIRECTS: usize = 10;
 const REDACTED: &str = "REDACTED";
+const ADVERTISED_ROUTE_ORIGIN_MISMATCH: &str =
+    "advertised HTTP route does not match the HTTP client origin";
 const INVALID_BASE_URL: &str = "Invalid server URL: use an http:// or https:// base URL with a host and without embedded credentials, a query, or a fragment";
 
 /// Start an asynchronous client builder with credential-safe redirect defaults.
@@ -39,6 +43,44 @@ pub fn public_blocking_client_builder() -> reqwest::blocking::ClientBuilder {
     reqwest::blocking::Client::builder()
         .referer(false)
         .redirect(public_redirect_policy())
+}
+
+/// Apply an mDNS-advertised direct route to an asynchronous client builder.
+///
+/// `resolve_to_addrs` changes only direct connection resolution: it does not
+/// rewrite the request URL and does not disable reqwest's configured system or
+/// explicit proxies. A selected proxy therefore retains its normal routing
+/// semantics, while a direct or `NO_PROXY` request avoids a second DNS lookup.
+pub fn apply_advertised_http_route(
+    builder: reqwest::ClientBuilder,
+    origin: &Url,
+    route: Option<&AdvertisedHttpRoute>,
+) -> Result<reqwest::ClientBuilder, &'static str> {
+    let Some(route) = route else {
+        return Ok(builder);
+    };
+    if !route.matches_origin(origin) {
+        return Err(ADVERTISED_ROUTE_ORIGIN_MISMATCH);
+    }
+    Ok(builder.resolve_to_addrs(route.hostname(), route.addresses()))
+}
+
+/// Apply an mDNS-advertised direct route to a blocking client builder.
+///
+/// This has the same exact-origin and proxy-preserving contract as
+/// [`apply_advertised_http_route`].
+pub fn apply_advertised_http_route_blocking(
+    builder: reqwest::blocking::ClientBuilder,
+    origin: &Url,
+    route: Option<&AdvertisedHttpRoute>,
+) -> Result<reqwest::blocking::ClientBuilder, &'static str> {
+    let Some(route) = route else {
+        return Ok(builder);
+    };
+    if !route.matches_origin(origin) {
+        return Err(ADVERTISED_ROUTE_ORIGIN_MISMATCH);
+    }
+    Ok(builder.resolve_to_addrs(route.hostname(), route.addresses()))
 }
 
 /// Remove a request URL before an HTTP error is retained or displayed.
@@ -343,9 +385,21 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::Duration;
+
+    struct StalledResolver {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl reqwest::dns::Resolve for StalledResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
 
     fn url(value: &str) -> Url {
         Url::parse(value).expect("test URL must parse")
@@ -471,6 +525,31 @@ mod tests {
         assert_eq!(redact_url_secrets(invalid), invalid);
     }
 
+    #[test]
+    fn advertised_route_helpers_reject_mismatched_origins_without_echoing_them() {
+        let secret_host = format!("{}.invalid", uuid::Uuid::new_v4());
+        let route_origin = url(&format!("https://{secret_host}"));
+        let route =
+            AdvertisedHttpRoute::new(&route_origin, [SocketAddr::from(([192, 0, 2, 1], 443))])
+                .expect("route");
+        let target = url("https://other.invalid");
+
+        let error =
+            apply_advertised_http_route(authenticated_client_builder(), &target, Some(&route))
+                .expect_err("async mismatch");
+        assert_eq!(error, ADVERTISED_ROUTE_ORIGIN_MISMATCH);
+        assert!(!error.contains(&secret_host));
+
+        let error = apply_advertised_http_route_blocking(
+            authenticated_blocking_client_builder(),
+            &target,
+            Some(&route),
+        )
+        .expect_err("blocking mismatch");
+        assert_eq!(error, ADVERTISED_ROUTE_ORIGIN_MISMATCH);
+        assert!(!error.contains(&secret_host));
+    }
+
     fn read_request(stream: &mut TcpStream) -> String {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -509,6 +588,125 @@ mod tests {
                 .expect("write test response");
         });
         (address, request_rx)
+    }
+
+    #[test]
+    fn asynchronous_advertised_route_bypasses_a_stalled_resolver_and_preserves_host() {
+        let (address, request_rx) = spawn_one_response("200 OK", None);
+        let origin = url(&format!(
+            "http://advertised-route.invalid:{}/from-advertisement",
+            address.port()
+        ));
+        let route = AdvertisedHttpRoute::new(&origin, [address]).expect("route");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = Arc::new(StalledResolver {
+            calls: Arc::clone(&calls),
+        });
+
+        let runtime = tokio::runtime::Runtime::new().expect("build runtime");
+        runtime.block_on(async {
+            let builder = authenticated_client_builder()
+                .no_proxy()
+                .dns_resolver(resolver);
+            let client = apply_advertised_http_route(builder, &origin, Some(&route))
+                .expect("matching route")
+                .build()
+                .expect("build routed client");
+            let response =
+                tokio::time::timeout(Duration::from_secs(2), client.get(origin.clone()).send())
+                    .await
+                    .expect("advertised route must not stall in DNS")
+                    .expect("send through advertised route");
+            assert!(response.status().is_success());
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured routed request");
+        assert!(request.starts_with("GET /from-advertisement HTTP/1.1\r\n"));
+        assert!(request.lines().any(|line| {
+            line.eq_ignore_ascii_case(&format!(
+                "Host: advertised-route.invalid:{}",
+                address.port()
+            ))
+        }));
+        assert!(!request.contains("Host: 127.0.0.1"));
+    }
+
+    #[test]
+    fn blocking_advertised_route_bypasses_a_stalled_resolver_and_preserves_host() {
+        let (address, request_rx) = spawn_one_response("200 OK", None);
+        let origin = url(&format!(
+            "http://blocking-route.invalid:{}/blocking-advertisement",
+            address.port()
+        ));
+        let route = AdvertisedHttpRoute::new(&origin, [address]).expect("route");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = Arc::new(StalledResolver {
+            calls: Arc::clone(&calls),
+        });
+        let builder = authenticated_blocking_client_builder()
+            .no_proxy()
+            .dns_resolver(resolver);
+        let client = apply_advertised_http_route_blocking(builder, &origin, Some(&route))
+            .expect("matching route")
+            .build()
+            .expect("build routed client");
+        let response = client
+            .get(origin.clone())
+            .timeout(Duration::from_secs(2))
+            .send()
+            .expect("send through advertised route");
+        assert!(response.status().is_success());
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured routed request");
+        assert!(request.starts_with("GET /blocking-advertisement HTTP/1.1\r\n"));
+        assert!(request.lines().any(|line| {
+            line.eq_ignore_ascii_case(&format!("Host: blocking-route.invalid:{}", address.port()))
+        }));
+        assert!(!request.contains("Host: 127.0.0.1"));
+    }
+
+    #[test]
+    fn advertised_route_does_not_disable_an_explicit_proxy() {
+        let target = TcpListener::bind("127.0.0.1:0").expect("bind direct target");
+        let target_address = target.local_addr().expect("target address");
+        let (proxy_address, proxy_rx) = spawn_one_response("200 OK", None);
+        let origin = url(&format!(
+            "http://proxied-route.invalid:{}/through-proxy",
+            target_address.port()
+        ));
+        let route = AdvertisedHttpRoute::new(&origin, [target_address]).expect("route");
+        let proxy =
+            reqwest::Proxy::all(format!("http://{proxy_address}")).expect("explicit test proxy");
+        let builder = authenticated_blocking_client_builder().proxy(proxy);
+        let client = apply_advertised_http_route_blocking(builder, &origin, Some(&route))
+            .expect("matching route")
+            .build()
+            .expect("build proxied client");
+        let response = client
+            .get(origin.clone())
+            .timeout(Duration::from_secs(2))
+            .send()
+            .expect("send through proxy");
+        assert!(response.status().is_success());
+
+        let request = proxy_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("proxy received request");
+        assert!(request.starts_with(&format!(
+            "GET http://proxied-route.invalid:{}/through-proxy HTTP/1.1\r\n",
+            target_address.port()
+        )));
+        target.set_nonblocking(true).expect("nonblocking target");
+        assert!(matches!(
+            target.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]

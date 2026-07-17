@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
-use crate::architecture::{RemoteMediaResolver, ResolvedHttpRequest};
+use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest};
 
 use super::api::{
     PlexAlbum, PlexAlbumsResponse, PlexArtist, PlexArtistsResponse, PlexIdentityResponse,
@@ -90,7 +90,20 @@ pub struct PlexBackend {
 impl PlexBackend {
     /// Connect using a pre-existing auth token, then fetch the full library.
     pub async fn connect(name: &str, server_url: &str, auth_token: &str) -> BackendResult<Self> {
-        let client = PlexClient::new(server_url, auth_token)?;
+        Self::connect_with_route(name, server_url, auth_token, None).await
+    }
+
+    /// Connect using an immutable address route supplied by discovery.
+    pub async fn connect_with_route(
+        name: &str,
+        server_url: &str,
+        auth_token: &str,
+        advertised_route: Option<AdvertisedHttpRoute>,
+    ) -> BackendResult<Self> {
+        let client = match advertised_route {
+            Some(route) => PlexClient::new_with_route(server_url, auth_token, Some(route))?,
+            None => PlexClient::new(server_url, auth_token)?,
+        };
         Self::init(name, client).await
     }
 

@@ -10,10 +10,11 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::architecture::ResolvedHttpRequest;
+use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
-    authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
+    apply_advertised_http_route, authenticated_client_builder, redact_url_secrets,
+    strip_request_url, validate_base_url,
 };
 
 use super::api::SubsonicEnvelope;
@@ -37,7 +38,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_API_BODY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// End-to-end and body-phase deadline for finite API requests.
-const API_RESPONSE_DEADLINE: Duration = Duration::from_secs(120);
+const API_RESPONSE_DEADLINE: Duration = Duration::from_mins(2);
 
 /// Authentication mode used for API requests.
 #[derive(Clone)]
@@ -66,6 +67,7 @@ impl std::fmt::Debug for AuthMode {
 #[derive(Clone)]
 pub struct SubsonicClient {
     base_url: Url,
+    advertised_route: Option<AdvertisedHttpRoute>,
     username: String,
     /// Raw password retained so we can switch auth modes on fallback.
     password: String,
@@ -81,6 +83,20 @@ impl SubsonicClient {
     /// [`switch_to_plaintext_auth`] to fall back to hex-encoded
     /// plaintext (only allowed over HTTPS).
     pub fn new(server_url: &str, username: &str, password: &str) -> BackendResult<Self> {
+        Self::new_with_route(server_url, username, password, None)
+    }
+
+    /// Build a client with an immutable address route supplied by discovery.
+    ///
+    /// The route changes only connection establishment. Request URLs, HTTP
+    /// `Host`, TLS identity, redirects, and proxy selection continue to use
+    /// the validated server URL.
+    pub fn new_with_route(
+        server_url: &str,
+        username: &str,
+        password: &str,
+        advertised_route: Option<AdvertisedHttpRoute>,
+    ) -> BackendResult<Self> {
         let base_url = Url::parse(server_url).map_err(|e| BackendError::ConnectionFailed {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
@@ -115,10 +131,15 @@ impl SubsonicClient {
 
         let auth = Self::make_token_auth(password);
 
-        let http = authenticated_client_builder()
+        let http_builder = authenticated_client_builder()
             .user_agent(CLIENT_NAME)
             .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
+            .read_timeout(READ_TIMEOUT);
+        let http = apply_advertised_http_route(http_builder, &base_url, advertised_route.as_ref())
+            .map_err(|message| BackendError::ConnectionFailed {
+                message: message.to_string(),
+                source: None,
+            })?
             .build()
             .map_err(|e| BackendError::ConnectionFailed {
                 message: format!("Failed to build HTTP client: {e}"),
@@ -133,6 +154,7 @@ impl SubsonicClient {
 
         Ok(Self {
             base_url,
+            advertised_route,
             username: username.to_string(),
             password: password.to_string(),
             auth,
@@ -361,7 +383,10 @@ impl SubsonicClient {
                 request.with_private_query_pair("p", format!("enc:{hex_password}"))?
             }
         };
-        Ok(request)
+        match &self.advertised_route {
+            Some(route) => request.with_advertised_route(route.clone()),
+            None => Ok(request),
+        }
     }
 }
 
@@ -385,7 +410,15 @@ fn response_body_error(context: &str, error: ResponseBodyError) -> BackendError 
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
     use super::*;
+
+    fn advertised_route(origin: &str) -> AdvertisedHttpRoute {
+        let origin = Url::parse(origin).expect("route origin");
+        AdvertisedHttpRoute::new(&origin, [SocketAddr::from((Ipv4Addr::LOCALHOST, 45_321))])
+            .expect("domain route")
+    }
 
     #[test]
     fn maps_response_body_deadline_to_timeout() {
@@ -471,5 +504,49 @@ mod tests {
             .private_query_pairs()
             .iter()
             .any(|(key, _)| matches!(key.as_str(), "t" | "s")));
+    }
+
+    #[test]
+    fn advertised_route_reaches_stream_and_artwork_requests() {
+        let origin = "https://music.example.test";
+        let route = advertised_route(origin);
+        let username = uuid::Uuid::new_v4().to_string();
+        let password = uuid::Uuid::new_v4().to_string();
+        let client =
+            SubsonicClient::new_with_route(origin, &username, &password, Some(route.clone()))
+                .expect("routed client");
+
+        for request in [
+            client.resolved_stream_request("song-id").unwrap(),
+            client.resolved_artwork_request("cover-id").unwrap(),
+        ] {
+            assert_eq!(request.advertised_route(), Some(&route));
+            assert_eq!(request.endpoint().host_str(), Some("music.example.test"));
+        }
+
+        let ordinary = SubsonicClient::new(origin, &username, &password).expect("ordinary client");
+        assert!(ordinary
+            .resolved_stream_request("song-id")
+            .unwrap()
+            .advertised_route()
+            .is_none());
+    }
+
+    #[test]
+    fn mismatched_advertised_route_fails_without_exposing_credentials() {
+        let username = uuid::Uuid::new_v4().to_string();
+        let password = uuid::Uuid::new_v4().to_string();
+        let Err(error) = SubsonicClient::new_with_route(
+            "https://music.example.test",
+            &username,
+            &password,
+            Some(advertised_route("https://other.example.test")),
+        ) else {
+            panic!("mismatched route must fail");
+        };
+
+        let rendered = error.to_string();
+        assert!(!rendered.contains(&username));
+        assert!(!rendered.contains(&password));
     }
 }

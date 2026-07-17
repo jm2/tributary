@@ -13,15 +13,15 @@ BuildRequires:  gcc
 BuildRequires:  pkgconf-pkg-config
 BuildRequires:  libadwaita-devel
 BuildRequires:  gtk4-devel
-BuildRequires:  pkgconfig(gtk4)
-BuildRequires:  pkgconfig(libadwaita-1)
+BuildRequires:  pkgconfig(gtk4) >= 4.16
+BuildRequires:  pkgconfig(libadwaita-1) >= 1.6
 BuildRequires:  pkgconfig(gstreamer-1.0)
 BuildRequires:  pkgconfig(dbus-1)
 BuildRequires:  desktop-file-utils
 BuildRequires:  libappstream-glib
 
-Requires:       gtk4 >= 4.14
-Requires:       libadwaita >= 1.5
+Requires:       gtk4 >= 4.16
+Requires:       libadwaita >= 1.6
 Requires:       gstreamer1-plugins-good
 Requires:       gstreamer1-plugins-bad-free
 Requires:       gstreamer1-plugins-ugly-free

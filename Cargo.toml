@@ -1,8 +1,8 @@
 [package]
 name = "tributary"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.92"
 description = "A high-performance, Rhythmbox-style media manager with unified local and remote backends"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/jm2/tributary"
@@ -34,6 +34,9 @@ futures = "0.3"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 
+# Safe, namespace-aware XSPF parsing
+quick-xml = "0.41"
+
 # URL handling
 url = { version = "2", features = ["serde"] }
 
@@ -59,6 +62,7 @@ async-channel = "2"
 
 # XDG / platform directories
 dirs = "6"
+tempfile = "3"
 
 # Shuffle randomness (zero-dependency PRNG)
 fastrand = "2"
@@ -107,7 +111,10 @@ souvlaki = "0.8"
 # Windows-only: GDK4 Win32 backend (HWND extraction for souvlaki SMTC)
 [target.'cfg(target_os = "windows")'.dependencies]
 gdk4-win32 = "0.11"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gdk-pixbuf = "0.22"
 
 # Stable filesystem IDs for removable/network library-root safety.
 [target.'cfg(unix)'.dependencies]
@@ -120,7 +127,7 @@ winresource = "0.1"
 maintainer = "Tributary Contributors"
 copyright = "2026, Tributary Contributors"
 license-file = ["LICENSE", "0"]
-depends = "libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.5), gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-libav, libdbus-1-3"
+depends = "libgtk-4-1 (>= 4.16), libadwaita-1-0 (>= 1.6), gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-libav, libdbus-1-3"
 section = "sound"
 assets = [
     ["target/release/tributary", "usr/bin/", "755"],
@@ -152,8 +159,8 @@ assets = [
 ]
 
 [package.metadata.generate-rpm.requires]
-gtk4 = ">= 4.14"
-libadwaita = ">= 1.5"
+gtk4 = ">= 4.16"
+libadwaita = ">= 1.6"
 gstreamer1-plugins-good = "*"
 gstreamer1-plugins-bad-free = "*"
 gstreamer1-plugins-ugly-free = "*"
@@ -163,6 +170,7 @@ dbus = "*"
 [dev-dependencies]
 http = "1"
 proptest = "1"
+toml = "0.8"
 
 [profile.release]
 opt-level = 3

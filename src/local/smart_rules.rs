@@ -17,8 +17,6 @@ pub struct SmartRules {
     pub rules: Vec<SmartRule>,
     /// Optional result limiting.
     pub limit: Option<SmartLimit>,
-    /// Whether the playlist auto-updates when the library changes.
-    pub live_updating: bool,
     /// Optional compound sort order applied to the final results.
     /// Each criterion is applied in sequence (multi-key sort).
     /// Example: Artist ascending → Year ascending → Track # ascending
@@ -260,7 +258,8 @@ impl SmartTrack for crate::db::entities::track::Model {
 
 /// Evaluate a smart playlist's rules against a set of tracks.
 ///
-/// Returns the matching tracks, optionally limited and sorted.
+/// Returns the matching tracks after applying the three evaluation stages in
+/// order: filter, limit selection/membership, then final compound ordering.
 pub fn evaluate<T: SmartTrack + Clone>(rules: &SmartRules, tracks: &[T]) -> Vec<T> {
     // Filter tracks through rules.
     let mut results: Vec<T> = tracks
@@ -284,14 +283,20 @@ pub fn evaluate<T: SmartTrack + Clone>(rules: &SmartRules, tracks: &[T]) -> Vec<
         .cloned()
         .collect();
 
-    // Apply compound sort order if specified.
-    if !rules.sort_order.is_empty() {
-        apply_compound_sort(&mut results, &rules.sort_order);
+    if results.is_empty() {
+        return results;
     }
 
-    // Apply limit if configured.
+    // Select membership before applying the presentation order. A limit's
+    // `selected_by` sort decides which tracks make the cut; `sort_order`
+    // independently decides how that selected subset is displayed.
     if let Some(limit) = &rules.limit {
         apply_limit(&mut results, limit);
+    }
+
+    // Apply the final compound presentation order to the selected subset.
+    if !rules.sort_order.is_empty() {
+        apply_compound_sort(&mut results, &rules.sort_order);
     }
 
     results
@@ -1158,7 +1163,6 @@ mod tests {
                 },
             ],
             limit: None,
-            live_updating: true,
             sort_order: Vec::new(),
         };
 
@@ -1193,7 +1197,6 @@ mod tests {
                 },
             ],
             limit: None,
-            live_updating: true,
             sort_order: Vec::new(),
         };
 
@@ -1209,7 +1212,6 @@ mod tests {
             match_mode: MatchMode::All,
             rules: vec![],
             limit: None,
-            live_updating: true,
             sort_order: Vec::new(),
         };
         let result = evaluate(&rules, &[t]);
@@ -1232,7 +1234,6 @@ mod tests {
                 unit: LimitUnit::Items,
                 selected_by: LimitSort::Title,
             }),
-            live_updating: true,
             sort_order: Vec::new(),
         };
 
@@ -1258,7 +1259,6 @@ mod tests {
                 unit: LimitUnit::Minutes,
                 selected_by: LimitSort::Title,
             }),
-            live_updating: true,
             sort_order: Vec::new(),
         };
 
@@ -1289,7 +1289,6 @@ mod tests {
                 unit: LimitUnit::MB,
                 selected_by: LimitSort::Title,
             }),
-            live_updating: true,
             sort_order: Vec::new(),
         };
 
@@ -1402,7 +1401,6 @@ mod tests {
                 unit: LimitUnit::Items,
                 selected_by: LimitSort::Title,
             }),
-            live_updating: true,
             sort_order: Vec::new(),
         };
 
@@ -1429,7 +1427,6 @@ mod tests {
                 unit: LimitUnit::Items,
                 selected_by: LimitSort::MostPlayed,
             }),
-            live_updating: true,
             sort_order: Vec::new(),
         };
 
@@ -1437,6 +1434,185 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].title(), "B"); // 20 plays
         assert_eq!(result[1].title(), "C"); // 10 plays
+    }
+
+    #[test]
+    fn filtering_and_item_selection_happen_before_final_sort() {
+        let mut excluded = TestTrack::new("Able", "Artist", "Album");
+        excluded.genre = "Jazz".into();
+        excluded.play_count = 100;
+
+        let mut most_played = TestTrack::new("Zulu", "Artist", "Album");
+        most_played.genre = "Rock".into();
+        most_played.play_count = 30;
+
+        let mut second_most_played = TestTrack::new("Apple", "Artist", "Album");
+        second_most_played.genre = "Rock".into();
+        second_most_played.play_count = 20;
+
+        let mut omitted_by_limit = TestTrack::new("Middle", "Artist", "Album");
+        omitted_by_limit.genre = "Rock".into();
+        omitted_by_limit.play_count = 10;
+
+        let rules = SmartRules {
+            match_mode: MatchMode::All,
+            rules: vec![SmartRule {
+                field: RuleField::Genre,
+                operator: RuleOperator::Is,
+                value: RuleValue::Text("Rock".into()),
+            }],
+            limit: Some(SmartLimit {
+                value: 2,
+                unit: LimitUnit::Items,
+                selected_by: LimitSort::MostPlayed,
+            }),
+            sort_order: vec![SortCriterion {
+                field: SortField::Title,
+                direction: SortDirection::Ascending,
+            }],
+        };
+
+        let result = evaluate(
+            &rules,
+            &[excluded, omitted_by_limit, most_played, second_most_played],
+        );
+        let titles: Vec<_> = result.iter().map(SmartTrack::title).collect();
+        assert_eq!(titles, ["Apple", "Zulu"]);
+    }
+
+    #[test]
+    fn capacity_selection_happens_before_final_sort() {
+        let mut most_played = TestTrack::new("Zulu", "Artist", "Album");
+        most_played.play_count = 30;
+        most_played.duration_secs = Some(180);
+
+        let mut second_most_played = TestTrack::new("Apple", "Artist", "Album");
+        second_most_played.play_count = 20;
+        second_most_played.duration_secs = Some(120);
+
+        let mut omitted_by_capacity = TestTrack::new("Middle", "Artist", "Album");
+        omitted_by_capacity.play_count = 10;
+        omitted_by_capacity.duration_secs = Some(120);
+
+        let rules = SmartRules {
+            match_mode: MatchMode::All,
+            rules: vec![],
+            limit: Some(SmartLimit {
+                value: 5,
+                unit: LimitUnit::Minutes,
+                selected_by: LimitSort::MostPlayed,
+            }),
+            sort_order: vec![SortCriterion {
+                field: SortField::Title,
+                direction: SortDirection::Ascending,
+            }],
+        };
+
+        let result = evaluate(
+            &rules,
+            &[omitted_by_capacity, most_played, second_most_played],
+        );
+        let titles: Vec<_> = result.iter().map(SmartTrack::title).collect();
+        assert_eq!(titles, ["Apple", "Zulu"]);
+    }
+
+    #[test]
+    fn a_random_limited_subset_still_gets_its_final_sort() {
+        let tracks: Vec<_> = [
+            "Juliet", "Delta", "Alpha", "India", "Echo", "Hotel", "Bravo", "Golf", "Charlie",
+            "Foxtrot",
+        ]
+        .into_iter()
+        .map(|title| TestTrack::new(title, "Artist", "Album"))
+        .collect();
+        let rules = SmartRules {
+            match_mode: MatchMode::All,
+            rules: vec![],
+            limit: Some(SmartLimit {
+                value: 4,
+                unit: LimitUnit::Items,
+                selected_by: LimitSort::Random,
+            }),
+            sort_order: vec![SortCriterion {
+                field: SortField::Title,
+                direction: SortDirection::Ascending,
+            }],
+        };
+
+        let result = evaluate(&rules, &tracks);
+        assert_eq!(result.len(), 4);
+        assert!(result
+            .windows(2)
+            .all(|pair| pair[0].title().to_lowercase() <= pair[1].title().to_lowercase()));
+    }
+
+    #[test]
+    fn compound_sort_honors_each_keys_direction() {
+        fn track(title: &str, artist: &str, year: i32, track_number: i32) -> TestTrack {
+            let mut track = TestTrack::new(title, artist, "Album");
+            track.year = Some(year);
+            track.track_number = Some(track_number);
+            track
+        }
+
+        let tracks = vec![
+            track("beta-old", "Beta", 2020, 1),
+            track("alpha-old", "Alpha", 2020, 2),
+            track("alpha-new-2", "Alpha", 2024, 2),
+            track("beta-new", "Beta", 2024, 1),
+            track("alpha-new-1", "Alpha", 2024, 1),
+        ];
+        let rules = SmartRules {
+            match_mode: MatchMode::All,
+            rules: vec![],
+            limit: None,
+            sort_order: vec![
+                SortCriterion {
+                    field: SortField::Artist,
+                    direction: SortDirection::Ascending,
+                },
+                SortCriterion {
+                    field: SortField::Year,
+                    direction: SortDirection::Descending,
+                },
+                SortCriterion {
+                    field: SortField::TrackNumber,
+                    direction: SortDirection::Ascending,
+                },
+            ],
+        };
+
+        let result = evaluate(&rules, &tracks);
+        let titles: Vec<_> = result.iter().map(SmartTrack::title).collect();
+        assert_eq!(
+            titles,
+            [
+                "alpha-new-1",
+                "alpha-new-2",
+                "alpha-old",
+                "beta-new",
+                "beta-old",
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_live_updating_is_accepted_but_not_reserialized() {
+        let legacy = r#"{
+            "match_mode": "All",
+            "rules": [],
+            "limit": null,
+            "live_updating": false
+        }"#;
+
+        let rules: SmartRules = serde_json::from_str(legacy).expect("legacy rules deserialize");
+        assert_eq!(rules.match_mode, MatchMode::All);
+        assert!(rules.rules.is_empty());
+        assert!(rules.limit.is_none());
+        assert!(rules.sort_order.is_empty());
+
+        let serialized = serde_json::to_value(&rules).expect("rules serialize");
+        assert!(serialized.get("live_updating").is_none());
     }
 
     // ── Proptest property-based tests ───────────────────────────────
@@ -1484,7 +1660,6 @@ mod tests {
                         },
                     ],
                     limit: None,
-                    live_updating: true,
                     sort_order: Vec::new(),
                 };
 
@@ -1492,7 +1667,6 @@ mod tests {
                     match_mode: MatchMode::Any,
                     rules: rules_all.rules.clone(),
                     limit: None,
-                    live_updating: true,
                     sort_order: Vec::new(),
                 };
 
@@ -1515,7 +1689,6 @@ mod tests {
                     match_mode: MatchMode::All,
                     rules: vec![],
                     limit: None,
-                    live_updating: true,
                     sort_order: Vec::new(),
                 };
 
@@ -1527,7 +1700,6 @@ mod tests {
                         unit: LimitUnit::Items,
                         selected_by: LimitSort::Title,
                     }),
-                    live_updating: true,
                     sort_order: Vec::new(),
                 };
 
@@ -1546,7 +1718,6 @@ mod tests {
                     match_mode: MatchMode::All,
                     rules: vec![],
                     limit: None,
-                    live_updating: true,
                     sort_order: Vec::new(),
                 };
 

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
-use crate::architecture::{RemoteMediaResolver, ResolvedHttpRequest};
+use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest};
 
 use super::api::{JellyfinItem, JellyfinItemsResponse, JellyfinViewsResponse};
 use super::client::JellyfinClient;
@@ -91,7 +91,23 @@ impl JellyfinBackend {
         api_key: &str,
         user_id: &str,
     ) -> BackendResult<Self> {
-        let client = JellyfinClient::new(server_url, api_key, user_id)?;
+        Self::connect_with_route(name, server_url, api_key, user_id, None).await
+    }
+
+    /// Connect using an immutable address route supplied by discovery.
+    pub async fn connect_with_route(
+        name: &str,
+        server_url: &str,
+        api_key: &str,
+        user_id: &str,
+        advertised_route: Option<AdvertisedHttpRoute>,
+    ) -> BackendResult<Self> {
+        let client = match advertised_route {
+            Some(route) => {
+                JellyfinClient::new_with_route(server_url, api_key, user_id, Some(route))?
+            }
+            None => JellyfinClient::new(server_url, api_key, user_id)?,
+        };
         Self::init(name, client).await
     }
 

@@ -50,20 +50,20 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Audio output selector (local + MPD, iTunes AirPlay-style) | ✅ |
 | MPD output backend (sink-only, TCP with security hardening) | ✅ |
 | Output switching (click to swap local ↔ MPD) | ✅ |
-| AirPlay 1 (RAOP) output | ✅ Requires a working `raopsink` GStreamer element or `shairport-sync` on `PATH`; falls back automatically |
+| AirPlay 1 (RAOP) output | ✅ Requires GStreamer's `raopsink` element (ships in `gst-plugins-bad`); a missing element fails with an actionable install message |
 | AirPlay 2 / HomeKit output | ❌ Not yet supported — see [AirPlay 2 roadmap](#airplay-2-roadmap) below |
 | Chromecast output (Cast V2 — local files + remote sources) | ✅ |
 | Album artist sort (preference toggle) | ✅ |
 | Smart playlist compound sort (multi-key ordering) | ✅ |
 | Geo-distance sorting for Stations Near Me | ✅ |
-| USB device browsing (sidebar + tracklist scan) | ✅ |
+| USB/removable-media browsing (live native sidebar + bounded track scan) | ✅ |
 | USB file transfer (copy to device with progress) | ❌ Planned ([#8](https://github.com/jm2/tributary/issues/8)) |
 | Multiple music library directories | ✅ |
 | Playlist import/export (XSPF) | ✅ |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
-| macOS "Open With" file association | ✅ |
+| Linux and macOS file associations | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
@@ -140,7 +140,7 @@ Pre-built packages for Linux (Flatpak, .deb, .rpm), macOS (.dmg), and Windows (.
 
 ### Prerequisites (all platforms)
 
-- [Rust 1.85+](https://rustup.rs) (stable toolchain) — this is the declared MSRV in `Cargo.toml`
+- [Rust 1.92+](https://rustup.rs) (stable toolchain) — this is the declared MSRV in `Cargo.toml`, set by the gtk-rs 0.11 release series and verified by a dedicated CI job
 - **GTK 4.16+** and **libadwaita 1.6+** — the crate compiles against these API levels, so older
   runtimes will fail to build, not merely fail at startup
 - `pkg-config`
@@ -224,35 +224,64 @@ This produces `dist/tributary-windows.zip` with the executable and all required 
 ### Flatpak (Linux)
 
 The manifest builds offline (`CARGO_NET_OFFLINE=true`) from a generated
-`build-aux/flatpak/cargo-sources.json`. That file is not checked in, so it must be generated
-before the first build — `flatpak-builder` will fail immediately without it.
+`build-aux/flatpak/cargo-sources.json`. The repository vendors the immutably pinned Cargo source
+generator, and the shared helper verifies its recorded checksum before writing the ignored source
+manifest beside the Flatpak manifest. Local builds and CI therefore run the same generator from the
+same location.
 
 ```bash
-# Install flatpak-builder if needed:
-sudo apt install flatpak-builder
+# Install the tools and configure Flathub for this user:
+sudo apt install flatpak flatpak-builder python3-venv
+flatpak remote-add --if-not-exists --user flathub \
+  https://dl.flathub.org/repo/flathub.flatpakrepo
 
-# Fetch the pinned generator (same commit and checksum CI uses) and its dependencies:
-pip3 install --requirement build-aux/flatpak/generator-requirements.txt
-GENERATOR_COMMIT=737c0085912f9f7dabf9341d4608e2a77a51a73a
-GENERATOR_SHA256=b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c
-curl --fail --show-error --silent --location --proto '=https' --tlsv1.2 \
-  --output build-aux/flatpak/flatpak-cargo-generator.py \
-  "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py"
-echo "${GENERATOR_SHA256}  build-aux/flatpak/flatpak-cargo-generator.py" | sha256sum --check --strict
+# Keep the generator dependencies isolated from the system Python:
+FLATPAK_VENV="${XDG_CACHE_HOME:-$HOME/.cache}/tributary-flatpak-venv"
+python3 -m venv "$FLATPAK_VENV"
+source "$FLATPAK_VENV/bin/activate"
+python3 -m pip install --requirement build-aux/flatpak/generator-requirements.txt
 
-# Generate the offline source manifest *next to the Flatpak manifest*:
-python3 build-aux/flatpak/flatpak-cargo-generator.py Cargo.lock \
-  -o build-aux/flatpak/cargo-sources.json
+# Verify the vendored pin and generate the offline source manifest:
+bash build-aux/flatpak/generate-cargo-sources.sh
 
 # Build and install locally:
-flatpak-builder --force-clean --repo=repo --install --user \
+flatpak-builder --user --install-deps-from=flathub --force-clean --repo=repo --install \
   build-dir build-aux/flatpak/io.github.tributary.Tributary.yml
 ```
 
-> `./scripts/build-linux.sh` does not yet perform these steps correctly — it invokes a generator
-> that is not vendored and writes `cargo-sources.json` to the repository root instead of beside
-> the manifest. Vendoring the generator so local and CI builds share one path is tracked as P2.5
-> in [`docs/task.md`](docs/task.md).
+`./scripts/build-linux.sh --flatpak` uses this same helper and enters the sandboxed build without
+first requiring a native Rust/GTK build. The manifest's directory source excludes known VCS,
+agent, and generated build/package paths—including `target/`, coverage, and stale source-manifest
+output—so those host artifacts are not copied into the SDK build. The local single-file bundle
+records Flathub as its runtime repository. The vendored file's
+immutable upstream revision, license, checksum, and update procedure are recorded in
+`build-aux/flatpak/flatpak-cargo-generator.PROVENANCE`.
+
+The sandbox deliberately does not expose the whole home directory. XDG Music is available
+read/write. A custom library selected explicitly in **Preferences → Library Folders** goes through
+GTK's [file-chooser portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.FileChooser.html),
+which requests a persistent read/write sandbox grant. Tag editing works when the selected directory
+is also writable under the host filesystem's ordinary permissions; a portal cannot make read-only
+storage writable.
+
+A custom path saved by an older Flatpak build as a direct host path may become unavailable under
+the narrower sandbox policy. Do not remove and re-add that root if preserving track IDs, history,
+and playlist links matters: use that root's **Reauthorize…** action in Preferences to select the
+same logical folder through the portal, confirm the identity-preserving move, and restart so the
+guarded relocation completes before scanning.
+
+Following [Flatpak's external-drive guidance](https://docs.flatpak.org/en/latest/sandbox-permissions.html#external-drive-access),
+host-mounted media under `/media`, `/run/media`, and `/mnt` is exposed read-only for the automatic
+**Devices** inventory and playback. The `org.gtk.vfs.*` bus namespace makes the host GVfs service
+methods available to GIO; Tributary consumes its cached native mount inventory and does not expose
+the non-native GVfs filesystem sockets. It does not request raw USB-device access, the whole host
+filesystem, or a writable external-media root. To treat external media as a writable custom
+library, select that directory explicitly in Preferences and use its portal-backed library entry
+rather than the automatic Devices entry. The grant still cannot override a physically or
+host-permission read-only filesystem. The automatic Devices entry remains browse/play-only at the
+sandbox boundary. Properties checks the selected files and their containing directory on a worker
+before enabling its editing controls, so a read-only automatic device is explained before Save and
+points to the custom-library flow that can request portal write access.
 
 ---
 
@@ -383,8 +412,8 @@ src/
 │   ├── client.rs           # HTTP client (5-step session handshake)
 │   └── backend.rs          # MediaBackend impl (in-memory cache)
 ├── device/
-│   ├── mod.rs              # Device trait + DeviceInfo (portable device abstraction)
-│   └── usb.rs              # USB mass storage detection (Linux, macOS, Windows)
+│   ├── mod.rs              # DeviceInfo model for mounted browseable media
+│   └── usb.rs              # GIO mount filtering + logical removable-source identity
 ├── radio/
 │   ├── mod.rs              # Internet Radio module root
 │   ├── api.rs              # RadioStation + GeoLocation serde types
@@ -395,6 +424,7 @@ src/
     ├── window.rs           # Main window orchestration (GTK lifecycle + event wiring)
     ├── window_state.rs     # Shared WindowState struct (Rc/RefCell state bundle)
     ├── source_connect.rs   # Sidebar selection handler (source switching + auth flows)
+    ├── removable_media.rs  # Native mount monitoring + live sidebar reconciliation
     ├── discovery_handler.rs# mDNS/DNS-SD event handler (sidebar + output list)
     ├── context_menu.rs     # Tracklist right-click menu (playlist ops + properties)
     ├── playlist_actions.rs # Playlist CRUD (create, rename, delete, reorder)
@@ -441,6 +471,51 @@ data/                        # .desktop, AppStream metainfo, icons
 
 On first launch, Tributary scans your `~/Music` folder (configurable in Preferences) and displays all discovered tracks in the main tracklist. Use the **browser panes** above the tracklist to filter by Genre → Artist → Album. Click any column header to sort; click again to reverse; click a third time to clear the sort.
 
+### Browsing Removable Media
+
+Tributary reads cached native mount metadata from GIO's `VolumeMonitor` on the GTK main thread. It
+does not scan platform mount directories, enumerate drive letters, canonicalize paths, or perform
+filesystem probes during discovery. Shadowed roots and roots without native-path access are
+excluded, as are mounts the backend explicitly classifies as network or loop. A native-path mount
+is shown when the platform reports a removable drive, eject or unmount support, or the `device`
+volume class. Because class metadata is optional and `can_unmount` is broad, this best-effort policy
+can also include a non-removable or natively mounted network filesystem. The translated **Devices**
+heading exists only while at least one qualifying mount is present.
+
+The monitor reconciles mount-added, mount-changed, pre-unmount, and mount-removed notifications for
+the life of the window. A device keeps its best available logical source key separate from its
+native `PathBuf`: mount UUID is preferred, then volume UUID, Unix device identifier, and finally
+root URI.
+Rows sharing that key are deduplicated deterministically. A rename atomically replaces the row at
+the same position. Relocation of the same logical source retires its old scan and playback state,
+temporarily falls back to Local, and reselects it at the new path only if that exact automatic
+fallback is still current. A confirmed removal retires the matching path synchronously before the
+coalesced snapshot, so a rapid same-path reattach cannot preserve stale state; pre-unmount alone
+does not remove the row because the operation can fail. Unplugging an active source invalidates its
+pending navigation, cached tracks, and playback before removing the row and falling back to Local.
+
+Selecting an uncached device starts a named background scan that streams parsed tracks through a
+bounded channel. Its empty projection is installed immediately, so rows from the previous source
+cannot be queued under the device identity while the scan runs. GTK checks source ownership while
+consuming it. Re-selecting the same logical device, relocating it, or unplugging it retires the old
+generation and closes the receiver so the producer stops cooperatively; navigating to a different
+source instead lets the newest scan finish into its cache without rendering it. The walk is lazy
+and does not follow directory or file symlinks, so links cannot escape the selected volume. It can
+still traverse a real nested mount, and cancellation cannot interrupt the one filesystem or
+tag-parser operation currently in progress.
+
+The key is best-available logical identity, not proof of unique physical hardware: cloned
+filesystems may share a UUID, Unix-device and root-URI fallbacks can change with device/path
+assignment, and GIO's broad `can_unmount` signal can include a non-removable or native-path network
+mount when the backend supplies no class. Tributary does not mount unmounted volumes, eject
+devices, or browse MTP-only devices. Real USB add/change/unplug behavior still needs cross-platform
+hardware validation. In Flatpak, the inventory can still list an eligible native mount elsewhere,
+but automatic Devices file access is read-only and limited to `/media`, `/run/media`, and `/mnt`;
+an inaccessible listed root cannot be scanned or played. Writable custom libraries require
+explicit selection through the folder portal as described in [Flatpak (Linux)](#flatpak-linux).
+The remaining local sandbox and physical-device smoke pass is tracked in
+[P2.5](docs/task.md#p25-repair-flatpak-behavior-and-local-build-path).
+
 ### Connecting to Remote Servers
 
 Remote servers are discovered automatically via mDNS (DAAP, Subsonic, Plex) and UDP broadcast (Jellyfin). Discovered servers appear in the sidebar — click one to connect. Password-protected DAAP shares show a lock icon; passwordless shares connect with a single click.
@@ -455,18 +530,123 @@ Use the **search bar** above the browser panes to filter tracks in real-time. Th
 
 Right-click any local track and select **Properties…** to view and edit its metadata. The Properties dialog supports:
 
-- **Single-track editing** — Title, Artist, Album, Genre, Year, Track #, Disc # (plus read-only Format, Bitrate, Sample Rate, Duration, and File Path)
-- **Batch editing** — Select multiple tracks, then right-click → Properties. Only batch-appropriate fields are shown (Artist, Album, Genre, Year, Disc #). Fields with mixed values display "Mixed" as a placeholder; only fields you explicitly change are written.
+- **Single-track editing** — Title, Artist, Album, Genre, Composer, Year, Track #, Disc # (plus read-only Format, Bitrate, Sample Rate, Duration, and File Path)
+- **Batch editing** — Select multiple tracks, then right-click → Properties. Only batch-appropriate fields are shown (Artist, Album, Genre, Composer, Year, Disc #). Fields with mixed values display "Mixed" as a placeholder; only fields you explicitly change are written.
 - **MusicBrainz Lookup** — In single-track mode, click "MusicBrainz Lookup" to search by title + artist. Results populate the form but are **not** saved automatically — you must click Save.
 
-All edits require an explicit **Save** click. Cancel discards all changes. Supported formats: MP3 (ID3v2), M4A/AAC, OGG Vorbis, and FLAC.
+All edits require an explicit **Save** click. Cancel discards all changes. Numeric edits are
+validated before a file is touched. Before editing is enabled, a background capability check
+requires every exact selected path to be a supported, readable, non-symlink regular file and
+rehearses create, flush, replace, and cleanup using two empty writer-owned siblings once per containing
+directory, stopping after the first blocked directory. Malformed or mixed local/remote selections
+fail closed instead of silently editing only a subset, and duplicate playlist rows write their
+exact file only once. Save rechecks the complete
+selection before writing the first track; the result is necessarily point-in-time, so an unplug,
+permission change, full filesystem, or target-specific lock can still make the real operation fail
+safely. Successful saves use an exclusively created, bounded
+`.tributary-tag-<UUID>.<format>` sibling carrying only the case-normalized source format extension,
+flush it before atomic replacement, and remove the sibling on success or attempt removal on every
+failure path. Unix copies begin private at mode `0600` before receiving the source mode; on Windows,
+each file's source DACL is independently installed on an empty sibling and must permit a fresh
+read/write/delete handle before any batch write begins. The real copy follows the same exclusive
+no-sharing sequence before its first audio byte, so a permissive parent-directory ACL cannot briefly
+expose it. Cleanup I/O and process termination remain fallible, so local scans and the filesystem
+watcher also recognize and exclude
+only that exact internal shape: an in-progress or residual copy never appears as another library
+track, and final replacement refreshes the original path without losing its stable identity,
+history, or playlist links. Supported formats:
+MP3 (ID3v2), M4A/AAC, OGG Vorbis, and FLAC.
 
 ### Playlists
 
 Tributary supports regular and smart playlists for the local library:
 
 - **Regular playlists** — Right-click the Playlists header in the sidebar to create a new playlist. Right-click tracks in the tracklist to add them. Playlists survive library folder changes via fingerprint-based track matching.
-- **Smart playlists** — iTunes-style rules engine with 15 filterable fields, text/numeric/date operators, result limiting, and live updating. Create via the sidebar context menu.
+- **Smart playlists** — iTunes-style rules engine with filterable metadata fields, text/numeric/date operators, sorting, and result limiting. Smart playlists are evaluated against the current local library whenever they are opened or exported; they are not stored snapshots. Create them via the sidebar context menu.
+
+#### Importing and exporting playlists
+
+Tributary directly reads and writes only [XSPF version 1](https://www.xspf.org/spec) (`.xspf`).
+The menus and file chooser identify that format explicitly; Apple Music/iTunes XML, Google
+Takeout CSV, M3U, and service-specific playlist URLs are not accepted directly. Export writes the
+complete XSPF document to a temporary sibling and atomically replaces the chosen destination, so
+an error leaves an existing export unchanged. XML 1.0-forbidden control characters are rejected
+before the temporary file or destination is touched. A corrupt negative stored duration or one
+outside Tributary's supported `u64` millisecond range is omitted rather than blocking the otherwise
+valid playlist, because XSPF duration is optional.
+
+Import requires a valid leading XML 1.0 declaration when one is present, `version="1"`, and the
+canonical XSPF namespace, expressed either as the default namespace or through a prefix. It
+validates every attribute's XML syntax and namespace binding; rejects DTDs, malformed or trailing
+documents, and elements that only look like tracks inside comments, CDATA, extensions, or other
+nesting; and imports only direct XSPF `<track>` children of `<trackList>`. Standard named and numeric
+character references are decoded by the XML parser.
+
+On import, each XSPF `<track>` is resolved against the local library in this order:
+
+1. An exact local path decoded from a valid `file:` URI in `<location>`. HTTP(S), other schemes,
+   and malformed locations are ignored as paths, though the row can still match by metadata.
+2. An exact title + artist match after trimming whitespace and ignoring case; a supplied album is
+   also exact. This is normalization, not fuzzy or “similarly named” matching.
+3. If `<duration>` is present, only candidates within five seconds qualify and the unique nearest
+   duration wins. Without a duration, the metadata candidate must already be unique. Ties and
+duplicate metadata remain unmatched instead of choosing an arbitrary song.
+
+Only a valid imported `<location>` supplies path authority. Metadata-only imports and tracks added
+inside Tributary remain fingerprint-only across later relinks, so a different song that eventually
+reuses a scanned library path cannot silently take over the playlist entry. Corrupt negative or
+out-of-schema library durations are ignored as optional matching evidence rather than wrapped or
+allowed to block an otherwise safe path/fingerprint reconciliation.
+
+The entire playlist and its entries commit in one database transaction. The completion dialog
+reports **matched**, **unmatched**, and **failed** counts. An unmatched entry with a usable path or
+title/artist fingerprint is preserved in playlist order and can be linked by a later library
+reconciliation; it is not currently playable until a unique local match appears. A row fails only
+when it has no usable path or title/artist identity (or contains a duration too large for the
+playlist schema). A database or write failure rolls the import back and does not add a sidebar row.
+An XSPF `<duration>` that is not a valid unsigned millisecond value rejects the document before a
+database transaction begins; a syntactically valid value that exceeds the playlist database range
+instead counts that individual row as failed.
+
+Apple Music and iTunes can export playlist metadata as XML, but their XML is an Apple property-list
+format, not XSPF. Follow Apple's official export steps for
+[Music on Mac](https://support.apple.com/en-ca/guide/music/-mus27cd5060f/mac) or
+[iTunes on Windows](https://support.apple.com/guide/itunes/itns2998/windows), then use a converter
+that dereferences each playlist item's `Track ID` through the XML `Tracks` dictionary and emits one
+XSPF `<track>` with these mappings:
+
+| Apple XML track key | XSPF v1 element | Conversion |
+|---|---|---|
+| `Location` | `<location>` | Preserve the `file:` URI when it points at the same local file; otherwise update it to the local library path. |
+| `Name` | `<title>` | Copy as text. |
+| `Artist` | `<creator>` | Copy as text. |
+| `Album` | `<album>` | Copy when present. |
+| `Total Time` | `<duration>` | Copy as milliseconds; both formats use milliseconds here. |
+
+Apple's export contains metadata and references, not the audio files themselves. Subscription-only
+or unavailable catalog items may therefore lack a corresponding local path, and duplicate editions
+with identical normalized metadata stay unmatched unless duration identifies one uniquely.
+
+For YouTube Music, use the official [Google Takeout download
+flow](https://support.google.com/accounts/answer/3024190) to obtain your YouTube/YouTube Music data.
+Takeout's CSV layout and available fields can vary, so convert each playlist row field by field:
+
+| Takeout value, when available | XSPF v1 element | Conversion |
+|---|---|---|
+| A verified path to the corresponding local audio file | `<location>` | Encode it as a `file:` URI. Do **not** put a YouTube watch URL here and expect local-file matching. |
+| Track/song title | `<title>` | Copy the music title, removing video-only decoration only when you can verify it. |
+| Music artist | `<creator>` | Copy the artist; a channel/uploader name is often not the tagged artist and should not be guessed. |
+| Release/album | `<album>` | Copy only when Takeout supplies or you can verify it. |
+| Duration | `<duration>` | Convert seconds to milliseconds; omit rather than estimate. |
+
+An archive containing only video IDs, watch URLs, or timestamps does not contain enough information
+for safe local-library matching; enrich it with verified local metadata before creating XSPF.
+Google also documents a [direct Takeout transfer to Apple
+Music](https://support.google.com/accounts/answer/14792019), after which the Apple XML conversion
+above can be used. That service transfer is a one-time copy, currently requires Apple Music,
+transfers all user-created playlists rather than selected ones, may omit songs absent from the
+destination catalog, and excludes saved third-party playlists, user-uploaded/private content, and
+podcasts. Tributary deliberately does not guess through any of those gaps.
 
 ### Playback Controls
 
@@ -508,7 +688,7 @@ Each of these has specifics (key exchange algorithms, audio codec, RTSP/HTTP ver
 
 Likely paths forward (each to be evaluated when the work begins):
 
-- **Subprocess delegation** to a maintained external tool, in the same spirit as the existing `shairport-sync` fallback on the RAOP path. Cheaper to integrate, but adds a runtime dependency outside the single-binary distribution model.
+- **Subprocess delegation** to a maintained external tool. Cheaper to integrate, but adds a runtime dependency outside the single-binary distribution model.
 - **A pure-Rust sender implementation**, either in-tree or as a contributed `gst-plugins-rs` element, so it can plug into the same pipeline pattern `raopsink` uses today. Higher engineering cost; cleanest distribution story.
 - **Wait for an upstream component** to mature to the point that one of the above becomes obviously preferable.
 

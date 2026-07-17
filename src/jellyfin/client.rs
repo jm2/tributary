@@ -10,10 +10,11 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::architecture::ResolvedHttpRequest;
+use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
-    authenticated_client_builder, redact_url_secrets, strip_request_url, validate_base_url,
+    apply_advertised_http_route, authenticated_client_builder, redact_url_secrets,
+    strip_request_url, validate_base_url,
 };
 
 use super::api::{JellyfinAuthRequest, JellyfinAuthResponse};
@@ -41,13 +42,14 @@ const MAX_TEXT_BODY_BYTES: u64 = 64 * 1024;
 
 /// End-to-end and body-phase deadlines for each finite request class.
 const AUTH_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
-const API_RESPONSE_DEADLINE: Duration = Duration::from_secs(120);
+const API_RESPONSE_DEADLINE: Duration = Duration::from_mins(2);
 const TEXT_RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Holds credentials and a reusable `reqwest::Client` with the
 /// `X-Emby-Authorization` header pre-configured on every request.
 pub struct JellyfinClient {
     base_url: Url,
+    advertised_route: Option<AdvertisedHttpRoute>,
     user_id: String,
     /// The raw access token, kept for building stream/image URLs.
     api_key: String,
@@ -66,6 +68,16 @@ impl JellyfinClient {
     /// * `api_key` — API key or authentication token
     /// * `user_id` — The Jellyfin user ID (required for user-scoped endpoints)
     pub fn new(server_url: &str, api_key: &str, user_id: &str) -> BackendResult<Self> {
+        Self::new_with_route(server_url, api_key, user_id, None)
+    }
+
+    /// Build a client with an immutable address route supplied by discovery.
+    pub fn new_with_route(
+        server_url: &str,
+        api_key: &str,
+        user_id: &str,
+        advertised_route: Option<AdvertisedHttpRoute>,
+    ) -> BackendResult<Self> {
         let base_url = Url::parse(server_url).map_err(|e| BackendError::ConnectionFailed {
             message: format!("Invalid server URL: {e}"),
             source: Some(Box::new(e)),
@@ -75,7 +87,7 @@ impl JellyfinClient {
             source: None,
         })?;
 
-        let http = build_http_client(api_key)?;
+        let http = build_http_client(api_key, &base_url, advertised_route.as_ref())?;
 
         info!(
             server = %redact_url_secrets(base_url.as_str()),
@@ -85,6 +97,7 @@ impl JellyfinClient {
 
         Ok(Self {
             base_url,
+            advertised_route,
             user_id: user_id.to_string(),
             api_key: api_key.to_string(),
             http,
@@ -100,6 +113,16 @@ impl JellyfinClient {
         server_url: &str,
         username: &str,
         password: &str,
+    ) -> BackendResult<Self> {
+        Self::authenticate_with_route(server_url, username, password, None).await
+    }
+
+    /// Authenticate with an immutable address route supplied by discovery.
+    pub async fn authenticate_with_route(
+        server_url: &str,
+        username: &str,
+        password: &str,
+        advertised_route: Option<AdvertisedHttpRoute>,
     ) -> BackendResult<Self> {
         let base_url = Url::parse(server_url).map_err(|e| BackendError::ConnectionFailed {
             message: format!("Invalid server URL: {e}"),
@@ -127,16 +150,22 @@ impl JellyfinClient {
         );
         pre_auth_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
-        let pre_auth_http = authenticated_client_builder()
+        let pre_auth_builder = authenticated_client_builder()
             .user_agent(CLIENT_NAME)
             .default_headers(pre_auth_headers)
             .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
-            .build()
-            .map_err(|e| BackendError::ConnectionFailed {
-                message: format!("Failed to build HTTP client: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+            .read_timeout(READ_TIMEOUT);
+        let pre_auth_http =
+            apply_advertised_http_route(pre_auth_builder, &base_url, advertised_route.as_ref())
+                .map_err(|message| BackendError::ConnectionFailed {
+                    message: message.to_string(),
+                    source: None,
+                })?
+                .build()
+                .map_err(|e| BackendError::ConnectionFailed {
+                    message: format!("Failed to build HTTP client: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
 
         // POST /Users/AuthenticateByName
         let mut auth_url = base_url.clone();
@@ -208,10 +237,11 @@ impl JellyfinClient {
         );
 
         // Build the real client with the acquired token.
-        let http = build_http_client(&api_key)?;
+        let http = build_http_client(&api_key, &base_url, advertised_route.as_ref())?;
 
         Ok(Self {
             base_url,
+            advertised_route,
             user_id,
             api_key,
             http,
@@ -260,10 +290,14 @@ impl JellyfinClient {
         url.set_query(None);
         url.set_fragment(None);
         url.query_pairs_mut().append_pair("static", "true");
-        ResolvedHttpRequest::new(url)?.with_sensitive_header(
+        let request = ResolvedHttpRequest::new(url)?.with_sensitive_header(
             HeaderName::from_static("x-emby-authorization"),
             jellyfin_auth_header(&self.api_key)?,
-        )
+        )?;
+        match &self.advertised_route {
+            Some(route) => request.with_advertised_route(route.clone()),
+            None => Ok(request),
+        }
     }
 
     /// Resolve a cover-art request with authentication isolated likewise.
@@ -274,10 +308,14 @@ impl JellyfinClient {
         let mut url = self.api_url(&format!("Items/{item_id}/Images/Primary"));
         url.set_query(None);
         url.set_fragment(None);
-        ResolvedHttpRequest::new(url)?.with_sensitive_header(
+        let request = ResolvedHttpRequest::new(url)?.with_sensitive_header(
             HeaderName::from_static("x-emby-authorization"),
             jellyfin_auth_header(&self.api_key)?,
-        )
+        )?;
+        match &self.advertised_route {
+            Some(route) => request.with_advertised_route(route.clone()),
+            None => Ok(request),
+        }
     }
 
     /// Issue a GET request to a Jellyfin endpoint and deserialize the
@@ -389,16 +427,25 @@ impl JellyfinClient {
 }
 
 /// Build a `reqwest::Client` with the full `X-Emby-Authorization` header.
-fn build_http_client(api_key: &str) -> BackendResult<Client> {
+fn build_http_client(
+    api_key: &str,
+    base_url: &Url,
+    advertised_route: Option<&AdvertisedHttpRoute>,
+) -> BackendResult<Client> {
     let mut default_headers = HeaderMap::new();
     default_headers.insert("X-Emby-Authorization", jellyfin_auth_header(api_key)?);
     default_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
-    authenticated_client_builder()
+    let builder = authenticated_client_builder()
         .user_agent(CLIENT_NAME)
         .default_headers(default_headers)
         .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_TIMEOUT)
+        .read_timeout(READ_TIMEOUT);
+    apply_advertised_http_route(builder, base_url, advertised_route)
+        .map_err(|message| BackendError::ConnectionFailed {
+            message: message.to_string(),
+            source: None,
+        })?
         .build()
         .map_err(|e| BackendError::ConnectionFailed {
             message: format!("Failed to build HTTP client: {e}"),
@@ -439,7 +486,15 @@ fn response_body_error(context: &str, error: ResponseBodyError) -> BackendError 
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
     use super::*;
+
+    fn advertised_route(origin: &str) -> AdvertisedHttpRoute {
+        let origin = Url::parse(origin).expect("route origin");
+        AdvertisedHttpRoute::new(&origin, [SocketAddr::from((Ipv4Addr::LOCALHOST, 45_322))])
+            .expect("domain route")
+    }
 
     #[test]
     fn maps_response_body_deadline_to_timeout() {
@@ -490,5 +545,51 @@ mod tests {
                 .expect("auth header");
             assert!(value.is_sensitive());
         }
+    }
+
+    #[test]
+    fn advertised_route_reaches_stream_and_artwork_requests() {
+        let origin = "https://media.example.test";
+        let route = advertised_route(origin);
+        let client = JellyfinClient::new_with_route(
+            origin,
+            "route-api-key",
+            "route-user-id",
+            Some(route.clone()),
+        )
+        .expect("routed client");
+
+        for request in [
+            client.resolved_stream_request("track-id").unwrap(),
+            client.resolved_artwork_request("album-id").unwrap(),
+        ] {
+            assert_eq!(request.advertised_route(), Some(&route));
+            assert_eq!(request.endpoint().host_str(), Some("media.example.test"));
+        }
+
+        let ordinary = JellyfinClient::new(origin, "api-key", "user-id").expect("ordinary client");
+        assert!(ordinary
+            .resolved_stream_request("track-id")
+            .unwrap()
+            .advertised_route()
+            .is_none());
+    }
+
+    #[test]
+    fn mismatched_advertised_route_fails_without_exposing_credentials() {
+        let api_key = uuid::Uuid::new_v4().to_string();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let Err(error) = JellyfinClient::new_with_route(
+            "https://media.example.test",
+            &api_key,
+            &user_id,
+            Some(advertised_route("https://other.example.test")),
+        ) else {
+            panic!("mismatched route must fail");
+        };
+
+        let rendered = error.to_string();
+        assert!(!rendered.contains(&api_key));
+        assert!(!rendered.contains(&user_id));
     }
 }

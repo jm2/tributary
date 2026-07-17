@@ -8,8 +8,8 @@ url="https://github.com/jm2/tributary"
 license=('GPL-3.0-or-later')
 options=('!lto')
 depends=(
-  'gtk4'
-  'libadwaita'
+  'gtk4>=4.16'
+  'libadwaita>=1.6'
   'gstreamer'
   'gst-plugins-good'
   'gst-plugins-bad'

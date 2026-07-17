@@ -144,20 +144,13 @@ BUNDLE_ROOT="$(dirname "$DIR")"
 # Blind the app to Homebrew by stripping it from PATH
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
-# Force macOS to prioritize our bundled dylibs above everything else
-export DYLD_LIBRARY_PATH="$BUNDLE_ROOT/Frameworks"
-
-# Force GTK to look inside the bundle for icons and schemas
-export XDG_DATA_DIRS="$BUNDLE_ROOT/Resources/share"
-export GTK_DATA_PREFIX="$BUNDLE_ROOT/Resources"
-export GDK_PIXBUF_MODULE_FILE="$BUNDLE_ROOT/Resources/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
-
-# Force GStreamer to only use bundled plugins and scanners
-export GST_PLUGIN_SYSTEM_PATH=""
-export GST_PLUGIN_PATH="$BUNDLE_ROOT/Resources/lib/gstreamer-1.0"
-export GST_PLUGIN_SCANNER="$DIR/gst-plugin-scanner"
-# Set a bundle-local registry path so the first launch scans bundled plugins
-export GST_REGISTRY="$DIR/gst-registry.bin"
+# The Rust entry point sets absolute GTK/GStreamer resource paths before either
+# toolkit initializes and preserves every explicit user override. DYLD must be
+# available before the binary starts, but an explicit value (including empty)
+# remains authoritative.
+if [[ -z "${DYLD_LIBRARY_PATH+x}" ]]; then
+  export DYLD_LIBRARY_PATH="$BUNDLE_ROOT/Frameworks"
+fi
 
 # Launch the actual Rust binary
 exec "$DIR/Tributary-bin" "$@"
@@ -198,6 +191,17 @@ if [[ -d "$PIXBUF_LOADER_DIR" ]]; then
   mkdir -p "${RESOURCES_DIR}/lib"
   cp -RL "$PIXBUF_LOADER_DIR" "${RESOURCES_DIR}/lib/" 2>/dev/null || true
 fi
+
+# Bundle the loader-cache generator. Runtime setup invokes this exact signed
+# helper with the exact relocated loader module paths, then writes the result
+# atomically to the user's cache directory.
+PIXBUF_QUERY_DEST="${APP_BUNDLE}/Contents/MacOS/gdk-pixbuf-query-loaders"
+PIXBUF_QUERY_SRC="${BREW_PREFIX}/bin/gdk-pixbuf-query-loaders"
+if [[ ! -x "$PIXBUF_QUERY_SRC" ]]; then
+  error "gdk-pixbuf-query-loaders not found at ${PIXBUF_QUERY_SRC}"
+fi
+cp "$PIXBUF_QUERY_SRC" "$PIXBUF_QUERY_DEST"
+chmod u+w "$PIXBUF_QUERY_DEST"
 
 # ── Bundle GStreamer plugins ─────────────────────────────────────────────────
 GST_PLUGIN_SRC="${BREW_PREFIX}/lib/gstreamer-1.0"
@@ -256,7 +260,7 @@ fi
 # NOTE: LSEnvironment is intentionally omitted.  Its relative paths
 # only work when the working directory is Contents/MacOS, which macOS
 # does NOT guarantee when launching from Finder / Launchpad.  The
-# binary's setup_macos_bundle_env() sets absolute paths at runtime.
+# binary's early platform-runtime setup sets absolute paths at runtime.
 cat > "${APP_BUNDLE}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -388,8 +392,11 @@ if [[ -f "$GST_SCANNER_DEST" ]]; then
   fix_rpaths "$GST_SCANNER_DEST"
 fi
 
-# (Stale GStreamer registry cleanup moved to end of script,
-# after code signing, to prevent re-generation.)
+# Fix rpaths in the bundled pixbuf cache generator.
+if [[ -f "$PIXBUF_QUERY_DEST" ]]; then
+  info "Fixing rpaths in gdk-pixbuf-query-loaders..."
+  fix_rpaths "$PIXBUF_QUERY_DEST"
+fi
 
 # Fix rpaths in pixbuf loaders
 PIXBUF_LOADERS_DEST="${RESOURCES_DIR}/lib/gdk-pixbuf-2.0/2.10.0/loaders"
@@ -402,12 +409,14 @@ if [[ -d "$PIXBUF_LOADERS_DEST" ]]; then
   done
 fi
 
-# Update pixbuf loaders.cache
+# A copied Homebrew cache contains builder paths and is mutable runtime state.
+# Runtime setup generates a relocated cache below the user's cache directory.
 PIXBUF_CACHE="${RESOURCES_DIR}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
-if [[ -f "$PIXBUF_CACHE" ]]; then
-  info "Patching pixbuf loaders.cache for bundle paths..."
-  sed -i '' "s|${BREW_PREFIX}/lib/gdk-pixbuf-2.0/2.10.0/loaders/|${RESOURCES_DIR}/lib/gdk-pixbuf-2.0/2.10.0/loaders/|g" "$PIXBUF_CACHE" 2>/dev/null || true
-fi
+rm -f "$PIXBUF_CACHE"
+
+# No mutable runtime cache may enter the code signature or be written beside
+# the executable on first launch.
+rm -f "${APP_BUNDLE}/Contents/MacOS/gst-registry.bin"
 
 # Verify critical GStreamer plugins for audio playback
 if [[ -d "$GST_PLUGIN_DEST" ]]; then
@@ -431,28 +440,79 @@ fi
 # We must re-sign everything with at least an ad-hoc signature.
 info "Ad-hoc code signing the bundle..."
 
-find "${FRAMEWORKS_DIR}" -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
-[[ -d "$GST_PLUGIN_DEST" ]] && find "$GST_PLUGIN_DEST" -name '*.dylib' -exec codesign --force --sign - {} \; 2>/dev/null || true
-[[ -d "$PIXBUF_LOADERS_DEST" ]] && find "$PIXBUF_LOADERS_DEST" \( -name '*.so' -o -name '*.dylib' \) -exec codesign --force --sign - {} \; 2>/dev/null || true
-[[ -f "$GST_SCANNER_DEST" ]] && codesign --force --sign - "$GST_SCANNER_DEST" 2>/dev/null || true
-
-codesign --force --sign - "$BIN" 2>/dev/null || true
-codesign --force --deep --sign - "$APP_BUNDLE" 2>/dev/null || true
+while IFS= read -r dylib; do
+  codesign --force --sign - "$dylib"
+done < <(find "${FRAMEWORKS_DIR}" -name '*.dylib' -type f)
+if [[ -d "$GST_PLUGIN_DEST" ]]; then
+  while IFS= read -r plugin; do
+    codesign --force --sign - "$plugin"
+  done < <(find "$GST_PLUGIN_DEST" -name '*.dylib' -type f)
+fi
+if [[ -d "$PIXBUF_LOADERS_DEST" ]]; then
+  while IFS= read -r loader; do
+    codesign --force --sign - "$loader"
+  done < <(find "$PIXBUF_LOADERS_DEST" \( -name '*.so' -o -name '*.dylib' \) -type f)
+fi
+[[ -f "$GST_SCANNER_DEST" ]] && codesign --force --sign - "$GST_SCANNER_DEST"
+codesign --force --sign - "$PIXBUF_QUERY_DEST"
+codesign --force --sign - "$BIN"
+codesign --force --deep --sign - "$APP_BUNDLE"
 
 info ".app bundle created: $(pwd)/${APP_BUNDLE}"
 
-if codesign --verify --verbose "$APP_BUNDLE" 2>/dev/null; then
-  info "Code signature verified OK."
-else
-  warn "Code signature verification failed."
-fi
+codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+info "Code signature verified before runtime probe."
 
-# Remove any stale GStreamer registry that the build may have generated.
-# This must happen AFTER code signing — if the registry is present during
-# signing, its hash goes into the seal and first-launch will invalidate it
-# when GStreamer overwrites it.  Deleting it here forces a clean first-launch
-# scan that writes a registry referencing the bundle-local plugin paths.
-rm -f "${APP_BUNDLE}/Contents/MacOS/gst-registry.bin"
+# Probe an exact signed copy from a relocated path containing spaces. The copy
+# is read-only, and a fresh explicit cache root prevents ambient user state
+# from making the packaging check pass accidentally.
+PROBE_PARENT="dist/Tributary Runtime Probe With Spaces"
+PROBE_APP="${PROBE_PARENT}/${APP_NAME}.app"
+PROBE_CACHE="$(mktemp -d "${TMPDIR:-/tmp}/Tributary Runtime Cache With Spaces.XXXXXX")"
+cleanup_probe() {
+  chmod -R u+w "$PROBE_PARENT" 2>/dev/null || true
+  rm -rf "$PROBE_PARENT" "$PROBE_CACHE"
+}
+trap cleanup_probe EXIT
+rm -rf "$PROBE_PARENT"
+mkdir -p "$PROBE_PARENT"
+ditto "$APP_BUNDLE" "$PROBE_APP"
+chmod -R a-w "$PROBE_APP"
+
+env -u GST_REGISTRY \
+    -u GST_REGISTRY_1_0 \
+    -u GDK_PIXBUF_MODULE_FILE \
+    -u GST_PLUGIN_PATH \
+    -u GST_PLUGIN_PATH_1_0 \
+    -u GST_PLUGIN_SYSTEM_PATH \
+    -u GST_PLUGIN_SYSTEM_PATH_1_0 \
+    -u GST_PLUGIN_SCANNER \
+    -u GST_PLUGIN_SCANNER_1_0 \
+    -u GDK_PIXBUF_MODULEDIR \
+    -u XDG_DATA_DIRS \
+    -u GTK_DATA_PREFIX \
+    -u GSETTINGS_SCHEMA_DIR \
+    -u GTK_PATH \
+    -u DYLD_LIBRARY_PATH \
+    "$PROBE_APP/Contents/MacOS/${APP_NAME}" \
+    --tributary-platform-runtime-probe "$PROBE_CACHE"
+
+PROBE_PIXBUF_CACHE="$(find "$PROBE_CACHE" -type f -path '*/gdk-pixbuf/loaders.cache' -print | sed -n '1p')"
+PROBE_GST_CACHE="$(find "$PROBE_CACHE" -type f -path '*/gstreamer/registry.bin' -print | sed -n '1p')"
+[[ -n "$PROBE_PIXBUF_CACHE" ]] || error "runtime probe did not create the pixbuf user cache"
+[[ -n "$PROBE_GST_CACHE" ]] || error "runtime probe did not create the GStreamer user cache"
+grep -F "$PROBE_APP/Contents/Resources" "$PROBE_PIXBUF_CACHE" >/dev/null \
+  || error "pixbuf probe cache does not reference the relocated app"
+if [[ -e "$PROBE_APP/Contents/MacOS/gst-registry.bin" \
+   || -e "$PROBE_APP/Contents/Resources/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" ]]; then
+  error "runtime probe wrote a mutable cache inside the signed app"
+fi
+codesign --verify --deep --strict --verbose=2 "$PROBE_APP"
+
+# The packaged app was not launched or mutated after signing. This final
+# strict verification is fatal and remains the last operation on the bundle.
+codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+info "Signed runtime probe and final signature verification passed."
 
 # ── DMG ──────────────────────────────────────────────────────────────────────
 if $MAKE_DMG; then

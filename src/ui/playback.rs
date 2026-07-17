@@ -598,6 +598,16 @@ fn resolve_play_request(has_current: bool, item_count: u32, shuffle: bool) -> Pl
     })
 }
 
+/// Read the session behind a function boundary so its `Ref` is released before
+/// the caller handles a request that may replace the queue.
+fn resolve_session_play_request(
+    session: &RefCell<PlaybackSession>,
+    item_count: u32,
+    shuffle: bool,
+) -> PlayRequest {
+    resolve_play_request(session.borrow().has_current(), item_count, shuffle)
+}
+
 /// Try to play the track at `position` in the given model.
 ///
 /// Captures the visible sorted model as an immutable playback queue, then
@@ -658,11 +668,10 @@ pub fn play_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
     if ctx.session.borrow().resolution_failed {
         return play_current(ctx);
     }
-    match resolve_play_request(
-        ctx.session.borrow().has_current(),
-        ctx.model.n_items(),
-        shuffle,
-    ) {
+    // Do not borrow the RefCell directly in the match scrutinee: scrutinee
+    // temporaries live through the selected arm, and StartAt mutably borrows
+    // the same session while installing the newly captured queue.
+    match resolve_session_play_request(&ctx.session, ctx.model.n_items(), shuffle) {
         PlayRequest::Resume => {
             ctx.active_output.borrow().play();
             true
@@ -750,13 +759,7 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         return true;
     }
 
-    let playback_uri = match resolve_live_media_reference(item.uri()) {
-        Ok(uri) => uri,
-        Err(error) => {
-            warn!(error = %error, "Could not resolve track through its live source session");
-            return false;
-        }
-    };
+    let playback_uri = item.uri.clone();
 
     // Each output resolves the source at its own trust boundary. Chromecast
     // serves local files over its embedded LAN server; authenticated remote
@@ -829,19 +832,7 @@ fn update_now_playing_ui(
                 }
             });
         } else {
-            // Remote track with a cover art URL — resolve session-scoped
-            // references immediately before fetching.
-            match resolve_live_media_reference(&item.cover_art_url) {
-                Ok(cover_art_url) => {
-                    album_art::fetch_remote_album_art(&ctx.album_art, &cover_art_url);
-                }
-                Err(error) => {
-                    warn!(error = %error, "Could not resolve artwork through its live source session");
-                    album_art::invalidate();
-                    ctx.album_art
-                        .set_icon_name(Some("audio-x-generic-symbolic"));
-                }
-            }
+            album_art::fetch_remote_album_art(&ctx.album_art, &item.cover_art_url);
         }
     } else if let Some(playback_uri) = direct_playback_uri {
         // Local track — extract from embedded tags.
@@ -888,22 +879,6 @@ fn find_queue_item_position(
         occurrence += 1;
     }
     None
-}
-
-/// Resolve credential-free source references while passing ordinary media
-/// URLs through unchanged. DAAP resolution only reads retained in-memory
-/// session state and constructs a URL; it performs no network I/O.
-fn resolve_live_media_reference(reference: &str) -> Result<String, String> {
-    if !reference.starts_with("daap:") {
-        return Ok(reference.to_string());
-    }
-
-    let reference = url::Url::parse(reference)
-        .map_err(|error| format!("Invalid DAAP media reference: {error}"))?;
-    crate::daap::resolve_media_url(&reference)
-        .map_err(|error| error.to_string())?
-        .map(|url| url.to_string())
-        .ok_or_else(|| "DAAP media reference was not recognized".to_string())
 }
 
 /// Advance to the next track, respecting shuffle and repeat-all.
@@ -1490,18 +1465,27 @@ mod tests {
 
     #[test]
     fn os_stop_then_play_starts_a_fresh_visible_queue() {
-        let mut session = PlaybackSession::default();
-        assert!(session.replace_queue(vec![item("local", "a")], 0));
+        let session = RefCell::new(PlaybackSession::default());
+        assert!(session
+            .borrow_mut()
+            .replace_queue(vec![item("local", "a")], 0));
         assert_eq!(
-            resolve_play_request(session.has_current(), 3, false),
+            resolve_session_play_request(&session, 3, false),
             PlayRequest::Resume
         );
 
-        session.clear();
+        session.borrow_mut().clear();
 
         assert_eq!(
-            resolve_play_request(session.has_current(), 3, false),
+            resolve_session_play_request(&session, 3, false),
             PlayRequest::StartAt(0)
+        );
+        assert!(
+            session
+                .try_borrow_mut()
+                .expect("play-request resolution must release its immutable borrow")
+                .replace_queue(vec![item("remote", "fresh")], 0),
+            "the StartAt arm must be able to install a fresh queue"
         );
     }
 
