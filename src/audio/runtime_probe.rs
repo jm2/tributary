@@ -908,7 +908,9 @@ mod tests {
         // Match production: publish cancellation before NULL teardown closes
         // the source, then publish final stop, drain, join, and inspect.
         server.begin_teardown();
-        drop(client);
+        client
+            .shutdown(Shutdown::Write)
+            .expect("half-close the abandoned request");
 
         server
             .finish_teardown()

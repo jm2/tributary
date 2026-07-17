@@ -81,12 +81,21 @@ incomplete header was misclassified as server corruption. PR #114 now publishes 
 before NULL, keeps both listeners observing through that transition, then separately stops and
 drains queued accepts.
 Only incomplete-header EOF/reset/abort is cancellation; malformed requests and every other server
-failure remain fatal. A full replacement PR matrix remains pending.
+failure remain fatal.
 The first two-phase-probe head run, 29610563120, then stopped in x86_64 Windows strict Clippy
 before native tests or packaging because the listener function's newly separated lifecycle flags
 raised its parameter count from seven to eight. PR #114 now owns both flags in one shared lifecycle
 state, keeping cancellation and final stop semantically distinct while restoring the bounded
-function signature. A replacement native matrix remains pending.
+function signature. Static run 29611191885 passed, and replacement matrix 29611194118 passed every
+completed exact-toolchain, audit, metadata, coverage, Linux, Flatpak, macOS, ARM64 Windows,
+packaging, and checksum job;
+the ARM64 finished distribution also passed the production protected-playback probe. The x86_64
+native suite passed 717 of 718 application tests but showed that the regression fixture's plain
+client-socket drop did not deterministically establish its intended incomplete-header EOF on that
+Windows runner. The fixture now explicitly half-closes its write side after cancellation, using
+the same cross-platform EOF contract as the already-passing request-classification fixtures,
+without broadening which production I/O failures count as cancellation. A replacement native
+matrix remains pending.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1536,8 +1545,14 @@ observer remains live until final stop drains queued accepts. Formatting and whi
 checklist, or completion-count change is involved. Run 29610563120 passed its completed static,
 audit, metadata, coverage, Linux aarch64, and Flatpak siblings, but Windows x86_64 strict Clippy
 rejected the initial eight-parameter listener before native tests. The follow-up groups the two
-lifecycle atomics into one state object without weakening their separate meanings; its replacement
-native matrix is pending.
+lifecycle atomics into one state object without weakening their separate meanings. Static run
+29611191885 passed, and replacement matrix 29611194118 passed every other completed job, including
+the ARM64 Windows production package probe;
+the x86_64 native suite passed 717 of 718 application tests but its plain client-socket drop did not
+deterministically deliver the intended incomplete-header EOF. That regression now explicitly
+half-closes the client write side after cancellation—the same EOF contract exercised by the
+already-passing request classifiers—while production timeout, semantic-request, and response
+failures remain fatal. Its replacement native matrix is pending.
 
 Most recent accepted validation (2026-07-17, PR #112 P2.10 exclusive-control slice):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature
