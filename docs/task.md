@@ -73,8 +73,14 @@ race: its release suite passed, but the debug suite observed terminal Shutdown a
 the wake receiver dropped between protected deque insertion and wake publication, so an accepted
 command spuriously reported `Disconnected`. PR #114 now keeps the same short-held mutex across the
 nonblocking `try_send`, preserving the GTK no-wait boundary while making insertion/wake publication
-one linearized operation. All 83 focused MPD tests pass in debug and release; final PR rerun is
-pending.
+one linearized operation. All 83 focused MPD tests pass in debug and release. Replacement run
+29609489061 then passed the corrected Linux x86_64 suite, but its ARM64 package probe exposed a
+second pre-existing race: GStreamer could close an accepted media connection during transition to
+NULL before the listener's old single stop flag was published, so an expected incomplete header
+was misclassified as server corruption. PR #114 now publishes cancellation before NULL, keeps both
+listeners observing through that transition, then separately stops and drains queued accepts.
+Only incomplete-header EOF/reset/abort is cancellation; malformed requests and every other server
+failure remain fatal. A full replacement PR matrix remains pending.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1309,6 +1315,24 @@ failed through the separately resolved media path—but did not prove DNS was th
   scanner, protected-loopback policy, real FLAC decode/EOS, poisoned-proxy, and alternate-source
   fail-closed checks. The intentionally deferred live release-workflow run is not required because
   CI invokes that same path on both supported architectures.
+  The pending follow-up PR hardens a plausible listener teardown race without changing this
+  completed checklist item. Production now publishes a narrow cancellation phase before
+  `teardown_to_null` without stopping either listener. Both remain accepting throughout the NULL
+  transition; afterward `finish_teardown` publishes a separate stop, counts every returned or queued
+  accept until the nonblocking queue is empty, then joins and inspects. Only EOF,
+  connection-aborted, or connection-reset I/O before complete media headers may cancel during that
+  phase; malformed UTF-8, request line, route, method, header, range, timeout, other I/O, accept, and
+  response-write failures remain fatal even when teardown overlaps. Four deterministic
+  Windows-gated unit tests distinguish incomplete-header I/O from semantic drift, synchronize on an
+  accepted media connection before proving both clean cancellation and fatal malformed input
+  completed during teardown, and prove the poison observer counts one accepted plus one potentially
+  queued connection across begin/finish. The x86_64 Windows job executes those unit tests. ARM64
+  deliberately skips Cargo tests, but compiles the production code and executes its real two-phase
+  path inside the packaged runtime probe. The transient ARM64 package false red in PR #112, run
+  `29603467226`, job `87960898351`, motivated the hardening; same-source post-merge main run
+  `29604363069`, job `87963920779`, passed the unchanged 498-target closure and packaged probe. Its
+  fixed diagnostic does not prove that incomplete-header teardown caused the failed attempt. This
+  adds neither a retry nor a weakened semantic-failure policy.
 - [ ] Record live playback from a packaged Windows artifact against the reported DAAP and Subsonic
   servers, including catalogue connection, protected-media startup, audible playback, and useful
   URL-free failure diagnostics if either server cannot play. The automated package probe cannot
@@ -1489,6 +1513,21 @@ Run before marking any milestone complete:
 PR #94's containerized Flatpak build proved the manifest-local source generation and permission
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
+
+Current PR #114 follow-up validation (2026-07-17, P2.11 packaged-probe teardown hardening):
+`cargo check --all-targets --all-features --locked`, strict all-target/all-feature
+Clippy, and `cargo test --all-targets --all-features --locked` pass in debug and release. Each full
+test profile passes 18 library, 727 application, and 10 repository-metadata tests (755 total), and
+all 28 focused platform-runtime tests pass in both profiles. The four new regressions live in the
+Windows-only packaged runtime module; this Linux validation parses and formats them but does not
+claim to compile or execute them. The x86_64 Windows job runs unit
+tests; ARM64 skips that step but compiles the production module and runs the bundled executable's
+production probe during packaging. The tests separate incomplete-header EOF/reset/abort from
+semantic drift, synchronize on media acceptance, exercise the production begin/NULL/finish ordering,
+require malformed input completed after cancellation begins to remain fatal, and prove the poison
+observer remains live until final stop drains queued accepts. Formatting and whitespace checks
+(`cargo fmt --all -- --check` and `git diff --check`) pass; no dependency, lockfile, README,
+checklist, or completion-count change is involved.
 
 Most recent accepted validation (2026-07-17, PR #112 P2.10 exclusive-control slice):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature
@@ -2229,6 +2268,18 @@ Record scope or design decisions here so deferred work is explicit.
   are fatal rather than ignored. This automated result is independently closeable, while
   `.local` routing, real DAAP/Subsonic behavior, physical output, firewall/endpoint security, and
   end-user proxy policy remain one explicit live packaged-Windows task.
+- 2026-07-17 — The P2.11 packaged listener distinguishes narrow teardown cancellation from request
+  failure. A PR #112 ARM64 package attempt completed the same 498-target dependency closure and then
+  reported only the probe's fixed loopback-server failure; a same-source main run passed the
+  unchanged packaged probe. That evidence shows a transient result but cannot prove its root cause.
+  The pending follow-up therefore hardens one plausible race without retrying or broadening success:
+  production publishes cancellation before moving GStreamer to NULL but keeps both listeners live;
+  final stop is separate and drains/counts queued accepts before join. Only an already-accepted
+  incomplete-header EOF, connection-aborted, or connection-reset result may cancel once that phase
+  is visible. Semantic request drift, timeouts, other I/O, every accept failure, and response-write
+  failure remain fatal regardless of teardown, while poison observation covers the entire NULL
+  transition. Deterministic listener regressions preserve both sides and the observation window;
+  P2.11 checklist arithmetic is unchanged.
 - 2026-07-15 — P2.11 treats repeated DAAP and Subsonic failures at exactly GStreamer's 15-second
   HTTP-source timeout as a shared protected-playback defect, not a protocol-authentication defect.
   The opaque loopback boundary remains necessary: handing backend requests directly to GStreamer
@@ -2321,3 +2372,4 @@ Add one line per completed task:
 | 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Native x86_64 and ARM64 CI both prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
 | 2026-07-17 | P3.1 source identity/lifecycle architecture | PR #113 | Records location-independent `(SourceId, TrackId)` media identity, an exact legacy-array-to-versioned-envelope saved-source migration with atomic replacement and fail-closed conflict quarantine, one registry-owned operation/session lifecycle, deterministic per-view radio locator ownership, playback-time locator resolution, exactly-once DAAP retirement, adapter-specific rules for every source kind, and staged completion tests. This closes only the two architecture decision boxes; runtime migration remains open. Independent review found and resolved two design ambiguities before the full exact-toolchain/native/package matrix passed in runs 29605029668 and 29605032344. |
 | 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the implementation-head exact-toolchain/native/package matrix passed. A documentation rerun exposed and fixed a pre-existing terminal MPD enqueue/wake race; its replacement matrix remains pending. The common `LocalBackend` integration seam, invalid persisted `TrackId` fallback, and final P3.2 record remain open. |
+| 2026-07-17 | P2.11 packaged-probe teardown hardening (follow-up) | PR #114 | Separates pre-NULL cancellation from final listener stop, keeps poison observation live through NULL, and drains/counts queued accepts before join. Only narrowly classified incomplete-header EOF/reset/abort outcomes may cancel; semantic request, accept, and response-write failures remain fatal even during teardown. Four Windows tests pin classification, synchronized clean-versus-malformed behavior, and the accepted/queued poison window. x86_64 runs the unit tests, while ARM64 compiles the code and executes the production probe during packaging. This hardens the already-complete packaged proof and leaves checklist arithmetic unchanged. |
