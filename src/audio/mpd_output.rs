@@ -6,7 +6,6 @@
 //! operation limits. URI-bearing commands and raw MPD errors are never logged
 //! or retained.
 
-#[cfg(test)]
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -35,6 +34,8 @@ const MAX_RESPONSE_LINES: usize = 256;
 const MAX_URI_BYTES: usize = 32 * 1024;
 const MAX_COMMAND_BYTES: usize = MAX_URI_BYTES + 128;
 const MAX_RESOLVED_ADDRESSES: usize = 32;
+/// One load-sized command plus a bounded burst of small playback controls.
+const MAX_PENDING_WORKER_COMMANDS: usize = 64;
 
 pub struct MpdOutput {
     #[allow(dead_code)]
@@ -45,7 +46,7 @@ pub struct MpdOutput {
     intent_epoch: Arc<AtomicU64>,
     cache: Arc<Mutex<MpdCache>>,
     proxy: ProxyServices,
-    worker_tx: mpsc::Sender<WorkerCommand>,
+    worker_tx: WorkerCommandSender,
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +84,276 @@ enum CommandKind {
     PollNow,
     #[cfg(test)]
     Fence(mpsc::Sender<()>),
+}
+
+impl CommandKind {
+    fn is_transient_control(&self) -> bool {
+        matches!(
+            self,
+            Self::Play | Self::Pause | Self::Toggle | Self::Seek(_)
+        )
+    }
+
+    fn is_playback_control(&self) -> bool {
+        matches!(self, Self::Play | Self::Pause | Self::Toggle)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerEnqueueOutcome {
+    Enqueued,
+    Superseded,
+    Saturated,
+    Disconnected,
+}
+
+struct PendingWorkerCommands {
+    commands: VecDeque<WorkerCommand>,
+    newest_epoch: Option<u64>,
+    capacity: usize,
+    receiver_alive: bool,
+}
+
+struct WorkerCommandSender {
+    pending: Arc<Mutex<PendingWorkerCommands>>,
+    wake_tx: mpsc::SyncSender<()>,
+}
+
+struct WorkerCommandReceiver {
+    pending: Arc<Mutex<PendingWorkerCommands>>,
+    wake_rx: mpsc::Receiver<()>,
+}
+
+fn worker_command_channel(capacity: usize) -> (WorkerCommandSender, WorkerCommandReceiver) {
+    assert!(capacity > 0, "worker command capacity must be positive");
+    let pending = Arc::new(Mutex::new(PendingWorkerCommands {
+        commands: VecDeque::with_capacity(capacity),
+        newest_epoch: None,
+        capacity,
+        receiver_alive: true,
+    }));
+    let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+    (
+        WorkerCommandSender {
+            pending: Arc::clone(&pending),
+            wake_tx,
+        },
+        WorkerCommandReceiver { pending, wake_rx },
+    )
+}
+
+impl WorkerCommandSender {
+    fn enqueue(&self, command: WorkerCommand) -> WorkerEnqueueOutcome {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !pending.receiver_alive {
+            return WorkerEnqueueOutcome::Disconnected;
+        }
+
+        match pending.newest_epoch {
+            Some(newest_epoch) if command.owner.epoch < newest_epoch => {
+                return WorkerEnqueueOutcome::Superseded;
+            }
+            Some(newest_epoch) if command.owner.epoch > newest_epoch => {
+                pending.commands.clear();
+                pending.newest_epoch = Some(command.owner.epoch);
+            }
+            None => pending.newest_epoch = Some(command.owner.epoch),
+            Some(_) => {}
+        }
+
+        // Below capacity the deque is an exact FIFO. Only a saturated burst
+        // may discard intermediate transient intent; lifecycle commands never
+        // share an epoch in production and a new epoch atomically purges the
+        // obsolete backlog above.
+        if pending.commands.len() == pending.capacity {
+            if command.kind.is_transient_control() {
+                pending.commands.push_back(command);
+                compact_saturated_controls(&mut pending.commands);
+                while pending.commands.len() > pending.capacity {
+                    let Some(oldest_transient) = pending
+                        .commands
+                        .iter()
+                        .position(|queued| queued.kind.is_transient_control())
+                    else {
+                        break;
+                    };
+                    let _ = pending.commands.remove(oldest_transient);
+                }
+            } else {
+                compact_saturated_controls(&mut pending.commands);
+                if pending.commands.len() == pending.capacity {
+                    if let Some(oldest_transient) = pending
+                        .commands
+                        .iter()
+                        .position(|queued| queued.kind.is_transient_control())
+                    {
+                        let _ = pending.commands.remove(oldest_transient);
+                    } else {
+                        return WorkerEnqueueOutcome::Saturated;
+                    }
+                }
+                pending.commands.push_back(command);
+            }
+        } else {
+            pending.commands.push_back(command);
+        }
+        debug_assert!(pending.commands.len() <= pending.capacity);
+        drop(pending);
+
+        match self.wake_tx.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => WorkerEnqueueOutcome::Enqueued,
+            Err(mpsc::TrySendError::Disconnected(())) => {
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                pending.receiver_alive = false;
+                pending.commands.clear();
+                WorkerEnqueueOutcome::Disconnected
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .commands
+            .len()
+    }
+}
+
+impl WorkerCommandReceiver {
+    fn pop_pending(&self) -> Option<WorkerCommand> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .commands
+            .pop_front()
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<WorkerCommand, mpsc::RecvTimeoutError> {
+        // A capacity-one wake can remain after the deque has been drained.
+        // Keep one absolute timeout so stale wake tokens cannot postpone the
+        // worker's periodic status poll.
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .expect("worker receive deadline representable");
+        loop {
+            if let Some(command) = self.pop_pending() {
+                return Ok(command);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            }
+            match self
+                .wake_rx
+                .recv_timeout(deadline.saturating_duration_since(now))
+            {
+                Ok(()) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(mpsc::RecvTimeoutError::Timeout);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Some(command) = self.pop_pending() {
+                        return Ok(command);
+                    }
+                    return Err(mpsc::RecvTimeoutError::Disconnected);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for WorkerCommandReceiver {
+    fn drop(&mut self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        pending.receiver_alive = false;
+        pending.commands.clear();
+    }
+}
+
+fn compact_saturated_controls(commands: &mut VecDeque<WorkerCommand>) {
+    let mut input = std::mem::take(commands);
+    let mut compacted = VecDeque::with_capacity(input.len());
+    while let Some(command) = input.pop_front() {
+        if matches!(command.kind, CommandKind::Seek(_)) {
+            let mut latest = command;
+            while input
+                .front()
+                .is_some_and(|next| matches!(next.kind, CommandKind::Seek(_)))
+            {
+                latest = input.pop_front().expect("front seek exists");
+            }
+            compacted.push_back(latest);
+        } else if command.kind.is_playback_control() {
+            let mut run = VecDeque::from([command]);
+            while input
+                .front()
+                .is_some_and(|next| next.kind.is_playback_control())
+            {
+                run.push_back(input.pop_front().expect("front playback control exists"));
+            }
+            fold_playback_controls(run, &mut compacted);
+        } else {
+            compacted.push_back(command);
+        }
+    }
+    *commands = compacted;
+}
+
+fn fold_playback_controls(
+    mut run: VecDeque<WorkerCommand>,
+    compacted: &mut VecDeque<WorkerCommand>,
+) {
+    // Map each possible starting state (Stopped, Playing, Paused) to its
+    // resulting state. The three commands generate only six transformations,
+    // each of which has a canonical sequence of at most two commands.
+    let mut transform = [0_usize, 1, 2];
+    let mut last_owner = None;
+    while let Some(command) = run.pop_front() {
+        last_owner = Some(command.owner);
+        let operation = match command.kind {
+            CommandKind::Play => [1, 1, 1],
+            // Pausing an already stopped MPD session leaves it stopped.
+            CommandKind::Pause => [0, 2, 2],
+            CommandKind::Toggle => [1, 2, 1],
+            _ => unreachable!("playback run contains only playback controls"),
+        };
+        transform = transform.map(|state| operation[state]);
+    }
+
+    let owner = last_owner.expect("non-empty playback run has an owner");
+    let canonical: &[CommandKind] = match transform {
+        [1, 1, 1] => &[CommandKind::Play],
+        [0, 2, 2] => &[CommandKind::Pause],
+        [1, 2, 1] => &[CommandKind::Toggle],
+        // Play then Pause guarantees Paused even from Stopped.
+        [2, 2, 2] => &[CommandKind::Play, CommandKind::Pause],
+        // Toggle is not involutive for Stopped: two toggles end Paused.
+        [2, 1, 2] => &[CommandKind::Toggle, CommandKind::Toggle],
+        _ => unreachable!("playback controls produce a known transformation"),
+    };
+    for kind in canonical {
+        compacted.push_back(WorkerCommand {
+            owner,
+            kind: match kind {
+                CommandKind::Play => CommandKind::Play,
+                CommandKind::Pause => CommandKind::Pause,
+                CommandKind::Toggle => CommandKind::Toggle,
+                _ => unreachable!("canonical sequence contains playback controls"),
+            },
+        });
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1057,11 +1328,11 @@ fn spawn_mpd_worker<C>(
     event_tx: async_channel::Sender<PlayerEvent>,
     timing: WorkerTiming,
     proxy: ProxyServices,
-) -> mpsc::Sender<WorkerCommand>
+) -> WorkerCommandSender
 where
     C: MpdConnector,
 {
-    let (worker_tx, worker_rx) = mpsc::channel();
+    let (worker_tx, worker_rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
     let spawn = std::thread::Builder::new()
         .name("mpd-worker".to_string())
         .spawn(move || {
@@ -1083,7 +1354,7 @@ where
 
 fn run_mpd_worker<C>(
     mut connector: C,
-    worker_rx: mpsc::Receiver<WorkerCommand>,
+    worker_rx: WorkerCommandReceiver,
     intent_epoch: Arc<AtomicU64>,
     cache: Arc<Mutex<MpdCache>>,
     event_tx: async_channel::Sender<PlayerEvent>,
@@ -2322,16 +2593,21 @@ impl MpdOutput {
     }
 
     fn enqueue(&self, owner: CommandOwner, kind: CommandKind) {
-        if self.worker_tx.send(WorkerCommand { owner, kind }).is_err()
-            && is_current(owner, &self.intent_epoch)
-        {
-            fail_current(
-                owner,
-                MpdFailure::new("worker availability"),
-                &self.intent_epoch,
-                &self.cache,
-                &self.event_tx,
-            );
+        match self.worker_tx.enqueue(WorkerCommand { owner, kind }) {
+            WorkerEnqueueOutcome::Enqueued | WorkerEnqueueOutcome::Superseded => {}
+            WorkerEnqueueOutcome::Saturated => {
+                error!("MPD worker command ingress rejected a non-transient command");
+            }
+            WorkerEnqueueOutcome::Disconnected if is_current(owner, &self.intent_epoch) => {
+                fail_current(
+                    owner,
+                    MpdFailure::new("worker availability"),
+                    &self.intent_epoch,
+                    &self.cache,
+                    &self.event_tx,
+                );
+            }
+            WorkerEnqueueOutcome::Disconnected => {}
         }
     }
 
@@ -2461,7 +2737,7 @@ impl Drop for MpdOutput {
             cache.state = PlayerState::Stopped;
             cache.position_ms = None;
         }
-        let _ = self.worker_tx.send(WorkerCommand {
+        let _ = self.worker_tx.enqueue(WorkerCommand {
             owner,
             kind: CommandKind::Shutdown,
         });
@@ -2851,7 +3127,7 @@ mod tests {
     }
 
     struct Harness {
-        tx: mpsc::Sender<WorkerCommand>,
+        tx: WorkerCommandSender,
         epoch: Arc<AtomicU64>,
         cache: Arc<Mutex<MpdCache>>,
         events: async_channel::Receiver<PlayerEvent>,
@@ -2892,7 +3168,7 @@ mod tests {
             timing: WorkerTiming,
             proxy: ProxyServices,
         ) -> Self {
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
             let epoch = Arc::new(AtomicU64::new(0));
             let cache = Arc::new(Mutex::new(MpdCache::default()));
             let (event_tx, events) = async_channel::unbounded();
@@ -2934,9 +3210,11 @@ mod tests {
         }
 
         fn send(&self, owner: CommandOwner, kind: CommandKind) {
-            self.tx
-                .send(WorkerCommand { owner, kind })
-                .expect("worker command accepted");
+            assert_eq!(
+                self.tx.enqueue(WorkerCommand { owner, kind }),
+                WorkerEnqueueOutcome::Enqueued,
+                "worker command accepted"
+            );
         }
 
         fn fence(&self, owner: CommandOwner) {
@@ -2974,6 +3252,240 @@ mod tests {
         CommandKind::ProtectedLoad {
             upstream: Box::new(Url::parse(uri).expect("protected test URL")),
         }
+    }
+
+    fn queue_test_owner(epoch: u64) -> CommandOwner {
+        CommandOwner {
+            epoch,
+            event_generation: PlayerEventGeneration::from_raw(epoch),
+        }
+    }
+
+    #[test]
+    fn worker_ingress_preserves_exact_fifo_below_capacity() {
+        let (tx, rx) = worker_command_channel(5);
+        let owner = queue_test_owner(1);
+        for kind in [
+            CommandKind::Seek(1_000),
+            CommandKind::Seek(2_000),
+            CommandKind::Play,
+            CommandKind::Toggle,
+        ] {
+            assert_eq!(
+                tx.enqueue(WorkerCommand { owner, kind }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(tx.pending_len(), 4);
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("first seek")
+                .kind,
+            CommandKind::Seek(1_000)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("second seek")
+                .kind,
+            CommandKind::Seek(2_000)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).expect("play").kind,
+            CommandKind::Play
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("toggle")
+                .kind,
+            CommandKind::Toggle
+        ));
+    }
+
+    #[test]
+    fn saturated_worker_ingress_compacts_controls_without_crossing_barriers() {
+        let (tx, rx) = worker_command_channel(8);
+        let owner = queue_test_owner(1);
+        let (done_tx, _done_rx) = mpsc::channel();
+        for kind in [
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+            },
+            CommandKind::Play,
+            CommandKind::Toggle,
+            CommandKind::Seek(1_000),
+            CommandKind::Pause,
+            CommandKind::Toggle,
+            CommandKind::Fence(done_tx),
+            CommandKind::Toggle,
+        ] {
+            assert_eq!(
+                tx.enqueue(WorkerCommand { owner, kind }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(tx.pending_len(), 8);
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Toggle,
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert_eq!(tx.pending_len(), 8);
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("load barrier")
+                .kind,
+            CommandKind::Load { .. }
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("folded pre-seek play")
+                .kind,
+            CommandKind::Play
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("folded pre-seek pause")
+                .kind,
+            CommandKind::Pause
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("seek barrier")
+                .kind,
+            CommandKind::Seek(1_000)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("folded post-seek control")
+                .kind,
+            CommandKind::Play
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("test fence")
+                .kind,
+            CommandKind::Fence(_)
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                rx.recv_timeout(Duration::from_secs(1))
+                    .expect("even toggle retained")
+                    .kind,
+                CommandKind::Toggle
+            ));
+        }
+    }
+
+    #[test]
+    fn saturated_worker_ingress_evicts_oldest_transient_for_latest_intent() {
+        let (tx, rx) = worker_command_channel(4);
+        let owner = queue_test_owner(1);
+        for kind in [
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+            },
+            CommandKind::Seek(1_000),
+            CommandKind::Toggle,
+            CommandKind::Seek(2_000),
+        ] {
+            assert_eq!(
+                tx.enqueue(WorkerCommand { owner, kind }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Toggle,
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert_eq!(tx.pending_len(), 4);
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("load retained")
+                .kind,
+            CommandKind::Load { .. }
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("oldest retained control")
+                .kind,
+            CommandKind::Toggle
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("latest seek retained")
+                .kind,
+            CommandKind::Seek(2_000)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("newest intent retained")
+                .kind,
+            CommandKind::Toggle
+        ));
+    }
+
+    #[test]
+    fn newer_epoch_purges_backlog_and_late_old_work_cannot_reenter() {
+        let (tx, rx) = worker_command_channel(4);
+        let old = queue_test_owner(1);
+        for kind in [
+            CommandKind::Load {
+                uri: "https://music.test/old".to_string(),
+            },
+            CommandKind::Play,
+            CommandKind::Seek(1_000),
+            CommandKind::Pause,
+        ] {
+            assert_eq!(
+                tx.enqueue(WorkerCommand { owner: old, kind }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+
+        let replacement = queue_test_owner(2);
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner: replacement,
+                kind: CommandKind::Stop,
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert_eq!(tx.pending_len(), 1);
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner: old,
+                kind: CommandKind::Toggle,
+            }),
+            WorkerEnqueueOutcome::Superseded
+        );
+        assert_eq!(tx.pending_len(), 1);
+        let command = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement stop");
+        assert_eq!(command.owner.epoch, replacement.epoch);
+        assert!(matches!(command.kind, CommandKind::Stop));
+    }
+
+    #[test]
+    fn worker_ingress_reports_a_dropped_receiver_without_buffering() {
+        let (tx, rx) = worker_command_channel(4);
+        drop(rx);
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner: queue_test_owner(1),
+                kind: CommandKind::Play,
+            }),
+            WorkerEnqueueOutcome::Disconnected
+        );
+        assert_eq!(tx.pending_len(), 0);
     }
 
     #[test]
@@ -4685,7 +5197,7 @@ mod tests {
             state: PlayerState::Playing,
             position_ms: Some(7_000),
         }));
-        let (worker_tx, worker_rx) = mpsc::channel();
+        let (worker_tx, worker_rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
         let output = MpdOutput {
             display_name: "test".to_string(),
             event_tx,
@@ -4702,7 +5214,9 @@ mod tests {
         let snapshot = *cache.lock().expect("cache lock");
         assert_eq!(snapshot.state, PlayerState::Buffering);
         assert_eq!(snapshot.position_ms, None);
-        let command = worker_rx.recv().expect("queued load");
+        let command = worker_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("queued load");
         assert_eq!(command.owner.epoch, 1);
         assert_eq!(command.owner.event_generation.as_raw(), 7);
         assert!(matches!(
@@ -4716,7 +5230,7 @@ mod tests {
         let (event_tx, _event_rx) = async_channel::unbounded();
         let intent_epoch = Arc::new(AtomicU64::new(0));
         let cache = Arc::new(Mutex::new(MpdCache::default()));
-        let (worker_tx, worker_rx) = mpsc::channel();
+        let (worker_tx, worker_rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
         let output = MpdOutput {
             display_name: "test".to_string(),
             event_tx,
@@ -4730,21 +5244,30 @@ mod tests {
 
         output.load_uri("https://music.test/stream?api_key=worker-secret");
         assert!(matches!(
-            worker_rx.recv().expect("protected command").kind,
+            worker_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("protected command")
+                .kind,
             CommandKind::ProtectedLoad { upstream }
                 if upstream.as_str().contains("api_key=worker-secret")
         ));
 
         output.load_uri("HTTPS://[malformed");
         assert!(matches!(
-            worker_rx.recv().expect("rejected command").kind,
+            worker_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("rejected command")
+                .kind,
             CommandKind::RejectLoad { failure }
                 if failure.operation == "media URI validation"
         ));
 
         output.load_uri("Albums/Artist/track.flac");
         assert!(matches!(
-            worker_rx.recv().expect("direct command").kind,
+            worker_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("direct command")
+                .kind,
             CommandKind::Load { uri } if uri == "Albums/Artist/track.flac"
         ));
     }
@@ -4752,7 +5275,7 @@ mod tests {
     #[test]
     fn typed_load_enters_the_ordered_worker_without_serializing_its_endpoint() {
         let (event_tx, _event_rx) = async_channel::unbounded();
-        let (worker_tx, worker_rx) = mpsc::channel();
+        let (worker_tx, worker_rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
         let output = MpdOutput {
             display_name: "test".to_string(),
             event_tx,
@@ -4769,7 +5292,9 @@ mod tests {
 
         output.load_resolved(request);
 
-        let command = worker_rx.recv().expect("resolved command");
+        let command = worker_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("resolved command");
         assert_eq!(command.owner.epoch, 1);
         assert_eq!(command.owner.event_generation.as_raw(), 3);
         match command.kind {
@@ -4941,6 +5466,221 @@ mod tests {
             }
         });
         (address, worker)
+    }
+
+    fn read_test_command(reader: &mut BufReader<TcpStream>, expected: &str) {
+        let mut command = String::new();
+        reader.read_line(&mut command).expect("read MPD command");
+        assert_eq!(command.strip_suffix('\n'), Some(expected));
+    }
+
+    fn write_test_response(stream: &mut TcpStream, response: &[u8]) {
+        stream.write_all(response).expect("write MPD response");
+        stream.flush().expect("flush MPD response");
+    }
+
+    #[test]
+    fn held_ack_keeps_enqueue_nonblocking_and_commands_fifo() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind fake MPD server");
+        let address = listener.local_addr().expect("fake server address");
+        let (pause_seen_tx, pause_seen_rx) = mpsc::channel();
+        let (commands_queued_tx, commands_queued_rx) = mpsc::channel();
+        let (pipeline_checked_tx, pipeline_checked_rx) = mpsc::channel();
+        let (release_ack_tx, release_ack_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept MPD client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("server read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("server write timeout");
+            write_test_response(&mut stream, b"OK MPD 0.24.0\n");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone test stream"));
+
+            for command in ["repeat 0", "random 0", "single 0", "consume 0"] {
+                read_test_command(&mut reader, command);
+                write_test_response(&mut stream, b"OK\n");
+            }
+            read_test_command(&mut reader, "addid \"https://music.test/a\"");
+            write_test_response(&mut stream, b"Id: 42\nOK\n");
+            read_test_command(&mut reader, "playid 42");
+            write_test_response(&mut stream, b"OK\n");
+            read_test_command(&mut reader, "status");
+            write_test_response(
+                &mut stream,
+                b"songid: 42\nelapsed: 0.000\nduration: 10.000\nstate: play\nOK\n",
+            );
+
+            read_test_command(&mut reader, "status");
+            write_test_response(
+                &mut stream,
+                b"songid: 42\nelapsed: 0.000\nduration: 10.000\nstate: play\nOK\n",
+            );
+            read_test_command(&mut reader, "pause 1");
+            pause_seen_tx.send(()).expect("pause observed");
+            commands_queued_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("later commands queued");
+
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .expect("short pipeline probe timeout");
+            let mut probe = [0_u8; 1];
+            match stream.peek(&mut probe) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Ok(0) => panic!("MPD worker disconnected while its ACK was held"),
+                Ok(_) => panic!("MPD worker pipelined a later command before the held ACK"),
+                Err(error) => panic!("unexpected pipeline probe error: {error}"),
+            }
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("restore server read timeout");
+            pipeline_checked_tx.send(()).expect("pipeline checked");
+            release_ack_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release held ACK");
+            write_test_response(&mut stream, b"OK\n");
+
+            read_test_command(&mut reader, "status");
+            write_test_response(
+                &mut stream,
+                b"songid: 42\nelapsed: 0.000\nduration: 10.000\nstate: pause\nOK\n",
+            );
+            read_test_command(&mut reader, "status");
+            write_test_response(
+                &mut stream,
+                b"songid: 42\nelapsed: 0.000\nduration: 10.000\nstate: pause\nOK\n",
+            );
+            read_test_command(&mut reader, "seekid 42 7.000");
+            write_test_response(&mut stream, b"OK\n");
+            read_test_command(&mut reader, "status");
+            write_test_response(
+                &mut stream,
+                b"songid: 42\nelapsed: 7.000\nduration: 10.000\nstate: pause\nOK\n",
+            );
+            read_test_command(&mut reader, "status");
+            write_test_response(
+                &mut stream,
+                b"songid: 42\nelapsed: 7.000\nduration: 10.000\nstate: pause\nOK\n",
+            );
+            read_test_command(&mut reader, "pause 0");
+            write_test_response(&mut stream, b"OK\n");
+            read_test_command(&mut reader, "status");
+            write_test_response(
+                &mut stream,
+                b"songid: 42\nelapsed: 7.000\nduration: 10.000\nstate: play\nOK\n",
+            );
+
+            // Shutdown revalidates once. A foreign current id deliberately
+            // suppresses global Stop and targeted deletion during teardown.
+            read_test_command(&mut reader, "status");
+            write_test_response(
+                &mut stream,
+                b"songid: 99\nelapsed: 0.000\nduration: 10.000\nstate: play\nOK\n",
+            );
+        });
+
+        let (worker_tx, worker_rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
+        let intent_epoch = Arc::new(AtomicU64::new(1));
+        let cache = Arc::new(Mutex::new(MpdCache::default()));
+        let (event_tx, _events) = async_channel::unbounded();
+        let worker_epoch = Arc::clone(&intent_epoch);
+        let worker_cache = Arc::clone(&cache);
+        let worker = std::thread::spawn(move || {
+            run_mpd_worker(
+                MpdTcpConnector {
+                    host: address.ip().to_string(),
+                    port: address.port(),
+                },
+                worker_rx,
+                worker_epoch,
+                worker_cache,
+                event_tx,
+                WorkerTiming {
+                    operation: Duration::from_secs(2),
+                    poll: Duration::from_hours(1),
+                    tick: Duration::from_millis(10),
+                },
+                ProxyServices::production(),
+            );
+        });
+        let owner = queue_test_owner(1);
+        assert_eq!(
+            worker_tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Load {
+                    uri: "https://music.test/a".to_string(),
+                },
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        let (loaded_tx, loaded_rx) = mpsc::channel();
+        assert_eq!(
+            worker_tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Fence(loaded_tx),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        loaded_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("load reached fence");
+
+        assert_eq!(
+            worker_tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Pause,
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        pause_seen_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server held pause ACK");
+        let (done_tx, done_rx) = mpsc::channel();
+        let enqueue_started = Instant::now();
+        for kind in [
+            CommandKind::Seek(7_000),
+            CommandKind::Play,
+            CommandKind::Fence(done_tx),
+        ] {
+            assert_eq!(
+                worker_tx.enqueue(WorkerCommand { owner, kind }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(worker_tx.pending_len(), 3);
+        assert!(
+            enqueue_started.elapsed() < Duration::from_millis(250),
+            "GTK-facing enqueue path waited for the held ACK"
+        );
+        commands_queued_tx
+            .send(())
+            .expect("tell server commands are queued");
+        pipeline_checked_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server observed no pipelined command");
+        release_ack_tx.send(()).expect("release held ACK");
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("queued controls reached fence");
+        assert_eq!(cache.lock().expect("cache lock").position_ms, Some(7_000));
+
+        let shutdown = queue_test_owner(2);
+        intent_epoch.store(shutdown.epoch, Ordering::SeqCst);
+        assert_eq!(
+            worker_tx.enqueue(WorkerCommand {
+                owner: shutdown,
+                kind: CommandKind::Shutdown,
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        worker.join().expect("worker stopped");
+        server.join().expect("fake server stopped");
     }
 
     fn connect_test(address: SocketAddr) -> MpdConnection {
