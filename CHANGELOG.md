@@ -135,6 +135,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Subsonic failed envelopes no longer retain a server-controlled error message** — HTTP-200 API failures keep only the numeric Subsonic code in a fixed typed error; code 40 remains authentication rejection and code 41 remains the HTTPS-only legacy-auth negotiation signal. A malicious or broken peer can no longer echo a submitted password or arbitrary text into retained errors, logs, or UI-facing classification.
 - **Radio-Browser and geolocation no longer trust successful-looking JSON on an HTTP error** — Station and all three IP-geolocation provider paths now require a success status before their bounded response reader or deserializer can publish data. A `503` carrying a syntactically valid station or location is rejected, the geolocation cascade advances to its next provider, and late or oversized bodies remain bounded. Public same-origin/cross-origin redirects retain the existing no-`Referer`, no-HTTPS-downgrade policy.
 - **Jellyfin and Plex now preserve reverse-proxy base paths for every API and media request** — Both clients remove only one trailing empty base segment before appending API paths, so root, `/share`, `/share/`, and already-escaped prefixes do not gain a doubled slash or lose their prefix. Plex stream-part and thumbnail paths now append below that same configured base instead of replacing it; escaped bytes are preserved and normalized dot segments cannot escape the prefix. Root `//` and prefixed `/share//` regressions pin the same one-empty-segment rule across catalogue and protected-media construction. The rejection uses a fixed peer-path-free error. Complete prefixed backend fixtures prove authenticated ping/identity, discovery, pagination, stream, and artwork construction.
+- **Recycled sidebar rows and asynchronous UI results have production-boundary stale-authority coverage** —
+  The existing one-handler sidebar invariant is strengthened with one parameterized `GAction`
+  installed during factory setup; each bind replaces its immutable delete, disconnect, or menu
+  target and unbind revokes that target before GTK recycles the widget. The display-independent
+  regression activates that exact production
+  action across repeated manual, unbound, connecting, DAAP, and playlist-header bindings, so it
+  runs on every headless native CI host rather than depending on a display server. A synchronized
+  loopback fixture also pauses a real request inside the persistent artwork worker, installs a
+  newer generation, and proves the stale response is discarded before publication while only the
+  newer bytes cross the completion channel. The production source cache and eviction boundary is
+  exercised with reversed same-key results: an old loaded or missing callback cannot overwrite or
+  remove the newer projection, and the newest inactive-source result remains cache-only.
 - **Packaged-probe accepted sockets honor their bounded deadlines on Windows** — Winsock can retain a nonblocking listener's mode on an accepted socket, so a fragmented protected-media request could return `WouldBlock` immediately instead of waiting for its next bytes or the configured deadline. The probe now explicitly restores blocking I/O before installing read/write deadlines and treats any socket-configuration failure as fatal; timeout, malformed-request, and response failures remain distinct from the narrow teardown cancellation case.
 - **Local Windows packaging could reject the Soup plugin it had just copied** — The bundle path
   remained relative until PE import inspection. PowerShell resolved the successful copy check

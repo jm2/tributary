@@ -6,8 +6,9 @@
 //! DAAP sources get a monochrome eject button for disconnecting.
 //! Manually-added servers get a trash button for removal.
 
-use gtk::gio;
+use gtk::glib::variant::{FromVariant, ToVariant};
 use gtk::prelude::*;
+use gtk::{gio, glib};
 
 use super::objects::SourceObject;
 use tracing::debug;
@@ -106,6 +107,59 @@ fn emit_sidebar_button_action(
             false
         }
     }
+}
+
+/// Encode one recycled row's current action as the immutable activation
+/// target installed by the factory's `bind` callback.
+///
+/// `GtkListItem` and its child widgets outlive any individual model binding.
+/// Keeping the current source in the button's action target means the one
+/// setup-time signal handler never captures a source from an earlier bind,
+/// while `unbind` can explicitly revoke the target before GTK recycles it.
+fn sidebar_button_action_target(action: Option<&SidebarButtonAction>) -> glib::Variant {
+    match action {
+        Some(SidebarButtonAction::OpenPlaylistMenu) => ("open", "").to_variant(),
+        Some(SidebarButtonAction::Disconnect(source_key)) => {
+            ("disconnect", source_key.as_str()).to_variant()
+        }
+        Some(SidebarButtonAction::Delete(source_key)) => {
+            ("delete", source_key.as_str()).to_variant()
+        }
+        None => ("none", "").to_variant(),
+    }
+}
+
+fn sidebar_button_action_from_target(target: &glib::Variant) -> Option<SidebarButtonAction> {
+    let (kind, source_key) = <(String, String)>::from_variant(target)?;
+    match kind.as_str() {
+        "open" if source_key.is_empty() => Some(SidebarButtonAction::OpenPlaylistMenu),
+        "disconnect" if !source_key.is_empty() => Some(SidebarButtonAction::Disconnect(source_key)),
+        "delete" if !source_key.is_empty() => Some(SidebarButtonAction::Delete(source_key)),
+        "none" if source_key.is_empty() => None,
+        _ => None,
+    }
+}
+
+/// Build the single row-lifetime action installed during factory setup.
+/// Rebinding changes only the action target; it never adds another handler.
+fn sidebar_row_action(
+    disconnect_tx: &async_channel::Sender<String>,
+    delete_tx: &async_channel::Sender<String>,
+    open_playlist_menu: impl Fn() + 'static,
+) -> gio::SimpleAction {
+    let parameter_type = glib::VariantTy::new("(ss)").expect("valid sidebar action type");
+    let action = gio::SimpleAction::new("invoke", Some(parameter_type));
+    let disconnect_tx = disconnect_tx.clone();
+    let delete_tx = delete_tx.clone();
+    action.connect_activate(move |_, target| {
+        let Some(action) = target.and_then(sidebar_button_action_from_target) else {
+            return;
+        };
+        if emit_sidebar_button_action(action, &disconnect_tx, &delete_tx) {
+            open_playlist_menu();
+        }
+    });
+    action
 }
 
 fn playlist_creation_menu() -> gio::Menu {
@@ -232,34 +286,30 @@ pub fn build_sidebar(
             row_box.append(&action_btn);
             list_item.set_child(Some(&row_box));
 
-            // Connect the recycled button exactly once. Resolve the current
-            // item on every click so a prior binding cannot retain authority
-            // to delete or disconnect its source.
+            // Connect the recycled button exactly once. Every bind replaces
+            // its immutable action target and unbind revokes it, so a prior
+            // source never remains reachable through this row-lifetime
+            // handler.
             let playlist_menu = playlist_creation_menu();
             let playlist_actions = playlist_creation_action_group(&tx_for_setup);
             action_btn.insert_action_group("pl-add", Some(&playlist_actions));
 
-            let list_item_for_action = list_item.downgrade();
-            let disconnect_tx = disconnect_tx_for_setup.clone();
-            let delete_tx = delete_tx_for_setup.clone();
-            action_btn.connect_clicked(move |button| {
-                let Some(list_item) = list_item_for_action.upgrade() else {
-                    return;
-                };
-                let Some(source) = list_item.item().and_downcast::<SourceObject>() else {
-                    return;
-                };
-                let Some(action) = sidebar_button_action(&source) else {
-                    return;
-                };
-
-                if emit_sidebar_button_action(action, &disconnect_tx, &delete_tx) {
+            let button_for_menu = action_btn.downgrade();
+            let row_action =
+                sidebar_row_action(&disconnect_tx_for_setup, &delete_tx_for_setup, move || {
+                    let Some(button) = button_for_menu.upgrade() else {
+                        return;
+                    };
                     let popover = gtk::PopoverMenu::from_model(Some(&playlist_menu));
-                    popover.set_parent(button);
+                    popover.set_parent(&button);
                     popover.connect_closed(|popover| popover.unparent());
                     popover.popup();
-                }
-            });
+                });
+            let row_actions = gio::SimpleActionGroup::new();
+            row_actions.add_action(&row_action);
+            row_box.insert_action_group("sidebar-row", Some(&row_actions));
+            action_btn.set_action_name(Some("sidebar-row.invoke"));
+            action_btn.set_action_target_value(Some(&sidebar_button_action_target(None)));
 
             // Per-row right-click gesture.
             //
@@ -439,6 +489,8 @@ pub fn build_sidebar(
 
             let action = sidebar_button_action(&obj);
             configure_action_button(&action_btn, action.as_ref());
+            action_btn
+                .set_action_target_value(Some(&sidebar_button_action_target(action.as_ref())));
         });
     }
 
@@ -450,6 +502,8 @@ pub fn build_sidebar(
             .expect("ListItem expected");
         if let Some(row_box) = list_item.child().and_downcast::<gtk::Box>() {
             if let Some(btn) = row_box.last_child().and_downcast::<gtk::Button>() {
+                btn.set_action_target_value(Some(&sidebar_button_action_target(None)));
+                configure_action_button(&btn, None);
                 btn.set_visible(false);
             }
         }
@@ -518,7 +572,8 @@ pub fn build_sidebar(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     use super::*;
 
@@ -530,49 +585,47 @@ mod tests {
     }
 
     #[test]
-    fn recycled_item_dispatches_once_for_only_the_current_source() {
+    fn recycled_setup_action_dispatches_once_for_only_the_current_binding() {
         let (disconnect_tx, disconnect_rx) = async_channel::unbounded();
         let (delete_tx, delete_rx) = async_channel::unbounded();
-        let current = RefCell::new(None::<SourceObject>);
-
-        // This single closure models the one setup-time click handler. Tests
-        // change only its current binding, including an explicit unbind.
-        let click = || {
-            let source = current.borrow();
-            let Some(action) = source.as_ref().and_then(sidebar_button_action) else {
-                return false;
-            };
-            emit_sidebar_button_action(action, &disconnect_tx, &delete_tx)
+        let opened = Rc::new(Cell::new(0));
+        let opened_for_action = opened.clone();
+        // This is the exact setup-time GAction used by every production row.
+        // The harness drives the same target values installed by bind/unbind,
+        // without constructing display-bound GTK widgets on headless CI.
+        let action = sidebar_row_action(&disconnect_tx, &delete_tx, move || {
+            opened_for_action.set(opened_for_action.get() + 1);
+        });
+        let activate = |source: Option<&SourceObject>| {
+            let current = source.and_then(sidebar_button_action);
+            let target = sidebar_button_action_target(current.as_ref());
+            action.activate(Some(&target));
         };
 
         let manual_a = SourceObject::manual("Manual A", "subsonic", "https://a.example");
-        current.replace(Some(manual_a.clone()));
-        assert!(!click());
+        activate(Some(&manual_a));
         assert_eq!(delete_rx.try_recv().unwrap(), "https://a.example");
         assert_empty(&delete_rx);
         assert_empty(&disconnect_rx);
 
-        // Forced remove/reinsert first unbinds the list item. A click while
-        // unbound cannot invoke the source captured by the previous binding.
-        current.replace(None);
-        assert!(!click());
+        // Forced remove/reinsert first runs unbind. Activating while unbound
+        // cannot invoke the source installed by the previous binding.
+        activate(None);
         assert_empty(&delete_rx);
         assert_empty(&disconnect_rx);
 
         // Reinsert the same object in its transient connecting state. The
         // stale delete action must still be absent.
         manual_a.set_connecting(true);
-        current.replace(Some(manual_a.clone()));
-        assert!(!click());
+        activate(Some(&manual_a));
         assert_empty(&delete_rx);
         assert_empty(&disconnect_rx);
 
         // A second forced reinsert of the same actionable source must still
         // produce one delete, not one per historical bind.
-        current.replace(None);
+        activate(None);
         manual_a.set_connecting(false);
-        current.replace(Some(manual_a));
-        assert!(!click());
+        activate(Some(&manual_a));
         assert_eq!(delete_rx.try_recv().unwrap(), "https://a.example");
         assert_empty(&delete_rx);
         assert_empty(&disconnect_rx);
@@ -581,16 +634,15 @@ mod tests {
         // source's eject event is emitted; Manual A is never deleted again.
         let daap_b = SourceObject::discovered("DAAP B", "daap", "http://b.example:3689");
         daap_b.set_connected(true);
-        current.replace(Some(daap_b));
-        assert!(!click());
+        activate(Some(&daap_b));
         assert_eq!(disconnect_rx.try_recv().unwrap(), "http://b.example:3689");
         assert_empty(&disconnect_rx);
         assert_empty(&delete_rx);
 
         // Recycle once more for the Playlists header. The click opens its
         // menu and emits no server action.
-        current.replace(Some(SourceObject::header("Playlists")));
-        assert!(click());
+        activate(Some(&SourceObject::header("Playlists")));
+        assert_eq!(opened.get(), 1);
         assert_empty(&disconnect_rx);
         assert_empty(&delete_rx);
     }

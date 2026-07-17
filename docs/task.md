@@ -31,8 +31,8 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**211/223 (94.6%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
-and **21/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**213/223 (95.5%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
+and **23/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -148,6 +148,18 @@ adversarial Chromecast harness now include a 1 MiB guard that rejects a peer-adv
 length before `rust_cast` allocates from it. The four broader UI/session-generation harness boxes
 and the P3.4 implementation record remain open. These two bounded closures advance the literal
 count to **207/223 (92.8%)** and P3 to **17/30** without changing P0–P2.
+This stacked UI-generation slice closes two additional P3.4 boxes. Recycled sidebar buttons now
+carry an immutable typed action target replaced at factory bind and revoked at unbind, while their
+single setup-time `GAction` remains the only dispatcher. The headless harness drives that exact
+production action repeatedly through manual-source, unbound, connecting, DAAP, and playlist-header
+targets and proves every activation has only the current row's authority. A real loopback artwork
+fixture holds an in-flight production worker request until a newer generation is queued, then
+proves the stale one-shot closes without bytes and only the newer body publishes. The production
+source-cache/eviction boundary is also driven with reversed same-key requests and an inactive
+newest request, proving an old load can neither overwrite nor evict the newer projection while an
+inactive current result remains cache-only. Those closures advance the literal total to
+**209/223 (93.7%)** and P3 to **19/30**; playback-session and output-transfer harnesses plus the
+P3.4 implementation record remain open.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1604,7 +1616,13 @@ service/DAAP foundation and is stacked on its PR #117 head pending publication.
 
 ### P3.4 Add UI/output integration harnesses
 
-- [ ] Cover GTK list-item recycling and stale callback prevention.
+- [x] Cover GTK list-item recycling and stale callback prevention. Each sidebar row installs one
+  parameterized `GAction` during factory setup. `bind` replaces its immutable `(kind, source)`
+  target and `unbind` installs a no-authority target before hiding the button, so neither signal
+  accumulation nor a captured prior `SourceObject` can survive recycling. A display-independent
+  harness activates that exact production action across repeated manual-source binds, explicit
+  unbind, connecting/no-action state, a different connected DAAP source, and the Playlists header;
+  it proves one exact delete, disconnect, or menu action and no historical callback on each step.
 - [ ] Cover playback-session behavior across sorting/filtering/navigation.
 - [ ] Cover output transfer and reselect semantics.
 - [x] Cover fake MPD and delayed/adversarial Chromecast state machines, including a cap applied
@@ -1625,7 +1643,14 @@ service/DAAP foundation and is stacked on its PR #117 head pending publication.
   with `UnexpectedEof`, and fragmented consecutive frames reset correctly while manager writes
   retain their framing. The cap is deliberately generous because Cast V2 carries protobuf control
   messages rather than media bytes.
-- [ ] Cover stale album-art and source-result generations.
+- [x] Cover stale album-art and source-result generations. A bounded real-HTTP fixture pauses the
+  first request after the persistent production artwork worker has accepted it, queues a second
+  generation, then releases the old response. The old completion channel closes without bytes and
+  only the current body crosses the worker boundary; the existing GTK callback repeats the same
+  generation check before texture publication. A second harness drives the production source
+  cache/eviction boundary with reversed same-key completion order, proving a stale loaded or
+  missing result cannot replace or remove the newer projection, while the newest result for an
+  inactive source is cached without rendering.
 - [x] Add keyboard context-menu and slider accessibility checks. This slice routes unmodified Menu
   and exact Shift+F10 through the right-click selection snapshot, consumes
   only a shortcut that opens a non-empty menu, exposes `has-popup` plus the standardized
@@ -1635,7 +1660,7 @@ service/DAAP foundation and is stacked on its PR #117 head pending publication.
   popover-scoped action ownership. Focused tests reject Shift+Menu, plain F10, and unrelated
   chords, exercise that complete plan, and parse each YAML catalog to prove both keys exist rather
   than mistaking an English fallback for a valid translation.
-- [ ] Record implementation: _pending; this section still has four open lifecycle harness items
+- [ ] Record implementation: _pending; this section still has two open lifecycle harness items
   plus this implementation record_
 
 The checked accessibility slice deliberately relies on `GtkScale` for slider focus, arrow/Page
@@ -1643,7 +1668,7 @@ Up/Page Down/Home/End behavior, role, current value, and range, then supplies th
 localized name and horizontal orientation. The context menu retains one action group on the
 one-shot popover rather than on the long-lived list, so closing it releases the captured selection;
 keyboard activation and pointer activation cannot drift into separate action implementations.
-P3.4 as a whole remains open until the four broader lifecycle/state-machine harness boxes and its
+P3.4 as a whole remains open until the two broader lifecycle/state-machine harness boxes and its
 implementation record are complete.
 
 ### P3.5 Make coverage reporting representative
@@ -1757,7 +1782,24 @@ macOS, both native Windows builds and finished-distribution probes, packages, an
 CodeQL run 29615866970 passed every analysis. No actionable automated review thread remains;
 Gemini posted only its service-sunset notice.
 
-Current local branch validation (2026-07-17, combined P3.4 accessibility/Cast slice): strict
+Current local branch validation (2026-07-17, stacked P3.4 recycled-row/UI-generation slice):
+strict all-target/all-feature Clippy and `cargo test --all-targets --all-features --locked` pass in
+debug and release. Each full profile passes 18 library, 743 application, and 10
+repository-metadata tests (771 total). The three focused production-boundary regressions pass
+directly in debug: the exact row-lifetime `GAction` is driven across repeated bind/unbind targets;
+a synchronized loopback server holds and releases an in-flight persistent-worker artwork fetch
+across a newer request; and reversed same-key loaded/missing results cross the source-cache and
+eviction boundary without altering the newer projection. These replace the old closure-shaped
+sidebar model with the actual production dispatcher and add two net-new tests. The artwork fixture
+uses channel synchronization and bounded socket I/O rather than sleeps or elapsed-time thresholds,
+and the GTK-independent action core runs on every native headless test host. Formatting and
+`git diff --check` pass. No dependency, lockfile, locale, package version, protocol, packaging, or
+release-workflow file changed. Exactly the list-item recycling/stale-callback and stale
+artwork/source-result boxes close, advancing this stacked branch's literal total to
+**209/223 (93.7%)** and P3 to **19/30**; playback-session, output-transfer, and the final P3.4
+implementation record remain open.
+
+Stacked base local branch validation (2026-07-17, combined P3.4 accessibility/Cast slice): strict
 all-target/all-feature Clippy and `cargo test --all-targets --all-features --locked` pass in debug
 and release with two build jobs. Each full profile passes 18 library, 741 application, and 10
 repository-metadata tests (769 total). The six net-new focused regressions also pass directly: two
@@ -2706,3 +2748,4 @@ Add one line per completed task:
 | 2026-07-17 | P3.2 shared catalogue backend completion | PR #116 | Adds object-safe complete-track catalogue access and removes every backend-specific `all_tracks` bypass. Scanner snapshots construct `LocalBackend`; local, environment, manual, discovery, Subsonic, Jellyfin, Plex, and DAAP publication all enter one explicit `&dyn MediaBackend` adapter. Concrete authentication and protected-media/session retention intentionally remain under P3.1. The production passwordless DAAP catalogue-error branch logs out and invokes the paired user-error/GTK-cleanup helper; focused coverage pins that helper's paired emissions without claiming to synthesize a catalogue failure. Together with PR #114's aggregate work, this closes P3.2's final two boxes. Its base-branch validation is recorded above. |
 | 2026-07-17 | P3.4 keyboard/context-menu and slider accessibility (partial) | local branch; PR pending | Closes only the accessibility item while broader P3.4 harnesses remain open. Unmodified Menu and exact Shift+F10 share right-click's immutable selection snapshot and popover-owned actions, propagate when no menu can open, and publish the standardized popup shortcut. Position and volume scales retain GTK's native slider semantics while gaining distinct localized names in all 13 catalogs. Two focused regressions pin the production-consumed interaction/accessibility plans and parse every source YAML catalog. |
 | 2026-07-17 | P3.4 MPD/Chromecast integration harnesses (partial) | local branch; PR pending | Closes the compound receiver-state-machine item while leaving the rest of P3.4 open. The already-established 83-test fake/real-socket MPD harness and 38-test delayed/adversarial Chromecast harness are joined by a plaintext 1 MiB Cast frame guard immediately below the real `rust_cast` manager. Four new real-manager regressions prove pre-allocation oversized rejection without payload reads, exact-limit acceptance, truncated-header/payload failure, and consecutive-frame reset/write preservation, bringing the focused Chromecast module to 42 tests. |
+| 2026-07-17 | P3.4 recycled-row and UI-generation harnesses (partial) | local branch; PR pending | Closes exactly the GTK recycling/stale-callback and stale artwork/source-result boxes while playback-session, output-transfer, and the final P3.4 record remain open. Sidebar setup installs one parameterized production `GAction`; factory bind replaces its typed current-source target and unbind revokes it. Its headless repeated-recycle harness proves no historical delete/disconnect/menu callback survives. A synchronized loopback fixture drives the real persistent artwork worker across an in-flight generation replacement, and the production source cache/eviction boundary rejects reversed same-key loaded and missing callbacks while retaining cache-only publication for an inactive newest request. |
