@@ -31,6 +31,22 @@ pub struct RadioBrowserClient {
     /// Base URL for API requests (e.g. `https://de1.api.radio-browser.info`).
     base_url: String,
     client: reqwest::Client,
+    policy: RequestPolicy,
+}
+
+#[derive(Clone, Copy)]
+struct RequestPolicy {
+    timeout: Duration,
+    max_station_body_bytes: u64,
+    max_geolocation_body_bytes: u64,
+}
+
+impl RequestPolicy {
+    const PRODUCTION: Self = Self {
+        timeout: REQUEST_TIMEOUT,
+        max_station_body_bytes: MAX_STATION_BODY_BYTES,
+        max_geolocation_body_bytes: MAX_GEOLOCATION_BODY_BYTES,
+    };
 }
 
 impl RadioBrowserClient {
@@ -50,12 +66,29 @@ impl RadioBrowserClient {
             .timeout(REQUEST_TIMEOUT)
             .build()?;
 
-        Ok(Self { base_url, client })
+        Ok(Self {
+            base_url,
+            client,
+            policy: RequestPolicy::PRODUCTION,
+        })
     }
 
     #[cfg(test)]
     fn with_http_client(base_url: String, client: reqwest::Client) -> Self {
-        Self { base_url, client }
+        Self {
+            base_url,
+            client,
+            policy: RequestPolicy::PRODUCTION,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_policy(base_url: String, client: reqwest::Client, policy: RequestPolicy) -> Self {
+        Self {
+            base_url,
+            client,
+            policy,
+        }
     }
 
     /// Fetch top-clicked stations.
@@ -156,11 +189,21 @@ impl RadioBrowserClient {
     /// Filters out stations with non-HTTP(S) stream URLs for safety.
     async fn fetch_stations(&self, url: &str) -> Vec<RadioStation> {
         debug!(url = %url, "Fetching radio stations");
-        match self.client.get(url).timeout(REQUEST_TIMEOUT).send().await {
+        match self
+            .client
+            .get(url)
+            .timeout(self.policy.timeout)
+            .send()
+            .await
+        {
             // lgtm[rs/cleartext-transmission] Base URL is always HTTPS; station stream URLs may be HTTP but carry no sensitive data.
-            Ok(resp) => {
-                match crate::http_body::read_limited(resp, MAX_STATION_BODY_BYTES, REQUEST_TIMEOUT)
-                    .await
+            Ok(resp) if resp.status().is_success() => {
+                match crate::http_body::read_limited(
+                    resp,
+                    self.policy.max_station_body_bytes,
+                    self.policy.timeout,
+                )
+                .await
                 {
                     Ok(body) => match serde_json::from_slice::<Vec<RadioStation>>(&body) {
                         Ok(stations) => {
@@ -186,6 +229,10 @@ impl RadioBrowserClient {
                         Vec::new()
                     }
                 }
+            }
+            Ok(resp) => {
+                warn!(status = %resp.status(), "Radio-Browser request returned an HTTP error");
+                Vec::new()
             }
             Err(e) => {
                 let e = crate::http_security::strip_request_url(e);
@@ -235,9 +282,17 @@ async fn fetch_geolocation_with(
     client: &reqwest::Client,
     endpoints: &GeolocationEndpoints<'_>,
 ) -> Option<GeoLocation> {
+    fetch_geolocation_with_policy(client, endpoints, RequestPolicy::PRODUCTION).await
+}
+
+async fn fetch_geolocation_with_policy(
+    client: &reqwest::Client,
+    endpoints: &GeolocationEndpoints<'_>,
+    policy: RequestPolicy,
+) -> Option<GeoLocation> {
     // ── Provider 1: ipapi.co ────────────────────────────────────────
     info!("Geolocation: trying ipapi.co (HTTPS)");
-    if let Some(geo) = try_ipapi_co(client, endpoints.ipapi_co).await {
+    if let Some(geo) = try_ipapi_co(client, endpoints.ipapi_co, policy).await {
         info!(
             lat = geo.latitude,
             lon = geo.longitude,
@@ -249,7 +304,7 @@ async fn fetch_geolocation_with(
 
     // ── Provider 2: ipwho.is ────────────────────────────────────────
     info!("Geolocation: trying ipwho.is (HTTPS)");
-    if let Some(geo) = try_ipwhois(client, endpoints.ipwhois).await {
+    if let Some(geo) = try_ipwhois(client, endpoints.ipwhois, policy).await {
         info!(
             lat = geo.latitude,
             lon = geo.longitude,
@@ -261,7 +316,7 @@ async fn fetch_geolocation_with(
 
     // ── Provider 3: freeipapi.com ───────────────────────────────────
     info!("Geolocation: trying freeipapi.com (HTTPS)");
-    if let Some(geo) = try_freeipapi(client, endpoints.freeipapi).await {
+    if let Some(geo) = try_freeipapi(client, endpoints.freeipapi, policy).await {
         info!(
             lat = geo.latitude,
             lon = geo.longitude,
@@ -276,16 +331,24 @@ async fn fetch_geolocation_with(
 }
 
 /// Try ipapi.co geolocation.
-async fn try_ipapi_co(client: &reqwest::Client, endpoint: &str) -> Option<GeoLocation> {
+async fn try_ipapi_co(
+    client: &reqwest::Client,
+    endpoint: &str,
+    policy: RequestPolicy,
+) -> Option<GeoLocation> {
     let resp = client
         .get(endpoint)
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(policy.timeout)
         .send()
         .await
         .ok()?;
-    let body = crate::http_body::read_limited(resp, MAX_GEOLOCATION_BODY_BYTES, REQUEST_TIMEOUT)
-        .await
-        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body =
+        crate::http_body::read_limited(resp, policy.max_geolocation_body_bytes, policy.timeout)
+            .await
+            .ok()?;
     let data: IpApiCoResponse = serde_json::from_slice(&body).ok()?;
     if !data.error && (data.latitude != 0.0 || data.longitude != 0.0) {
         Some(GeoLocation {
@@ -300,16 +363,24 @@ async fn try_ipapi_co(client: &reqwest::Client, endpoint: &str) -> Option<GeoLoc
 }
 
 /// Try ipwho.is geolocation.
-async fn try_ipwhois(client: &reqwest::Client, endpoint: &str) -> Option<GeoLocation> {
+async fn try_ipwhois(
+    client: &reqwest::Client,
+    endpoint: &str,
+    policy: RequestPolicy,
+) -> Option<GeoLocation> {
     let resp = client
         .get(endpoint)
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(policy.timeout)
         .send()
         .await
         .ok()?;
-    let body = crate::http_body::read_limited(resp, MAX_GEOLOCATION_BODY_BYTES, REQUEST_TIMEOUT)
-        .await
-        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body =
+        crate::http_body::read_limited(resp, policy.max_geolocation_body_bytes, policy.timeout)
+            .await
+            .ok()?;
     let data: IpWhoIsResponse = serde_json::from_slice(&body).ok()?;
     if data.success && (data.latitude != 0.0 || data.longitude != 0.0) {
         Some(GeoLocation {
@@ -324,16 +395,24 @@ async fn try_ipwhois(client: &reqwest::Client, endpoint: &str) -> Option<GeoLoca
 }
 
 /// Try freeipapi.com geolocation.
-async fn try_freeipapi(client: &reqwest::Client, endpoint: &str) -> Option<GeoLocation> {
+async fn try_freeipapi(
+    client: &reqwest::Client,
+    endpoint: &str,
+    policy: RequestPolicy,
+) -> Option<GeoLocation> {
     let resp = client
         .get(endpoint)
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(policy.timeout)
         .send()
         .await
         .ok()?;
-    let body = crate::http_body::read_limited(resp, MAX_GEOLOCATION_BODY_BYTES, REQUEST_TIMEOUT)
-        .await
-        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body =
+        crate::http_body::read_limited(resp, policy.max_geolocation_body_bytes, policy.timeout)
+            .await
+            .ok()?;
     let data: FreeIpApiResponse = serde_json::from_slice(&body).ok()?;
     if data.latitude != 0.0 || data.longitude != 0.0 {
         Some(GeoLocation {
@@ -373,6 +452,8 @@ fn resolve_api_host() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::{header::LOCATION, HeaderValue, StatusCode};
+
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
 
     use super::*;
@@ -450,6 +531,130 @@ mod tests {
         assert_eq!(location.country_code, "US");
         assert_eq!(location.region, "Indiana");
         assert_eq!(service.requests().len(), 1);
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn radio_browser_follows_public_redirect_but_rejects_non_success_json() {
+        let redirected = MockHttpService::start(vec![
+            MockRoute::get("/json/stations/topclick")
+                .with_query("limit", "1")
+                .reply(
+                    MockResponse::status(StatusCode::TEMPORARY_REDIRECT)
+                        .with_header(LOCATION, HeaderValue::from_static("/mirror/topclick")),
+                ),
+            MockRoute::get("/mirror/topclick").reply(MockResponse::json(serde_json::json!([{
+                "stationuuid": "redirected",
+                "name": "Redirected Station",
+                "url_resolved": "https://stream.example.test/live"
+            }]))),
+        ])
+        .await;
+        let client = RadioBrowserClient::with_http_client(redirected.base_url(), fixture_client());
+
+        let stations = client.fetch_top_click(Some(1)).await;
+        assert_eq!(stations.len(), 1);
+        assert_eq!(stations[0].stationuuid, "redirected");
+        redirected.finish().await;
+
+        let failed = MockHttpService::start(vec![MockRoute::get("/json/stations/topclick")
+            .with_query("limit", "1")
+            .reply(
+                MockResponse::json(serde_json::json!([{
+                    "stationuuid": "must-not-publish",
+                    "name": "Error Body Station",
+                    "url_resolved": "https://stream.example.test/live"
+                }]))
+                .with_status(StatusCode::SERVICE_UNAVAILABLE),
+            )])
+        .await;
+        let client = RadioBrowserClient::with_http_client(failed.base_url(), fixture_client());
+
+        assert!(client.fetch_top_click(Some(1)).await.is_empty());
+        failed.finish().await;
+    }
+
+    #[tokio::test]
+    async fn radio_browser_deadline_and_body_cap_fail_closed() {
+        let policy = RequestPolicy {
+            timeout: Duration::from_millis(25),
+            max_station_body_bytes: 128,
+            max_geolocation_body_bytes: 128,
+        };
+        let delayed = MockHttpService::start(vec![MockRoute::get("/json/stations/topclick")
+            .with_query("limit", "1")
+            .reply(
+                MockResponse::json(serde_json::json!([{
+                    "stationuuid": "too-late",
+                    "name": "Too Late",
+                    "url_resolved": "https://stream.example.test/live"
+                }]))
+                .with_delay(Duration::from_millis(100)),
+            )])
+        .await;
+        let client =
+            RadioBrowserClient::with_test_policy(delayed.base_url(), fixture_client(), policy);
+        assert!(client.fetch_top_click(Some(1)).await.is_empty());
+        delayed.finish().await;
+
+        let oversized = MockHttpService::start(vec![MockRoute::get("/json/stations/topclick")
+            .with_query("limit", "1")
+            .reply(MockResponse::text(format!(
+                r#"[{{"stationuuid":"oversized","name":"{}","url_resolved":"https://stream.example.test/live"}}]"#,
+                "x".repeat(256)
+            )))])
+        .await;
+        let client =
+            RadioBrowserClient::with_test_policy(oversized.base_url(), fixture_client(), policy);
+        assert!(client.fetch_top_click(Some(1)).await.is_empty());
+        oversized.finish().await;
+    }
+
+    #[tokio::test]
+    async fn geolocation_skips_http_errors_oversized_bodies_and_timeouts() {
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/ipapi").reply(
+                MockResponse::json(serde_json::json!({
+                    "latitude": 1.0,
+                    "longitude": 2.0,
+                    "country_code": "BAD",
+                    "region": "HTTP error",
+                    "error": false
+                }))
+                .with_status(StatusCode::SERVICE_UNAVAILABLE),
+            ),
+            MockRoute::get("/ipwhois").reply(MockResponse::text(format!(
+                r#"{{"success":true,"latitude":3.0,"longitude":4.0,"country_code":"BAD","region":"oversized","padding":"{}"}}"#,
+                "x".repeat(256)
+            ))),
+            MockRoute::get("/freeipapi").reply(
+                MockResponse::json(serde_json::json!({
+                    "latitude": 39.7684,
+                    "longitude": -86.1581,
+                    "countryCode": "US",
+                    "regionName": "Indiana"
+                }))
+                .with_delay(Duration::from_millis(100)),
+            ),
+        ])
+        .await;
+        let base_url = service.base_url();
+        let endpoints = GeolocationEndpoints {
+            ipapi_co: &format!("{base_url}/ipapi"),
+            ipwhois: &format!("{base_url}/ipwhois"),
+            freeipapi: &format!("{base_url}/freeipapi"),
+        };
+        let policy = RequestPolicy {
+            timeout: Duration::from_millis(25),
+            max_station_body_bytes: 128,
+            max_geolocation_body_bytes: 128,
+        };
+
+        assert!(
+            fetch_geolocation_with_policy(&fixture_client(), &endpoints, policy)
+                .await
+                .is_none()
+        );
         service.finish().await;
     }
 }

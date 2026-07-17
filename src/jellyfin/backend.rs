@@ -607,6 +607,8 @@ fn jellyfin_item_to_track(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::{header::LOCATION, HeaderValue, StatusCode};
+
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
 
     use super::*;
@@ -720,6 +722,127 @@ mod tests {
                 .expect("Jellyfin fixture request authorization");
             assert!(authorization.contains(&format!(r#"Token="{token}""#)));
             assert!(request.body.is_empty());
+        }
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn prefixed_backend_follows_same_origin_redirect_and_paginates() {
+        fn track(index: u32) -> serde_json::Value {
+            serde_json::json!({
+                "Id": format!("track-{index}"),
+                "Name": format!("Track {index}"),
+                "Type": "Audio",
+                "Album": "Fixture Album",
+                "AlbumId": "album-1",
+                "AlbumArtist": "Fixture Artist",
+                "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}]
+            })
+        }
+
+        let first_page = (0..PAGE_SIZE).map(track).collect::<Vec<_>>();
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/gateway/System/Ping").reply(
+                MockResponse::status(StatusCode::TEMPORARY_REDIRECT)
+                    .with_header(LOCATION, HeaderValue::from_static("/gateway/ping-result")),
+            ),
+            MockRoute::get("/gateway/ping-result").reply(MockResponse::text("Jellyfin Server")),
+            MockRoute::get("/gateway/Users/fixture-user/Views").reply(MockResponse::json(
+                serde_json::json!({
+                    "Items": [{
+                        "Id": "music-library",
+                        "Name": "Music",
+                        "CollectionType": "music"
+                    }],
+                    "TotalRecordCount": 1
+                }),
+            )),
+            MockRoute::get("/gateway/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "Audio")
+                .with_query("StartIndex", "0")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": first_page,
+                    "TotalRecordCount": PAGE_SIZE + 1
+                }))),
+            MockRoute::get("/gateway/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "Audio")
+                .with_query("StartIndex", PAGE_SIZE.to_string())
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [track(PAGE_SIZE)],
+                    "TotalRecordCount": PAGE_SIZE + 1
+                }))),
+            MockRoute::get("/gateway/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicAlbum")
+                .with_query("StartIndex", "0")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [{
+                        "Id": "album-1",
+                        "Name": "Fixture Album",
+                        "Type": "MusicAlbum",
+                        "AlbumArtist": "Fixture Artist",
+                        "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}]
+                    }],
+                    "TotalRecordCount": 1
+                }))),
+            MockRoute::get("/gateway/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicArtist")
+                .with_query("StartIndex", "0")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [{"Id": "artist-1", "Name": "Fixture Artist", "Type": "MusicArtist"}],
+                    "TotalRecordCount": 1
+                }))),
+        ])
+        .await;
+        let token = Uuid::new_v4().to_string();
+        let backend = JellyfinBackend::connect(
+            "fixture",
+            &format!("{}/gateway/", service.base_url()),
+            &token,
+            "fixture-user",
+        )
+        .await
+        .expect("prefixed paginated Jellyfin fixture");
+
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), (PAGE_SIZE + 1) as usize);
+        assert_eq!(cache.albums.len(), 1);
+        assert_eq!(cache.artists.len(), 1);
+        let first_id = cache.tracks[0].id;
+        drop(cache);
+        assert_eq!(
+            backend
+                .resolve_stream(&first_id)
+                .await
+                .expect("resolve prefixed stream")
+                .endpoint()
+                .path(),
+            "/gateway/Audio/track-0/stream"
+        );
+        assert_eq!(
+            backend
+                .resolve_artwork(&first_id)
+                .await
+                .expect("resolve prefixed artwork")
+                .expect("track artwork")
+                .endpoint()
+                .path(),
+            "/gateway/Items/album-1/Images/Primary"
+        );
+
+        let requests = service.requests();
+        assert_eq!(requests.len(), 7);
+        for request in requests {
+            let authorization = request
+                .headers
+                .get("x-emby-authorization")
+                .and_then(|value| value.to_str().ok())
+                .expect("Jellyfin fixture request authorization");
+            assert!(authorization.contains(&format!(r#"Token="{token}""#)));
+            assert!(request.headers.get(reqwest::header::REFERER).is_none());
         }
         service.finish().await;
     }

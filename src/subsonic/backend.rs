@@ -588,6 +588,7 @@ fn album_entry_to_album(entry: &AlbumEntry, id: Uuid, artist_id: Option<Uuid>) -
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
     use md5::{Digest as _, Md5};
 
     use crate::architecture::MediaBackend as _;
@@ -759,6 +760,119 @@ mod tests {
             assert_eq!(query.get("t"), Some(&expected_token));
             assert!(request.body.is_empty());
         }
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_token_auth_stops_before_catalogue_fetch() {
+        let password = Uuid::new_v4().to_string();
+        let service = MockHttpService::start(vec![MockRoute::get("/rest/ping.view").reply(
+            MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "failed",
+                    "error": {"code": 40, "message": password.clone()}
+                }
+            })),
+        )])
+        .await;
+        let error = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
+            .await
+            .err()
+            .expect("fixture authentication must fail");
+
+        assert!(matches!(error, BackendError::AuthenticationFailed { .. }));
+        assert!(!error.to_string().contains(&password));
+        assert_eq!(service.requests().len(), 1);
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn prefixed_catalogue_keeps_healthy_items_after_bounded_partial_failures() {
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/gateway/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/gateway/rest/getArtists.view").reply(MockResponse::json(
+                serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artists": {"index": [{"artist": [
+                            {"id": "healthy-artist", "name": "Healthy Artist"},
+                            {"id": "failed-artist", "name": "Failed Artist"}
+                        ]}]}
+                    }
+                }),
+            )),
+            MockRoute::get("/gateway/rest/getArtist.view")
+                .with_query("id", "healthy-artist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artist": {
+                            "id": "healthy-artist",
+                            "name": "Healthy Artist",
+                            "album": [
+                                {"id": "healthy-album", "name": "Healthy Album"},
+                                {"id": "failed-album", "name": "Failed Album"}
+                            ]
+                        }
+                    }
+                }))),
+            MockRoute::get("/gateway/rest/getArtist.view")
+                .with_query("id", "failed-artist")
+                .reply(MockResponse::status(StatusCode::SERVICE_UNAVAILABLE)),
+            MockRoute::get("/gateway/rest/getAlbum.view")
+                .with_query("id", "healthy-album")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "album": {
+                            "id": "healthy-album",
+                            "name": "Healthy Album",
+                            "song": [{
+                                "id": "healthy-track",
+                                "title": "Healthy Track",
+                                "artist": "Healthy Artist",
+                                "album": "Healthy Album"
+                            }]
+                        }
+                    }
+                }))),
+            MockRoute::get("/gateway/rest/getAlbum.view")
+                .with_query("id", "failed-album")
+                .reply(MockResponse::status(StatusCode::BAD_GATEWAY)),
+        ])
+        .await;
+        let password = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect(
+            "fixture",
+            &format!("{}/gateway/", service.base_url()),
+            "user",
+            &password,
+        )
+        .await
+        .expect("partial failures must retain the healthy catalogue subset");
+
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), 1);
+        assert_eq!(cache.tracks[0].title, "Healthy Track");
+        assert_eq!(cache.albums.len(), 1);
+        assert_eq!(cache.albums[0].title, "Healthy Album");
+        assert_eq!(cache.artists.len(), 1);
+        assert_eq!(cache.artists[0].name, "Healthy Artist");
+        assert_eq!(cache.artists[0].album_count, 2);
+        let track_id = cache.tracks[0].id;
+        drop(cache);
+        assert_eq!(
+            backend
+                .resolve_stream(&track_id)
+                .await
+                .expect("resolve healthy stream")
+                .endpoint()
+                .path(),
+            "/gateway/rest/stream.view"
+        );
+        assert_eq!(service.requests().len(), 6);
         service.finish().await;
     }
 }

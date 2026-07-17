@@ -301,29 +301,28 @@ impl SubsonicClient {
             })?;
 
         if envelope.response.status != "ok" {
-            let msg = envelope
-                .response
-                .error
-                .as_ref()
-                .map(|e| format!("Subsonic error {}: {}", e.code, e.message))
-                .unwrap_or_else(|| "Unknown Subsonic error".into());
-
             if let Some(err) = &envelope.response.error {
+                let message = format!("Subsonic API error {}", err.code);
                 match err.code {
                     // Code 40 = wrong credentials
                     40 => {
-                        return Err(BackendError::AuthenticationFailed { message: msg });
+                        return Err(BackendError::AuthenticationFailed { message });
                     }
                     // Code 41 = token auth not supported
                     41 => {
-                        return Err(BackendError::TokenAuthNotSupported { message: msg });
+                        return Err(BackendError::TokenAuthNotSupported { message });
                     }
                     _ => {}
                 }
+
+                return Err(BackendError::ConnectionFailed {
+                    message,
+                    source: None,
+                });
             }
 
             return Err(BackendError::ConnectionFailed {
-                message: msg,
+                message: "Subsonic API returned a failed response".into(),
                 source: None,
             });
         }
@@ -554,7 +553,7 @@ mod tests {
                 .expect_err("failed envelope must not be accepted");
             server.join().expect("join fixture server");
 
-            let expected = format!("Subsonic error {code}: fixture failure");
+            let expected = format!("Subsonic API error {code}");
             match (code, error) {
                 (40, BackendError::AuthenticationFailed { message }) => {
                     assert_eq!(message, expected);

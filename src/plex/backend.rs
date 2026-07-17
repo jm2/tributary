@@ -646,6 +646,8 @@ fn plex_track_to_track(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
+
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
 
     use super::*;
@@ -824,6 +826,142 @@ mod tests {
                 Some(token.as_str())
             );
             assert!(request.body.is_empty());
+        }
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn prefixed_backend_paginates_and_skips_one_failed_section_atomically() {
+        fn track(index: u32) -> serde_json::Value {
+            serde_json::json!({
+                "ratingKey": format!("track-{index}"),
+                "title": format!("Track {index}"),
+                "grandparentTitle": "Fixture Artist",
+                "grandparentRatingKey": "artist-1",
+                "parentTitle": "Fixture Album",
+                "parentRatingKey": "album-1",
+                "thumb": format!("/library/metadata/track-{index}/thumb"),
+                "Media": [{
+                    "audioCodec": "flac",
+                    "Part": [{"key": format!("/library/parts/track-{index}/file.flac")}]
+                }]
+            })
+        }
+
+        let first_page = (0..PLEX_PAGE_SIZE).map(track).collect::<Vec<_>>();
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/gateway/identity").reply(MockResponse::json(
+                serde_json::json!({"MediaContainer": {"machineIdentifier": "fixture"}}),
+            )),
+            MockRoute::get("/gateway/library/sections").reply(MockResponse::json(
+                serde_json::json!({
+                    "MediaContainer": {
+                        "size": 2,
+                        "Directory": [
+                            {"key": "7", "title": "Healthy", "type": "artist"},
+                            {"key": "8", "title": "Unavailable", "type": "artist"}
+                        ]
+                    }
+                }),
+            )),
+            MockRoute::get("/gateway/library/sections/7/all")
+                .with_query("type", "10")
+                .with_query("X-Plex-Container-Start", "0")
+                .reply(MockResponse::json(serde_json::json!({
+                    "MediaContainer": {
+                        "size": PLEX_PAGE_SIZE,
+                        "totalSize": PLEX_PAGE_SIZE + 1,
+                        "offset": 0,
+                        "Metadata": first_page
+                    }
+                }))),
+            MockRoute::get("/gateway/library/sections/7/all")
+                .with_query("type", "10")
+                .with_query("X-Plex-Container-Start", PLEX_PAGE_SIZE.to_string())
+                .reply(MockResponse::json(serde_json::json!({
+                    "MediaContainer": {
+                        "size": 1,
+                        "totalSize": PLEX_PAGE_SIZE + 1,
+                        "offset": PLEX_PAGE_SIZE,
+                        "Metadata": [track(PLEX_PAGE_SIZE)]
+                    }
+                }))),
+            MockRoute::get("/gateway/library/sections/7/all")
+                .with_query("type", "9")
+                .with_query("X-Plex-Container-Start", "0")
+                .reply(MockResponse::json(serde_json::json!({
+                    "MediaContainer": {
+                        "size": 1,
+                        "totalSize": 1,
+                        "Metadata": [{
+                            "ratingKey": "album-1",
+                            "title": "Fixture Album",
+                            "parentTitle": "Fixture Artist",
+                            "parentRatingKey": "artist-1"
+                        }]
+                    }
+                }))),
+            MockRoute::get("/gateway/library/sections/7/all")
+                .with_query("type", "8")
+                .with_query("X-Plex-Container-Start", "0")
+                .reply(MockResponse::json(serde_json::json!({
+                    "MediaContainer": {
+                        "size": 1,
+                        "totalSize": 1,
+                        "Metadata": [{"ratingKey": "artist-1", "title": "Fixture Artist"}]
+                    }
+                }))),
+            MockRoute::get("/gateway/library/sections/8/all")
+                .with_query("type", "10")
+                .with_query("X-Plex-Container-Start", "0")
+                .reply(MockResponse::status(StatusCode::SERVICE_UNAVAILABLE)),
+        ])
+        .await;
+        let token = Uuid::new_v4().to_string();
+        let backend = PlexBackend::connect(
+            "fixture",
+            &format!("{}/gateway/", service.base_url()),
+            &token,
+        )
+        .await
+        .expect("the healthy section must survive another section's failure");
+
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), (PLEX_PAGE_SIZE + 1) as usize);
+        assert_eq!(cache.albums.len(), 1);
+        assert_eq!(cache.artists.len(), 1);
+        let first_id = cache.tracks[0].id;
+        drop(cache);
+        assert_eq!(
+            backend
+                .resolve_stream(&first_id)
+                .await
+                .expect("resolve prefixed stream")
+                .endpoint()
+                .path(),
+            "/gateway/library/parts/track-0/file.flac"
+        );
+        assert_eq!(
+            backend
+                .resolve_artwork(&first_id)
+                .await
+                .expect("resolve prefixed artwork")
+                .expect("track artwork")
+                .endpoint()
+                .path(),
+            "/gateway/library/metadata/track-0/thumb"
+        );
+
+        let requests = service.requests();
+        assert_eq!(requests.len(), 7);
+        for request in requests {
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-plex-token")
+                    .and_then(|value| value.to_str().ok()),
+                Some(token.as_str())
+            );
         }
         service.finish().await;
     }
