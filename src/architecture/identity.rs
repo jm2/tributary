@@ -87,6 +87,16 @@ impl SourceId {
         self.0
     }
 
+    /// Whether this value is reserved and therefore cannot identify a
+    /// persisted remote source.
+    ///
+    /// Nil is kept unavailable as a sentinel, while the two built-in IDs
+    /// have application-wide owners that a saved-server file must never be
+    /// able to impersonate.
+    pub fn is_reserved_remote(self) -> bool {
+        self.0.is_nil() || self == Self::local() || self == Self::radio_browser()
+    }
+
     fn deterministic(input: &[u8]) -> Self {
         Self(Uuid::new_v5(&SOURCE_ID_NAMESPACE, input))
     }
@@ -351,6 +361,20 @@ mod tests {
                 .to_string(),
             "86e16344-b0ec-5aeb-a798-2d5f401538d2"
         );
+    }
+
+    #[test]
+    fn persisted_remote_identity_reserves_nil_and_builtin_owners() {
+        assert!(SourceId::from_uuid(Uuid::nil()).is_reserved_remote());
+        assert!(SourceId::local().is_reserved_remote());
+        assert!(SourceId::radio_browser().is_reserved_remote());
+        assert!(!SourceId::random().is_reserved_remote());
+        assert!(!SourceId::remote(
+            "subsonic",
+            &Url::parse("https://music.example.test").expect("URL")
+        )
+        .expect("remote ID")
+        .is_reserved_remote());
     }
 
     #[test]

@@ -156,9 +156,9 @@ fn playlist_creation_action_group(
 ///
 /// Returns `(sidebar_box, ListStore, SingleSelection, disconnect_rx, delete_rx, add_button, playlist_action_rx)`.
 ///
-/// * `disconnect_rx` emits the `server_url` of a DAAP source when the
+/// * `disconnect_rx` emits the stable `SourceId` of a DAAP source when the
 ///   user clicks its eject button.
-/// * `delete_rx` emits the `server_url` of a manually-added source when
+/// * `delete_rx` emits the stable `SourceId` of a manually-added source when
 ///   the user clicks its trash button.
 /// * `add_button` is the `+` button for adding manual servers (wired in `window.rs`).
 /// * `playlist_action_rx` emits playlist CRUD actions from the context menu.

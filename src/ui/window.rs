@@ -84,6 +84,43 @@ fn remote_source_id(backend_type: &str, server_url: &str) -> crate::architecture
         .expect("supported remote backend produces a stable source ID")
 }
 
+/// Add an environment-configured row or reuse the saved/discovered owner of
+/// the same canonical `(backend, endpoint)` pair.
+///
+/// Saved rows are loaded first, so their persisted identity wins over the
+/// deterministic environment identity. The returned ID must be used by the
+/// connection attempt; recomputing it from the URL would split one logical
+/// source across two registry owners.
+fn upsert_environment_source(
+    sources: &mut Vec<SourceObject>,
+    name: &str,
+    backend_type: &str,
+    server_url: &str,
+) -> crate::architecture::SourceId {
+    if let Some(source) = sources.iter().find(|source| {
+        super::server_dialogs::same_remote_endpoint(
+            &source.backend_type(),
+            &source.server_url(),
+            backend_type,
+            server_url,
+        )
+    }) {
+        source.set_connecting(true);
+        return source
+            .source_id()
+            .expect("validated remote source has a stable identity");
+    }
+
+    ensure_category_header_vec(sources, backend_type);
+    let source = SourceObject::discovered(name, backend_type, server_url);
+    source.set_connecting(true);
+    let source_id = source
+        .source_id()
+        .unwrap_or_else(|| remote_source_id(backend_type, server_url));
+    sources.push(source);
+    source_id
+}
+
 /// Build and present the main Tributary window.
 pub fn build_window(
     app: &adw::Application,
@@ -150,38 +187,31 @@ pub fn build_window(
 
     // If env vars are set, add pre-configured remote server entries
     // under their respective category headers.
-    if let Some((url, _user, _pass)) = subsonic_env.as_ref() {
-        ensure_category_header_vec(&mut sources, "subsonic");
-        let src = SourceObject::discovered("Subsonic (env)", "subsonic", url);
-        src.set_connecting(true);
-        sources.push(src);
+    let subsonic_env_source_id = subsonic_env.as_ref().map(|(url, _user, _pass)| {
+        upsert_environment_source(&mut sources, "Subsonic (env)", "subsonic", url)
+    });
+    if subsonic_env_source_id.is_some() {
         info!("Subsonic server configured via env vars");
     }
 
-    if let Some((url, _key, _uid)) = jellyfin_env.as_ref() {
-        ensure_category_header_vec(&mut sources, "jellyfin");
-        let src = SourceObject::discovered("Jellyfin (env)", "jellyfin", url);
-        src.set_connecting(true);
-        sources.push(src);
+    let jellyfin_env_source_id = jellyfin_env.as_ref().map(|(url, _key, _uid)| {
+        upsert_environment_source(&mut sources, "Jellyfin (env)", "jellyfin", url)
+    });
+    if jellyfin_env_source_id.is_some() {
         info!("Jellyfin server configured via env vars");
     }
 
-    if let Some((url, _token)) = plex_env.as_ref() {
-        ensure_category_header_vec(&mut sources, "plex");
-        let src = SourceObject::discovered("Plex (env)", "plex", url);
-        src.set_connecting(true);
-        sources.push(src);
+    let plex_env_source_id = plex_env
+        .as_ref()
+        .map(|(url, _token)| upsert_environment_source(&mut sources, "Plex (env)", "plex", url));
+    if plex_env_source_id.is_some() {
         info!("Plex server configured via env vars");
     }
 
-    if let Some((url, _password)) = daap_env.as_ref() {
-        ensure_category_header_vec(&mut sources, "daap");
-        // Keep the configured URL as the source identity so the retained
-        // session, generation-scoped sync event, sidebar row, and disconnect action all
-        // address the same owner.
-        let src = SourceObject::discovered("DAAP (env)", "daap", url);
-        src.set_connecting(true);
-        sources.push(src);
+    let daap_env_source_id = daap_env
+        .as_ref()
+        .map(|(url, _password)| upsert_environment_source(&mut sources, "DAAP (env)", "daap", url));
+    if daap_env_source_id.is_some() {
         info!("DAAP server configured via env vars");
     }
 
@@ -509,7 +539,7 @@ pub fn build_window(
     // ── Start Subsonic backend if configured via env vars ──────────
     if let Some((url, user, pass)) = subsonic_env {
         let tx = engine_tx.clone();
-        let source_id = remote_source_id("subsonic", &url);
+        let source_id = subsonic_env_source_id.expect("configured Subsonic source ID");
         rt_handle.spawn(async move {
             info!("Connecting to Subsonic server...");
             let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
@@ -556,7 +586,7 @@ pub fn build_window(
     // ── Start Jellyfin backend if configured via env vars ──────────
     if let Some((url, api_key, user_id)) = jellyfin_env {
         let tx = engine_tx.clone();
-        let source_id = remote_source_id("jellyfin", &url);
+        let source_id = jellyfin_env_source_id.expect("configured Jellyfin source ID");
         rt_handle.spawn(async move {
             info!("Connecting to Jellyfin server...");
             let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
@@ -605,7 +635,7 @@ pub fn build_window(
     // ── Start Plex backend if configured via env vars ──────────────
     if let Some((url, token)) = plex_env {
         let tx = engine_tx.clone();
-        let source_id = remote_source_id("plex", &url);
+        let source_id = plex_env_source_id.expect("configured Plex source ID");
         rt_handle.spawn(async move {
             info!("Connecting to Plex server...");
             let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
@@ -652,7 +682,7 @@ pub fn build_window(
     // ── Start DAAP backend if configured via env vars ──────────────
     if let Some((url, password)) = daap_env {
         let tx = engine_tx.clone();
-        let source_id = remote_source_id("daap", &url);
+        let source_id = daap_env_source_id.expect("configured DAAP source ID");
         rt_handle.spawn(async move {
             info!("Connecting to DAAP server...");
             let Some(attempt) = crate::daap::begin_connect(source_id) else {
@@ -2820,3 +2850,47 @@ pub fn remove_empty_category_header(store: &gtk::gio::ListStore, category: &str)
 }
 
 // ── Popover scrollbar fix ───────────────────────────────────────────
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::architecture::SourceId;
+
+    #[test]
+    fn saved_and_environment_startup_share_the_persisted_source_owner() {
+        let persisted = SourceId::random();
+        let mut sources = vec![
+            SourceObject::header("Subsonic"),
+            SourceObject::manual(
+                "Saved",
+                "subsonic",
+                "HTTPS://MUSIC.EXAMPLE.TEST:443/base/",
+                persisted,
+            ),
+        ];
+
+        let connection_source_id = upsert_environment_source(
+            &mut sources,
+            "Subsonic (env)",
+            "subsonic",
+            "https://music.example.test/base",
+        );
+
+        let owners: Vec<_> = sources
+            .iter()
+            .filter(|source| {
+                super::super::server_dialogs::same_remote_endpoint(
+                    &source.backend_type(),
+                    &source.server_url(),
+                    "subsonic",
+                    "https://music.example.test/base",
+                )
+            })
+            .collect();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(connection_source_id, persisted);
+        assert_eq!(owners[0].source_id(), Some(persisted));
+        assert!(owners[0].manually_added());
+        assert!(owners[0].connecting());
+    }
+}

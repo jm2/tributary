@@ -107,9 +107,10 @@ struct MdnsPublication {
 /// Live mDNS publications keyed by exact service identity.
 ///
 /// Several service instances may legitimately publish the same HTTP origin.
-/// The UI still owns one URL-keyed source row, so this state aggregates their
-/// addresses and emits `Lost` only after the final retained matching instance
-/// leaves. Retention limits are documented below.
+/// The UI owns one stable source row per canonical `(backend, endpoint)`, so
+/// this state aggregates addresses within that same pair and emits `Lost` only
+/// after the final retained matching instance leaves. Retention limits are
+/// documented below.
 #[derive(Default)]
 struct MdnsPublications {
     by_instance: HashMap<ServiceInstanceKey, MdnsPublication>,

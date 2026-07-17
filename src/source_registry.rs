@@ -15,6 +15,7 @@ use crate::architecture::media::{MediaLease, RemoteMediaResolver, ResolvedHttpRe
 use crate::architecture::{SourceId, TrackId};
 
 const MEDIA_REFERENCE_SCHEME: &str = "tributary-remote";
+const MEDIA_TRACK_SEGMENT_PREFIX: &str = "id-";
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 enum RegistryGate {
@@ -255,8 +256,55 @@ fn media_reference(lease_key: Uuid, kind: MediaKind, track_id: &TrackId) -> Stri
     format!(
         "{MEDIA_REFERENCE_SCHEME}://{lease_key}/{}/{}",
         kind.path_component(),
-        urlencoding::encode(track_id.as_str())
+        encode_track_segment(track_id)
     )
+}
+
+/// Encode an exact UTF-8 native identifier into one URL segment that cannot
+/// be interpreted as `.` or `..` by an RFC 3986 parser.
+///
+/// The fixed non-dot prefix and lowercase hex alphabet make the representation
+/// canonical, reversible, and independent of percent-decoder behavior.
+fn encode_track_segment(track_id: &TrackId) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = track_id.as_str().as_bytes();
+    let mut encoded = String::with_capacity(
+        MEDIA_TRACK_SEGMENT_PREFIX
+            .len()
+            .saturating_add(bytes.len().saturating_mul(2)),
+    );
+    encoded.push_str(MEDIA_TRACK_SEGMENT_PREFIX);
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_track_segment(segment: &str) -> Result<TrackId, MediaReferenceError> {
+    let encoded = segment
+        .strip_prefix(MEDIA_TRACK_SEGMENT_PREFIX)
+        .ok_or(MediaReferenceError::Malformed)?;
+    if encoded.is_empty() || !encoded.len().is_multiple_of(2) {
+        return Err(MediaReferenceError::Malformed);
+    }
+
+    let mut decoded = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = decode_hex_nibble(pair[0]).ok_or(MediaReferenceError::Malformed)?;
+        let low = decode_hex_nibble(pair[1]).ok_or(MediaReferenceError::Malformed)?;
+        decoded.push((high << 4) | low);
+    }
+    let value = String::from_utf8(decoded).map_err(|_| MediaReferenceError::Malformed)?;
+    TrackId::remote(value).map_err(|_| MediaReferenceError::Malformed)
+}
+
+const fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 /// Return true for references owned by this registry, including malformed
@@ -366,11 +414,7 @@ fn parse_reference(
         return Err(MediaReferenceError::WrongKind);
     }
     let encoded_track_id = segments.next().ok_or(MediaReferenceError::Malformed)?;
-    let track_id = urlencoding::decode(encoded_track_id)
-        .map_err(|_| MediaReferenceError::Malformed)
-        .and_then(|value| {
-            TrackId::remote(value.into_owned()).map_err(|_| MediaReferenceError::Malformed)
-        })?;
+    let track_id = decode_track_segment(encoded_track_id)?;
     if segments.next().is_some() {
         return Err(MediaReferenceError::Malformed);
     }
@@ -463,7 +507,8 @@ mod tests {
     }
 
     struct CapturingResolver {
-        seen: Arc<Mutex<Vec<TrackId>>>,
+        seen_streams: Arc<Mutex<Vec<TrackId>>>,
+        seen_artwork: Arc<Mutex<Vec<TrackId>>>,
     }
 
     impl MockResolver {
@@ -492,7 +537,7 @@ mod tests {
     #[async_trait]
     impl RemoteMediaResolver for CapturingResolver {
         async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
-            self.seen
+            self.seen_streams
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(track_id.clone());
@@ -501,9 +546,14 @@ mod tests {
 
         async fn resolve_artwork(
             &self,
-            _track_id: &TrackId,
+            track_id: &TrackId,
         ) -> BackendResult<Option<ResolvedHttpRequest>> {
-            Ok(None)
+            self.seen_artwork
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(track_id.clone());
+            ResolvedHttpRequest::new(Url::parse("https://media.invalid/artwork").expect("URL"))
+                .map(Some)
         }
     }
 
@@ -660,7 +710,7 @@ mod tests {
         let track_id = TrackId::remote(" Case/Sensitive + Unicode ☃").expect("test track ID");
         let stream = stream_reference(source.lease_key(), &track_id);
         let artwork = artwork_reference(source.lease_key(), &track_id);
-        let encoded_track_id = urlencoding::encode(track_id.as_str());
+        let encoded_track_id = encode_track_segment(&track_id);
 
         assert_eq!(
             stream,
@@ -693,25 +743,50 @@ mod tests {
     async fn reference_round_trip_preserves_the_exact_backend_native_id() {
         let _guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry();
-        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_streams = Arc::new(Mutex::new(Vec::new()));
+        let seen_artwork = Arc::new(Mutex::new(Vec::new()));
         let source = begin_connect(SourceId::random())
             .expect("connection attempt")
             .retain(Arc::new(CapturingResolver {
-                seen: Arc::clone(&seen),
+                seen_streams: Arc::clone(&seen_streams),
+                seen_artwork: Arc::clone(&seen_artwork),
             }))
             .expect("retained source");
-        let track_id = TrackId::remote(" Case/Sensitive?x=1 + Unicode ☃").expect("track ID");
-        let reference = stream_reference(source.lease_key(), &track_id);
+        let track_ids = [
+            TrackId::remote(".").expect("dot track ID"),
+            TrackId::remote("..").expect("dot-dot track ID"),
+        ];
 
-        resolve_stream_reference(&reference)
-            .await
-            .expect("resolve exact ID");
+        for track_id in &track_ids {
+            let stream = stream_reference(source.lease_key(), track_id);
+            let artwork = artwork_reference(source.lease_key(), track_id);
+            assert!(!stream.contains("/./"));
+            assert!(!stream.contains("/../"));
+            assert!(!artwork.contains("/./"));
+            assert!(!artwork.contains("/../"));
+
+            resolve_stream_reference(&stream)
+                .await
+                .expect("resolve exact stream ID");
+            assert!(resolve_artwork_reference(&artwork)
+                .await
+                .expect("resolve exact artwork ID")
+                .is_some());
+        }
 
         assert_eq!(
-            seen.lock()
+            seen_streams
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_slice(),
-            std::slice::from_ref(&track_id)
+            track_ids.as_slice()
+        );
+        assert_eq!(
+            seen_artwork
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            track_ids.as_slice()
         );
         reset_registry();
     }
@@ -741,6 +816,10 @@ mod tests {
             "tributary-remote://not-a-uuid/stream/track",
             "tributary-remote://00000000-0000-4000-8000-000000000001/stream/",
             "tributary-remote://00000000-0000-4000-8000-000000000001/stream/%FF",
+            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/id-",
+            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/id-0",
+            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/id-2E",
+            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/id-ff",
             "tributary-remote://00000000-0000-4000-8000-000000000001/stream/track/extra",
             "tributary-remote://00000000-0000-4000-8000-000000000001/stream/track?secret=no",
         ] {

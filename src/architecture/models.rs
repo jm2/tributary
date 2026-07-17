@@ -28,10 +28,9 @@ pub struct Track {
     /// it independently from the compatibility UUID above.
     ///
     /// Local-library rows use their SQLite `tracks.id` value byte-for-byte so
-    /// legacy non-UUID keys remain stable across reads. This transitional
-    /// The value is typed and bounded before an adapter publishes the row;
-    /// remote resolvers consume it directly without round-tripping through a
-    /// derived UUID.
+    /// legacy non-UUID keys remain stable across reads. The value is typed and
+    /// bounded before an adapter publishes the row; remote resolvers consume
+    /// it directly without round-tripping through a derived UUID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_track_id: Option<TrackId>,
 

@@ -8,28 +8,29 @@
 ## Context
 
 Tributary presents local files, playlists, remote libraries, radio stations, removable media, and
-files opened by the operating system through one browser and playback surface. Those sources do
-not currently share one identity or lifecycle boundary:
+files opened by the operating system through one browser and playback surface. When this decision
+was recorded, those sources did not share one identity or lifecycle boundary:
 
-- local, playlist, radio, and remote navigation use strings assembled by the UI;
-- a remote source's configured URL is also its source key;
-- standard authenticated backends and DAAP use separate process-owned registries;
-- local, playlist, removable, radio, and external-file queue entries retain a concrete URI;
-- remote catalogue identifiers are converted to UUIDv5 values before entering the generic model;
+- local, playlist, radio, and remote navigation used strings assembled by the UI;
+- a remote source's configured URL was also its source key;
+- standard authenticated backends and DAAP used separate process-owned registries;
+- local, playlist, removable, radio, and external-file queue entries retained a concrete URI;
+- remote catalogue identifiers were converted to UUIDv5 values before entering the generic model;
   and
-- connection, refresh, cancellation, cached publication, failure, and disconnect behavior is
+- connection, refresh, cancellation, cached publication, failure, and disconnect behavior was
   split between the GTK window, source-selection callbacks, the local engine, and the registries.
 
-Several important foundations already exist. Playback uses an immutable queue addressed by source
-and track identity instead of a mutable GTK row index. Standard remote backends retain private
-native locators behind generation-owned, revocable leases, while DAAP retains its stateful session
-and performs explicit logout. Source navigation rejects stale asynchronous publications. Local
-renames preserve database track IDs, and removable scans are generation-owned and cancelled on
-relocation or removal.
+The stable-identity portion has since been implemented. Playback uses an immutable queue addressed
+by typed source and exact native track identity instead of a mutable GTK row index. Standard remote
+backends retain private native locators behind generation-owned, revocable leases, while DAAP
+retains its stateful session and performs explicit logout. Source navigation rejects stale
+asynchronous publications. Local renames preserve database track IDs, and removable scans are
+generation-owned and cancelled on relocation or removal.
 
-This decision defines how those foundations converge. It does **not** claim that the convergence is
-implemented, and it does not make the current `MediaBackend` trait the integration seam; that
-separate work remains [P3.2](../task.md#p32-make-the-backend-abstraction-real-and-stable).
+This decision defines how those foundations converge. Identity migration is implemented, but the
+single lifecycle boundary and retained local file authority are not. The decision also does not
+make the current `MediaBackend` trait the integration seam; that separate work remains
+[P3.2](../task.md#p32-make-the-backend-abstraction-real-and-stable).
 
 ## Decision
 
@@ -107,8 +108,10 @@ ID above. Duplicate canonical `(backend, base URL)` rows collapse to their first
 its display name because they describe one logical source. A duplicate canonical endpoint with
 different pre-existing IDs, or one `source_id` assigned to different canonical endpoints, instead
 quarantines the complete file: no row is published or rewritten until the user explicitly removes
-or rebinds the conflicting record. Quarantine is a loader state over the unchanged `servers.json`,
-not a second persistence store.
+or rebinds the conflicting record. Nil and the frozen local/Radio-Browser built-in IDs are reserved
+and likewise quarantine a version-1 file, so persisted remote input cannot impersonate an
+application-owned source. Quarantine is a loader state over the unchanged `servers.json`, not a
+second persistence store.
 
 The complete version-1 envelope is written to a same-directory temporary file and atomically
 replaces the legacy file before any migrated row is published. A write or replacement failure
@@ -275,12 +278,16 @@ available, and each scan or watcher reconciliation is a generation-owned refresh
 replacement or application shutdown changes the session epoch. Root-trust authority remains in
 the local engine; the registry adapter cannot make an untrusted root playable.
 
-Local playback resolves the exact database `TrackId` at use, obtains the current file path, and
-validates it under the current authoritative root before an output or file server receives it.
-Playlist navigation queries entries by playlist ID and resolves their linked local track IDs from
-the same current snapshot. Fingerprint/path fallback is only a reconciliation operation that
-updates `playlist_entries.track_id`; playback never performs fuzzy or path fallback on its own.
-An orphan remains visibly unavailable until reconciliation commits a unique match.
+The target local adapter resolves the exact database `TrackId` at use, obtains the current file
+path, proves it is contained by the currently authorized root, acquires root/file authority, and
+retains that authority until the output or file server has finished consuming it. The current
+partial resolver performs only the exact database lookup and a bounded regular-file metadata
+check; it does not yet acquire the current root, prove containment beneath it, or retain either
+root or file authority through consumption. Playlist navigation queries entries by playlist ID and
+resolves their linked local track IDs from the same current snapshot. Fingerprint/path fallback is
+only a reconciliation operation that updates `playlist_entries.track_id`; playback never performs
+fuzzy or path fallback on its own. An orphan remains visibly unavailable until reconciliation
+commits a unique match.
 
 A playlist is a `ViewOrigin`, not a source session. Regular and smart playlist queue items carry
 the local `SourceId` and local `TrackId`, plus the playlist ID and occurrence for ordering. Deleting
@@ -356,14 +363,18 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
 - Saved sources use the strict version-1 envelope. Loading a legacy array derives deterministic
   IDs, collapses canonical duplicates in file order, atomically replaces `servers.json` before
   publication, and publishes nothing when validation or replacement fails. Malformed or unknown
-  version-1 data and endpoint/ID conflicts quarantine the complete unchanged file.
+  version-1 data, reserved nil/built-in identities, and endpoint/ID conflicts quarantine the
+  complete unchanged file. Repeated manual Add, discovered-to-saved promotion, and saved-plus-env
+  startup coalesce by canonical `(backend, endpoint)`; the persisted ID wins and only one sidebar
+  and registry owner is used.
 - Saved remote rows retain random persisted `SourceId` values. Legacy, discovered, environment,
   and unsaved remote endpoints use deterministic backend-plus-canonical-base-URL identity. The
   same typed ID is carried through sidebar objects, connect generations, standard and DAAP
   registries, sync events, navigation, disconnect, discovery loss, deletion, and shutdown.
 - Subsonic, Jellyfin, Plex, and DAAP catalogue rows preserve their exact bounded native song ID,
   item `Id`, `ratingKey`, and decimal `miid`, respectively. Standard opaque playback references
-  encode that exact native ID and their resolvers look it up without a derived UUID compatibility
+  carry that exact native ID in a reversible, prefixed lowercase-hex segment (so `.` and `..`
+  cannot be path-normalized) and their resolvers look it up without a derived UUID compatibility
   projection.
 - `PlaybackSession` captures immutable source/track identity, queue order, duplicate occurrence,
   and playback event generation independently of GTK sorting/filtering. Queue identity is a
@@ -378,8 +389,9 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
 - Local database IDs and playlist foreign keys survive authoritative file/directory renames.
   Architecture rows preserve the exact SQLite ID—including a legacy non-UUID value—and local or
   playlist queues no longer retain a file locator. Every queue load resolves that ID against the
-  current row and checks the current file under a five-second budget before handing a URI to an
-  output; stale generations cannot claim a later load.
+  current row and performs a regular-file metadata check under a five-second budget before handing
+  a URI to an output; stale generations cannot claim a later load. This check is not yet a current
+  root-containment or retained-authority proof.
 - Removable sources derive `SourceId` from the best-available logical key and exact `TrackId` from
   the losslessly encoded mount-relative native path. Relocation/removal still retires scans, cache,
   and playback. Radio queues share the built-in Radio-Browser source and reject empty/oversized
@@ -392,7 +404,9 @@ publication still crosses UI-owned paths. Radio, removable, and external queue e
 location-independent identity but retain their current locator until their registry adapters and
 at-use resolvers are implemented. Local and playlist GTK rows retain paths for non-playback UI
 operations, and the playback-time local resolver does not yet retain root/file authority through
-complete output consumption. Those lifecycle and authority items remain explicit P3.1 work.
+complete output consumption. More precisely, it does not yet acquire the current authorized root,
+prove the resolved path is contained beneath it, or retain root/file authority while the output
+consumes the result. Those lifecycle and authority items remain explicit P3.1 work.
 
 ## Deliberately deferred implementation details
 
@@ -413,8 +427,8 @@ implementation details so long as one registry ultimately enforces this contract
    `ViewOrigin`; remote protected references already resolve at use, while radio/removable/external
    locators remain until their adapters land.
 4. **Resolution partial:** local/playlist playback queries the exact ID at use and the random
-   invalid-local-ID fallback is gone; retained root/file authority through complete output
-   consumption remains open.
+   invalid-local-ID fallback is gone; acquisition of the current root, containment proof, exact
+   file authority, and retention through complete output consumption remain open.
 5. **Identity complete, lifecycle open:** Radio-Browser, removable media, and external files have
    the specified source/track identity; moving their locator and retirement ownership into
    registry adapters remains open.

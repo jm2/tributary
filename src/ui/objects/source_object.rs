@@ -30,8 +30,8 @@ mod imp {
         /// endpoint and from the UI navigation/view key.
         pub source_id: RefCell<String>,
         /// Ephemeral address route supplied by network discovery. This is
-        /// deliberately separate from the persisted URL and logical source
-        /// key; a connection generation snapshots it when authentication
+        /// deliberately separate from the persisted URL and stable logical
+        /// identity; a connection generation snapshots it when authentication
         /// begins.
         pub(super) advertised_route: RefCell<Option<AdvertisedHttpRoute>>,
         /// Logical identity kept separate from location for sources such as a
@@ -187,6 +187,14 @@ impl SourceObject {
 
     pub fn set_connected(&self, val: bool) {
         self.imp().connected.set(val);
+    }
+
+    pub fn set_name(&self, name: &str) {
+        self.imp().name.replace(name.to_string());
+    }
+
+    pub fn set_server_url(&self, server_url: &str) {
+        self.imp().server_url.replace(server_url.to_string());
     }
 
     pub fn set_source_id(&self, source_id: SourceId) {

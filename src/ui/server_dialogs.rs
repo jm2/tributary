@@ -168,6 +168,9 @@ fn validate_version_one_servers(servers: Vec<SavedServer>) -> Option<Vec<SavedSe
     let mut accepted = Vec::with_capacity(servers.len());
 
     for server in servers {
+        if server.source_id.is_reserved_remote() {
+            return None;
+        }
         let (_, canonical) = validated_endpoint(&server.server_type, &server.url)?;
         let endpoint = (server.server_type.clone(), canonical);
         if let Some(existing) = by_endpoint.get(&endpoint) {
@@ -197,6 +200,79 @@ fn validated_endpoint(server_type: &str, raw_url: &str) -> Option<(url::Url, Str
     let parsed = crate::http_security::parse_base_url(raw_url).ok()?;
     let canonical = crate::architecture::identity::canonical_remote_base_url(&parsed).ok()?;
     Some((parsed, canonical))
+}
+
+/// Whether two validated remote descriptions name the same logical source.
+///
+/// The backend is part of identity: two protocols may legitimately be
+/// advertised at the same origin. Endpoint spelling is not identity, so the
+/// comparison uses the shared canonical base-URL policy.
+pub(super) fn same_remote_endpoint(
+    left_type: &str,
+    left_url: &str,
+    right_type: &str,
+    right_url: &str,
+) -> bool {
+    if left_type != right_type {
+        return false;
+    }
+    validated_endpoint(left_type, left_url)
+        .zip(validated_endpoint(right_type, right_url))
+        .is_some_and(|((_, left), (_, right))| left == right)
+}
+
+fn source_owns_remote_endpoint(source: &SourceObject, server_type: &str, server_url: &str) -> bool {
+    same_remote_endpoint(
+        &source.backend_type(),
+        &source.server_url(),
+        server_type,
+        server_url,
+    )
+}
+
+/// Publish a saved source without allowing another sidebar row to own the
+/// same canonical `(backend, endpoint)` pair.
+///
+/// A discovered row is promoted in place so its ephemeral advertised route
+/// survives. Re-adding an already-saved endpoint updates the same object and
+/// therefore leaves deletion keyed by one unambiguous persisted `SourceId`.
+fn upsert_saved_source_in_store(
+    store: &gtk::gio::ListStore,
+    saved: &SavedServer,
+) -> (SourceObject, Option<SourceId>) {
+    for index in 0..store.n_items() {
+        let Some(source) = store.item(index).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if !source_owns_remote_endpoint(&source, &saved.server_type, &saved.url) {
+            continue;
+        }
+
+        let replaced_source_id = source
+            .source_id()
+            .filter(|source_id| *source_id != saved.source_id);
+        source.set_name(&saved.name);
+        source.set_server_url(&saved.url);
+        source.set_source_id(saved.source_id);
+        source.set_manually_added(true);
+        source.set_connecting(true);
+        if replaced_source_id.is_some() {
+            source.set_connected(false);
+        }
+
+        // SourceObject fields are deliberately plain GTK-side state rather
+        // than GObject properties. Reinsert the same object to refresh the
+        // list-item binding without creating a second logical owner.
+        store.remove(index);
+        store.insert(index, &source);
+        return (source, replaced_source_id);
+    }
+
+    let insert_pos = super::window::ensure_category_header_store(store, &saved.server_type);
+    let source = SourceObject::manual(&saved.name, &saved.server_type, &saved.url, saved.source_id);
+    source.set_connecting(true);
+    store.insert(insert_pos, &source);
+    (source, None)
 }
 
 /// Save one complete v1 envelope through a same-directory atomic replacement.
@@ -505,21 +581,24 @@ pub fn show_add_server_dialog(
             }
         };
 
-        // Add to sidebar as a manual server.
-        let insert_pos = super::window::ensure_category_header_store(&store, backend_type);
-        let src = SourceObject::manual(&display_name, backend_type, &url, saved.source_id);
-        src.set_connecting(true);
-        store.insert(insert_pos, &src);
+        // Publish exactly one owner for this logical endpoint. If this is a
+        // discovered row, promotion adopts the persisted identity before the
+        // authenticated connection is started and retires its old ephemeral
+        // registry owner.
+        let (_source, replaced_source_id) = upsert_saved_source_in_store(&store, &saved);
+        if let Some(replaced_source_id) = replaced_source_id {
+            crate::source_registry::release_source(replaced_source_id);
+        }
 
         // One-shot to clear spinner on failure.
         let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
         let store_for_fail = store.clone();
-        let url_for_fail = url.clone();
+        let source_id_for_fail = saved.source_id;
         glib::MainContext::default().spawn_local(async move {
             if fail_rx.recv().await.is_ok() {
                 for i in 0..store_for_fail.n_items() {
                     if let Some(src) = store_for_fail.item(i).and_downcast_ref::<SourceObject>() {
-                        if src.server_url() == url_for_fail {
+                        if src.source_id() == Some(source_id_for_fail) {
                             src.set_connecting(false);
                             let src = src.clone();
                             store_for_fail.remove(i);
@@ -533,8 +612,8 @@ pub fn show_add_server_dialog(
 
         // Spawn auth + fetch on tokio.
         let engine_tx = engine_tx.clone();
-        let server_url = url.clone();
-        let server_name = display_name.clone();
+        let server_url = saved.url.clone();
+        let server_name = saved.name.clone();
         let backend_type = backend_type.to_string();
         let source_id = saved.source_id;
 
@@ -768,6 +847,33 @@ mod tests {
                     }
                 ]
             }),
+            serde_json::json!({
+                "schema_version": 1,
+                "servers": [{
+                    "type": "subsonic",
+                    "name": "Cannot impersonate local",
+                    "url": "https://music.example.test",
+                    "source_id": SourceId::local()
+                }]
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "servers": [{
+                    "type": "jellyfin",
+                    "name": "Cannot impersonate radio",
+                    "url": "https://video.example.test",
+                    "source_id": SourceId::radio_browser()
+                }]
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "servers": [{
+                    "type": "plex",
+                    "name": "Nil is reserved",
+                    "url": "https://plex.example.test",
+                    "source_id": SourceId::from_uuid(uuid::Uuid::nil())
+                }]
+            }),
         ];
 
         for fixture in fixtures {
@@ -862,6 +968,81 @@ mod tests {
             .expect("serialize row")
             .get("source_id")
             .is_some());
+    }
+
+    #[test]
+    fn repeated_manual_add_reuses_one_sidebar_owner_and_persisted_id() {
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        let saved = SavedServer {
+            server_type: "subsonic".to_string(),
+            name: "Home".to_string(),
+            url: "HTTPS://MUSIC.EXAMPLE.TEST:443/base/".to_string(),
+            source_id: SourceId::random(),
+        };
+
+        let (first, first_replaced) = upsert_saved_source_in_store(&store, &saved);
+        let equivalent = SavedServer {
+            name: "Ignored duplicate name".to_string(),
+            url: "https://music.example.test/base".to_string(),
+            ..saved.clone()
+        };
+        let (second, second_replaced) = upsert_saved_source_in_store(&store, &equivalent);
+
+        let owners: Vec<_> = (0..store.n_items())
+            .filter_map(|index| store.item(index).and_downcast::<SourceObject>())
+            .filter(|source| {
+                source_owns_remote_endpoint(
+                    source,
+                    &saved.server_type,
+                    "https://music.example.test/base",
+                )
+            })
+            .collect();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].source_id(), Some(saved.source_id));
+        assert_eq!(first.source_id(), second.source_id());
+        assert_eq!(first_replaced, None);
+        assert_eq!(second_replaced, None);
+    }
+
+    #[test]
+    fn saving_a_discovered_endpoint_promotes_it_without_a_second_owner() {
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        let insert_pos = super::super::window::ensure_category_header_store(&store, "subsonic");
+        let discovered = SourceObject::discovered(
+            "Discovered name",
+            "subsonic",
+            "HTTPS://MUSIC.EXAMPLE.TEST:443/base/",
+        );
+        let old_source_id = discovered.source_id().expect("deterministic source ID");
+        let origin = url::Url::parse("https://music.example.test/base").expect("origin");
+        let route = crate::architecture::AdvertisedHttpRoute::new(
+            &origin,
+            ["192.0.2.9:443".parse().expect("socket address")],
+        )
+        .expect("route");
+        discovered.set_advertised_route(Some(route.clone()));
+        store.insert(insert_pos, &discovered);
+
+        let saved = SavedServer {
+            server_type: "subsonic".to_string(),
+            name: "Saved name".to_string(),
+            url: "https://music.example.test/base".to_string(),
+            source_id: SourceId::random(),
+        };
+        let (promoted, replaced) = upsert_saved_source_in_store(&store, &saved);
+
+        let owner_count = (0..store.n_items())
+            .filter_map(|index| store.item(index).and_downcast::<SourceObject>())
+            .filter(|source| source_owns_remote_endpoint(source, &saved.server_type, &saved.url))
+            .count();
+        assert_eq!(owner_count, 1);
+        assert_eq!(promoted.source_id(), Some(saved.source_id));
+        assert_eq!(promoted.advertised_route(), Some(route));
+        assert!(promoted.manually_added());
+        assert!(promoted.connecting());
+        assert_eq!(replaced, Some(old_source_id));
+        assert_ne!(saved.source_id, SourceId::local());
     }
 
     #[test]
