@@ -31,8 +31,8 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**194/223 (87.0%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **74/79 P2**,
-and **6/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**196/223 (87.9%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **74/79 P2**,
+and **8/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -44,8 +44,9 @@ Windows plugin/source-policy/decode proof is complete in PR #110 after successfu
 ARM64 package executions; live Windows DAAP and Subsonic playback remains open. The P3.2 README
 claim was re-audited and closed because the
 document already labels its diagram as intended and names the shipping abstraction gaps exactly.
-P3.5 now reports every Linux-host source area in one pinned aggregate and keeps different native
-source sets as informational reports; its exact-toolchain baseline acceptance still awaits PR CI.
+P3.5 now reports every Linux-host source area in one pinned aggregate, keeps different native
+source sets as informational reports, and enforces the baseline accepted by two exact pinned PR
+executions in PR #111.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1344,7 +1345,7 @@ closed as a milestone.
   architectures' conditional code cannot produce a comparable percentage on Linux x86_64, so
   every helper summary is explicitly informational while native CI continues to compile and test
   those source sets.
-- [ ] Establish a documented baseline and ratchet policy. The dedicated job pins Rust 1.92.0,
+- [x] Establish a documented baseline and ratchet policy. The dedicated job pins Rust 1.92.0,
   `llvm-tools-preview`, cargo-llvm-cov 0.8.7, `Cargo.lock`, all targets, and all features, then
   enforces the reviewed numeric value in `coverage-baseline.txt`, attempts the HTML upload on every
   outcome, and treats a missing artifact as an error. README documents the two-clean-run,
@@ -1356,10 +1357,12 @@ closed as a milestone.
   (GitHub Actions run 29595891966) then passed all 746 tests, generated the 80-file HTML artifact,
   and measured 67.03% lines (32,909/49,099), 66.84% functions (2,870/4,294), and 65.93% regions
   (51,397/77,952). It failed solely because that exact denominator was below the provisional 67.3%
-  local floor. Applying the documented round-down-minus-0.1 policy yields 66.9%; the checkbox awaits
-  a second clean exact pinned run confirming that floor.
-- [ ] Record implementation: branch `agent/p3.5-coverage-ratchet`; final commit/PR and exact pinned
-  CI acceptance pending.
+  local floor. The clean repeat in run 29596583439 measured 67.02% lines (32,904/49,099), 66.81%
+  functions (2,869/4,294), and the same 65.93% regions (51,392/77,952), passed the gate, and uploaded
+  another 80-file report. The lower exact result rounds down to 67.0%; subtracting 0.1 confirms the
+  reviewed 66.9% floor.
+- [x] Record implementation: PR #111; commits `fbd7e7d` and `a8d41aa`; exact pinned coverage
+  acceptance in runs 29595891966 and 29596583439.
 
 Acceptance criteria: the sole comparable report includes every production source file compiled on
 Linux, uses a version-pinned compiler/frontend and locked Rust dependency inputs, fails below a
@@ -1402,9 +1405,10 @@ test-source omission; no tool was installed or downloaded to manufacture local a
 first exact pinned PR-CI run (29595891966) subsequently passed the same 746 tests and generated an
 80-file report covering the formerly excluded UI, remote backends, radio, migrations, desktop
 integration, and entry point. It measured 67.03% lines, 66.84% functions, and 65.93% regions, then
-failed only against the provisional 67.3% local floor. The checked-in floor is corrected to 66.9%
-under the documented policy, and CI now prints its exact summary while preserving the original
-test/threshold exit status; a second exact pinned run remains the final acceptance gate.
+failed only against the provisional 67.3% local floor. The repeat exact pinned run 29596583439
+passed the same test and artifact gates and measured 67.02% lines, 66.81% functions, and 65.93%
+regions. The lower exact result confirms the checked-in 66.9% floor under the documented policy.
+CI prints that exact summary while preserving the original test/threshold exit status.
 
 Previous branch validation (2026-07-17, PR #110 packaged-Windows P2.11 slice before CI):
 `cargo check --all-targets --all-features --locked` and
