@@ -205,11 +205,13 @@ impl MediaLease {
 /// A resolved HTTP request whose credential material is isolated from its URL.
 ///
 /// This type is intentionally `Clone` but neither `Debug` nor serializable.
-/// Sensitive headers and private query pairs must only be applied by the
-/// app-owned media proxy immediately before its exact-origin upstream fetch.
+/// Required protocol headers, sensitive headers, and private query pairs must
+/// only be applied by the app-owned media proxy immediately before its
+/// exact-origin upstream fetch.
 #[derive(Clone)]
 pub struct ResolvedHttpRequest {
     endpoint: Url,
+    required_headers: HeaderMap,
     sensitive_headers: HeaderMap,
     private_query_pairs: Vec<(String, String)>,
     advertised_route: Option<AdvertisedHttpRoute>,
@@ -222,11 +224,29 @@ impl ResolvedHttpRequest {
         validate_endpoint(&endpoint)?;
         Ok(Self {
             endpoint,
+            required_headers: HeaderMap::new(),
             sensitive_headers: HeaderMap::new(),
             private_query_pairs: Vec::new(),
             advertised_route: None,
             lease: None,
         })
+    }
+
+    /// Add a fixed, non-secret header required by the remote media protocol.
+    ///
+    /// This deliberately narrow allowlist covers DAAP's content negotiation
+    /// and client-identification contract without admitting receiver-owned,
+    /// authentication, routing, proxy, framing, or hop-by-hop headers.
+    pub(crate) fn with_required_header(
+        mut self,
+        name: HeaderName,
+        value: HeaderValue,
+    ) -> BackendResult<Self> {
+        if !is_allowed_required_header(&name) {
+            return Err(anyhow::anyhow!("media request required header is not allowlisted").into());
+        }
+        self.required_headers.insert(name, value);
+        Ok(self)
     }
 
     /// Add an explicitly allowlisted authentication header.
@@ -285,6 +305,10 @@ impl ResolvedHttpRequest {
 
     pub(crate) fn endpoint(&self) -> &Url {
         &self.endpoint
+    }
+
+    pub(crate) fn required_headers(&self) -> &HeaderMap {
+        &self.required_headers
     }
 
     pub(crate) fn sensitive_headers(&self) -> &HeaderMap {
@@ -363,6 +387,13 @@ fn is_allowed_auth_header(name: &HeaderName) -> bool {
     )
 }
 
+fn is_allowed_required_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept" | "user-agent" | "client-daap-version" | "client-daap-access-index"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,20 +412,64 @@ mod tests {
     }
 
     #[test]
-    fn request_builders_allow_only_auth_material() {
+    fn request_builders_keep_required_and_sensitive_header_allowlists_disjoint() {
         let request =
             ResolvedHttpRequest::new(Url::parse("https://example.test/audio?id=track-1").unwrap())
                 .unwrap();
+
+        let required = [
+            reqwest::header::ACCEPT,
+            reqwest::header::USER_AGENT,
+            HeaderName::from_static("client-daap-version"),
+            HeaderName::from_static("client-daap-access-index"),
+        ];
+        for name in required {
+            assert!(request
+                .clone()
+                .with_required_header(name.clone(), HeaderValue::from_static("accepted"))
+                .is_ok());
+            assert!(request
+                .clone()
+                .with_sensitive_header(name, HeaderValue::from_static("rejected"))
+                .is_err());
+        }
+
+        let sensitive = [
+            reqwest::header::AUTHORIZATION,
+            HeaderName::from_static("x-emby-authorization"),
+            HeaderName::from_static("x-plex-token"),
+        ];
+        for name in sensitive {
+            assert!(request
+                .clone()
+                .with_sensitive_header(name.clone(), HeaderValue::from_static("accepted"))
+                .is_ok());
+            assert!(request
+                .clone()
+                .with_required_header(name, HeaderValue::from_static("rejected"))
+                .is_err());
+        }
 
         for name in [
             reqwest::header::HOST,
             reqwest::header::REFERER,
             reqwest::header::COOKIE,
             reqwest::header::RANGE,
+            reqwest::header::CONTENT_LENGTH,
             reqwest::header::CONNECTION,
+            HeaderName::from_static("keep-alive"),
+            reqwest::header::TE,
+            reqwest::header::TRAILER,
             reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::UPGRADE,
             reqwest::header::PROXY_AUTHORIZATION,
+            HeaderName::from_static("proxy-connection"),
+            HeaderName::from_static("x-arbitrary-request-header"),
         ] {
+            assert!(request
+                .clone()
+                .with_required_header(name.clone(), HeaderValue::from_static("rejected"))
+                .is_err());
             assert!(request
                 .clone()
                 .with_sensitive_header(name, HeaderValue::from_static("rejected"))
