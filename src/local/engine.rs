@@ -6159,14 +6159,21 @@ fn get_mtime(path: &Path) -> String {
 
 /// Convert a database `track::Model` to an architecture `Track`.
 pub fn db_model_to_track(model: &track::Model) -> Track {
+    let effective_album_artist = super::backend::effective_album_artist(
+        model.album_artist_name.as_deref(),
+        &model.artist_name,
+    );
     Track {
         id: Uuid::parse_str(&model.id).unwrap_or_else(|_| Uuid::new_v4()),
         title: model.title.clone(),
         artist_name: model.artist_name.clone(),
         album_artist_name: model.album_artist_name.clone(),
-        artist_id: None,
+        artist_id: Some(super::backend::local_artist_id(&model.artist_name)),
         album_title: model.album_title.clone(),
-        album_id: None,
+        album_id: Some(super::backend::local_album_id(
+            &model.album_title,
+            effective_album_artist,
+        )),
         track_number: model.track_number.map(|n| n as u32),
         disc_number: model.disc_number.map(|n| n as u32),
         duration_secs: model.duration_secs.map(|d| d as u64),
