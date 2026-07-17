@@ -1334,14 +1334,6 @@ fn run_mpd_resolver_service(
         #[cfg(test)]
         let mut shutdown_done: Option<mpsc::Sender<()>> = None;
         'service: loop {
-            if !ingress_alive && active_count.get() == 0 {
-                #[cfg(test)]
-                if let Some(done_tx) = shutdown_done.take() {
-                    let _ = done_tx.send(());
-                }
-                break 'service;
-            }
-
             let mut handled = 0;
             while ingress_alive && handled < MAX_RESOLVER_REQUESTS_PER_TICK {
                 let request = match request_rx.try_recv() {
