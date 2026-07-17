@@ -31,8 +31,8 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**198/223 (88.8%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
-and **8/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**200/223 (89.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
+and **10/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -55,6 +55,11 @@ state/option commands, protected-media tickets, or queue mutation. The exact que
 remains retryable, while a second worker gate covers internal callers and media rejected before
 dispatch. Two actionable Codex findings were fixed before the final `91536ab` review found no
 further issues, and the exact-toolchain/native PR matrix accepted the result.
+The P3.1 source-lifecycle ADR was accepted in PR #113, closing its two architecture-only decision
+boxes. Independent review clarified deterministic overlapping-radio locator ownership and the
+exact versioned saved-source migration/quarantine boundary before the complete exact-toolchain and
+native/package matrix passed in runs 29605029668 and 29605032344; runtime implementation remains
+open.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1305,9 +1310,10 @@ closed as a milestone.
 
 ### P3.1 Introduce a source/session registry
 
-- [ ] Define stable source IDs and backend-native track IDs. Standard backends now retain their
-  native stream/artwork locators privately, but the registry and queue still use the configured
-  URL string as source identity; a first-class stable source ID and its migration rules remain.
+- [ ] Define stable source IDs and backend-native track IDs. The recorded
+  [source-lifecycle decision](architecture/source-lifecycle.md) specifies the identity and
+  migration contract, but standard backends still expose derived UUIDs and the registry/queue
+  still use the configured URL string as source identity; implementation remains.
 - [x] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source. P1.6 now
   retains an `Arc<dyn RemoteMediaResolver>` behind an exact generation and random revocable lease
   for each standard remote source; the existing DAAP registry retains its stateful live backend.
@@ -1319,17 +1325,27 @@ closed as a milestone.
   output then mints its receiver-scoped proxy ticket. Stale playback and artwork completions are
   generation- and lease-rejected.
 - [ ] Resolve local/playlist media by stable track ID at playback, navigation, and receiver-load
-  time so fallback reconciliation and in-flight casts cannot retain dead file paths.
+  time so fallback reconciliation and in-flight casts cannot retain dead file paths. The ADR
+  makes playlists local-library views and confines fallback matching to committed reconciliation;
+  the runtime still carries paths.
 - [ ] Centralize source refresh, cancellation, disconnect, and failure state. Generation/lease
   ownership and source-owned playback retirement are centralized, but environment startup,
   interactive auth, manual add, refresh publication, and UI failure handling remain separate
-  paths, and DAAP still has a sibling registry because it owns an explicit logout lifecycle.
-- [ ] Decide how local, radio, and external-file sources fit the same lifecycle. They deliberately
-  stay on their existing direct paths in this security slice.
-- [ ] Record architecture decision: _pending_
-- [ ] Record implementation: P1.6 completed the remote resolver/session ownership subset in this
-  PR. Stable source IDs, local/playlist resolution, unified refresh/failure state, and the
-  local/radio/external lifecycle remain before P3.1 as a whole can be recorded complete.
+  paths, and DAAP still has a sibling registry because it owns an explicit logout lifecycle. The
+  ADR defines the target state machine, operation generations, session epochs, and ownership.
+- [x] Decide how local, radio, and external-file sources fit the same lifecycle. Local is one
+  always-registered source, playlists are local views, Radio-Browser is one stateless source whose
+  feeds are views, removable filesystems are generation-owned sources keyed by their existing
+  logical GIO identity, and the first playable file in each OS-open delivery is an ephemeral
+  one-item source. Their implementation remains on the current direct paths. Recorded in the
+  [source-lifecycle decision](architecture/source-lifecycle.md), accepted in PR #113.
+- [x] Record architecture decision: [Source identity and lifecycle ownership](architecture/source-lifecycle.md).
+  The document distinguishes accepted decisions, existing foundations, remaining implementation,
+  migration, and completion tests. Accepted in PR #113 after the full native/package matrix passed.
+- [ ] Record implementation: P1.6 completed the remote resolver/session ownership subset in PR
+  #86. The architecture-only ADR branch closes no implementation box: stable source IDs,
+  backend-native IDs, local/playlist ID-at-use resolution, unified refresh/failure state, and the
+  local/radio/removable/external adapters remain before P3.1 as a whole can be recorded complete.
 
 ### P3.2 Make the backend abstraction real and stable
 
@@ -2212,3 +2228,4 @@ Add one line per completed task:
 | 2026-07-16 | P2.11 deterministic HTTP compatibility (partial) | PR #108 | Preserves exact escaped reverse-proxy prefixes across DAAP stream/artwork and Subsonic API/media construction, carries DAAP's four fixed protocol headers through a separate strict non-secret allowlist into protected stream and artwork fetches, retains receiver `Range` as the only forwarded header, proves existing typed Subsonic HTTP-200 failures, and exercises explicit upstream proxy selection at the asynchronous protected-fetch boundary. Seven net-new regressions cover the contracts. At PR #108, full fake GStreamer, packaged source-policy, and live Windows playback validation remained open; the following slice closes the fake-GStreamer part. |
 | 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
 | 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Native x86_64 and ARM64 CI both prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
+| 2026-07-17 | P3.1 source identity/lifecycle architecture | PR #113 | Records location-independent `(SourceId, TrackId)` media identity, an exact legacy-array-to-versioned-envelope saved-source migration with atomic replacement and fail-closed conflict quarantine, one registry-owned operation/session lifecycle, deterministic per-view radio locator ownership, playback-time locator resolution, exactly-once DAAP retirement, adapter-specific rules for every source kind, and staged completion tests. This closes only the two architecture decision boxes; runtime migration remains open. Independent review found and resolved two design ambiguities before the full exact-toolchain/native/package matrix passed in runs 29605029668 and 29605032344. |

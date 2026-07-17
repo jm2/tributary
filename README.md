@@ -109,6 +109,14 @@ conservatively retains its queued ID rather than risking disruption of the forei
 
 The diagram above is the **intended** architecture, and the remote backends (Subsonic, Jellyfin, Plex, DAAP) each implement the `MediaBackend` async trait. The trait is not yet the real seam, though: it is never used as a trait object, the UI still branches per backend when connecting a source, and the local library is queried directly through SQLite rather than through `LocalBackend`. Unifying them is tracked as P3.2 in [`docs/task.md`](docs/task.md).
 
+The P3.1 [source identity and lifecycle decision](docs/architecture/source-lifecycle.md)
+defines the seam beneath that intended backend diagram: stable `SourceId` plus backend-native
+`TrackId` identity, one generation/cancellation/failure owner, explicit DAAP shutdown, and
+playback-time resolution for local, playlist, radio, removable, remote, and OS-opened media. It is
+an implementation plan, not a claim about the current runtime. Today remote sources are still
+keyed by URL, standard remote and DAAP sessions still use sibling registries, and direct-source
+queues still retain concrete locations; the remaining implementation is tracked under P3.1.
+
 ---
 
 ## Installation
