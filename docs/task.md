@@ -31,7 +31,7 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**191/223 (85.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **73/79 P2**,
+**192/223 (86.1%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **74/79 P2**,
 and **4/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
@@ -40,9 +40,9 @@ PR #105, the cancellable resolver box implemented in PR #106, and the
 held-ACK/slow-greeting/real-IPv6 coverage box completed by PR #107, since the earlier snapshot. The
 deterministic protected-HTTP compatibility box under P2.11 is also complete in PR #108. The
 process-isolated real-GStreamer fake-backend box under P2.11 is complete in PR #109. The packaged
-Windows plugin/source-policy/decode probe is implemented in PR #110, but its checkbox
-awaits successful execution in both native Windows PR jobs; live Windows DAAP and Subsonic playback
-also remains open. The P3.2 README claim was re-audited and closed because the
+Windows plugin/source-policy/decode proof is complete in PR #110 after successful native x86_64 and
+ARM64 package executions; live Windows DAAP and Subsonic playback remains open. The P3.2 README
+claim was re-audited and closed because the
 document already labels its diagram as intended and names the shipping abstraction gaps exactly.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
@@ -1208,7 +1208,7 @@ failed through the separately resolved media path—but did not prove DNS was th
   absolute deadline and requires a success sentinel so a misspelled libtest filter cannot pass
   with zero tests. This exercises the build host's plugins, not the bundled Windows artifact.
   Implemented in PR #109.
-- [ ] Prove the packaged Windows artifact carries and selects the required GStreamer runtime and
+- [x] Prove the packaged Windows artifact carries and selects the required GStreamer runtime and
   enforces the protected-loopback policy before it is archived. The bundler now copies the exact
   architecture's `gst-plugin-scanner.exe`, places it beside Tributary and the root-level bundled
   DLLs, and computes a bounded, deduplicated transitive DLL closure seeded by the app, scanner, and
@@ -1246,9 +1246,11 @@ failed through the separately resolved media path—but did not prove DNS was th
   passing feature-detect newer .NET APIs and retain bounded Windows PowerShell 5.1 fallbacks. Both
   native Windows CI architectures and the release bundle path invoke this same pre-archive script;
   the later installer-only step consumes that already-probed tree.
-  Implementation is complete in PR #110; acceptance and this checkbox await successful
-  execution in both native Windows PR jobs. The intentionally deferred live release-workflow run is
-  not required because CI invokes the identical bundling/probe path on both supported architectures.
+  Implemented and accepted in PR #110. CI run `29593455545` passed the identical pre-archive
+  bundling/probe path on native x86_64 and ARM64, including the bundle-only factory/decoder,
+  scanner, protected-loopback policy, real FLAC decode/EOS, poisoned-proxy, and alternate-source
+  fail-closed checks. The intentionally deferred live release-workflow run is not required because
+  CI invokes that same path on both supported architectures.
 - [ ] Record live playback from a packaged Windows artifact against the reported DAAP and Subsonic
   servers, including catalogue connection, protected-media startup, audible playback, and useful
   URL-free failure diagnostics if either server cannot play. The automated package probe cannot
@@ -1260,10 +1262,10 @@ URL-free failure before the downstream source times out; a loopback ticket never
 external proxy; and logs can distinguish transport, upstream HTTP, decoder, and sink categories
 without exposing credentials or filesystem paths. The urgent shared-path implementation,
 deterministic proxy and compatibility proofs, retained mDNS routing, and complete fake pipeline are
-implemented: six of eight P2.11 tasks are closed before native PR CI. The build-host pipeline
-regression has a packaged-Windows source/plugin/decode proof ready to execute on both supported
-architectures. Its native CI acceptance and live packaged-Windows playback against the reported
-servers remain open, so P2.11 is not yet closed as a milestone.
+implemented: seven of eight P2.11 tasks are closed. The build-host pipeline regression and both
+native packaged-Windows architectures prove the source/plugin/DLL/decode path deterministically.
+Only live packaged-Windows playback against the reported servers remains open, so P2.11 is not yet
+closed as a milestone.
 
 ## P3 — Architecture and integration coverage
 
@@ -1357,7 +1359,7 @@ PR #94's containerized Flatpak build proved the manifest-local source generation
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
 
-Most recent local branch validation (2026-07-17, PR #110 packaged-Windows P2.11 slice before CI):
+Most recent branch validation (2026-07-17, PR #110 packaged-Windows P2.11 slice):
 `cargo check --all-targets --all-features --locked` and
 `cargo test --all-targets --all-features --locked` pass in debug and release, as does strict
 all-target/all-feature Clippy in both profiles. Each full profile passes 18 library, 718
@@ -1372,15 +1374,18 @@ co-locates the scanner with its shipped DLLs while removing probe-only DLL searc
 Windows PowerShell 5.1 process/argument fallbacks, and replaces executable dependency discovery.
 ARM64 CI first exposed a missed path-only Soup dependency; after that parser fix, its next package
 run showed the fundamental problem by hanging for more than 33 minutes while `ldd` executed
-`libgstencoding.dll`. The current pre-CI fix replaces executable inspection with bounded batched PE
+`libgstencoding.dll`. The accepted fix replaces executable inspection with bounded batched PE
 import-table reads, while retaining the exact recursive copy queue and direct Soup edge gate. It
 also bounds the dependency closure, scanner termination, process-tree termination,
 redirected-output drain, diagnostics, and overall execution.
 PowerShell parses without errors; `cargo audit` reports no vulnerability and
 only the two tracked allowed unmaintained warnings; desktop and AppStream validation,
-`cargo fmt --all -- --check`, and `git diff --check` pass. No dependency or lockfile changed. The
-native x86_64 and ARM64 package executions remain the acceptance authority, so the tracker checkbox
-and post-CI count stay open until both PR jobs pass.
+`cargo fmt --all -- --check`, and `git diff --check` pass. No dependency or lockfile changed. CI run
+`29593455545` passed every required check; its native Windows x86_64 (14m15s) and ARM64 (12m17s)
+jobs both completed the architecture-local PE-import closure, exact packaged scanner preflight,
+fresh external registry, bundle-only factory/decoder provenance, protected FLAC decode/EOS,
+direct/zero-retry/30-second source policy, zero poisoned-proxy connections, alternate-source
+fail-closed path, and ZIP creation.
 
 Most recent branch validation (2026-07-17, PR #109 P2.11 real-GStreamer fake-backend slice):
 `cargo check --all-targets --all-features --locked` and
@@ -2072,4 +2077,4 @@ Add one line per completed task:
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
 | 2026-07-16 | P2.11 deterministic HTTP compatibility (partial) | PR #108 | Preserves exact escaped reverse-proxy prefixes across DAAP stream/artwork and Subsonic API/media construction, carries DAAP's four fixed protocol headers through a separate strict non-secret allowlist into protected stream and artwork fetches, retains receiver `Range` as the only forwarded header, proves existing typed Subsonic HTTP-200 failures, and exercises explicit upstream proxy selection at the asynchronous protected-fetch boundary. Seven net-new regressions cover the contracts. At PR #108, full fake GStreamer, packaged source-policy, and live Windows playback validation remained open; the following slice closes the fake-GStreamer part. |
 | 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
-| 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Both native architectures must prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
+| 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Native x86_64 and ARM64 CI both prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
