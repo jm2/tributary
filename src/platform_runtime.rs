@@ -1609,6 +1609,103 @@ mod tests {
     }
 
     #[test]
+    fn windows_script_resolves_the_relative_distribution_before_import_inspection() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        let create = script
+            .find("New-Item -ItemType Directory -Force $DIST | Out-Null")
+            .expect("relative distribution creation");
+        let resolve = script
+            .find("$DIST = (Resolve-Path -LiteralPath $DIST).ProviderPath")
+            .expect("physical provider distribution resolution");
+        let soup_inspection = script
+            .find("Write-Host \"  inspecting required Soup plugin imports...\"")
+            .expect("required Soup inspection");
+
+        assert!(script.contains("$DIST = \"dist\\tributary-windows\""));
+        assert!(create < resolve);
+        assert!(resolve < soup_inspection);
+        assert!(!script[resolve..soup_inspection].contains("$DIST = \"dist\\tributary-windows\""));
+        for fragment in [
+            "$gstScannerDest = Join-Path $DIST \"gst-plugin-scanner.exe\"",
+            "$requiredSoupPluginDest = Join-Path $DIST",
+            "$initialDllScanTargets = @(Join-Path $DIST",
+            "$initialDllScanTargets += Get-ChildItem -Path \"$DIST\\lib\"",
+            "$requiredSoupRuntimeDest = Join-Path $DIST",
+        ] {
+            let target = script
+                .find(fragment)
+                .unwrap_or_else(|| panic!("missing distribution-rooted PE target: {fragment}"));
+            assert!(
+                resolve < target,
+                "PE target was constructed before distribution resolution: {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_provider_resolution_handles_changed_pwd_spaces_and_psdrives() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("Tributary Repository With Spaces");
+        fs::create_dir(&repository).unwrap();
+        let command = r#"
+$ErrorActionPreference = "Stop"
+Set-Location -LiteralPath $env:TRIBUTARY_PATH_TEST_REPOSITORY
+$DIST = "dist\tributary-windows"
+$legacyFullPath = [System.IO.Path]::GetFullPath($DIST)
+New-Item -ItemType Directory -Force $DIST | Out-Null
+$DIST = (Resolve-Path -LiteralPath $DIST).ProviderPath
+$expected = Join-Path (Get-Location).Path "dist\tributary-windows"
+if ($DIST -ne $expected) { throw "distribution did not resolve against PowerShell PWD" }
+if (-not [System.IO.Path]::IsPathRooted($DIST)) { throw "distribution is not absolute" }
+if (-not (Test-Path -LiteralPath $DIST -PathType Container)) { throw "distribution does not exist" }
+if ($DIST -eq $legacyFullPath) { throw "test did not separate process cwd from PowerShell PWD" }
+
+$driveName = "TributaryPathTest"
+New-PSDrive -Name $driveName -PSProvider FileSystem -Root $env:TRIBUTARY_PATH_TEST_REPOSITORY | Out-Null
+try {
+    Set-Location -LiteralPath "${driveName}:\"
+    $DIST = "dist\tributary-windows"
+    New-Item -ItemType Directory -Force $DIST | Out-Null
+    $resolved = Resolve-Path -LiteralPath $DIST
+    $providerPath = $resolved.ProviderPath
+    $drivePath = $resolved.Path
+    $expected = Join-Path $env:TRIBUTARY_PATH_TEST_REPOSITORY "dist\tributary-windows"
+    if ($providerPath -ne $expected) { throw "provider path did not resolve to the physical repository" }
+    if (-not [System.IO.Path]::IsPathRooted($providerPath)) { throw "provider path is not absolute" }
+    if (-not (Test-Path -LiteralPath $providerPath -PathType Container)) { throw "provider path does not exist" }
+    if ($drivePath -eq $providerPath) { throw "test did not exercise a custom FileSystem PSDrive" }
+}
+finally {
+    Set-Location -LiteralPath $env:TRIBUTARY_PATH_TEST_REPOSITORY
+    Remove-PSDrive -Name $driveName
+}
+"#;
+
+        let run = |program: &str| {
+            std::process::Command::new(program)
+                .args(["-NoProfile", "-NonInteractive", "-Command", command])
+                .current_dir(temp.path())
+                .env("TRIBUTARY_PATH_TEST_REPOSITORY", &repository)
+                .output()
+        };
+        let output = match run("pwsh") {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match run("powershell") {
+                Ok(output) => output,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) => panic!("could not run Windows PowerShell path regression: {error}"),
+            },
+            Err(error) => panic!("could not run PowerShell path regression: {error}"),
+        };
+
+        assert!(
+            output.status.success(),
+            "PowerShell path regression failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn windows_script_runs_a_sanitized_deadline_bounded_exact_probe() {
         let script = include_str!("../scripts/build-windows.ps1");
         for fragment in [
