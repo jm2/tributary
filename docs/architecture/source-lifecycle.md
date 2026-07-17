@@ -111,9 +111,10 @@ explicit rebind retains the stored ID. Merely discovering a different URL never 
 by name or library similarity.
 
 The existing local `tracks.id` value is already the local backend's native `TrackId` and is kept
-byte-for-byte, including a legacy non-UUID string. The current random fallback in
-`db_model_to_track` is removed rather than rewriting such a row on every read. New local tracks may
-continue to receive UUIDv4 strings, and playlist foreign keys remain unchanged.
+byte-for-byte, including a legacy non-UUID string. The random fallback in `db_model_to_track` has
+been removed: exact local identity uses the original string, while still-unmigrated UUID APIs see
+a frozen deterministic compatibility projection. New local tracks may continue to receive UUIDv4
+strings, and playlist foreign keys remain unchanged.
 
 No remote catalogue or playback queue is persisted today. Therefore remote migration discards and
 refetches process-local catalogues; it never attempts to reverse the current one-way UUIDv5 mapping
@@ -345,16 +346,24 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
   logout, a synchronous shutdown gate, and joined retirement.
 - Source navigation rejects stale same-key and cross-source publications and preserves the newest
   cache independently of rendering.
-- Local database IDs and playlist foreign keys survive authoritative file/directory renames, and
-  an incoming full sync refreshes matching queued local locations.
+- Local database IDs and playlist foreign keys survive authoritative file/directory renames.
+  Architecture rows preserve the exact SQLite ID—including a legacy non-UUID value—and local or
+  playlist queues no longer retain a file locator. Every queue load resolves that ID against the
+  current row and checks the current file under a five-second budget before handing a URI to an
+  output; stale generations cannot claim a later load.
 - Removable sources separate a best-available logical key from the mount path and retire scans,
   cache, and playback on relocation/removal.
 - Radio rows use station UUIDs, and OS-opened files use a one-item external queue.
 
 These are compatible foundations, not proof that the decision is complete. In particular, current
 remote `SourceId` values are still URLs, remote `TrackId` values are still derived UUIDs, the two
-remote registries remain siblings, local/playlist/radio/removable/external queues still retain
-locations, and lifecycle failures still cross several UI-owned paths.
+remote registries remain siblings, and radio/removable/external queues still retain locations.
+Local and playlist GTK rows retain paths for non-playback UI operations, and the playback-time
+local resolver does not yet retain root/file authority through complete output consumption.
+Playlist queue identity also still puts the transitional `playlist:<id>` view key in
+`PlaybackIdentity.source_id` instead of carrying the local source plus a separate `ViewOrigin`;
+therefore generic local-source retirement does not yet retire a playlist-origin queue. Lifecycle
+failures also still cross several UI-owned paths.
 
 ## Deliberately deferred implementation details
 

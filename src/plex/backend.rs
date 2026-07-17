@@ -616,6 +616,7 @@ fn plex_track_to_track(
 
     Track {
         id,
+        native_track_id: None,
         title: plex.title.clone().unwrap_or_else(|| "Unknown".into()),
         artist_name: plex
             .grandparent_title

@@ -1093,6 +1093,7 @@ pub fn build_window(
             let ctrl_for_ctx = media_ctrl.clone();
             let column_view_for_keys = column_view.clone();
             let clear_playback_ui = clear_playback_ui.clone();
+            let playback_rt = rt_handle.clone();
 
             glib::MainContext::default().spawn_local(async move {
                 while let Ok(action) = media_rx.recv().await {
@@ -1106,6 +1107,7 @@ pub fn build_window(
                         artist_label: artist_label.clone(),
                         media_ctrl: ctrl_for_ctx.clone(),
                         session: playback_session.clone(),
+                        rt_handle: playback_rt.clone(),
                         column_view: column_view_for_keys.clone(),
                     };
                     match action {
@@ -1182,6 +1184,7 @@ pub fn build_window(
         let playback_session = playback_session.clone();
         let shuffle = hb.shuffle_button.clone();
         let column_view_c = column_view.clone();
+        let playback_rt = rt_handle.clone();
 
         hb.play_button.connect_clicked(move |_| {
             toggle_or_start(
@@ -1194,6 +1197,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    rt_handle: playback_rt.clone(),
                     column_view: column_view_c.clone(),
                 },
                 shuffle.is_active(),
@@ -1316,6 +1320,7 @@ pub fn build_window(
         let active_source_key = active_source_key.clone();
         let playback_session = playback_session.clone();
         let cv = column_view.clone();
+        let playback_rt = rt_handle.clone();
 
         column_view.connect_activate(move |_view, position| {
             play_track_at(
@@ -1329,6 +1334,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
                 },
             );
@@ -1370,6 +1376,7 @@ pub fn build_window(
         let repeat_mode = hb.repeat_mode.clone();
         let shuffle = hb.shuffle_button.clone();
         let cv = column_view.clone();
+        let playback_rt = rt_handle.clone();
 
         hb.next_button.connect_clicked(move |_| {
             advance_track(
@@ -1382,6 +1389,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
                 },
                 repeat_mode.get(),
@@ -1403,6 +1411,7 @@ pub fn build_window(
         let repeat_mode = hb.repeat_mode.clone();
         let shuffle = hb.shuffle_button.clone();
         let cv = column_view.clone();
+        let playback_rt = rt_handle.clone();
 
         hb.prev_button.connect_clicked(move |_| {
             // If more than 3 s into the track, restart it.
@@ -1422,6 +1431,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
                 },
                 repeat_mode.get(),
@@ -1457,6 +1467,7 @@ pub fn build_window(
         let buffering_tracker = buffering_tracker.clone();
         let clear_playback_ui = clear_playback_ui.clone();
         let toast_overlay = toast_overlay.clone();
+        let playback_rt = rt_handle.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -1592,6 +1603,7 @@ pub fn build_window(
                                 artist_label: artist_label.clone(),
                                 media_ctrl: media_ctrl.clone(),
                                 session: playback_session.clone(),
+                                rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
                             })
                         {
@@ -1609,6 +1621,7 @@ pub fn build_window(
                                 artist_label: artist_label.clone(),
                                 media_ctrl: media_ctrl.clone(),
                                 session: playback_session.clone(),
+                                rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
                             },
                             mode,
@@ -1632,14 +1645,15 @@ pub fn build_window(
                         // message is safe to display verbatim. Without this,
                         // a failed load is visible only in the logs.
                         toast_overlay.add_toast(adw::Toast::new(&message));
-                        // A protected resolver has already handed its request
-                        // to the output at this point. If that load fails, keep
-                        // the queue item but force the next Play through a new
-                        // resolution instead of calling `play()` on an output
-                        // that may never have accepted media.
+                        // A protected or exact-local resolver has already
+                        // handed media to the output at this point. If that
+                        // load fails, keep the queue item but force the next
+                        // Play through a new resolution instead of calling
+                        // `play()` on an output that may never have accepted
+                        // media.
                         if playback_session
                             .borrow_mut()
-                            .mark_protected_load_failed(event_generation)
+                            .mark_resolved_load_failed(event_generation)
                         {
                             active_output.borrow().stop();
                         }
@@ -1706,6 +1720,7 @@ pub fn build_window(
         let active_source_key = active_source_key.clone();
         let playback_session = playback_session.clone();
         let cv = column_view.clone();
+        let playback_rt = rt_handle.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
         play_pending.connect_activate(move |_, _| {
@@ -1725,6 +1740,7 @@ pub fn build_window(
                 artist_label: artist_label.clone(),
                 media_ctrl: media_ctrl.clone(),
                 session: playback_session.clone(),
+                rt_handle: playback_rt.clone(),
                 column_view: cv.clone(),
             };
             for path in paths {
@@ -2633,7 +2649,11 @@ fn track_to_object(
         uri,
     );
 
-    obj.set_track_id(&t.id.to_string());
+    if let Some(native_track_id) = &t.native_track_id {
+        obj.set_track_id(native_track_id);
+    } else {
+        obj.set_track_id(&t.id.to_string());
+    }
 
     if let Some(artwork_reference) = artwork_reference {
         obj.set_cover_art_url(artwork_reference);

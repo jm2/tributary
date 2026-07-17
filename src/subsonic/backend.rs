@@ -546,6 +546,7 @@ fn song_to_track(
 ) -> Track {
     Track {
         id,
+        native_track_id: None,
         title: song.title.clone().unwrap_or_else(|| "Unknown".into()),
         artist_name: song.artist.clone().unwrap_or_else(|| "Unknown".into()),
         album_artist_name: None,

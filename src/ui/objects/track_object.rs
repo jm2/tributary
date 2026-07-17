@@ -19,6 +19,9 @@ mod imp {
         /// Stable backend-provided track identifier.  Sources without a
         /// native identifier fall back to the playable URI in `track_id()`.
         pub track_id: RefCell<String>,
+        /// Distinguishes an explicitly supplied (even malformed/empty) native
+        /// identifier from UI-only rows that deliberately use their URI.
+        pub has_explicit_track_id: Cell<bool>,
         /// Identity of this concrete UI row instance. Duplicate playlist
         /// entries share `track_id` but receive distinct row IDs.
         pub row_instance_id: Cell<u64>,
@@ -107,11 +110,11 @@ impl TrackObject {
     /// Architecture-backed tracks set their backend UUID explicitly.  UI-only
     /// sources such as USB scans retain stable identity through their URI.
     pub fn track_id(&self) -> String {
-        let id = self.imp().track_id.borrow().clone();
-        if id.is_empty() {
-            self.uri()
+        let imp = self.imp();
+        if imp.has_explicit_track_id.get() {
+            imp.track_id.borrow().clone()
         } else {
-            id
+            self.uri()
         }
     }
     /// Identity used only to reselect this concrete queue occurrence in GTK.
@@ -188,7 +191,9 @@ impl TrackObject {
     }
 
     pub fn set_track_id(&self, id: &str) {
-        self.imp().track_id.replace(id.to_string());
+        let imp = self.imp();
+        imp.track_id.replace(id.to_string());
+        imp.has_explicit_track_id.set(true);
     }
 
     pub fn set_album_artist(&self, name: &str) {
@@ -261,5 +266,18 @@ mod tests {
         assert_eq!(first.track_id(), duplicate.track_id());
         assert_ne!(first.row_instance_id(), duplicate.row_instance_id());
         assert_eq!(first.row_instance_id(), first.clone().row_instance_id());
+    }
+
+    #[test]
+    fn an_explicit_empty_native_id_never_falls_back_to_a_file_locator() {
+        let row = track("file:///private/library/track.flac");
+        assert_eq!(row.track_id(), "file:///private/library/track.flac");
+
+        row.set_track_id("");
+        assert_eq!(
+            row.track_id(),
+            "",
+            "malformed persisted identity must fail resolution, not become a path identity"
+        );
     }
 }

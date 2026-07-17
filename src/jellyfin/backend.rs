@@ -573,6 +573,7 @@ fn jellyfin_item_to_track(
 
     Track {
         id,
+        native_track_id: None,
         title: item.name.clone().unwrap_or_else(|| "Unknown".into()),
         artist_name: item
             .artist_items

@@ -28,6 +28,15 @@ use super::tag_writer;
 use crate::architecture::models::Track;
 use crate::db::entities::{library_root, playlist_entry, root_reauthorization_receipt, track};
 
+/// Frozen namespace for projecting a legacy non-UUID SQLite track key into
+/// compatibility APIs that have not yet migrated from `Uuid`.
+///
+/// Queue and playback identity never use this projection; they preserve the
+/// exact database string. Changing these bytes would nevertheless destabilize
+/// callers that still inspect `Track::id`, so treat them as data-format state.
+const LOCAL_TRACK_COMPAT_NAMESPACE: Uuid =
+    Uuid::from_u128(0xa607_efde_6d16_4f0b_b16c_f654_b2df_d7c8);
+
 // ---------------------------------------------------------------------------
 // LibraryEvent — messages sent to GTK main thread
 // ---------------------------------------------------------------------------
@@ -6160,7 +6169,14 @@ fn get_mtime(path: &Path) -> String {
 /// Convert a database `track::Model` to an architecture `Track`.
 pub fn db_model_to_track(model: &track::Model) -> Track {
     Track {
-        id: Uuid::parse_str(&model.id).unwrap_or_else(|_| Uuid::new_v4()),
+        // `Track::id` is still required by compatibility APIs that accept a
+        // UUID. Keep valid legacy UUIDs unchanged and map every other exact
+        // SQLite key deterministically; never manufacture a different random
+        // identity each time the same row is read. Queue identity uses the
+        // byte-for-byte `native_track_id` below.
+        id: Uuid::parse_str(&model.id)
+            .unwrap_or_else(|_| Uuid::new_v5(&LOCAL_TRACK_COMPAT_NAMESPACE, model.id.as_bytes())),
+        native_track_id: Some(model.id.clone()),
         title: model.title.clone(),
         artist_name: model.artist_name.clone(),
         album_artist_name: model.album_artist_name.clone(),
@@ -11051,6 +11067,10 @@ mod tests {
 
         let track = db_model_to_track(&model);
 
+        assert_eq!(
+            track.native_track_id.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
         assert_eq!(track.title, "Test Song");
         assert_eq!(track.artist_name, "Test Artist");
         assert_eq!(track.album_title, "Test Album");
@@ -11131,9 +11151,18 @@ mod tests {
             file_size_bytes: None,
         };
 
-        // Should not panic — falls back to a new random UUID.
-        let track = db_model_to_track(&model);
-        assert!(!track.id.is_nil());
+        // The exact database key is the source-native identity, and the UUID
+        // compatibility projection is deterministic rather than random.
+        let first = db_model_to_track(&model);
+        let second = db_model_to_track(&model);
+        assert_eq!(first.native_track_id.as_deref(), Some("not-a-valid-uuid"));
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            first.id,
+            Uuid::parse_str("de7878c3-1d8f-5e45-a0a2-da3616e6a623")
+                .expect("frozen compatibility UUID")
+        );
+        assert!(!first.id.is_nil());
     }
 
     #[test]

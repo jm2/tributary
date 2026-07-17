@@ -17,7 +17,22 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
     /// Unique identifier (assigned by the originating backend).
+    ///
+    /// This UUID remains the compatibility key used by the current remote
+    /// resolver API. Backends whose native identifier is not a UUID also set
+    /// `native_track_id`; queue identity prefers that exact value.
     pub id: Uuid,
+
+    /// Exact backend-native track identifier, when the adapter can preserve
+    /// it independently from the compatibility UUID above.
+    ///
+    /// Local-library rows use their SQLite `tracks.id` value byte-for-byte so
+    /// legacy non-UUID keys remain stable across reads. This transitional
+    /// field can be removed together with `id` once every resolver consumes
+    /// the architecture-level `TrackId` newtype described by the source
+    /// lifecycle ADR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_track_id: Option<String>,
 
     /// Track title.
     pub title: String,

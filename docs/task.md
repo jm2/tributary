@@ -59,7 +59,11 @@ The P3.1 source-lifecycle ADR was accepted in PR #113, closing its two architect
 boxes. Independent review clarified deterministic overlapping-radio locator ownership and the
 exact versioned saved-source migration/quarantine boundary before the complete exact-toolchain and
 native/package matrix passed in runs 29605029668 and 29605032344; runtime implementation remains
-open.
+open. A first local-identity implementation slice is prepared: exact SQLite IDs survive legacy
+non-UUID rows, local/playlist queues retain no file path, and every queue load resolves the current
+row by exact ID before an output sees a URI. It deliberately leaves the compound checkbox open
+until the resulting file/root authority is retained through complete output consumption and an
+in-flight receiver cannot outlive the resolved authority.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1312,8 +1316,11 @@ closed as a milestone.
 
 - [ ] Define stable source IDs and backend-native track IDs. The recorded
   [source-lifecycle decision](architecture/source-lifecycle.md) specifies the identity and
-  migration contract, but standard backends still expose derived UUIDs and the registry/queue
-  still use the configured URL string as source identity; implementation remains.
+  migration contract. Local architecture/UI/queue rows now preserve the exact SQLite track ID,
+  including legacy non-UUID values, and the old random UUID fallback is gone. Standard backends
+  still expose derived UUIDs, the registry/queue still use the configured URL string as remote
+  source identity, and playlist queues still put `playlist:<id>` in the source slot rather than
+  carrying local source identity plus a separate `ViewOrigin`, so the compound task remains open.
 - [x] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source. P1.6 now
   retains an `Arc<dyn RemoteMediaResolver>` behind an exact generation and random revocable lease
   for each standard remote source; the existing DAAP registry retains its stateful live backend.
@@ -1326,8 +1333,16 @@ closed as a milestone.
   generation- and lease-rejected.
 - [ ] Resolve local/playlist media by stable track ID at playback, navigation, and receiver-load
   time so fallback reconciliation and in-flight casts cannot retain dead file paths. The ADR
-  makes playlists local-library views and confines fallback matching to committed reconciliation;
-  the runtime still carries paths.
+  makes playlists local-library views and confines fallback matching to committed reconciliation.
+  The first runtime slice makes local/playlist queue items pathless and performs an asynchronous
+  exact-ID lookup plus five-second current regular-file check for initial Play, Next, Previous when
+  it selects another queue item, repeat/replay, and every output load;
+  missing/dead/timed-out/stale results fail without fallback.
+  An output error leaves the item retryable through a fresh ID lookup. GTK rows still carry a
+  current path for display/file actions, and the resolved root/file authority is not yet retained
+  through complete output consumption. Playlist-origin queues also cannot yet be retired through
+  generic local-source invalidation because the separate `ViewOrigin` model is not implemented,
+  leaving the in-flight receiver race and this box open.
 - [ ] Centralize source refresh, cancellation, disconnect, and failure state. Generation/lease
   ownership and source-owned playback retirement are centralized, but environment startup,
   interactive auth, manual add, refresh publication, and UI failure handling remain separate
@@ -1343,9 +1358,10 @@ closed as a milestone.
   The document distinguishes accepted decisions, existing foundations, remaining implementation,
   migration, and completion tests. Accepted in PR #113 after the full native/package matrix passed.
 - [ ] Record implementation: P1.6 completed the remote resolver/session ownership subset in PR
-  #86. The architecture-only ADR branch closes no implementation box: stable source IDs,
-  backend-native IDs, local/playlist ID-at-use resolution, unified refresh/failure state, and the
-  local/radio/removable/external adapters remain before P3.1 as a whole can be recorded complete.
+  #86. PR #113 closes only architecture boxes. The pending local-identity slice preserves exact
+  local IDs and removes locations from local/playlist queues, but closes no compound checkbox:
+  root/file leases, stable source and remaining native IDs, unified refresh/failure state, and the
+  local/radio/removable/external adapters remain before P3.1 can be recorded complete.
 
 ### P3.2 Make the backend abstraction real and stable
 
@@ -1849,14 +1865,16 @@ Record scope or design decisions here so deferred work is explicit.
   before persistence. Missing audio paths retain the guarded-delete behavior; symlinks, Windows
   reparse points, unexpected path types, and metadata errors force authoritative reconciliation.
 - 2026-07-12 — A committed bulk rename publishes one library snapshot rather than a per-row
-  event storm, and an already-captured playback queue re-resolves its items from it by stable
-  track ID, in place. Already-open playlist rows are retargeted by the same stable ID, and an
+  event storm. The first implementation eagerly retargeted an already-captured playback queue;
+  the later P3.1 local-ID slice supersedes that compatibility path by keeping queue items pathless
+  and resolving the exact database ID on every load. Already-open playlist rows are still
+  retargeted by the same stable ID for display and file-management actions, and an
   in-flight playlist result overlays committed local URIs before it can render. Same-key request
   generations and post-reconciliation reloads remain P1.9. A rename that falls back to
   reconciliation still mints new track IDs, so the ID-based refresh cannot repair a queue captured
-  before it; recovery requires rebuilding it from a refreshed source model. Stable-ID resolution
-  at playback, navigation, and receiver-load time remains P3.1 rather than changing queue semantics
-  here.
+  before it; recovery requires rebuilding it from a refreshed source model. Exact-ID-at-use
+  resolution supersedes only the eager path refresh; a retained authority lease through playback
+  and receiver consumption remains P3.1.
 - 2026-07-12 — P1.3 installs each watcher before enumeration, retries roots that become available
   during enumeration, and replays its bounded, ordered ingress after the initial snapshot. Notify
   errors, rescan flags, and queue overflow discard the incomplete incremental batch and retry a
@@ -2229,3 +2247,4 @@ Add one line per completed task:
 | 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
 | 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Native x86_64 and ARM64 CI both prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
 | 2026-07-17 | P3.1 source identity/lifecycle architecture | PR #113 | Records location-independent `(SourceId, TrackId)` media identity, an exact legacy-array-to-versioned-envelope saved-source migration with atomic replacement and fail-closed conflict quarantine, one registry-owned operation/session lifecycle, deterministic per-view radio locator ownership, playback-time locator resolution, exactly-once DAAP retirement, adapter-specific rules for every source kind, and staged completion tests. This closes only the two architecture decision boxes; runtime migration remains open. Independent review found and resolved two design ambiguities before the full exact-toolchain/native/package matrix passed in runs 29605029668 and 29605032344. |
+| 2026-07-17 | P3.1 exact local ID-at-use resolution (partial) | Pending PR | Preserves each SQLite `tracks.id` byte-for-byte in local and playlist UI/queue identity, replaces random malformed-UUID fallback with a frozen deterministic compatibility projection, removes file locators from local/playlist queue items, and resolves the exact current database row plus five-second regular-file evidence before initial, newly navigated, repeated, or receiver-targeted output loads. Exact-generation completion suppresses stale async results and missing, empty, dead, timed-out, or deleted IDs never use metadata/path fallback. Focused resolver, queue, GObject, and model-conversion tests plus strict full debug/release suites cover the slice. Root/file authority retention through full output consumption remains open, so no compound task or progress count closes. |
