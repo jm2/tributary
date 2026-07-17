@@ -241,20 +241,22 @@ impl WorkerCommandSender {
             pending.commands.push_back(command);
         }
         debug_assert!(pending.commands.len() <= pending.capacity);
-        drop(pending);
-
-        match self.wake_tx.try_send(()) {
+        // Publish the nonblocking wake while insertion still owns the deque
+        // lock. Otherwise the worker can consume a terminal Shutdown, exit,
+        // and drop its wake receiver between insertion and try_send(), making
+        // an accepted command spuriously report Disconnected. The receiver
+        // never holds this lock while waiting for a wake, and try_send never
+        // blocks, so GTK-facing enqueue remains a short in-memory operation.
+        let outcome = match self.wake_tx.try_send(()) {
             Ok(()) | Err(mpsc::TrySendError::Full(())) => WorkerEnqueueOutcome::Enqueued,
             Err(mpsc::TrySendError::Disconnected(())) => {
-                let mut pending = self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
                 pending.receiver_alive = false;
                 pending.commands.clear();
                 WorkerEnqueueOutcome::Disconnected
             }
-        }
+        };
+        drop(pending);
+        outcome
     }
 
     #[cfg(test)]

@@ -31,8 +31,8 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**200/223 (89.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
-and **10/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**203/223 (91.0%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
+and **13/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -60,6 +60,53 @@ boxes. Independent review clarified deterministic overlapping-radio locator owne
 exact versioned saved-source migration/quarantine boundary before the complete exact-toolchain and
 native/package matrix passed in runs 29605029668 and 29605032344; runtime implementation remains
 open.
+The bounded P3.2 local-aggregate slice accepted in PR #114 closes its three
+identity/grouping/lookup boxes: local artist and album UUIDs are
+stable, same-titled albums are disambiguated by effective album artist, and both formerly
+unsupported by-ID track methods now resolve compact keys before narrowed SQL queries. The common
+local integration boundary, invalid persisted `TrackId` fallback, and final P3.2 implementation
+record remain open. Static analysis passed in run 29607279056 and the complete exact-toolchain,
+coverage, audit, native, Flatpak, and package matrix passed in run 29607280861. The review window
+produced no code findings; Gemini posted only its service-sunset notice.
+The first documentation-head rerun, 29608292265, then exposed a pre-existing MPD worker-enqueue
+race: its release suite passed, but the debug suite observed terminal Shutdown already consumed and
+the wake receiver dropped between protected deque insertion and wake publication, so an accepted
+command spuriously reported `Disconnected`. PR #114 now keeps the same short-held mutex across the
+nonblocking `try_send`, preserving the GTK no-wait boundary while making insertion/wake publication
+one linearized operation. All 83 focused MPD tests pass in debug and release. Replacement run
+29609489061 then passed the corrected Linux x86_64 suite, but both native Windows package probes
+exposed a second pre-existing race: GStreamer could close an accepted media connection during
+transition to NULL before the listener's old single stop flag was published, so an expected
+incomplete header was misclassified as server corruption. PR #114 now publishes cancellation
+before NULL, keeps both listeners observing through that transition, then separately stops and
+drains queued accepts.
+Only incomplete-header EOF/reset/abort is cancellation; malformed requests and every other server
+failure remain fatal.
+The first two-phase-probe head run, 29610563120, then stopped in x86_64 Windows strict Clippy
+before native tests or packaging because the listener function's newly separated lifecycle flags
+raised its parameter count from seven to eight. PR #114 now owns both flags in one shared lifecycle
+state, keeping cancellation and final stop semantically distinct while restoring the bounded
+function signature. Static run 29611191885 passed, and replacement matrix 29611194118 passed every
+completed exact-toolchain, audit, metadata, coverage, Linux, Flatpak, macOS, ARM64 Windows,
+packaging, and checksum job;
+the ARM64 finished distribution also passed the production protected-playback probe. The x86_64
+native suite passed 717 of 718 application tests but showed that the regression fixture's plain
+client-socket drop did not deterministically establish its intended incomplete-header EOF on that
+Windows runner. The fixture now explicitly half-closes its write side after cancellation, using
+the same cross-platform EOF contract as the already-passing request-classification fixtures.
+Static run 29612456247 passed, but matrix 29612458758 then reproduced the teardown failure despite
+that explicit half-close; the malformed-request fixture also received a Windows response-drain
+abort (716 of 718 application tests passed). The remaining production cause was the listener's
+nonblocking mode: Winsock can retain it on an accepted socket,
+letting a fragmented header return `WouldBlock` before cancellation is published. Accepted sockets
+are now explicitly restored to blocking mode before their bounded read/write deadlines are
+installed, and any configuration failure remains fatal. The malformed fixture also half-closes its
+completed request before reading the response, making request completion deterministic without
+relaxing the server assertion. Final static run 29613604485 and complete matrix 29613606936 then
+passed: all 718 x86_64 Windows application tests were green, both Windows architectures completed
+their finished-distribution protected-playback probes, and every exact-toolchain, audit, metadata,
+coverage, Linux, Flatpak, macOS, package, and checksum sibling passed. No actionable automated
+review thread remains.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1080,7 +1127,11 @@ error that tells the user what to install.
   lifecycle or test barriers, then the oldest remaining transient is evicted if needed so the
   newest intent survives. Lifecycle commands advance the epoch and therefore cannot be crowded out.
   Stale wake tokens share one absolute receive deadline and cannot postpone authoritative polling;
-  receiver loss clears pending work and fails the current operation closed.
+  receiver loss clears pending work and fails the current operation closed. PR #114's CI follow-up
+  keeps the deque lock through the capacity-one channel's nonblocking wake publication. This closes
+  the terminal race in which the worker could consume Shutdown and drop its receiver after insertion
+  but before `try_send`, causing an accepted command to report `Disconnected`; it adds no blocking
+  operation or checklist credit.
 - [x] Eliminate the shared-partition race between ownership revalidation and MPD's global pause or
   stop commands, and the unguarded global side effects of load-time option resets, or require a
   detectable exclusive-control configuration. Accepted in PR #112:
@@ -1290,6 +1341,24 @@ failed through the separately resolved media path—but did not prove DNS was th
   scanner, protected-loopback policy, real FLAC decode/EOS, poisoned-proxy, and alternate-source
   fail-closed checks. The intentionally deferred live release-workflow run is not required because
   CI invokes that same path on both supported architectures.
+  The pending follow-up PR hardens a plausible listener teardown race without changing this
+  completed checklist item. Production now publishes a narrow cancellation phase before
+  `teardown_to_null` without stopping either listener. Both remain accepting throughout the NULL
+  transition; afterward `finish_teardown` publishes a separate stop, counts every returned or queued
+  accept until the nonblocking queue is empty, then joins and inspects. Only EOF,
+  connection-aborted, or connection-reset I/O before complete media headers may cancel during that
+  phase; malformed UTF-8, request line, route, method, header, range, timeout, other I/O, accept, and
+  response-write failures remain fatal even when teardown overlaps. Four deterministic
+  Windows-gated unit tests distinguish incomplete-header I/O from semantic drift, synchronize on an
+  accepted media connection before proving both clean cancellation and fatal malformed input
+  completed during teardown, and prove the poison observer counts one accepted plus one potentially
+  queued connection across begin/finish. The x86_64 Windows job executes those unit tests. ARM64
+  deliberately skips Cargo tests, but compiles the production code and executes its real two-phase
+  path inside the packaged runtime probe. The transient ARM64 package false red in PR #112, run
+  `29603467226`, job `87960898351`, motivated the hardening; same-source post-merge main run
+  `29604363069`, job `87963920779`, passed the unchanged 498-target closure and packaged probe. Its
+  fixed diagnostic does not prove that incomplete-header teardown caused the failed attempt. This
+  adds neither a retry nor a weakened semantic-failure policy.
 - [ ] Record live playback from a packaged Windows artifact against the reported DAAP and Subsonic
   servers, including catalogue connection, protected-media startup, audible playback, and useful
   URL-free failure diagnostics if either server cannot play. The automated package probe cannot
@@ -1350,15 +1419,47 @@ closed as a milestone.
 ### P3.2 Make the backend abstraction real and stable
 
 - [ ] Construct and use `LocalBackend` through the same integration boundary.
-- [ ] Replace ephemeral album/artist UUIDs with stable identities.
-- [ ] Group local albums by a disambiguating key, not title alone.
-- [ ] Implement or remove unsupported trait methods.
+- [x] Replace ephemeral album/artist UUIDs with stable identities. PR #114 derives local
+  artist and album UUIDv5 values under one private versioned namespace with distinct domains,
+  component-count and length framing, and pinned golden values. Artist identity uses the exact
+  stored performing-artist name; album identity uses the grouping key below. No case folding,
+  trimming, Unicode normalization, year, or location enters the UUID. Every converted local
+  `Track` carries matching aggregate IDs, while `Album.artist_id` deliberately remains `None`
+  because a compilation album credit need not identify a performing-artist entity.
+- [x] Group local albums by a disambiguating key, not title alone. PR #114 groups by exact
+  `(album_title, effective_album_artist)`. Only a missing or Unicode-whitespace-only album-artist
+  tag falls back to the exact track artist; every nonblank value, including case, normalization,
+  and surrounding whitespace, is preserved. Album listings, per-artist album counts, track album
+  IDs, and library album statistics share that key. SQL pre-aggregates exact metadata fragments;
+  the final Rust fold groups compilation performers consistently and uses deterministic numeric
+  and lexical minima for year and genre instead of SQLite bare-column selection.
+- [x] Implement or remove unsupported trait methods. PR #114 implements
+  `get_album_tracks` and `get_artist_tracks`. Each maps the UUID through compact distinct aggregate
+  keys, returns an empty vector when no key exists, then queries full track models only for the
+  exact album title or performing artist under deterministic ordering. Album results retain the
+  shared exact effective-artist predicate after the title-constrained SQL query, so blank-tag
+  fallback and same-title disambiguation cannot diverge from listing/ID semantics.
 - [x] Align README architecture claims with actual code. README explicitly labels its diagram as
   the intended architecture and accurately records the shipping gaps: the four remote backends
   implement `MediaBackend`, but no trait object uses that seam; source connection still branches
   by concrete backend; and the local library bypasses `LocalBackend`. Implemented in `e6c68bc` and
-  re-audited on the packaged-Windows probe branch.
-- [ ] Record implementation: _pending_
+  re-audited on the packaged-Windows probe branch. The P3.2 aggregate slice now documents the
+  shipped stable-ID/grouping/lookup contract without implying that the integration seam exists.
+- [ ] Record implementation: the stable aggregate subset is accepted in PR #114, with four focused
+  SQLite regressions, the complete 243-test local-module surface, the 759-test local debug suite,
+  and the complete static/native/package PR matrix passing. P3.2 remains incomplete until
+  production constructs and uses `LocalBackend` through the common boundary. Repairing or
+  rejecting an invalid persisted local track UUID, instead of the existing random conversion
+  fallback, belongs with the typed `TrackId` migration in P3.1 and is not silently broadened into
+  this metadata-aggregate slice.
+
+Acceptance criteria for this bounded slice: unchanged exact local metadata yields identical
+artist/album identities across queries and restarts; concatenation or artist/album domain
+collisions cannot alias; a compilation and same-titled albums group by the documented effective
+album artist; listing IDs round-trip through both by-ID methods; unknown IDs return no tracks; and
+the lookup's full-model query is constrained to the resolved title or exact artist. This does not
+accept the still-direct local UI/library integration, path-bearing queue values, or invalid
+persisted `TrackId` fallback.
 
 ### P3.3 Add network integration harnesses
 
@@ -1439,6 +1540,39 @@ PR #94's containerized Flatpak build proved the manifest-local source generation
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
 
+Current PR #114 follow-up validation (2026-07-17, P2.11 packaged-probe teardown hardening):
+`cargo check --all-targets --all-features --locked`, strict all-target/all-feature
+Clippy, and `cargo test --all-targets --all-features --locked` pass in debug and release. Each full
+test profile passes 18 library, 731 application, and 10 repository-metadata tests (759 total), and
+all 28 focused platform-runtime tests pass in both profiles. The four new regressions live in the
+Windows-only packaged runtime module; this Linux validation parses and formats them but does not
+claim to compile or execute them. The x86_64 Windows job runs unit
+tests; ARM64 skips that step but compiles the production module and runs the bundled executable's
+production probe during packaging. The tests separate incomplete-header EOF/reset/abort from
+semantic drift, synchronize on media acceptance, exercise the production begin/NULL/finish ordering,
+require malformed input completed after cancellation begins to remain fatal, and prove the poison
+observer remains live until final stop drains queued accepts. Formatting and whitespace checks
+(`cargo fmt --all -- --check` and `git diff --check`) pass; no dependency, lockfile, README,
+checklist, or completion-count change is involved. Run 29610563120 passed its completed static,
+audit, metadata, coverage, Linux aarch64, and Flatpak siblings, but Windows x86_64 strict Clippy
+rejected the initial eight-parameter listener before native tests. The follow-up groups the two
+lifecycle atomics into one state object without weakening their separate meanings. Static run
+29611191885 passed, and replacement matrix 29611194118 passed every other completed job, including
+the ARM64 Windows production package probe;
+the x86_64 native suite passed 717 of 718 application tests but its plain client-socket drop did not
+deterministically deliver the intended incomplete-header EOF. That regression now explicitly
+half-closes the client write side after cancellation—the same EOF contract exercised by the
+already-passing request classifiers. Static run 29612456247 passed, but matrix 29612458758 proved
+the half-close alone insufficient; the malformed fixture also received an abort while draining its
+response (716 of 718 application tests passed). The production
+listener now explicitly returns each accepted Winsock socket to blocking mode before installing
+its bounded read/write deadlines, so a fragmented header waits rather than spuriously returning
+`WouldBlock`; configuration, timeout, semantic-request, and response failures remain fatal. The
+malformed fixture now half-closes its completed request before response drain to make completion
+deterministic. Final static run 29613604485 and complete matrix 29613606936 passed every job,
+including all 718 x86_64 Windows application tests and both native finished-distribution probes.
+No actionable automated review thread remains; Gemini posted only its service-sunset notice.
+
 Most recent accepted validation (2026-07-17, PR #112 P2.10 exclusive-control slice):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature
 Clippy, and `cargo test --all-targets --all-features --locked` pass in debug and release. Each full
@@ -1460,7 +1594,29 @@ CodeQL and all three static-analysis jobs passed; final Codex review of `91536ab
 issues after both earlier findings were fixed and resolved. P2.10 is complete at 198/223 overall
 and 76/79 P2; P3.5's exact-toolchain acceptance remains recorded by PR #111.
 
-Most recent local branch validation (2026-07-17, P3.5 representative-coverage slice before CI):
+Most recent accepted validation (2026-07-17, P3.2 stable-local-aggregate slice in PR #114):
+`cargo check --all-targets --all-features --locked`, strict
+`cargo clippy --all-targets --all-features --locked -- -D warnings`,
+`cargo fmt --all -- --check`, and `git diff --check` pass. Four focused SQLite backend tests cover
+the two pinned UUID goldens, artist/album domain separation, collision-safe framing, exact metadata
+and Unicode-whitespace fallback, same-title disambiguation, compilation grouping, deterministic
+year/genre minima, aggregate counts/stats, listing-ID round trips, deterministic result ordering,
+unknown IDs, and an empty library. The full local-module surface passes 243 tests. After `b067d18`,
+the `5012b77` follow-up replaced each full-table lookup with compact aggregate-key resolution and
+an exact title/artist SQL query. The complete current debug all-target/all-feature suite then passed
+18 library, 731 application, and 10 repository-metadata tests (759 total), in addition to the
+focused and local-module runs above. No dependency, schema, migration, or lockfile changed.
+Static analysis and CodeQL passed in run 29607279056. Run 29607280861 passed MSRV, audit, desktop
+metadata, representative coverage, Linux x86_64/aarch64, Flatpak, macOS aarch64, Windows
+x86_64/aarch64, package creation, and SHA256 checksums. The review window produced no actionable
+code comments; Gemini posted only its service-sunset notice. The four local backend regressions
+exercise only SQLite and do not claim the still-unused production `LocalBackend` integration
+boundary. Documentation-head run 29608292265 passed release tests and every completed sibling but
+failed the debug Linux suite on the MPD terminal enqueue/wake race documented above. After the
+linearization fix, the failing regression and all 83 MPD tests pass in both debug and release;
+formatting and whitespace checks pass. A complete replacement PR matrix remains pending.
+
+Previous local branch validation (2026-07-17, P3.5 representative-coverage slice before CI):
 `cargo fmt --all -- --check`, strict all-target/all-feature Clippy in debug and release, and
 `cargo test --all-targets --all-features --locked` in debug and release pass. Each profile passes
 18 library, 718 application, and 10 repository-metadata tests (746 total); the two new metadata
@@ -1700,6 +1856,24 @@ Record scope or design decisions here so deferred work is explicit.
   denominators. CI enforces only the value committed on the branch; the non-decrease ratchet is
   repository review policy. Lowering the floor requires a dedicated measurement-definition change
   that explains and remeasures a tool or source-set transition.
+
+- 2026-07-17 — P3.2 treats local album/artist identity as a versioned deterministic projection of
+  exact stored metadata, not a new persisted schema. The former UUIDs were random per listing and
+  therefore supplied no durable aggregate references to migrate; a private v1 UUIDv5 namespace,
+  separate artist/album domains, component-count framing, and big-endian length framing now define
+  the contract and pinned goldens. Performing-artist name is the artist key. Album title plus
+  effective album artist is the album key: only absent or Unicode-whitespace-only album-artist
+  metadata falls back to the performing artist, while every nonblank byte sequence is retained.
+  Year is deliberately excluded because missing/inconsistent tags and ordinary year edits must not
+  split aggregate identity; year and genre are display aggregates with deterministic minima.
+  `Album.artist_id` stays absent because a compilation album artist may have no corresponding
+  performing-artist row. A metadata edit to an identity component intentionally creates a new
+  aggregate rather than guessing continuity. UUIDs are not reversible, so by-ID methods first scan
+  compact grouped keys and then load only rows under the resolved exact title or artist; album
+  results reuse the same effective-artist predicate. This decision closes stable aggregate and
+  lookup behavior only. It neither makes `LocalBackend` the shipping integration seam nor changes
+  the invalid database track-UUID fallback; typed/persisted `TrackId` migration, local/playlist
+  ID-at-use resolution, and common source integration remain P3.1/P3.2 work.
 
 - 2026-07-10 — Implemented P0.1, P0.3-P0.6, and P0.8 in PR #68. P0.7's
   workflow contract is implemented, but its live manual-dispatch acceptance test requires a
@@ -2138,6 +2312,18 @@ Record scope or design decisions here so deferred work is explicit.
   are fatal rather than ignored. This automated result is independently closeable, while
   `.local` routing, real DAAP/Subsonic behavior, physical output, firewall/endpoint security, and
   end-user proxy policy remain one explicit live packaged-Windows task.
+- 2026-07-17 — The P2.11 packaged listener distinguishes narrow teardown cancellation from request
+  failure. A PR #112 ARM64 package attempt completed the same 498-target dependency closure and then
+  reported only the probe's fixed loopback-server failure; a same-source main run passed the
+  unchanged packaged probe. That evidence shows a transient result but cannot prove its root cause.
+  The pending follow-up therefore hardens one plausible race without retrying or broadening success:
+  production publishes cancellation before moving GStreamer to NULL but keeps both listeners live;
+  final stop is separate and drains/counts queued accepts before join. Only an already-accepted
+  incomplete-header EOF, connection-aborted, or connection-reset result may cancel once that phase
+  is visible. Semantic request drift, timeouts, other I/O, every accept failure, and response-write
+  failure remain fatal regardless of teardown, while poison observation covers the entire NULL
+  transition. Deterministic listener regressions preserve both sides and the observation window;
+  P2.11 checklist arithmetic is unchanged.
 - 2026-07-15 — P2.11 treats repeated DAAP and Subsonic failures at exactly GStreamer's 15-second
   HTTP-source timeout as a shared protected-playback defect, not a protocol-authentication defect.
   The opaque loopback boundary remains necessary: handing backend requests directly to GStreamer
@@ -2229,3 +2415,5 @@ Add one line per completed task:
 | 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
 | 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Native x86_64 and ARM64 CI both prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
 | 2026-07-17 | P3.1 source identity/lifecycle architecture | PR #113 | Records location-independent `(SourceId, TrackId)` media identity, an exact legacy-array-to-versioned-envelope saved-source migration with atomic replacement and fail-closed conflict quarantine, one registry-owned operation/session lifecycle, deterministic per-view radio locator ownership, playback-time locator resolution, exactly-once DAAP retirement, adapter-specific rules for every source kind, and staged completion tests. This closes only the two architecture decision boxes; runtime migration remains open. Independent review found and resolved two design ambiguities before the full exact-toolchain/native/package matrix passed in runs 29605029668 and 29605032344. |
+| 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the implementation-head exact-toolchain/native/package matrix passed. A documentation rerun exposed and fixed a pre-existing terminal MPD enqueue/wake race; its replacement matrix remains pending. The common `LocalBackend` integration seam, invalid persisted `TrackId` fallback, and final P3.2 record remain open. |
+| 2026-07-17 | P2.11 packaged-probe teardown hardening (follow-up) | PR #114 | Separates pre-NULL cancellation from final listener stop, keeps poison observation live through NULL, and drains/counts queued accepts before join. Only narrowly classified incomplete-header EOF/reset/abort outcomes may cancel; semantic request, accept, and response-write failures remain fatal even during teardown. Four Windows tests pin classification, synchronized clean-versus-malformed behavior, and the accepted/queued poison window. x86_64 runs the unit tests, while ARM64 compiles the code and executes the production probe during packaging. This hardens the already-complete packaged proof and leaves checklist arithmetic unchanged. |
