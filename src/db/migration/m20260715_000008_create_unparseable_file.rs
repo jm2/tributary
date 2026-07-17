@@ -13,16 +13,16 @@ impl MigrationTrait for Migration {
         manager
             .create_table(
                 Table::create()
-                    .table(UnparseableFile::Table)
+                    .table(UnparseableFiles::Table)
                     .if_not_exists()
                     .col(
-                        ColumnDef::new(UnparseableFile::FilePath)
+                        ColumnDef::new(UnparseableFiles::FilePath)
                             .string()
                             .not_null()
                             .primary_key(),
                     )
                     .col(
-                        ColumnDef::new(UnparseableFile::DateModified)
+                        ColumnDef::new(UnparseableFiles::DateModified)
                             .string()
                             .not_null(),
                     )
@@ -33,13 +33,13 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .drop_table(Table::drop().table(UnparseableFile::Table).to_owned())
+            .drop_table(Table::drop().table(UnparseableFiles::Table).to_owned())
             .await
     }
 }
 
 #[derive(DeriveIden)]
-enum UnparseableFile {
+enum UnparseableFiles {
     Table,
     FilePath,
     DateModified,

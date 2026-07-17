@@ -2674,6 +2674,7 @@ async fn initial_scan_with_root_trust_guards(
 
     for path in &audio_files {
         let path_str = path.to_string_lossy().to_string();
+        let path_mtime = get_mtime(path);
         on_disk_paths.insert(path_str.clone());
 
         // Look up the existing row (if any) in the preloaded map.
@@ -2681,7 +2682,7 @@ async fn initial_scan_with_root_trust_guards(
 
         let needs_update = match existing {
             // Compare FS mtime with stored date_modified.
-            Some(row) => get_mtime(path) != row.date_modified,
+            Some(row) => path_mtime != row.date_modified,
             None => true,
         };
 
@@ -2689,7 +2690,7 @@ async fn initial_scan_with_root_trust_guards(
             // Skip files that were previously determined unparseable
             // when their mtime hasn't changed (file has not been fixed).
             if let Some(failed) = unparseable_by_path.get(path_str.as_str()) {
-                if get_mtime(path) == failed.date_modified {
+                if path_mtime == failed.date_modified {
                     scanned += 1;
                     continue;
                 }
@@ -2832,8 +2833,7 @@ async fn initial_scan_with_root_trust_guards(
                     // Record the failure so subsequent scans skip this file.
                     // If the file is later fixed (mtime changes), the record
                     // is superseded and the parse is re-attempted.
-                    let mtime = get_mtime(path);
-                    if let Err(error) = upsert_unparseable_file(db, &path_str, &mtime).await {
+                    if let Err(error) = upsert_unparseable_file(db, &path_str, &path_mtime).await {
                         warn!(path = %path_str, %error, "Failed to record unparseable file");
                     }
                 }
@@ -5424,24 +5424,36 @@ async fn upsert_unparseable_file(
     file_path: &str,
     date_modified: &str,
 ) -> anyhow::Result<()> {
-    match unparseable_file::Entity::find_by_id(file_path)
-        .one(db)
-        .await?
-    {
-        Some(existing) => {
-            let mut active: unparseable_file::ActiveModel = existing.into();
-            active.date_modified = Set(date_modified.to_owned());
-            active.update(db).await?;
-        }
-        None => {
-            unparseable_file::ActiveModel {
-                file_path: Set(file_path.to_owned()),
-                date_modified: Set(date_modified.to_owned()),
-            }
-            .insert(db)
-            .await?;
-        }
-    }
+    // match unparseable_file::Entity::find_by_id(file_path)
+    //     .one(db)
+    //     .await?
+    // {
+    //     Some(existing) => {
+    //         let mut active: unparseable_file::ActiveModel = existing.into();
+    //         active.date_modified = Set(date_modified.to_owned());
+    //         active.update(db).await?;
+    //     }
+    //     None => {
+    //         unparseable_file::ActiveModel {
+    //             file_path: Set(file_path.to_owned()),
+    //             date_modified: Set(date_modified.to_owned()),
+    //         }
+    //         .insert(db)
+    //         .await?;
+    //     }
+    // }
+    let active = unparseable_file::ActiveModel {
+        file_path: Set(file_path.to_owned()),
+        date_modified: Set(date_modified.to_owned()),
+    };
+    unparseable_file::Entity::insert(active)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(unparseable_file::Column::FilePath)
+                .update_column(unparseable_file::Column::DateModified)
+                .to_owned(),
+        )
+        .exec(db)
+        .await?;
     Ok(())
 }
 
