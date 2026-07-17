@@ -6,8 +6,10 @@
 
 pub mod backend;
 pub mod error;
+pub mod identity;
 pub mod media;
 pub mod models;
 
 pub use backend::MediaBackend;
+pub use identity::SourceId;
 pub use media::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest};
