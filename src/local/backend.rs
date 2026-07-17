@@ -58,6 +58,35 @@ impl LocalBackend {
             .await
             .map_err(|error| BackendError::Internal(error.into()))
     }
+
+    async fn resolve_album_key(&self, album_id: &Uuid) -> BackendResult<Option<(String, String)>> {
+        let keys: BTreeSet<(String, String)> = self
+            .aggregate_fragments()
+            .await?
+            .into_iter()
+            .map(|row| {
+                let effective_artist =
+                    effective_album_artist(row.album_artist_name.as_deref(), &row.artist_name)
+                        .to_owned();
+                (row.album_title, effective_artist)
+            })
+            .collect();
+        Ok(keys
+            .into_iter()
+            .find(|(title, artist)| local_album_id(title, artist) == *album_id))
+    }
+
+    async fn resolve_artist_name(&self, artist_id: &Uuid) -> BackendResult<Option<String>> {
+        let names: BTreeSet<String> = self
+            .aggregate_fragments()
+            .await?
+            .into_iter()
+            .map(|row| row.artist_name)
+            .collect();
+        Ok(names
+            .into_iter()
+            .find(|name| local_artist_id(name) == *artist_id))
+    }
 }
 
 /// One pre-aggregated metadata fragment. Several fragments can belong to one
@@ -261,7 +290,11 @@ impl MediaBackend for LocalBackend {
     }
 
     async fn get_album_tracks(&self, album_id: &Uuid) -> BackendResult<Vec<Track>> {
+        let Some((album_title, effective_artist)) = self.resolve_album_key(album_id).await? else {
+            return Ok(Vec::new());
+        };
         let rows = track::Entity::find()
+            .filter(track::Column::AlbumTitle.eq(album_title))
             .order_by_asc(track::Column::DiscNumber)
             .order_by_asc(track::Column::TrackNumber)
             .order_by_asc(track::Column::Title)
@@ -275,14 +308,18 @@ impl MediaBackend for LocalBackend {
             .filter(|row| {
                 let artist =
                     effective_album_artist(row.album_artist_name.as_deref(), &row.artist_name);
-                local_album_id(&row.album_title, artist) == *album_id
+                artist == effective_artist
             })
             .map(db_model_to_track)
             .collect())
     }
 
     async fn get_artist_tracks(&self, artist_id: &Uuid) -> BackendResult<Vec<Track>> {
+        let Some(artist_name) = self.resolve_artist_name(artist_id).await? else {
+            return Ok(Vec::new());
+        };
         let rows = track::Entity::find()
+            .filter(track::Column::ArtistName.eq(artist_name))
             .order_by_asc(track::Column::AlbumTitle)
             .order_by_asc(track::Column::DiscNumber)
             .order_by_asc(track::Column::TrackNumber)
@@ -292,11 +329,7 @@ impl MediaBackend for LocalBackend {
             .await
             .map_err(|error| BackendError::Internal(error.into()))?;
 
-        Ok(rows
-            .iter()
-            .filter(|row| local_artist_id(&row.artist_name) == *artist_id)
-            .map(db_model_to_track)
-            .collect())
+        Ok(rows.iter().map(db_model_to_track).collect())
     }
 
     async fn get_stats(&self) -> BackendResult<LibraryStats> {
