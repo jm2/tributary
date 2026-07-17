@@ -13,7 +13,7 @@
 
 use nom::bytes::complete::take;
 use nom::multi::many0;
-use nom::number::complete::{be_i16, be_i32, be_i64, be_i8, be_u16, be_u32, be_u64, be_u8};
+use nom::number::complete::be_u32;
 use nom::IResult;
 use nom::Parser;
 
@@ -153,10 +153,30 @@ pub fn parse_dmap(input: &[u8]) -> Result<Vec<DmapNode>, BackendError> {
             }
             Ok(nodes)
         }
-        Err(e) => Err(BackendError::ParseError {
-            message: format!("Malformed DMAP data: {e}"),
-            source: None,
-        }),
+        Err(error) => {
+            // `nom`'s Debug/Display output includes the remaining input slice.
+            // A hostile response could therefore turn one parse failure into a
+            // very large, attacker-controlled log/error message. Keep the
+            // public diagnostic fixed and classify only the parser reason.
+            let reason = match error {
+                nom::Err::Failure(error) if error.code == nom::error::ErrorKind::TooLarge => {
+                    "container nesting exceeds the supported limit"
+                }
+                nom::Err::Failure(error) if error.code == nom::error::ErrorKind::Eof => {
+                    "truncated nested container"
+                }
+                nom::Err::Failure(error) if error.code == nom::error::ErrorKind::Verify => {
+                    "known scalar has an invalid width"
+                }
+                nom::Err::Error(_) | nom::Err::Failure(_) | nom::Err::Incomplete(_) => {
+                    "invalid tag-length framing"
+                }
+            };
+            Err(BackendError::ParseError {
+                message: format!("Malformed DMAP data: {reason}"),
+                source: None,
+            })
+        }
     }
 }
 
@@ -196,61 +216,62 @@ fn parse_single_node(input: &[u8], depth: usize) -> IResult<&[u8], DmapNode> {
 
 /// Decode the content bytes of a node according to its tag type.
 ///
-/// Returns `Err` only to propagate an unrecoverable depth-limit `Failure`
-/// from a nested container; all other (recoverable) decode problems fall
-/// back to [`DmapValue::Raw`].
+/// Returns `Err` for an unrecoverable depth-limit `Failure` or for malformed
+/// framing inside a known container. Silently accepting the successfully
+/// parsed prefix of a truncated container would let a response reach the
+/// client as an empty/partial listing.
 fn decode_value<'a>(
     tag: &[u8; 4],
     content: &'a [u8],
     depth: usize,
 ) -> Result<DmapValue, nom::Err<nom::error::Error<&'a [u8]>>> {
     let value = match tag_type(tag) {
-        DmapType::Container => {
-            match parse_nodes(content, depth + 1) {
-                Ok((_, children)) => DmapValue::Container(children),
-                // A depth-limit breach is an unrecoverable `Failure` — pass
-                // it up so the whole parse aborts instead of stack-overflowing.
-                Err(e @ nom::Err::Failure(_)) => return Err(e),
-                // Any other (recoverable) error: store the raw bytes.
-                Err(_) => DmapValue::Raw(content.to_vec()),
+        DmapType::Container => match parse_nodes(content, depth + 1) {
+            Ok(([], children)) => DmapValue::Container(children),
+            Ok((remaining, _)) => {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    remaining,
+                    nom::error::ErrorKind::Eof,
+                )))
             }
-        }
+            // A depth-limit breach is an unrecoverable `Failure` — pass it up
+            // so the whole parse aborts instead of stack-overflowing.
+            Err(e @ nom::Err::Failure(_)) => return Err(e),
+            // Known containers must be structurally complete. Promote a
+            // recoverable nested parse failure so the outer parser cannot
+            // publish a partial response.
+            Err(nom::Err::Error(error)) => return Err(nom::Err::Failure(error)),
+            Err(nom::Err::Incomplete(needed)) => return Err(nom::Err::Incomplete(needed)),
+        },
         DmapType::String => DmapValue::String(String::from_utf8_lossy(content).into_owned()),
-        DmapType::U8 => match be_u8::<&[u8], nom::error::Error<&[u8]>>(content) {
-            Ok((_, v)) => DmapValue::U8(v),
-            Err(_) => DmapValue::Raw(content.to_vec()),
-        },
-        DmapType::U16 => match be_u16::<&[u8], nom::error::Error<&[u8]>>(content) {
-            Ok((_, v)) => DmapValue::U16(v),
-            Err(_) => DmapValue::Raw(content.to_vec()),
-        },
-        DmapType::U32 => match be_u32::<&[u8], nom::error::Error<&[u8]>>(content) {
-            Ok((_, v)) => DmapValue::U32(v),
-            Err(_) => DmapValue::Raw(content.to_vec()),
-        },
-        DmapType::U64 => match be_u64::<&[u8], nom::error::Error<&[u8]>>(content) {
-            Ok((_, v)) => DmapValue::U64(v),
-            Err(_) => DmapValue::Raw(content.to_vec()),
-        },
-        DmapType::I8 => match be_i8::<&[u8], nom::error::Error<&[u8]>>(content) {
-            Ok((_, v)) => DmapValue::I8(v),
-            Err(_) => DmapValue::Raw(content.to_vec()),
-        },
-        DmapType::I16 => match be_i16::<&[u8], nom::error::Error<&[u8]>>(content) {
-            Ok((_, v)) => DmapValue::I16(v),
-            Err(_) => DmapValue::Raw(content.to_vec()),
-        },
-        DmapType::I32 => match be_i32::<&[u8], nom::error::Error<&[u8]>>(content) {
-            Ok((_, v)) => DmapValue::I32(v),
-            Err(_) => DmapValue::Raw(content.to_vec()),
-        },
-        DmapType::I64 => match be_i64::<&[u8], nom::error::Error<&[u8]>>(content) {
-            Ok((_, v)) => DmapValue::I64(v),
-            Err(_) => DmapValue::Raw(content.to_vec()),
-        },
+        DmapType::U8 => DmapValue::U8(u8::from_be_bytes(exact_scalar_bytes(content)?)),
+        DmapType::U16 => DmapValue::U16(u16::from_be_bytes(exact_scalar_bytes(content)?)),
+        DmapType::U32 => DmapValue::U32(u32::from_be_bytes(exact_scalar_bytes(content)?)),
+        DmapType::U64 => DmapValue::U64(u64::from_be_bytes(exact_scalar_bytes(content)?)),
+        DmapType::I8 => DmapValue::I8(i8::from_be_bytes(exact_scalar_bytes(content)?)),
+        DmapType::I16 => DmapValue::I16(i16::from_be_bytes(exact_scalar_bytes(content)?)),
+        DmapType::I32 => DmapValue::I32(i32::from_be_bytes(exact_scalar_bytes(content)?)),
+        DmapType::I64 => DmapValue::I64(i64::from_be_bytes(exact_scalar_bytes(content)?)),
         DmapType::Raw => DmapValue::Raw(content.to_vec()),
     };
     Ok(value)
+}
+
+/// Copy one known integer payload only when its TLV length is exact.
+///
+/// Integer decoders normally accept a valid prefix and return the remaining
+/// bytes. For protocol fields such as `mstt`, that would let both short and
+/// overlong status values bypass validation. Promote every width mismatch to
+/// a fatal, fixed-category parse failure instead.
+fn exact_scalar_bytes<const N: usize>(
+    content: &[u8],
+) -> Result<[u8; N], nom::Err<nom::error::Error<&[u8]>>> {
+    content.try_into().map_err(|_| {
+        nom::Err::Failure(nom::error::Error::new(
+            content,
+            nom::error::ErrorKind::Verify,
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +436,32 @@ mod tests {
     }
 
     #[test]
+    fn known_integer_tags_require_their_exact_scalar_width() {
+        // One representative tag for every integer type used by Tributary.
+        // `mstt` is included explicitly because accepting it as Raw or
+        // parsing a four-byte prefix would bypass response-status handling.
+        for (tag, width) in [
+            (b"msau", 1_usize),
+            (b"mikd", 1),
+            (b"astn", 2),
+            (b"mstt", 4),
+            (b"mper", 8),
+        ] {
+            parse_dmap(&make_tlv(tag, &vec![0; width]))
+                .unwrap_or_else(|error| panic!("{tag:?}: exact width must parse: {error}"));
+
+            for malformed_width in [width - 1, width + 1] {
+                let error = parse_dmap(&make_tlv(tag, &vec![0; malformed_width]))
+                    .expect_err("known integer with malformed width must fail");
+                assert!(
+                    error.to_string().contains("invalid width"),
+                    "{tag:?}/{malformed_width}: unexpected error: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_truncated_input_returns_error() {
         // Tag says content is 100 bytes, but we only provide 2.
         let mut blob = Vec::new();
@@ -512,6 +559,24 @@ mod tests {
         let items = find_containers(mlcl_children, b"mlit");
         assert_eq!(items.len(), 1);
         assert_eq!(find_string(items[0], b"minm"), Some("Deep".to_string()));
+    }
+
+    #[test]
+    fn test_truncated_child_inside_known_container_is_rejected() {
+        // The outer `adbs` length is valid, but its `mlcl` child claims a
+        // payload longer than the bytes that remain. Accepting the parsed
+        // prefix would turn this malformed response into an empty catalogue.
+        let mut truncated_child = Vec::new();
+        truncated_child.extend_from_slice(b"mlcl");
+        truncated_child.extend_from_slice(&16_u32.to_be_bytes());
+        truncated_child.extend_from_slice(b"short");
+        let blob = make_tlv(b"adbs", &truncated_child);
+
+        let error = parse_dmap(&blob).expect_err("truncated nested container must fail closed");
+        assert!(
+            error.to_string().contains("Malformed DMAP data"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

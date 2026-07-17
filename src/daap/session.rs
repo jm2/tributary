@@ -441,19 +441,97 @@ fn invalid_reference(detail: &str) -> BackendError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Notify;
+    use tokio::task::JoinSet;
 
     use super::*;
 
     static REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    const MOCK_DEADLINE: Duration = Duration::from_secs(5);
+    const MOCK_REQUEST_HEADER_CAP: usize = 16 * 1024;
+    // Deliberately smaller than any real request line so every fixture test
+    // exercises fragmented socket reads deterministically.
+    const MOCK_READ_CHUNK_BYTES: usize = 7;
+
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    enum MockEndpoint {
+        ServerInfo,
+        Login,
+        Update,
+        Databases,
+        Items,
+        Stream,
+        Artwork,
+        Logout,
+        Other,
+    }
+
+    impl MockEndpoint {
+        fn classify(path: &str) -> Self {
+            if path.starts_with("/server-info") {
+                Self::ServerInfo
+            } else if path.starts_with("/login") {
+                Self::Login
+            } else if path.starts_with("/update?") {
+                Self::Update
+            } else if path.starts_with("/databases?") {
+                Self::Databases
+            } else if path.starts_with("/databases/1/items?") {
+                Self::Items
+            } else if path.starts_with("/databases/1/items/9.mp3?") {
+                Self::Stream
+            } else if path.starts_with("/databases/1/items/9/extra_data/artwork?") {
+                Self::Artwork
+            } else if path.starts_with("/logout?") {
+                Self::Logout
+            } else {
+                Self::Other
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct MockResponse {
+        status: &'static str,
+        content_type: &'static str,
+        body: Vec<u8>,
+    }
+
+    impl MockResponse {
+        fn dmap(body: Vec<u8>) -> Self {
+            Self {
+                status: "200 OK",
+                content_type: "application/x-dmap-tagged",
+                body,
+            }
+        }
+
+        fn status(status: &'static str) -> Self {
+            Self {
+                status,
+                content_type: "text/plain",
+                body: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct MockDaapState {
+        requests: Mutex<Vec<String>>,
+        scripted: Mutex<HashMap<MockEndpoint, VecDeque<MockResponse>>>,
+        handler_failures: Mutex<Vec<String>>,
+        request_changed: Notify,
+    }
 
     struct MockDaapServer {
         base_url: String,
-        requests: Arc<Mutex<Vec<String>>>,
+        state: Arc<MockDaapState>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -463,50 +541,89 @@ mod tests {
                 .await
                 .expect("bind mock DAAP server");
             let address = listener.local_addr().expect("mock address");
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let requests_for_task = Arc::clone(&requests);
+            let state = Arc::new(MockDaapState::default());
+            let state_for_task = Arc::clone(&state);
 
             let task = tokio::spawn(async move {
-                while let Ok((mut stream, _)) = listener.accept().await {
-                    let requests = Arc::clone(&requests_for_task);
-                    tokio::spawn(async move {
-                        let mut request = vec![0_u8; 16 * 1024];
-                        let Ok(read) = stream.read(&mut request).await else {
-                            return;
-                        };
-                        if read == 0 {
-                            return;
+                let mut handlers = JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => match accepted {
+                            Ok((stream, _)) => {
+                                let state = Arc::clone(&state_for_task);
+                                handlers.spawn(serve_mock_connection(state, stream));
+                            }
+                            Err(_) => break,
+                        },
+                        result = handlers.join_next(), if !handlers.is_empty() => {
+                            if let Some(Err(_)) = result {
+                                record_mock_failure(&state_for_task, "mock DAAP handler panicked");
+                            }
                         }
-                        let request = String::from_utf8_lossy(&request[..read]);
-                        let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
-                        requests
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(path.clone());
-
-                        let (status, content_type, body) = response_for(&path);
-                        let headers = format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        let _ = stream.write_all(headers.as_bytes()).await;
-                        let _ = stream.write_all(&body).await;
-                    });
+                    }
+                }
+                while let Some(result) = handlers.join_next().await {
+                    if result.is_err() {
+                        record_mock_failure(&state_for_task, "mock DAAP handler panicked");
+                    }
                 }
             });
 
             Self {
                 base_url: format!("http://{address}"),
-                requests,
+                state,
                 task,
             }
         }
 
+        fn enqueue(&self, endpoint: MockEndpoint, response: MockResponse) {
+            self.state
+                .scripted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(endpoint)
+                .or_default()
+                .push_back(response);
+        }
+
         fn paths(&self) -> Vec<String> {
-            self.requests
+            self.state
+                .requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
+        }
+
+        fn request_count(&self, endpoint: MockEndpoint) -> usize {
+            self.paths()
+                .iter()
+                .filter(|path| MockEndpoint::classify(path) == endpoint)
+                .count()
+        }
+
+        async fn wait_for_requests(&self, endpoint: MockEndpoint, expected: usize) {
+            tokio::time::timeout(MOCK_DEADLINE, async {
+                loop {
+                    let changed = self.state.request_changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if self.request_count(endpoint) >= expected {
+                        return;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("mock DAAP request must arrive before the test deadline");
+        }
+
+        fn assert_healthy(&self) {
+            let failures = self
+                .state
+                .handler_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(failures.is_empty(), "mock DAAP failures: {failures:?}");
         }
     }
 
@@ -516,6 +633,92 @@ mod tests {
         }
     }
 
+    async fn serve_mock_connection(state: Arc<MockDaapState>, mut stream: TcpStream) {
+        let path = match read_mock_request_path(&mut stream).await {
+            Ok(path) => path,
+            Err(reason) => {
+                record_mock_failure(&state, reason);
+                return;
+            }
+        };
+        state
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(path.clone());
+        state.request_changed.notify_waiters();
+
+        let response = response_for(&state, &path);
+        let headers = format!(
+            "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.status,
+            response.content_type,
+            response.body.len()
+        );
+        let write_result = tokio::time::timeout(MOCK_DEADLINE, async {
+            stream.write_all(headers.as_bytes()).await?;
+            stream.write_all(&response.body).await
+        })
+        .await;
+        if !matches!(write_result, Ok(Ok(()))) {
+            record_mock_failure(&state, "mock DAAP response write failed or timed out");
+        }
+    }
+
+    async fn read_mock_request_path(stream: &mut TcpStream) -> Result<String, &'static str> {
+        tokio::time::timeout(MOCK_DEADLINE, async {
+            let mut request = Vec::with_capacity(1024);
+            let mut chunk = [0_u8; MOCK_READ_CHUNK_BYTES];
+            loop {
+                let remaining = MOCK_REQUEST_HEADER_CAP.saturating_sub(request.len());
+                if remaining == 0 {
+                    return Err("mock DAAP request headers exceeded the cap");
+                }
+                let read_limit = remaining.min(chunk.len());
+                let read = stream
+                    .read(&mut chunk[..read_limit])
+                    .await
+                    .map_err(|_| "mock DAAP request read failed")?;
+                if read == 0 {
+                    return Err("mock DAAP request ended before complete headers");
+                }
+                request.extend_from_slice(&chunk[..read]);
+
+                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let header = &request[..header_end];
+                let request_line_end = header
+                    .windows(2)
+                    .position(|bytes| bytes == b"\r\n")
+                    .unwrap_or(header.len());
+                let request_line = std::str::from_utf8(&header[..request_line_end])
+                    .map_err(|_| "mock DAAP request line was not UTF-8")?;
+                let mut fields = request_line.split_whitespace();
+                if fields.next() != Some("GET") {
+                    return Err("mock DAAP request did not use GET");
+                }
+                let path = fields
+                    .next()
+                    .filter(|path| path.starts_with('/'))
+                    .ok_or("mock DAAP request path was missing")?;
+                return Ok(path.to_string());
+            }
+        })
+        .await
+        .map_err(|_| "mock DAAP request headers exceeded the deadline")?
+    }
+
+    fn record_mock_failure(state: &MockDaapState, reason: &str) {
+        state
+            .handler_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(reason.to_string());
+        state.request_changed.notify_waiters();
+    }
+
     async fn reset_registry() {
         shutdown_all().await;
         *lock_registry() = SessionRegistry::default();
@@ -523,11 +726,7 @@ mod tests {
     }
 
     fn logout_count(server: &MockDaapServer) -> usize {
-        server
-            .paths()
-            .iter()
-            .filter(|path| path.starts_with("/logout?"))
-            .count()
+        server.request_count(MockEndpoint::Logout)
     }
 
     #[tokio::test]
@@ -546,6 +745,278 @@ mod tests {
             .pending_attempts
             .iter()
             .any(|(key, _)| key == source_key));
+        reset_registry().await;
+    }
+
+    fn malformed_items_responses() -> Vec<(&'static str, MockResponse)> {
+        let wrong_top_level = MockResponse::dmap(tlv(
+            b"avdb",
+            &tlv(b"mlcl", &tlv(b"mlit", &tlv_u32(b"miid", 9))),
+        ));
+        let wrong_nested = MockResponse::dmap(tlv(
+            b"adbs",
+            &[tlv_u32(b"mstt", 200), tlv(b"mlit", &[])].concat(),
+        ));
+
+        let mut truncated_child = Vec::new();
+        truncated_child.extend_from_slice(b"mlit");
+        truncated_child.extend_from_slice(&16_u32.to_be_bytes());
+        truncated_child.extend_from_slice(b"short");
+        let malformed_nested = MockResponse::dmap(tlv(
+            b"adbs",
+            &[tlv_u32(b"mstt", 200), tlv(b"mlcl", &truncated_child)].concat(),
+        ));
+
+        let mut valid_prefix_then_truncated = tlv(b"mlit", &tlv_u32(b"miid", 9));
+        valid_prefix_then_truncated.extend_from_slice(&truncated_child);
+        let partial_listing = MockResponse::dmap(tlv(
+            b"adbs",
+            &[
+                tlv_u32(b"mstt", 200),
+                tlv(b"mlcl", &valid_prefix_then_truncated),
+            ]
+            .concat(),
+        ));
+
+        let mut truncated_top_level = Vec::new();
+        truncated_top_level.extend_from_slice(b"adbs");
+        truncated_top_level.extend_from_slice(&64_u32.to_be_bytes());
+        truncated_top_level.extend_from_slice(b"short");
+
+        let mut deep_listing = tlv(b"mlit", &[]);
+        for _ in 0..40 {
+            deep_listing = tlv(b"mlit", &deep_listing);
+        }
+        let excessive_nesting = MockResponse::dmap(tlv(
+            b"adbs",
+            &[tlv_u32(b"mstt", 200), tlv(b"mlcl", &deep_listing)].concat(),
+        ));
+        let short_status = MockResponse::dmap(tlv(
+            b"adbs",
+            &[tlv(b"mstt", &[0, 0, 200]), tlv(b"mlcl", &[])].concat(),
+        ));
+        let overlong_status = MockResponse::dmap(tlv(
+            b"adbs",
+            &[tlv(b"mstt", &[0, 0, 0, 200, 0]), tlv(b"mlcl", &[])].concat(),
+        ));
+        let duplicate_status = MockResponse::dmap(tlv(
+            b"adbs",
+            &[
+                tlv_u32(b"mstt", 200),
+                tlv_u32(b"mstt", 200),
+                tlv(b"mlcl", &[]),
+            ]
+            .concat(),
+        ));
+
+        vec![
+            ("wrong top-level container", wrong_top_level),
+            ("wrong nested container", wrong_nested),
+            ("malformed nested container", malformed_nested),
+            (
+                "valid item before malformed nested remainder",
+                partial_listing,
+            ),
+            (
+                "truncated top-level container",
+                MockResponse::dmap(truncated_top_level),
+            ),
+            ("excessive container nesting", excessive_nesting),
+            ("short response status", short_status),
+            ("overlong response status", overlong_status),
+            ("duplicate response status", duplicate_status),
+        ]
+    }
+
+    fn assert_bounded_parse_error(error: BackendError, case: &str) {
+        let BackendError::ParseError { message, .. } = error else {
+            panic!("{case}: expected typed parse failure, got {error}");
+        };
+        assert!(
+            message.len() <= 256,
+            "{case}: parse diagnostic must stay bounded: {message}"
+        );
+        assert!(!message.contains("session-id"));
+        assert!(!message.contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn adversarial_item_containers_fail_before_publication_and_logout_once() {
+        let _registry_guard = REGISTRY_TEST_LOCK.lock().await;
+        reset_registry().await;
+
+        for (case, response) in malformed_items_responses() {
+            let server = MockDaapServer::start().await;
+            server.enqueue(MockEndpoint::Items, response);
+            let source_key = format!("adversarial:{case}");
+            let attempt = begin_connect(source_key.clone()).expect("register connection attempt");
+
+            let outcome = tokio::time::timeout(
+                MOCK_DEADLINE,
+                DaapBackend::connect("Adversarial DAAP", &server.base_url, None),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: failure and cleanup must be bounded"));
+            let Err(error) = outcome else {
+                panic!("{case}: malformed catalogue must not publish a backend");
+            };
+            assert_bounded_parse_error(error, case);
+
+            drop(attempt);
+            assert!(
+                release_source(&source_key).is_none(),
+                "{case}: failed initial sync must not enter the session registry"
+            );
+            server.wait_for_requests(MockEndpoint::Logout, 1).await;
+            assert_eq!(server.request_count(MockEndpoint::Items), 1, "{case}");
+            assert_eq!(logout_count(&server), 1, "{case}");
+            assert_eq!(server.request_count(MockEndpoint::Stream), 0, "{case}");
+            assert_eq!(server.request_count(MockEndpoint::Artwork), 0, "{case}");
+            server.assert_healthy();
+        }
+
+        reset_registry().await;
+    }
+
+    fn in_band_items_status(status: u32) -> MockResponse {
+        MockResponse::dmap(tlv(b"adbs", &tlv_u32(b"mstt", status)))
+    }
+
+    #[tokio::test]
+    async fn session_expiration_fails_lifecycle_without_publication_and_logs_out_once() {
+        // libdmapsharing rejects an invalid database session with HTTP 403,
+        // while other peers use 401. Exercise both statuses on every
+        // post-login HTTP route plus both in-band item-response forms.
+        let _registry_guard = REGISTRY_TEST_LOCK.lock().await;
+        reset_registry().await;
+        let cases = [
+            (
+                "update HTTP 401",
+                MockEndpoint::Update,
+                MockResponse::status("401 Unauthorized"),
+            ),
+            (
+                "update HTTP 403",
+                MockEndpoint::Update,
+                MockResponse::status("403 Forbidden"),
+            ),
+            (
+                "databases HTTP 401",
+                MockEndpoint::Databases,
+                MockResponse::status("401 Unauthorized"),
+            ),
+            (
+                "databases HTTP 403",
+                MockEndpoint::Databases,
+                MockResponse::status("403 Forbidden"),
+            ),
+            (
+                "items HTTP 401",
+                MockEndpoint::Items,
+                MockResponse::status("401 Unauthorized"),
+            ),
+            (
+                "items HTTP 403",
+                MockEndpoint::Items,
+                MockResponse::status("403 Forbidden"),
+            ),
+            (
+                "items DMAP mstt 401",
+                MockEndpoint::Items,
+                in_band_items_status(401),
+            ),
+            (
+                "items DMAP mstt 403",
+                MockEndpoint::Items,
+                in_band_items_status(403),
+            ),
+        ];
+
+        for (case, endpoint, response) in cases {
+            let server = MockDaapServer::start().await;
+            server.enqueue(endpoint, response);
+            let source_key = format!("expired:{case}");
+            let attempt = begin_connect(source_key.clone()).expect("register connection attempt");
+
+            let outcome = tokio::time::timeout(
+                MOCK_DEADLINE,
+                DaapBackend::connect("Expired DAAP", &server.base_url, None),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: expiration must be bounded"));
+            let Err(error) = outcome else {
+                panic!("{case}: expired session must prevent backend construction");
+            };
+            assert!(
+                matches!(
+                    error,
+                    BackendError::AuthenticationFailed { ref message }
+                        if message == "DAAP session expired or unauthorized"
+                ),
+                "{case}: unexpected expiration error: {error}"
+            );
+
+            drop(attempt);
+            assert!(
+                release_source(&source_key).is_none(),
+                "{case}: failed session must never enter the registry"
+            );
+            server.wait_for_requests(MockEndpoint::Logout, 1).await;
+            assert_eq!(server.request_count(MockEndpoint::ServerInfo), 1, "{case}");
+            assert_eq!(server.request_count(MockEndpoint::Login), 1, "{case}");
+            assert_eq!(server.request_count(MockEndpoint::Update), 1, "{case}");
+            assert_eq!(
+                server.request_count(MockEndpoint::Databases),
+                usize::from(endpoint != MockEndpoint::Update),
+                "{case}"
+            );
+            assert_eq!(
+                server.request_count(MockEndpoint::Items),
+                usize::from(endpoint == MockEndpoint::Items),
+                "{case}"
+            );
+            assert_eq!(logout_count(&server), 1, "{case}");
+            assert_eq!(server.request_count(MockEndpoint::Stream), 0, "{case}");
+            assert_eq!(server.request_count(MockEndpoint::Artwork), 0, "{case}");
+            server.assert_healthy();
+        }
+
+        reset_registry().await;
+    }
+
+    #[tokio::test]
+    async fn non_auth_dmap_status_fails_lifecycle_and_logs_out_once() {
+        let _registry_guard = REGISTRY_TEST_LOCK.lock().await;
+        reset_registry().await;
+        let server = MockDaapServer::start().await;
+        server.enqueue(MockEndpoint::Items, in_band_items_status(500));
+        let source_key = "non-auth-status".to_string();
+        let attempt = begin_connect(source_key.clone()).expect("register connection attempt");
+
+        let outcome = tokio::time::timeout(
+            MOCK_DEADLINE,
+            DaapBackend::connect("Failed DAAP", &server.base_url, None),
+        )
+        .await
+        .expect("DMAP failure must be bounded");
+        let Err(error) = outcome else {
+            panic!("non-success DMAP status must fail");
+        };
+        assert!(matches!(
+            error,
+            BackendError::ConnectionFailed {
+                ref message,
+                source: None
+            } if message == "DAAP items returned status 500"
+        ));
+
+        drop(attempt);
+        assert!(release_source(&source_key).is_none());
+        server.wait_for_requests(MockEndpoint::Logout, 1).await;
+        assert_eq!(logout_count(&server), 1);
+        assert_eq!(server.request_count(MockEndpoint::Stream), 0);
+        assert_eq!(server.request_count(MockEndpoint::Artwork), 0);
+        server.assert_healthy();
         reset_registry().await;
     }
 
@@ -896,39 +1367,38 @@ mod tests {
         );
     }
 
-    fn response_for(path: &str) -> (&'static str, &'static str, Vec<u8>) {
-        if path.starts_with("/server-info") {
+    fn response_for(state: &MockDaapState, path: &str) -> MockResponse {
+        let endpoint = MockEndpoint::classify(path);
+        let scripted_response = {
+            let mut scripted = state
+                .scripted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            scripted.get_mut(&endpoint).and_then(VecDeque::pop_front)
+        };
+        if let Some(response) = scripted_response {
+            return response;
+        }
+
+        if endpoint == MockEndpoint::ServerInfo {
             let children = [tlv_u32(b"mstt", 200), tlv(b"minm", b"Mock DAAP")].concat();
-            return (
-                "200 OK",
-                "application/x-dmap-tagged",
-                tlv(b"msrv", &children),
-            );
+            return MockResponse::dmap(tlv(b"msrv", &children));
         }
-        if path.starts_with("/login") {
-            return (
-                "200 OK",
-                "application/x-dmap-tagged",
-                tlv(b"mlog", &tlv_u32(b"mlid", 42)),
-            );
+        if endpoint == MockEndpoint::Login {
+            let children = [tlv_u32(b"mstt", 200), tlv_u32(b"mlid", 42)].concat();
+            return MockResponse::dmap(tlv(b"mlog", &children));
         }
-        if path.starts_with("/update?") {
-            return (
-                "200 OK",
-                "application/x-dmap-tagged",
-                tlv(b"mupd", &tlv_u32(b"musr", 7)),
-            );
+        if endpoint == MockEndpoint::Update {
+            let children = [tlv_u32(b"mstt", 200), tlv_u32(b"musr", 7)].concat();
+            return MockResponse::dmap(tlv(b"mupd", &children));
         }
-        if path.starts_with("/databases?") {
+        if endpoint == MockEndpoint::Databases {
             let database = [tlv_u32(b"miid", 1), tlv(b"minm", b"Music")].concat();
             let listing = tlv(b"mlcl", &tlv(b"mlit", &database));
-            return (
-                "200 OK",
-                "application/x-dmap-tagged",
-                tlv(b"avdb", &listing),
-            );
+            let children = [tlv_u32(b"mstt", 200), listing].concat();
+            return MockResponse::dmap(tlv(b"avdb", &children));
         }
-        if path.starts_with("/databases/1/items?") {
+        if endpoint == MockEndpoint::Items {
             let track = [
                 tlv_u32(b"miid", 9),
                 tlv(b"minm", b"Lifecycle Song"),
@@ -938,22 +1408,31 @@ mod tests {
             ]
             .concat();
             let listing = tlv(b"mlcl", &tlv(b"mlit", &track));
-            return (
-                "200 OK",
-                "application/x-dmap-tagged",
-                tlv(b"adbs", &listing),
-            );
+            let children = [tlv_u32(b"mstt", 200), listing].concat();
+            return MockResponse::dmap(tlv(b"adbs", &children));
         }
-        if path.starts_with("/databases/1/items/9.mp3?") {
-            return ("200 OK", "audio/mpeg", b"mock audio".to_vec());
+        if endpoint == MockEndpoint::Stream {
+            return MockResponse {
+                status: "200 OK",
+                content_type: "audio/mpeg",
+                body: b"mock audio".to_vec(),
+            };
         }
-        if path.starts_with("/databases/1/items/9/extra_data/artwork?") {
-            return ("200 OK", "image/png", b"mock artwork".to_vec());
+        if endpoint == MockEndpoint::Artwork {
+            return MockResponse {
+                status: "200 OK",
+                content_type: "image/png",
+                body: b"mock artwork".to_vec(),
+            };
         }
-        if path.starts_with("/logout?") {
-            return ("200 OK", "application/x-dmap-tagged", Vec::new());
+        if endpoint == MockEndpoint::Logout {
+            return MockResponse::dmap(Vec::new());
         }
-        ("404 Not Found", "text/plain", b"not found".to_vec())
+        MockResponse {
+            status: "404 Not Found",
+            content_type: "text/plain",
+            body: b"not found".to_vec(),
+        }
     }
 
     fn tlv(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {

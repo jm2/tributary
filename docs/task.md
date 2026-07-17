@@ -31,8 +31,8 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**205/223 (91.9%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
-and **15/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**207/223 (92.8%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
+and **17/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -48,11 +48,13 @@ document already labels its diagram as intended and names the shipping abstracti
 P3.5 now reports every Linux-host source area in one pinned aggregate, keeps different native
 source sets as informational reports, and enforces the baseline accepted by two exact pinned PR
 executions in PR #111.
-The prepared P3.3 service-mock slices deliberately do not change this arithmetic yet: this branch
-adds the shared harness plus every non-DAAP success-path fixture, while the DAAP fixture remains on
-the separate prepared commit `6f6c9ac`. The compound service-mock checkbox can close only after both
-slices are integrated; the behavior-matrix and implementation-record boxes remain independently
-open.
+This P3.3 integration combines the independently reviewed non-DAAP service fixture from
+`b80e534` with the independently reviewed DAAP adversarial fixture from `6f6c9ac`. Their source
+merges cleanly over the accepted P3.1/P3.2 predecessors, and both reviews reported no actionable
+findings. The combined coverage closes the all-services mock box and the DAAP
+malformed-container/session-expiration box. The cross-service auth, redirect, timeout, body-cap,
+pagination, partial-failure, and reverse-proxy-prefix matrix remains open, as does P3.3's final
+implementation record.
 P2.10 is complete in PR #112. Legacy MPD outputs remain unconfirmed until the exact endpoint is
 re-added with the required localized checkbox; their public load boundary rejects playback before
 optimistic Buffering state, epoch advancement, worker enqueue/cleanup, MPD connection, MPD
@@ -1507,35 +1509,62 @@ values and invalid persisted `TrackId` fallback remain explicitly assigned to P3
 
 ### P3.3 Add network integration harnesses
 
-- [ ] Mock Subsonic, Jellyfin, Plex, DAAP, Radio-Browser, and geolocation services.
-  - Prepared non-DAAP slice: one shared loopback fixture matches concurrent requests by method,
-    exact path, and decoded query subset; queues bounded replies; records bounded bodies and
-    headers; treats an unexpected, ambiguous, over-count, or missing request as a test failure; and
-    performs explicit five-second graceful shutdown with abort-on-drop cleanup.
-  - Subsonic's existing live regression now uses that fixture and additionally proves every API
-    request carries the expected username, protocol/client/format values, salt, and correctly
-    derived token without the legacy plaintext parameter. New live tests connect complete Jellyfin
-    and Plex backends, prove their credential headers on all five expected requests, filter
-    non-music libraries, and map one track/album/artist catalogue despite Jellyfin's concurrent
-    item fetches. Radio-Browser proves its request contract and rejects a returned `file:` stream;
-    geolocation proves a valid first provider ends the cascade before either later endpoint is
-    contacted.
-  - DAAP remains untouched here. Its bounded endpoint-scripted fixture is prepared separately in
-    commit `6f6c9ac`; this compound box stays open until that change and this non-DAAP slice are both
-    integrated.
-  - Prepared-branch validation passes the five live service paths (four net-new tests plus the
-    migrated Subsonic regression), strict debug and release Clippy over every target/feature,
-    formatting, and diff hygiene. The complete locked debug and release suites each pass 18 library
-    tests, 735 application tests, and 10 repository metadata tests: 763 total.
+- [x] Mock Subsonic, Jellyfin, Plex, DAAP, Radio-Browser, and geolocation services.
+  - The five non-DAAP production success paths share one loopback fixture that matches concurrent
+    requests by method, exact path, and decoded query subset; queues bounded replies; records
+    bounded bodies and headers; treats an unexpected, ambiguous, over-count, or missing request as
+    a test failure; and performs explicit five-second graceful shutdown with abort-on-drop cleanup.
+  - Subsonic's existing live regression now proves every API request carries the expected username,
+    protocol/client/format values, salt, and correctly derived token without the legacy plaintext
+    parameter. Jellyfin and Plex tests connect complete backends, prove credential headers on all
+    five expected requests, filter non-music libraries, and map one track/album/artist catalogue
+    despite Jellyfin's concurrent item fetches. Radio-Browser proves its request contract and
+    rejects a returned `file:` stream; geolocation proves a valid first provider ends the cascade
+    before either later endpoint is contacted.
+  - DAAP uses a separate protocol-appropriate raw-socket fixture. It is deterministic,
+    endpoint-scripted, deadline/header-capped, fragmentation-forcing, stateful, and owns its handler
+    tasks. Integrating that fixture with the five non-DAAP success fixtures closes this all-services
+    box. Independent reviews of source commits `b80e534` and `6f6c9ac` reported no actionable
+    findings.
 - [ ] Cover auth, redirect, timeout, body cap, pagination, partial failure, and reverse-proxy
   prefix behavior.
-  - The success fixtures above establish real request/response wiring only. They do not claim the
-    rejected/alternate-auth, redirect, deadline, oversized-response, multi-page, partial-failure,
-    or prefixed-origin cases required to close this behavior box.
-- [ ] Cover DAAP malformed nested containers and session expiration.
-- [ ] Record implementation: _pending; prepared foundation is branch
-  `agent/p3.3-service-mocks` plus DAAP commit `6f6c9ac`, with no P3.3 checkbox or numerator change
-  until its compound dependencies are integrated and the remaining behavior matrix is complete._
+  - The five non-DAAP fixtures establish successful production request/response wiring only. DAAP
+    adds malformed-container and session-expiration adversarial coverage, but neither slice claims
+    the rejected/alternate-auth, redirect, deadline, oversized-response, multi-page,
+    partial-failure, or prefixed-origin cases across every named service required to close this
+    behavior box.
+- [x] Cover DAAP malformed nested containers and session expiration. The DAAP socket fixture reads
+  through `CRLFCRLF` in forced seven-byte fragments under a 16 KiB header cap and five-second
+  deadline, and owns/cancels spawned handlers through a `JoinSet`. Nine catalogue cases cover a
+  wrong top-level container, a missing/wrong listing container, truncated top-level and nested
+  framing, a valid `mlit` prefix followed by a malformed remainder, nesting beyond the parser
+  limit, short and overlong integer status fields, and duplicate `mstt`. Every known DMAP integer
+  type now requires its exact width rather than accepting a valid prefix or treating malformed data
+  as Raw. Eight post-login expiration cases cover HTTP 401 and 403 independently on update,
+  databases, and items plus in-band item `mstt` 401 and 403; an explicit `mstt` 500 proves
+  non-authentication classification. Each case has a five-second test deadline and fixed typed
+  error. The tests drive `DaapBackend::connect` through a real connection attempt, prove the failed
+  backend never enters the session registry and issues no stream/artwork request, and observe
+  exactly one automatic bounded logout.
+- [ ] Record implementation: _the combined service harness and DAAP adversarial/session-expiration
+  slice are implemented in source commits `b80e534` and `6f6c9ac`; the cross-service behavior
+  matrix above remains incomplete, so P3.3 as a whole and its final implementation record remain
+  open._
+
+Protocol decision and compatibility boundary: GNOME's primary `libdmapsharing` implementation
+[returns HTTP 403 for an invalid DAAP session on database routes](https://gitlab.gnome.org/GNOME/libdmapsharing/-/blob/de7af2940a7cfbe626fa063dd89dab41e04170ce/libdmapsharing/dmap-share.c#L605-608),
+[emits HTTP-shaped `mstt` values in successful DMAP responses](https://gitlab.gnome.org/GNOME/libdmapsharing/-/blob/de7af2940a7cfbe626fa063dd89dab41e04170ce/libdmapsharing/dmap-share.c#L745-825),
+and [its client rejects an explicit non-200 `mstt`](https://gitlab.gnome.org/GNOME/libdmapsharing/-/blob/de7af2940a7cfbe626fa063dd89dab41e04170ce/libdmapsharing/dmap-connection.c#L900-936).
+Tributary therefore treats either HTTP 401/403 or in-band `mstt` 401/403 as an expired/unauthorized
+session, maps any other explicit non-200 `mstt` to a connection failure, and continues to accept
+an absent `mstt` on login or later session responses for older peers; server-info retains its
+pre-existing mandatory-success-status rule. A present status must be one exact-width U32 and unique
+within its response container. The shared HTTP classifier covers every post-login session-bound
+control or catalogue route; once login yields a usable session ID, any later failure attempts one
+bounded logout before returning. This closes the DAAP malformed/session-expiration box without
+claiming the remaining cross-service behavior matrix.
+
+Combined-branch validation: pending rerun after integration.
 
 ### P3.4 Add UI/output integration harnesses
 
@@ -1942,8 +1971,26 @@ Record scope or design decisions here so deferred work is explicit.
   lifecycle failures. Explicit `finish` both bounds graceful shutdown and verifies no route was
   missed, while `Drop` remains cleanup-only so panic unwinding cannot leak a server task. The first
   slice intentionally tests only one successful production flow per non-DAAP service. It does not
-  silently convert that foundation into credit for P3.3's adversarial behavior matrix, and it does
-  not edit `src/daap/**` while the independently prepared DAAP work awaits integration.
+  silently convert that foundation into credit for P3.3's adversarial behavior matrix. DAAP's
+  protocol-appropriate raw-socket fixture is integrated separately; together they close the named
+  service-mock box while leaving the cross-service behavior matrix open.
+
+- 2026-07-17 — The P3.3 DAAP harness treats authentication/session status as a two-layer wire
+  contract. HTTP 401 and 403 both mean the session is unauthorized or expired because a primary
+  DAAP implementation uses 403 for an invalid database session. When a successfully decoded
+  response carries `mstt`, 401/403 have the same typed meaning and every other non-200 value is a
+  typed connection failure; missing `mstt` remains accepted on login and later session responses
+  for compatibility with older peers, while server-info still requires success status. A present
+  status must be a unique exact-width U32, and every other known integer tag likewise requires its
+  exact protocol width. Known nested DMAP containers must consume their entire payload, so even a
+  valid item prefix followed by a malformed remainder cannot become a partial catalogue. Update,
+  databases, and items share the same HTTP classifier, and one bounded logout is attempted for
+  every failure after login has yielded a usable session ID—including before a complete client can
+  be returned. Diagnostics are fixed and bounded rather than formatting peer-controlled remaining
+  bytes. The fixture proves the failed initial sync never enters the registry, issues no media
+  request, and sends exactly one logout. This closes the DAAP
+  malformed-container/session-expiration box and, alongside the non-DAAP fixture, the named
+  service-mock box; the broader P3.3 behavior matrix and final implementation record remain open.
 
 - 2026-07-17 — PR #112 completes P2.10 by requiring an explicit, persisted
   exclusive-control promise rather than pretending MPD offers an ownership lock or conditional
@@ -2534,6 +2581,7 @@ Add one line per completed task:
 | 2026-07-16 | P2.10 cancellable MPD resolution (partial) | PR #106 | Replaces blocking `ToSocketAddrs` with a process-lifetime private-context GIO resolver. Capacity-64, 1-KiB-host ingress processes at most 16 requests per context tick and caps active operations at eight; overload fails closed and callbacks run between batches. One absolute load/probe deadline spans resolution, connection, and greeting, while lifecycle supersession or result loss cancels GIO and late callback sends/drops remain on the resolver thread. Numeric addresses bypass DNS; enumerated results preserve order and IPv6 flowinfo/scope while deduplicating to 32. Nine net-new regressions plus one expanded raw/bracketed IPv6 case cover the contract. PR #107 follows with slow-greeting/real-IPv6 socket coverage; only exclusive-control/global-option semantics remain open. |
 | 2026-07-16 | P2.10 MPD real-socket coverage (partial) | PR #107 | Completes the compound socket-coverage item begun by PR #105's held-ACK FIFO peer. A channel-held silent first IPv4 greeting proves the shared absolute deadline preserves a fair slice for a later address without sleeps or elapsed-time thresholds. A real `::1` listener proves numeric resolution, connection, greeting, and IPv6 client/peer addresses; only an unavailable initial IPv6 bind skips that capability-specific case. Two net-new regressions bring the focused MPD suite to 79. Only exclusive-control/global-option semantics remain open. |
 | 2026-07-17 | P2.10 MPD exclusive-control contract | PR #112 | Persists an explicit legacy-default-false mode; requires localized partition-wide warning and one-controller confirmation; upgrades an exact endpoint in place; makes mode part of output identity; refuses unconfirmed public loads before Buffering/epoch/enqueue while retaining retry state; and independently gates every load intent—including pre-dispatch rejection—in the worker before cleanup, MPD connection/state/options, protected tickets, or queue mutation. Foreign-ID relinquishment remains fail-safe even when the confirmed deployment promise is violated. Nine focused migration, upsert, identity, boundary/worker zero-action, retry, and localization tests cover the final slice. Two actionable Codex findings were fixed and resolved; the final review and full native/package CI matrix passed. |
+| 2026-07-17 | P3.3 service fixtures and DAAP adversarial/session harness (partial) | `b80e534`, `6f6c9ac` | Adds one bounded keyed HTTP fixture for five non-DAAP production success paths and integrates DAAP's protocol-appropriate deadline/header-capped, fragmentation-forcing, endpoint-scripted raw-socket fixture with owned handlers. DAAP rejects nine wrong, truncated, over-deep, invalid-width, duplicate-status, or valid-prefix/malformed-remainder catalogue forms without registry publication or media access; shares HTTP 401/403 expiration handling across update/databases/items; classifies in-band 401/403 and non-auth `mstt`; and proves fixed diagnostics plus one automatic bounded logout after every post-login failure. Independent reviews found no actionable issues. This closes the named all-services mock and DAAP malformed/session-expiration boxes; the cross-service adversarial behavior matrix and final P3.3 implementation record remain open. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
 | 2026-07-16 | P2.11 deterministic HTTP compatibility (partial) | PR #108 | Preserves exact escaped reverse-proxy prefixes across DAAP stream/artwork and Subsonic API/media construction, carries DAAP's four fixed protocol headers through a separate strict non-secret allowlist into protected stream and artwork fetches, retains receiver `Range` as the only forwarded header, proves existing typed Subsonic HTTP-200 failures, and exercises explicit upstream proxy selection at the asynchronous protected-fetch boundary. Seven net-new regressions cover the contracts. At PR #108, full fake GStreamer, packaged source-policy, and live Windows playback validation remained open; the following slice closes the fake-GStreamer part. |
