@@ -40,7 +40,7 @@ PR #105, the cancellable resolver box implemented in PR #106, and the
 held-ACK/slow-greeting/real-IPv6 coverage box completed by PR #107, since the earlier snapshot. The
 deterministic protected-HTTP compatibility box under P2.11 is also complete in PR #108. The
 process-isolated real-GStreamer fake-backend box under P2.11 is complete in PR #109. The packaged
-Windows plugin/source-policy/decode probe is implemented on the current branch, but its checkbox
+Windows plugin/source-policy/decode probe is implemented in PR #110, but its checkbox
 awaits successful execution in both native Windows PR jobs; live Windows DAAP and Subsonic playback
 also remains open. The P3.2 README claim was re-audited and closed because the
 document already labels its diagram as intended and names the shipping abstraction gaps exactly.
@@ -1231,9 +1231,9 @@ failed through the separately resolved media path—but did not prove DNS was th
   connection, and teardown waits remain independently bounded. PowerShell applies the enclosing
   90-second process-tree deadline, a 1 MiB output-flood threshold with bounded diagnostic tails, an
   exact success sentinel, and exception-safe cleanup. Both native Windows CI architectures and the
-  release bundle path invoke
-  this same pre-archive script; the later installer-only step consumes that already-probed tree.
-  Implementation is complete on the current branch; acceptance and this checkbox await successful
+  release bundle path invoke this same pre-archive script; the later installer-only step consumes
+  that already-probed tree.
+  Implementation is complete in PR #110; acceptance and this checkbox await successful
   execution in both native Windows PR jobs. The intentionally deferred live release-workflow run is
   not required because CI invokes the identical bundling/probe path on both supported architectures.
 - [ ] Record live playback from a packaged Windows artifact against the reported DAAP and Subsonic
@@ -1344,7 +1344,7 @@ PR #94's containerized Flatpak build proved the manifest-local source generation
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
 
-Most recent local branch validation (2026-07-17, packaged-Windows P2.11 slice before PR CI):
+Most recent local branch validation (2026-07-17, PR #110 packaged-Windows P2.11 slice before CI):
 `cargo check --all-targets --all-features --locked` and
 `cargo test --all-targets --all-features --locked` pass in debug and release, as does strict
 all-target/all-feature Clippy in both profiles. Each full profile passes 18 library, 716
@@ -2045,4 +2045,4 @@ Add one line per completed task:
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
 | 2026-07-16 | P2.11 deterministic HTTP compatibility (partial) | PR #108 | Preserves exact escaped reverse-proxy prefixes across DAAP stream/artwork and Subsonic API/media construction, carries DAAP's four fixed protocol headers through a separate strict non-secret allowlist into protected stream and artwork fetches, retains receiver `Range` as the only forwarded header, proves existing typed Subsonic HTTP-200 failures, and exercises explicit upstream proxy selection at the asynchronous protected-fetch boundary. Seven net-new regressions cover the contracts. At PR #108, full fake GStreamer, packaged source-policy, and live Windows playback validation remained open; the following slice closes the fake-GStreamer part. |
 | 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
-| 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | _current PR_ | The completed Windows distribution bundles and dependency-scans its own GStreamer plugin scanner, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Both native architectures must prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
+| 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution bundles and dependency-scans its own GStreamer plugin scanner, directly preflights that exact helper, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Both native architectures must prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
