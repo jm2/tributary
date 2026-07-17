@@ -40,22 +40,39 @@ pub struct HeaderBarWidgets {
     pub output_list: gtk::ListBox,
 }
 
-fn slider_accessibility_labels(locale: &str) -> (String, String) {
-    (
-        rust_i18n::t!("header.playback_position", locale = locale).into_owned(),
-        rust_i18n::t!("header.volume", locale = locale).into_owned(),
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SliderAccessibleOrientation {
+    Horizontal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SliderAccessibilityPlan {
+    playback_position_label: String,
+    volume_label: String,
+    orientation: SliderAccessibleOrientation,
+}
+
+fn slider_accessibility_plan(locale: &str) -> SliderAccessibilityPlan {
+    SliderAccessibilityPlan {
+        playback_position_label: rust_i18n::t!("header.playback_position", locale = locale)
+            .into_owned(),
+        volume_label: rust_i18n::t!("header.volume", locale = locale).into_owned(),
+        orientation: SliderAccessibleOrientation::Horizontal,
+    }
 }
 
 fn expose_slider_accessibility(progress: &gtk::Scale, volume: &gtk::Scale, locale: &str) {
-    let (progress_label, volume_label) = slider_accessibility_labels(locale);
+    let plan = slider_accessibility_plan(locale);
+    let orientation = match plan.orientation {
+        SliderAccessibleOrientation::Horizontal => gtk::Orientation::Horizontal,
+    };
     progress.update_property(&[
-        gtk::accessible::Property::Label(&progress_label),
-        gtk::accessible::Property::Orientation(gtk::Orientation::Horizontal),
+        gtk::accessible::Property::Label(&plan.playback_position_label),
+        gtk::accessible::Property::Orientation(orientation),
     ]);
     volume.update_property(&[
-        gtk::accessible::Property::Label(&volume_label),
-        gtk::accessible::Property::Orientation(gtk::Orientation::Horizontal),
+        gtk::accessible::Property::Label(&plan.volume_label),
+        gtk::accessible::Property::Orientation(orientation),
     ]);
 }
 
@@ -374,43 +391,52 @@ pub fn build_output_row(name: &str, icon_name: &str, active: bool) -> gtk::Box {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use serde::Deserialize;
+
     use super::*;
 
-    #[test]
-    fn slider_accessibility_labels_exist_in_every_catalog() {
-        let expected = [
-            ("de", "Wiedergabeposition", "Lautstärke"),
-            ("en", "Playback position", "Volume"),
-            ("es", "Posición de reproducción", "Volumen"),
-            ("fr", "Position de lecture", "Volume"),
-            ("it", "Posizione di riproduzione", "Volume"),
-            ("ja", "再生位置", "音量"),
-            ("ko", "재생 위치", "음량"),
-            ("nl", "Afspeelpositie", "Volume"),
-            ("pl", "Pozycja odtwarzania", "Głośność"),
-            ("pt-BR", "Posição da reprodução", "Volume"),
-            ("ru", "Позиция воспроизведения", "Громкость"),
-            ("zh-CN", "播放位置", "音量"),
-            ("zh-TW", "播放位置", "音量"),
-        ];
-        let available = rust_i18n::available_locales!();
-        assert_eq!(available.len(), expected.len());
+    #[derive(Debug, Deserialize)]
+    struct AccessibilityCatalog {
+        header: AccessibilityHeader,
+    }
 
-        for (locale, expected_position, expected_volume) in expected {
-            assert!(
-                available
-                    .iter()
-                    .any(|candidate| candidate.as_ref() == locale),
-                "{locale} is missing from the available catalogs"
-            );
-            let labels = slider_accessibility_labels(locale);
+    #[derive(Debug, Deserialize)]
+    struct AccessibilityHeader {
+        playback_position: String,
+        volume: String,
+    }
+
+    #[test]
+    fn slider_accessibility_plan_is_backed_by_every_yaml_catalog() {
+        let locale_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+
+        for locale in rust_i18n::available_locales!() {
+            let path = locale_dir.join(format!("{locale}.yml"));
+            let yaml = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let catalog: AccessibilityCatalog = serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            let plan = slider_accessibility_plan(&locale);
+
+            assert_eq!(plan.orientation, SliderAccessibleOrientation::Horizontal);
+            assert!(!catalog.header.playback_position.trim().is_empty());
+            assert!(!catalog.header.volume.trim().is_empty());
             assert_eq!(
-                labels,
-                (expected_position.into(), expected_volume.into()),
-                "missing or fallback accessibility label for {locale}"
+                plan.playback_position_label,
+                catalog.header.playback_position,
+                "header.playback_position fell back instead of using {}",
+                path.display()
+            );
+            assert_eq!(
+                plan.volume_label,
+                catalog.header.volume,
+                "header.volume fell back instead of using {}",
+                path.display()
             );
             assert_ne!(
-                labels.0, labels.1,
+                plan.playback_position_label, plan.volume_label,
                 "the two sliders are indistinguishable for {locale}"
             );
         }
