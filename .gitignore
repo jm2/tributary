@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+/coverage/
 **/*.rs.bk
 
 # IDE

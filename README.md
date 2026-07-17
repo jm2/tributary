@@ -336,20 +336,46 @@ Clippy runs with `clippy::pedantic` and `clippy::nursery` enabled crate-wide (co
 ### Testing & Code Quality
 
 ```bash
-# Run all tests (unit + proptest property-based):
-cargo test
+# Run every host target and feature (unit, integration, and proptest suites):
+cargo test --all-targets --all-features --locked
 
-# Quick coverage summary (requires cargo-llvm-cov):
-cargo llvm-cov --summary-only
+# Install the exact compiler, LLVM tools, and coverage frontend used by CI:
+rustup toolchain install 1.92.0 --profile minimal --component llvm-tools-preview
+cargo +1.92.0 install cargo-llvm-cov --version 0.8.7 --locked
 
-# Full HTML coverage report:
-cargo llvm-cov --html --output-dir coverage
+# Run the Linux x86_64 coverage gate and print its summary:
+minimum="$(tr -d '[:space:]' < coverage-baseline.txt)"
+cargo +1.92.0 llvm-cov clean --workspace
+cargo +1.92.0 llvm-cov --all-targets --all-features --locked --summary-only \
+  --fail-under-lines "$minimum"
+
+# Or generate the complete HTML report:
+cargo +1.92.0 llvm-cov --all-targets --all-features --locked --html \
+  --output-dir coverage --fail-under-lines "$minimum"
 ```
+
+CI's comparable coverage metric is one aggregate Linux x86_64 run pinned to Rust 1.92.0,
+`llvm-tools-preview`, cargo-llvm-cov 0.8.7, the committed dependency lockfile, every host target,
+and every feature. It does not exclude UI, backend, migration, desktop-integration, or entry-point
+files. Every test suite still executes; cargo-llvm-cov's default omission of test-only source files
+keeps the percentage a production-code denominator. Other Linux architectures, macOS, and Windows
+`--coverage`/`-Coverage` helpers report their native source sets too, but those summaries are
+informational because they use the active compiler and conditional code cannot produce the same
+percentage as the pinned Linux x86_64 job.
+
+[`coverage-baseline.txt`](coverage-baseline.txt) is the minimum accepted line percentage. To raise
+it, run the canonical clean Linux command twice, take the lower total, round down to one decimal,
+and subtract 0.1 percentage point for instrumentation noise. CI enforces the checked-in value but
+does not compare it with the base branch. The repository review policy treats the floor as a
+ratchet: ordinary changes keep or raise it, while lowering it requires a dedicated
+measurement-definition change that explains the source-set or tooling change and records a new
+two-run baseline. This is not a claim that every platform branch is exercised by one host.
 
 CI automatically runs on every push/PR:
 - **Security audit** — `cargo audit` checks dependencies against the RustSec Advisory Database
 - **Pedantic Clippy** — `clippy::pedantic` + `clippy::nursery` with `-D warnings`
-- **Code coverage** — `cargo-llvm-cov` HTML report uploaded as a CI artifact (Linux x86_64)
+- **Code coverage** — pinned, comprehensive `cargo-llvm-cov` Linux x86_64 line-floor gate governed
+  by the repository review ratchet, plus an HTML report uploaded even when the threshold fails
 - **Weekly fuzzing** — `cargo-fuzz` target for the DMAP binary parser (5 min, Sundays)
 
 ---
