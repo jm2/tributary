@@ -31,12 +31,13 @@ has five independently verifiable tasks rather than the original three compound 
 denominator excludes the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**182/220 (82.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **65/76 P2**,
+**185/220 (84.1%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **68/76 P2**,
 and **3/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
-closed by PR #101 and the four P2.8 Chromecast-deadline boxes closed by PR #102, since the earlier
-snapshot. The release-workflow dry run remains deliberately deferred rather than being counted as
-unfinished P0 remediation.
+closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
+ACK/terminal/orphan-semantics boxes implemented in PR #104, since the earlier snapshot.
+The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
+P0 remediation.
 
 ## P0 — Release blockers
 
@@ -1038,14 +1039,37 @@ error that tells the user what to install.
 - [ ] Eliminate the shared-partition race between ownership revalidation and MPD's global pause or
   stop commands, and the unguarded global side effects of load-time option resets, or require a
   detectable exclusive-control configuration.
-- [ ] Retain only redacted ACK error codes so cleanup can distinguish a missing song ID from a
-  permission or argument rejection without keeping server-controlled text.
-- [ ] Define semantics for an external Next/queue edit that yields stopped/no current song; MPD
-  exposes the same completion proof as natural queue exhaustion.
-- [ ] Clean up or deliberately retain Tributary's queued ID after an observed foreign replacement
-  without disturbing foreign playback.
+- [x] Retain only redacted ACK error codes so cleanup can distinguish a missing song ID from a
+  permission or argument rejection without keeping server-controlled text. The response parser
+  retains only a closed typed code from MPD's numeric ACK header and discards the command-list
+  index, echoed command name, and all trailing server text after validating that the single-command
+  index is zero and the echo matches the outstanding command. Code 50 (`NoExist`) is the only ACK
+  that proves a targeted queue ID is already absent; permission, argument, password, system,
+  valid-but-unknown, and every other correlated rejection remain synchronized failures, never
+  successful cleanup. Malformed or mismatched ACK-like input poisons the connection.
+- [x] Define semantics for an external Next/queue edit that yields stopped/no current song; MPD
+  exposes the same completion proof as natural queue exhaustion. After Tributary has observed its
+  item active, stopped/no-current followed by a successful targeted `deleteid` is completion: the
+  owned entry still existed and was atomically removed. This deliberately treats an external Next
+  past the final item like natural exhaustion because MPD exposes no stronger distinction. A
+  `NoExist` ACK instead proves only that the ID was already absent—whether because another client
+  deleted/cleared it or for another external reason—so Tributary reports ownership loss and never
+  emits a false end-of-track event; any other ACK is a real cleanup failure, not absence evidence.
+- [x] Clean up or deliberately retain Tributary's queued ID after an observed foreign replacement
+  without disturbing foreign playback. Shared-partition mode deliberately retains it: status and
+  `deleteid` cannot form one conditional operation, so the foreign client could select Tributary's
+  ID between revalidation and deletion. Tributary relinquishes the session and revokes any
+  protected ticket, leaving a possibly playable direct-media entry—or a protected entry whose
+  revoked opaque ticket will fail—rather than risking deletion of what has become current. No
+  retained entry carries a backend credential. A stale response that discovers foreign ownership
+  also drops its old session before a replacement Load can target the retained ID. Automatic orphan
+  removal remains deferred until the open exclusive-control configuration work can make that
+  mutation safe.
 - [ ] Add held-ACK worker FIFO, slow-first-greeting fairness, and real IPv6 loopback coverage.
-- [ ] Record implementation: _pending_
+- [ ] Record implementation: ACK/terminal/orphan-semantics partial slice — PR #104, with seven new
+  focused parser, real-socket, cleanup, terminal, foreign-owner, and stale-supersession regressions.
+  Resolver, ingress, exclusive-control/global-option, and deeper socket-coverage items remain open
+  before P2.10 as a whole can be recorded complete.
 
 ### P2.11 Bound protected remote-playback startup and expose safe diagnostics
 
@@ -1217,7 +1241,17 @@ PR #94's containerized Flatpak build proved the manifest-local source generation
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
 
-Most recent branch validation (2026-07-16, PR #102 P2.8 Chromecast-deadline slice): `cargo check
+Most recent branch validation (2026-07-16, PR #104 P2.10 ACK/terminal/orphan-semantics slice):
+`cargo check --all-targets --all-features --locked`, strict debug and release
+all-target/all-feature Clippy, and `cargo test --all-targets --all-features --locked` in debug and
+release pass. Each full profile passes 18 library, 681 application, and 8 repository-metadata tests
+(707 total); all 62 focused MPD tests pass. Seven new regressions cover strict ACK parsing and
+redaction, real-socket absence classification, malformed correlation poisoning, non-absence
+cleanup rejection, external-Next terminal proof, foreign-current shutdown retention, and a stale
+foreign-status response superseded by replacement Load. `cargo fmt --all -- --check` and
+`git diff --check` pass. No dependency or lockfile changed.
+
+Previous branch validation (2026-07-16, PR #102 P2.8 Chromecast-deadline slice): `cargo check
 --all-targets --all-features --locked`, strict debug and release all-target/all-feature Clippy,
 and `cargo test --all-targets --all-features --locked` in both debug and release pass. Each full
 test profile passes 18 library, 674 application, and 8 repository-metadata tests (700 total);
@@ -1587,22 +1621,33 @@ Record scope or design decisions here so deferred work is explicit.
   remains a separate adversarial-framing follow-up under P3.4.
 - 2026-07-13 — P1.8 gives MPD one FIFO worker and one persistent TCP session per owned load.
   Stable `addid`/`playid` identity, authoritative status polling, and targeted `deleteid` cleanup
-  distinguish explicit Stop and remote errors, classify stopped/no-current plus a retained owned ID
-  as completion, and detect an observed replacement queue. Loads never clear the shared queue, and
-  controls revalidate the current ID before acting; after ownership loss is observed, Tributary
-  drops its session without mutating the foreign queue. That conservative handoff also leaves its
-  own queued entry untouched; safe orphan cleanup remains P2.10 work. Every owned load explicitly
-  disables MPD `repeat`, `random`, `single`, and `consume` modes so queue exhaustion remains
-  attributable to Tributary. Protocol lines, responses, resolved-address counts, media-URI sizes,
-  idle I/O, and post-resolution operations are bounded; poisoned streams are dropped rather than
-  reused, and all diagnostics discard server text and authenticated URLs.
-  Standard-library DNS resolution itself remains blocking and the nonblocking command channel is
-  unbounded. MPD has no ID-scoped pause or conditional compare-and-act, so another client can still
-  race between status revalidation and a global pause or stop; the load-time option resets are
-  global and unguarded. MPD also exposes the same stopped/no-current proof for natural exhaustion
-  and some external queue changes, while opaque synchronized ACKs cannot yet distinguish a missing
-  ID from other rejections. Those narrower resilience and shared-partition improvements, plus
-  deeper OS loopback coverage, are tracked as P2.10 rather than overstated as part of P1.8.
+  distinguish explicit Stop and remote errors and detect an observed replacement queue. Loads
+  never clear the shared queue, and controls revalidate the current ID before acting. Every owned
+  load explicitly disables MPD `repeat`, `random`, `single`, and `consume` modes so queue
+  exhaustion remains attributable to Tributary. Protocol lines, responses, resolved-address
+  counts, media-URI sizes, idle I/O, and post-resolution operations are bounded; poisoned streams
+  are dropped rather than reused, and all diagnostics discard server text and authenticated URLs.
+  P2.10's PR #104 follow-up makes the remaining terminal proof explicit: after an
+  owned item was active, stopped/no-current plus successful targeted deletion is completion,
+  whether caused by natural exhaustion or an indistinguishable external Next past the final item.
+  `NoExist` instead proves only that the ID was already absent and produces ownership loss without
+  EOS, while every other correlated ACK remains a cleanup failure. ACK framing, index zero, and the
+  expected command echo are validated before only the closed numeric code is retained; malformed
+  or mismatched ACK-like input poisons the connection. MPD's index, echo, and free-form text are
+  then discarded.
+  When a foreign current song is observed, shared-partition mode deliberately relinquishes the
+  session without deleting Tributary's queued ID, including during explicit Stop and shutdown.
+  Revalidation plus `deleteid` is not atomic, so the foreign client could select that ID between
+  the two operations. A stale response that reports foreign ownership drops the old session before
+  replacement cleanup can target the retained ID. Protected tickets are revoked and no retained
+  entry contains a backend credential, but a direct entry may remain playable and a protected
+  entry may remain selectable until its revoked route fails. Cleanup of those retained IDs waits
+  for a detectable exclusive-control mode. Standard-library DNS resolution itself remains blocking
+  and the nonblocking command channel is unbounded. MPD also has no ID-scoped pause or conditional
+  compare-and-act, so another client can still race between status revalidation and a global pause
+  or stop, and load-time option resets remain global and unguarded. Those remaining resolver,
+  ingress, exclusivity, and deeper OS-loopback improvements stay tracked under P2.10 rather than
+  being overstated as part of P1.8.
 - 2026-07-15 — P1.9 separates the source whose rows remain visible from the user's current
   navigation intent. Each selection advances one monotonic generation and records an exact
   `{source_key, generation}` request; completion has three explicit dispositions: ignore a
@@ -1743,5 +1788,6 @@ Add one line per completed task:
 | 2026-07-16 | P2.9 | PR #99 | Removed the inoperative `shairport-sync` receiver fallback, moved the remaining capability refusal ahead of media preparation, localized actionable `raopsink`/`gst-plugins-bad` guidance, surfaced safe player errors in-app, and added focused missing-element/load-path regressions. |
 | 2026-07-16 | P2.7 platform runtime caches | PR #101 | Moved bundled GStreamer registries to install-keyed per-user caches before toolkit initialization, removed executable-adjacent fallback, added record-structured validation and exact absolute-path rewriting for the signed macOS pixbuf helper's generated cache, and made a path-with-spaces/read-only post-sign runtime probe plus final strict signature verification part of macOS packaging. Sixteen focused policy/static tests cover the portable contract, the independent fuzz lock remains synchronized, and PR CI passed the native macOS relocation/signature probe plus both Windows architecture jobs. |
 | 2026-07-16 | P2.8 bounded Chromecast control | PR #102 | Rebuilt the public `rust_cast` channel graph over a worker-local deadline-aware TLS stream, retained deterministic usable numeric mDNS IPv4 endpoints, and bounded TCP connect, operation-wide, and idle read/write time without moving the `Rc` session across threads. Poisoned sessions are dropped immediately while synchronized semantic rejections retain bounded cleanup; 12 focused real-socket, trickle, lifecycle, classifier, supersession, and discovery regressions cover the contract. |
+| 2026-07-16 | P2.10 ACK/terminal/orphan semantics (partial) | PR #104 | Retains only correlated typed redacted MPD ACK codes and accepts only `NoExist` as proof that a targeted ID is already absent; malformed or mismatched ACK-like input poisons the connection. Successful targeted removal supplies the stopped/no-current completion proof shared by natural exhaustion and external Next, while an already-absent ID is ownership loss. After a foreign replacement is observed, polling, explicit Stop, and shutdown deliberately retain the queued ID because shared-mode revalidation cannot make deletion conditional; a stale foreign-status response also drops its old session before replacement Load can target that retained ID. Protected tickets are revoked, so a retained entry carries no backend credential. Seven new focused parser, real-socket, cleanup, terminal, foreign-owner, and stale-supersession regressions cover the slice; resolver, command-ingress, exclusive-control/global-option, and deeper socket coverage remain open. |
 | 2026-07-15 | P2.11 protected-playback urgent slice | PR #96 | Shared pooled upstream transport with independent connect/header/body-idle budgets; validated direct-only local and AirPlay ticket sources; localized fixed-category, secret-free proxy/GStreamer/backend diagnostics; one-shot terminal handling; and 13 focused regressions including an isolated poisoned-proxy process plus catalog-wide translation checks. Retained mDNS routing and packaged full-backend Windows playback remain open. |
 | 2026-07-15 | P2.11 retained mDNS address routing | PR #97 | Exact service-instance ownership, bounded origin-indexed duplicate aggregation, bounded ephemeral exact-origin routes through applicable API/auth clients and protected stream/artwork pools, unchanged hostname/Host/TLS/proxy behavior, pre-network loss invalidation, and DAAP bearer isolation in revocable typed requests. Thirty new focused regressions plus strengthened DAAP-lifecycle and cast-proxy integration coverage exercise route canonicalization, IPv6 scope, discovery update/removal/alias/cap semantics, stalled resolvers, explicit-proxy preservation, backend propagation, auth-attempt ownership, end-to-end Host/auth/ticket containment, and ephemeral UI identity. Full packaged-Windows/backend playback validation remains open. |
