@@ -140,6 +140,14 @@ induce the catalogue failure itself. The source-lifecycle decision's historical 
 note and README now describe this shipped seam without overstating broader lifecycle convergence.
 Together with PR #114's aggregate identity, grouping, and by-ID methods, this closes P3.2's final
 two boxes and advances the literal count to **205/223 (91.9%)**.
+This combined P3.4 slice closes exactly two more boxes. The track list now shares one
+selection-snapshotted action model across right-click, Menu, and Shift+F10, exposes its popup
+shortcut to assistive technology, and gives both playback sliders distinct localized accessible
+names in all 13 catalogs. Separately, the established 83-test MPD socket harness and delayed,
+adversarial Chromecast harness now include a 1 MiB guard that rejects a peer-advertised Cast frame
+length before `rust_cast` allocates from it. The four broader UI/session-generation harness boxes
+and the P3.4 implementation record remain open. These two bounded closures advance the literal
+count to **207/223 (92.8%)** and P3 to **17/30** without changing P0–P2.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1618,10 +1626,10 @@ service/DAAP foundation and is stacked on its PR #117 head pending publication.
   retain their framing. The cap is deliberately generous because Cast V2 carries protobuf control
   messages rather than media bytes.
 - [ ] Cover stale album-art and source-result generations.
-- [x] Add keyboard context-menu and slider accessibility checks. Commits `f0446f3` and `8945c97`
-  route unmodified Menu and exact Shift+F10 through the right-click selection snapshot, consume
-  only a shortcut that opens a non-empty menu, expose `has-popup` plus the standardized
-  `Shift+F10 ContextMenu` property on the track list, and explicitly label and orient the position
+- [x] Add keyboard context-menu and slider accessibility checks. This slice routes unmodified Menu
+  and exact Shift+F10 through the right-click selection snapshot, consumes
+  only a shortcut that opens a non-empty menu, exposes `has-popup` plus the standardized
+  `Shift+F10 ContextMenu` property on the track list, and explicitly labels and orients the position
   and volume sliders in all 13 catalogs. A production-consumed interaction plan pins the bubbling
   key controller, empty/non-empty propagation, immutable post-popup selection snapshot, and
   popover-scoped action ownership. Focused tests reject Shift+Menu, plain F10, and unrelated
@@ -1749,7 +1757,22 @@ macOS, both native Windows builds and finished-distribution probes, packages, an
 CodeQL run 29615866970 passed every analysis. No actionable automated review thread remains;
 Gemini posted only its service-sunset notice.
 
-Current local branch validation (2026-07-17, P3.2 shared-catalogue completion): strict
+Current local branch validation (2026-07-17, combined P3.4 accessibility/Cast slice): strict
+all-target/all-feature Clippy and `cargo test --all-targets --all-features --locked` pass in debug
+and release with two build jobs. Each full profile passes 18 library, 741 application, and 10
+repository-metadata tests (769 total). The six net-new focused regressions also pass directly: two
+pin the accepted/rejected Menu and Shift+F10 interaction plan plus exact slider labels in every
+source YAML catalog, and four exercise the real `rust_cast 0.21` manager at oversized, exact-limit,
+truncated, and consecutive-frame boundaries. Both full profiles include all 83 focused MPD tests
+and all 42 focused Chromecast tests. Independent review found no issue with the intended 1 MiB
+control-frame policy or its pre-allocation, deadline, and poisoned-session boundaries. Formatting
+and `git diff --check` pass. `serde_yaml`, already locked transitively, is now an explicit
+test-only dependency; no production dependency, package version, protocol schema, packaging, or
+release workflow changed. Exactly the keyboard/context-menu/slider accessibility box and the
+compound MPD/Chromecast harness box close, advancing the literal total to **207/223 (92.8%)** and
+P3 to **17/30**; the other four P3.4 harness boxes and its implementation record remain open.
+
+Base local branch validation (2026-07-17, P3.2 shared-catalogue completion): strict
 all-target/all-feature Clippy and `cargo test --all-targets --all-features --locked` pass in debug
 and release. Each full profile passes 18 library, 735 application, and 10 repository-metadata tests
 (763 total). The trait-object catalogue spy and paired passwordless-DAAP error/cleanup helper tests
@@ -2680,5 +2703,6 @@ Add one line per completed task:
 | 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the implementation-head exact-toolchain/native/package matrix passed. A documentation rerun exposed and fixed a pre-existing terminal MPD enqueue/wake race; replacement static run 29614521885 and complete matrix 29614525132 passed every job. At PR #114 the common `LocalBackend` catalogue seam and final P3.2 record remained open; the completion row below closes both, while invalid persisted `TrackId` repair remains P3.1 work. |
 | 2026-07-17 | P2.11 packaged-probe teardown hardening (follow-up) | PR #114 | Separates pre-NULL cancellation from final listener stop, keeps poison observation live through NULL, and drains/counts queued accepts before join. Only narrowly classified incomplete-header EOF/reset/abort outcomes may cancel; semantic request, accept, and response-write failures remain fatal even during teardown. Four Windows tests pin classification, synchronized clean-versus-malformed behavior, and the accepted/queued poison window. x86_64 runs the unit tests, while ARM64 compiles the code and executes the production probe during packaging. This hardens the already-complete packaged proof and leaves checklist arithmetic unchanged. |
 | 2026-07-17 | P2.11 Windows distribution-path repair (follow-up) | PR #115 | Resolves the caller-relative bundle immediately after creation through PowerShell's FileSystem provider and retains its physical `ProviderPath`, preventing `.NET` PE inspection from using a stale process working directory and preventing custom PSDrive names from escaping into native tools. Static ordering and live PowerShell regressions cover a changed `$PWD`, repository spaces, and custom FileSystem PSDrives. Full debug/release suites pass 761 tests per profile, all 30 focused platform-runtime tests pass in both profiles, and strict Clippy is clean. CI run 29615869107 passed every job, including both native finished bundles; the live packaged DAAP/Subsonic playback box remains open, so checklist arithmetic is unchanged. |
-| 2026-07-17 | P3.2 shared catalogue backend completion | PR #116 | Adds object-safe complete-track catalogue access and removes every backend-specific `all_tracks` bypass. Scanner snapshots construct `LocalBackend`; local, environment, manual, discovery, Subsonic, Jellyfin, Plex, and DAAP publication all enter one explicit `&dyn MediaBackend` adapter. Concrete authentication and protected-media/session retention intentionally remain under P3.1. The production passwordless DAAP catalogue-error branch logs out and invokes the paired user-error/GTK-cleanup helper; focused coverage pins that helper's paired emissions without claiming to synthesize a catalogue failure. Together with PR #114's aggregate work, this closes P3.2's final two boxes. Current-branch validation is recorded above. |
+| 2026-07-17 | P3.2 shared catalogue backend completion | PR #116 | Adds object-safe complete-track catalogue access and removes every backend-specific `all_tracks` bypass. Scanner snapshots construct `LocalBackend`; local, environment, manual, discovery, Subsonic, Jellyfin, Plex, and DAAP publication all enter one explicit `&dyn MediaBackend` adapter. Concrete authentication and protected-media/session retention intentionally remain under P3.1. The production passwordless DAAP catalogue-error branch logs out and invokes the paired user-error/GTK-cleanup helper; focused coverage pins that helper's paired emissions without claiming to synthesize a catalogue failure. Together with PR #114's aggregate work, this closes P3.2's final two boxes. Its base-branch validation is recorded above. |
+| 2026-07-17 | P3.4 keyboard/context-menu and slider accessibility (partial) | local branch; PR pending | Closes only the accessibility item while broader P3.4 harnesses remain open. Unmodified Menu and exact Shift+F10 share right-click's immutable selection snapshot and popover-owned actions, propagate when no menu can open, and publish the standardized popup shortcut. Position and volume scales retain GTK's native slider semantics while gaining distinct localized names in all 13 catalogs. Two focused regressions pin the production-consumed interaction/accessibility plans and parse every source YAML catalog. |
 | 2026-07-17 | P3.4 MPD/Chromecast integration harnesses (partial) | local branch; PR pending | Closes the compound receiver-state-machine item while leaving the rest of P3.4 open. The already-established 83-test fake/real-socket MPD harness and 38-test delayed/adversarial Chromecast harness are joined by a plaintext 1 MiB Cast frame guard immediately below the real `rust_cast` manager. Four new real-manager regressions prove pre-allocation oversized rejection without payload reads, exact-limit acceptance, truncated-header/payload failure, and consecutive-frame reset/write preservation, bringing the focused Chromecast module to 42 tests. |
