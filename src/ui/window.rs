@@ -509,8 +509,24 @@ pub fn build_window(
             };
             match crate::subsonic::SubsonicBackend::connect("Subsonic", &url, &user, &pass).await {
                 Ok(backend) => {
-                    let tracks: Vec<crate::architecture::models::Track> =
-                        backend.all_tracks().await;
+                    let tracks = match crate::architecture::load_track_catalog(&backend).await {
+                        Ok(tracks) => tracks,
+                        Err(error) => {
+                            if !attempt.is_latest() {
+                                tracing::debug!("Ignoring superseded Subsonic catalogue failure");
+                                return;
+                            }
+                            let category = super::source_connect::remote_failure_category(&error);
+                            tracing::error!(
+                                category = category.as_str(),
+                                "Subsonic catalogue load failed"
+                            );
+                            let _ = tx
+                                .send(LibraryEvent::Error(category.user_message("Subsonic")))
+                                .await;
+                            return;
+                        }
+                    };
                     let Some(source) = attempt.retain(Arc::new(backend)) else {
                         tracing::debug!("Subsonic connect was superseded");
                         return;
@@ -557,8 +573,24 @@ pub fn build_window(
                 .await
             {
                 Ok(backend) => {
-                    let tracks: Vec<crate::architecture::models::Track> =
-                        backend.all_tracks().await;
+                    let tracks = match crate::architecture::load_track_catalog(&backend).await {
+                        Ok(tracks) => tracks,
+                        Err(error) => {
+                            if !attempt.is_latest() {
+                                tracing::debug!("Ignoring superseded Jellyfin catalogue failure");
+                                return;
+                            }
+                            let category = super::source_connect::remote_failure_category(&error);
+                            tracing::error!(
+                                category = category.as_str(),
+                                "Jellyfin catalogue load failed"
+                            );
+                            let _ = tx
+                                .send(LibraryEvent::Error(category.user_message("Jellyfin")))
+                                .await;
+                            return;
+                        }
+                    };
                     let Some(source) = attempt.retain(Arc::new(backend)) else {
                         tracing::debug!("Jellyfin connect was superseded");
                         return;
@@ -603,8 +635,24 @@ pub fn build_window(
             };
             match crate::plex::PlexBackend::connect("Plex", &url, &token).await {
                 Ok(backend) => {
-                    let tracks: Vec<crate::architecture::models::Track> =
-                        backend.all_tracks().await;
+                    let tracks = match crate::architecture::load_track_catalog(&backend).await {
+                        Ok(tracks) => tracks,
+                        Err(error) => {
+                            if !attempt.is_latest() {
+                                tracing::debug!("Ignoring superseded Plex catalogue failure");
+                                return;
+                            }
+                            let category = super::source_connect::remote_failure_category(&error);
+                            tracing::error!(
+                                category = category.as_str(),
+                                "Plex catalogue load failed"
+                            );
+                            let _ = tx
+                                .send(LibraryEvent::Error(category.user_message("Plex")))
+                                .await;
+                            return;
+                        }
+                    };
                     let Some(source) = attempt.retain(Arc::new(backend)) else {
                         tracing::debug!("Plex connect was superseded");
                         return;
@@ -649,12 +697,29 @@ pub fn build_window(
             };
             match crate::daap::DaapBackend::connect("DAAP", &url, password.as_deref()).await {
                 Ok(backend) => {
+                    let tracks = match crate::architecture::load_track_catalog(&backend).await {
+                        Ok(tracks) => tracks,
+                        Err(error) => {
+                            backend.disconnect().await;
+                            if !attempt.is_latest() {
+                                tracing::debug!("Ignoring superseded DAAP catalogue failure");
+                                return;
+                            }
+                            let category = super::source_connect::remote_failure_category(&error);
+                            tracing::error!(
+                                category = category.as_str(),
+                                "DAAP catalogue load failed"
+                            );
+                            let _ = tx
+                                .send(LibraryEvent::Error(category.user_message("DAAP")))
+                                .await;
+                            return;
+                        }
+                    };
                     let Some(session) = attempt.retain(backend).await else {
                         tracing::debug!("DAAP connect was superseded");
                         return;
                     };
-                    let tracks: Vec<crate::architecture::models::Track> =
-                        session.all_tracks().await;
                     if !session.is_current() {
                         tracing::debug!("DAAP sync was superseded");
                         return;

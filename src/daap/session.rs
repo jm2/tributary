@@ -557,7 +557,9 @@ mod tests {
         let backend = DaapBackend::connect("Mock DAAP", &server.base_url, None)
             .await
             .expect("connect and sync");
-        let tracks = backend.all_tracks().await;
+        let tracks = crate::architecture::load_track_catalog(&backend)
+            .await
+            .expect("read DAAP track catalogue");
         assert_eq!(tracks.len(), 1);
 
         let stream_reference = tracks[0]
@@ -745,7 +747,9 @@ mod tests {
         // This pair models the ownership token stored in a queued DaapSync.
         let queued_generation = first.generation();
         let queued_session_key = first.session_key();
-        let queued_reference = first.all_tracks().await[0]
+        let queued_reference = crate::architecture::load_track_catalog(&*first)
+            .await
+            .expect("read retained DAAP track catalogue")[0]
             .stream_url
             .clone()
             .expect("queued stream reference");

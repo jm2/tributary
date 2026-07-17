@@ -340,11 +340,6 @@ impl JellyfinBackend {
         Ok(all_items)
     }
 
-    /// Return all tracks from the cache (for UI integration layer).
-    pub async fn all_tracks(&self) -> Vec<Track> {
-        self.cache.read().await.tracks.clone()
-    }
-
     /// Return the music libraries discovered during init.
     pub fn music_libraries(&self) -> &[MusicLibrary] {
         &self.music_libraries
@@ -449,6 +444,10 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
             albums,
             artists,
         })
+    }
+
+    async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
+        Ok(self.cache.read().await.tracks.clone())
     }
 
     async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {

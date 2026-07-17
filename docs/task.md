@@ -31,8 +31,8 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**203/223 (91.0%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
-and **13/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**205/223 (91.9%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
+and **15/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -114,8 +114,21 @@ working directory. This follow-up resolves the created distribution through the
 PowerShell filesystem provider and retains its physical `ProviderPath` before constructing any
 PE-inspection target. It covers the location split, repository paths containing spaces, and custom
 FileSystem PSDrives whose provider-only names are unusable by `.NET` and external tools. This
-repairs the local path into the already-accepted automated proof; it does not close or alter the
-one remaining live-server box, so the literal progress count remains **203/223 (91.0%)**.
+repairs the local path into the already-accepted automated proof; it did not close or alter the
+one remaining live-server box and left the accepted pre-seam count at **203/223 (91.0%)**.
+PR #115 run 29615869107 passed every CI job, including both native Windows finished-bundle probes;
+CodeQL run 29615866970 passed all three analyses, and no actionable review thread was posted.
+This P3.2 completion slice makes complete track-catalogue publication a real object-safe backend
+seam. Scanner snapshots construct `LocalBackend`, and every local, Subsonic, Jellyfin, Plex, and
+DAAP publication path now invokes the same explicit `&dyn MediaBackend` adapter; backend-specific
+`all_tracks` bypasses are removed. Authentication and media/session ownership remain concrete by
+design and continue under P3.1. The production passwordless DAAP catalogue-error path logs out and
+then invokes the paired user-error/GTK-cleanup helper, preventing the spinner and pending guard from
+remaining live; its focused regression pins the helper's paired emissions without claiming to
+induce the catalogue failure itself. The source-lifecycle decision's historical implementation
+note and README now describe this shipped seam without overstating broader lifecycle convergence.
+Together with PR #114's aggregate identity, grouping, and by-ID methods, this closes P3.2's final
+two boxes and advances the literal count to **205/223 (91.9%)**.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1438,7 +1451,15 @@ closed as a milestone.
 
 ### P3.2 Make the backend abstraction real and stable
 
-- [ ] Construct and use `LocalBackend` through the same integration boundary.
+- [x] Construct and use `LocalBackend` through the same integration boundary. Complete catalogue
+  publication now has one object-safe `MediaBackend::list_tracks` operation and one explicit
+  `&dyn MediaBackend` adapter. Full local scanner snapshots construct `LocalBackend`; environment,
+  manual, discovery, and authenticated Subsonic, Jellyfin, Plex, and DAAP catalogue paths use the
+  same adapter. Backend-specific `all_tracks` methods are removed, and a trait-object spy pins
+  dynamic dispatch without conflating the still-distinct authentication and protected-media
+  lifecycles. The production passwordless DAAP catalogue-error branch logs out before invoking a
+  paired user-error/GTK-cleanup helper; its focused unit regression pins those paired emissions.
+  PR #116.
 - [x] Replace ephemeral album/artist UUIDs with stable identities. PR #114 derives local
   artist and album UUIDv5 values under one private versioned namespace with distinct domains,
   component-count and length framing, and pinned golden values. Artist identity uses the exact
@@ -1460,26 +1481,24 @@ closed as a milestone.
   shared exact effective-artist predicate after the title-constrained SQL query, so blank-tag
   fallback and same-title disambiguation cannot diverge from listing/ID semantics.
 - [x] Align README architecture claims with actual code. README explicitly labels its diagram as
-  the intended architecture and accurately records the shipping gaps: the four remote backends
-  implement `MediaBackend`, but no trait object uses that seam; source connection still branches
-  by concrete backend; and the local library bypasses `LocalBackend`. Implemented in `e6c68bc` and
-  re-audited on the packaged-Windows probe branch. The P3.2 aggregate slice now documents the
-  shipped stable-ID/grouping/lookup contract without implying that the integration seam exists.
-- [ ] Record implementation: the stable aggregate subset is accepted in PR #114, with four focused
-  SQLite regressions, the complete 243-test local-module surface, the 759-test local debug suite,
-  and the complete static/native/package PR matrix passing. P3.2 remains incomplete until
-  production constructs and uses `LocalBackend` through the common boundary. Repairing or
-  rejecting an invalid persisted local track UUID, instead of the existing random conversion
-  fallback, belongs with the typed `TrackId` migration in P3.1 and is not silently broadened into
-  this metadata-aggregate slice.
+  the intended architecture. It first recorded the absence of any trait-object/local seam in
+  `e6c68bc`; this completion slice updates the claim to the now-shipping shared catalogue boundary
+  while retaining the concrete authentication/lifecycle limitations tracked under P3.1.
+- [x] Record implementation: PR #114 accepted stable aggregate identity, same-title
+  disambiguation, and both formerly unsupported by-ID methods. This completion slice constructs
+  `LocalBackend`, routes every complete local and remote catalogue through the shared trait-object
+  adapter, removes the backend-specific `all_tracks` bypasses, and updates the public architecture
+  claims. Repairing or rejecting an invalid persisted local track UUID, instead of the existing
+  random conversion fallback, belongs with the typed `TrackId` migration in P3.1 and does not block
+  this bounded P3.2 completion. PR #116.
 
 Acceptance criteria for this bounded slice: unchanged exact local metadata yields identical
 artist/album identities across queries and restarts; concatenation or artist/album domain
 collisions cannot alias; a compilation and same-titled albums group by the documented effective
 album artist; listing IDs round-trip through both by-ID methods; unknown IDs return no tracks; and
-the lookup's full-model query is constrained to the resolved title or exact artist. This does not
-accept the still-direct local UI/library integration, path-bearing queue values, or invalid
-persisted `TrackId` fallback.
+the lookup's full-model query is constrained to the resolved title or exact artist. Complete
+catalogue publication must additionally enter the shared trait-object adapter. Path-bearing queue
+values and invalid persisted `TrackId` fallback remain explicitly assigned to P3.1.
 
 ### P3.3 Add network integration harnesses
 
@@ -1592,7 +1611,8 @@ malformed fixture now half-closes its completed request before response drain to
 deterministic. Final static run 29613604485 and complete matrix 29613606936 passed every job,
 including all 718 x86_64 Windows application tests and both native finished-distribution probes.
 No actionable automated review thread remains; Gemini posted only its service-sunset notice.
-Current local branch validation (2026-07-17, P2.11 Windows distribution-path follow-up): the
+Most recent accepted validation (2026-07-17, PR #115 P2.11 Windows distribution-path follow-up):
+the
 PowerShell helper parses without AST errors; strict all-target/all-feature Clippy passes in debug
 and release; and `cargo test --all-targets --all-features --locked` passes in debug and release.
 Each profile passes 18 library, 733 application, and 10 repository-metadata tests (761 total),
@@ -1604,8 +1624,25 @@ containing spaces while leaving the process working directory elsewhere, reprodu
 divergent `Path.GetFullPath` result, and proves the fixed path is absolute and existing. It then
 mounts that repository beneath a custom FileSystem PSDrive and proves `ProviderPath`, rather than
 the provider-only drive-qualified `Path`, reaches the same physical directory. Formatting and
-`git diff --check` pass. No dependency or lockfile changed, no checklist box moved, and native
-Windows bundle execution remains required in PR CI.
+`git diff --check` pass. No dependency or lockfile changed and no checklist box moved. CI run
+29615869107 passed MSRV, audit, metadata, representative coverage, Linux x86_64/aarch64, Flatpak,
+macOS, both native Windows builds and finished-distribution probes, packages, and checksums;
+CodeQL run 29615866970 passed every analysis. No actionable automated review thread remains;
+Gemini posted only its service-sunset notice.
+
+Current local branch validation (2026-07-17, P3.2 shared-catalogue completion): strict
+all-target/all-feature Clippy and `cargo test --all-targets --all-features --locked` pass in debug
+and release. Each full profile passes 18 library, 735 application, and 10 repository-metadata tests
+(763 total). The trait-object catalogue spy and paired passwordless-DAAP error/cleanup helper tests
+also pass individually in both profiles, while PR #114's four local aggregate regressions remain
+green in the complete suite. The production diff constructs `LocalBackend` for scanner snapshots,
+routes every complete local and remote catalogue publication through the explicit
+`&dyn MediaBackend` adapter, removes all backend-specific `all_tracks` bypasses, and preserves the
+concrete authentication/session boundaries assigned to P3.1. Formatting and `git diff --check`
+pass. No dependency, schema, migration, or lockfile changed. Independent review found no code
+integration or arithmetic defect after the rebase; its documentation findings were corrected.
+The two P3.2 closures advance the literal total to **205/223 (91.9%)** and P3 to **15/30**; native
+and package validation remains required in PR CI.
 
 Earlier accepted validation (2026-07-17, PR #112 P2.10 exclusive-control slice):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature
@@ -1648,7 +1685,8 @@ exercise only SQLite and do not claim the still-unused production `LocalBackend`
 boundary. Documentation-head run 29608292265 passed release tests and every completed sibling but
 failed the debug Linux suite on the MPD terminal enqueue/wake race documented above. After the
 linearization fix, the failing regression and all 83 MPD tests pass in both debug and release;
-formatting and whitespace checks pass. A complete replacement PR matrix remains pending.
+formatting and whitespace checks pass. Final static run 29614521885 and complete replacement
+matrix 29614525132 passed every job, as recorded above.
 
 Previous local branch validation (2026-07-17, P3.5 representative-coverage slice before CI):
 `cargo fmt --all -- --check`, strict all-target/all-feature Clippy in debug and release, and
@@ -1904,10 +1942,11 @@ Record scope or design decisions here so deferred work is explicit.
   performing-artist row. A metadata edit to an identity component intentionally creates a new
   aggregate rather than guessing continuity. UUIDs are not reversible, so by-ID methods first scan
   compact grouped keys and then load only rows under the resolved exact title or artist; album
-  results reuse the same effective-artist predicate. This decision closes stable aggregate and
-  lookup behavior only. It neither makes `LocalBackend` the shipping integration seam nor changes
-  the invalid database track-UUID fallback; typed/persisted `TrackId` migration, local/playlist
-  ID-at-use resolution, and common source integration remain P3.1/P3.2 work.
+  results reuse the same effective-artist predicate. At PR #114 this decision closed stable
+  aggregate and lookup behavior only; it did not yet make `LocalBackend` the shipping integration
+  seam or change the invalid database track-UUID fallback. The current P3.2 completion slice now
+  closes the complete-catalogue seam, while typed/persisted `TrackId` migration, local/playlist
+  ID-at-use resolution, and broader source lifecycle integration remain P3.1 work.
 
 - 2026-07-10 — Implemented P0.1, P0.3-P0.6, and P0.8 in PR #68. P0.7's
   workflow contract is implemented, but its live manual-dispatch acceptance test requires a
@@ -2461,6 +2500,7 @@ Add one line per completed task:
 | 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
 | 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Native x86_64 and ARM64 CI both prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
 | 2026-07-17 | P3.1 source identity/lifecycle architecture | PR #113 | Records location-independent `(SourceId, TrackId)` media identity, an exact legacy-array-to-versioned-envelope saved-source migration with atomic replacement and fail-closed conflict quarantine, one registry-owned operation/session lifecycle, deterministic per-view radio locator ownership, playback-time locator resolution, exactly-once DAAP retirement, adapter-specific rules for every source kind, and staged completion tests. This closes only the two architecture decision boxes; runtime migration remains open. Independent review found and resolved two design ambiguities before the full exact-toolchain/native/package matrix passed in runs 29605029668 and 29605032344. |
-| 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the implementation-head exact-toolchain/native/package matrix passed. A documentation rerun exposed and fixed a pre-existing terminal MPD enqueue/wake race; replacement static run 29614521885 and complete matrix 29614525132 passed every job. The common `LocalBackend` integration seam, invalid persisted `TrackId` fallback, and final P3.2 record remain open. |
+| 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the implementation-head exact-toolchain/native/package matrix passed. A documentation rerun exposed and fixed a pre-existing terminal MPD enqueue/wake race; replacement static run 29614521885 and complete matrix 29614525132 passed every job. At PR #114 the common `LocalBackend` catalogue seam and final P3.2 record remained open; the completion row below closes both, while invalid persisted `TrackId` repair remains P3.1 work. |
 | 2026-07-17 | P2.11 packaged-probe teardown hardening (follow-up) | PR #114 | Separates pre-NULL cancellation from final listener stop, keeps poison observation live through NULL, and drains/counts queued accepts before join. Only narrowly classified incomplete-header EOF/reset/abort outcomes may cancel; semantic request, accept, and response-write failures remain fatal even during teardown. Four Windows tests pin classification, synchronized clean-versus-malformed behavior, and the accepted/queued poison window. x86_64 runs the unit tests, while ARM64 compiles the code and executes the production probe during packaging. This hardens the already-complete packaged proof and leaves checklist arithmetic unchanged. |
-| 2026-07-17 | P2.11 Windows distribution-path repair (follow-up) | PR #115 | Resolves the caller-relative bundle immediately after creation through PowerShell's FileSystem provider and retains its physical `ProviderPath`, preventing `.NET` PE inspection from using a stale process working directory and preventing custom PSDrive names from escaping into native tools. Static ordering and live PowerShell regressions cover a changed `$PWD`, repository spaces, and custom FileSystem PSDrives. Full debug/release suites pass 761 tests per profile, all 30 focused platform-runtime tests pass in both profiles, and strict Clippy is clean; the live packaged DAAP/Subsonic playback box remains open, so checklist arithmetic is unchanged. |
+| 2026-07-17 | P2.11 Windows distribution-path repair (follow-up) | PR #115 | Resolves the caller-relative bundle immediately after creation through PowerShell's FileSystem provider and retains its physical `ProviderPath`, preventing `.NET` PE inspection from using a stale process working directory and preventing custom PSDrive names from escaping into native tools. Static ordering and live PowerShell regressions cover a changed `$PWD`, repository spaces, and custom FileSystem PSDrives. Full debug/release suites pass 761 tests per profile, all 30 focused platform-runtime tests pass in both profiles, and strict Clippy is clean. CI run 29615869107 passed every job, including both native finished bundles; the live packaged DAAP/Subsonic playback box remains open, so checklist arithmetic is unchanged. |
+| 2026-07-17 | P3.2 shared catalogue backend completion | PR #116 | Adds object-safe complete-track catalogue access and removes every backend-specific `all_tracks` bypass. Scanner snapshots construct `LocalBackend`; local, environment, manual, discovery, Subsonic, Jellyfin, Plex, and DAAP publication all enter one explicit `&dyn MediaBackend` adapter. Concrete authentication and protected-media/session retention intentionally remain under P3.1. The production passwordless DAAP catalogue-error branch logs out and invokes the paired user-error/GTK-cleanup helper; focused coverage pins that helper's paired emissions without claiming to synthesize a catalogue failure. Together with PR #114's aggregate work, this closes P3.2's final two boxes. Current-branch validation is recorded above. |
