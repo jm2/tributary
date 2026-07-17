@@ -72,7 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit exactly-once DAAP retirement, and ID-at-use resolution for local, playlist, radio,
   removable, remote, and OS-opened media. It separates playlist and radio-feed view identity from
   underlying media identity and documents the evidence limits of discovered endpoints and
-  removable-device keys.
+  removable-device keys. The migration contract pins the legacy-array reader, versioned envelope,
+  atomic replacement, deterministic duplicate collapse, and fail-closed whole-file conflict
+  quarantine. Overlapping radio views retain separate locator contributions and choose the newest
+  initiated accepted refresh deterministically rather than completion order.
   This change records the decision only: URL-keyed remote ownership, sibling standard/DAAP
   registries, derived remote UUIDs, direct-source queue locations, and split UI lifecycle paths
   remain implementation work tracked under P3.1.

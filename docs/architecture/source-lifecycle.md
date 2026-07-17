@@ -1,6 +1,6 @@
 # Source identity and lifecycle ownership
 
-- Status: Accepted design; repository PR/CI acceptance pending; implementation is incomplete
+- Status: Accepted in PR #113; implementation is incomplete
 - Decision date: 2026-07-17
 - Tracker: [P3.1](../task.md#p31-introduce-a-sourcesession-registry)
 - Review finding: [Architectural assessment](../../CODE_REVIEW_2026-07-10.md#architectural-assessment)
@@ -86,7 +86,7 @@ Saved-source persistence replaces the legacy bare JSON array with this versioned
       "type": "subsonic",
       "name": "Home",
       "url": "https://music.example.test/",
-      "source_id": "00000000-0000-0000-0000-000000000000"
+      "source_id": "f1ee34c2-0b48-5c0d-8eb3-1ccb076c7af9"
     }
   ]
 }
@@ -302,13 +302,14 @@ the geolocation/consent branch for Near Me, and each view retains its last succe
 during refresh. `TrackId` is the station UUID; the current station URL is a locator in the source
 adapter and resolves only when playback starts. The adapter retains a locator while at least one
 current view snapshot contains that station. It retains contributions per `ViewOrigin`, tagged
-with the globally increasing operation generation that produced each accepted snapshot. If live
-views disagree about a station locator, resolution selects the contribution with the greatest
-accepted generation—therefore the newest initiated successful refresh, not whichever request
-completed last. Replacing or deleting a view snapshot removes that view's old contributions and
-recomputes the winner from the remaining views; a failed or superseded refresh leaves its prior
-accepted contribution intact. Once no current view owns the station, it is unavailable rather than
-played from an old URL. The resolved public stream may remain direct because it carries no
+with the source-wide monotonically increasing operation generation that produced each accepted
+snapshot. If live views disagree about a station locator, resolution selects the contribution
+with the greatest accepted generation—therefore the newest initiated successful refresh, not
+whichever request completed last. Replacing or deleting a view snapshot removes that view's old
+contributions and recomputes the winner from the remaining views; a failed or superseded refresh
+leaves its prior accepted contribution intact. Once no current view owns the station, it is
+unavailable rather than played from an old URL. The resolved public stream may remain direct
+because it carries no
 Tributary credential.
 
 #### Removable media

@@ -55,8 +55,11 @@ state/option commands, protected-media tickets, or queue mutation. The exact que
 remains retryable, while a second worker gate covers internal callers and media rejected before
 dispatch. Two actionable Codex findings were fixed before the final `91536ab` review found no
 further issues, and the exact-toolchain/native PR matrix accepted the result.
-The P3.1 source-lifecycle ADR closes its two architecture-only decision boxes on this branch;
-implementation and PR/CI acceptance remain pending.
+The P3.1 source-lifecycle ADR was accepted in PR #113, closing its two architecture-only decision
+boxes. Independent review clarified deterministic overlapping-radio locator ownership and the
+exact versioned saved-source migration/quarantine boundary before the complete exact-toolchain and
+native/package matrix passed in runs 29605029668 and 29605032344; runtime implementation remains
+open.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1335,10 +1338,10 @@ closed as a milestone.
   feeds are views, removable filesystems are generation-owned sources keyed by their existing
   logical GIO identity, and the first playable file in each OS-open delivery is an ephemeral
   one-item source. Their implementation remains on the current direct paths. Recorded in the
-  [source-lifecycle decision](architecture/source-lifecycle.md); pending PR/CI acceptance.
+  [source-lifecycle decision](architecture/source-lifecycle.md), accepted in PR #113.
 - [x] Record architecture decision: [Source identity and lifecycle ownership](architecture/source-lifecycle.md).
   The document distinguishes accepted decisions, existing foundations, remaining implementation,
-  migration, and completion tests. Pending PR/CI acceptance.
+  migration, and completion tests. Accepted in PR #113 after the full native/package matrix passed.
 - [ ] Record implementation: P1.6 completed the remote resolver/session ownership subset in PR
   #86. The architecture-only ADR branch closes no implementation box: stable source IDs,
   backend-native IDs, local/playlist ID-at-use resolution, unified refresh/failure state, and the
@@ -2225,3 +2228,4 @@ Add one line per completed task:
 | 2026-07-16 | P2.11 deterministic HTTP compatibility (partial) | PR #108 | Preserves exact escaped reverse-proxy prefixes across DAAP stream/artwork and Subsonic API/media construction, carries DAAP's four fixed protocol headers through a separate strict non-secret allowlist into protected stream and artwork fetches, retains receiver `Range` as the only forwarded header, proves existing typed Subsonic HTTP-200 failures, and exercises explicit upstream proxy selection at the asynchronous protected-fetch boundary. Seven net-new regressions cover the contracts. At PR #108, full fake GStreamer, packaged source-policy, and live Windows playback validation remained open; the following slice closes the fake-GStreamer part. |
 | 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
 | 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Native x86_64 and ARM64 CI both prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
+| 2026-07-17 | P3.1 source identity/lifecycle architecture | PR #113 | Records location-independent `(SourceId, TrackId)` media identity, an exact legacy-array-to-versioned-envelope saved-source migration with atomic replacement and fail-closed conflict quarantine, one registry-owned operation/session lifecycle, deterministic per-view radio locator ownership, playback-time locator resolution, exactly-once DAAP retirement, adapter-specific rules for every source kind, and staged completion tests. This closes only the two architecture decision boxes; runtime migration remains open. Independent review found and resolved two design ambiguities before the full exact-toolchain/native/package matrix passed in runs 29605029668 and 29605032344. |
