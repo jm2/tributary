@@ -10,6 +10,7 @@ mod m20250710_000005_create_library_roots;
 mod m20260712_000006_playlist_track_fk;
 mod m20260714_000007_add_composer;
 mod m20260715_000008_create_unparseable_file;
+mod m20260717_000009_rename_unparseable_file_table;
 
 pub struct Migrator;
 
@@ -25,6 +26,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260712_000006_playlist_track_fk::Migration),
             Box::new(m20260714_000007_add_composer::Migration),
             Box::new(m20260715_000008_create_unparseable_file::Migration),
+            Box::new(m20260717_000009_rename_unparseable_file_table::Migration),
         ]
     }
 }

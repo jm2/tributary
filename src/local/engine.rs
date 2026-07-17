@@ -2994,6 +2994,17 @@ async fn initial_scan_with_root_trust_guards(
                 }
             }
         }
+
+        // Remove unparseable-file records for files no longer on disk.
+        // These are ephemeral derived state so a simple existence check
+        // against the scan results is sufficient.
+        for path in unparseable_by_path.keys() {
+            if !on_disk_paths.contains(*path) {
+                if let Err(error) = delete_unparseable_file(db, path).await {
+                    warn!(path = %path, %error, "Failed to remove stale unparseable-file record");
+                }
+            }
+        }
     }
 
     // Send full sync. A transient failure here is logged but still lets the
@@ -4459,8 +4470,28 @@ async fn process_directory_events(
                             if let Some(displaced) = displaced {
                                 let displaced = *displaced;
                                 let _ = tx
-                                    .send(LibraryEvent::TrackRemoved(displaced.file_path))
+                                    .send(LibraryEvent::TrackRemoved(displaced.file_path.clone()))
                                     .await;
+                                // Clean up unparseable-file record for the displaced destination.
+                                if let Err(error) =
+                                    delete_unparseable_file(db.as_ref(), &displaced.file_path).await
+                                {
+                                    warn!(path = %displaced.file_path, %error, "Failed to remove unparseable-file record for displaced file");
+                                }
+                            }
+                            // Clean up unparseable-file record for the source path.
+                            let from_str = pair.from.to_string_lossy();
+                            if let Err(error) =
+                                delete_unparseable_file(db.as_ref(), from_str.as_ref()).await
+                            {
+                                warn!(from = %pair.from.display(), %error, "Failed to remove unparseable-file record after rename");
+                            }
+                            // Clean up unparseable-file record for the destination path.
+                            let to_str = pair.to.to_string_lossy();
+                            if let Err(error) =
+                                delete_unparseable_file(db.as_ref(), to_str.as_ref()).await
+                            {
+                                warn!(to = %pair.to.display(), %error, "Failed to remove unparseable-file record at rename destination");
                             }
                             let _ = tx
                                 .send(LibraryEvent::TrackUpserted(Box::new(db_model_to_track(
@@ -4699,7 +4730,7 @@ async fn process_directory_events(
             match delete_track_if_root_stable(db.as_ref(), &mut root_cache, music_dirs, path).await
             {
                 Ok(true) => {
-                    let _ = tx.send(LibraryEvent::TrackRemoved(path_str)).await;
+                    let _ = tx.send(LibraryEvent::TrackRemoved(path_str.clone())).await;
                 }
                 Ok(false) => {
                     warn!(path = %path.display(), "Ignored removal without a stable confirmed library root");
@@ -4708,6 +4739,10 @@ async fn process_directory_events(
                     warn!(path = %path.display(), %error, "Failed to process watched removal safely");
                     reconciliation_required = true;
                 }
+            }
+            // Clean up any unparseable-file record for the removed file.
+            if let Err(error) = delete_unparseable_file(db.as_ref(), &path_str).await {
+                warn!(path = %path.display(), %error, "Failed to remove unparseable-file record for deleted file");
             }
         }
 
@@ -4907,6 +4942,11 @@ async fn process_directory_events(
                         match outcome {
                             Ok(GuardedTrackUpsertOutcome::Committed(model)) => {
                                 upsert_committed = true;
+                                // Clear any prior unparseable-file record now
+                                // that the file parsed successfully.
+                                if let Err(error) = delete_unparseable_file(db.as_ref(), &path_str).await {
+                                    warn!(path = %path_str, %error, "Failed to clear unparseable-file record after successful parse");
+                                }
                                 let t = db_model_to_track(&model);
                                 let _ = tx.send(LibraryEvent::TrackUpserted(Box::new(t))).await;
                             }
