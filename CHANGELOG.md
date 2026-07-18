@@ -46,6 +46,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Credential-bearing media tickets now expire** — Every upstream proxy ticket has a hard, absolute, non-sliding 24-hour lifetime from registration in addition to earlier playback-lifecycle revocation. It is usable only before its monotonic deadline; a lookup at or after that boundary atomically removes it and returns the same 404 as an unknown or revoked route. GET and byte-range requests, pause, seek, and receiver status do not renew the deadline, so a compromised receiver cannot perpetuate the bearer. A response admitted before expiry may finish afterward, but every later lookup fails. Local-file routes retain their existing server-lifetime behavior because they front no backend credential.
 
 ### Changed
+- **A centralized source-lifecycle authority is now compiled and adversarially tested before
+  production cutover** — An intentionally unwired `SourceLifecycleRegistry` establishes one atomic
+  owner for adapter, existing revocable media lease, session epoch, accepted catalogue/view
+  snapshots, keyed/refcounted provenance claims, and generation-correlated sanitized failures.
+  Framework-owned adapter wrapping plus an unforgeable close capability sends rejected, stale,
+  cancelled, panicking, replaced, disconnected, and shutdown sessions through one exactly-once
+  tracked retirement path; panic isolation covers both synchronous closure invocation and future
+  polling. Repeated disconnect callers share an exact waiter that wakes only after retirement
+  bookkeeping, typed events, the terminal snapshot, and that close task's shutdown-barrier
+  participation are finalized. Reconnect can adopt a
+  successor while the predecessor closes without letting old success or failure mutate the new
+  session, and a later successor disconnect has its own completion. Every associated predecessor
+  close publishes its old session epoch so a pending-retirement count change advances the snapshot
+  revision even when the successor remains Ready. At-use protected HTTP
+  resolution snapshots adapter/lease/epoch and rechecks all three before attaching the production
+  lease, while refresh owners carry the exact atomically captured predecessor session.
+  Sessionful constructors can select `FinishConstruction`: cancellation is signalled without raw
+  abort until a bounded login returns a close-capable adapter, which is synchronously staged before
+  abortable catalogue work. This pins the required DAAP migration boundary after parsed login
+  session ID and before update, database discovery, items, or initial catalogue work; the current
+  full DAAP constructor is deliberately not wired through this closure yet. Task admission and
+  shutdown participation are atomic, unspawned owners and dropped cancellation handles are inert,
+  late connect/refresh spawn cannot reopen a completed barrier, and dropping the final external
+  registry handle revokes leases and starts fail-closed teardown. Thirty-eight deterministic tests
+  cover protected-construction cancellation and supersession, post-stage abort/panic, correlated
+  event ordering, duplicate/reappearing provenance, exact resolution/refresh ownership, retirement
+  waiter races, last-handle cleanup, replacement, view refresh, shutdown, and pruning. Shipping
+  standard/DAAP registries and GTK connection paths remain unchanged until the adapter wiring
+  slices land, so this foundation fixes no user-visible source behavior by itself and P3.1 remains
+  open.
 - **Playback queues and output selection now share tested lifecycle boundaries** — Starting from
   the track list captures its current sorted/filtered `ListModel` projection exactly once. Initial
   direct playback, Next, Previous, EOS replay, and a retry after synchronous refusal now all hand the
@@ -338,8 +368,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discovery publication, and discovery loss deliberately retires live ownership even when the
   saved row remains. Radio, removable, and external queues have location-independent identity but
   still retain their current locator instead of resolving it through a shared adapter at use.
-  Unified provenance and those lifecycle/adapter items remain P3.1 work; they do not reintroduce
-  backend credentials or local playback paths into generic queue values.
+  The compiled centralized lifecycle foundation now pins keyed provenance, generation-correlated
+  failure/state, session retirement, shutdown, and at-use lease/epoch contracts under deterministic
+  tests, but it is intentionally unwired and therefore does not change these production paths.
+  Adapter cutover and the remaining locator/embedded-art items remain P3.1 work; they do not
+  reintroduce backend credentials or local playback paths into generic queue values.
 - **Credential-bearing media tickets remain replayable within their hard lifetime** — Each opaque output ticket is a bearer for one fixed media item and arbitrary byte ranges until the earlier of source-lease/lifecycle revocation or its absolute 24-hour expiry; it is not a one-shot token. Neither event cancels a response the proxy already admitted. Protected local/AirPlay tickets are reachable only through a dedicated loopback listener; a protected MPD load from an unspecified address, or a scoped/link-local IPv6 route, fails closed rather than exposing the upstream request. Playback-time local-authority tickets follow their owning load lifecycle; only legacy explicit-file routes retain the older server-lifetime capability contract.
 - **Live packaged-Windows protected-playback validation remains outstanding** — Fake DAAP and Subsonic streams traverse the complete production protected-player path through real GStreamer, and native x86_64 and ARM64 package jobs both prove their finished distribution supplies the selected HTTP source, scanner, decoder, required DLL closure, direct-loopback policy, alternate-source fail-closed path, and real FLAC decode to end-of-stream without borrowing the build host's runtime. That deterministic probe cannot establish compatibility with the reported live DAAP/Subsonic servers, `.local`/mDNS routing, TLS, physical audio output, firewall or endpoint-security policy, or the user's legitimate upstream proxy. Audible live playback from the packaged application remains to be recorded, and no automated result proves that DNS caused the original failures.
 

@@ -1,6 +1,7 @@
 # Source identity and lifecycle ownership
 
-- Status: Accepted in PR #113; stable-identity migration implemented, lifecycle consolidation incomplete
+- Status: Accepted in PR #113; stable identity and the unwired lifecycle foundation are implemented,
+  adapter consolidation incomplete
 - Decision date: 2026-07-17
 - Tracker: [P3.1](../task.md#p31-introduce-a-sourcesession-registry)
 - Review finding: [Architectural assessment](../../CODE_REVIEW_2026-07-10.md#architectural-assessment)
@@ -233,9 +234,11 @@ session epoch and `ViewOrigin`. The registry rechecks all fields before changing
 publishing a snapshot. Starting a newer operation cancels and supersedes the older operation in the
 same lane without recording a user failure; independent radio-feed view refreshes may coexist and
 cannot overwrite each other. Disconnect, discovery loss, source removal, and shutdown cancel all
-lanes and revoke the current session lease synchronously. Backends must cooperate with
-cancellation at every bounded network/page boundary; a late result can be dropped safely even when
-an underlying API cannot be interrupted immediately.
+lanes and revoke the current session lease synchronously. Backends cooperate with cancellation at
+bounded network/page boundaries only while aborting cannot strand remote ownership. A sessionful
+constructor uses the protected construction phase described below: cancellation is observable but
+cannot abort the task until a close-capable adapter is under the registry's staged retirement
+guard.
 
 GTK source navigation retains its own view-request generation. It answers only whether a current
 registry snapshot should be rendered. It does not own authentication, session lifetime, refresh,
@@ -312,12 +315,24 @@ Subsonic, Jellyfin, Plex, and DAAP all occupy ordinary registry entries and expo
 track IDs through their adapters. Their endpoint, advertised route, authentication, native media
 locator, and protocol metadata remain private to the ready session.
 
-DAAP's adapter additionally implements an asynchronous, idempotent `close`. Explicit disconnect,
+DAAP's adapter additionally implements an asynchronous `close` that only the registry can
+authorize. Explicit disconnect,
 replacement, discovery loss, deletion, and shutdown transfer its session into registry-owned
-retirement, synchronously revoke media, and elect exactly one logout owner. Concurrent close
-callers await the same completion and never send a second logout. A failed or timed-out best-effort
-logout still ends in `Dormant`/`Retired`; it cannot resurrect the session. `Drop` performs only
-local revocation and memory cleanup and never starts network I/O.
+retirement, synchronously revoke media, and elect exactly one logout owner. Repeated disconnect
+callers receive clones of one exact retirement waiter and never send a second logout. A failed or
+timed-out best-effort logout still ends in `Dormant`/`Retired`; it cannot resurrect the session.
+`Drop` performs only local revocation and memory cleanup and never starts network I/O.
+
+DAAP wiring must split its current constructor at the first close-capable boundary. The bounded
+`FinishConstruction` phase covers server-info and login only, and returns a logged-in adapter
+immediately after parsing the session ID. The registry synchronously installs its mandatory
+`StagedConnect` retirement guard before update, database discovery, items, or initial catalogue
+work begins. Once the unsafe login request has started, the constructor may observe cancellation
+but must not select/drop itself; it finishes and either performs its own ordinary-error cleanup or
+returns the adapter for registry retirement. Post-stage catalogue work may be aborted because
+dropping the staged guard starts the one tracked close. The current full
+`DaapBackend::connect_with_route`/`connect` path must therefore be split during production wiring;
+calling that full constructor as the protected authentication closure would stage too late.
 
 At application close the registry first closes its admission gate, cancels attempts and refreshes,
 and revokes every session lease. It then joins all bounded DAAP logout owners and other adapter
@@ -425,15 +440,49 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
   independent random source and track identities.
 
 These are compatible foundations, not proof that the complete lifecycle decision is implemented.
-The standard and DAAP registries remain siblings, and connect/refresh/cancellation/failure
-publication still crosses UI-owned paths. Radio, removable, and external queue entries now have
-location-independent identity but retain their current locator until their registry adapters and
-at-use resolvers are implemented. Local and playlist GTK rows retain paths for non-playback UI
-operations; embedded-art display begins with the exact playback-time resolution but still hands
-its helper a path rather than retained file authority. A row with both saved and discovered
-provenance also collapses them into one `manually_added` flag: Delete cannot yet demote it to a
-still-live discovery publication, and discovery loss retires live ownership even if the saved row
-remains. Those provenance, lifecycle, nonlocal-adapter, and embedded-art authority items remain
+An initially unwired `SourceLifecycleRegistry` now defines the shared authority boundary without
+creating a second production owner. Its entry atomically owns the adopted adapter, production
+`MediaLease`, and session epoch. Non-cloneable connect/refresh authority carries exact global
+generations and wakeable cancel-before-wait observation. Only atomically admitted spawned tasks and
+adapter retirements participate in the persistent shutdown barrier; an unspawned owner is inert,
+cannot hold shutdown open, and cannot start work after the gate closes. Dropping the optional task
+cancellation capability is also inert. The registry routes explicit cancellation through the
+current phase policy, so a protected constructor finishes cooperatively while post-stage work may
+be aborted safely. The final external registry handle closes admission, cancels tasks, revokes
+leases, and starts fail-closed retirement even if normal shutdown was omitted.
+
+New adapters are wrapped by the framework and synchronously enter either the active session or a
+non-cloneable staged retirement guard; no operational handle has close authority. Stale, cancelled,
+panicking, rejected, or shutdown results, adopted replacement, explicit disconnect, and shutdown
+all use the same exactly-once close path. Repeated disconnect returns one exact reusable waiter;
+disconnect/reconnect races dissociate the predecessor close from successor state without losing
+its waiter, and a second successor disconnect receives a distinct waiter that the predecessor
+cannot complete. A waiter wakes only after locked bookkeeping, typed retirement publication, and
+the terminal snapshot transition; replacement and dissociated closes also publish their retired
+session epoch so removing a pending-retirement count always advances the observable revision.
+Media resolution snapshots the exact adapter/lease/epoch, performs the backend
+lookup, rechecks all three, and only then attaches that existing lease to the request.
+
+Source-wide and per-`ViewOrigin` refresh lanes retain their last complete snapshot and accepted
+generation. Their sanitized failures carry the exact operation generation and optional session
+epoch, so a stale event cannot clear a newer retry. Every provenance publisher owns an opaque keyed
+claim; duplicate `Discovery` or removable publishers are reference-counted independently, and a
+new claim during close reactivates the logical source while the old retirement remains joined but
+cannot mutate a successor. Typed state, snapshot, provenance, cancellation, and failure changes
+carry one monotonically increasing registry revision, and only inert, provenance-free retired
+entries can be pruned.
+
+The new module is compiled and race-tested but deliberately has no shipping adapter call sites yet.
+The standard and DAAP registries therefore remain the production owners, and
+connect/refresh/cancellation/failure publication still crosses UI-owned paths. Radio, removable,
+and external queue entries have location-independent identity but retain their current locator
+until their registry adapters and at-use resolvers are implemented. Local and playlist GTK rows
+retain paths for non-playback UI operations; embedded-art display begins with the exact
+playback-time resolution but still hands its helper a path rather than retained file authority. A
+production row with both saved and discovered provenance still collapses them into one
+`manually_added` flag: Delete cannot yet demote it to a still-live discovery publication, and
+discovery loss retires live ownership even if the saved row remains. Wiring those production paths
+into the new authority, the nonlocal adapters, and the embedded-art authority boundary remain
 explicit P3.1 work.
 
 ## Deliberately deferred implementation details
@@ -461,9 +510,12 @@ implementation details so long as one registry ultimately enforces this contract
 5. **Identity complete, lifecycle open:** Radio-Browser, removable media, and external files have
    the specified source/track identity; moving their locator and retirement ownership into
    registry adapters remains open.
-6. Move connection/refresh cancellation, sanitized failure state, and snapshot publication out of
-   GTK callbacks. Remove URL-keyed lifecycle maps and the sibling DAAP registry only after race,
-   migration, disconnect, and shutdown tests cover the unified path.
+6. **Lifecycle foundation complete, production wiring open:** the unwired registry now owns the
+   state-machine, generation, epoch, provenance, close-task, and persistent shutdown-barrier
+   contracts under deterministic race coverage. Move connection/refresh cancellation, sanitized
+   failure state, and snapshot publication out of GTK callbacks one adapter family at a time.
+   Remove URL-keyed lifecycle maps and the sibling DAAP registry only after standard remotes, DAAP,
+   radio, removable, local/playlist, and external-file adapters have entered the unified path.
 
 Each step must keep existing credential-isolation, exact-origin, root-authority, receiver-ticket,
 and generation-supersession tests green. Compatibility code is removed in the same milestone; two
