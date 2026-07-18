@@ -31,8 +31,8 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**217/223 (97.3%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
-and **27/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**218/223 (97.8%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
+and **28/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -170,6 +170,25 @@ segments. The local-ID-at-use slice is included but its compound box remains ope
 root acquisition, containment, exact file authority, and retention through output consumption
 land. Central lifecycle/provenance and nonlocal at-use adapters also remain open. This advances the
 literal total to **217/223 (97.3%)** and P3 to **27/30** without changing P0–P2.
+PR #121 closes the remaining exact local/playlist ID-at-use and retained-output-authority box.
+Each queue load re-reads only its exact SQLite track ID, chooses the most-specific currently
+configured root backed by complete, available, identity-confirmed state, and acquires retained
+root, marker, ancestor, and exact regular-file handles under a five-second outer budget. The
+resolver rechecks both database bindings before publication, and the GTK handoff rejects an
+in-flight parent-root result when configuration adds a more-specific root without probing the
+filesystem on the UI thread. Local and AirPlay GStreamer, Chromecast, and MPD receive a typed
+`ResolvedLocalMedia` lease and expose only an opaque app-owned ticket; explicit-offset reads keep
+full and Range responses independent even when OS-cloned handles share a cursor. Replacement,
+Stop, failure, natural completion, ticket drop, and output/server teardown revoke future lookup,
+while an already admitted response remains bound to the retained file rather than a replacement
+installed at its old path. Playlist media keeps PR #120's local `MediaKey` plus separate
+`ViewOrigin`. Embedded local artwork still crosses a path-based helper, and centralized source
+refresh/failure/provenance plus radio/removable/external at-use adapters remain open. PR #121
+advances the literal total to **218/223 (97.8%)** and P3 to **28/30** without changing P0–P2.
+Its 55 focused resolver/root-authority/playback/Cast/GStreamer/MPD regressions, locked all-target
+compile, strict warning-free Clippy in debug and release, formatting, and diff checks pass locally.
+The complete debug and release suites each pass 20 library, 803 application, and 10
+repository-metadata tests (833 total), including every socket-bearing regression.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1475,7 +1494,7 @@ closed as a milestone.
   live navigation, cache, playback, or registry ownership nor loses discovery-only reachability.
   Runtime implementation is traceable through `79b9d0c`, `9bf87db`, `8232d90`, `432b66b`, and
   `269eb93`, with the accepted-reconnect follow-up in `4bb27a3` and final persisted-ID/route
-  hardening in `208dbf4`; the combined milestone is prepared for PR #120.
+  hardening in `208dbf4`; the combined milestone landed in PR #120.
 - [x] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source. P1.6 now
   retains an `Arc<dyn RemoteMediaResolver>` behind an exact generation and random revocable lease
   for each standard remote source; the existing DAAP registry retains its stateful live backend.
@@ -1486,21 +1505,32 @@ closed as a milestone.
   exact-lease reference; consuming it yields a typed `ResolvedHttpRequest`, and the selected
   output then mints its receiver-scoped proxy ticket. Stale playback and artwork completions are
   generation- and lease-rejected.
-- [ ] Resolve local/playlist media by stable track ID at playback, navigation, and receiver-load
+- [x] Resolve local/playlist media by stable track ID at playback, navigation, and receiver-load
   time so fallback reconciliation and outputs cannot retain dead or unauthorized file paths. The
-  ADR makes playlists local-library views and confines fallback matching to committed
-  reconciliation.
-  The first runtime slice makes local/playlist queue items pathless and performs an asynchronous
-  exact-ID lookup plus five-second current regular-file check for initial Play, Next, Previous when
-  it selects another queue item, repeat/replay, and every output load;
-  missing/dead/timed-out/stale results fail without fallback.
-  An output error leaves the item retryable through a fresh ID lookup. GTK rows still carry a
-  current path for display/file actions. The resolver does not yet acquire the currently
-  authorized root, prove that the database path is contained beneath it, acquire exact file
-  authority, or retain root/file authority through complete output consumption. Playlist-origin
-  queues now use local `SourceId` plus separate `ViewOrigin`, so generic local invalidation retires
-  them and view invalidation remains exact; those acquisition, containment, and lifetime gaps keep
-  this compound box open.
+  ADR makes playlists local-library views and confines fallback matching to committed reconciliation.
+  Local/playlist queue items are pathless and every initial, newly navigated, repeated, retried,
+  or receiver-targeted load asynchronously re-reads the exact SQLite ID. Resolution selects the
+  most-specific root that is both currently configured and backed by complete, available,
+  identity-confirmed database state; a missing/dead/timed-out/stale row, root, or file fails
+  without path, metadata, fingerprint, or alternate-track fallback. It acquires and retains the
+  exact root, marker, ancestor, and regular-file handles under a five-second outer budget, then
+  re-reads both row and root state before publication. The GTK thread rechecks that the retained
+  root is still the most-specific current configured match, without filesystem I/O, before handing
+  a typed `ResolvedLocalMedia` to the output; the bounded ticket worker revalidates physical
+  authority before every retained-handle clone.
+  Local and AirPlay GStreamer, Chromecast, and MPD consume only a handle-backed opaque HTTP ticket,
+  never the database path. Its bounded explicit-offset stream keeps sequential and concurrent
+  full/Range requests independent even when cloned OS handles share a cursor; replacement at the
+  path cannot retarget an admitted request, while physical root/marker loss blocks later handle
+  clones. Output replacement, Stop, load/error cleanup, end-of-queue completion, ticket drop, and
+  output/server teardown retire the lease.
+  Playlist rows now carry local source identity plus a separate `ViewOrigin`, preserving view
+  scrolling while allowing generic local-source invalidation to retire a playlist-origin queue.
+  GTK rows may still carry the current path for non-playback display/file actions. Implemented in
+  PR #121 with exact-ID/configured-root, no-fallback, retained-handle replacement,
+  symlink-escape, receiver-ticket/revocation, and playlist-invalidation regressions. Embedded-art
+  display still hands its UI helper the exact playback-time path rather than retained authority;
+  that narrower boundary remains under the unfinished lifecycle/adapters work below.
 - [ ] Centralize source refresh, cancellation, disconnect, and failure state. Generation/lease
   ownership and source-owned playback retirement are centralized, but environment startup,
   interactive auth, manual add, refresh publication, and UI failure handling remain separate
@@ -1519,12 +1549,12 @@ closed as a milestone.
   The document distinguishes accepted decisions, existing foundations, remaining implementation,
   migration, and completion tests. Accepted in PR #113 after the full native/package matrix passed.
 - [ ] Record implementation: P1.6 completed the remote resolver/session ownership subset in PR
-  #86 and PR #113 closed the architecture boxes. The current runtime milestone completes frozen
-  identity types, saved-source migration/quarantine, stable source ownership, exact native IDs,
-  `MediaKey`/`ViewOrigin` queues, and radio/removable/external identity. Exact local ID-at-use
-  resolution is also implemented, but current-root acquisition, containment, exact file authority,
-  and retention through consumption are still open. One centralized refresh/cancellation/failure
-  lifecycle and at-use radio/removable/external locator adapters must land before P3.1 itself can
+  #86 and PR #113 closed the architecture boxes. PR #120 completes frozen identity types,
+  saved-source migration/quarantine, stable source ownership, exact native IDs,
+  `MediaKey`/`ViewOrigin` queues, and radio/removable/external identity. PR #121 closes exact
+  local/playlist ID-at-use plus retained root/file authority through every output. One centralized
+  refresh/cancellation/failure/provenance lifecycle and at-use radio/removable/external locator
+  adapters—including the local embedded-art authority boundary—must land before P3.1 itself can
   be recorded complete.
 
 ### P3.2 Make the backend abstraction real and stable
@@ -2608,8 +2638,9 @@ Record scope or design decisions here so deferred work is explicit.
   completes P1.6 and also completes P3.1's remote session-retention, authenticated-URL removal,
   and playback-time remote-resolution boxes. The later P3.1 identity milestone supplies stable
   source IDs, exact local/remote IDs, playlist/radio view identity, and removable/external
-  identities. P3.1 still needs retained local file authority, centralized refresh/failure state,
-  and at-use radio/removable/external locator adapters.
+  identities; PR #121 then closes exact local/playlist ID-at-use and retained output authority.
+  P3.1 still needs centralized refresh/failure/provenance state and at-use
+  radio/removable/external locator adapters, including retained authority for local embedded art.
 - 2026-07-15 — A late PR #86 review found that Plex catalogue publication did not distinguish a
   track with no `Media`/`Part.key` from a resolvable track: GTK received a non-empty opaque
   reference that failed only after selection, whereas the old direct-URL path had left that row
@@ -2924,3 +2955,4 @@ Add one line per completed task:
 | 2026-07-17 | P3.1 exact local ID-at-use resolution (partial) | PR #120 (`81db425`) | Preserves each SQLite `tracks.id` byte-for-byte in local and playlist UI/queue identity, replaces random malformed-UUID fallback with a frozen deterministic compatibility projection, removes file locators from local/playlist queue items, and resolves the exact current database row plus five-second regular-file evidence before initial, newly navigated, repeated, or receiver-targeted output loads. Exact-generation completion suppresses stale async results and missing, empty, dead, timed-out, or deleted IDs never use metadata/path fallback. Focused resolver, queue, GObject, and model-conversion tests plus strict full debug/release suites cover the slice. Acquisition of the current root, containment proof, exact file authority, and retention through full output consumption remain open, so that compound task remains unchecked. |
 | 2026-07-17 | P3.1 stable identity runtime | PR #120 (`79b9d0c`, `9bf87db`, `8232d90`, `432b66b`, `269eb93`, `4bb27a3`, `208dbf4`, `3357765`, `3adf3ee`) | Freezes typed source/media/view identity and a strict atomic saved-source migration; replaces URL ownership with persisted or deterministic `SourceId` across standard and DAAP flows; preserves exact bounded native IDs for every remote adapter; and adopts source-scoped `MediaKey` plus playlist/radio `ViewOrigin` in playback. Version-1 rows accept only random RFC UUIDv4 IDs or their exact canonical remote UUIDv5 owner, preventing crafted values from claiming another endpoint, backend, built-in, or removable identity. Repeated Add reuses the saved owner, discovered-to-saved promotion persists the already-published ID and retains its ephemeral advertised route for the immediate route-aware connection, and saved-plus-env startup authenticates under the stored ID; a prefixed reversible segment round-trips even native `.`/`..` IDs through stream and artwork references. Accepted reconnect publications clear the transient connecting state even when the canonical owner remains connected; environment authentication/catalogue failures carry exact owner plus opaque UI-attempt identity, preserving a retained predecessor and rejecting a stale queued failure after a same-source retry. Removable rows use frozen lossless mount-relative native identity, malformed radio IDs fail closed, and external sessions mint independent random IDs. A row carrying both saved and discovery provenance still collapses those facts into `manually_added`, so Delete cannot yet demote it to a still-live discovered row and discovery loss can still retire the saved owner; that remains part of the open centralized-lifecycle task. Focused migration, route, registry, exact-native-ID adapter, queue, removable, radio, source-object, and reordered exact-attempt failure regressions cover the completed stable-ID compound box; the final independent-review head passes 827 tests and strict Clippy in both debug and release. Centralized lifecycle/provenance, nonlocal at-use locators, and acquisition/containment/retention of local root/file authority remain open. |
 | 2026-07-17 | P3.1 stable identity CI follow-up | PR #120 | Replaces the failed-atomic-migration fixture's Unix permission manipulation with an injected error at the loader's private save boundary. Privileged containers can bypass `chmod 0500`, but the new cross-platform fixture deterministically proves a failed replacement quarantines the configuration, publishes no migrated rows, and preserves the legacy bytes exactly. The focused regression passes in debug and release; it now also runs on Windows, changes no production migration behavior, and leaves checklist arithmetic unchanged. |
+| 2026-07-17 | P3.1 exact local/playlist ID-at-use and retained output authority | PR #121 | Preserves PR #120's exact SQLite IDs and typed local `MediaKey`/playlist `ViewOrigin`, keeps playback queues pathless, and resolves only the exact current row beneath the most-specific currently configured authoritative root. A typed `ResolvedLocalMedia` lease retains root, marker, ancestor, and exact file handles through local/AirPlay GStreamer, Chromecast, and MPD handle-backed tickets; path replacement cannot retarget admitted playback, explicit-offset full/Range reads cannot interfere through a shared cloned-handle cursor, and load replacement, Stop, error, terminal completion, ticket drop, and teardown revoke future lookup. All 55 focused root/state recheck, no-fallback, symlink-escape, retained-file replacement, ticket/revocation, output-boundary, and playlist-ownership regressions pass alongside locked all-target check, formatting/diff checks, strict debug/release Clippy, and complete 833-test debug/release suites. Central lifecycle/provenance, nonlocal at-use locator adapters, and the path-based local embedded-art helper remain open. |

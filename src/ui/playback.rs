@@ -90,6 +90,25 @@ fn identity_belongs_to_source(identity: &PlaybackIdentity, source_key: &str) -> 
         && queue_view(source_key).is_some_and(|view| view.source_id == identity.media_key.source_id)
 }
 
+/// Whether `source_key` names the media-source session that owns this item.
+///
+/// Playlist and radio-feed keys are view origins, not source owners. They are
+/// intentionally accepted by `identity_belongs_to_source` for GTK visibility,
+/// but retiring one view must not revoke media owned by the local library or
+/// shared Radio-Browser source.
+fn identity_is_owned_by_source(identity: &PlaybackIdentity, source_key: &str) -> bool {
+    let source_id = if source_key == LOCAL_SOURCE_KEY {
+        Some(SourceId::local())
+    } else if source_key.starts_with(PLAYLIST_SOURCE_PREFIX) || source_key.starts_with("radio-") {
+        None
+    } else if let Ok(source_id) = source_key.parse::<SourceId>() {
+        Some(source_id)
+    } else {
+        SourceId::removable(source_key).ok()
+    };
+    source_id == Some(identity.media_key.source_id)
+}
+
 /// Overlay committed local-library URIs onto an existing playlist projection.
 ///
 /// Playlist rows and the local library share stable track IDs, but each
@@ -304,7 +323,7 @@ impl PlaybackSession {
     pub(crate) fn clear_if_source(&mut self, source_id: &str) -> bool {
         if self
             .current_identity()
-            .is_none_or(|identity| !identity_belongs_to_source(identity, source_id))
+            .is_none_or(|identity| !identity_is_owned_by_source(identity, source_id))
         {
             return false;
         }
@@ -738,6 +757,9 @@ pub struct PlaybackContext {
     pub artist_label: gtk::Label,
     pub media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>>,
     pub session: Rc<RefCell<PlaybackSession>>,
+    /// Current in-process configuration. Local resolution snapshots its roots
+    /// before background work and rechecks them immediately before output.
+    pub app_config: Rc<RefCell<super::preferences::AppConfig>>,
     /// Tokio runtime used for exact local-database resolution without
     /// blocking GTK's main thread.
     pub rt_handle: tokio::runtime::Handle,
@@ -877,10 +899,14 @@ fn play_current(ctx: &PlaybackContext) -> bool {
             .as_ref()
             .map(|identity| identity.media_key.track_id.clone())
             .expect("local queue item has an identity");
+        let configured_roots = ctx.app_config.borrow().library_paths.clone();
         let (resolved_tx, resolved_rx) = async_channel::bounded(1);
         ctx.rt_handle.spawn(async move {
             let resolved = match crate::db::connection::init_db().await {
-                Ok(db) => crate::local::resolver::resolve_track_uri(&db, track_id.as_str()).await,
+                Ok(db) => {
+                    crate::local::resolver::resolve_track(&db, track_id.as_str(), &configured_roots)
+                        .await
+                }
                 Err(source) => {
                     Err(crate::local::resolver::LocalMediaResolutionError::Database { source })
                 }
@@ -891,17 +917,30 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         let session = Rc::clone(&ctx.session);
         let active_output = Rc::clone(&ctx.active_output);
         let media_ctrl = Rc::clone(&ctx.media_ctrl);
+        let app_config = Rc::clone(&ctx.app_config);
         let album_art = ctx.album_art.clone();
         glib::MainContext::default().spawn_local(async move {
             match resolved_rx.recv().await {
-                Ok(Ok(uri)) => {
+                Ok(Ok(media))
+                    if media.matches_current_configuration(&app_config.borrow().library_paths) =>
+                {
                     if session.borrow_mut().finish_pending_resolution(generation) {
-                        let accepted = active_output.borrow().load_uri(uri.as_str());
+                        let artwork_uri = media.file_uri().as_str().to_string();
+                        let accepted = active_output.borrow().load_local(media);
                         if !accepted {
                             let marked = session.borrow_mut().mark_load_rejected(generation);
                             debug_assert!(marked, "current local load remains retryable");
                         }
-                        album_art::update_album_art(&album_art, uri.as_str());
+                        album_art::update_album_art(&album_art, &artwork_uri);
+                    }
+                }
+                Ok(Ok(_)) => {
+                    if session.borrow_mut().fail_pending_resolution(generation) {
+                        warn!("Local media root changed before output handoff");
+                        active_output.borrow().stop();
+                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                            ctrl.update_playback(false);
+                        }
                     }
                 }
                 Ok(Err(error)) => {
@@ -1282,6 +1321,10 @@ mod tests {
         }
 
         fn load_resolved(&self, _request: crate::architecture::media::ResolvedHttpRequest) -> bool {
+            false
+        }
+
+        fn load_local(&self, _media: crate::local::resolver::ResolvedLocalMedia) -> bool {
             false
         }
 
@@ -1844,6 +1887,7 @@ mod tests {
     fn playlist_view_origin_is_separate_from_local_media_identity() {
         let mut session = PlaybackSession::default();
         assert!(session.replace_queue(vec![item("playlist:favourites", "local-track")], 0));
+        let generation = session.begin_pending_resolution();
         let identity = session.current_identity().expect("identity");
         assert_eq!(identity.media_key.source_id, SourceId::local());
         assert_eq!(
@@ -1852,6 +1896,8 @@ mod tests {
         );
 
         assert!(!session.clear_if_source("playlist:other"));
+        assert!(!session.clear_if_source("playlist:favourites"));
+        assert!(session.accepts_event_generation(generation));
         assert!(session.clear_if_source(LOCAL_SOURCE_KEY));
         assert!(!session.has_current());
 
@@ -1871,7 +1917,8 @@ mod tests {
             Some(ViewOrigin::Radio("radio-topvote".to_string()))
         );
         assert!(!session.clear_if_source("radio-nearme"));
-        assert!(session.clear_if_source("radio-topvote"));
+        assert!(!session.clear_if_source("radio-topvote"));
+        assert!(session.clear_if_source(&SourceId::radio_browser().to_string()));
     }
 
     #[test]

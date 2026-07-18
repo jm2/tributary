@@ -50,6 +50,7 @@ use url::{Host, Url};
 
 use self::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket};
 use crate::architecture::media::ResolvedHttpRequest;
+use crate::local::resolver::ResolvedLocalMedia;
 
 /// `souphttpsrc`'s default blocking-I/O deadline is 15 seconds. Protected
 /// playback gives the app-owned proxy a shorter upstream startup budget, then
@@ -285,6 +286,15 @@ impl Player {
         tracing::debug!("Loading resolved track");
         let generation = self.begin_load();
         let prepared = self.media_proxy.prepare_resolved(request);
+        self.finish_load(generation, prepared);
+    }
+
+    /// Load an exact local-library file through an app-owned handle-backed
+    /// loopback ticket. The GStreamer source never reopens the database path.
+    pub fn load_local(&self, media: ResolvedLocalMedia) {
+        tracing::debug!("Loading authorized local track");
+        let generation = self.begin_load();
+        let prepared = self.media_proxy.prepare_local(media);
         self.finish_load(generation, prepared);
     }
 

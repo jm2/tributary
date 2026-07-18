@@ -18,21 +18,24 @@
 //!   in-process outputs may select a specific address, but wildcard addresses
 //!   are rejected and the requested address family is preserved.
 //! - **No directory listing**: Only pre-registered UUIDs are servable.
-//! - **No path traversal**: File paths are stored in a `DashMap` keyed
-//!   by random UUID — there is no URL-to-filesystem path mapping.
+//! - **No path traversal**: Legacy explicit paths and playback-time retained
+//!   file authorities are stored in a `DashMap` keyed by random UUID — there
+//!   is no URL-to-filesystem path mapping.
 //! - **Not an open relay**: an upstream ticket resolves to a URL fixed at
 //!   registration time. A caller cannot ask the proxy to fetch anything else,
 //!   and only the `Range` header is forwarded upstream.
 //! - **Credential tickets are explicitly revocable**: every new load revokes the
 //!   previous credential ticket — including a load that turns out to be a local
-//!   file or unauthenticated radio — and `stop()` revokes them all. At most one
+//!   file or unauthenticated radio — and `stop()` revokes them all. Playback-time
+//!   retained-file routes follow the same load lifecycle. At most one
 //!   credential-bearing ticket is live at a time, and it dies when playback
 //!   moves on rather than lingering until the next credentialed track.
 //! - **Credential tickets expire**: upstream tickets have a hard, non-sliding
 //!   24-hour lifetime from registration. Receiver requests, pause, and seek do
 //!   not renew it. An already-admitted response may finish after expiration,
 //!   but every later lookup receives the same 404 as an unknown or revoked
-//!   ticket. Local-file routes keep their existing server-lifetime contract.
+//!   ticket. Legacy explicit-file routes keep their server-lifetime contract;
+//!   playback-time local-authority routes are revoked with their owning load.
 //! - **OS-assigned port**: Uses port 0 for dynamic assignment.
 //! - **Graceful shutdown**: Can be stopped when no longer needed.
 
@@ -57,6 +60,7 @@ use uuid::Uuid;
 
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::architecture::AdvertisedHttpRoute;
+use crate::local::resolver::ResolvedLocalMedia;
 
 const OPAQUE_UPSTREAM_BODY_ERROR: &str = "upstream media body stream failed";
 
@@ -200,8 +204,11 @@ impl UpstreamMediaClient {
 /// request state that must never be printed, logged, or handed to a receiver.
 #[derive(Clone)]
 enum MediaSource {
-    /// A local file, streamed from disk.
-    Local(PathBuf),
+    /// Legacy path-based local file registration used outside library-ID
+    /// resolution.
+    LocalPath(PathBuf),
+    /// An exact library file and its retained root/file authority.
+    LocalAuthority(ResolvedLocalMedia),
     /// A remote stream that Tributary fetches on the receiver's behalf.
     Upstream {
         request: UpstreamRequest,
@@ -448,11 +455,35 @@ impl CastHttpServer {
         let ticket = format!("{}.{ext}", Uuid::new_v4());
 
         self.media
-            .insert(ticket.clone(), MediaSource::Local(path.to_path_buf()));
+            .insert(ticket.clone(), MediaSource::LocalPath(path.to_path_buf()));
 
         let url = self.ticket_url(&ticket);
         debug!(url = %url, path = %path.display(), "Registered file for casting");
         url
+    }
+
+    /// Register one playback-time local authority lease.
+    ///
+    /// The map owns the lease rather than a pathname. Each admitted request
+    /// clones the exact retained file handle, so a later unlink/replacement at
+    /// the database path cannot retarget a receiver to different bytes.
+    /// Registration itself performs no filesystem I/O: the bounded blocking
+    /// handler revalidates root and file authority immediately before every
+    /// handle clone, so a dead network root cannot stall the UI handoff.
+    pub(crate) fn register_local(&self, media: ResolvedLocalMedia) -> String {
+        let extension = media.extension().and_then(|extension| {
+            PROTECTED_TICKET_AUDIO_EXTENSIONS
+                .iter()
+                .find(|known| known.eq_ignore_ascii_case(extension))
+                .copied()
+        });
+        let ticket = match extension {
+            Some(extension) => format!("{}.{extension}", Uuid::new_v4()),
+            None => Uuid::new_v4().to_string(),
+        };
+        self.media
+            .insert(ticket.clone(), MediaSource::LocalAuthority(media));
+        self.ticket_url(&ticket)
     }
 
     /// Register a remote stream that Tributary will fetch on the receiver's
@@ -532,6 +563,11 @@ impl CastHttpServer {
         revoke_upstreams_in(&self.media);
     }
 
+    /// Revoke every route owned by this output generation.
+    pub(crate) fn revoke_all(&self) {
+        self.media.clear();
+    }
+
     fn ticket_url(&self, ticket: &str) -> String {
         format!("http://{}/cast/{}", self.addr, ticket)
     }
@@ -539,6 +575,21 @@ impl CastHttpServer {
     /// The socket address the server is listening on.
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detached_for_test(runtime: &tokio::runtime::Handle, addr: SocketAddr) -> Self {
+        let task = runtime.spawn(std::future::pending::<()>());
+        Self {
+            addr,
+            media: Arc::new(DashMap::new()),
+            abort_handle: task.abort_handle(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registered_route_count(&self) -> usize {
+        self.media.len()
     }
 }
 
@@ -586,7 +637,8 @@ async fn serve_media(
     };
 
     match source {
-        MediaSource::Local(path) => serve_local_file(&path, &headers).await,
+        MediaSource::LocalPath(path) => serve_local_file(&path, &headers).await,
+        MediaSource::LocalAuthority(media) => serve_authorized_local_file(media, &headers).await,
         MediaSource::Upstream { request, .. } => {
             debug!(
                 stage = STAGE_INBOUND_TICKET,
@@ -793,26 +845,160 @@ where
 /// Stream a local file, honoring `Range` requests so the receiver can seek.
 async fn serve_local_file(path: &std::path::Path, headers: &HeaderMap) -> Response {
     let path = path.to_path_buf();
-
-    // Open the file.
-    let metadata = match tokio::fs::metadata(&path).await {
-        Ok(m) => m,
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
         Err(e) => {
-            error!(error = %e, path = %path.display(), "Failed to stat registered file");
+            error!(error = %e, path = %path.display(), "Failed to open registered file");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    let file_size = match file.metadata().await {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            error!(%error, "Failed to inspect registered file");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    serve_open_local_file(file, file_size, extension, headers).await
+}
 
-    let file_size = metadata.len();
+/// Stream a playback-time authorized file from its retained handle.
+async fn serve_authorized_local_file(media: ResolvedLocalMedia, headers: &HeaderMap) -> Response {
+    let extension = media.extension().unwrap_or("").to_string();
+    let opened = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            let file = media.try_clone_file()?;
+            let file_size = file.metadata()?.len();
+            Ok::<_, std::io::Error>((file, file_size))
+        }),
+    )
+    .await;
+    let (file, file_size) = match opened {
+        Ok(Ok(Ok(opened))) => opened,
+        Ok(Ok(Err(error))) => {
+            error!(
+                category = ?error.kind(),
+                "Retained local media authority is no longer usable"
+            );
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Ok(Err(_)) => {
+            error!("Retained local media authority task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(_) => {
+            error!("Retained local media authority check timed out");
+            return StatusCode::GATEWAY_TIMEOUT.into_response();
+        }
+    };
+    serve_open_authorized_file(file, file_size, &extension, headers)
+}
 
-    // Determine content type from extension.
-    let content_type = match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
-        .as_str()
-    {
+/// Serve an authorized handle with position-independent reads.
+///
+/// `File::try_clone` may share one cursor with the retained descriptor. Using
+/// ordinary `Read`/`Seek` would therefore let concurrent or sequential Range
+/// requests corrupt one another's offsets. A bounded blocking producer uses
+/// `read_at`/`seek_read` against explicit offsets, preserving the exact handle
+/// without reopening its pathname.
+fn serve_open_authorized_file(
+    file: std::fs::File,
+    file_size: u64,
+    extension: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let requested_range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_range_header(value, file_size));
+    let (status, start, length, content_range) = match requested_range {
+        Some((start, end)) => (
+            StatusCode::PARTIAL_CONTENT,
+            start,
+            end - start + 1,
+            Some(format!("bytes {start}-{end}/{file_size}")),
+        ),
+        None => (StatusCode::OK, 0, file_size, None),
+    };
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, local_content_type(extension))
+        .header(header::CONTENT_LENGTH, length.to_string())
+        .header(header::ACCEPT_RANGES, "bytes");
+    if let Some(content_range) = content_range {
+        response = response.header(header::CONTENT_RANGE, content_range);
+    }
+    response
+        .body(authorized_file_body(file, start, length))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn authorized_file_body(file: std::fs::File, start: u64, length: u64) -> Body {
+    const CHUNK_BYTES: usize = 64 * 1024;
+    const BUFFERED_CHUNKS: usize = 2;
+
+    let (sender, receiver) =
+        async_channel::bounded::<Result<Vec<u8>, std::io::Error>>(BUFFERED_CHUNKS);
+    drop(tokio::task::spawn_blocking(move || {
+        let mut offset = start;
+        let mut remaining = length;
+        while remaining > 0 {
+            let chunk_len = usize::try_from(remaining.min(CHUNK_BYTES as u64))
+                .expect("bounded authorized-media chunk length fits usize");
+            let mut chunk = vec![0; chunk_len];
+            match read_file_at(&file, &mut chunk, offset) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Ok(0) => {
+                    let _ = sender.send_blocking(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "authorized media ended before its retained size",
+                    )));
+                    break;
+                }
+                Ok(read) => {
+                    chunk.truncate(read);
+                    offset = offset.saturating_add(read as u64);
+                    remaining = remaining.saturating_sub(read as u64);
+                    if sender.send_blocking(Ok(chunk)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send_blocking(Err(error));
+                    break;
+                }
+            }
+        }
+    }));
+    Body::from_stream(receiver)
+}
+
+#[cfg(unix)]
+fn read_file_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+
+    file.read_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_file_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+
+    file.seek_read(buffer, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_file_at(_file: &std::fs::File, _buffer: &mut [u8], _offset: u64) -> std::io::Result<usize> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "position-independent authorized media reads are unsupported on this platform",
+    ))
+}
+
+fn local_content_type(extension: &str) -> &'static str {
+    match extension.to_ascii_lowercase().as_str() {
         "mp3" => "audio/mpeg",
         "flac" => "audio/flac",
         "ogg" | "oga" => "audio/ogg",
@@ -822,7 +1008,16 @@ async fn serve_local_file(path: &std::path::Path, headers: &HeaderMap) -> Respon
         "aiff" | "aif" => "audio/aiff",
         "wma" => "audio/x-ms-wma",
         _ => "application/octet-stream",
-    };
+    }
+}
+
+async fn serve_open_local_file(
+    mut file: tokio::fs::File,
+    file_size: u64,
+    extension: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let content_type = local_content_type(extension);
 
     // Parse Range header for byte-range support.
     if let Some(range_header) = headers.get(header::RANGE) {
@@ -831,16 +1026,7 @@ async fn serve_local_file(path: &std::path::Path, headers: &HeaderMap) -> Respon
                 let (start, end) = range;
                 let length = end - start + 1;
 
-                let file = match tokio::fs::File::open(&path).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        error!(error = %e, "Failed to open file for range request");
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                };
-
                 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-                let mut file = file;
                 if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
                     error!(error = %e, "Failed to seek in file");
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -863,15 +1049,6 @@ async fn serve_local_file(path: &std::path::Path, headers: &HeaderMap) -> Respon
             }
         }
     }
-
-    // Full file response.
-    let file = match tokio::fs::File::open(&path).await {
-        Ok(f) => f,
-        Err(e) => {
-            error!(error = %e, path = %path.display(), "Failed to open registered file");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
 
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = Body::from_stream(stream);
@@ -1096,7 +1273,7 @@ mod tests {
         let now = Instant::now();
         media.insert(
             "local.flac".to_string(),
-            MediaSource::Local(PathBuf::from("/music/local.flac")),
+            MediaSource::LocalPath(PathBuf::from("/music/local.flac")),
         );
         let much_later = now
             .checked_add(Duration::from_hours(365 * 24))
@@ -1104,9 +1281,133 @@ mod tests {
 
         assert!(matches!(
             resolve_media_with_clock(&media, "local.flac", || much_later),
-            Some(MediaSource::Local(_))
+            Some(MediaSource::LocalPath(_))
         ));
         assert!(media.contains_key("local.flac"));
+    }
+
+    #[tokio::test]
+    async fn authorized_local_ticket_serves_retained_file_and_revokes() {
+        let root = tempfile::tempdir().expect("temporary library root");
+        let marker = format!("marker:v1:{}", Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .expect("write root marker");
+        let path = root.path().join("track.flac");
+        let displaced = root.path().join("admitted.flac");
+        std::fs::write(&path, b"authorized").expect("write admitted media");
+
+        let media = ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &path)
+            .expect("retain local media authority");
+        #[cfg(unix)]
+        let invalidation_media = media.clone();
+        let registry = Arc::new(DashMap::new());
+        let server_task = tokio::spawn(std::future::pending::<()>());
+        let server = CastHttpServer {
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 46_000)),
+            media: Arc::clone(&registry),
+            abort_handle: server_task.abort_handle(),
+        };
+        let state = ServerState {
+            media: registry,
+            upstream: UpstreamMediaClient::new().expect("test upstream client"),
+        };
+        let ticket = server.register_local(media);
+        let ticket_id = Url::parse(&ticket)
+            .expect("parse ticket URL")
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .expect("ticket path")
+            .to_string();
+
+        match std::fs::rename(&path, &displaced) {
+            Ok(()) => {
+                std::fs::write(&path, b"replacement").expect("install pathname replacement");
+            }
+            Err(error) => {
+                #[cfg(not(windows))]
+                panic!("move admitted pathname: {error}");
+                #[cfg(windows)]
+                {
+                    let _ = error;
+                    // Windows retains the stronger namespace pin because
+                    // authority handles intentionally omit delete sharing.
+                    assert_eq!(
+                        std::fs::read(&path).expect("read pinned path"),
+                        b"authorized"
+                    );
+                }
+            }
+        }
+
+        let response = serve_media(
+            State(state.clone()),
+            Path(ticket_id.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read media response")
+                .as_ref(),
+            b"authorized"
+        );
+
+        let mut range_headers = HeaderMap::new();
+        range_headers.insert(header::RANGE, HeaderValue::from_static("bytes=2-5"));
+        let range = serve_media(State(state.clone()), Path(ticket_id.clone()), range_headers).await;
+        assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            axum::body::to_bytes(range.into_body(), usize::MAX)
+                .await
+                .expect("read ranged media response")
+                .as_ref(),
+            b"thor"
+        );
+
+        let replay = serve_media(
+            State(state.clone()),
+            Path(ticket_id.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(replay.into_body(), usize::MAX)
+                .await
+                .expect("read replayed media response")
+                .as_ref(),
+            b"authorized"
+        );
+
+        server.revoke_all();
+        let revoked = serve_media(State(state.clone()), Path(ticket_id), HeaderMap::new()).await;
+        assert_eq!(revoked.status(), StatusCode::NOT_FOUND);
+
+        #[cfg(unix)]
+        {
+            let invalidated_ticket = server.register_local(invalidation_media);
+            let invalidated_id = Url::parse(&invalidated_ticket)
+                .expect("parse invalidated ticket URL")
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .expect("invalidated ticket path")
+                .to_string();
+            let replacement_marker = format!("marker:v1:{}", Uuid::new_v4());
+            std::fs::write(
+                root.path().join(".tributary-root-id"),
+                format!("{replacement_marker}\n"),
+            )
+            .expect("replace marker content");
+
+            let invalidated =
+                serve_media(State(state), Path(invalidated_id), HeaderMap::new()).await;
+            assert_eq!(invalidated.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[test]
@@ -1180,7 +1481,9 @@ mod tests {
             MediaSource::Upstream { request, .. } => {
                 assert_eq!(request.endpoint(), &upstream);
             }
-            MediaSource::Local(_) => panic!("expected admitted upstream source"),
+            MediaSource::LocalPath(_) | MediaSource::LocalAuthority(_) => {
+                panic!("expected admitted upstream source")
+            }
         }
     }
 

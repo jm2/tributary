@@ -25,6 +25,7 @@ use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::http_security::{classify_media_uri, MediaUriSecurity};
+use crate::local::resolver::ResolvedLocalMedia;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -101,6 +102,9 @@ enum CommandKind {
     ResolvedLoad {
         request: Box<ResolvedHttpRequest>,
     },
+    LocalLoad {
+        media: ResolvedLocalMedia,
+    },
     RejectLoad {
         failure: MpdFailure,
     },
@@ -123,6 +127,7 @@ impl CommandKind {
             Self::Load { .. }
                 | Self::ProtectedLoad { .. }
                 | Self::ResolvedLoad { .. }
+                | Self::LocalLoad { .. }
                 | Self::RejectLoad { .. }
         )
     }
@@ -532,14 +537,16 @@ trait MpdMediaTicket: Send + Sync {
 enum MpdUpstream {
     Legacy(Box<Url>),
     Resolved(Box<ResolvedHttpRequest>),
+    Local(ResolvedLocalMedia),
 }
 
 impl MpdUpstream {
     #[cfg(test)]
-    fn endpoint(&self) -> &Url {
+    fn endpoint(&self) -> Option<&Url> {
         match self {
-            Self::Legacy(url) => url,
-            Self::Resolved(request) => request.endpoint(),
+            Self::Legacy(url) => Some(url),
+            Self::Resolved(request) => Some(request.endpoint()),
+            Self::Local(_) => None,
         }
     }
 
@@ -547,6 +554,10 @@ impl MpdUpstream {
         match self {
             Self::Legacy(_) => true,
             Self::Resolved(request) => request.is_active(),
+            // Filesystem validation may block on a dead network root, so local
+            // authority is revalidated only by the bounded ticket handler
+            // immediately before it clones the retained file handle.
+            Self::Local(_) => true,
         }
     }
 }
@@ -573,7 +584,7 @@ impl MpdMediaTicket for CastMpdMediaTicket {
     }
 
     fn revoke(&self) {
-        self.server.revoke_upstreams();
+        self.server.revoke_all();
     }
 }
 
@@ -595,6 +606,7 @@ impl MpdProxyFactory for CastMpdProxyFactory {
             MpdUpstream::Resolved(request) => server
                 .register_resolved(request.as_ref().clone())
                 .ok_or_else(|| MpdFailure::new("media source availability"))?,
+            MpdUpstream::Local(media) => server.register_local(media.clone()),
         };
         // Keep the same command and URI bounds for generated tickets as for
         // direct media. Registration is fail-closed if the route cannot yield
@@ -1870,6 +1882,20 @@ fn run_mpd_worker<C>(
                             &mut active,
                             command.owner,
                             MpdMedia::Protected(MpdUpstream::Resolved(request)),
+                            &proxy,
+                            &intent_epoch,
+                            &cache,
+                            &event_tx,
+                            timing,
+                        );
+                        true
+                    }
+                    CommandKind::LocalLoad { media } => {
+                        handle_load(
+                            &mut connector,
+                            &mut active,
+                            command.owner,
+                            MpdMedia::Protected(MpdUpstream::Local(media)),
                             &proxy,
                             &intent_epoch,
                             &cache,
@@ -3170,6 +3196,15 @@ impl AudioOutput for MpdOutput {
         true
     }
 
+    fn load_local(&self, media: ResolvedLocalMedia) -> bool {
+        if !self.ensure_load_allowed() {
+            return false;
+        }
+        let owner = self.begin_load();
+        self.enqueue(owner, CommandKind::LocalLoad { media });
+        true
+    }
+
     fn set_event_generation(&self, generation: PlayerEventGeneration) {
         self.event_generation
             .store(generation.as_raw(), Ordering::SeqCst);
@@ -3249,6 +3284,21 @@ mod tests {
     use std::io::Read;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
     use std::sync::atomic::AtomicBool;
+
+    fn authorized_local_media() -> (tempfile::TempDir, ResolvedLocalMedia) {
+        let root = tempfile::tempdir().expect("temporary local-media root");
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .expect("write local-media marker");
+        let path = root.path().join("track.flac");
+        std::fs::write(&path, b"local media").expect("write local-media fixture");
+        let media = ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &path)
+            .expect("retain local-media authority");
+        (root, media)
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Point {
@@ -3561,11 +3611,13 @@ mod tests {
                 .lock()
                 .expect("proxy starts lock")
                 .push(local_addr);
-            self.shared
-                .upstreams
-                .lock()
-                .expect("proxy upstreams lock")
-                .push(upstream.endpoint().as_str().to_string());
+            if let Some(endpoint) = upstream.endpoint() {
+                self.shared
+                    .upstreams
+                    .lock()
+                    .expect("proxy upstreams lock")
+                    .push(endpoint.as_str().to_string());
+            }
             if self.shared.fail_start.load(Ordering::SeqCst) {
                 return Err(MpdFailure::new("media proxy registration"));
             }
@@ -4149,6 +4201,41 @@ mod tests {
         assert_ne!(added[0], endpoint.as_str());
         assert!(!added[0].contains("music.test"));
         assert!(!added[0].contains("track=42"));
+        assert!(proxy_shared.active(0));
+
+        harness.shutdown();
+        assert!(!proxy_shared.active(0));
+    }
+
+    #[test]
+    fn local_load_reaches_mpd_only_as_an_opaque_handle_backed_ticket() {
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_with_proxy(Arc::clone(&shared), proxy);
+        let owner = harness.next_replacing_owner(1);
+        let (_root, media) = authorized_local_media();
+
+        harness.send(owner, CommandKind::LocalLoad { media });
+        harness.fence(owner);
+
+        assert_eq!(
+            *proxy_shared.starts.lock().expect("proxy starts lock"),
+            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 45_000))]
+        );
+        assert!(
+            proxy_shared
+                .upstreams
+                .lock()
+                .expect("proxy upstreams lock")
+                .is_empty(),
+            "local authority must not become an upstream URL"
+        );
+        let added = shared.added_uris();
+        assert_eq!(added.len(), 1);
+        assert!(added[0].starts_with("http://127.0.0.1:46000/cast/opaque-"));
+        assert!(!added[0].contains("track.flac"));
         assert!(proxy_shared.active(0));
 
         harness.shutdown();

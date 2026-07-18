@@ -288,16 +288,17 @@ available, and each scan or watcher reconciliation is a generation-owned refresh
 replacement or application shutdown changes the session epoch. Root-trust authority remains in
 the local engine; the registry adapter cannot make an untrusted root playable.
 
-The target local adapter resolves the exact database `TrackId` at use, obtains the current file
-path, proves it is contained by the currently authorized root, acquires root/file authority, and
-retains that authority until the output or file server has finished consuming it. The current
-partial resolver performs only the exact database lookup and a bounded regular-file metadata
-check; it does not yet acquire the current root, prove containment beneath it, or retain either
-root or file authority through consumption. Playlist navigation queries entries by playlist ID and
-resolves their linked local track IDs from the same current snapshot. Fingerprint/path fallback is
-only a reconciliation operation that updates `playlist_entries.track_id`; playback never performs
-fuzzy or path fallback on its own. An orphan remains visibly unavailable until reconciliation
-commits a unique match.
+The local playback adapter resolves the exact database `TrackId` at use, obtains the current file
+path, proves it is contained by the most-specific currently configured authoritative root,
+acquires retained root/marker/ancestor/file authority, and keeps that authority until the output
+or file server has finished consuming it. It rechecks database bindings after acquisition and
+rechecks current root configuration before output handoff. Playlist navigation queries entries by
+playlist ID and resolves their linked local track IDs from the same current snapshot.
+Fingerprint/path fallback is only a reconciliation operation that updates
+`playlist_entries.track_id`; playback never performs fuzzy or path fallback on its own. An orphan
+remains visibly unavailable until reconciliation commits a unique match. Embedded-art display
+still hands its application-owned helper the exact playback-time path rather than retained file
+authority; that narrower adapter boundary remains open.
 
 A playlist is a `ViewOrigin`, not a source session. Regular and smart playlist queue items carry
 the local `SourceId` and local `TrackId`, plus the playlist ID and occurrence for ordering. Deleting
@@ -405,9 +406,15 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
 - Local database IDs and playlist foreign keys survive authoritative file/directory renames.
   Architecture rows preserve the exact SQLite ID—including a legacy non-UUID value—and local or
   playlist queues no longer retain a file locator. Every queue load resolves that ID against the
-  current row and performs a regular-file metadata check under a five-second budget before handing
-  a URI to an output; stale generations cannot claim a later load. This check is not yet a current
-  root-containment or retained-authority proof.
+  current row and the most-specific currently configured authoritative root under a five-second
+  budget. The resolver retains the root, marker, ancestor chain, and exact regular-file handle,
+  rechecks database bindings after acquisition, and hands only typed authority to the output;
+  stale generations cannot claim a later load. Local and AirPlay GStreamer, Chromecast, and MPD
+  exchange that handle for an opaque app-owned ticket whose bounded explicit-offset stream keeps
+  full and Range requests independent even when cloned OS handles share a cursor. Every
+  replacement, Stop, error, terminal queue completion, ticket drop, or output teardown retires
+  future lookups. Playlist queue identity uses the local source plus a separate `ViewOrigin`, so
+  generic local retirement also retires a playlist-origin queue without losing view navigation.
 - Removable sources derive `SourceId` from the best-available logical key and exact `TrackId` from
   the losslessly encoded mount-relative native path. Relocation/removal still retires scans, cache,
   and playback. Radio queues share the built-in Radio-Browser source and reject empty/oversized
@@ -419,13 +426,12 @@ The standard and DAAP registries remain siblings, and connect/refresh/cancellati
 publication still crosses UI-owned paths. Radio, removable, and external queue entries now have
 location-independent identity but retain their current locator until their registry adapters and
 at-use resolvers are implemented. Local and playlist GTK rows retain paths for non-playback UI
-operations, and the playback-time local resolver does not yet retain root/file authority through
-complete output consumption. More precisely, it does not yet acquire the current authorized root,
-prove the resolved path is contained beneath it, acquire exact file authority, or retain root/file
-authority while the output consumes the result. A row with both saved and discovered provenance
-also collapses them into one `manually_added` flag: Delete cannot yet demote it to a still-live
-discovery publication, and discovery loss retires live ownership even if the saved row remains.
-Those provenance, lifecycle, and authority items remain explicit P3.1 work.
+operations; embedded-art display begins with the exact playback-time resolution but still hands
+its helper a path rather than retained file authority. A row with both saved and discovered
+provenance also collapses them into one `manually_added` flag: Delete cannot yet demote it to a
+still-live discovery publication, and discovery loss retires live ownership even if the saved row
+remains. Those provenance, lifecycle, nonlocal-adapter, and embedded-art authority items remain
+explicit P3.1 work.
 
 ## Deliberately deferred implementation details
 
@@ -445,9 +451,10 @@ implementation details so long as one registry ultimately enforces this contract
 3. **Identity complete, locator removal partial:** queues carry `MediaKey` and optional
    `ViewOrigin`; remote protected references already resolve at use, while radio/removable/external
    locators remain until their adapters land.
-4. **Resolution partial:** local/playlist playback queries the exact ID at use and the random
-   invalid-local-ID fallback is gone; acquisition of the current root, containment proof, exact
-   file authority, and retention through complete output consumption remain open.
+4. **Playback resolution complete, adapter convergence open:** local/playlist playback queries the
+   exact ID at use, acquires the current authoritative root and exact file, and retains both
+   through output consumption. The random invalid-local-ID fallback is gone. Local embedded art
+   and radio/removable/external locators remain on direct helpers until their adapters land.
 5. **Identity complete, lifecycle open:** Radio-Browser, removable media, and external files have
    the specified source/track identity; moving their locator and retirement ownership into
    registry adapters remains open.

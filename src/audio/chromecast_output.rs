@@ -22,6 +22,7 @@ use super::cast_http_server::CastHttpServer;
 use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
 use crate::architecture::media::ResolvedHttpRequest;
+use crate::local::resolver::ResolvedLocalMedia;
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const POSITION_POLL_INTERVAL_SECS: u64 = 1;
@@ -1887,11 +1888,10 @@ impl ChromecastOutput {
     ///   through untouched. There is no secret to protect, and relaying a live
     ///   radio stream through this process would buy nothing.
     fn resolve_uri(&self, uri: &str) -> CastResult<String> {
-        // Any new load retires the previous credential ticket, whatever the new
-        // track turns out to be. Revoking only inside `register_upstream` would
-        // leave a ticket alive when a credentialed track is followed by an
-        // unauthenticated one (radio, or a local file): the device could keep
-        // replaying the protected stream long after playback moved on.
+        // Any new load retires every route owned by the previous load, whatever
+        // the new track turns out to be. Revoking only inside a registration
+        // method would leave credential or retained-file authority alive when
+        // playback moves to another media kind.
         self.revoke_proxy_tickets();
 
         match classify_cast_uri(uri) {
@@ -1925,6 +1925,15 @@ impl ChromecastOutput {
             .ok_or_else(|| CastFailure::new("media source availability"))
     }
 
+    fn resolve_local_authority(&self, media: ResolvedLocalMedia) -> CastResult<String> {
+        self.revoke_proxy_tickets();
+        let server = self.ensure_cast_server()?;
+        let server = server
+            .as_ref()
+            .ok_or_else(|| CastFailure::new("local media server startup"))?;
+        Ok(server.register_local(media))
+    }
+
     fn resolve_local_file(&self, file_path: &std::path::Path) -> CastResult<String> {
         let file_path = file_path.to_path_buf();
         // A regular file, not merely something that exists: `file://` parses to
@@ -1944,14 +1953,14 @@ impl ChromecastOutput {
         Ok(server.register_file(&file_path))
     }
 
-    /// Revoke every credential-bearing ticket the proxy is holding.
+    /// Revoke every route the current output load is holding.
     ///
     /// Best-effort: a poisoned lock or an unstarted server means there is
     /// nothing to revoke.
     fn revoke_proxy_tickets(&self) {
         if let Ok(guard) = self.cast_server.lock() {
             if let Some(server) = guard.as_ref() {
-                server.revoke_upstreams();
+                server.revoke_all();
             }
         }
     }
@@ -2018,6 +2027,19 @@ impl AudioOutput for ChromecastOutput {
         true
     }
 
+    fn load_local(&self, media: ResolvedLocalMedia) -> bool {
+        let owner = self.next_owner();
+        let kind = match self.resolve_local_authority(media) {
+            Ok(uri) => CommandKind::Load {
+                uri,
+                volume: self.volume,
+            },
+            Err(failure) => CommandKind::RejectLoad { failure },
+        };
+        let _ = self.enqueue(owner, kind);
+        true
+    }
+
     fn set_event_generation(&self, generation: PlayerEventGeneration) {
         self.event_generation
             .store(generation.as_raw(), Ordering::SeqCst);
@@ -2032,9 +2054,10 @@ impl AudioOutput for ChromecastOutput {
     }
 
     fn stop(&self) {
-        // Kill the credential ticket as soon as playback is meant to end. It is
-        // not revoked on pause or seek: a Cast device re-fetches with a `Range`
-        // header when it seeks, so a ticket has to outlive those.
+        // Kill credential and retained-file routes as soon as playback is
+        // meant to end. They are not revoked on pause or seek: a Cast device
+        // re-fetches with a `Range` header when it seeks, so the current route
+        // has to outlive those controls.
         self.revoke_proxy_tickets();
         let _ = self.enqueue(self.next_owner(), CommandKind::Stop);
     }

@@ -5,6 +5,8 @@
 //! redirect and diagnostic behavior is outside Tributary's security boundary.
 //! This module exchanges each protected URL for a dedicated loopback ticket;
 //! the existing app-owned HTTP proxy performs the real exact-origin fetch.
+//! Exact local-library file authority takes the same ticket boundary so the
+//! pipeline never reopens a mutable database pathname.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -14,6 +16,7 @@ use url::{Host, Url};
 use super::cast_http_server::{CastHttpServer, UpstreamMediaClient};
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::http_security::{classify_media_uri, MediaUriSecurity};
+use crate::local::resolver::ResolvedLocalMedia;
 
 const MEDIA_PREPARATION_FAILED: &str = "protected media preparation failed";
 
@@ -59,7 +62,7 @@ impl GstreamerMediaTicket {
     }
 
     pub(super) fn revoke(&self) {
-        self.server.revoke_upstreams();
+        self.server.revoke_all();
     }
 }
 
@@ -144,6 +147,57 @@ impl GstreamerMediaProxy {
                 upstream,
             ))
         })
+    }
+
+    /// Retire the previous load and exchange retained local-file authority for
+    /// a dedicated loopback ticket. GStreamer never reopens the database path;
+    /// the server streams clones of the exact authorized file handle.
+    pub(super) fn prepare_local(
+        &self,
+        media: ResolvedLocalMedia,
+    ) -> Result<PreparedGstreamerMedia, &'static str> {
+        let upstream = self.upstream.clone();
+        self.prepare_local_with_server_start(media, move |runtime| {
+            let upstream = upstream.ok_or_else(|| anyhow::anyhow!(MEDIA_PREPARATION_FAILED))?;
+            runtime.block_on(CastHttpServer::start_on_with_upstream_client(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                upstream,
+            ))
+        })
+    }
+
+    fn prepare_local_with_server_start<F>(
+        &self,
+        media: ResolvedLocalMedia,
+        start_server: F,
+    ) -> Result<PreparedGstreamerMedia, &'static str>
+    where
+        F: FnOnce(&tokio::runtime::Handle) -> anyhow::Result<CastHttpServer>,
+    {
+        let generation = Arc::new(PreparationGeneration);
+        let (previous, runtime) = {
+            let mut state = self.lock_state();
+            state.generation = Arc::clone(&generation);
+            (state.active.take(), state.runtime.clone())
+        };
+        if let Some(previous) = previous {
+            previous.revoke();
+        }
+
+        let runtime = runtime.ok_or(MEDIA_PREPARATION_FAILED)?;
+        let server = start_server(&runtime).map_err(|_| MEDIA_PREPARATION_FAILED)?;
+        let uri = server.register_local(media);
+        if !valid_loopback_ticket(server.addr(), &uri) {
+            server.revoke_all();
+            return Err(MEDIA_PREPARATION_FAILED);
+        }
+
+        let ticket = Arc::new(GstreamerMediaTicket { server, uri });
+        if !self.install_if_current(&generation, &ticket) {
+            ticket.revoke();
+            return Err(MEDIA_PREPARATION_FAILED);
+        }
+        Ok(PreparedGstreamerMedia::Protected(ticket))
     }
 
     fn prepare_resolved_with_server_start<F>(
@@ -358,6 +412,21 @@ mod tests {
 
     use super::*;
 
+    fn authorized_local_media() -> (tempfile::TempDir, ResolvedLocalMedia) {
+        let root = tempfile::tempdir().expect("temporary local-media root");
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .expect("write local-media marker");
+        let path = root.path().join("track.flac");
+        std::fs::write(&path, b"local media").expect("write local-media fixture");
+        let media = ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &path)
+            .expect("retain local-media authority");
+        (root, media)
+    }
+
     struct MockServer {
         addr: SocketAddr,
         abort_handle: tokio::task::AbortHandle,
@@ -551,6 +620,29 @@ mod tests {
             proxy.prepare_resolved(request).err(),
             Some(MEDIA_PREPARATION_FAILED)
         );
+    }
+
+    #[test]
+    fn local_authority_becomes_an_opaque_generation_owned_loopback_ticket() {
+        let runtime = runtime();
+        let proxy = GstreamerMediaProxy::new(Some(runtime.handle().clone()));
+        let (_root, media) = authorized_local_media();
+        let prepared = proxy
+            .prepare_local_with_server_start(media, |handle| {
+                Ok(CastHttpServer::detached_for_test(
+                    handle,
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 46_000)),
+                ))
+            })
+            .expect("prepare authorized local media");
+        let ticket = prepared.ticket().expect("local media ticket");
+
+        assert!(prepared.uri().starts_with("http://127.0.0.1:46000/cast/"));
+        assert!(!prepared.uri().contains("track.flac"));
+        assert_eq!(ticket.server.registered_route_count(), 1);
+
+        proxy.revoke_if_current(&ticket);
+        assert_eq!(ticket.server.registered_route_count(), 0);
     }
 
     #[test]
