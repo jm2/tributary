@@ -125,7 +125,7 @@ impl ExternalFileCandidate {
     /// publication/shutdown gate proves admission remains open.
     pub fn into_adapter(self) -> ExternalFileAdapter {
         // Identity is deliberately minted only after exact-handle parsing has
-        // established that the candidate is playable.
+        // established that the candidate is accepted audio.
         let source_id = SourceId::external();
         let track_id = TrackId::external();
         let compatibility_id = Uuid::parse_str(track_id.as_str())

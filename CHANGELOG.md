@@ -136,15 +136,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   final implementation record open.
 - **OS-opened files now use an ephemeral registry-owned lifecycle instead of direct path queues** —
   A delivery is processed sequentially on a blocking worker, preserving candidate order, skipping
-  invalid files, and stopping after the first playable one. Before identity or adapter publication,
+  files that cannot be opened, parsed as audio, or accepted by the metadata bounds, and stopping
+  after the first accepted candidate. Before identity or adapter publication,
   the worker must still own the delivery's exact admission generation under the shared
   shutdown/publication gate. A newer delivery, every explicit Play/Pause/Next/Previous/scrub action,
   Stop, a real output change, or shutdown supersedes older admission; selecting the already-active
   output remains inert. Only a successfully parsed already-open regular file receives fresh random
   source and track IDs. Its one-item queue carries those pathless IDs and the exact registry epoch,
   while the hidden adapter retains the original handle behind a `MediaLease` checked both before and
-  after every clone. The closed stream resolver now returns either `Http` or a retained `File`
-  capability, so remote/radio behavior is unchanged and external playback never reconstructs a URI.
+  after every file-handle clone. The closed stream resolver now returns either `Http` or a retained
+  `File` capability, so remote/radio behavior is unchanged and external playback never reconstructs
+  a URI.
   Embedded art receives a cloned capability only after the selected output accepts the load.
   Replacement by another external or ordinary queue, Stop, unrepeated EOS, playback/load failure,
   real output change, stale post-adoption admission, and shutdown explicitly retire the ephemeral

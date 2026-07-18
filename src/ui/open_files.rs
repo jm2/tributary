@@ -119,12 +119,12 @@ pub(super) fn is_current(generation: u64) -> bool {
     ADMISSION_GENERATION.load(Ordering::Acquire) == generation
 }
 
-/// Open and admit the first playable candidate from one exact delivery.
+/// Open and admit the first successfully parsed audio candidate from one exact delivery.
 ///
 /// This function performs blocking filesystem and tag-parser work and must be
 /// called only from a blocking worker. Candidates are attempted strictly in OS
 /// delivery order. No failure includes or logs a pathname.
-pub(super) fn admit_first_playable(
+pub(super) fn admit_first_accepted_audio(
     delivery: PendingDelivery,
     source_registry: crate::source_registry::SourceRegistry,
 ) -> Option<PendingExternalSession> {

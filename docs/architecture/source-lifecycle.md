@@ -416,9 +416,10 @@ path-based fallbacks—remain explicit rather than being disguised as hardware i
 
 For an OS delivery containing one or more paths, one blocking worker opens and parses candidates
 sequentially in delivery order. Invalid or unsupported candidates are skipped and processing stops
-after the first playable file; the remaining candidates are not queued. Before minting identity or
-publishing an adapter, the worker must still own the delivery's exact admission generation under
-the same gate that serializes publication with shutdown. A newer OS delivery, any explicit
+after the first file that parses as audio and passes the metadata bounds; the remaining candidates
+are not queued. Before minting identity or publishing an adapter, the worker must still own the
+delivery's exact admission generation under the same gate that serializes publication with
+shutdown. A newer OS delivery, any explicit
 Play/Pause/Next/Previous/scrub action, Stop, a real output change, or shutdown advances that
 generation, so superseded parsing cannot become visible. Same-output reselection is deliberately
 inert. Logs report only a count and fixed outcome; an OS-delivered path or derived direct URI never
@@ -512,8 +513,8 @@ queue can extend the same ephemeral-source rule explicitly.
   and playback. Radio queues share the built-in Radio-Browser source and reject empty/oversized
   station UUIDs instead of falling back to a stream URL.
 - Each accepted OS-opened file owns a hidden registry adapter with fresh independent random source
-  and track identities plus the exact adopted epoch. Ordered first-playable admission runs on a
-  blocking worker and rechecks its exact generation under the shutdown/publication gate before
+  and track identities plus the exact adopted epoch. Ordered first-accepted-audio admission runs on
+  a blocking worker and rechecks its exact generation under the shutdown/publication gate before
   identity is minted or the retained already-open file is adopted. Its one-item queue is pathless;
   stream resolution returns only a lease-checked file capability, embedded art clones that
   capability after output acceptance, and every terminal or superseding boundary retires the
@@ -584,8 +585,8 @@ shutdown, and actual-wire DAAP regressions cover protected login cancellation, s
 malformed post-login catalogue responses, exact logout, invalid Jellyfin token containment,
 stale-epoch stream/artwork rejection, accepted-catalogue reactivation, `RefCell` signal re-entry,
 failure correlation, route-withdrawal demotion/visibility, composite disconnect settlement, and
-retirement/pruning races. External-file regressions additionally cover ordered first-playable
-admission, exact admission and shutdown races, pathless identity and epoch checks, retained-handle
+retirement/pruning races. External-file regressions additionally cover delivery-order and exact
+admission state, shutdown/publication races, pathless identity and epoch checks, retained-handle
 behavior after path replacement, lease revocation, hidden-baseline ownership, and exactly-once
 retirement. Independent review covers the complete intent/terminal wiring and post-accept artwork
 handoff. The focused lifecycle module passes all 53 tests.
@@ -677,10 +678,10 @@ and complete restoration of Local presentation after automatic fallback.
 The external-file adapter cutover passes the locked all-target/all-feature check, strict Clippy in
 debug and release, formatting, and whitespace checks. Complete locked debug and release suites each
 pass 938 tests. An independent integrated review is clean after its findings were resolved. Focused
-coverage proves ordered first-playable admission, exact-generation supersession,
-shutdown/adoption serialization, random pathless identity, epoch isolation, retained-handle
-path-replacement resistance, lease checks, hidden-baseline behavior, and explicit idempotent
-retirement; integrated review covers the same-output and post-accept artwork wiring.
+coverage proves delivery-order and exact-generation state, shutdown/adoption serialization, random
+pathless identity, epoch isolation, retained-handle path-replacement resistance, lease checks,
+hidden-baseline behavior, and explicit idempotent retirement; integrated review covers sequential
+first-accepted candidate handling, the same-output boundary, and post-accept artwork wiring.
 
 Each step must keep existing credential-isolation, exact-origin, root-authority, receiver-ticket,
 and generation-supersession tests green. Compatibility code is removed in the same milestone; two

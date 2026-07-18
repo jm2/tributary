@@ -2688,7 +2688,7 @@ pub fn build_window(
             let generation = delivery.generation();
             let registry = playback_source_registry.clone();
             let admission = playback_rt.spawn_blocking(move || {
-                super::open_files::admit_first_playable(delivery, registry)
+                super::open_files::admit_first_accepted_audio(delivery, registry)
             });
 
             let active_output = active_output.clone();
