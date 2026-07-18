@@ -21,22 +21,23 @@ state.
 - Do not treat the order below as a release promise. It is a dependency-aware starting order and
   can change as issues receive product decisions and milestones.
 
-Status at reset: **0/35 (0%)** active implementation records complete. This percentage measures
+Current status: **1/35 (2.9%)** active implementation records complete. This percentage measures
 checklist completion, not equal engineering effort: several P3 records are deliberately large
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
 ## Current focus
 
-Start with P1.1, then the bounded P1.2 interaction fix and the playback-history foundation in
-P1.3. The rest of P1 builds on the source-scoped identity already present in the runtime and the
-history semantics established here.
+P1.1 is complete. Continue with the bounded P1.2 interaction fix, then the playback-history
+foundation in P1.3. The rest of P1 builds on the source-scoped identity already present in the
+runtime and the now-bounded shuffle navigation semantics.
 
 ## P1 — Correctness and shared feature foundations
 
 ### P1.1 — Harden and document existing shuffled playback history
 
-- [ ] Bound, specify, and fully regress the existing occurrence-aware shuffle history.
+- [x] Bound, specify, and fully regress the existing occurrence-aware shuffle history
+  (implementation PR; number added immediately after publication).
 
   Acceptance criteria:
 
@@ -56,11 +57,14 @@ history semantics established here.
   - Tests cover multi-step backward/forward traversal in `PlaybackSession` and pin both the header
     button and operating-system media-control dispatch to that path.
 
-  Current note: `PlaybackSession` already retains visited queue indices; Previous moves departed
-  indices back to the LIFO remaining set, so multiple Next calls after multiple Previous calls
-  replay the actual forward sequence. Both user-facing Previous entry points already use that
-  helper after the intentional three-second restart check. The open work is bounded Repeat All and
-  boundary/toggle semantics plus broader regression coverage—not a second shuffle implementation.
+  Implemented contract: `PlaybackSession` retains a chronological timeline capped at the current
+  queue occurrence plus ten real predecessors, with an explicit cursor separate from the active
+  cycle's randomized bag. Previous never fabricates or wraps at the retained boundary; Next first
+  replays fixed forward history. Repeat All rolls into complete occurrence-permutation cycles
+  without an immediate boundary repeat, while Repeat One remains an end-of-stream policy. Either
+  shuffle-button transition starts a fresh traversal at the unchanged current item. The header
+  button and OS media action now share the exact `> 3000 ms` restart dispatcher, and regressions
+  cover duplicates, one/two-item queues, rollback, resets, and preservation boundaries.
 
 ### P1.2 — Make unsupported remote playlist actions honest
 
@@ -213,3 +217,4 @@ history semantics established here.
 | Date | Task | PR | Result |
 |---|---|---|---|
 | 2026-07-18 | Backlog reset | — | Archived the holistic-review tracker and established the audited feature backlog; no implementation record completed. |
+| 2026-07-18 | P1.1 bounded shuffle history | Pending publication | Retained ten real prior occurrences, fixed forward traversal and complete Repeat All cycles, unified Previous dispatch, made toggle/reset semantics explicit, and added lifecycle/rollback regressions. |

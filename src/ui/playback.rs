@@ -7,7 +7,7 @@
 //! - [`format_ms`] — format milliseconds as `m:ss` or `h:mm:ss`
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -28,6 +28,10 @@ pub const LOCAL_SOURCE_KEY: &str = "local";
 /// The source-key prefix of every playlist view. Playlists are projections of
 /// the local library, so their queue items carry library track IDs too.
 pub const PLAYLIST_SOURCE_PREFIX: &str = "playlist:";
+
+/// Previous restarts the current item only after this position. At exactly
+/// three seconds it still walks the queue or retained shuffle history.
+const PREVIOUS_RESTART_THRESHOLD_MS: u64 = 3_000;
 
 /// Whether a queue source is backed by the local library database, and its
 /// track IDs are therefore library track IDs.
@@ -321,12 +325,48 @@ impl QueueItem {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Maximum number of real queue occurrences retained before the current one.
+const SHUFFLE_PRIOR_LIMIT: usize = 10;
+const SHUFFLE_TIMELINE_CAPACITY: usize = SHUFFLE_PRIOR_LIMIT + 1;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ShuffleState {
-    /// Items visited in this shuffle cycle, ending with the current item.
-    history: Vec<usize>,
-    /// Items not yet visited in this cycle.
+    /// Bounded chronological playback timeline. `cursor` identifies the
+    /// current occurrence; entries after it are fixed forward history created
+    /// by Previous and must be replayed before another random draw.
+    history: VecDeque<usize>,
+    cursor: usize,
+    /// Queue occurrences not yet drawn from the active shuffle cycle.
     remaining: Vec<usize>,
+}
+
+impl ShuffleState {
+    fn current(&self) -> Option<usize> {
+        self.history.get(self.cursor).copied()
+    }
+
+    fn step_forward(&mut self) -> Option<usize> {
+        let next = self.cursor.checked_add(1)?;
+        let selected = self.history.get(next).copied()?;
+        self.cursor = next;
+        Some(selected)
+    }
+
+    fn step_back(&mut self) -> Option<usize> {
+        self.cursor = self.cursor.checked_sub(1)?;
+        self.current()
+    }
+
+    fn record_selection(&mut self, selected: usize) {
+        debug_assert_eq!(self.cursor + 1, self.history.len());
+        self.history.push_back(selected);
+        self.cursor += 1;
+        if self.history.len() > SHUFFLE_TIMELINE_CAPACITY {
+            let removed = self.history.pop_front();
+            debug_assert!(removed.is_some());
+            self.cursor -= 1;
+        }
+    }
 }
 
 /// Playback-owned queue and cursor.
@@ -335,9 +375,11 @@ struct ShuffleState {
 /// external file), reaches the unrepeated end, stops playback, or changes the
 /// output target. Sorting, filtering, and sidebar navigation never mutate it.
 /// Sequential Next/Previous follow snapshot order; repeat-all wraps that
-/// snapshot. Shuffle visits every snapshot item once per cycle, Previous walks
-/// shuffle history, and repeat-all starts a new shuffled cycle. Repeat-one is
-/// an EOS policy implemented by [`replay_current`], so manual Next still moves.
+/// snapshot. Shuffle visits every snapshot occurrence once per cycle, retains
+/// the current occurrence plus ten real predecessors, and replays fixed
+/// forward history after Previous before drawing again. Reaching the retained
+/// boundary never invents a predecessor. Repeat-one is an EOS policy
+/// implemented by [`replay_current`], so manual Next still moves.
 #[derive(Clone, Debug, Default)]
 pub struct PlaybackSession {
     queue: Vec<QueueItem>,
@@ -375,6 +417,13 @@ impl PlaybackSession {
         self.event_generation = self.event_generation.next();
         self.pending_resolution = None;
         self.resolution_failed = false;
+    }
+
+    /// Start a fresh shuffle traversal without changing the queue or current
+    /// item. The UI calls this for either direction of a shuffle toggle, so an
+    /// old randomized path cannot unexpectedly reappear after a mode change.
+    pub(crate) fn reset_shuffle_navigation(&mut self) {
+        self.shuffle = None;
     }
 
     /// Clear playback only when the current queue belongs to `source_id`.
@@ -632,9 +681,26 @@ impl PlaybackSession {
             .collect();
         fastrand::shuffle(&mut remaining);
         self.shuffle = Some(ShuffleState {
-            history: vec![current],
+            history: VecDeque::from([current]),
+            cursor: 0,
             remaining,
         });
+    }
+
+    /// Start a complete Repeat All cycle while avoiding an immediate repeat at
+    /// the rollover boundary. Unlike the initial cycle (whose manually chosen
+    /// current item is already counted), every later cycle contains every
+    /// queue occurrence exactly once.
+    fn refill_shuffle_cycle(state: &mut ShuffleState, queue_len: usize, current: usize) {
+        state.remaining = (0..queue_len).collect();
+        fastrand::shuffle(&mut state.remaining);
+        if queue_len > 1 && state.remaining.last() == Some(&current) {
+            // Condition the uniform permutation on a different first draw by
+            // swapping the boundary item with a uniformly selected earlier
+            // slot. Choosing a fixed slot would bias otherwise valid cycles.
+            let replacement = fastrand::usize(0..(queue_len - 1));
+            state.remaining.swap(replacement, queue_len - 1);
+        }
     }
 
     fn advance(&mut self, repeat_mode: RepeatMode, shuffle: bool) -> Option<usize> {
@@ -661,25 +727,31 @@ impl PlaybackSession {
         }
 
         let state = self.shuffle.as_mut()?;
+        if let Some(selected) = state.step_forward() {
+            self.current_index = Some(selected);
+            self.pending_resolution = None;
+            self.resolution_failed = false;
+            return Some(selected);
+        }
+
         if state.remaining.is_empty() {
             if repeat_mode != RepeatMode::All {
                 return None;
             }
-            state.remaining = (0..self.queue.len())
-                .filter(|&index| index != current)
-                .collect();
-            fastrand::shuffle(&mut state.remaining);
 
             // A one-item queue repeats itself under repeat-all.
-            if state.remaining.is_empty() {
+            if self.queue.len() == 1 {
+                state.record_selection(current);
                 self.pending_resolution = None;
                 self.resolution_failed = false;
                 return Some(current);
             }
+
+            Self::refill_shuffle_cycle(state, self.queue.len(), current);
         }
 
         let selected = state.remaining.pop()?;
-        state.history.push(selected);
+        state.record_selection(selected);
         self.current_index = Some(selected);
         self.pending_resolution = None;
         self.resolution_failed = false;
@@ -708,32 +780,29 @@ impl PlaybackSession {
             self.initialize_shuffle();
         }
         let state = self.shuffle.as_mut()?;
-        if state.history.len() > 1 {
-            if let Some(departed) = state.history.pop() {
-                state.remaining.push(departed);
-            }
-            let selected = *state.history.last()?;
-            self.current_index = Some(selected);
-            self.pending_resolution = None;
-            self.resolution_failed = false;
-            return Some(selected);
-        }
-
-        if repeat_mode != RepeatMode::All {
-            return None;
-        }
-
-        let mut candidates: Vec<usize> = (0..self.queue.len())
-            .filter(|&index| index != current)
-            .collect();
-        fastrand::shuffle(&mut candidates);
-        let selected = candidates.pop().unwrap_or(current);
-        state.history = vec![selected];
-        state.remaining = candidates;
+        let selected = state.step_back()?;
         self.current_index = Some(selected);
         self.pending_resolution = None;
         self.resolution_failed = false;
         Some(selected)
+    }
+
+    #[cfg(test)]
+    pub(super) fn advance_for_test(
+        &mut self,
+        repeat_mode: RepeatMode,
+        shuffle: bool,
+    ) -> Option<usize> {
+        self.advance(repeat_mode, shuffle)
+    }
+
+    #[cfg(test)]
+    pub(super) fn previous_for_test(
+        &mut self,
+        repeat_mode: RepeatMode,
+        shuffle: bool,
+    ) -> Option<usize> {
+        self.previous(repeat_mode, shuffle)
     }
 }
 
@@ -1354,21 +1423,11 @@ fn find_queue_item_position(
 /// Returns `true` if a new track was loaded, `false` if we've reached
 /// the end (caller should reset to idle).
 pub fn advance_track(ctx: &PlaybackContext, repeat_mode: RepeatMode, shuffle: bool) -> bool {
-    let previous = ctx.session.borrow().clone();
-    if ctx
-        .session
-        .borrow_mut()
-        .advance(repeat_mode, shuffle)
-        .is_none()
-    {
-        return false;
-    }
-    if play_current(ctx) {
-        true
-    } else {
-        *ctx.session.borrow_mut() = previous;
-        false
-    }
+    navigate_and_play(
+        ctx.session.as_ref(),
+        |session| session.advance(repeat_mode, shuffle),
+        || play_current(ctx),
+    )
 }
 
 /// Explicit Next behavior. Natural EOS uses [`advance_track`] directly so an
@@ -1389,31 +1448,78 @@ pub fn advance_track_from_user(
 /// heuristic belongs to the UI/key callers, which know what threshold
 /// they want to use. Returns `true` if a new track was loaded.
 pub fn previous_track(ctx: &PlaybackContext, repeat_mode: RepeatMode, shuffle: bool) -> bool {
-    let previous = ctx.session.borrow().clone();
-    if ctx
-        .session
-        .borrow_mut()
-        .previous(repeat_mode, shuffle)
-        .is_none()
-    {
+    navigate_and_play(
+        ctx.session.as_ref(),
+        |session| session.previous(repeat_mode, shuffle),
+        || play_current(ctx),
+    )
+}
+
+fn navigate_and_play(
+    session: &RefCell<PlaybackSession>,
+    navigate: impl FnOnce(&mut PlaybackSession) -> Option<usize>,
+    play: impl FnOnce() -> bool,
+) -> bool {
+    let previous = session.borrow().clone();
+    let selected = {
+        let mut session = session.borrow_mut();
+        navigate(&mut session)
+    };
+    if selected.is_none() {
         return false;
     }
-    if play_current(ctx) {
+    if play() {
         true
     } else {
-        *ctx.session.borrow_mut() = previous;
+        *session.borrow_mut() = previous;
         false
     }
 }
 
-/// Explicit Previous behavior, which supersedes an older OS-open delivery.
-pub fn previous_track_from_user(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviousDispatch {
+    Stepped,
+    Restarted,
+}
+
+fn dispatch_previous(
+    position_ms: u64,
+    step: impl FnOnce() -> bool,
+    restart: impl FnOnce(),
+) -> PreviousDispatch {
+    if position_ms > PREVIOUS_RESTART_THRESHOLD_MS {
+        restart();
+        return PreviousDispatch::Restarted;
+    }
+
+    if step() {
+        PreviousDispatch::Stepped
+    } else {
+        restart();
+        PreviousDispatch::Restarted
+    }
+}
+
+/// Shared header-button and OS-media-control Previous behavior.
+///
+/// The output position borrow is deliberately released before navigation can
+/// load another item. This keeps both entry points on one exact threshold and
+/// avoids carrying a `RefCell` borrow into output callbacks.
+pub fn previous_or_restart_from_user(
     ctx: &PlaybackContext,
     repeat_mode: RepeatMode,
     shuffle: bool,
-) -> bool {
+) {
     super::open_files::invalidate_admission();
-    previous_track(ctx, repeat_mode, shuffle)
+    let position_ms = {
+        let output = ctx.active_output.borrow();
+        output.position_ms().unwrap_or(0)
+    };
+    let _ = dispatch_previous(
+        position_ms,
+        || previous_track(ctx, repeat_mode, shuffle),
+        || ctx.active_output.borrow().seek_to(0),
+    );
 }
 
 /// Replay the current queue item without consulting the mutable view.
@@ -2070,12 +2176,189 @@ mod tests {
         assert_eq!(visited, HashSet::from(["a".into(), "b".into(), "c".into()]));
         assert_eq!(session.advance(RepeatMode::Off, true), None);
 
-        // Repeat-all starts another shuffle cycle instead of ending.
-        assert!(session.advance(RepeatMode::All, true).is_some());
+        // Repeat-all starts a complete new cycle and does not immediately
+        // repeat the item at the rollover boundary.
+        let rollover_from = session.current_index.expect("current index");
+        let first = session
+            .advance(RepeatMode::All, true)
+            .expect("repeat-all begins another cycle");
+        assert_ne!(first, rollover_from);
+        let state = session.shuffle.as_ref().expect("shuffle state");
+        assert_eq!(state.remaining.len(), 2);
+        assert!(state.remaining.contains(&rollover_from));
+
+        let mut second_cycle = HashSet::from([first]);
+        for _ in 0..2 {
+            second_cycle.insert(
+                session
+                    .advance(RepeatMode::All, true)
+                    .expect("the complete repeat cycle remains available"),
+            );
+        }
+        assert_eq!(second_cycle, HashSet::from([0, 1, 2]));
     }
 
     #[test]
-    fn shuffled_previous_follows_play_history() {
+    fn shuffled_previous_and_next_walk_exact_occurrence_history() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![
+                item("source", "a"),
+                item("source", "b"),
+                item("source", "c"),
+                item("source", "d"),
+                item("source", "e"),
+                item("source", "f"),
+                item("source", "g"),
+                item("source", "h"),
+            ],
+            0,
+        ));
+
+        let mut actual = vec![0];
+        for _ in 0..4 {
+            actual.push(
+                session
+                    .advance(RepeatMode::Off, true)
+                    .expect("unvisited shuffle occurrence"),
+            );
+        }
+
+        for expected in actual[1..4].iter().rev() {
+            assert_eq!(session.previous(RepeatMode::All, true), Some(*expected));
+        }
+        for expected in &actual[2..=4] {
+            assert_eq!(
+                session.advance(RepeatMode::Off, true),
+                Some(*expected),
+                "fixed forward history precedes another random draw"
+            );
+        }
+
+        let drawn = session
+            .advance(RepeatMode::Off, true)
+            .expect("an unvisited random occurrence follows forward history");
+        assert!(!actual.contains(&drawn));
+    }
+
+    #[test]
+    fn shuffle_history_is_bounded_and_never_fabricates_a_predecessor() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![
+                item("source", "a"),
+                item("source", "b"),
+                item("source", "c"),
+                item("source", "d"),
+            ],
+            0,
+        ));
+
+        let mut actual = vec![0];
+        for _ in 0..40 {
+            actual.push(
+                session
+                    .advance(RepeatMode::All, true)
+                    .expect("repeat-all keeps selecting occurrences"),
+            );
+            let state = session.shuffle.as_ref().expect("shuffle state");
+            assert!(state.history.len() <= SHUFFLE_TIMELINE_CAPACITY);
+            assert!(state.cursor < state.history.len());
+        }
+
+        let retained = actual[actual.len() - SHUFFLE_TIMELINE_CAPACITY..].to_vec();
+        assert_eq!(
+            session
+                .shuffle
+                .as_ref()
+                .expect("shuffle state")
+                .history
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            retained
+        );
+
+        for expected in retained[..SHUFFLE_PRIOR_LIMIT].iter().rev() {
+            assert_eq!(session.previous(RepeatMode::All, true), Some(*expected));
+        }
+        let boundary = session.shuffle.clone();
+        assert_eq!(session.previous(RepeatMode::All, true), None);
+        assert_eq!(
+            session.shuffle, boundary,
+            "the retained boundary is a no-op"
+        );
+
+        for expected in &retained[1..] {
+            assert_eq!(session.advance(RepeatMode::Off, true), Some(*expected));
+        }
+    }
+
+    #[test]
+    fn duplicate_tracks_remain_distinct_shuffle_occurrences() {
+        let mut first = item("source", "duplicate");
+        first.occurrence = 0;
+        let other = item("source", "other");
+        let mut duplicate = item("source", "duplicate");
+        duplicate.occurrence = 1;
+
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![first, other, duplicate], 0));
+        let mut visited = vec![(0, 0)];
+        for _ in 0..2 {
+            let index = session
+                .advance(RepeatMode::Off, true)
+                .expect("distinct queue occurrence");
+            visited.push((index, session.current().expect("current").occurrence));
+        }
+        assert_eq!(
+            visited
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<HashSet<_>>(),
+            HashSet::from([0, 1, 2])
+        );
+        assert!(visited.contains(&(0, 0)));
+        assert!(visited.contains(&(2, 1)));
+
+        let previous = visited[1];
+        assert_eq!(session.previous(RepeatMode::Off, true), Some(previous.0));
+        assert_eq!(session.current().expect("current").occurrence, previous.1);
+        assert_eq!(session.advance(RepeatMode::Off, true), Some(visited[2].0));
+        assert_eq!(session.current().expect("current").occurrence, visited[2].1);
+    }
+
+    #[test]
+    fn one_and_two_item_shuffle_repeat_semantics_are_explicit() {
+        let mut one = PlaybackSession::default();
+        assert!(one.replace_queue(vec![item("source", "only")], 0));
+        assert_eq!(one.advance(RepeatMode::Off, true), None);
+        assert_eq!(one.advance(RepeatMode::One, true), None);
+        for _ in 0..20 {
+            assert_eq!(one.advance(RepeatMode::All, true), Some(0));
+        }
+        assert_eq!(
+            one.shuffle.as_ref().expect("shuffle state").history.len(),
+            SHUFFLE_TIMELINE_CAPACITY
+        );
+        for _ in 0..SHUFFLE_PRIOR_LIMIT {
+            assert_eq!(one.previous(RepeatMode::All, true), Some(0));
+        }
+        assert_eq!(one.previous(RepeatMode::All, true), None);
+
+        let mut two = PlaybackSession::default();
+        assert!(two.replace_queue(vec![item("source", "left"), item("source", "right")], 0,));
+        assert_eq!(two.advance(RepeatMode::Off, true), Some(1));
+        assert_eq!(two.advance(RepeatMode::One, true), None);
+        assert_eq!(two.previous(RepeatMode::All, true), Some(0));
+        assert_eq!(two.advance(RepeatMode::Off, true), Some(1));
+        for expected in [0, 1, 0, 1, 0, 1] {
+            assert_eq!(two.advance(RepeatMode::All, true), Some(expected));
+        }
+    }
+
+    #[test]
+    fn shuffle_toggle_resets_navigation_but_preserves_the_current_item() {
         let mut session = PlaybackSession::default();
         assert!(session.replace_queue(
             vec![
@@ -2086,10 +2369,197 @@ mod tests {
             0,
         ));
         assert!(session.advance(RepeatMode::Off, true).is_some());
-        let previous_id = current_id(&session).to_string();
+        let current = session.current_index;
+        assert!(session.shuffle.is_some());
+
+        // Either button transition deliberately starts a fresh traversal.
+        session.reset_shuffle_navigation();
+        assert_eq!(session.current_index, current);
+        assert!(session.shuffle.is_none());
+        assert_eq!(session.previous(RepeatMode::All, true), None);
+        assert_eq!(session.current_index, current);
+
+        session.reset_shuffle_navigation();
+        let current = session.current_index.expect("current");
+        let expected = if current + 1 < session.queue.len() {
+            current + 1
+        } else {
+            0
+        };
+        assert_eq!(session.advance(RepeatMode::All, false), Some(expected));
+        assert!(session.shuffle.is_none());
+    }
+
+    #[test]
+    fn rejected_navigation_before_output_handoff_restores_all_shuffle_state() {
+        let mut original = PlaybackSession::default();
+        assert!(original.replace_queue(
+            vec![
+                item("source", "a"),
+                item("source", "b"),
+                item("source", "c"),
+                item("source", "d"),
+            ],
+            0,
+        ));
+        assert!(original.advance(RepeatMode::Off, true).is_some());
+        assert!(original.advance(RepeatMode::Off, true).is_some());
+        let expected_index = original.current_index;
+        let expected_shuffle = original.shuffle.clone();
+        let session = RefCell::new(original);
+
+        assert!(!navigate_and_play(
+            &session,
+            |session| session.advance(RepeatMode::Off, true),
+            || false,
+        ));
+        assert_eq!(session.borrow().current_index, expected_index);
+        assert_eq!(session.borrow().shuffle, expected_shuffle);
+
+        assert!(!navigate_and_play(
+            &session,
+            |session| session.previous(RepeatMode::All, true),
+            || false,
+        ));
+        assert_eq!(session.borrow().current_index, expected_index);
+        assert_eq!(session.borrow().shuffle, expected_shuffle);
+
+        // Once an output handoff is initiated, the selected occurrence is a
+        // committed retry target; synchronous output rejection is handled by
+        // the existing retry state rather than rolling navigation back.
+        assert!(navigate_and_play(
+            &session,
+            |session| session.advance(RepeatMode::Off, true),
+            || true,
+        ));
+        assert_ne!(session.borrow().current_index, expected_index);
+    }
+
+    #[test]
+    fn queue_lifecycle_resets_and_non_navigation_updates_preserve_shuffle_history() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![item("local", "a"), item("local", "b"), item("local", "c")],
+            0,
+        ));
         assert!(session.advance(RepeatMode::Off, true).is_some());
-        assert!(session.previous(RepeatMode::Off, true).is_some());
-        assert_eq!(current_id(&session), previous_id);
+        let history = session.shuffle.clone();
+
+        assert_eq!(refresh(&mut session, "a", refreshed_metadata()), 1);
+        assert_eq!(session.shuffle, history);
+        let pending = session.begin_pending_resolution();
+        assert!(session.accepts_event_generation(pending));
+        assert!(session.cancel_pending_resolution_for_retry());
+        assert_eq!(
+            session.shuffle, history,
+            "pending-resolution Pause preserves navigation"
+        );
+        assert!(!session.clear_if_source("another-source"));
+        assert_eq!(session.shuffle, history);
+
+        assert!(session.replace_queue(vec![item("source", "replacement")], 0));
+        assert!(session.shuffle.is_none(), "a new queue resets history");
+
+        assert!(session.replace_queue(vec![item("source", "a"), item("source", "b")], 0,));
+        assert!(session.advance(RepeatMode::Off, true).is_some());
+        assert!(session.clear_if_source("source"));
+        assert!(
+            session.shuffle.is_none(),
+            "source retirement resets history"
+        );
+
+        assert!(session.replace_queue(vec![item("source", "a"), item("source", "b")], 0,));
+        assert!(session.advance(RepeatMode::Off, true).is_some());
+        let (output, output_state) = RecordingOutput::new(0);
+        stop_owned_playback(&mut session, &output);
+        assert!(session.shuffle.is_none(), "Stop resets history");
+        assert_eq!(output_state.borrow().stops, 1);
+    }
+
+    #[test]
+    fn shared_previous_dispatch_pins_threshold_step_and_boundary_restart() {
+        let steps = Cell::new(0);
+        let restarts = Cell::new(0);
+        assert_eq!(
+            dispatch_previous(
+                PREVIOUS_RESTART_THRESHOLD_MS + 1,
+                || {
+                    steps.set(steps.get() + 1);
+                    true
+                },
+                || restarts.set(restarts.get() + 1),
+            ),
+            PreviousDispatch::Restarted
+        );
+        assert_eq!(steps.get(), 0);
+        assert_eq!(restarts.get(), 1);
+
+        assert_eq!(
+            dispatch_previous(
+                PREVIOUS_RESTART_THRESHOLD_MS,
+                || {
+                    steps.set(steps.get() + 1);
+                    true
+                },
+                || restarts.set(restarts.get() + 1),
+            ),
+            PreviousDispatch::Stepped
+        );
+        assert_eq!(steps.get(), 1);
+        assert_eq!(restarts.get(), 1);
+
+        assert_eq!(
+            dispatch_previous(
+                0,
+                || {
+                    steps.set(steps.get() + 1);
+                    false
+                },
+                || restarts.set(restarts.get() + 1),
+            ),
+            PreviousDispatch::Restarted
+        );
+        assert_eq!(steps.get(), 2);
+        assert_eq!(restarts.get(), 2);
+    }
+
+    #[test]
+    fn a_restart_then_early_previous_walks_the_real_shuffle_timeline() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![
+                item("source", "a"),
+                item("source", "b"),
+                item("source", "c")
+            ],
+            0,
+        ));
+        assert!(session.advance(RepeatMode::Off, true).is_some());
+        let state = session.shuffle.as_ref().expect("shuffle state");
+        let expected_previous = state.history[state.cursor - 1];
+        let current = session.current_index;
+        let restarts = Cell::new(0);
+
+        assert_eq!(
+            dispatch_previous(
+                PREVIOUS_RESTART_THRESHOLD_MS + 1,
+                || session.previous(RepeatMode::All, true).is_some(),
+                || restarts.set(restarts.get() + 1),
+            ),
+            PreviousDispatch::Restarted
+        );
+        assert_eq!(session.current_index, current);
+
+        assert_eq!(
+            dispatch_previous(
+                0,
+                || session.previous(RepeatMode::All, true).is_some(),
+                || restarts.set(restarts.get() + 1),
+            ),
+            PreviousDispatch::Stepped
+        );
+        assert_eq!(session.current_index, Some(expected_previous));
+        assert_eq!(restarts.get(), 1);
     }
 
     #[test]

@@ -23,7 +23,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | GStreamer audio playback (`playbin3`) | ✅ |
 | MPRIS / SMTC / macOS Now Playing integration (`souvlaki`) | ✅ |
 | Playback controls (play/pause, next/prev, seek, volume) | ✅ |
-| Shuffle & repeat (off / all / one) with actual Previous history and persistence | ✅ Bounded Repeat All/test hardening is tracked in [P1.1](docs/task.md#p11--harden-and-document-existing-shuffled-playback-history) |
+| Shuffle & repeat (off / all / one) with bounded actual Previous/forward history and persistence | ✅ |
 | Column sort persistence | ✅ |
 | Subsonic / Navidrome / Nextcloud Music backend | ✅ |
 | Jellyfin backend | ✅ |
@@ -741,8 +741,13 @@ podcasts. Tributary deliberately does not guess through any of those gaps.
 ### Playback Controls
 
 - **Play/Pause** — click the circular play button, or double-click any track in the tracklist
-- **Next / Previous** — skip buttons; Previous restarts the current track if more than 3 seconds in
-- **Shuffle** — randomises track order (avoids repeating the current track)
+- **Next / Previous** — skip buttons and OS media controls share the same behavior. More than three
+  seconds into a track, Previous first restarts it; otherwise it walks the actual prior queue
+  occurrence. After walking backward, Next replays that fixed forward history before randomizing.
+- **Shuffle** — randomises complete queue-occurrence cycles without an immediate rollover repeat.
+  Tributary retains the current occurrence plus ten real predecessors; the oldest retained boundary
+  restarts instead of inventing a random predecessor. Toggling shuffle starts a fresh traversal at
+  the unchanged current track.
 - **Repeat** — cycles through Off → All → One
 - **Seek** — drag the progress scrubber
 - **Volume** — drag the volume slider (cubic perceptual curve)
