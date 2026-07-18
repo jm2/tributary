@@ -591,7 +591,7 @@ Locked debug and release suites each pass 20 library, 865 application, and 10 re
 tests (895 total), with locked all-target/all-feature compile, strict warning-free Clippy,
 formatting, and diff checks green.
 
-Current-branch validation for the retained embedded-art slice passes all 9 focused album-art
+PR #125 validation for the retained embedded-art slice passes all 9 focused album-art
 tests, the locked all-target/all-feature check, strict Clippy in debug and release, formatting, and
 the whitespace check. Locked debug and release suites each pass 20 library, 872 application, and
 10 repository-metadata tests (902 total).
