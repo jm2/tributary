@@ -8,7 +8,6 @@ use gtk::glib;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Duration;
 use tracing::info;
 
 use crate::local::engine::LibraryEvent;
@@ -127,14 +126,42 @@ pub(super) fn remote_failure_category(
     }
 }
 
-/// Bound parsed USB rows so a fast filesystem cannot grow memory without
-/// limit while GTK is busy. Closing the receiver wakes a blocked producer.
-const USB_SCAN_CHANNEL_CAPACITY: usize = 64;
+pub(super) const fn lifecycle_failure_category(
+    category: crate::source_lifecycle::FailureCategory,
+) -> RemoteFailureCategory {
+    use crate::source_lifecycle::FailureCategory;
 
-/// Poll exact navigation ownership even while no scan row is arriving. This
-/// lets unplug/supersession close the bounded channel promptly; the filesystem
-/// walk itself can still remain blocked in the kernel until that call returns.
-const USB_SCAN_CANCELLATION_POLL: Duration = Duration::from_millis(50);
+    match category {
+        FailureCategory::AuthenticationRejected => RemoteFailureCategory::Authentication,
+        FailureCategory::Connection => RemoteFailureCategory::Connection,
+        FailureCategory::Timeout => RemoteFailureCategory::Timeout,
+        FailureCategory::InvalidResponse => RemoteFailureCategory::Response,
+        FailureCategory::UnsupportedAuthentication => RemoteFailureCategory::AuthenticationMethod,
+        FailureCategory::UnavailableOrPermission | FailureCategory::Backend => {
+            RemoteFailureCategory::Backend
+        }
+    }
+}
+
+/// Return the retained, sanitized construction failure for one removable
+/// source. Mount scanning starts before row selection, so an inactive failure
+/// must remain available for the first later selection instead of looking like
+/// an accepted empty catalogue.
+fn retained_removable_connect_failure(
+    source_registry: &crate::source_registry::SourceRegistry,
+    source_id: crate::architecture::SourceId,
+) -> Option<RemoteFailureCategory> {
+    let snapshot = source_registry.snapshot(source_id)?;
+    if !snapshot
+        .provenance
+        .contains(crate::source_lifecycle::SourceProvenance::Removable)
+    {
+        return None;
+    }
+    let failure = snapshot.failure?;
+    (failure.failure.operation() == crate::source_lifecycle::FailureOperation::Connect)
+        .then(|| lifecycle_failure_category(failure.failure.category()))
+}
 
 fn resolve_source_key(
     explicit_key: &str,
@@ -144,6 +171,8 @@ fn resolve_source_key(
 ) -> String {
     if backend_type == "local" || backend_type.is_empty() {
         "local".to_string()
+    } else if backend_type == "usb-device" && !stable_source_id.is_empty() {
+        stable_source_id.to_string()
     } else if !explicit_key.is_empty() {
         explicit_key.to_string()
     } else if !server_url.is_empty() && !stable_source_id.is_empty() {
@@ -571,15 +600,15 @@ pub fn setup_source_connect(state: &WindowState) {
             return;
         }
 
-        // ── USB device source: scan and display music files ──────
+        // ── USB device source: display its lifecycle catalogue ──
         if backend_type == "usb-device" {
-            let Some(mount_point) = src.device_mount_point() else {
-                return;
-            };
-
-            let request = source_navigation.borrow_mut().select(key.clone());
+            source_navigation.borrow_mut().select(key.clone());
             *active_source_key.borrow_mut() = key.clone();
             pre_connect_selection.set(sel.selected());
+
+            let retained_failure = src.source_id().and_then(|source_id| {
+                retained_removable_connect_failure(&source_registry, source_id)
+            });
 
             // Restore music column layout if coming from radio.
             apply_radio_columns(&column_view, false);
@@ -588,185 +617,26 @@ pub fn setup_source_connect(state: &WindowState) {
             preferences::update_browser_visibility(&browser_widget, &cfg.browser_views);
             drop(cfg);
 
-            // Check if we already scanned this device.
-            let already_scanned = source_tracks.borrow().contains_key(&key);
-            if already_scanned {
-                let st = source_tracks.borrow();
-                let tracks = st.get(&key).cloned().unwrap_or_default();
-                display_tracks(
-                    &tracks,
-                    &track_store,
-                    &master_tracks,
-                    &browser_widget,
-                    &browser_state,
-                    &status_label,
-                    &column_view,
-                );
-            } else {
-                // The source identity changes immediately, so its projection
-                // must change with it. Leaving the previous source's rows in
-                // place would let a click queue those tracks under this USB
-                // source key while a large device scan is still running.
-                display_tracks(
-                    &[],
-                    &track_store,
-                    &master_tracks,
-                    &browser_widget,
-                    &browser_state,
-                    &status_label,
-                    &column_view,
-                );
-
-                // Scan on a background thread to avoid blocking UI.
-                let mount = mount_point;
-                let track_store = track_store.clone();
-                let master_tracks = master_tracks.clone();
-                let source_tracks = source_tracks.clone();
-                let browser_widget = browser_widget.clone();
-                let browser_state = browser_state.clone();
-                let status_label = status_label.clone();
-                let column_view = column_view.clone();
-                let active_source_key = active_source_key.clone();
-                let source_navigation = source_navigation.clone();
-                let request = request.clone();
-
-                // Serialisable track data for cross-thread transfer.
-                // TrackObject is a GObject (not Send), so we send
-                // tuples of raw data from the background thread and
-                // construct TrackObjects on the GTK main thread.
-                type ScanRow = (
-                    u32,
-                    String,
-                    u64,
-                    String,
-                    String,
-                    String,
-                    String,
-                    i32,
-                    String,
-                    u32,
-                    u32,
-                    String,
-                    String,
-                    crate::architecture::TrackId,
-                );
-                let (scan_tx, scan_rx) =
-                    async_channel::bounded::<ScanRow>(USB_SCAN_CHANNEL_CAPACITY);
-
-                // Background thread: stream the device filesystem into a
-                // bounded channel. A superseded/unplugged receiver closes the
-                // channel, waking send_blocking and stopping the producer.
-                if let Err(error) = std::thread::Builder::new()
-                    .name("usb-scan".to_string())
-                    .spawn(move || {
-                        for path in enumerate_device_audio_files(&mount) {
-                            if scan_tx.is_closed() {
-                                break;
-                            }
-                            let path = path.as_path();
-                            let Ok(track_id) =
-                                crate::architecture::TrackId::removable_relative(&mount, path)
-                            else {
-                                continue;
-                            };
-                            if let Ok(parsed) = crate::local::tag_parser::parse_audio_file(path) {
-                                let uri = url::Url::from_file_path(path)
-                                    .map(|u| u.to_string())
-                                    .unwrap_or_default();
-                                let row: ScanRow = (
-                                    parsed.track_number.unwrap_or(0),
-                                    parsed.title,
-                                    parsed.duration_secs.unwrap_or(0),
-                                    parsed.artist_name,
-                                    parsed.album_title,
-                                    parsed.genre.unwrap_or_else(|| "Unknown".to_string()),
-                                    parsed.composer.unwrap_or_default(),
-                                    parsed.year.unwrap_or(0),
-                                    parsed.date_modified.format("%Y-%m-%d").to_string(),
-                                    parsed.bitrate_kbps.unwrap_or(0),
-                                    parsed.sample_rate_hz.unwrap_or(0),
-                                    parsed.format,
-                                    uri,
-                                    track_id,
-                                );
-                                if scan_tx.send_blocking(row).is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    })
-                {
-                    tracing::warn!(%error, "Failed to start USB device scan worker");
-                    // The failed spawn drops its closure and sender, so the
-                    // channel is closed explicitly and this request remains
-                    // uncached, allowing a later selection to retry.
-                    scan_rx.close();
-                    return;
-                }
-
-                // Collect results on the GTK main thread.
-                glib::MainContext::default().spawn_local(async move {
-                    let mut objects = Vec::new();
-                    loop {
-                        if source_navigation.borrow().completion(&request)
-                            == CompletionDisposition::Ignore
-                        {
-                            scan_rx.close();
-                            return;
-                        }
-
-                        let receive = scan_rx.recv();
-                        futures::pin_mut!(receive);
-                        let cancellation_poll = glib::timeout_future(USB_SCAN_CANCELLATION_POLL);
-                        match futures::future::select(receive, cancellation_poll).await {
-                            futures::future::Either::Left((Ok(row), _)) => {
-                                // Ownership may have changed while recv was
-                                // ready but before GTK resumed this task.
-                                if source_navigation.borrow().completion(&request)
-                                    == CompletionDisposition::Ignore
-                                {
-                                    scan_rx.close();
-                                    return;
-                                }
-                                let obj = TrackObject::new(
-                                    row.0, &row.1, row.2, &row.3, &row.4, &row.5, &row.6, row.7,
-                                    &row.8, row.9, row.10, 0, &row.11, &row.12,
-                                );
-                                obj.set_track_id(row.13.as_str());
-                                objects.push(obj);
-                            }
-                            futures::future::Either::Left((Err(_), _)) => break,
-                            futures::future::Either::Right(((), _)) => {}
-                        }
-                    }
-
-                    if source_navigation.borrow().completion(&request)
-                        == CompletionDisposition::Ignore
-                    {
-                        scan_rx.close();
-                        return;
-                    }
-
-                    let should_render = cache_source_completion(
-                        &source_navigation,
-                        &request,
-                        &source_tracks,
-                        &objects,
-                        &active_source_key,
-                    );
-
-                    if should_render {
-                        display_tracks(
-                            &objects,
-                            &track_store,
-                            &master_tracks,
-                            &browser_widget,
-                            &browser_state,
-                            &status_label,
-                            &column_view,
-                        );
-                    }
-                });
+            // The removable controller starts registry-owned scanning at
+            // mount arrival. Selection never opens the mount or constructs a
+            // competing scan; it displays only the latest accepted pathless
+            // snapshot, or an empty projection while the first scan is live.
+            let tracks = source_tracks
+                .borrow()
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            display_tracks(
+                &tracks,
+                &track_store,
+                &master_tracks,
+                &browser_widget,
+                &browser_state,
+                &status_label,
+                &column_view,
+            );
+            if let Some(category) = retained_failure {
+                status_label.set_text(&category.user_message("Removable media"));
             }
             return;
         }
@@ -1173,41 +1043,18 @@ pub fn setup_source_connect(state: &WindowState) {
     });
 }
 
-/// Enumerate audio files on a mounted device, never leaving the device.
-///
-/// Symlinks are not followed. A USB stick containing `music -> /home/user`
-/// would otherwise make Tributary walk the user's entire home directory and
-/// index whatever it found there as "on the device". `file_type()` is checked
-/// rather than `Path::is_file()` because the latter follows the link anyway,
-/// which would still pull in an individual file symlinked from off the device.
-///
-/// This matches the policy the library scanner already applies in
-/// `local::engine`.
-fn enumerate_device_audio_files(
-    mount: &std::path::Path,
-) -> impl Iterator<Item = std::path::PathBuf> {
-    walkdir::WalkDir::new(mount)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .map(walkdir::DirEntry::into_path)
-        .filter(|path| crate::local::tag_parser::is_audio_file(path))
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::net::SocketAddr;
-    use std::path::{Path, PathBuf};
     use std::rc::Rc;
 
     use url::Url;
 
     use super::{
-        cache_source_completion, enumerate_device_audio_files, evict_source_completion,
-        prepare_remote_auth_submission, remote_failure_category, resolve_source_key,
+        cache_source_completion, evict_source_completion, prepare_remote_auth_submission,
+        remote_failure_category, resolve_source_key, retained_removable_connect_failure,
         with_active_source_key_snapshot, PendingConnection, RemoteFailureCategory,
         SourceNavigation, TrackObject,
     };
@@ -1234,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_source_identity_precedes_legacy_fallbacks() {
+    fn stable_removable_identity_and_explicit_view_keys_precede_legacy_fallbacks() {
         assert_eq!(
             resolve_source_key(
                 "device:uuid:123",
@@ -1242,7 +1089,7 @@ mod tests {
                 "file:///legacy",
                 "usb-device"
             ),
-            "device:uuid:123"
+            "stable-id"
         );
         assert_eq!(
             resolve_source_key("", "stable-id", "https://music.example.test", "subsonic"),
@@ -1321,6 +1168,50 @@ mod tests {
             source_tracks.borrow()["radio-topvote"][0].title(),
             "background"
         );
+    }
+
+    #[tokio::test]
+    async fn removable_selection_replays_a_retained_background_scan_failure() {
+        let registry =
+            crate::source_registry::SourceRegistry::new(tokio::runtime::Handle::current());
+        let source_id = crate::architecture::SourceId::removable("test:retained-scan-failure")
+            .expect("removable source identity");
+        let claim = registry
+            .claim_provenance(
+                source_id,
+                crate::source_lifecycle::SourceProvenance::Removable,
+            )
+            .expect("claim removable provenance");
+        let missing_mount = std::env::temp_dir().join(format!(
+            "tributary-missing-removable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        registry
+            .connect_removable(source_id, missing_mount, |_| {})
+            .expect("admit failing removable scan");
+
+        let category = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(category) = retained_removable_connect_failure(&registry, source_id) {
+                    break category;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("removable failure becomes visible");
+        assert_eq!(category, RemoteFailureCategory::Backend);
+        let message = category.user_message("Removable media");
+        assert!(message.contains("Removable media"));
+        assert!(!message.contains("tributary-missing-removable"));
+        assert_eq!(
+            retained_removable_connect_failure(&registry, source_id),
+            Some(RemoteFailureCategory::Backend),
+            "reading the UI status must not consume the retained lifecycle failure"
+        );
+
+        assert!(registry.release_provenance(source_id, claim));
+        registry.shutdown().wait().await;
     }
 
     fn advertised_route(address: &str) -> AdvertisedHttpRoute {
@@ -1488,116 +1379,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    struct TestTree {
-        path: PathBuf,
-    }
-
-    impl TestTree {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("tributary-device-{label}-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&path).expect("create test tree");
-            Self { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-
-        /// Only the symlink test needs a bare directory, and that test is Unix
-        /// only — without this gate the helper is dead code on Windows, which
-        /// `-D warnings` rejects.
-        #[cfg(unix)]
-        fn directory(&self, name: &str) -> PathBuf {
-            let path = self.path.join(name);
-            std::fs::create_dir_all(&path).expect("create directory");
-            path
-        }
-
-        fn audio(&self, relative: &str) -> PathBuf {
-            let path = self.path.join(relative);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("create parent");
-            }
-            std::fs::write(&path, b"audio").expect("write audio file");
-            path
-        }
-    }
-
-    impl Drop for TestTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    fn file_names(paths: &[PathBuf]) -> Vec<String> {
-        let mut names: Vec<String> = paths
-            .iter()
-            .map(|path| {
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into()
-            })
-            .collect();
-        names.sort();
-        names
-    }
-
-    #[test]
-    fn a_device_scan_finds_audio_in_nested_directories() {
-        let device = TestTree::new("nested");
-        device.audio("root.mp3");
-        device.audio("Album/track.flac");
-        device.audio("Album/cover.jpg");
-        device.audio("notes.txt");
-
-        let found: Vec<_> = enumerate_device_audio_files(device.path()).collect();
-        assert_eq!(file_names(&found), vec!["root.mp3", "track.flac"]);
-    }
-
-    #[test]
-    fn device_audio_enumeration_is_lazy() {
-        let device = TestTree::new("lazy");
-        let track = device.audio("removed-before-poll.mp3");
-        let mut paths = enumerate_device_audio_files(device.path());
-
-        std::fs::remove_file(track).expect("remove track before polling iterator");
-
-        assert_eq!(paths.next(), None);
-    }
-
-    /// The P2.4 defect: the walk followed symlinks, so a stick containing
-    /// `music -> /home/user` walked the whole home directory.
-    #[cfg(unix)]
-    #[test]
-    fn a_device_scan_never_follows_a_symlink_off_the_device() {
-        let elsewhere = TestTree::new("elsewhere");
-        elsewhere.audio("private.mp3");
-        elsewhere.audio("Deep/deeper/secret.mp3");
-
-        let device = TestTree::new("device");
-        device.audio("on-device.mp3");
-        let escape = device.directory("Music").join("escape");
-        std::os::unix::fs::symlink(elsewhere.path(), &escape).expect("link a directory off-device");
-        std::os::unix::fs::symlink(
-            elsewhere.path().join("private.mp3"),
-            device.path().join("linked.mp3"),
-        )
-        .expect("link a file off-device");
-
-        let found: Vec<_> = enumerate_device_audio_files(device.path()).collect();
-
-        assert_eq!(
-            file_names(&found),
-            vec!["on-device.mp3"],
-            "only files physically on the device may be indexed"
-        );
-        assert!(
-            !found.iter().any(|path| path.starts_with(elsewhere.path())),
-            "no result may resolve outside the mount"
-        );
     }
 }

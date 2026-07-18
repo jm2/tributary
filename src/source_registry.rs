@@ -1,11 +1,12 @@
 //! Production lifecycle service for every managed media source.
 //!
-//! Authenticated remotes, the built-in Radio-Browser adapter, and ephemeral
-//! OS-opened files share one source/session authority. Catalogue rows and
-//! playback queues retain only `(SourceId, TrackId)`, an optional
-//! `ViewOrigin`, and the non-secret epoch that published them. Protected
-//! requests, public locators, retained files, credentials, leases, and adapter
-//! state stay behind this boundary until media use.
+//! Authenticated remotes, the built-in Radio-Browser adapter, mounted
+//! removable media, and ephemeral OS-opened files share one source/session
+//! authority. Catalogue rows and playback queues retain only
+//! `(SourceId, TrackId)`, an optional `ViewOrigin`, and the non-secret epoch
+//! that published them. Protected requests, public locators, retained
+//! roots/files, credentials, leases, and adapter state stay behind this
+//! boundary until media use.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -349,6 +350,7 @@ struct BuiltInInstallation {
 
 struct SourceRegistryInner {
     lifecycle: SourceLifecycleRegistry<dyn ManagedSourceAdapter, AcceptedSourcePayload>,
+    runtime: tokio::runtime::Handle,
     built_ins: Mutex<HashMap<SourceId, BuiltInInstallation>>,
     external_sessions: Mutex<HashMap<SourceId, ProvenanceClaimId>>,
 }
@@ -424,7 +426,7 @@ impl std::fmt::Debug for ExternalFileSession {
 
 impl SourceRegistry {
     pub fn new(runtime: tokio::runtime::Handle) -> Self {
-        let lifecycle = SourceLifecycleRegistry::new(runtime);
+        let lifecycle = SourceLifecycleRegistry::new(runtime.clone());
         let source_id = SourceId::radio_browser();
         let claim_id = lifecycle
             .claim_provenance(source_id, SourceProvenance::BuiltIn)
@@ -440,6 +442,7 @@ impl SourceRegistry {
         Self {
             inner: Arc::new(SourceRegistryInner {
                 lifecycle,
+                runtime,
                 built_ins: Mutex::new(built_ins),
                 external_sessions: Mutex::new(HashMap::new()),
             }),
@@ -702,6 +705,66 @@ impl SourceRegistry {
             on_generation,
             authenticate,
         )
+    }
+
+    /// Scan and connect one exact mounted removable source under lifecycle
+    /// cancellation and epoch ownership.
+    ///
+    /// Filesystem walking and tag parsing run on Tokio's blocking pool. The
+    /// construction task must finish cooperatively so registry shutdown can
+    /// join it, but the cancellation observer lets a removed or relocated
+    /// mount stop between filesystem operations without publishing failure.
+    pub fn connect_removable<OnGeneration>(
+        &self,
+        source_id: SourceId,
+        mount_root: std::path::PathBuf,
+        on_generation: OnGeneration,
+    ) -> Option<u64>
+    where
+        OnGeneration: FnOnce(u64),
+    {
+        if source_id == SourceId::radio_browser() {
+            return None;
+        }
+        let owner = self.inner.lifecycle.begin_connect(source_id)?;
+        let generation = owner.generation();
+        on_generation(generation);
+        let blocking_runtime = self.inner.runtime.clone();
+        let adapter_runtime = self.inner.runtime.clone();
+        owner.spawn_staged(
+            ConstructionCancellationPolicy::FinishConstruction,
+            move |cancellation| async move {
+                let worker_cancellation = cancellation.clone();
+                let result = blocking_runtime
+                    .spawn_blocking(move || {
+                        crate::removable::RemovableMediaAdapter::scan(
+                            source_id,
+                            mount_root,
+                            &worker_cancellation,
+                            adapter_runtime,
+                        )
+                    })
+                    .await;
+                match result {
+                    Ok(Ok(Some(adapter))) => constructed_adapter(adapter),
+                    Ok(Ok(None)) => AdapterTaskResult::Cancelled,
+                    Ok(Err(error)) => AdapterTaskResult::Failed(failure_category(&error)),
+                    Err(_) => AdapterTaskResult::Failed(FailureCategory::Backend),
+                }
+            },
+            move |adapter, cancellation| async move {
+                if cancellation.is_cancelled() {
+                    return RefreshTaskResult::Cancelled;
+                }
+                match adapter.load_initial_catalogue().await {
+                    Ok(tracks) => {
+                        RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(tracks))
+                    }
+                    Err(error) => RefreshTaskResult::Failed(failure_category(&error)),
+                }
+            },
+        );
+        Some(generation)
     }
 
     fn spawn_connect<A, OnGeneration, Authenticate, AuthenticateFuture>(
@@ -2146,6 +2209,256 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].uri.path(), "/System/Ping");
         service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn removable_connect_publishes_pathless_epoch_and_resolves_only_accepted_tracks() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let path = mount.path().join("accepted.wav");
+        let expected = minimal_wav_bytes(0x80);
+        std::fs::write(&path, &expected).expect("write accepted removable WAV");
+        let source_id =
+            SourceId::removable("registry:test:pathless").expect("removable source identity");
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+        let observed_generation = Arc::new(AtomicU64::new(0));
+        let callback_generation = Arc::clone(&observed_generation);
+        let generation = registry
+            .connect_removable(source_id, mount.path().to_path_buf(), move |generation| {
+                callback_generation.store(generation, Ordering::Release);
+            })
+            .expect("removable connection admitted");
+        assert_eq!(observed_generation.load(Ordering::Acquire), generation);
+
+        let (accepted_generation, session_epoch) = wait_for_catalogue(&registry, source_id).await;
+        assert_eq!(accepted_generation, generation);
+        let snapshot = registry.snapshot(source_id).expect("removable snapshot");
+        assert_eq!(snapshot.state, crate::source_lifecycle::SourceState::Ready);
+        assert_eq!(snapshot.session_epoch, Some(session_epoch));
+        assert!(snapshot.provenance.contains(SourceProvenance::Removable));
+        assert_eq!(
+            snapshot.visibility,
+            crate::source_lifecycle::SourceVisibility::Visible
+        );
+        let catalogue = snapshot.catalogue.expect("accepted removable catalogue");
+        assert_eq!(catalogue.value.tracks().len(), 1);
+        let published = &catalogue.value.tracks()[0];
+        assert!(published.file_path.is_none());
+        assert!(published.stream_url.is_none());
+        assert!(published.cover_art_url.is_none());
+        let track_id = published
+            .native_track_id
+            .clone()
+            .expect("removable native identity");
+        assert_eq!(
+            track_id
+                .removable_relative_path()
+                .expect("decode accepted identity"),
+            std::path::PathBuf::from("accepted.wav")
+        );
+
+        let appeared_later = mount.path().join("appeared-later.wav");
+        std::fs::write(&appeared_later, minimal_wav_bytes(0x40))
+            .expect("write unlisted removable WAV");
+        let unlisted_id = TrackId::removable_relative(mount.path(), &appeared_later)
+            .expect("unlisted relative identity");
+        assert!(registry
+            .resolve_stream(source_id, session_epoch, unlisted_id)
+            .await
+            .is_err());
+
+        let resolved = registry
+            .resolve_stream(source_id, session_epoch, track_id)
+            .await
+            .expect("resolve accepted removable media");
+        assert_eq!(read_file_stream(&resolved), expected);
+
+        assert!(registry.release_provenance(source_id, claim));
+        wait_until_pruned(&registry, source_id).await;
+        assert!(!resolved.is_active());
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn removable_reconnect_mints_a_new_epoch_and_revokes_the_predecessor() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let path = mount.path().join("same.wav");
+        let expected = minimal_wav_bytes(0x80);
+        std::fs::write(&path, &expected).expect("write removable WAV");
+        let source_id =
+            SourceId::removable("registry:test:reconnect").expect("removable source identity");
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("initial removable connection admitted");
+        let (_, predecessor_epoch) = wait_for_catalogue(&registry, source_id).await;
+        let predecessor_track = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .and_then(|catalogue| catalogue.value.tracks().first().cloned())
+            .and_then(|track| track.native_track_id)
+            .expect("predecessor track identity");
+        let predecessor = registry
+            .resolve_stream(source_id, predecessor_epoch, predecessor_track.clone())
+            .await
+            .expect("resolve predecessor removable media");
+        assert!(predecessor.is_active());
+
+        registry
+            .disconnect(source_id)
+            .expect("disconnect predecessor")
+            .wait()
+            .await;
+        assert!(!predecessor.is_active());
+        let ResolvedSourceStream::File(predecessor_media) = &predecessor else {
+            panic!("fixture expected removable file media");
+        };
+        assert_eq!(
+            predecessor_media
+                .try_clone_file()
+                .expect_err("disconnect revokes predecessor file authority")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let dormant = registry
+            .snapshot(source_id)
+            .expect("claimed source retained");
+        assert_eq!(dormant.state, crate::source_lifecycle::SourceState::Dormant);
+        assert!(dormant.catalogue.is_none());
+
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("successor removable connection admitted");
+        let (_, successor_epoch) = wait_for_catalogue(&registry, source_id).await;
+        assert_ne!(successor_epoch, predecessor_epoch);
+        let successor_track = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .and_then(|catalogue| catalogue.value.tracks().first().cloned())
+            .and_then(|track| track.native_track_id)
+            .expect("successor track identity");
+        assert_eq!(successor_track, predecessor_track);
+        assert!(registry
+            .resolve_stream(source_id, predecessor_epoch, successor_track.clone())
+            .await
+            .is_err());
+        let successor = registry
+            .resolve_stream(source_id, successor_epoch, successor_track)
+            .await
+            .expect("resolve successor removable media");
+        assert_eq!(read_file_stream(&successor), expected);
+
+        assert!(registry.release_provenance(source_id, claim));
+        wait_until_pruned(&registry, source_id).await;
+        assert!(!successor.is_active());
+        registry.shutdown().wait().await;
+    }
+
+    #[test]
+    fn removable_disconnect_cancels_a_queued_blocking_scan_without_failure() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single-blocking-thread runtime");
+        runtime.block_on(async {
+            let registry = registry();
+            let mount = tempfile::tempdir().expect("temporary removable mount");
+            std::fs::write(mount.path().join("queued.wav"), minimal_wav_bytes(0x80))
+                .expect("write queued removable WAV");
+            let source_id = SourceId::removable("registry:test:cancel-queued")
+                .expect("removable source identity");
+            let claim = registry
+                .claim_provenance(source_id, SourceProvenance::Removable)
+                .expect("claim removable source");
+
+            let (blocker_started_tx, blocker_started_rx) = oneshot::channel();
+            let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::channel();
+            let blocker = Handle::current().spawn_blocking(move || {
+                let _ = blocker_started_tx.send(());
+                release_blocker_rx.recv().expect("release blocking pool");
+            });
+            blocker_started_rx.await.expect("blocking pool occupied");
+
+            registry
+                .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+                .expect("queued removable connection admitted");
+            // Let the tracked constructor reach `spawn_blocking`; the only
+            // blocking slot is held above, so its cooperative scan is queued.
+            tokio::task::yield_now().await;
+            let waiter = registry
+                .disconnect(source_id)
+                .expect("disconnect queued removable scan");
+            assert!(!waiter.is_complete());
+            release_blocker_tx.send(()).expect("release blocking pool");
+            blocker.await.expect("blocking pool fixture");
+            waiter.wait().await;
+
+            let snapshot = registry
+                .snapshot(source_id)
+                .expect("claimed source retained");
+            assert_eq!(
+                snapshot.state,
+                crate::source_lifecycle::SourceState::Dormant
+            );
+            assert!(snapshot.catalogue.is_none());
+            assert!(snapshot.failure.is_none());
+            assert!(snapshot.pending_connect.is_none());
+            assert!(registry.release_provenance(source_id, claim));
+            wait_until_pruned(&registry, source_id).await;
+            registry.shutdown().wait().await;
+        });
+    }
+
+    #[test]
+    fn removable_shutdown_joins_a_queued_scan_and_rejects_later_connect() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single-blocking-thread runtime");
+        runtime.block_on(async {
+            let registry = registry();
+            let mount = tempfile::tempdir().expect("temporary removable mount");
+            std::fs::write(mount.path().join("queued.wav"), minimal_wav_bytes(0x80))
+                .expect("write queued removable WAV");
+            let source_id = SourceId::removable("registry:test:shutdown-queued")
+                .expect("removable source identity");
+            registry
+                .claim_provenance(source_id, SourceProvenance::Removable)
+                .expect("claim removable source");
+
+            let (blocker_started_tx, blocker_started_rx) = oneshot::channel();
+            let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::channel();
+            let blocker = Handle::current().spawn_blocking(move || {
+                let _ = blocker_started_tx.send(());
+                release_blocker_rx.recv().expect("release blocking pool");
+            });
+            blocker_started_rx.await.expect("blocking pool occupied");
+
+            registry
+                .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+                .expect("queued removable connection admitted");
+            tokio::task::yield_now().await;
+            let barrier = registry.shutdown();
+            assert!(!barrier.is_complete());
+            assert!(registry
+                .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+                .is_none());
+
+            release_blocker_tx.send(()).expect("release blocking pool");
+            blocker.await.expect("blocking pool fixture");
+            timeout(Duration::from_secs(2), barrier.wait())
+                .await
+                .expect("shutdown joins queued removable scan");
+            assert!(registry.is_shutting_down());
+        });
     }
 
     #[tokio::test]

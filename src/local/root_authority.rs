@@ -1,9 +1,12 @@
-//! Retained authority for filesystem mutations beneath a library root.
+//! Retained authority for filesystem access beneath an exact root.
 //!
 //! A marker string alone cannot prove that a configured path still names the
 //! directory that was inspected. A [`RootAuthorityLease`] keeps both the root
 //! directory and its marker open, then compares freshly opened objects against
 //! those retained handles before a caller performs an authorized mutation.
+//! [`MountedRootAuthority`] applies the same handle, filesystem-boundary, and
+//! mount-generation checks to an ephemeral mounted root without requiring the
+//! removable filesystem to contain an application marker.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -29,6 +32,23 @@ pub(super) struct RootAuthorityLease {
     expected_marker: String,
     root_handle: RetainedObject,
     marker_handle: RetainedObject,
+    boundary: BoundaryIdentity,
+    #[cfg(windows)]
+    root_ancestors: Vec<RetainedObject>,
+    mount_generation: Option<u64>,
+}
+
+/// Live authority for one exact mounted root without an on-disk marker.
+///
+/// This is intentionally weaker than [`RootAuthorityLease`] as durable
+/// identity evidence: the source lifecycle must replace its session epoch on
+/// relocation, pre-unmount, or removal. While one session is live, retained
+/// root and descendant handles prevent path replacement, symlink traversal,
+/// or a nested filesystem from retargeting an admitted file.
+pub struct MountedRootAuthority {
+    token: Uuid,
+    root: PathBuf,
+    root_handle: RetainedObject,
     boundary: BoundaryIdentity,
     #[cfg(windows)]
     root_ancestors: Vec<RetainedObject>,
@@ -113,6 +133,12 @@ struct OpenedRoot {
     root: RetainedObject,
     #[cfg(windows)]
     ancestors: Vec<RetainedObject>,
+    /// Short-lived no-delete handle for the exact Windows mount-point
+    /// namespace entry. Mounted authorities deliberately do not move this
+    /// into their long-lived state, but validation and path-based descendant
+    /// traversal retain the surrounding `OpenedRoot` until they finish.
+    #[cfg(windows)]
+    _namespace_guard: Option<File>,
 }
 
 struct OpenedDescendant {
@@ -120,10 +146,35 @@ struct OpenedDescendant {
     parent_guards: Vec<RetainedObject>,
 }
 
+/// Internal common view of the two retained-root authority forms.
+trait RootBinding {
+    fn token(&self) -> Uuid;
+    fn root(&self) -> &Path;
+    fn root_handle(&self) -> &RetainedObject;
+    fn boundary(&self) -> BoundaryIdentity;
+    fn mount_generation(&self) -> Option<u64>;
+    fn unmount_friendly_sharing(&self) -> bool;
+
+    #[cfg(windows)]
+    fn root_ancestors(&self) -> &[RetainedObject];
+
+    fn validate_binding(&self) -> io::Result<()>;
+}
+
 impl fmt::Debug for RootAuthorityLease {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RootAuthorityLease")
+            .field("root", &self.root)
+            .field("mount_generation", &self.mount_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for MountedRootAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MountedRootAuthority")
             .field("root", &self.root)
             .field("mount_generation", &self.mount_generation)
             .finish_non_exhaustive()
@@ -191,12 +242,24 @@ impl BoundFile {
     /// old path. The root, marker, retained parent chain, and lease token must
     /// all remain valid before another handle is issued.
     pub(super) fn try_clone_for_consumption(&self, lease: &RootAuthorityLease) -> io::Result<File> {
-        lease.validate_bound_token(self.lease_token)?;
+        self.try_clone_for_root_consumption(lease)
+    }
+
+    /// Clone one exact mounted file while its retained root remains current.
+    pub(super) fn try_clone_for_mounted_consumption(
+        &self,
+        authority: &MountedRootAuthority,
+    ) -> io::Result<File> {
+        self.try_clone_for_root_consumption(authority)
+    }
+
+    fn try_clone_for_root_consumption(&self, authority: &impl RootBinding) -> io::Result<File> {
+        validate_bound_token(authority, self.lease_token)?;
         self.object.validate_live()?;
         validate_retained_objects(&self.parent_guards)?;
-        lease.validate()?;
+        authority.validate_binding()?;
         let file = self.object.file.try_clone()?;
-        lease.validate()?;
+        authority.validate_binding()?;
         Ok(file)
     }
 
@@ -266,6 +329,149 @@ enum DescendantKind {
     Directory,
 }
 
+impl RootBinding for RootAuthorityLease {
+    fn token(&self) -> Uuid {
+        self.token
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn root_handle(&self) -> &RetainedObject {
+        &self.root_handle
+    }
+
+    fn boundary(&self) -> BoundaryIdentity {
+        self.boundary
+    }
+
+    fn mount_generation(&self) -> Option<u64> {
+        self.mount_generation
+    }
+
+    fn unmount_friendly_sharing(&self) -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    fn root_ancestors(&self) -> &[RetainedObject] {
+        &self.root_ancestors
+    }
+
+    fn validate_binding(&self) -> io::Result<()> {
+        self.validate()
+    }
+}
+
+impl RootBinding for MountedRootAuthority {
+    fn token(&self) -> Uuid {
+        self.token
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn root_handle(&self) -> &RetainedObject {
+        &self.root_handle
+    }
+
+    fn boundary(&self) -> BoundaryIdentity {
+        self.boundary
+    }
+
+    fn mount_generation(&self) -> Option<u64> {
+        self.mount_generation
+    }
+
+    fn unmount_friendly_sharing(&self) -> bool {
+        true
+    }
+
+    #[cfg(windows)]
+    fn root_ancestors(&self) -> &[RetainedObject] {
+        &self.root_ancestors
+    }
+
+    fn validate_binding(&self) -> io::Result<()> {
+        self.validate()
+    }
+}
+
+impl MountedRootAuthority {
+    /// Open and retain the exact native mounted root currently at `root`.
+    ///
+    /// No marker is required or created. The caller's source lifecycle is
+    /// responsible for replacing the owning session on relocation or removal.
+    pub(crate) fn acquire(root: &Path) -> io::Result<Self> {
+        if !root.is_absolute() {
+            return Err(invalid_input(
+                "mounted root authority requires an absolute native path",
+            ));
+        }
+
+        let opened_root = open_configured_root(root, true, true)?;
+        let boundary = boundary_identity(&opened_root.root.file)?;
+        let mount_generation = root_mount_generation(&opened_root.root.file)?;
+        let authority = Self {
+            token: Uuid::new_v4(),
+            root: root.to_path_buf(),
+            root_handle: opened_root.root,
+            boundary,
+            #[cfg(windows)]
+            root_ancestors: opened_root.ancestors,
+            mount_generation,
+        };
+        authority.validate()?;
+        Ok(authority)
+    }
+
+    /// Return the exact native mount path retained by this authority.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Open a real regular file using only normal components relative to the
+    /// retained mounted root.
+    pub(super) fn open_relative_regular_file(&self, relative: &Path) -> io::Result<BoundFile> {
+        let components = strict_relative_components(relative)?;
+        self.validate()?;
+        let path = join_components(&self.root, &components);
+        let opened =
+            open_descendant_from_root(self, &path, &components, DescendantKind::RegularFile)?;
+        self.validate()?;
+        #[cfg(windows)]
+        let OpenedDescendant {
+            object,
+            parent_guards: _,
+        } = opened;
+        #[cfg(not(windows))]
+        let OpenedDescendant {
+            object,
+            parent_guards,
+        } = opened;
+        // Windows traversal guards deliberately deny delete sharing while the
+        // absolute-path fallback opens the complete descendant chain. Once the
+        // exact final file is retained, drop those short-lived namespace pins
+        // so playback cannot block unmount/eject.
+        #[cfg(windows)]
+        let parent_guards = Vec::new();
+        Ok(BoundFile {
+            lease_token: self.token,
+            path,
+            object,
+            parent_guards,
+        })
+    }
+
+    /// Reopen the mount path and verify the exact retained root, filesystem
+    /// boundary, ancestor chain, and platform mount generation.
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        validate_root_binding(self)
+    }
+}
+
 impl RootAuthorityLease {
     /// Open and retain the exact root and marker currently at `root`.
     ///
@@ -287,7 +493,7 @@ impl RootAuthorityLease {
         }
         let expected_marker = parsed_marker;
 
-        let opened_root = open_configured_root(root)?;
+        let opened_root = open_configured_root(root, false, false)?;
         let boundary = boundary_identity(&opened_root.root.file)?;
         let mount_generation = root_mount_generation(&opened_root.root.file)?;
         let marker_file = open_marker(root, &opened_root.root.file)?;
@@ -432,7 +638,7 @@ impl RootAuthorityLease {
         #[cfg(windows)]
         validate_retained_objects(&self.root_ancestors)?;
 
-        let current_root = open_configured_root(&self.root)?;
+        let current_root = open_configured_root(&self.root, false, false)?;
         let current_mount_generation = root_mount_generation(&current_root.root.file)?;
         if current_root.root.identity != self.root_handle.identity {
             return Err(authority_changed(
@@ -462,7 +668,7 @@ impl RootAuthorityLease {
             ));
         }
 
-        let after_marker = open_configured_root(&self.root)?;
+        let after_marker = open_configured_root(&self.root, false, false)?;
         let after_marker_mount = root_mount_generation(&after_marker.root.file)?;
         if after_marker.root.identity != self.root_handle.identity
             || after_marker_mount != self.mount_generation
@@ -489,6 +695,63 @@ fn invalid_marker(message: impl Into<String>) -> io::Error {
 
 fn authority_changed(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+
+fn validate_bound_token(authority: &impl RootBinding, token: Uuid) -> io::Result<()> {
+    if token == authority.token() {
+        Ok(())
+    } else {
+        Err(authority_changed(
+            "bound filesystem evidence belongs to a different root authority",
+        ))
+    }
+}
+
+fn validate_opened_root_binding(
+    authority: &impl RootBinding,
+    current: &OpenedRoot,
+) -> io::Result<()> {
+    if current.root.identity != authority.root_handle().identity {
+        return Err(authority_changed(
+            "mounted root path no longer names the retained directory",
+        ));
+    }
+    if root_mount_generation(&current.root.file)? != authority.mount_generation() {
+        return Err(authority_changed(
+            "mounted root path no longer belongs to the retained mount",
+        ));
+    }
+    if boundary_identity(&current.root.file)? != authority.boundary() {
+        return Err(authority_changed(
+            "mounted root filesystem boundary changed",
+        ));
+    }
+    #[cfg(windows)]
+    compare_object_chains(authority.root_ancestors(), &current.ancestors)?;
+    Ok(())
+}
+
+fn validate_root_binding(authority: &impl RootBinding) -> io::Result<()> {
+    authority.root_handle().validate_live()?;
+    #[cfg(windows)]
+    validate_retained_objects(authority.root_ancestors())?;
+
+    let current = open_configured_root(
+        authority.root(),
+        authority.unmount_friendly_sharing(),
+        authority.unmount_friendly_sharing(),
+    )?;
+    validate_opened_root_binding(authority, &current)?;
+    authority.root_handle().validate_live()?;
+
+    // A second reopen catches a path replacement racing the first comparison.
+    let after = open_configured_root(
+        authority.root(),
+        authority.unmount_friendly_sharing(),
+        authority.unmount_friendly_sharing(),
+    )?;
+    validate_opened_root_binding(authority, &after)?;
+    authority.root_handle().validate_live()
 }
 
 fn unsupported_platform() -> io::Error {
@@ -519,6 +782,29 @@ fn descendant_components(root: &Path, path: &Path, allow_root: bool) -> io::Resu
     if components.is_empty() && !allow_root {
         return Err(invalid_input(
             "bound operation requires a path below the library root",
+        ));
+    }
+    Ok(components)
+}
+
+fn strict_relative_components(relative: &Path) -> io::Result<Vec<OsString>> {
+    if relative.is_absolute() {
+        return Err(invalid_input("mounted descendant path must be relative"));
+    }
+    let mut components = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(value) => components.push(value.to_os_string()),
+            _ => {
+                return Err(invalid_input(
+                    "mounted descendant path contains a non-normal component",
+                ))
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err(invalid_input(
+            "mounted file authority requires a path below the root",
         ));
     }
     Ok(components)
@@ -730,10 +1016,31 @@ fn validate_marker_metadata(_metadata: &std::fs::Metadata) -> io::Result<()> {
 
 #[cfg(unix)]
 fn open_unix_directory_path(path: &Path) -> io::Result<File> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
     use rustix::fs::{Mode, OFlags};
 
+    // On Linux, `O_NOFOLLOW` protects the final path component, but a trailing
+    // slash or `/.` makes the preceding symlink an intermediate component and
+    // therefore follows it. Remove only those semantically redundant suffixes
+    // before the no-follow open, preserving native non-UTF-8 bytes and `/`.
+    let mut bytes = path.as_os_str().as_bytes().to_vec();
+    loop {
+        while bytes.len() > 1 && bytes.last() == Some(&b'/') {
+            bytes.pop();
+        }
+        if bytes.ends_with(b"/.") {
+            bytes.truncate(bytes.len() - 2);
+            if bytes.is_empty() {
+                bytes.push(b'/');
+            }
+            continue;
+        }
+        break;
+    }
+    let no_follow_path = PathBuf::from(OsString::from_vec(bytes));
     let descriptor = rustix::fs::open(
-        path,
+        &no_follow_path,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
         Mode::empty(),
     )
@@ -774,49 +1081,143 @@ fn open_unix_regular_at(parent: &File, name: &OsString) -> io::Result<File> {
 }
 
 #[cfg(windows)]
-fn open_windows_directory(path: &Path) -> io::Result<File> {
+fn is_windows_volume_mount_point(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+
+    let mut mount_point: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if !mount_point
+        .last()
+        .is_some_and(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))
+    {
+        mount_point.push(u16::from(b'\\'));
+    }
+    mount_point.push(0);
+    // A volume GUID path is far below this fixed bound. Failure, truncation,
+    // and every non-volume reparse all fail closed as `false`.
+    let mut volume_name = [0_u16; 256];
+    // SAFETY: both pointers refer to writable/readable NUL-terminated buffers
+    // for the complete duration of the call, and the size is in u16 elements.
+    unsafe {
+        GetVolumeNameForVolumeMountPointW(
+            mount_point.as_ptr(),
+            volume_name.as_mut_ptr(),
+            volume_name.len() as u32,
+        ) != 0
+    }
+}
+
+#[cfg(windows)]
+struct OpenedWindowsDirectory {
+    target: File,
+    namespace_guard: Option<File>,
+}
+
+#[cfg(windows)]
+fn open_windows_directory(
+    path: &Path,
+    unmount_friendly_sharing: bool,
+    follow_final_mount_target: bool,
+) -> io::Result<OpenedWindowsDirectory> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    // `FILE_SHARE_DELETE` is intentionally omitted. These are namespace
-    // guards, not ordinary read handles: allowing delete sharing would let a
-    // retained root, ancestor, or bound directory be renamed or unlinked
-    // between final authority validation and the SQLite commit it authorizes.
+    // If the GIO-supplied mounted root is a reparse point, pin that exact
+    // namespace entry without delete sharing while proving it is an actual
+    // volume mount and opening its target. Merely omitting
+    // `FILE_FLAG_OPEN_REPARSE_POINT` would also follow arbitrary symlinks,
+    // junctions, and cloud-provider reparses.
+    let namespace_guard = if follow_final_mount_target {
+        let guard = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let metadata = guard.metadata()?;
+        // Rust's `is_symlink_dir` also classifies volume-mount name-surrogate
+        // reparses as symlinks, so the Windows volume API is the discriminator
+        // here: ordinary directory symlinks and junctions fail this probe.
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            && !is_windows_volume_mount_point(path)
+        {
+            return Err(invalid_marker(
+                "mounted root reparse point is not a volume mount",
+            ));
+        }
+        Some(guard)
+    } else {
+        None
+    };
+
+    // Marker-backed roots omit `FILE_SHARE_DELETE`: those handles pin the
+    // namespace through an authorized SQLite mutation. Ephemeral mounted
+    // roots opt in so a live browse/playback authority does not unnecessarily
+    // block rename, unmount, or eject; identity revalidation remains the
+    // authority boundary there.
+    let share_mode = FILE_SHARE_READ
+        | FILE_SHARE_WRITE
+        | if unmount_friendly_sharing {
+            FILE_SHARE_DELETE
+        } else {
+            0
+        };
     let file = OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .share_mode(share_mode)
+        .custom_flags(
+            FILE_FLAG_BACKUP_SEMANTICS
+                | if follow_final_mount_target {
+                    0
+                } else {
+                    FILE_FLAG_OPEN_REPARSE_POINT
+                },
+        )
         .open(path)?;
     let metadata = file.metadata()?;
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    if !follow_final_mount_target && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
         return Err(invalid_marker("library root must not be a reparse point"));
     }
     if !metadata.is_dir() {
         return Err(invalid_marker("library root is not a directory"));
     }
-    Ok(file)
+    Ok(OpenedWindowsDirectory {
+        target: file,
+        namespace_guard,
+    })
 }
 
 #[cfg(windows)]
-fn open_windows_regular(path: &Path, share_writes: bool) -> io::Result<File> {
+fn open_windows_regular(
+    path: &Path,
+    share_writes: bool,
+    unmount_friendly_sharing: bool,
+) -> io::Result<File> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    // Keep delete sharing disabled for the same reason as directory handles:
-    // the marker and bound files must pin their namespace entries through the
-    // database commit. `share_writes` is permitted only where an in-place
-    // content update can be detected by marker/evidence revalidation.
-    let share_mode = FILE_SHARE_READ | if share_writes { FILE_SHARE_WRITE } else { 0 };
+    // Marker-backed files keep delete sharing disabled for the same namespace
+    // pinning reason as directory handles. Mounted files allow write/delete
+    // sharing for unmount friendliness; retained object identity prevents a
+    // renamed or replaced path from retargeting an admitted capability.
+    let share_mode = FILE_SHARE_READ
+        | if share_writes { FILE_SHARE_WRITE } else { 0 }
+        | if unmount_friendly_sharing {
+            FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        } else {
+            0
+        };
     let file = OpenOptions::new()
         .read(true)
         .share_mode(share_mode)
@@ -835,7 +1236,11 @@ fn open_windows_regular(path: &Path, share_writes: bool) -> io::Result<File> {
 }
 
 #[cfg(unix)]
-fn open_configured_root(path: &Path) -> io::Result<OpenedRoot> {
+fn open_configured_root(
+    path: &Path,
+    _unmount_friendly_sharing: bool,
+    _follow_final_mount_target: bool,
+) -> io::Result<OpenedRoot> {
     // Configured aliases may contain an ancestor symlink (notably `/var` on
     // macOS). The final component itself is never followed, and every
     // descendant operation below is anchored to the retained directory fd.
@@ -845,7 +1250,11 @@ fn open_configured_root(path: &Path) -> io::Result<OpenedRoot> {
 }
 
 #[cfg(windows)]
-fn open_configured_root(path: &Path) -> io::Result<OpenedRoot> {
+fn open_configured_root(
+    path: &Path,
+    unmount_friendly_sharing: bool,
+    follow_final_mount_target: bool,
+) -> io::Result<OpenedRoot> {
     if path
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
@@ -866,9 +1275,22 @@ fn open_configured_root(path: &Path) -> io::Result<OpenedRoot> {
         ));
     }
 
-    let mut handles = Vec::with_capacity(prefixes.len());
-    for prefix in prefixes {
-        handles.push(RetainedObject::new(open_windows_directory(&prefix)?)?);
+    let prefix_count = prefixes.len();
+    let mut handles = Vec::with_capacity(prefix_count);
+    let mut namespace_guard = None;
+    for (index, prefix) in prefixes.into_iter().enumerate() {
+        // A Windows directory volume mount point is itself a reparse point.
+        // GIO supplies the mounted root, so mounted authority follows only
+        // that final target and binds its exact volume/file identity. Every
+        // ancestor and every later descendant remains no-follow.
+        let follow_final_mount_target = follow_final_mount_target && index + 1 == prefix_count;
+        let opened =
+            open_windows_directory(&prefix, unmount_friendly_sharing, follow_final_mount_target)?;
+        if opened.namespace_guard.is_some() {
+            debug_assert!(follow_final_mount_target);
+            namespace_guard = opened.namespace_guard;
+        }
+        handles.push(RetainedObject::new(opened.target)?);
     }
     let root = handles
         .pop()
@@ -876,11 +1298,16 @@ fn open_configured_root(path: &Path) -> io::Result<OpenedRoot> {
     Ok(OpenedRoot {
         root,
         ancestors: handles,
+        _namespace_guard: namespace_guard,
     })
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_configured_root(_path: &Path) -> io::Result<OpenedRoot> {
+fn open_configured_root(
+    _path: &Path,
+    _unmount_friendly_sharing: bool,
+    _follow_final_mount_target: bool,
+) -> io::Result<OpenedRoot> {
     Err(unsupported_platform())
 }
 
@@ -900,7 +1327,7 @@ fn open_marker(_root: &Path, root_file: &File) -> io::Result<File> {
 
 #[cfg(windows)]
 fn open_marker(root: &Path, _root_file: &File) -> io::Result<File> {
-    open_windows_regular(&root.join(ROOT_IDENTITY_FILE), true)
+    open_windows_regular(&root.join(ROOT_IDENTITY_FILE), true, false)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -910,21 +1337,21 @@ fn open_marker(_root: &Path, _root_file: &File) -> io::Result<File> {
 
 #[cfg(unix)]
 fn open_descendant_from_root(
-    lease: &RootAuthorityLease,
+    authority: &impl RootBinding,
     _path: &Path,
     components: &[OsString],
     kind: DescendantKind,
 ) -> io::Result<OpenedDescendant> {
     if components.is_empty() {
-        let file = lease.root_handle.file.try_clone()?;
-        ensure_boundary(lease.boundary, &file)?;
+        let file = authority.root_handle().file.try_clone()?;
+        ensure_boundary(authority.boundary(), &file)?;
         return Ok(OpenedDescendant {
             object: RetainedObject::new(file)?,
             parent_guards: Vec::new(),
         });
     }
 
-    let mut parent = lease.root_handle.file.try_clone()?;
+    let mut parent = authority.root_handle().file.try_clone()?;
     let mut parent_guards = Vec::with_capacity(components.len().saturating_sub(1));
     for (index, component) in components.iter().enumerate() {
         let is_last = index + 1 == components.len();
@@ -933,7 +1360,7 @@ fn open_descendant_from_root(
         } else {
             open_unix_directory_at(&parent, component)?
         };
-        ensure_boundary(lease.boundary, &file)?;
+        ensure_boundary(authority.boundary(), &file)?;
         if is_last {
             return Ok(OpenedDescendant {
                 object: RetainedObject::new(file)?,
@@ -949,31 +1376,46 @@ fn open_descendant_from_root(
 
 #[cfg(windows)]
 fn open_descendant_from_root(
-    lease: &RootAuthorityLease,
+    authority: &impl RootBinding,
     _path: &Path,
     components: &[OsString],
     kind: DescendantKind,
 ) -> io::Result<OpenedDescendant> {
     if components.is_empty() {
-        let file = lease.root_handle.file.try_clone()?;
-        ensure_boundary(lease.boundary, &file)?;
+        let file = authority.root_handle().file.try_clone()?;
+        ensure_boundary(authority.boundary(), &file)?;
         return Ok(OpenedDescendant {
             object: RetainedObject::new(file)?,
             parent_guards: Vec::new(),
         });
     }
 
-    let mut current_path = lease.root.clone();
+    // The standard library cannot open Windows descendants relative to a
+    // retained directory handle. Mounted authority normally shares delete so
+    // it does not block eject, but that would let an intermediate directory be
+    // replaced by a same-volume junction between path-based component opens.
+    // Temporarily reopen and pin the exact root/ancestor namespace without
+    // delete sharing, then retain similarly strict directory guards until the
+    // final no-follow regular-file handle has been opened.
+    let _mounted_traversal_root = if authority.unmount_friendly_sharing() {
+        let current = open_configured_root(authority.root(), false, true)?;
+        validate_opened_root_binding(authority, &current)?;
+        Some(current)
+    } else {
+        None
+    };
+
+    let mut current_path = authority.root().to_path_buf();
     let mut parent_guards = Vec::with_capacity(components.len().saturating_sub(1));
     for (index, component) in components.iter().enumerate() {
         current_path.push(component);
         let is_last = index + 1 == components.len();
         let file = if is_last && matches!(kind, DescendantKind::RegularFile) {
-            open_windows_regular(&current_path, false)?
+            open_windows_regular(&current_path, false, authority.unmount_friendly_sharing())?
         } else {
-            open_windows_directory(&current_path)?
+            open_windows_directory(&current_path, false, false)?.target
         };
-        ensure_boundary(lease.boundary, &file)?;
+        ensure_boundary(authority.boundary(), &file)?;
         let object = RetainedObject::new(file)?;
         if is_last {
             return Ok(OpenedDescendant {
@@ -988,7 +1430,7 @@ fn open_descendant_from_root(
 
 #[cfg(not(any(unix, windows)))]
 fn open_descendant_from_root(
-    _lease: &RootAuthorityLease,
+    _authority: &impl RootBinding,
     _path: &Path,
     _components: &[OsString],
     _kind: DescendantKind,
@@ -1148,6 +1590,108 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert!(lease.mount_generation().is_some());
         lease.validate().expect("validate lease");
+    }
+
+    #[test]
+    fn mounted_authority_needs_no_marker_and_opens_only_relative_files() {
+        let directory = TestDirectory::new("mounted-valid");
+        let album = directory.path().join("album");
+        fs::create_dir(&album).expect("create album");
+        let song = album.join("song.flac");
+        fs::write(&song, b"mounted audio").expect("write song");
+
+        let authority =
+            MountedRootAuthority::acquire(directory.path()).expect("acquire mounted authority");
+        assert_eq!(authority.root(), directory.path());
+        authority.validate().expect("validate mounted authority");
+        let bound = authority
+            .open_relative_regular_file(Path::new("album/song.flac"))
+            .expect("open relative mounted file");
+        let mut file = bound
+            .try_clone_for_mounted_consumption(&authority)
+            .expect("clone mounted file");
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).expect("read mounted file");
+        assert_eq!(contents, b"mounted audio");
+
+        assert!(authority.open_relative_regular_file(&song).is_err());
+        assert!(authority
+            .open_relative_regular_file(Path::new("../outside.flac"))
+            .is_err());
+        assert!(authority
+            .open_relative_regular_file(Path::new("album/../song.flac"))
+            .is_err());
+        assert!(authority.open_relative_regular_file(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn mounted_bounds_cannot_cross_authority_instances() {
+        let first = TestDirectory::new("mounted-first");
+        fs::write(first.path().join("song.flac"), b"first").expect("write first song");
+        let first_authority =
+            MountedRootAuthority::acquire(first.path()).expect("first mounted authority");
+        let bound = first_authority
+            .open_relative_regular_file(Path::new("song.flac"))
+            .expect("bind first song");
+
+        let second = TestDirectory::new("mounted-second");
+        fs::write(second.path().join("song.flac"), b"second").expect("write second song");
+        let second_authority =
+            MountedRootAuthority::acquire(second.path()).expect("second mounted authority");
+
+        assert!(bound
+            .try_clone_for_mounted_consumption(&second_authority)
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mounted_authority_rejects_symlink_escape_and_root_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("mounted-symlink");
+        let outside = TestDirectory::new("mounted-outside");
+        fs::write(outside.path().join("outside.flac"), b"outside").expect("write outside file");
+        symlink(outside.path(), directory.path().join("escape")).expect("create escape symlink");
+        let authority =
+            MountedRootAuthority::acquire(directory.path()).expect("acquire mounted authority");
+        assert!(authority
+            .open_relative_regular_file(Path::new("escape/outside.flac"))
+            .is_err());
+
+        let replacement = TestDirectory::new("mounted-replacement");
+        let displaced = directory.path().with_extension("displaced");
+        fs::rename(directory.path(), &displaced).expect("displace mounted root");
+        fs::rename(replacement.path(), directory.path()).expect("install replacement root");
+        assert!(authority.validate().is_err());
+
+        drop(authority);
+        fs::rename(directory.path(), replacement.path()).expect("restore replacement root");
+        fs::rename(&displaced, directory.path()).expect("restore mounted root");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mounted_file_handles_allow_namespace_retirement() {
+        let directory = TestDirectory::new("windows-mounted-sharing");
+        let song = directory.path().join("song.flac");
+        let moved = directory.path().join("moved.flac");
+        fs::write(&song, b"audio").expect("write song");
+        let authority =
+            MountedRootAuthority::acquire(directory.path()).expect("acquire mounted authority");
+        let bound = authority
+            .open_relative_regular_file(Path::new("song.flac"))
+            .expect("bind mounted song");
+
+        fs::rename(&song, &moved).expect("mounted sharing permits file rename");
+        let mut retained = bound
+            .try_clone_for_mounted_consumption(&authority)
+            .expect("clone renamed exact file");
+        let mut contents = Vec::new();
+        retained
+            .read_to_end(&mut contents)
+            .expect("read renamed file");
+        assert_eq!(contents, b"audio");
     }
 
     #[test]
@@ -1408,6 +1952,16 @@ mod tests {
         let final_alias = container.path().join("final-alias");
         symlink(&real_root, &final_alias).expect("create final alias");
         assert!(RootAuthorityLease::acquire(&final_alias, MARKER).is_err());
+
+        // `O_NOFOLLOW` alone follows the alias when a slash or dot is appended
+        // because the alias is no longer the kernel's final path component.
+        // Authority normalizes only those redundant suffixes before opening.
+        let trailing_slash = PathBuf::from(format!("{}/", final_alias.display()));
+        let trailing_dot = final_alias.join(".");
+        assert!(RootAuthorityLease::acquire(&trailing_slash, MARKER).is_err());
+        assert!(RootAuthorityLease::acquire(&trailing_dot, MARKER).is_err());
+        assert!(MountedRootAuthority::acquire(&trailing_slash).is_err());
+        assert!(MountedRootAuthority::acquire(&trailing_dot).is_err());
     }
 
     #[cfg(unix)]

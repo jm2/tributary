@@ -544,8 +544,10 @@ fn build_properties_action(
     automatic_device: bool,
 ) {
     // Snapshot the exact selection while building the menu. Properties is an
-    // all-or-none local-file operation: silently dropping a malformed or
-    // remote row would let a batch edit only an unexpected subset.
+    // all-or-none path-authorized local-file operation: silently dropping a
+    // malformed, remote, or pathless lifecycle row would let a batch edit
+    // only an unexpected subset. Removable rows deliberately remain absent
+    // until a typed mutation target can revalidate their exact live epoch.
     let mut track_infos = Vec::new();
     for &position in &selection.positions {
         let Some(item) = sm.item(position) else {
@@ -610,8 +612,8 @@ fn local_file_path(uri: &str) -> Option<std::path::PathBuf> {
         .flatten()
 }
 
-/// Match the active logical source against exact sidebar metadata. Opaque
-/// source keys and mount-path spellings are not type information.
+/// Match the active lifecycle source against exact sidebar metadata. Opaque
+/// logical GIO keys and mount-path spellings are not navigation identities.
 fn active_source_is_automatic_device(
     sidebar_store: &gtk::gio::ListStore,
     active_source_key: &str,
@@ -621,7 +623,10 @@ fn active_source_is_automatic_device(
             .item(position)
             .and_downcast::<SourceObject>()
             .is_some_and(|source| {
-                source.backend_type() == "usb-device" && source.source_key() == active_source_key
+                source.backend_type() == "usb-device"
+                    && source
+                        .source_id()
+                        .is_some_and(|source_id| source_id.to_string() == active_source_key)
             })
     })
 }
@@ -689,6 +694,7 @@ mod tests {
         assert_eq!(local_file_path("https://example.test/song.flac"), None);
         assert_eq!(local_file_path("file://%"), None);
         assert_eq!(local_file_path("not a URI"), None);
+        assert_eq!(local_file_path(""), None);
     }
 
     #[test]
@@ -705,7 +711,11 @@ mod tests {
             PathBuf::from("/media/player"),
         ));
 
-        assert!(active_source_is_automatic_device(
+        let source_id = crate::architecture::SourceId::removable("device:opaque-id")
+            .expect("removable source")
+            .to_string();
+        assert!(active_source_is_automatic_device(&store, &source_id));
+        assert!(!active_source_is_automatic_device(
             &store,
             "device:opaque-id"
         ));
