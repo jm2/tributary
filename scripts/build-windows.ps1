@@ -839,9 +839,13 @@ $peInspectorClosureClock = [System.Diagnostics.Stopwatch]::StartNew()
 Write-Host "  inspecting required Soup plugin imports..."
 try {
     $soupInspectorLines = @(Invoke-BoundedPeImportBatch `
-        $peImportInspector @($requiredSoupPluginFull) $peInspectorClosureClock `
-        $peInspectorClosureDeadlineMs $peInspectorBatchDeadlineMs `
-        $maxPeInspectorBatchOutputBytes $maxPeInspectorArgumentCharacters)
+        -Inspector $peImportInspector `
+        -Paths @($requiredSoupPluginFull) `
+        -ClosureClock $peInspectorClosureClock `
+        -ClosureDeadlineMs $peInspectorClosureDeadlineMs `
+        -ProcessDeadlineMs $peInspectorBatchDeadlineMs `
+        -OutputByteLimit $maxPeInspectorBatchOutputBytes `
+        -ArgumentCharacterLimit $maxPeInspectorArgumentCharacters)
     foreach ($line in $soupInspectorLines) {
         $dllName = Get-PeImportDependencyName ([string]$line)
         if ($dllName -and $dllName -ieq $requiredSoupRuntimeName) {
@@ -903,9 +907,13 @@ while ($dllScanQueue.Count -gt 0) {
         Write-Host "    batch ${batchNumber}: $($batchTargets.Count) target(s)"
         try {
             $batchLines = @(Invoke-BoundedPeImportBatch `
-                $peImportInspector $batchTargets $peInspectorClosureClock `
-                $peInspectorClosureDeadlineMs $peInspectorBatchDeadlineMs `
-                $maxPeInspectorBatchOutputBytes $maxPeInspectorArgumentCharacters)
+                -Inspector $peImportInspector `
+                -Paths $batchTargets `
+                -ClosureClock $peInspectorClosureClock `
+                -ClosureDeadlineMs $peInspectorClosureDeadlineMs `
+                -ProcessDeadlineMs $peInspectorBatchDeadlineMs `
+                -OutputByteLimit $maxPeInspectorBatchOutputBytes `
+                -ArgumentCharacterLimit $maxPeInspectorArgumentCharacters)
             $batchNames = @($batchTargets | Select-Object -First 3 | ForEach-Object {
                 [System.IO.Path]::GetFileName($_)
             }) -join ", "

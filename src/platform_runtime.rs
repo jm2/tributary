@@ -1566,7 +1566,7 @@ mod tests {
             "$dllScanQueue = [System.Collections.Queue]::new()",
             "$knownDllScanTargets = @{}",
             "Invoke-BoundedPeImportBatch `",
-            "$peImportInspector @($requiredSoupPluginFull)",
+            "-Paths @($requiredSoupPluginFull)",
             "$scannedDllTargets[$requiredSoupPluginFull] = $true",
             "while ($dllScanQueue.Count -gt 0)",
             "$roundTargets = @()",
@@ -1606,6 +1606,58 @@ mod tests {
         assert!(!script.contains("$ldd"));
         assert!(!script.contains("ReadToEnd"));
         assert!(!script.contains("DataReceived"));
+    }
+
+    #[test]
+    fn windows_pe_import_batches_use_explicit_parameter_binding() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        assert_eq!(
+            script.matches("Invoke-BoundedPeImportBatch `").count(),
+            2,
+            "every production PE-import batch call must be covered"
+        );
+        assert_eq!(script.matches("-Inspector $peImportInspector `").count(), 2);
+        assert_eq!(
+            script
+                .matches("-ClosureClock $peInspectorClosureClock `")
+                .count(),
+            2
+        );
+        assert_eq!(
+            script
+                .matches("-ClosureDeadlineMs $peInspectorClosureDeadlineMs `")
+                .count(),
+            2
+        );
+        assert_eq!(
+            script
+                .matches("-ProcessDeadlineMs $peInspectorBatchDeadlineMs `")
+                .count(),
+            2
+        );
+        assert_eq!(
+            script
+                .matches("-OutputByteLimit $maxPeInspectorBatchOutputBytes `")
+                .count(),
+            2
+        );
+        assert_eq!(
+            script
+                .matches("-ArgumentCharacterLimit $maxPeInspectorArgumentCharacters)")
+                .count(),
+            2
+        );
+        assert_eq!(
+            script
+                .matches("-Paths @($requiredSoupPluginFull) `")
+                .count(),
+            1
+        );
+        assert_eq!(script.matches("-Paths $batchTargets `").count(), 1);
+        assert!(
+            !script.contains("$peImportInspector @($requiredSoupPluginFull)"),
+            "a non-terminal string-array parameter must not rely on positional binding"
+        );
     }
 
     #[test]
