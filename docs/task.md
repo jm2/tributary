@@ -37,7 +37,7 @@ runtime and the now-bounded shuffle navigation semantics.
 ### P1.1 — Harden and document existing shuffled playback history
 
 - [x] Bound, specify, and fully regress the existing occurrence-aware shuffle history
-  (implementation PR; number added immediately after publication).
+  ([#132](https://github.com/jm2/tributary/pull/132)).
 
   Acceptance criteria:
 
@@ -217,4 +217,4 @@ runtime and the now-bounded shuffle navigation semantics.
 | Date | Task | PR | Result |
 |---|---|---|---|
 | 2026-07-18 | Backlog reset | — | Archived the holistic-review tracker and established the audited feature backlog; no implementation record completed. |
-| 2026-07-18 | P1.1 bounded shuffle history | Pending publication | Retained ten real prior occurrences, fixed forward traversal and complete Repeat All cycles, unified Previous dispatch, made toggle/reset semantics explicit, and added lifecycle/rollback regressions. |
+| 2026-07-18 | P1.1 bounded shuffle history | [#132](https://github.com/jm2/tributary/pull/132) | Retained ten real prior occurrences, fixed forward traversal and complete Repeat All cycles, unified Previous dispatch, made toggle/reset semantics explicit, and added lifecycle/rollback regressions. |
