@@ -2,7 +2,7 @@
 
 - Status: Accepted in PR #113; stable identity, retained local playback and embedded-art
   authority, authenticated-remote lifecycle ownership, and the Radio-Browser stateless-source
-  adapter are implemented; removable-media and OS-opened-file adapter consolidation remains
+  and OS-opened-file adapters are implemented; only removable-media adapter consolidation remains
   incomplete
 - Decision date: 2026-07-17
 - Tracker: [P3.1](../task.md#p31-introduce-a-sourcesession-registry)
@@ -34,15 +34,17 @@ IDs; local playback and local/playlist embedded-art reads retain exact root/file
 consumption; and removable scans are generation-owned and cancelled on relocation or removal.
 
 This decision still describes the intended boundary for every source kind; it does **not** claim
-that all non-remote adapters have converged. PR #120 implements stable identity, PR #121 adds
+that every non-remote adapter has converged. PR #120 implements stable identity, PR #121 adds
 retained local file authority through output consumption, PR #122 introduces the generic lifecycle
 foundation, and the following production cutover moves all authenticated remotes onto it. P3.2 has
 also completed its bounded backend-abstraction scope: scanner snapshots construct `LocalBackend`,
 and all five shipping backends publish complete track catalogues through one `&dyn MediaBackend`
 adapter. Local/playlist embedded-art display now consumes a cloned `ResolvedLocalMedia` capability
 rather than a path. Radio-Browser now publishes three registry-owned views and resolves its public
-stream locator only at final playback use. Removable media and OS-opened external files still
-retain their current at-use locators outside registry adapters. That remaining work stays tracked under
+stream locator only at final playback use. OS-opened files now use ephemeral registry-owned
+adapters, pathless queues, and a retained exact-file capability through playback and artwork
+consumption. Removable media alone still retains its current at-use locator outside a registry
+adapter. That final convergence step stays tracked under
 [P3.1](../task.md#p31-introduce-a-sourcesession-registry).
 
 ## Decision
@@ -270,13 +272,16 @@ resolution boundary is conceptually:
 resolve(MediaKey, MediaUse) -> DirectMedia | ProtectedHttpRequest | LocalFileLease
 ```
 
-`MediaUse` distinguishes stream, artwork, local playback, and receiver load. Resolution snapshots
+`MediaUse` distinguishes stream, artwork, local playback, and receiver load. Production stream
+resolution exposes the closed `ResolvedSourceStream::Http` or `ResolvedSourceStream::File` result
+instead of returning a separable locator and lease. Resolution snapshots
 the exact ready session epoch, asks the source adapter for its current locator, and rechecks the
 epoch before returning. A protected HTTP result carries the current revocable source lease. A
-local/removable/external result carries a file-authority lease or an exact revalidated file
-locator. An epoch change, disconnect, missing track, ambiguous reconciliation, unavailable mount,
-or unsafe file returns a typed unavailable failure; it never falls back to a stale URI or a track
-from another source.
+local or external result carries the retained exact-file capability with its current authority
+lease; removable media will use the same typed file branch after its adapter lands. An epoch
+change, disconnect, missing track, ambiguous reconciliation, unavailable mount, or unsafe file
+returns a typed unavailable failure; it never falls back to a stale URI or a track from another
+source.
 
 Outputs continue to mint receiver-scoped tickets at their own trust boundary. A ticket binds the
 resolved session/file lease and is retired on the existing replacement, Stop, end, failure,
@@ -409,13 +414,35 @@ path-based fallbacks—remain explicit rather than being disguised as hardware i
 
 #### Files opened by the operating system
 
-For an OS delivery containing one or more paths, Tributary tries candidates in order; the first
-playable candidate creates an ephemeral one-file source with random `SourceId` and `TrackId`, and
-the remaining candidates are not queued. The adapter validates/parses that file and retains the
-authority needed to resolve it; the playback queue remains one item. Stop, replacement, end of
-stream, failure, or shutdown retires the source and its file lease. An external file is not
-silently merged with the local library even when its path currently matches a scanned row. A
-future multi-file queue can extend the same ephemeral-source rule explicitly.
+For an OS delivery containing one or more paths, one blocking worker opens and parses candidates
+sequentially in delivery order. Invalid or unsupported candidates are skipped and processing stops
+after the first playable file; the remaining candidates are not queued. Before minting identity or
+publishing an adapter, the worker must still own the delivery's exact admission generation under
+the same gate that serializes publication with shutdown. A newer OS delivery, any explicit
+Play/Pause/Next/Previous/scrub action, Stop, a real output change, or shutdown advances that
+generation, so superseded parsing cannot become visible. Same-output reselection is deliberately
+inert. Logs report only a count and fixed outcome; an OS-delivered path or derived direct URI never
+enters diagnostics.
+
+Only after the exact already-open file parses successfully does Tributary mint random `SourceId`
+and `TrackId` values and atomically adopt an ephemeral hidden adapter. That adapter owns the
+original open regular-file handle and a revocable `MediaLease`; `try_clone_file` checks the lease
+both before and after cloning the handle. The one-item queue carries only those random IDs and the
+exact session epoch—no path or URI—and generic resolution returns the typed
+`ResolvedSourceStream::File` capability. HTTP-backed sources continue through the sibling
+`ResolvedSourceStream::Http` branch. Embedded-art parsing receives a clone of the retained file
+only after the selected output has accepted the load, preventing rejected or stale work from
+gaining an artwork read.
+
+The hidden adapter is retired explicitly and idempotently on replacement by another external or
+ordinary queue, Stop, unrepeated end-of-stream, playback or load failure, real output change, and
+shutdown. A stale worker that loses admission after adoption retires its own exact session before
+discarding it. Registry shutdown closes admission under the same publication gate, so it cannot
+leave a late hidden source behind. A lifecycle baseline clears hidden entries only when they own a
+real published UI projection or pending sidebar state; adopting an intentionally hidden external
+source therefore does not invalidate its own playback. An external file is not silently merged
+with the local library even when its path currently matches a scanned row. A future multi-file
+queue can extend the same ephemeral-source rule explicitly.
 
 ## What is already implemented
 
@@ -483,13 +510,20 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
 - Removable sources derive `SourceId` from the best-available logical key and exact `TrackId` from
   the losslessly encoded mount-relative native path. Relocation/removal still retires scans, cache,
   and playback. Radio queues share the built-in Radio-Browser source and reject empty/oversized
-  station UUIDs instead of falling back to a stream URL. Each OS-opened file queue receives fresh,
-  independent random source and track identities.
+  station UUIDs instead of falling back to a stream URL.
+- Each accepted OS-opened file owns a hidden registry adapter with fresh independent random source
+  and track identities plus the exact adopted epoch. Ordered first-playable admission runs on a
+  blocking worker and rechecks its exact generation under the shutdown/publication gate before
+  identity is minted or the retained already-open file is adopted. Its one-item queue is pathless;
+  stream resolution returns only a lease-checked file capability, embedded art clones that
+  capability after output acceptance, and every terminal or superseding boundary retires the
+  ephemeral adapter idempotently. Count-only OS-open diagnostics expose no path.
 
 The initially unwired `SourceLifecycleRegistry` now backs the shipping `SourceRegistry`. For
-Subsonic, Jellyfin, Plex, DAAP, and the built-in Radio-Browser source, each entry atomically owns the
-adopted adapter, production `MediaLease`, session epoch, operation generations, immutable accepted
-snapshots, keyed provenance, and sanitized failure state. Non-cloneable operation authority carries exact global generations
+Subsonic, Jellyfin, Plex, DAAP, the built-in Radio-Browser source, and ephemeral external-file
+sessions, each entry atomically owns the adopted adapter, production `MediaLease`, session epoch,
+operation generations, immutable accepted snapshots where applicable, keyed provenance, and
+sanitized failure state. Non-cloneable operation authority carries exact global generations
 and wakeable cancel-before-wait observation. Only atomically admitted tasks and adapter retirements
 participate in the persistent shutdown barrier; an unspawned owner is inert, cannot hold shutdown
 open, and cannot start work after the gate closes. The registry routes cancellation through the
@@ -530,7 +564,9 @@ GTK helpers clone `RefCell`-backed active keys and release all navigation borrow
 `GtkSingleSelection`, whose signals may synchronously re-enter those cells. Generation-correlated
 failure or cancellation clears only its exact pending intent, including a result observed only
 through a resnapshot. Hidden or absent lifecycle state authoritatively clears pending state, cache,
-playback, navigation, sidebar row, and empty category header. Lifecycle-owned pruning waits for the
+playback, navigation, sidebar row, and empty category header only for sources that actually own one
+of those published UI projections. Intentionally hidden external-file adapters therefore remain
+playback-owned rather than being erased by the next baseline. Lifecycle-owned pruning waits for the
 current retirement to finish without issuing another mutating disconnect.
 
 Saved, Environment, and Discovery publishers own independent opaque keyed claims. Duplicate
@@ -548,17 +584,23 @@ shutdown, and actual-wire DAAP regressions cover protected login cancellation, s
 malformed post-login catalogue responses, exact logout, invalid Jellyfin token containment,
 stale-epoch stream/artwork rejection, accepted-catalogue reactivation, `RefCell` signal re-entry,
 failure correlation, route-withdrawal demotion/visibility, composite disconnect settlement, and
-retirement/pruning races. The focused lifecycle module passes all 53 tests.
+retirement/pruning races. External-file regressions additionally cover ordered first-playable
+admission, exact admission and shutdown races, pathless identity and epoch checks, retained-handle
+behavior after path replacement, lease revocation, hidden-baseline ownership, and exactly-once
+retirement. Independent review covers the complete intent/terminal wiring and post-accept artwork
+handoff. The focused lifecycle module passes all 53 tests.
 
-The authenticated-remote and Radio-Browser cutovers still do not complete the full decision.
-Removable and external queue entries have location-independent identity but retain their current
-locator until their registry adapters and at-use resolvers are implemented. Local and playlist GTK
-rows may retain paths for non-playback UI operations, but those paths no longer cross the embedded-
-art boundary. After the exact local ID has resolved, its configuration and generation are still
-current, and the selected output accepts the load, playback gives the art worker a clone of the
-same `ResolvedLocalMedia` authority. The worker revalidates the root marker, ancestor chain, and
-exact file while cloning the handle and owns that capability through parsing, so replacement at
-the pathname cannot retarget the read and authority drift fails closed.
+The authenticated-remote, Radio-Browser, and external-file cutovers still leave the removable-media
+adapter before the full decision is complete. Removable queue entries have location-independent
+identity but retain their current locator until that registry adapter and at-use resolver are
+implemented. Local and playlist GTK rows may retain paths for non-playback UI operations, but those
+paths no longer cross the embedded-art boundary. After the exact local ID has resolved, its
+configuration and generation are still current, and the selected output accepts the load, playback
+gives the art worker a clone of the same `ResolvedLocalMedia` authority. The worker revalidates the
+root marker, ancestor chain, and exact file while cloning the handle and owns that capability
+through parsing, so replacement at the pathname cannot retarget the read and authority drift fails
+closed. External-file playback and artwork similarly retain and clone the already-open
+lease-protected capability rather than reopening a pathname.
 
 The retained reader rewinds before every attempt and when it finishes because cloned operating-
 system handles can share a cursor. Lofty receives only the safe extension hint, uses a content
@@ -566,8 +608,8 @@ probe only for an unknown suffix, and skips unrelated property reads. Its explic
 raw `covr` fallback operate on the same handle; the raw fallback caps the complete file image at
 256 MiB, caps returned artwork at 32 MiB, and checks every atom offset, size conversion, and
 addition. The ordinary Lofty path applies the same 32 MiB artwork cap. A separate art generation
-check rejects a result superseded while parsing. Only the direct URI helper used by removable and
-OS-opened external files remains transitional; those two adapters remain explicit P3.1 work.
+check rejects a result superseded while parsing. Only the direct URI helper used by removable media
+remains transitional; that adapter is the final explicit P3.1 implementation step.
 
 ## Deliberately deferred implementation details
 
@@ -586,28 +628,33 @@ implementation details so long as one registry ultimately enforces this contract
    Plex, and DAAP adapter/resolver contracts now live behind `SourceRegistry` entries.
 3. **Identity complete, locator removal partial:** queues carry `MediaKey` and optional
    `ViewOrigin`; authenticated remotes carry a non-secret session epoch and resolve pathlessly at
-   use. Radio is also pathless; removable/external locators remain until their adapters land.
-4. **Playback resolution complete, adapter convergence open:** local/playlist playback queries the
+   use. Radio and external files are also pathless; the removable locator remains until its adapter
+   lands.
+4. **Playback resolution complete, final adapter convergence open:** local/playlist playback queries the
    exact ID at use, acquires the current authoritative root and exact file, and retains both
    through output consumption. The random invalid-local-ID fallback is gone. Radio resolves its
-   validated public locator from the exact current accepted view; removable and external locators
-   remain on direct helpers until their adapters land.
-5. **Radio-Browser lifecycle complete; filesystem-source lifecycle open:** Radio-Browser is one
+   validated public locator from the exact current accepted view; external files resolve a retained
+   already-open capability, while the removable locator remains on its direct helper.
+5. **Radio-Browser and external-file lifecycle complete; removable lifecycle open:** Radio-Browser is one
    stateless registered source with three exact view lanes, private locator contributions, and
-   final-consumption authority. Removable media and external files have their specified
-   source/track identity, but their locator and retirement ownership still needs registry adapters.
-6. **Authenticated-remote and radio production cutovers complete; filesystem wiring open:** the lifecycle
+   final-consumption authority. Each external file is one ephemeral hidden registered source with
+   generation-owned admission, retained file authority, pathless identity, and explicit retirement.
+   Removable media has its specified source/track identity, but its locator and retirement ownership
+   still need a registry adapter.
+6. **Authenticated-remote, radio, and external production cutovers complete; removable wiring open:** the lifecycle
    registry owns the state machine, generation, epoch, provenance, close task, persistent shutdown
    barrier, and coherent baseline/watch contracts under deterministic race coverage. Subsonic,
    Jellyfin, Plex, and DAAP connection/catalogue cancellation, sanitized failure state, media
    resolution, disconnect, and shutdown use that production path; the URL-keyed standard owner and
    sibling DAAP registry are removed. Radio-Browser uses the same owner for cancellable view
-   refresh, closed failure state, exact-epoch publication, and public at-use resolution. Move
-   removable and external-file authority into their specified adapters to complete P3.1.
+   refresh, closed failure state, exact-epoch publication, and public at-use resolution. External
+   OS-open admission and playback now use the same registry ownership. Move removable authority
+   into its specified adapter to complete P3.1.
 7. **Local embedded-art authority complete:** local and playlist playback clone the accepted
    `ResolvedLocalMedia` into a generation-checked art worker. It revalidates and retains the exact
-   file capability through bounded, cursor-safe parsing without reopening a pathname. Removable
-   and external direct-file art move with their source adapters in the remaining steps.
+   file capability through bounded, cursor-safe parsing without reopening a pathname. External art
+   now follows the same post-accept retained-capability rule; removable direct-file art moves with
+   its source adapter in the remaining step.
 
 The authenticated-remote cutover's locked debug and release suites each passed 20 library, 865
 application, and 10 repository-metadata tests (895 total), with locked all-target/all-feature
@@ -627,6 +674,14 @@ last-registry-drop, partial Near Me tiers, deduplication/distance ordering, path
 pre-publication source loss, exact failure ownership, the generation-owned consent prerequisite,
 and complete restoration of Local presentation after automatic fallback.
 
+The external-file adapter cutover passes the locked all-target/all-feature check, strict Clippy in
+debug and release, formatting, and whitespace checks. Complete locked debug and release suites each
+pass 938 tests. An independent integrated review is clean after its findings were resolved. Focused
+coverage proves ordered first-playable admission, exact-generation supersession,
+shutdown/adoption serialization, random pathless identity, epoch isolation, retained-handle
+path-replacement resistance, lease checks, hidden-baseline behavior, and explicit idempotent
+retirement; integrated review covers the same-output and post-accept artwork wiring.
+
 Each step must keep existing credential-isolation, exact-origin, root-authority, receiver-ticket,
 and generation-supersession tests green. Compatibility code is removed in the same milestone; two
 independent lifecycle systems must not become the permanent architecture.
@@ -639,8 +694,9 @@ independent lifecycle systems must not become the permanent architecture.
   while adapters retain protocol-specific behavior such as DAAP logout and local root authority.
 - Local/playlist queues, receivers, and embedded-art parsing cannot retain or reopen a dead library
   path, and path replacement cannot retarget a retained read. Authenticated-remote and radio queues
-  likewise retain identity and epoch rather than a credential-bearing or public locator. Removable
-  and external queues still retain direct locators that may become stale; their pending adapters
+  likewise retain identity and epoch rather than a credential-bearing or public locator. External
+  queues now retain only random identity, epoch, and a registry-owned open-file capability.
+  Removable queues alone still retain direct locators that may become stale; their pending adapter
   must close that remaining boundary.
 - The registry becomes an application service with more explicit state and migration code. Source
   adapters and UI event consumers require a staged internal API change.
@@ -671,5 +727,5 @@ only when the tracker’s remaining boxes are backed by tests proving stable sou
 native-ID namespace isolation, exact-generation publication, connect/refresh cancellation,
 failure retention, DAAP replacement/disconnect/shutdown, local and playlist ID-at-use resolution,
 retained local/playlist embedded-art parsing, radio refresh, removable relocation/unplug, and
-external-file retirement. The embedded-art criterion is implemented; the final three adapter
-families keep the compound implementation record open.
+external-file retirement. Every criterion except the removable-media adapter is implemented; that
+final adapter family keeps the compound implementation record open.

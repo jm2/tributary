@@ -52,8 +52,9 @@ executions in PR #111.
 PR #123's P3.1 production cutover closes the centralized refresh/cancellation/disconnect/failure
 box while deliberately leaving the final implementation-record box unchecked, so the literal
 arithmetic is now **219/223 (98.2%)** and P3 is **29/30**. `SourceRegistry` is the sole
-lifecycle owner for Subsonic, Jellyfin, Plex, DAAP, and the built-in Radio-Browser source. GTK catalogue rows and
-playback queues carry only `SourceId`, exact `TrackId`, and the non-secret publishing session epoch;
+lifecycle owner for Subsonic, Jellyfin, Plex, DAAP, the built-in Radio-Browser source, and admitted
+hidden external-file sessions. GTK catalogue rows and playback queues carry only `SourceId`, exact
+`TrackId`, and the non-secret publishing session epoch;
 they no longer carry an authenticated resolver URL or lease key. One baseline/watch reducer now
 projects connection, catalogue, sanitized failure, provenance, visibility, cancellation, and
 retirement state into GTK. Exact accepted catalogues clear their pending guard before rebind and
@@ -83,25 +84,26 @@ PR #124 named every PE-inspector argument and passed its native x86_64 and ARM64
 but the 2026-07-18 affected-host rerun still rejected the singleton Soup target after dependency
 discovery, release compilation, plugin synchronization, scanner replacement, and distribution-path
 resolution. That exact result disproves the positional array-binding hypothesis; explicit names
-were not a complete repair. The current candidate removes the non-terminal `[string[]]` function
-boundary entirely. Callers now construct explicit `List[string]` instances for the Soup singleton,
+were not a complete repair. Merged PR #127 removes the non-terminal `[string[]]` function boundary
+entirely. Callers now construct explicit `List[string]` instances for the Soup singleton,
 each closure round, and every bounded process batch. Before `llvm-readobj` receives a target, the
 validator distinguishes null/empty values, quotes or control characters, non-rooted paths,
 `GetFullPath` failures, non-DLL/EXE extensions, and missing files. Its bounded single-line
 diagnostic retains at most 192 sanitized target characters plus a fixed truncation marker. The
 nonexecuting inspector, exact architecture, batch/argument/output/time/process-tree limits, and
 fail-closed closure policy are unchanged.
-PowerShell 7 can exercise the new behavior regression away from Windows, but only the exact Windows
-PowerShell 5.1/MSYS2 rerun can confirm the host-specific failure is repaired. PowerShell's AST
-parser reports zero errors; formatting, diff, locked check, and strict debug/release Clippy pass;
-the current 14 `windows_*` and three `powershell_*` tests pass; and complete locked debug/release
-suites each pass 20 library, 896 application, and 10 repository-metadata tests (**926 total**) with
-zero failures or ignored tests. Native Windows package CI/Desktop PowerShell 5.1 execution and the
-exact affected-host rerun remain pending, so this is a repair candidate and changes no checkbox:
-the totals remain **219/223 (98.2%)**, **76/79 P2**, and **29/30 P3**.
+PowerShell 7 exercises the behavior regression away from Windows, while native run `29648906031`
+passed the x86_64 and ARM64 package/probe jobs and the x86_64 job's required Desktop PowerShell 5.1
+behavior regression. PowerShell's AST parser reports zero errors; formatting, diff, locked check,
+and strict debug/release Clippy pass; all 14 `windows_*` and three `powershell_*` tests pass; and
+complete locked debug/release suites each pass 20 library, 896 application, and 10
+repository-metadata tests (**926 total**) with zero failures or ignored tests. Only rerunning the
+exact affected Windows PowerShell/MSYS2 command can confirm the host-specific failure is repaired.
+That field proof remains pending, so PR #127 changes no checkbox: the totals remain **219/223
+(98.2%)**, **76/79 P2**, and **29/30 P3**.
 Comprehensive lifecycle, playback-boundary, reducer, provenance, Jellyfin, and actual-wire DAAP
-regressions cover the authenticated cutover. Removable and OS-opened external media still need
-registry-owned at-use locator adapters; those keep the final P3.1 implementation record open.
+regressions cover the authenticated cutover. Only removable media still needs its registry-owned
+at-use locator adapter; that keeps the final P3.1 implementation record open.
 PR #125 closed the separate local/playlist embedded-art authority boundary.
 Artwork begins only after exact-ID resolution is still current for the configured roots and the
 selected output accepts the load, then owns a cloned `ResolvedLocalMedia` through its background
@@ -131,9 +133,27 @@ source loss, while a stale/superseded dialog cannot suppress ordinary fallback. 
 construction failure or later source loss returns a selected radio lane to Local and restores the
 user's music-column and browser-visibility preferences. Its adapter tolerates partial successful
 tiers, deduplicates by tier precedence, computes each retained distance once before one stable
-global sort, and retains no locator in rows or queues. This is
-another part of the still-open compound record, so the literal totals remain **219/223 (98.2%)**,
-**76/79 P2**, and **29/30 P3** until the removable and external-file adapters also land.
+global sort, and retains no locator in rows or queues.
+The current external-file follow-up replaces OS-open direct-URI playback with one hidden,
+registry-owned ephemeral source per admitted file. Each OS delivery is drained in order on a
+blocking worker, skips invalid candidates, and publishes only its first playable exact open handle;
+source and track IDs are minted only after exact-handle tag parsing succeeds and its results pass
+bounded metadata validation. The resulting `Track` and queue item are pathless and bind the exact
+source session epoch. Playback receives an inseparable
+lease-bearing file capability from `SourceRegistry`, rechecks the lease before and after every
+handle clone, and starts embedded-art parsing only after the selected output accepts that retained
+file. A pre-source admission generation rejects stale work after a newer OS delivery, any explicit
+playback intent (including scrubber seeks), Stop, a real output change, or shutdown. Queue
+replacement, unrepeated EOS, playback/load error, output transfer, and shutdown explicitly retire
+the ephemeral source; exact output reselection remains inert. Independent review tightened the
+admission gate predicate, made playback intent and scrubber invalidation explicit, limited baseline
+clears to hidden sources with an actual UI projection, serialized external publication against
+shutdown, and kept raw adapter results inseparable from their lifecycle lease. Formatting/diff,
+locked check, strict debug/release Clippy, and serial complete debug/release suites are green; each
+profile passes 20 library, 908 application, and 10 repository-metadata tests (**938 total**).
+This closes the external-file portion of the compound record without changing literal arithmetic:
+**219/223 (98.2%)** overall, **76/79 P2**, and **29/30 P3**. Only the removable-media adapter
+remains before P3.1's final implementation record can close.
 P3.3 is complete after combining the independently reviewed non-DAAP service fixture from
 `b80e534`, the DAAP adversarial fixture from `6f6c9ac`, and this representative cross-service
 behavior matrix. The matrix exercises rejected authentication, credential-safe authenticated and
@@ -313,8 +333,11 @@ embedded-art authority kept P3.1's final implementation record open. The current
 follow-up removes paths from local/playlist embedded-art parsing: only a clone of the exact
 `ResolvedLocalMedia` accepted for output reaches the worker, which revalidates and owns its retained
 file through bounded parsing. The Radio-Browser follow-up adds its stateless source, exact views,
-private public locators, and final-consumption authority. Removable and external at-use adapters are
-now the remaining work in the compound record, so its checklist arithmetic does not yet change.
+private public locators, and final-consumption authority. The external-file follow-up adds hidden
+ephemeral registry sessions, ordered first-playable OS-delivery admission, pathless queue identity,
+retained file authority, admission supersession at explicit playback intents, and exact retirement
+at terminal boundaries. Only the removable at-use adapter now remains in the compound record, so
+its checklist arithmetic does not yet change.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1688,14 +1711,16 @@ closed as a milestone.
   ancestor, and exact-file authority at clone, retains that handle throughout parsing, rewinds the
   shared cursor, and rejects stale generations. Lofty's bounded handle reader and the same-handle
   raw MP4 fallback cap returned art at 32 MiB; the raw fallback additionally caps the complete file
-  at 256 MiB and uses checked atom arithmetic. The direct URI art helper remains only for removable
-  and OS-opened external files until their at-use adapters land.
+  at 256 MiB and uses checked atom arithmetic. The direct URI art helper now remains only for
+  removable files until their at-use adapter lands; OS-opened external files use the retained
+  file-capability path for both playback and embedded art.
 - [x] Centralize source refresh, cancellation, disconnect, and failure state. The production
   `SourceRegistry` is now the sole adapter/session authority for Subsonic, Jellyfin, Plex, DAAP,
-  and Radio-Browser across environment startup, interactive authentication, manual Add, discovery,
-  catalogue publication, at-use stream/artwork resolution, disconnect, route loss, deletion, and
-  application shutdown. Each entry atomically owns its adapter, media lease, non-secret session
-  epoch, exact connect/catalogue/view generations, sanitized failure, immutable snapshot, keyed
+  Radio-Browser, and admitted OS-opened external files across environment startup, interactive
+  authentication, manual Add, discovery, catalogue publication, at-use stream/artwork resolution,
+  disconnect, route loss, deletion, and application shutdown. Each entry atomically owns its
+  adapter, media lease, non-secret session epoch, exact connect/catalogue/view generations,
+  sanitized failure, immutable snapshot, keyed
   provenance, and tracked retirement. The old standard/DAAP sibling registries and URL/lease-key
   UI ownership are gone.
 
@@ -1736,6 +1761,16 @@ closed as a milestone.
   pending request from retaining the registry or surviving view/source replacement. A failed
   refresh preserves its predecessor while a successful empty feed replaces it authoritatively.
 
+  Each accepted OS-open file is a hidden, ephemeral one-track source with a registry-owned
+  provenance claim, exact session epoch, random source/track identity, and retained open file.
+  Exact-handle tag parsing and bounded metadata validation happen before identity is minted; failed
+  candidates publish no source. The registry returns only a typed lease-bearing file stream and
+  rechecks the exact media lease around handle cloning, so callers never receive separable raw
+  adapter data and lease parts. External publication and shutdown share one admission gate: shutdown
+  closes the gate before draining claims, while a candidate that loses the gate rolls back instead
+  of inserting a dead session. Explicit retirement is idempotent and revokes pending resolution,
+  retained playback/artwork authority, and the hidden source exactly once.
+
   One atomic lifecycle baseline plus a monotonic invalidation watch now drives a GTK reducer; the
   UI no longer infers lifecycle authority from row spinners, URLs, or channel closure. Exact
   generation-correlated cancellation and closed failure categories clear only their owning intent,
@@ -1758,17 +1793,23 @@ closed as a milestone.
   cancellation, supersession, malformed post-login catalogue responses, exact logout, invalid
   minted-token containment, durable credential non-revocation, stale-epoch stream/artwork rejection,
   failure correlation, accepted-catalogue activation, demotion/visibility, and retirement races.
-  The focused lifecycle module passes all 53 tests. Locked debug and release suites each pass 20
-  library, 865 application, and 10 repository-metadata tests (**895 total**), with locked
-  all-target/all-feature check, strict warning-free Clippy, formatting, and diff checks green.
+  External-file regressions additionally cover ordered first-playable delivery, invalid/stale
+  admission, exact identity/epoch/track matching, path replacement after handle admission,
+  lease revocation, publication-versus-shutdown races, terminal retirement, hidden-source reducer
+  ownership, and same-output reselection. The current complete debug and release suites each pass
+  20 library, 908 application, and 10 repository-metadata tests (**938 total**), with locked
+  all-target/all-feature check, strict warning-free Clippy in both profiles, formatting, and diff
+  checks green.
 - [x] Decide how local, radio, and external-file sources fit the same lifecycle. Local is one
   always-registered source, playlists are local views, Radio-Browser is one stateless source whose
   feeds are views, removable filesystems are generation-owned sources keyed by their existing
   logical GIO identity, and the first playable file in each OS-open delivery is an ephemeral
   one-item source. The local/playlist embedded-art authority boundary is now implemented;
-  Radio-Browser now uses its specified registry/view adapter and at-use resolver. Removable and
-  external-file adapters remain on the current direct paths. Recorded
-  in the [source-lifecycle decision](architecture/source-lifecycle.md), accepted in PR #113.
+  Radio-Browser now uses its specified registry/view adapter and at-use resolver. OS-opened files
+  now use their specified pathless registry adapter, retained file capability, and explicit
+  retirement boundaries. Only the removable-file adapter remains on its transitional direct path.
+  Recorded in the [source-lifecycle decision](architecture/source-lifecycle.md), accepted in PR
+  #113.
 - [x] Record architecture decision: [Source identity and lifecycle ownership](architecture/source-lifecycle.md).
   The document distinguishes accepted decisions, existing foundations, remaining implementation,
   migration, and completion tests. Accepted in PR #113 after the full native/package matrix passed.
@@ -1780,10 +1821,12 @@ closed as a milestone.
   the central state/owner/task/provenance/shutdown API and race contracts; the following production
   cutover makes that authority the sole owner for Subsonic, Jellyfin, Plex, and DAAP and moves GTK
   to pathless epoch-bound catalogue/queue state. PR #125 moves local/playlist embedded-art parsing
-  onto cloned, revalidated `ResolvedLocalMedia` authority after output acceptance. The current
-  follow-up adds Radio-Browser's registry/view resolver; retained removable
-  and ephemeral external-file at-use adapters must still land before P3.1 itself can be recorded
-  complete.
+  onto cloned, revalidated `ResolvedLocalMedia` authority after output acceptance. PR #126 adds
+  Radio-Browser's registry/view resolver. The current external-file follow-up adds ordered
+  first-playable OS-delivery admission, hidden ephemeral registry sessions, exact pathless
+  source/track/epoch queue ownership, retained file streams for playback/art, and explicit
+  intent/terminal/output/shutdown retirement. The retained removable-media at-use adapter must still
+  land before P3.1 itself can be recorded complete.
 
 ### P3.2 Make the backend abstraction real and stable
 
@@ -2064,7 +2107,32 @@ PR #94's containerized Flatpak build proved the manifest-local source generation
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
 
-Current branch validation (2026-07-18, P3.1 Radio-Browser registry/view adapter):
+Current branch validation (2026-07-18, P3.1 external-file at-use adapter):
+`cargo fmt --all -- --check`, `git diff --check`, and
+`cargo check --locked --all-targets --all-features` pass. Strict warning-free
+`cargo clippy --locked --all-targets --all-features -- -D warnings` and its
+`--release` counterpart pass. Serial complete locked debug and release suites each pass 20 library,
+908 application, and 10 repository-metadata tests (**938 total**) with zero failures or ignored
+tests. Focused coverage proves ordered first-playable OS delivery, invalid candidate skipping,
+exact pre-source generation rejection, pathless random source/track identity plus exact epoch,
+already-open-handle retention across path replacement, pre/post-clone lease checks, stale and
+retired resolution rejection, embedded art after output acceptance, idempotent retirement, and
+publication-versus-shutdown rollback.
+
+Integrated review found and fixed five boundary defects before final validation. The admission
+generation is now tested as the exact predicate while the registry publication/shutdown gate is
+held, so source identity cannot be minted for a delivery superseded during parsing. All explicit
+playback intents—including the progress scrubber—now invalidate an in-flight OS delivery. The
+baseline reducer clears hidden lifecycle entries only when an ordinary UI projection was actually
+published or is still UI-owned, preventing hidden external adoption from invalidating itself.
+External publication and shutdown now serialize through one gate, preventing a stale ownership-map
+insertion after lifecycle shutdown. Finally, lifecycle resolution attaches the lease internally and
+returns one typed file capability, so registry callers cannot separate raw adapter output from the
+authority that revokes it. This closes only the external-file portion of P3.1's compound final
+record: literal progress remains **219/223 (98.2%)** overall, **76/79 P2**, and **29/30 P3**. Only
+the removable-file at-use adapter remains.
+
+PR #126 validation (2026-07-18, P3.1 Radio-Browser registry/view adapter):
 `cargo check --locked --all-targets --all-features`, strict all-target/all-feature Clippy in debug
 and release, `cargo fmt --all -- --check`, and `git diff --check` pass. Locked complete debug and
 release suites each pass 20 library, 895 application, and 10 repository-metadata tests (**925
@@ -2100,17 +2168,18 @@ embedded-art portion of P3.1's compound final record, so the tracker remains **2
 overall, **76/79 P2**, and **29/30 P3** while Radio-Browser, removable, and external-file adapters
 remain.
 
-Current branch validation (2026-07-18, P2.11 Windows typed PE-target repair candidate):
+Accepted validation (2026-07-18, PR #127 P2.11 Windows typed PE-target repair):
 PowerShell 7's AST parser reports `parser_errors=0`; `cargo fmt --all -- --check`,
 `git diff --check`, locked all-target/all-feature check, and strict debug/release Clippy pass. The
-current focused filters pass 14 `windows_*` and three `powershell_*` platform-runtime tests. The
+focused filters pass 14 `windows_*` and three `powershell_*` platform-runtime tests. The
 new target-batch behavior regression executes through `pwsh` on non-Windows development hosts and
-is designed to require Desktop PowerShell 5.1 on native Windows. Complete locked debug and release
-suites each pass 20 library, 896 application, and 10 repository-metadata tests (**926 total**) with
-zero failures or ignored tests. Native package CI/Desktop PowerShell 5.1 execution and the exact
-affected Windows PowerShell/MSYS2 rerun remain pending. Consequently this evidence does not yet
-claim the reported host failure is fixed, and the tracker remains **219/223 (98.2%)** overall,
-**76/79 P2**, and **29/30 P3**.
+requires Desktop PowerShell 5.1 on native Windows. Complete locked debug and release suites each
+pass 20 library, 896 application, and 10 repository-metadata tests (**926 total**) with zero
+failures or ignored tests. CI run `29648906031` passed both native x86_64 and ARM64 Windows package
+and probe jobs; the x86_64 job also executed the behavior regression under Desktop PowerShell 5.1.
+That cross-host evidence does not substitute for the exact affected Windows PowerShell/MSYS2 rerun,
+which remains pending. Consequently the tracker remains **219/223 (98.2%)** overall, **76/79 P2**,
+and **29/30 P3**.
 
 Accepted validation (2026-07-18, PR #124 P2.11 Windows PE-import named-binding follow-up):
 `cargo check --locked --all-targets --all-features`, strict all-target/all-feature Clippy in debug
@@ -2577,6 +2646,33 @@ failed following a successful install; the separate Cargo cache remains enabled.
 
 Record scope or design decisions here so deferred work is explicit.
 
+- 2026-07-18 — P3.1 treats each OS `open` delivery as one ordered playback intent, not as a set of
+  paths that may outlive user actions. Enqueue mints one generation before publishing the batch; a
+  blocking worker tests candidates sequentially, skips invalid/unplayable entries, and may admit
+  only the first playable already-open regular-file handle while that exact generation still owns
+  the gate. Handle-based tag parsing and bounded metadata validation precede random source/track
+  identity, so rejection leaves no lifecycle row. The publication predicate runs beneath the same
+  short-held gate as shutdown: shutdown closes admission and drains claims atomically relative to
+  publication, and a stale candidate cannot install a session between lifecycle retirement and the
+  external ownership map. The accepted source is hidden because it has no sidebar or ordinary GTK
+  catalogue projection; reducer baselines therefore clear a hidden source only when the UI actually
+  published or still owns a projection, and playback—not visibility observation—owns external
+  retirement.
+
+  The pathless queue binds the exact random source ID, track ID, and session epoch. Lifecycle
+  resolution attaches `MediaLease` inside the adapter boundary and returns one inseparable retained
+  file capability; no registry caller can hold raw adapter output separately from its lease. Each
+  handle clone rechecks revocation before and after cloning, and embedded art starts only after the
+  output accepts the same retained capability. A newer OS delivery, visible track selection, Play,
+  Pause/toggle, Next, Previous, explicit retry, progress-scrubber seek, Stop, real output transfer,
+  or shutdown invalidates in-flight admission. Automatic EOS replay/advance deliberately does not.
+  Replacing an external queue, unrepeated EOS, output/load error, real output change, and shutdown
+  retire the exact hidden source idempotently; selecting the already-active output remains a
+  complete no-op. Independent review added the exact gate predicate,
+  explicit playback-intent/scrubber coverage, the hidden UI-owner filter, shutdown/publication race
+  serialization, and the nonseparable lease-bearing resolver boundary before this slice was
+  accepted for PR #TBD.
+
 - 2026-07-17 — P3.3 uses one deterministic keyed HTTP fixture rather than a FIFO script because
   Jellyfin fetches three item classes concurrently and Subsonic performs bounded unordered library
   walks. A route therefore keys method plus exact path plus a required decoded-query subset, while
@@ -2952,8 +3048,8 @@ Record scope or design decisions here so deferred work is explicit.
   The authenticated-remote production cutover subsequently replaces the original standard lease
   URI and sibling DAAP reference with pathless source/track/epoch queue state, one registry, and
   centralized refresh/failure/provenance projection. The retained embedded-art follow-up then
-  removes the final local/playlist path-based consumer. P3.1 still needs at-use Radio-Browser,
-  removable, and external-file locator adapters.
+  removes the final local/playlist path-based consumer. Radio-Browser and external-file at-use
+  adapters subsequently landed; P3.1 now needs only the removable-file locator adapter.
 - 2026-07-15 — A late PR #86 review found that Plex catalogue publication did not distinguish a
   track with no `Media`/`Part.key` from a resolvable track: GTK received a non-empty opaque
   reference that failed only after selection, whereas the old direct-URL path had left that row
@@ -3165,7 +3261,7 @@ Record scope or design decisions here so deferred work is explicit.
   already-required packaged probe and does not substitute for the open live DAAP/Subsonic playback
   evidence.
 - 2026-07-18 — P2.11 treats PR #124's exact-host reproduction as evidence against its positional
-  array-binding hypothesis, not as a reason to weaken PE-target validation. The repair candidate
+  array-binding hypothesis, not as a reason to weaken PE-target validation. Merged PR #127
   removes `[string[]]` from the function boundary and has each caller construct an explicit
   `List[string]` for the singleton Soup check, a closure round, and every bounded process batch.
   Each target is rejected before process launch if it is null/empty, contains a quote or control
@@ -3174,11 +3270,11 @@ Record scope or design decisions here so deferred work is explicit.
   characters plus a fixed truncation marker, so the affected host can identify the exact
   predicate. The selected architecture's nonexecuting `llvm-readobj`, closure inputs, and all
   established batching, argument, output, deadline, and process-tree bounds remain unchanged. A
-  live behavior
-  regression uses `pwsh` on non-Windows hosts and Desktop PowerShell 5.1 on Windows; neither that
-  coverage nor native package CI substitutes for rerunning the exact affected PowerShell/MSYS2
-  command. Checklist arithmetic therefore remains unchanged until the separate live-playback task
-  is actually satisfied.
+  live behavior regression uses `pwsh` on non-Windows hosts and Desktop PowerShell 5.1 on Windows.
+  CI run `29648906031` passed both native Windows package/probe jobs and exercised that regression
+  under Desktop PowerShell 5.1 on x86_64; neither that cross-host coverage nor native package CI
+  substitutes for rerunning the exact affected PowerShell/MSYS2 command. Checklist arithmetic
+  therefore remains unchanged until the separate live-playback task is actually satisfied.
 - 2026-07-15 — P2.11 treats repeated DAAP and Subsonic failures at exactly GStreamer's 15-second
   HTTP-source timeout as a shared protected-playback defect, not a protocol-authentication defect.
   The opaque loopback boundary remains necessary: handing backend requests directly to GStreamer
@@ -3289,4 +3385,5 @@ Add one line per completed task:
 | 2026-07-18 | P2.11 Windows PE-import argument-binding repair (follow-up) | PR #124 | Replaces positional calls to the non-terminal `[string[]] Paths` parameter with explicit names for every singleton and batch inspector argument. The regression checks the declaration and each of the exactly two production calls independently. PowerShell 7 parses the complete script, all 11 focused Windows contracts pass, and locked debug/release suites each pass 20 library, 866 application, and 10 repository-metadata tests (896 total) with locked check and strict Clippy green. CI run `29633729566` passed every job, including production bundle/probe execution on native x86_64 and ARM64 Windows runners. The later exact affected-host rerun nevertheless failed at the same singleton Soup validation, disproving the positional array-binding hypothesis and showing that named arguments were not a complete repair. The separate live DAAP/Subsonic proof remains pending, so checklist arithmetic stays at 219/223 overall and 76/79 P2. |
 | 2026-07-18 | P3.1 retained local/playlist embedded-art authority (partial) | PR #125 | Starts embedded-art work only after exact local resolution remains current and the selected output accepts its retained load, then gives a cloned `ResolvedLocalMedia` rather than a path/URI to the background worker. Clone-time root-marker, ancestor, and exact-file revalidation plus handle ownership through parsing make path replacement non-retargetable and authority drift fail closed. Cursor-safe Lofty parsing uses an extension hint with property reads disabled; its explicit MP4 reread and checked raw `covr` fallback use the same handle, cap the raw file at 256 MiB, and cap returned artwork at 32 MiB. Exact art generations reject delayed results. All 9 focused tests, locked check, strict debug/release Clippy, formatting/diff checks, and complete 902-test debug/release suites pass. The direct URI helper remains transitional only for removable/external files; Radio-Browser and those two adapters keep the compound P3.1 record open at 219/223 overall and 29/30 P3. |
 | 2026-07-18 | P3.1 Radio-Browser registry/view and public at-use authority (partial) | PR #126 | Generalizes `SourceRegistry` and installs one stateless built-in Radio-Browser session whose Top Clicked, Top Voted, and Near Me feeds are exact cancellable views. Accepted snapshots expose pathless tracks while validated public locators, per-view leases, and source-wide generations remain private. Playback resolves the greatest accepted contributing generation and rechecks that exact winner through weak registry authority immediately before direct output load; same-view replacement, a newer overlapping view, removal, disconnect, and last-registry-drop all revoke pending requests. The typed client uses a known HTTPS mirror without synchronous DNS, closed redacted failures, deadlines and body caps, validated coordinates/filters/URLs, and success-empty semantics. Near Me preserves partial successful tiers, deduplicates by tier precedence before stable global distance ordering, and GTK owns only translated consent/navigation. Independent review fixed an unrelated-invalidation race during first-use consent with an exact generation-owned prerequisite marker, then ensured automatic source loss restores Local's configured music-column and browser presentation; automated PR review cached one distance per accepted station instead of repeating Haversine/centroid work in every sort comparison. Locked all-target check, strict debug/release Clippy, formatting/diff checks, 53 lifecycle tests, 14 registry tests, 9 media tests, 37 radio-filtered tests, and complete 925-test debug/release suites pass. Removable and external-file at-use adapters keep the compound record open at 219/223 overall and 29/30 P3. |
-| 2026-07-18 | P2.11 typed Windows PE-target repair candidate | PR #127 | Removes the non-terminal array boundary by assembling explicit `List[string]` values for the Soup singleton, closure rounds, and bounded inspector batches. Per-target validation distinguishes null/empty, quote/control, rooted, normalization, extension, and existence failures. Its bounded single-line diagnostic retains at most 192 sanitized target characters plus a fixed truncation marker. The nonexecuting architecture-local inspector and every existing resource bound remain intact. AST parsing, formatting/diff, locked check, strict debug/release Clippy, 14 `windows_*` tests, three `powershell_*` tests, and complete 926-test debug/release profiles pass. Native package CI/Desktop PowerShell 5.1 execution and the exact affected-host rerun remain pending. This repair candidate leaves progress at 219/223 overall and 76/79 P2. |
+| 2026-07-18 | P2.11 typed Windows PE-target repair | PR #127 | Removes the non-terminal array boundary by assembling explicit `List[string]` values for the Soup singleton, closure rounds, and bounded inspector batches. Per-target validation distinguishes null/empty, quote/control, rooted, normalization, extension, and existence failures. Its bounded single-line diagnostic retains at most 192 sanitized target characters plus a fixed truncation marker. The nonexecuting architecture-local inspector and every existing resource bound remain intact. AST parsing, formatting/diff, locked check, strict debug/release Clippy, 14 `windows_*` tests, three `powershell_*` tests, and complete 926-test debug/release profiles pass. CI run `29648906031` passed native x86_64 and ARM64 packages/probes, including the x86_64 Desktop PowerShell 5.1 behavior regression. The exact affected-host PowerShell/MSYS2 rerun remains pending, so this merged repair leaves progress at 219/223 overall and 76/79 P2. |
+| 2026-07-18 | P3.1 external-file at-use adapter (partial) | PR #TBD | Replaces OS-open direct-URI playback with ordered first-playable admission into hidden, ephemeral registry sources. Exact-handle parsing and bounded metadata validation precede random source/track identity; accepted tracks and queues are pathless and bind the exact session epoch. One inseparable lease-bearing file capability drives output loading and post-acceptance embedded art, with pre/post-clone revocation checks and no path/URI diagnostics. Newer OS deliveries, explicit playback intents including scrubber seek, Stop, real output transfer, and shutdown reject stale admission; queue replacement, unrepeated EOS, player/load error, output transfer, and shutdown retire the exact source idempotently while same-output reselection is inert. Automatic EOS replay/advance deliberately does not invalidate in-flight admission. Independent review tightened the admission-gate predicate, hidden UI-owner filter, shutdown/publication serialization, and nonseparable resolver lease boundary. Formatting/diff, locked check, strict debug/release Clippy, and serial complete 938-test debug/release suites pass. Only the removable adapter keeps P3.1's final record open, so progress remains 219/223 overall and 29/30 P3. |
