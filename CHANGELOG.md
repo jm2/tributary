@@ -226,7 +226,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   available, identity-confirmed state, and reject missing, empty, dead, timed-out, stale, or
   displaced authority without metadata, fingerprint, saved-path, or alternate-track fallback.
   Resolution retains the exact root, marker, ancestor chain, and regular-file handle under a
-  five-second outer budget and rechecks both database bindings before publication; the GTK
+  five-second outer budget and rechecks the exact track path plus the root key, marker identity,
+  confirmation, availability, and complete-scan authority state before publication. The
+  observational `last_checked_at` scan timestamp is deliberately excluded from that authority
+  snapshot, so a concurrent successful scan cannot reject playback merely by refreshing metadata;
+  any authority-relevant drift still fails closed. The GTK
   handoff rechecks that the retained root is still the most-specific configured match without
   touching the filesystem, and the bounded ticket worker revalidates physical authority before
   every retained-handle clone. Local and AirPlay GStreamer, Chromecast, and MPD receive a typed
@@ -240,11 +244,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while preserving the documented server-lifetime contract of legacy explicit-file routes. GTK
   rows may still retain current paths for non-playback display and file management, and embedded-art
   display still gives its helper the exact playback-time path rather than retained authority.
-  Fifty-five focused exact-ID, root-authority, queue/view-ownership,
+  Fifty-six focused exact-ID, root-authority, queue/view-ownership,
   handle-streaming, GStreamer-ticket, and MPD-ticket regressions pass with the locked all-target
   compile, formatting/diff gates, and strict warning-free Clippy in both profiles. The complete
-  debug and release suites each pass 20 library, 803 application, and 10 repository-metadata tests
-  (833 total), including every socket-bearing regression.
+  debug and release suites each pass 20 library, 804 application, and 10 repository-metadata tests
+  (834 total), including every socket-bearing regression. Gemini's review follow-up is covered by
+  a deterministic regression that accepts timestamp-only drift while independently rejecting
+  changes to every retained root-authority field.
 - **Subsonic failed envelopes no longer retain a server-controlled error message** — HTTP-200 API failures keep only the numeric Subsonic code in a fixed typed error; code 40 remains authentication rejection and code 41 remains the HTTPS-only legacy-auth negotiation signal. A malicious or broken peer can no longer echo a submitted password or arbitrary text into retained errors, logs, or UI-facing classification.
 - **Radio-Browser and geolocation no longer trust successful-looking JSON on an HTTP error** — Station and all three IP-geolocation provider paths now require a success status before their bounded response reader or deserializer can publish data. A `503` carrying a syntactically valid station or location is rejected, the geolocation cascade advances to its next provider, and late or oversized bodies remain bounded. Public same-origin/cross-origin redirects retain the existing no-`Referer`, no-HTTPS-downgrade policy.
 - **Jellyfin and Plex now preserve reverse-proxy base paths for every API and media request** — Both clients remove only one trailing empty base segment before appending API paths, so root, `/share`, `/share/`, and already-escaped prefixes do not gain a doubled slash or lose their prefix. Plex stream-part and thumbnail paths now append below that same configured base instead of replacing it; escaped bytes are preserved and normalized dot segments cannot escape the prefix. Root `//` and prefixed `/share//` regressions pin the same one-empty-segment rule across catalogue and protected-media construction. The rejection uses a fixed peer-path-free error. Complete prefixed backend fixtures prove authenticated ping/identity, discovery, pagination, stream, and artwork construction.

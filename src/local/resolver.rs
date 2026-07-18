@@ -60,6 +60,42 @@ struct ResolvedLocalMediaInner {
     extension: Option<String>,
 }
 
+/// Security-relevant database state captured before filesystem authority is
+/// acquired.
+///
+/// `last_checked_at` is observational scan metadata, not an authority
+/// generation: a concurrent successful scan may refresh it without changing
+/// which root is trusted. Keep the comparison explicit so such timestamp-only
+/// drift cannot spuriously reject an otherwise current resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedRootAuthorityState {
+    path: String,
+    device_id: Option<String>,
+    identity_confirmed: bool,
+    is_available: bool,
+    last_scan_complete: bool,
+}
+
+impl ExpectedRootAuthorityState {
+    fn from_model(state: &library_root::Model) -> Self {
+        Self {
+            path: state.path.clone(),
+            device_id: state.device_id.clone(),
+            identity_confirmed: state.identity_confirmed,
+            is_available: state.is_available,
+            last_scan_complete: state.last_scan_complete,
+        }
+    }
+
+    fn matches(&self, state: &library_root::Model) -> bool {
+        self.path == state.path
+            && self.device_id == state.device_id
+            && self.identity_confirmed == state.identity_confirmed
+            && self.is_available == state.is_available
+            && self.last_scan_complete == state.last_scan_complete
+    }
+}
+
 /// Exact local file authority retained for one output load.
 ///
 /// Clones share the same root, marker, ancestor, and file handles. Outputs and
@@ -210,7 +246,7 @@ pub async fn resolve_track(
         .device_id
         .clone()
         .ok_or(LocalMediaResolutionError::RootUnavailable)?;
-    let original_state = state.clone();
+    let expected_root_state = ExpectedRootAuthorityState::from_model(state);
     let authority_path = path.clone();
     let authority_root = root.clone();
     let acquired = tokio::time::timeout(
@@ -239,12 +275,12 @@ pub async fn resolve_track(
         .await
         .map_err(|source| LocalMediaResolutionError::Database { source })?
         .ok_or(LocalMediaResolutionError::Missing)?;
-    let current_state = library_root::Entity::find_by_id(original_state.path.clone())
+    let current_state = library_root::Entity::find_by_id(expected_root_state.path.clone())
         .one(db)
         .await
         .map_err(|source| LocalMediaResolutionError::Database { source })?
         .ok_or(LocalMediaResolutionError::ChangedDuringResolution)?;
-    if current_model.file_path != model.file_path || current_state != original_state {
+    if current_model.file_path != model.file_path || !expected_root_state.matches(&current_state) {
         return Err(LocalMediaResolutionError::ChangedDuringResolution);
     }
 
@@ -329,6 +365,43 @@ mod tests {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).expect("read authorized file");
         bytes
+    }
+
+    #[test]
+    fn root_authority_snapshot_ignores_timestamp_but_binds_every_authority_field() {
+        let original = library_root::Model {
+            path: "/music".to_string(),
+            device_id: Some("marker:v1:00000000-0000-4000-8000-000000000000".to_string()),
+            identity_confirmed: true,
+            is_available: true,
+            last_scan_complete: true,
+            last_checked_at: "2026-07-17T00:00:00Z".to_string(),
+        };
+        let expected = ExpectedRootAuthorityState::from_model(&original);
+
+        let mut timestamp_only = original.clone();
+        timestamp_only.last_checked_at = "2099-01-01T00:00:00Z".to_string();
+        assert!(expected.matches(&timestamp_only));
+
+        let mut changed = original.clone();
+        changed.path = "/replacement".to_string();
+        assert!(!expected.matches(&changed));
+
+        let mut changed = original.clone();
+        changed.device_id = Some("marker:v1:ffffffff-ffff-4fff-bfff-ffffffffffff".to_string());
+        assert!(!expected.matches(&changed));
+
+        let mut changed = original.clone();
+        changed.identity_confirmed = false;
+        assert!(!expected.matches(&changed));
+
+        let mut changed = original.clone();
+        changed.is_available = false;
+        assert!(!expected.matches(&changed));
+
+        let mut changed = original;
+        changed.last_scan_complete = false;
+        assert!(!expected.matches(&changed));
     }
 
     #[tokio::test]

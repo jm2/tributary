@@ -187,10 +187,16 @@ plus separate `ViewOrigin`. Embedded local artwork still crosses a path-based he
 centralized source refresh/failure/provenance plus radio/removable/external at-use adapters remain
 open. PR #121
 advances the literal total to **218/223 (97.8%)** and P3 to **28/30** without changing P0–P2.
-Its 55 focused resolver/root-authority/playback/Cast/GStreamer/MPD regressions, locked all-target
+Its 56 focused resolver/root-authority/playback/Cast/GStreamer/MPD regressions, locked all-target
 compile, strict warning-free Clippy in debug and release, formatting, and diff checks pass locally.
-The complete debug and release suites each pass 20 library, 803 application, and 10
-repository-metadata tests (833 total), including every socket-bearing regression.
+The complete debug and release suites each pass 20 library, 804 application, and 10
+repository-metadata tests (834 total), including every socket-bearing regression. Gemini's review
+found that whole-row root-state equality also compared the observational `last_checked_at` value,
+so an otherwise unchanged concurrent scan could spuriously reject playback. The post-acquisition
+snapshot now binds only the exact root key, marker identity, confirmation, availability, and
+complete-scan authority fields; its deterministic regression accepts timestamp-only drift and
+rejects each authority-field change independently. This review fix does not alter checklist
+arithmetic.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -1516,7 +1522,10 @@ closed as a milestone.
   identity-confirmed database state; a missing/dead/timed-out/stale row, root, or file fails
   without path, metadata, fingerprint, or alternate-track fallback. It acquires and retains the
   exact root, marker, ancestor, and regular-file handles under a five-second outer budget, then
-  re-reads both row and root state before publication. The GTK thread rechecks that the retained
+  re-reads the exact track path and a semantic root-authority snapshot before publication. That
+  snapshot binds the root key, marker identity, confirmation, availability, and complete-scan
+  fields while deliberately ignoring the observational scan timestamp, so timestamp-only refresh
+  cannot create a false stale result. The GTK thread rechecks that the retained
   root is still the most-specific current configured match, without filesystem I/O, before handing
   a typed `ResolvedLocalMedia` to the output; the bounded ticket worker revalidates physical
   authority before every retained-handle clone.
@@ -1979,7 +1988,20 @@ CodeQL and all three static-analysis jobs passed; final Codex review of `91536ab
 issues after both earlier findings were fixed and resolved. P2.10 is complete at 198/223 overall
 and 76/79 P2; P3.5's exact-toolchain acceptance remains recorded by PR #111.
 
-Current local branch validation (2026-07-17, P3.1 stable-identity independent-review follow-up):
+Current local branch validation (2026-07-17, P3.1 local-authority review follow-up):
+Gemini correctly identified that the resolver's post-acquisition whole-model comparison included
+`library_roots.last_checked_at`, even though ordinary successful scans refresh that observational
+timestamp and the existing root-trust contract explicitly excludes it from security state. A
+named expected-authority snapshot now compares only `path`, `device_id`, `identity_confirmed`,
+`is_available`, and `last_scan_complete`; exact track `file_path` comparison remains separate.
+One deterministic regression proves timestamp-only drift is accepted and independently changes
+every authority field to prove each still rejects. The focused regression passes in debug and
+release. `cargo test --all-targets --all-features --locked` passes in debug and release with 20
+library, 804 application, and 10 repository-metadata tests (834 total) per profile. Strict
+all-target/all-feature Clippy passes in debug and release; formatting and diff checks pass. The
+completed-box count remains 218/223 and P3 remains 28/30.
+
+Earlier local branch validation (2026-07-17, P3.1 stable-identity independent-review follow-up):
 `cargo check --all-targets --all-features --locked`, strict
 `cargo clippy --all-targets --all-features --locked -- -D warnings`, and
 `cargo test --all-targets --all-features --locked` pass in debug and release. Each complete profile
@@ -2958,4 +2980,4 @@ Add one line per completed task:
 | 2026-07-17 | P3.1 exact local ID-at-use resolution (partial) | PR #120 (`81db425`) | Preserves each SQLite `tracks.id` byte-for-byte in local and playlist UI/queue identity, replaces random malformed-UUID fallback with a frozen deterministic compatibility projection, removes file locators from local/playlist queue items, and resolves the exact current database row plus five-second regular-file evidence before initial, newly navigated, repeated, or receiver-targeted output loads. Exact-generation completion suppresses stale async results and missing, empty, dead, timed-out, or deleted IDs never use metadata/path fallback. Focused resolver, queue, GObject, and model-conversion tests plus strict full debug/release suites cover the slice. Acquisition of the current root, containment proof, exact file authority, and retention through full output consumption remain open, so that compound task remains unchecked. |
 | 2026-07-17 | P3.1 stable identity runtime | PR #120 (`79b9d0c`, `9bf87db`, `8232d90`, `432b66b`, `269eb93`, `4bb27a3`, `208dbf4`, `3357765`, `3adf3ee`) | Freezes typed source/media/view identity and a strict atomic saved-source migration; replaces URL ownership with persisted or deterministic `SourceId` across standard and DAAP flows; preserves exact bounded native IDs for every remote adapter; and adopts source-scoped `MediaKey` plus playlist/radio `ViewOrigin` in playback. Version-1 rows accept only random RFC UUIDv4 IDs or their exact canonical remote UUIDv5 owner, preventing crafted values from claiming another endpoint, backend, built-in, or removable identity. Repeated Add reuses the saved owner, discovered-to-saved promotion persists the already-published ID and retains its ephemeral advertised route for the immediate route-aware connection, and saved-plus-env startup authenticates under the stored ID; a prefixed reversible segment round-trips even native `.`/`..` IDs through stream and artwork references. Accepted reconnect publications clear the transient connecting state even when the canonical owner remains connected; environment authentication/catalogue failures carry exact owner plus opaque UI-attempt identity, preserving a retained predecessor and rejecting a stale queued failure after a same-source retry. Removable rows use frozen lossless mount-relative native identity, malformed radio IDs fail closed, and external sessions mint independent random IDs. A row carrying both saved and discovery provenance still collapses those facts into `manually_added`, so Delete cannot yet demote it to a still-live discovered row and discovery loss can still retire the saved owner; that remains part of the open centralized-lifecycle task. Focused migration, route, registry, exact-native-ID adapter, queue, removable, radio, source-object, and reordered exact-attempt failure regressions cover the completed stable-ID compound box; the final independent-review head passes 827 tests and strict Clippy in both debug and release. Centralized lifecycle/provenance, nonlocal at-use locators, and acquisition/containment/retention of local root/file authority remain open. |
 | 2026-07-17 | P3.1 stable identity CI follow-up | PR #120 | Replaces the failed-atomic-migration fixture's Unix permission manipulation with an injected error at the loader's private save boundary. Privileged containers can bypass `chmod 0500`, but the new cross-platform fixture deterministically proves a failed replacement quarantines the configuration, publishes no migrated rows, and preserves the legacy bytes exactly. The focused regression passes in debug and release; it now also runs on Windows, changes no production migration behavior, and leaves checklist arithmetic unchanged. |
-| 2026-07-17 | P3.1 exact local/playlist ID-at-use and retained output authority | PR #121 | Preserves PR #120's exact SQLite IDs and typed local `MediaKey`/playlist `ViewOrigin`, keeps playback queues pathless, and resolves only the exact current row beneath the most-specific currently configured authoritative root. A typed `ResolvedLocalMedia` lease retains root, marker, ancestor, and exact file handles through local/AirPlay GStreamer, Chromecast, and MPD handle-backed tickets; path replacement cannot retarget admitted playback, explicit-offset full/Range reads cannot interfere through a shared cloned-handle cursor, and load replacement, Stop, error, terminal completion, ticket drop, and teardown revoke future lookup. Shared Chromecast cleanup revokes credential and retained-authority routes without changing the legacy explicit-file server-lifetime contract. All 55 focused root/state recheck, no-fallback, symlink-escape, retained-file replacement, ticket/revocation, output-boundary, and playlist-ownership regressions pass alongside locked all-target check, formatting/diff checks, strict debug/release Clippy, and complete 833-test debug/release suites. Central lifecycle/provenance, nonlocal at-use locator adapters, and the path-based local embedded-art helper remain open. |
+| 2026-07-17 | P3.1 exact local/playlist ID-at-use and retained output authority | PR #121 | Preserves PR #120's exact SQLite IDs and typed local `MediaKey`/playlist `ViewOrigin`, keeps playback queues pathless, and resolves only the exact current row beneath the most-specific currently configured authoritative root. A typed `ResolvedLocalMedia` lease retains root, marker, ancestor, and exact file handles through local/AirPlay GStreamer, Chromecast, and MPD handle-backed tickets; path replacement cannot retarget admitted playback, explicit-offset full/Range reads cannot interfere through a shared cloned-handle cursor, and load replacement, Stop, error, terminal completion, ticket drop, and teardown revoke future lookup. Shared Chromecast cleanup revokes credential and retained-authority routes without changing the legacy explicit-file server-lifetime contract. Gemini's review follow-up replaced whole-row root equality with a semantic snapshot that ignores observational timestamp drift while binding every root-authority field. All 56 focused root/state recheck, no-fallback, symlink-escape, retained-file replacement, ticket/revocation, output-boundary, and playlist-ownership regressions pass alongside locked all-target check, formatting/diff checks, strict debug/release Clippy, and complete 834-test debug/release suites. Central lifecycle/provenance, nonlocal at-use locator adapters, and the path-based local embedded-art helper remain open. |
