@@ -6,7 +6,7 @@ This document explains the product and engineering work that remains **after** t
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
 remediation record is preserved separately in
 [`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **220/223 (98.7%)**, with only three
-real-environment validation records left. The new feature backlog starts at **0/35 (0%)**. Neither
+real-environment validation records left. The feature backlog is now **1/35 (2.9%)** complete. Neither
 percentage estimates equal engineering effort, and the historical percentage is not a claim that
 Tributary has implemented every requested product feature.
 
@@ -31,6 +31,9 @@ starts. Historical holistic-review documents are point-in-time findings, not act
   direct input modes.
 - Mounted removable filesystems can be browsed and played. Copy/sync, MTP-only devices, automount,
   eject, and pathless removable tag mutation are not implemented.
+- Shuffled playback retains the current queue occurrence plus ten real predecessors. Previous and
+  subsequent forward navigation follow that fixed history, Repeat All uses complete bounded
+  occurrence cycles, and the header and OS media controls share one exact restart threshold.
 
 ## Proposed implementation order
 
@@ -39,12 +42,11 @@ before starting large protocol or transfer subsystems.
 
 ### 1. Correct the playlist and playback-history contracts
 
-1. **Make shuffled navigation follow real history.** `PlaybackSession` already keeps visited queue
-   indices, but the user-facing Previous/Next path needs an end-to-end regression and bounded
-   repeat-all semantics. Previous should walk actual queue occurrences, Next after Previous should
-   walk forward history before drawing another random occurrence, and the fixed history budget
-   should retain the current occurrence plus ten real predecessors without weakening per-cycle
-   no-repeat behavior.
+1. **Completed: make shuffled navigation follow real history.** `PlaybackSession` now retains a
+   bounded occurrence timeline, walks backward and forward through real selections, stops at the
+   retained boundary, and starts complete Repeat All cycles without an immediate repeat. Shuffle
+   toggles, rollback, lifecycle resets, duplicate occurrences, small queues, and the shared
+   header/OS Previous dispatcher are covered by regressions.
 2. **Make remote-to-playlist behavior explicit ([#47]).** The current Add to Playlist action is
    offered for remote selections, but unsupported rows are only counted in a log message. The
    smallest slice is a user-visible refusal. Full support is separate: regular playlist entries

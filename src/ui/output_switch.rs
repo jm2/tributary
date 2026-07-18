@@ -401,6 +401,7 @@ mod tests {
 
     use super::*;
     use crate::audio::PlayerEventGeneration;
+    use crate::ui::header_bar::RepeatMode;
 
     #[derive(Debug, Default)]
     struct FakeOutputState {
@@ -577,14 +578,26 @@ mod tests {
         let (mut active_output, local_state) = FakeOutput::boxed("local", OutputType::Local, 0);
         let mut parked_local = None;
         let mut active_target = OutputTarget::Local;
-        let queue_item = super::super::playback::QueueItem::direct_for_test(
-            "file:///tmp/example.flac".to_string(),
-            "Example".to_string(),
-            "Artist".to_string(),
-            "Album".to_string(),
-        );
+        let queue_item = |name: &str| {
+            super::super::playback::QueueItem::direct_for_test(
+                format!("file:///tmp/{name}.flac"),
+                name.to_string(),
+                "Artist".to_string(),
+                "Album".to_string(),
+            )
+        };
         let mut session = PlaybackSession::default();
-        assert!(session.replace_queue(vec![queue_item], 0));
+        assert!(session.replace_queue(
+            vec![
+                queue_item("first"),
+                queue_item("second"),
+                queue_item("third")
+            ],
+            0,
+        ));
+        assert!(session.advance_for_test(RepeatMode::Off, true).is_some());
+        let prior_shuffle_identity = session.current_identity().cloned();
+        assert!(session.advance_for_test(RepeatMode::Off, true).is_some());
         let local_load = session
             .load_current_direct(active_output.as_ref())
             .expect("local queue item reaches the active output");
@@ -609,6 +622,14 @@ mod tests {
         assert!(session.accepts_event_generation(local_event.generation()));
         assert_eq!(local_state.borrow().stops, 0);
         assert!(parked_local.is_none());
+        assert!(session.previous_for_test(RepeatMode::All, true).is_some());
+        assert_eq!(
+            session.current_identity(),
+            prior_shuffle_identity.as_ref(),
+            "same-output reselection preserves shuffle history"
+        );
+        assert!(session.advance_for_test(RepeatMode::Off, true).is_some());
+        assert_eq!(session.current_identity(), local_identity.as_ref());
 
         let remote_target = OutputTarget::Mpd {
             host: "music.local".to_string(),

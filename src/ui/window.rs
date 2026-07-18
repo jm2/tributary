@@ -30,7 +30,7 @@ use super::persistence::{
 };
 use super::playback::{
     advance_track, advance_track_from_user, format_ms, play_or_start, play_track_at,
-    previous_track_from_user, refresh_projected_library_uris, replay_current, stop_playback,
+    previous_or_restart_from_user, refresh_projected_library_uris, replay_current, stop_playback,
     toggle_or_start, BufferingTracker, PlaybackContext, PlaybackSession, QueueTrackRefresh,
     PLAYLIST_SOURCE_PREFIX,
 };
@@ -53,10 +53,6 @@ const SIDEBAR_POS: i32 = 200;
 
 /// Browser paned default position (px from top of right content area).
 const BROWSER_POS: i32 = 220;
-
-/// If the user presses Previous when more than this many ms into a track,
-/// restart the current track instead of going back.
-const PREV_RESTART_THRESHOLD_MS: u64 = 3000;
 
 /// User trust decisions are serialized by the engine; this bounded queue
 /// prevents a stalled engine from accumulating unbounded confirmations.
@@ -2060,22 +2056,11 @@ pub fn build_window(
                             advance_track_from_user(&ctx, repeat_mode.get(), shuffle.is_active());
                         }
                         MediaAction::Previous => {
-                            super::open_files::invalidate_admission();
-                            // Mirror the header-bar heuristic: if we're past
-                            // the restart threshold, restart the current track.
-                            let position_ms = active_output.borrow().position_ms().unwrap_or(0);
-                            if position_ms > PREV_RESTART_THRESHOLD_MS {
-                                active_output.borrow().seek_to(0);
-                            } else {
-                                let stepped = previous_track_from_user(
-                                    &ctx,
-                                    repeat_mode.get(),
-                                    shuffle.is_active(),
-                                );
-                                if !stepped {
-                                    active_output.borrow().seek_to(0);
-                                }
-                            }
+                            previous_or_restart_from_user(
+                                &ctx,
+                                repeat_mode.get(),
+                                shuffle.is_active(),
+                            );
                         }
                     }
                 }
@@ -2131,9 +2116,13 @@ pub fn build_window(
             save_repeat_mode(mode.get());
         });
     }
-    hb.shuffle_button.connect_toggled(move |btn| {
-        save_shuffle(btn.is_active());
-    });
+    {
+        let playback_session = playback_session.clone();
+        hb.shuffle_button.connect_toggled(move |btn| {
+            playback_session.borrow_mut().reset_shuffle_navigation();
+            save_shuffle(btn.is_active());
+        });
+    }
 
     // ── Wire output selector row-click handler ──────────────────────
     {
@@ -2348,15 +2337,7 @@ pub fn build_window(
         let playback_source_registry = source_registry.clone();
 
         hb.prev_button.connect_clicked(move |_| {
-            super::open_files::invalidate_admission();
-            // If more than 3 s into the track, restart it.
-            let position_ms = active_output.borrow().position_ms().unwrap_or(0);
-            if position_ms > PREV_RESTART_THRESHOLD_MS {
-                active_output.borrow().seek_to(0);
-                return;
-            }
-
-            let stepped = previous_track_from_user(
+            previous_or_restart_from_user(
                 &PlaybackContext {
                     model: sm.clone(),
                     active_source_key: active_source_key.clone(),
@@ -2374,12 +2355,6 @@ pub fn build_window(
                 repeat_mode.get(),
                 shuffle.is_active(),
             );
-
-            // If we couldn't step back (track 0 with repeat off, or no
-            // current track), restart whatever is playing instead.
-            if !stepped {
-                active_output.borrow().seek_to(0);
-            }
         });
     }
 

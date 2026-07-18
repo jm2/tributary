@@ -5,6 +5,20 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Shuffled Previous and Next now follow a bounded real playback timeline** — Tributary retains
+  the current queue occurrence plus ten actual predecessors, walks backward without fabricating a
+  random track at the oldest boundary, and replays fixed forward history before drawing again.
+  Duplicate tracks remain distinct queue occurrences; one- and two-item queues, repeat Off/All/One,
+  navigation rollback, and queue/output/source lifecycle boundaries are explicitly regressed.
+  Repeat All now starts complete queue-occurrence cycles and avoids immediately repeating the
+  rollover track instead of omitting that occurrence from the new cycle. Either shuffle toggle
+  starts a fresh traversal without changing the current item. The header button and operating-system
+  media controls also share one Previous dispatcher: positions above three seconds restart, exactly
+  three seconds still navigates, and a retained-boundary Previous restarts the current item.
+
 ## [0.5.1] — 2026-07-18
 
 ### Added
@@ -966,6 +980,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
+[Unreleased]: https://github.com/jm2/tributary/compare/v0.5.1...HEAD
 [0.5.1]: https://github.com/jm2/tributary/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/jm2/tributary/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/jm2/tributary/compare/v0.4.0...v0.4.1
