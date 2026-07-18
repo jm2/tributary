@@ -26,7 +26,6 @@ use super::root_authority::{AbsenceProof, BoundDirectory, BoundFile, RootAuthori
 use super::tag_parser::{self, ParsedTrack};
 use super::tag_writer;
 use crate::architecture::models::Track;
-use crate::architecture::SourceId;
 use crate::db::entities::{library_root, playlist_entry, root_reauthorization_receipt, track};
 
 /// Frozen namespace for projecting a legacy non-UUID SQLite track key into
@@ -47,31 +46,6 @@ const LOCAL_TRACK_COMPAT_NAMESPACE: Uuid =
 pub enum LibraryEvent {
     /// Complete library snapshot after initial scan.
     FullSync(Vec<Track>),
-    /// Tracks from a remote backend, keyed by stable logical source ID.
-    RemoteSync {
-        source_id: SourceId,
-        /// Connection generation validated at the GTK publication boundary.
-        generation: u64,
-        /// Opaque registry lease used to synthesize credential-free media refs.
-        lease_key: Uuid,
-        tracks: Vec<Track>,
-    },
-    /// Tracks from a generation-scoped DAAP session. The GTK receiver
-    /// validates this ownership token before publishing the tracks.
-    DaapSync {
-        source_id: SourceId,
-        generation: u64,
-        session_key: Uuid,
-        tracks: Vec<Track>,
-    },
-    /// The newest environment-configured connection attempt failed before it
-    /// could publish a catalogue. GTK uses the exact logical owner to retire
-    /// only that row's transient connecting state.
-    RemoteConnectionFailed {
-        source_id: SourceId,
-        attempt: Uuid,
-        message: String,
-    },
     /// A single track was added or updated.
     TrackUpserted(Box<Track>),
     /// A track was removed (by file_path).

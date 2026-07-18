@@ -8,7 +8,6 @@ use gtk::glib;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 
@@ -22,70 +21,11 @@ use super::radio::{
 };
 use super::server_dialogs::{show_auth_dialog, validate_remote_server_url};
 use super::source_navigation::{
-    CompletionDisposition, PendingConnection, SourceNavigation, SourceRequest,
+    CompletionDisposition, ConnectionIntentKind, PendingConnection, SourceNavigation, SourceRequest,
 };
 use super::tracklist;
 use super::window::{arch_track_to_object, display_tracks};
 use super::window_state::WindowState;
-
-enum RemoteLibrarySnapshot {
-    Standard {
-        tracks: Vec<crate::architecture::models::Track>,
-        generation: u64,
-        lease_key: uuid::Uuid,
-    },
-    Daap {
-        tracks: Vec<crate::architecture::models::Track>,
-        generation: u64,
-        session_key: uuid::Uuid,
-    },
-}
-
-/// Registry ownership minted synchronously before a remote task is queued.
-///
-/// Discovery loss can run on the GTK loop immediately after this callback
-/// returns. Registering the attempt first lets that loss invalidate the exact
-/// generation even when Tokio has not polled the network future yet.
-enum RemoteConnectionAttempt {
-    Standard(crate::source_registry::ConnectionAttempt),
-    Daap(crate::daap::session::ConnectionAttempt),
-}
-
-impl RemoteConnectionAttempt {
-    fn is_latest(&self) -> bool {
-        match self {
-            Self::Standard(attempt) => attempt.is_latest(),
-            Self::Daap(attempt) => attempt.is_latest(),
-        }
-    }
-
-    fn into_standard(self) -> crate::source_registry::ConnectionAttempt {
-        match self {
-            Self::Standard(attempt) => attempt,
-            Self::Daap(_) => unreachable!("standard backend received a DAAP connection attempt"),
-        }
-    }
-
-    fn into_daap(self) -> crate::daap::session::ConnectionAttempt {
-        match self {
-            Self::Daap(attempt) => attempt,
-            Self::Standard(_) => {
-                unreachable!("DAAP backend received a standard connection attempt")
-            }
-        }
-    }
-}
-
-fn begin_remote_connection(
-    backend_type: &str,
-    source_id: crate::architecture::SourceId,
-) -> Option<RemoteConnectionAttempt> {
-    if backend_type == "daap" {
-        crate::daap::begin_connect(source_id).map(RemoteConnectionAttempt::Daap)
-    } else {
-        crate::source_registry::begin_connect(source_id).map(RemoteConnectionAttempt::Standard)
-    }
-}
 
 enum PlaylistLoadOutcome {
     Loaded(Vec<crate::architecture::models::Track>),
@@ -115,6 +55,7 @@ impl RemoteFailureCategory {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn log_message(self) -> &'static str {
         match self {
             Self::Authentication => "Remote authentication rejected",
@@ -168,6 +109,7 @@ impl RemoteFailureCategory {
     }
 }
 
+#[cfg(test)]
 pub(super) fn remote_failure_category(
     error: &crate::architecture::error::BackendError,
 ) -> RemoteFailureCategory {
@@ -185,23 +127,6 @@ pub(super) fn remote_failure_category(
         | BackendError::Unsupported { .. }
         | BackendError::Internal(_) => RemoteFailureCategory::Backend,
     }
-}
-
-/// Publish one passwordless-DAAP failure and wake the GTK cleanup owner.
-///
-/// The background task cannot touch GObjects directly. Keeping the user error
-/// and the one-shot cleanup signal together prevents a newly fallible stage
-/// between authentication and publication from leaving the sidebar spinner or
-/// pending navigation guard live forever.
-async fn signal_passwordless_daap_failure(
-    engine_tx: &async_channel::Sender<LibraryEvent>,
-    fail_tx: &async_channel::Sender<()>,
-    category: RemoteFailureCategory,
-) {
-    let _ = engine_tx
-        .send(LibraryEvent::Error(category.user_message("DAAP")))
-        .await;
-    let _ = fail_tx.send(()).await;
 }
 
 /// Bound parsed USB rows so a fast filesystem cannot grow memory without
@@ -273,24 +198,36 @@ fn restore_pending_selection(
     sidebar_store: &gtk::gio::ListStore,
     selection: &gtk::SingleSelection,
     pending_source_key: &str,
-    fallback_position: u32,
+    fallback_source_key: &str,
 ) {
-    let position = (0..sidebar_store.n_items())
-        .find(|position| {
-            sidebar_store
-                .item(*position)
-                .and_downcast_ref::<SourceObject>()
-                .is_some_and(|source| {
-                    source
-                        .source_id()
-                        .is_some_and(|id| id.to_string() == pending_source_key)
-                        || source.source_key() == pending_source_key
-                })
-        })
-        .unwrap_or(fallback_position);
-    if selection.selected() != position {
-        selection.set_selected(position);
+    let position = (0..sidebar_store.n_items()).find(|position| {
+        sidebar_store
+            .item(*position)
+            .and_downcast_ref::<SourceObject>()
+            .is_some_and(|source| {
+                source
+                    .source_id()
+                    .is_some_and(|id| id.to_string() == pending_source_key)
+                    || source.source_key() == pending_source_key
+            })
+    });
+    if let Some(position) = position {
+        if selection.selected() != position {
+            selection.set_selected(position);
+        }
+    } else {
+        super::window::select_sidebar_source_key(sidebar_store, selection, fallback_source_key);
     }
+}
+
+fn with_active_source_key_snapshot<T>(
+    active_source_key: &Rc<RefCell<String>>,
+    use_key: impl FnOnce(&str) -> T,
+) -> T {
+    // The callback may change GtkSingleSelection and synchronously re-enter a
+    // handler that mutates this cell, so clone and release the guard first.
+    let key = active_source_key.borrow().clone();
+    use_key(&key)
 }
 
 /// Cache a completed source load if it is still the newest request for that
@@ -491,6 +428,7 @@ pub fn setup_source_connect(state: &WindowState) {
     let sidebar_store = state.sidebar_store.clone();
     let pending_connection = state.pending_connection.clone();
     let pre_connect_selection = state.pre_connect_selection.clone();
+    let remote_sources = state.remote_sources.clone();
 
     sel.connect_selection_changed(move |sel, _, _| {
         let Some(item) = sel.selected_item() else {
@@ -520,15 +458,28 @@ pub fn setup_source_connect(state: &WindowState) {
                 // If clicking a different server while one is connecting,
                 // also ignore — let the first connection finish first.
                 if src.connecting() || (!src.connected() && !src.server_url().is_empty()) {
-                    restore_pending_selection(
-                        &sidebar_store,
-                        sel,
-                        pending.source_key(),
-                        pre_connect_selection.get(),
-                    );
+                    with_active_source_key_snapshot(&active_source_key, |fallback_source_key| {
+                        restore_pending_selection(
+                            &sidebar_store,
+                            sel,
+                            pending.source_key(),
+                            fallback_source_key,
+                        );
+                    });
                     return;
                 }
             }
+        }
+
+        // Environment and manual startup attempts do not own a deferred
+        // navigation token. A click on their spinner must never open a second
+        // dialog or supersede the credential-bearing generation (especially
+        // with a passwordless DAAP retry).
+        if src.connecting() {
+            with_active_source_key_snapshot(&active_source_key, |fallback_source_key| {
+                super::window::select_sidebar_source_key(&sidebar_store, sel, fallback_source_key);
+            });
+            return;
         }
 
         let backend_type = src.backend_type();
@@ -975,7 +926,6 @@ pub fn setup_source_connect(state: &WindowState) {
         let server_url = src.server_url();
         let advertised_route = src.advertised_route();
         let engine_tx = engine_tx.clone();
-        let rt_handle = rt_handle.clone();
         let win = win.clone();
         let sidebar_store = sidebar_store.clone();
         let selected_pos = sel.selected();
@@ -1004,15 +954,8 @@ pub fn setup_source_connect(state: &WindowState) {
         // For passwordless DAAP servers, bypass the dialog entirely
         // and connect directly.
         if backend_type == "daap" && !requires_password {
-            // Mint ownership before queuing the task. A final mDNS Lost event
-            // can now invalidate this generation even if Tokio has not yet
-            // started the handshake.
             let Some(source_id) = src.source_id() else {
                 tracing::warn!("Remote source has no stable identity");
-                return;
-            };
-            let Some(attempt) = crate::daap::begin_connect(source_id) else {
-                tracing::debug!("Skipping DAAP connect during shutdown");
                 return;
             };
             *pending_connection.borrow_mut() = Some(PendingConnection::new(
@@ -1020,173 +963,53 @@ pub fn setup_source_connect(state: &WindowState) {
                 connection_request.clone(),
             ));
 
-            // Mark as connecting → spinner in sidebar.
-            if let Some(src) = sidebar_store
-                .item(selected_pos)
-                .and_downcast_ref::<SourceObject>()
-            {
-                src.set_connecting(true);
-                let src = src.clone();
-                sidebar_store.remove(selected_pos);
-                sidebar_store.insert(selected_pos, &src);
-            }
-
-            let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
-            // Separate signal for "server actually does require a password":
-            // the no-password connect came back with AuthenticationFailed, so
-            // we flip the flag and re-fire the selection to let the existing
-            // auth-dialog branch handle it.
-            let (auth_needed_tx, auth_needed_rx) = async_channel::bounded::<()>(1);
-            let sidebar_store_for_fail = sidebar_store.clone();
-            let sel_for_fail = sel.clone();
-            let pre_sel = pre_connect_selection.get();
-            let pending_for_fail = pending_connection.clone();
-            let navigation_for_fail = source_navigation.clone();
-            let request_for_fail = connection_request.clone();
-            let url_for_fail = url_for_closure.clone();
-            glib::MainContext::default().spawn_local(async move {
-                if fail_rx.recv().await.is_ok() {
-                    let owns_pending = pending_for_fail
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|pending| pending.request() == &request_for_fail);
-                    if owns_pending {
-                        if let Some((position, source)) =
-                            super::discovery_handler::remote_source_at(
-                                &sidebar_store_for_fail,
-                                &url_for_fail,
-                                "daap",
-                            )
-                        {
-                            source.set_connecting(false);
-                            sidebar_store_for_fail.remove(position);
-                            sidebar_store_for_fail.insert(position, &source);
-                        }
-                        *pending_for_fail.borrow_mut() = None;
-                        if navigation_for_fail.borrow().is_current(&request_for_fail) {
-                            sel_for_fail.set_selected(pre_sel);
-                        }
-                    }
-                }
-            });
-
-            let sidebar_store_for_auth = sidebar_store.clone();
-            let sel_for_auth = sel.clone();
-            let pending_for_auth = pending_connection.clone();
-            let navigation_for_auth = source_navigation.clone();
-            let request_for_auth = connection_request.clone();
-            let url_for_auth = url_for_closure.clone();
-            glib::MainContext::default().spawn_local(async move {
-                if auth_needed_rx.recv().await.is_ok() {
-                    let owns_pending = pending_for_auth
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|pending| pending.request() == &request_for_auth);
-                    if owns_pending {
-                        let Some((position, source)) = super::discovery_handler::remote_source_at(
-                            &sidebar_store_for_auth,
-                            &url_for_auth,
-                            "daap",
-                        ) else {
-                            *pending_for_auth.borrow_mut() = None;
-                            return;
-                        };
-                        // Clear connecting state and flip requires_password so
-                        // the re-fired selection lands in the dialog branch.
-                        source.set_connecting(false);
-                        source.set_requires_password(true);
-                        sidebar_store_for_auth.remove(position);
-                        sidebar_store_for_auth.insert(position, &source);
-                        *pending_for_auth.borrow_mut() = None;
-                        if navigation_for_auth.borrow().is_current(&request_for_auth) {
-                            // Setting the same position is a no-op in
-                            // GtkSingleSelection, so deselect then reselect.
-                            sel_for_auth.set_selected(gtk::INVALID_LIST_POSITION);
-                            sel_for_auth.set_selected(position);
-                        }
-                    }
-                }
-            });
-
-            let engine_tx = engine_tx.clone();
             let server_url = url_for_closure.clone();
             let server_name = name_for_closure.clone();
             let advertised_route = advertised_route.clone();
-            rt_handle.spawn(async move {
-                info!("Connecting to passwordless DAAP server...");
-                if !attempt.is_latest() {
-                    tracing::debug!("Skipping withdrawn DAAP connection attempt");
-                    return;
-                }
-                match crate::daap::DaapBackend::connect_with_route(
-                    &server_name,
-                    &server_url,
-                    None,
-                    advertised_route,
-                )
-                .await
-                {
-                    Ok(backend) => {
-                        let tracks = match crate::architecture::load_track_catalog(&backend).await {
-                            Ok(tracks) => tracks,
-                            Err(error) => {
-                                backend.disconnect().await;
-                                if !attempt.is_latest() {
-                                    tracing::debug!("Ignoring superseded DAAP catalogue failure");
-                                    return;
-                                }
-                                let category = remote_failure_category(&error);
-                                tracing::error!(
-                                    category = category.as_str(),
-                                    "DAAP catalogue load failed"
-                                );
-                                signal_passwordless_daap_failure(&engine_tx, &fail_tx, category)
-                                    .await;
-                                return;
-                            }
-                        };
-                        let Some(session) = attempt.retain(backend).await else {
-                            tracing::debug!("DAAP connect was superseded");
-                            return;
-                        };
-                        if !session.is_current() {
-                            tracing::debug!("DAAP sync was superseded");
-                            return;
-                        }
-                        info!(count = tracks.len(), "DAAP library fetched (no password)");
-                        let _ = engine_tx
-                            .send(LibraryEvent::DaapSync {
-                                source_id: session.source_id(),
-                                generation: session.generation(),
-                                session_key: session.session_key(),
-                                tracks,
-                            })
-                            .await;
-                    }
-                    Err(crate::architecture::error::BackendError::AuthenticationFailed {
-                        ..
-                    }) => {
-                        if !attempt.is_latest() {
-                            tracing::debug!("Ignoring superseded DAAP authentication failure");
-                            return;
-                        }
-                        info!("DAAP server requires a password — re-prompting via auth dialog");
-                        let _ = auth_needed_tx.send(()).await;
-                    }
-                    Err(e) => {
-                        if !attempt.is_latest() {
-                            tracing::debug!("Ignoring superseded DAAP connection failure");
-                            return;
-                        }
-                        let category = remote_failure_category(&e);
-                        tracing::error!(
-                            category = category.as_str(),
-                            "Passwordless DAAP connection failed"
-                        );
-                        signal_passwordless_daap_failure(&engine_tx, &fail_tx, category).await;
-                    }
-                }
-            });
+            let source = src.clone();
+            let sidebar_store_for_generation = sidebar_store.clone();
+            let sidebar_selection_for_generation = sel.clone();
+            let pending_for_generation = pending_connection.clone();
+            let request_for_generation = connection_request.clone();
+            let generation = remote_sources.connect_daap(
+                source_id,
+                move |generation| {
+                    let bound = pending_for_generation
+                        .borrow_mut()
+                        .as_mut()
+                        .filter(|pending| pending.request() == &request_for_generation)
+                        .is_some_and(|pending| {
+                            pending.bind_lifecycle(
+                                source_id,
+                                generation,
+                                ConnectionIntentKind::PasswordlessDaap,
+                            )
+                        });
+                    debug_assert!(bound, "passwordless DAAP intent is bound before spawn");
+                    source.set_connecting_generation(generation);
+                    super::window::rebind_sidebar_source(
+                        &sidebar_store_for_generation,
+                        &sidebar_selection_for_generation,
+                        selected_pos,
+                        &source,
+                        true,
+                    );
+                },
+                move || async move {
+                    info!("Connecting to passwordless DAAP server...");
+                    crate::daap::DaapBackend::login_with_route(
+                        &server_name,
+                        &server_url,
+                        None,
+                        advertised_route,
+                    )
+                    .await
+                },
+            );
+            if generation.is_none() {
+                *pending_connection.borrow_mut() = None;
+                tracing::debug!("Skipping DAAP connect during shutdown or after source retirement");
+            }
             return;
         }
 
@@ -1203,17 +1026,16 @@ pub fn setup_source_connect(state: &WindowState) {
 
         // Clone Rc's before moving into the auth dialog closure so
         // the outer `Fn` closure can be called multiple times.
-        let pre_connect_for_auth = pre_connect_selection.clone();
         let pending_for_auth = pending_connection.clone();
-        let sel_for_auth = sel.clone();
 
         // If the user cancels / escapes the auth dialog, drop the
         // pending-connection guard so the next sidebar click works.
         let pending_for_cancel = pending_connection.clone();
         let navigation_for_cancel = source_navigation.clone();
         let request_for_cancel = connection_request.clone();
-        let sel_for_cancel = sel.clone();
-        let pre_sel_for_cancel = pre_connect_selection.get();
+        let sel_for_cancel = (*sel).clone();
+        let store_for_cancel = sidebar_store.clone();
+        let active_key_for_cancel = active_source_key.clone();
         let on_cancel = move || {
             let owns_pending = pending_for_cancel
                 .borrow()
@@ -1225,11 +1047,22 @@ pub fn setup_source_connect(state: &WindowState) {
                     .borrow()
                     .is_current(&request_for_cancel)
                 {
-                    sel_for_cancel.set_selected(pre_sel_for_cancel);
+                    with_active_source_key_snapshot(
+                        &active_key_for_cancel,
+                        |fallback_source_key| {
+                            super::window::select_sidebar_source_key(
+                                &store_for_cancel,
+                                &sel_for_cancel,
+                                fallback_source_key,
+                            );
+                        },
+                    );
                 }
             }
         };
         let navigation_for_submit = source_navigation.clone();
+        let remote_sources_for_auth = remote_sources.clone();
+        let selection_for_auth = (*sel).clone();
 
         show_auth_dialog(
             &win,
@@ -1237,7 +1070,6 @@ pub fn setup_source_connect(state: &WindowState) {
             &server_url,
             password_only,
             move |user, pass| {
-                let engine_tx = engine_tx.clone();
                 let server_url = url_for_closure.clone();
                 let server_name = name_for_closure.clone();
                 let backend_type = backend_type.clone();
@@ -1266,300 +1098,107 @@ pub fn setup_source_connect(state: &WindowState) {
                     tracing::warn!("Remote source has no stable identity");
                     return;
                 };
-                let Some(connection_attempt) = begin_remote_connection(&backend_type, source_id)
-                else {
-                    // Controlled shutdown closed the registry. The submission
-                    // still owns this exact pending guard, so release it
-                    // without touching a newer attempt.
-                    *pending_for_auth.borrow_mut() = None;
-                    tracing::debug!("Skipping remote connect during shutdown");
-                    return;
+                let source_for_generation = submitted_source.clone();
+                let store_for_generation = sidebar_store.clone();
+                let selection_for_generation = selection_for_auth.clone();
+                let pending_for_generation = pending_for_auth.clone();
+                let request_for_generation = connection_request.clone();
+                let on_generation = move |generation| {
+                    let bound = pending_for_generation
+                        .borrow_mut()
+                        .as_mut()
+                        .filter(|pending| pending.request() == &request_for_generation)
+                        .is_some_and(|pending| {
+                            pending.bind_lifecycle(
+                                source_id,
+                                generation,
+                                ConnectionIntentKind::Interactive,
+                            )
+                        });
+                    debug_assert!(bound, "interactive remote intent is bound before spawn");
+                    source_for_generation.set_connecting_generation(generation);
+                    super::window::rebind_sidebar_source(
+                        &store_for_generation,
+                        &selection_for_generation,
+                        current_pos,
+                        &source_for_generation,
+                        true,
+                    );
                 };
 
-                // Mark as connecting → spinner in sidebar.
-                submitted_source.set_connecting(true);
-                sidebar_store.remove(current_pos);
-                sidebar_store.insert(current_pos, &submitted_source);
-
-                // One-shot to signal failure back to the main thread so we
-                // can clear the spinner (GObjects are not Send).
-                let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
-                let sidebar_store_for_fail = sidebar_store.clone();
-                let backend_for_fail = backend_type.clone();
-                let url_for_fail = server_url.clone();
-                let sel_for_fail = sel_for_auth.clone();
-                let pre_sel = pre_connect_for_auth.get();
-                let pending_for_fail = pending_for_auth.clone();
-                let navigation_for_fail = navigation_for_submit.clone();
-                let request_for_fail = connection_request.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    if fail_rx.recv().await.is_ok() {
-                        let owns_pending = pending_for_fail
-                            .borrow()
-                            .as_ref()
-                            .is_some_and(|pending| pending.request() == &request_for_fail);
-                        if owns_pending {
-                            if let Some((position, source)) =
-                                super::discovery_handler::remote_source_at(
-                                    &sidebar_store_for_fail,
-                                    &url_for_fail,
-                                    &backend_for_fail,
-                                )
-                            {
-                                source.set_connecting(false);
-                                sidebar_store_for_fail.remove(position);
-                                sidebar_store_for_fail.insert(position, &source);
-                            }
-                            *pending_for_fail.borrow_mut() = None;
-                            if navigation_for_fail.borrow().is_current(&request_for_fail) {
-                                sel_for_fail.set_selected(pre_sel);
-                            }
-                        }
-                    }
-                });
-
-                rt_handle.spawn(async move {
-                    if !connection_attempt.is_latest() {
-                        tracing::debug!(
-                            backend = %backend_type,
-                            "Skipping withdrawn remote connection attempt"
-                        );
-                        return;
-                    }
-                    let result: Result<
-                        Option<RemoteLibrarySnapshot>,
-                        crate::architecture::error::BackendError,
-                    > = match backend_type.as_str() {
-                        "jellyfin" => {
+                let generation = match backend_type.as_str() {
+                    "jellyfin" => remote_sources_for_auth.connect_jellyfin_session(
+                        source_id,
+                        on_generation,
+                        move || async move {
                             info!("Authenticating with Jellyfin...");
-                            let attempt = connection_attempt.into_standard();
-                            match crate::jellyfin::client::JellyfinClient::authenticate_with_route(
-                                &server_url,
-                                &user,
-                                &pass,
-                                advertised_route.clone(),
-                            )
-                            .await
-                            {
-                                Ok(client) => {
-                                    match crate::jellyfin::JellyfinBackend::from_client(
-                                        &server_name,
-                                        client,
-                                    )
-                                    .await
-                                    {
-                                        Ok(backend) => {
-                                            match crate::architecture::load_track_catalog(&backend)
-                                                .await
-                                            {
-                                                Ok(tracks) => Ok(attempt
-                                                    .retain(Arc::new(backend))
-                                                    .and_then(|source| {
-                                                        source.is_current().then(|| {
-                                                            RemoteLibrarySnapshot::Standard {
-                                                                tracks,
-                                                                generation: source.generation(),
-                                                                lease_key: source.lease_key(),
-                                                            }
-                                                        })
-                                                    })),
-                                                Err(_) if !attempt.is_latest() => Ok(None),
-                                                Err(error) => Err(error),
-                                            }
-                                        }
-                                        Err(_) if !attempt.is_latest() => Ok(None),
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                                Err(_) if !attempt.is_latest() => Ok(None),
-                                Err(e) => Err(e),
-                            }
-                        }
-                        "plex" => {
+                            let client =
+                                crate::jellyfin::client::JellyfinClient::authenticate_with_route(
+                                    &server_url,
+                                    &user,
+                                    &pass,
+                                    advertised_route,
+                                )
+                                .await?;
+                            Ok(crate::jellyfin::JellyfinBackend::stage_authenticated(
+                                &server_name,
+                                client,
+                            ))
+                        },
+                    ),
+                    "plex" => remote_sources_for_auth.connect_standard(
+                        source_id,
+                        on_generation,
+                        move || async move {
                             info!("Authenticating with Plex...");
-                            let attempt = connection_attempt.into_standard();
-                            match crate::plex::client::PlexClient::authenticate_with_route(
+                            let client = crate::plex::client::PlexClient::authenticate_with_route(
                                 &server_url,
                                 &user,
                                 &pass,
-                                advertised_route.clone(),
+                                advertised_route,
                             )
-                            .await
-                            {
-                                Ok(client) => {
-                                    match crate::plex::PlexBackend::from_client(
-                                        &server_name,
-                                        client,
-                                    )
-                                    .await
-                                    {
-                                        Ok(backend) => {
-                                            match crate::architecture::load_track_catalog(&backend)
-                                                .await
-                                            {
-                                                Ok(tracks) => Ok(attempt
-                                                    .retain(Arc::new(backend))
-                                                    .and_then(|source| {
-                                                        source.is_current().then(|| {
-                                                            RemoteLibrarySnapshot::Standard {
-                                                                tracks,
-                                                                generation: source.generation(),
-                                                                lease_key: source.lease_key(),
-                                                            }
-                                                        })
-                                                    })),
-                                                Err(_) if !attempt.is_latest() => Ok(None),
-                                                Err(error) => Err(error),
-                                            }
-                                        }
-                                        Err(_) if !attempt.is_latest() => Ok(None),
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                                Err(_) if !attempt.is_latest() => Ok(None),
-                                Err(e) => Err(e),
-                            }
-                        }
-                        "daap" => {
+                            .await?;
+                            crate::plex::PlexBackend::from_client(&server_name, client).await
+                        },
+                    ),
+                    "daap" => remote_sources_for_auth.connect_daap(
+                        source_id,
+                        on_generation,
+                        move || async move {
                             info!("Connecting to DAAP server...");
-                            let password = if pass.is_empty() {
-                                None
-                            } else {
-                                Some(pass.as_str())
-                            };
-                            let attempt = connection_attempt.into_daap();
-                            match crate::daap::DaapBackend::connect_with_route(
+                            let password = (!pass.is_empty()).then_some(pass.as_str());
+                            crate::daap::DaapBackend::login_with_route(
                                 &server_name,
                                 &server_url,
                                 password,
-                                advertised_route.clone(),
+                                advertised_route,
                             )
                             .await
-                            {
-                                Ok(backend) => {
-                                    match crate::architecture::load_track_catalog(&backend).await {
-                                        Ok(tracks) => match attempt.retain(backend).await {
-                                            Some(session) if session.is_current() => {
-                                                Ok(Some(RemoteLibrarySnapshot::Daap {
-                                                    tracks,
-                                                    generation: session.generation(),
-                                                    session_key: session.session_key(),
-                                                }))
-                                            }
-                                            Some(_) | None => Ok(None),
-                                        },
-                                        Err(error) => {
-                                            backend.disconnect().await;
-                                            if attempt.is_latest() {
-                                                Err(error)
-                                            } else {
-                                                Ok(None)
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(_) if !attempt.is_latest() => Ok(None),
-                                Err(error) => Err(error),
-                            }
-                        }
-                        _ => {
-                            // Default: Subsonic
+                        },
+                    ),
+                    _ => remote_sources_for_auth.connect_standard(
+                        source_id,
+                        on_generation,
+                        move || async move {
                             info!("Authenticating with Subsonic...");
-                            let attempt = connection_attempt.into_standard();
-                            match crate::subsonic::SubsonicBackend::connect_with_route(
+                            crate::subsonic::SubsonicBackend::connect_with_route(
                                 &server_name,
                                 &server_url,
                                 &user,
                                 &pass,
-                                advertised_route.clone(),
+                                advertised_route,
                             )
                             .await
-                            {
-                                Ok(backend) => {
-                                    match crate::architecture::load_track_catalog(&backend).await {
-                                        Ok(tracks) => Ok(attempt
-                                            .retain(Arc::new(backend))
-                                            .and_then(|source| {
-                                                source.is_current().then(|| {
-                                                    RemoteLibrarySnapshot::Standard {
-                                                        tracks,
-                                                        generation: source.generation(),
-                                                        lease_key: source.lease_key(),
-                                                    }
-                                                })
-                                            })),
-                                        Err(_) if !attempt.is_latest() => Ok(None),
-                                        Err(error) => Err(error),
-                                    }
-                                }
-                                Err(_) if !attempt.is_latest() => Ok(None),
-                                Err(e) => Err(e),
-                            }
-                        }
-                    };
-
-                    match result {
-                        Ok(Some(snapshot)) => {
-                            let (count, event) = match snapshot {
-                                RemoteLibrarySnapshot::Standard {
-                                    tracks,
-                                    generation,
-                                    lease_key,
-                                } => {
-                                    let count = tracks.len();
-                                    (
-                                        count,
-                                        LibraryEvent::RemoteSync {
-                                            source_id,
-                                            generation,
-                                            lease_key,
-                                            tracks,
-                                        },
-                                    )
-                                }
-                                RemoteLibrarySnapshot::Daap {
-                                    tracks,
-                                    generation,
-                                    session_key,
-                                } => {
-                                    let count = tracks.len();
-                                    (
-                                        count,
-                                        LibraryEvent::DaapSync {
-                                            source_id,
-                                            generation,
-                                            session_key,
-                                            tracks,
-                                        },
-                                    )
-                                }
-                            };
-                            info!(
-                                backend = %backend_type,
-                                count,
-                                "Remote library fetched"
-                            );
-                            let _ = engine_tx.send(event).await;
-                        }
-                        Ok(None) => tracing::debug!(
-                            backend = %backend_type,
-                            "Remote connection was superseded or shutdown-gated"
-                        ),
-                        Err(e) => {
-                            let category = remote_failure_category(&e);
-                            tracing::error!(
-                                backend = %backend_type,
-                                category = category.as_str(),
-                                "{}",
-                                category.log_message()
-                            );
-                            let _ = engine_tx
-                                .send(LibraryEvent::Error(category.user_message(&backend_type)))
-                                .await;
-                            let _ = fail_tx.send(()).await;
-                        }
-                    }
-                });
+                        },
+                    ),
+                };
+                if generation.is_none() {
+                    *pending_for_auth.borrow_mut() = None;
+                    tracing::debug!(
+                        backend = %backend_type,
+                        "Skipping remote connect during shutdown or after source retirement"
+                    );
+                }
             },
             on_cancel,
         );
@@ -1598,16 +1237,14 @@ mod tests {
 
     use url::Url;
 
-    use crate::architecture::error::BackendError;
-    use crate::architecture::AdvertisedHttpRoute;
-    use crate::local::engine::LibraryEvent;
-
     use super::{
         cache_source_completion, enumerate_device_audio_files, evict_source_completion,
         prepare_remote_auth_submission, remote_failure_category, resolve_source_key,
-        signal_passwordless_daap_failure, PendingConnection, RemoteFailureCategory,
+        with_active_source_key_snapshot, PendingConnection, RemoteFailureCategory,
         SourceNavigation, TrackObject,
     };
+    use crate::architecture::error::BackendError;
+    use crate::architecture::AdvertisedHttpRoute;
 
     fn projected_track(label: &str) -> TrackObject {
         TrackObject::new(
@@ -1649,6 +1286,23 @@ mod tests {
         );
         assert_eq!(resolve_source_key("", "stable-id", "", "local"), "local");
         assert_eq!(resolve_source_key("", "", "", ""), "local");
+    }
+
+    #[test]
+    fn connecting_and_auth_cancel_selection_release_active_key_before_reentry() {
+        let active_source_key = Rc::new(RefCell::new("local".to_string()));
+
+        // Both the connecting-row guard and auth-cancel callback use this
+        // boundary immediately before a synchronous selection change. Model
+        // the re-entered Local handler by mutably borrowing the same cell.
+        for replacement in ["local-after-connecting", "local-after-cancel"] {
+            with_active_source_key_snapshot(&active_source_key, |snapshot| {
+                assert!(snapshot.starts_with("local"));
+                *active_source_key.borrow_mut() = replacement.to_string();
+            });
+        }
+
+        assert_eq!(&*active_source_key.borrow(), "local-after-cancel");
     }
 
     #[test]
@@ -1699,22 +1353,6 @@ mod tests {
             source_tracks.borrow()["radio-topvote"][0].title(),
             "background"
         );
-    }
-
-    #[tokio::test]
-    async fn passwordless_daap_failure_publishes_error_and_ui_cleanup_signal() {
-        let (engine_tx, engine_rx) = async_channel::bounded(1);
-        let (fail_tx, fail_rx) = async_channel::bounded(1);
-        let category = RemoteFailureCategory::Backend;
-        let expected_message = category.user_message("DAAP");
-
-        signal_passwordless_daap_failure(&engine_tx, &fail_tx, category).await;
-
-        match engine_rx.recv().await.expect("receive library error") {
-            LibraryEvent::Error(message) => assert_eq!(message, expected_message),
-            event => panic!("unexpected library event: {event:?}"),
-        }
-        fail_rx.recv().await.expect("receive GTK cleanup signal");
     }
 
     fn advertised_route(address: &str) -> AdvertisedHttpRoute {

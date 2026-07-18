@@ -1,12 +1,13 @@
-//! Central source lifecycle ownership foundation.
+//! Central source lifecycle ownership authority.
 //!
-//! This module is intentionally not wired to the shipping adapters yet. It
-//! defines the authority boundary those adapters will enter: one registry
-//! atomically owns an adapter, its revocable lease, and its session epoch;
-//! connect and refresh work is generation-scoped and joinable; and every
-//! constructed adapter is retired exactly once even when its result is stale.
-//! Backend errors are reduced to closed categories before they cross this
-//! boundary.
+//! The production remote-source service uses this generic registry for
+//! Subsonic, Jellyfin, Plex, and DAAP. One entry atomically owns its adapter,
+//! revocable media lease, session epoch, provenance, accepted snapshots, and
+//! generation-scoped operations. Every constructed adapter enters exactly-once
+//! retirement even when cancelled or stale, and shutdown joins all tracked
+//! construction/refresh/close work. Built-in local, radio, removable, and
+//! external-file adapters remain outside this remote production cutover for
+//! now, while sharing the same typed SourceId model.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -397,6 +398,46 @@ struct OperationTracker {
     active_sender: watch::Sender<usize>,
 }
 
+/// Exact lifetime and sanitized close outcome for one spawned connect task.
+/// The task holds one participant, and any adapter it constructs transfers a
+/// second participant into mandatory retirement before the task can finish.
+struct ConnectSettlement {
+    tracker: Arc<OperationTracker>,
+    close_failure: Mutex<Option<SourceFailure>>,
+}
+
+impl ConnectSettlement {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            tracker: OperationTracker::new(),
+            close_failure: Mutex::new(None),
+        })
+    }
+
+    fn participate(&self) -> OperationParticipant {
+        self.tracker.participate()
+    }
+
+    fn active(&self) -> usize {
+        self.tracker.active()
+    }
+
+    async fn wait(&self) {
+        self.tracker.wait_idle().await;
+    }
+
+    fn record_close_failure(&self, category: FailureCategory) {
+        let mut failure = lock(&self.close_failure);
+        if failure.is_none() {
+            *failure = Some(SourceFailure::disconnect(category));
+        }
+    }
+
+    fn close_failure(&self) -> Option<SourceFailure> {
+        *lock(&self.close_failure)
+    }
+}
+
 impl OperationTracker {
     fn new() -> Arc<Self> {
         let (active_sender, _receiver) = watch::channel(0);
@@ -514,12 +555,26 @@ pub struct LifecycleSnapshot<S> {
     pub pending_retirements: usize,
 }
 
+/// One atomic observer baseline. The global revision, shutdown gate, and all
+/// per-source snapshots are captured under the same registry lock so a
+/// reducer never combines live rows with a stale admission state.
+#[derive(Clone)]
+pub struct LifecycleBaseline<S> {
+    pub revision: u64,
+    pub shutting_down: bool,
+    pub sources: Vec<(SourceId, LifecycleSnapshot<S>)>,
+}
+
 struct PendingOperation {
     generation: u64,
     session_epoch: Option<u64>,
     cancellation: CancellationSwitch,
     abort: Option<AbortHandle>,
     abortable: bool,
+    /// Exact task/late-adapter settlement for a connect operation. A protected
+    /// constructor can outlive cancellation and mint an adapter which must be
+    /// closed before an explicit-disconnect waiter may complete.
+    settlement: Option<Arc<ConnectSettlement>>,
 }
 
 /// Whether cancellation may abort a connect constructor before it returns.
@@ -556,6 +611,8 @@ struct Entry<A: ?Sized, S> {
     connect: Option<PendingOperation>,
     refreshes: HashMap<RefreshLane, PendingOperation>,
     disconnect_retirement: Option<u64>,
+    disconnect_waiter: Option<RetirementWaiter>,
+    connect_settlements: HashMap<u64, Arc<ConnectSettlement>>,
     retirement_ids: HashSet<u64>,
     catalogue: Option<AcceptedSnapshot<S>>,
     views: HashMap<ViewOrigin, AcceptedSnapshot<S>>,
@@ -578,6 +635,8 @@ impl<A: ?Sized, S> Entry<A, S> {
             connect: None,
             refreshes: HashMap::new(),
             disconnect_retirement: None,
+            disconnect_waiter: None,
+            connect_settlements: HashMap::new(),
             retirement_ids: HashSet::new(),
             catalogue: None,
             views: HashMap::new(),
@@ -610,6 +669,28 @@ impl<A: ?Sized, S> Entry<A, S> {
             SourceState::Dormant
         }
     }
+
+    fn snapshot(&self) -> LifecycleSnapshot<S> {
+        LifecycleSnapshot {
+            revision: self.revision,
+            state: self.state,
+            session_epoch: self.session_epoch(),
+            provenance: self.provenance.clone(),
+            visibility: self.provenance.visibility(),
+            retention: self.provenance.retention(),
+            catalogue: self.catalogue.clone(),
+            views: self.views.clone(),
+            failure: self.failure,
+            refresh_failures: self.refresh_failures.clone(),
+            pending_connect: self.connect.as_ref().map(|operation| operation.generation),
+            pending_refreshes: self
+                .refreshes
+                .iter()
+                .map(|(lane, operation)| (lane.clone(), operation.generation))
+                .collect(),
+            pending_retirements: self.retirement_ids.len(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -625,13 +706,19 @@ enum RetirementOutcome {
     Finished(Option<SourceFailure>),
 }
 
-/// Join-only capability for one exact adapter retirement. It cannot start or
-/// complete close work, and clones/repeated disconnect callers await the same
-/// registry-owned task.
+/// Join-only capability for one exact disconnect settlement.
+///
+/// A settlement can combine an adopted-adapter retirement with every spawned
+/// connect generation that was still capable of returning a late adapter when
+/// disconnect began. It cannot start or complete close work, and clones or
+/// repeated disconnect callers await the same registry-owned work. Sanitized
+/// close failure from either the adopted adapter or a late rejected adapter is
+/// returned after all joined work settles.
 #[derive(Clone)]
 pub struct RetirementWaiter {
     retirement_id: Option<u64>,
     outcome: watch::Receiver<RetirementOutcome>,
+    settlements: Vec<Arc<ConnectSettlement>>,
 }
 
 impl RetirementWaiter {
@@ -640,7 +727,16 @@ impl RetirementWaiter {
         Self {
             retirement_id: None,
             outcome,
+            settlements: Vec::new(),
         }
+    }
+
+    fn join_settlement(mut self, generation: u64, settlement: Arc<ConnectSettlement>) -> Self {
+        if self.retirement_id.is_none() {
+            self.retirement_id = Some(generation);
+        }
+        self.settlements.push(settlement);
+        self
     }
 
     pub const fn retirement_id(&self) -> Option<u64> {
@@ -649,18 +745,30 @@ impl RetirementWaiter {
 
     pub fn is_complete(&self) -> bool {
         matches!(*self.outcome.borrow(), RetirementOutcome::Finished(_))
+            && self
+                .settlements
+                .iter()
+                .all(|settlement| settlement.active() == 0)
     }
 
     pub async fn wait(mut self) -> Option<SourceFailure> {
-        loop {
+        let base_failure = loop {
             let outcome = *self.outcome.borrow_and_update();
             if let RetirementOutcome::Finished(failure) = outcome {
-                return failure;
+                break failure;
             }
             if self.outcome.changed().await.is_err() {
-                return Some(SourceFailure::disconnect(FailureCategory::Backend));
+                break Some(SourceFailure::disconnect(FailureCategory::Backend));
             }
+        };
+        for settlement in &self.settlements {
+            settlement.wait().await;
         }
+        base_failure.or_else(|| {
+            self.settlements
+                .iter()
+                .find_map(|settlement| settlement.close_failure())
+        })
     }
 }
 
@@ -698,6 +806,7 @@ struct RegistryInner<A: LifecycleAdapter + ?Sized, S> {
     runtime: Handle,
     tracker: Arc<OperationTracker>,
     changes: broadcast::Sender<RevisionedLifecycleChange>,
+    invalidations: watch::Sender<u64>,
     state: Mutex<RegistryState<A, S>>,
     external_handles: AtomicUsize,
 }
@@ -744,6 +853,8 @@ struct RetirementJob<A: LifecycleAdapter + ?Sized, S> {
     retirement_id: u64,
     adapter: Option<ConstructedAdapter<A>>,
     participant: Option<OperationParticipant>,
+    settlement_participant: Option<OperationParticipant>,
+    settlement: Option<Arc<ConnectSettlement>>,
     completed: bool,
     waiter: RetirementWaiter,
 }
@@ -763,8 +874,12 @@ where
             return;
         }
         self.completed = true;
+        if let (Some(settlement), Err(category)) = (&self.settlement, result) {
+            settlement.record_close_failure(category);
+        }
         self.inner
             .finish_retirement(self.retirement_id, result, &mut self.participant);
+        self.settlement_participant.take();
     }
 }
 
@@ -772,11 +887,15 @@ impl<A: LifecycleAdapter + ?Sized, S> Drop for RetirementJob<A, S> {
     fn drop(&mut self) {
         if !self.completed {
             self.completed = true;
+            if let Some(settlement) = &self.settlement {
+                settlement.record_close_failure(FailureCategory::Backend);
+            }
             self.inner.finish_retirement(
                 self.retirement_id,
                 Err(FailureCategory::Backend),
                 &mut self.participant,
             );
+            self.settlement_participant.take();
         }
     }
 }
@@ -810,6 +929,8 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
                 entry.failure = None;
                 entry.refresh_failures.clear();
                 entry.disconnect_retirement = None;
+                entry.disconnect_waiter = None;
+                entry.connect_settlements.clear();
                 entry.state = SourceState::Retired;
             }
         }
@@ -856,6 +977,7 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
             .revision
             .checked_add(1)
             .expect("source lifecycle revision exhausted");
+        self.invalidations.send_replace(state.revision);
         if let Some(entry) = state.entries.get_mut(&source_id) {
             entry.revision = state.revision;
         }
@@ -864,6 +986,35 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
             source_id,
             change,
         });
+    }
+
+    fn source_is_prunable(state: &RegistryState<A, S>, source_id: SourceId) -> bool {
+        state.entries.get(&source_id).is_some_and(|entry| {
+            entry.state == SourceState::Retired
+                && entry.provenance.is_empty()
+                && entry.active.is_none()
+                && entry.connect.is_none()
+                && entry.refreshes.is_empty()
+                && entry.disconnect_retirement.is_none()
+                && entry
+                    .disconnect_waiter
+                    .as_ref()
+                    .is_none_or(RetirementWaiter::is_complete)
+                && entry
+                    .connect_settlements
+                    .values()
+                    .all(|settlement| settlement.active() == 0)
+                && entry.retirement_ids.is_empty()
+        })
+    }
+
+    fn prune_source_locked(&self, state: &mut RegistryState<A, S>, source_id: SourceId) -> bool {
+        if !Self::source_is_prunable(state, source_id) {
+            return false;
+        }
+        self.publish_locked(state, source_id, LifecycleChange::Pruned);
+        state.entries.remove(&source_id);
+        true
     }
 
     fn transition_locked(
@@ -1023,7 +1174,10 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
             waiter: RetirementWaiter {
                 retirement_id: Some(retirement_id),
                 outcome: outcome_receiver,
+                settlements: Vec::new(),
             },
+            settlement_participant: None,
+            settlement: None,
         }
     }
 
@@ -1037,6 +1191,7 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
             .map(|record| RetirementWaiter {
                 retirement_id: Some(retirement_id),
                 outcome: record.outcome.subscribe(),
+                settlements: Vec::new(),
             })
     }
 
@@ -1145,7 +1300,7 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
         source_id: SourceId,
         generation: u64,
         policy: ConstructionCancellationPolicy,
-    ) -> Option<OperationParticipant> {
+    ) -> Option<(OperationParticipant, OperationParticipant)> {
         let mut state = lock(&self.state);
         if state.gate != RegistryGate::Running {
             return None;
@@ -1156,7 +1311,13 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
             .and_then(|entry| entry.connect.as_mut())
             .filter(|operation| operation.generation == generation)?;
         operation.abortable = policy.abortable();
-        Some(self.tracker.participate())
+        let settlement = Arc::clone(
+            operation
+                .settlement
+                .as_ref()
+                .expect("connect operation owns settlement tracker"),
+        );
+        Some((self.tracker.participate(), settlement.participate()))
     }
 
     fn register_refresh_task(
@@ -1492,7 +1653,7 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
     }
 }
 
-/// Unwired centralized lifecycle authority for every typed `SourceId`.
+/// Centralized lifecycle authority for every typed `SourceId`.
 pub struct SourceLifecycleRegistry<A: LifecycleAdapter + ?Sized, S> {
     inner: Arc<RegistryInner<A, S>>,
 }
@@ -1519,12 +1680,14 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
     /// supplied process-owned runtime.
     pub fn new(runtime: Handle) -> Self {
         let (changes, _receiver) = broadcast::channel(256);
+        let (invalidations, _receiver) = watch::channel(0);
         Self {
             inner: Arc::new(RegistryInner {
                 incarnation: Uuid::new_v4(),
                 runtime,
                 tracker: OperationTracker::new(),
                 changes,
+                invalidations,
                 state: Mutex::new(RegistryState::default()),
                 external_handles: AtomicUsize::new(1),
             }),
@@ -1533,6 +1696,13 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
 
     pub fn subscribe(&self) -> broadcast::Receiver<RevisionedLifecycleChange> {
         self.inner.changes.subscribe()
+    }
+
+    /// Subscribe to the registry-wide invalidation revision. Unlike the
+    /// source-scoped diagnostic event stream, this also advances when the
+    /// global admission gate closes with no live source rows.
+    pub fn subscribe_invalidations(&self) -> watch::Receiver<u64> {
+        self.inner.invalidations.subscribe()
     }
 
     pub fn revision(&self) -> u64 {
@@ -1584,6 +1754,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                     // waiter, but may no longer transition or annotate this
                     // reappeared incarnation.
                     entry.disconnect_retirement = None;
+                    entry.disconnect_waiter = None;
                 }
             }
             std::collections::hash_map::Entry::Vacant(vacant) => {
@@ -1663,26 +1834,51 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
 
     pub fn snapshot(&self, source_id: SourceId) -> Option<LifecycleSnapshot<S>> {
         let state = lock(&self.inner.state);
-        let entry = state.entries.get(&source_id)?;
-        Some(LifecycleSnapshot {
-            revision: entry.revision,
-            state: entry.state,
-            session_epoch: entry.session_epoch(),
-            provenance: entry.provenance.clone(),
-            visibility: entry.provenance.visibility(),
-            retention: entry.provenance.retention(),
-            catalogue: entry.catalogue.clone(),
-            views: entry.views.clone(),
-            failure: entry.failure,
-            refresh_failures: entry.refresh_failures.clone(),
-            pending_connect: entry.connect.as_ref().map(|operation| operation.generation),
-            pending_refreshes: entry
-                .refreshes
-                .iter()
-                .map(|(lane, operation)| (lane.clone(), operation.generation))
-                .collect(),
-            pending_retirements: entry.retirement_ids.len(),
-        })
+        state.entries.get(&source_id).map(Entry::snapshot)
+    }
+
+    /// Read only the current adopted session epoch without cloning catalogue
+    /// or view snapshot handles.
+    pub fn active_session_epoch(&self, source_id: SourceId) -> Option<u64> {
+        let state = lock(&self.inner.state);
+        (state.gate == RegistryGate::Running)
+            .then(|| state.entries.get(&source_id).and_then(Entry::session_epoch))
+            .flatten()
+    }
+
+    /// Validate one accepted catalogue identity without cloning its value.
+    pub fn is_current_catalogue(
+        &self,
+        source_id: SourceId,
+        generation: u64,
+        session_epoch: u64,
+    ) -> bool {
+        let state = lock(&self.inner.state);
+        state.gate == RegistryGate::Running
+            && state
+                .entries
+                .get(&source_id)
+                .and_then(|entry| entry.catalogue.as_ref())
+                .is_some_and(|catalogue| {
+                    catalogue.generation == generation && catalogue.session_epoch == session_epoch
+                })
+    }
+
+    /// Atomically capture the global revision and every logical source.
+    /// A reducer subscribes to monotonic invalidations first, takes this
+    /// baseline, and resnapshots whenever the watched revision advances.
+    pub fn snapshot_all(&self) -> LifecycleBaseline<S> {
+        let state = lock(&self.inner.state);
+        let sources = state
+            .entries
+            .iter()
+            .map(|(source_id, entry)| (*source_id, entry.snapshot()))
+            .collect();
+        LifecycleBaseline {
+            revision: state.revision,
+            shutting_down: state.gate != RegistryGate::Running,
+            sources,
+        }
     }
 
     /// Snapshot the adapter, lease, and epoch in one registry-lock operation.
@@ -1702,14 +1898,16 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         })
     }
 
-    /// Resolve one protected HTTP locator through the exact active adapter,
-    /// then recheck its epoch and lease before attaching the production
-    /// `MediaLease`. This is the migration seam that replaces the standard
-    /// resolver map and DAAP lease map without introducing a second lookup
-    /// authority.
+    /// Resolve one protected HTTP locator through the exact expected adapter
+    /// epoch, then recheck its epoch and lease before attaching the production
+    /// `MediaLease`. Requiring the caller's captured epoch prevents a queued
+    /// reference from being resolved against a later same-source session.
+    /// This is the migration seam that replaces the standard resolver map and
+    /// DAAP lease map without introducing a second lookup authority.
     pub async fn resolve_http<F, Fut>(
         &self,
         source_id: SourceId,
+        expected_session_epoch: u64,
         resolve: F,
     ) -> BackendResult<ResolvedHttpRequest>
     where
@@ -1722,6 +1920,11 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                 "source session unavailable"
             ))
         })?;
+        if session.session_epoch != expected_session_epoch {
+            return Err(crate::architecture::error::BackendError::Internal(
+                anyhow::anyhow!("source session changed before media resolution"),
+            ));
+        }
         let epoch = session.session_epoch;
         let lease = session.lease.clone();
         let request = resolve(session.adapter).await?;
@@ -1741,10 +1944,12 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
     }
 
     /// Optional-artwork form of [`Self::resolve_http`] with the same exact
-    /// post-resolution epoch/lease recheck.
+    /// pre-resolution expected-epoch check and post-resolution epoch/lease
+    /// recheck.
     pub async fn resolve_optional_http<F, Fut>(
         &self,
         source_id: SourceId,
+        expected_session_epoch: u64,
         resolve: F,
     ) -> BackendResult<Option<ResolvedHttpRequest>>
     where
@@ -1757,6 +1962,11 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                 "source session unavailable"
             ))
         })?;
+        if session.session_epoch != expected_session_epoch {
+            return Err(crate::architecture::error::BackendError::Internal(
+                anyhow::anyhow!("source session changed before media resolution"),
+            ));
+        }
         let epoch = session.session_epoch;
         let lease = session.lease.clone();
         let request = resolve(session.adapter).await?;
@@ -1795,17 +2005,29 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             // the reconnecting entry.
             entry.disconnect_retirement = None;
         }
+        // A reconnect is a new foreground incarnation. Any predecessor
+        // disconnect waiter remains valid through its own cloned settlement
+        // trackers, but must not be reused by a later disconnect.
+        entry.disconnect_waiter = None;
+        entry
+            .connect_settlements
+            .retain(|_, settlement| settlement.active() != 0);
         let displaced_generation = entry.connect.as_ref().map(|operation| operation.generation);
         if let Some(previous) = entry.connect.take() {
             RegistryInner::<A, S>::cancel_pending(previous);
         }
         let (cancellation, observer) = CancellationSwitch::pair();
+        let settlement = ConnectSettlement::new();
+        entry
+            .connect_settlements
+            .insert(generation, Arc::clone(&settlement));
         entry.connect = Some(PendingOperation {
             generation,
             session_epoch: None,
             cancellation,
             abort: None,
             abortable: true,
+            settlement: Some(Arc::clone(&settlement)),
         });
         let session_epoch = entry.session_epoch();
         if let Some(generation) = displaced_generation {
@@ -1837,6 +2059,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             source_id,
             generation,
             cancellation: observer,
+            settlement,
             completed: false,
         })
     }
@@ -1882,6 +2105,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                 cancellation,
                 abort: None,
                 abortable: true,
+                settlement: None,
             },
         );
         if let Some(generation) = displaced_generation {
@@ -1989,8 +2213,9 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         true
     }
 
-    /// Synchronously revoke operation and media authority, then start one
-    /// registry-owned close for the exact adopted adapter if present.
+    /// Synchronously revoke operation and media authority, start one
+    /// registry-owned close for the exact adopted adapter if present, and join
+    /// every spawned connect generation which can still return a late adapter.
     pub fn disconnect(&self, source_id: SourceId) -> Option<RetirementWaiter>
     where
         S: Send + Sync + 'static,
@@ -1999,37 +2224,94 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         if state.gate != RegistryGate::Running || !state.entries.contains_key(&source_id) {
             return None;
         }
-        if let Some(retirement_id) = state
+        if let Some(waiter) = state
             .entries
             .get(&source_id)
-            .and_then(|entry| entry.disconnect_retirement)
+            .and_then(|entry| entry.disconnect_waiter.clone())
         {
-            return RegistryInner::retirement_waiter_locked(&state, retirement_id);
+            return Some(waiter);
         }
         let jobs = self.disconnect_locked(&mut state, source_id, false);
-        let waiter = jobs.first().map(RetirementJob::waiter).or_else(|| {
-            let latest_disconnect = state
-                .entries
-                .get(&source_id)
-                .into_iter()
-                .flat_map(|entry| entry.retirement_ids.iter().copied())
-                .filter(|retirement_id| {
-                    state
-                        .retirements
-                        .get(retirement_id)
-                        .is_some_and(|record| record.purpose == RetirementPurpose::Disconnect)
+        let waiter = state
+            .entries
+            .get(&source_id)
+            .and_then(|entry| entry.disconnect_waiter.clone())
+            .or_else(|| {
+                // A reconnect can dissociate an older foreground close before
+                // adopting a successor. Disconnecting that still-unadopted
+                // reconnect continues to join the one close already in flight.
+                let latest_disconnect = state
+                    .entries
+                    .get(&source_id)
+                    .into_iter()
+                    .flat_map(|entry| entry.retirement_ids.iter().copied())
+                    .filter(|retirement_id| {
+                        state
+                            .retirements
+                            .get(retirement_id)
+                            .is_some_and(|record| record.purpose == RetirementPurpose::Disconnect)
+                    })
+                    .max();
+                latest_disconnect.and_then(|retirement_id| {
+                    RegistryInner::retirement_waiter_locked(&state, retirement_id)
                 })
-                .max();
-            latest_disconnect.and_then(|retirement_id| {
-                RegistryInner::retirement_waiter_locked(&state, retirement_id)
             })
-        });
-        let waiter = waiter.unwrap_or_else(RetirementWaiter::completed);
+            .unwrap_or_else(RetirementWaiter::completed);
+        if !waiter.is_complete() {
+            state
+                .entries
+                .get_mut(&source_id)
+                .expect("disconnect entry retained")
+                .disconnect_waiter = Some(waiter.clone());
+        }
         drop(state);
         for job in jobs {
             self.inner.spawn_retirement(job);
         }
         Some(waiter)
+    }
+
+    /// Return a join-only waiter for an already-started foreground
+    /// disconnect. This never cancels a successor operation or initiates a new
+    /// disconnect, so production pruning can safely race reappearance.
+    pub fn current_disconnect_waiter(&self, source_id: SourceId) -> Option<RetirementWaiter> {
+        let state = lock(&self.inner.state);
+        state
+            .entries
+            .get(&source_id)
+            .and_then(|entry| entry.disconnect_waiter.clone())
+            .filter(|waiter| !waiter.is_complete())
+    }
+
+    /// Arrange lifecycle-owned cleanup after the disconnect already started
+    /// by a final provenance release. This never initiates or cancels work.
+    /// The maintenance task captures only the internal Arc, so it cannot
+    /// suppress last-external-handle fail-closed teardown.
+    pub fn schedule_prune_after_current_retirement(&self, source_id: SourceId)
+    where
+        S: Send + Sync + 'static,
+    {
+        let waiter = {
+            let mut state = lock(&self.inner.state);
+            if self.inner.prune_source_locked(&mut state, source_id) {
+                return;
+            }
+            state
+                .entries
+                .get(&source_id)
+                .and_then(|entry| entry.disconnect_waiter.clone())
+                .filter(|waiter| !waiter.is_complete())
+        };
+        let Some(waiter) = waiter else {
+            return;
+        };
+        let inner = Arc::clone(&self.inner);
+        let runtime = inner.runtime.clone();
+        runtime.spawn(async move {
+            waiter.wait().await;
+            let mut state = lock(&inner.state);
+            inner.prune_source_locked(&mut state, source_id);
+        });
     }
 
     fn disconnect_locked(
@@ -2041,9 +2323,32 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         let Some(entry) = state.entries.get_mut(&source_id) else {
             return Vec::new();
         };
-        if entry.disconnect_retirement.is_some() {
+        let disconnect_in_progress = entry
+            .disconnect_waiter
+            .as_ref()
+            .is_some_and(|waiter| !waiter.is_complete())
+            || entry.disconnect_retirement.is_some();
+        if disconnect_in_progress {
+            if forced_retirement {
+                // A prior explicit disconnect may be settlement-only: there is
+                // no adopted-session retirement callback left to observe the
+                // final provenance release. Record retirement intent now while
+                // preserving the one existing waiter and its exact work.
+                self.inner
+                    .transition_locked(state, source_id, SourceState::Retired);
+            }
             return Vec::new();
         }
+        entry.disconnect_waiter = None;
+        entry
+            .connect_settlements
+            .retain(|_, settlement| settlement.active() != 0);
+        let mut connect_settlements: Vec<_> = entry
+            .connect_settlements
+            .iter()
+            .map(|(generation, settlement)| (*generation, Arc::clone(settlement)))
+            .collect();
+        connect_settlements.sort_unstable_by_key(|(generation, _)| *generation);
         if let Some(connect) = entry.connect.take() {
             RegistryInner::<A, S>::cancel_pending(connect);
         }
@@ -2076,6 +2381,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             self.inner
                 .set_refresh_failure_locked(state, source_id, lane, None, correlation);
         }
+        let mut jobs = Vec::new();
         if let Some(active) = active {
             let job = self.inner.prepare_retirement_locked(
                 state,
@@ -2087,7 +2393,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             );
             self.inner
                 .transition_locked(state, source_id, SourceState::Disconnecting);
-            vec![job]
+            jobs.push(job);
         } else {
             let next = if forced_retirement {
                 SourceState::Retired
@@ -2100,8 +2406,42 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                 }
             };
             self.inner.transition_locked(state, source_id, next);
-            Vec::new()
         }
+
+        let mut waiter =
+            jobs.first()
+                .map(RetirementJob::waiter)
+                .or_else(|| {
+                    // Reconnecting dissociates an older foreground close so it
+                    // cannot mutate the successor row, but a disconnect before
+                    // successor adoption must still join that already-owned close.
+                    let latest_disconnect = state
+                        .entries
+                        .get(&source_id)
+                        .into_iter()
+                        .flat_map(|entry| entry.retirement_ids.iter().copied())
+                        .filter(|retirement_id| {
+                            state.retirements.get(retirement_id).is_some_and(|record| {
+                                record.purpose == RetirementPurpose::Disconnect
+                            })
+                        })
+                        .max();
+                    latest_disconnect.and_then(|retirement_id| {
+                        RegistryInner::retirement_waiter_locked(state, retirement_id)
+                    })
+                })
+                .unwrap_or_else(RetirementWaiter::completed);
+        for (generation, settlement) in connect_settlements {
+            waiter = waiter.join_settlement(generation, settlement);
+        }
+        if !waiter.is_complete() {
+            state
+                .entries
+                .get_mut(&source_id)
+                .expect("disconnect entry retained")
+                .disconnect_waiter = Some(waiter);
+        }
+        jobs
     }
 
     /// Close admission, synchronously cancel/abort every operation and revoke
@@ -2120,6 +2460,14 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             return barrier;
         }
         state.gate = RegistryGate::ShuttingDown;
+        // Closing the global gate is observable even for an empty registry or
+        // one containing only inert retired entries. Reducers use this wakeup
+        // to release their final registry/window references on shutdown.
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .expect("source lifecycle revision exhausted");
+        self.inner.invalidations.send_replace(state.revision);
         let sources: Vec<_> = state.entries.keys().copied().collect();
         for source_id in sources {
             let (active, disconnect_pending, had_snapshots, session_failure, refresh_failure_lanes) = {
@@ -2206,22 +2554,14 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         let mut state = lock(&self.inner.state);
         let candidates: Vec<_> = state
             .entries
-            .iter()
-            .filter_map(|(source_id, entry)| {
-                (entry.state == SourceState::Retired
-                    && entry.provenance.is_empty()
-                    && entry.active.is_none()
-                    && entry.connect.is_none()
-                    && entry.refreshes.is_empty()
-                    && entry.disconnect_retirement.is_none()
-                    && entry.retirement_ids.is_empty())
-                .then_some(*source_id)
+            .keys()
+            .filter_map(|source_id| {
+                RegistryInner::source_is_prunable(&state, *source_id).then_some(*source_id)
             })
             .collect();
         for source_id in &candidates {
-            self.inner
-                .publish_locked(&mut state, *source_id, LifecycleChange::Pruned);
-            state.entries.remove(source_id);
+            let pruned = self.inner.prune_source_locked(&mut state, *source_id);
+            debug_assert!(pruned);
         }
         candidates.len()
     }
@@ -2290,6 +2630,7 @@ pub struct ConnectOwner<A: LifecycleAdapter + ?Sized, S> {
     source_id: SourceId,
     generation: u64,
     cancellation: CancellationObserver,
+    settlement: Arc<ConnectSettlement>,
     completed: bool,
 }
 
@@ -2435,14 +2776,20 @@ impl<A: LifecycleAdapter + ?Sized, S> ConnectOwner<A, S> {
                 lease,
             }
         } else {
-            jobs.push(self.inner.prepare_retirement_locked(
+            let mut job = self.inner.prepare_retirement_locked(
                 &mut state,
                 self.source_id,
                 None,
                 Some(adapter),
                 RetirementPurpose::Rejected,
                 false,
-            ));
+            );
+            // Transfer exact connect-settlement ownership before the task's
+            // participant can drop. A disconnect waiter therefore observes no
+            // zero-count gap between protected construction and late close.
+            job.settlement_participant = Some(self.settlement.participate());
+            job.settlement = Some(Arc::clone(&self.settlement));
+            jobs.push(job);
             ConnectSubmission::Rejected
         };
         self.completed = true;
@@ -2489,7 +2836,7 @@ impl<A: LifecycleAdapter + ?Sized, S> ConnectOwner<A, S> {
                     .as_ref()
                     .is_some_and(|operation| operation.generation == self.generation)
             });
-        let job = self.inner.prepare_retirement_locked(
+        let mut job = self.inner.prepare_retirement_locked(
             &mut state,
             self.source_id,
             None,
@@ -2497,6 +2844,10 @@ impl<A: LifecycleAdapter + ?Sized, S> ConnectOwner<A, S> {
             RetirementPurpose::Rejected,
             false,
         );
+        // The staged adapter's mandatory close is part of the exact connect
+        // settlement. Enroll it before the enclosing connect task can finish.
+        job.settlement_participant = Some(self.settlement.participate());
+        job.settlement = Some(Arc::clone(&self.settlement));
         if current {
             state
                 .entries
@@ -2570,7 +2921,8 @@ impl<A: LifecycleAdapter + ?Sized, S> ConnectOwner<A, S> {
         let generation = self.generation;
         let incarnation = self.incarnation;
         let authentication_cancellation = self.cancellation();
-        let Some(participant) =
+        let settlement_cleanup = Arc::clone(&self.settlement);
+        let Some((participant, settlement_participant)) =
             inner.register_connect_task(source_id, generation, construction_policy)
         else {
             self.cancel();
@@ -2579,10 +2931,26 @@ impl<A: LifecycleAdapter + ?Sized, S> ConnectOwner<A, S> {
                 request_cancellation: None,
             };
         };
+        let cleanup_inner = Arc::clone(&inner);
+        inner.runtime.spawn(async move {
+            settlement_cleanup.wait().await;
+            let mut state = lock(&cleanup_inner.state);
+            let Some(entry) = state.entries.get_mut(&source_id) else {
+                return;
+            };
+            let is_exact = entry
+                .connect_settlements
+                .get(&generation)
+                .is_some_and(|current| Arc::ptr_eq(current, &settlement_cleanup));
+            if is_exact {
+                entry.connect_settlements.remove(&generation);
+            }
+        });
         let task_inner = Arc::clone(&inner);
         let (start_task, task_started) = oneshot::channel();
         let join = inner.runtime.spawn(async move {
             let _participant = participant;
+            let _settlement_participant = settlement_participant;
             if task_started.await.is_err() {
                 return;
             }
@@ -3683,6 +4051,223 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnect_waiter_joins_protected_constructor_and_rejected_close() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        claim(&registry, source_id, SourceProvenance::Saved);
+        let mut fixture = AdapterFixture::held();
+        let adapter = fixture.take_raw();
+        let catalogue_calls = Arc::new(AtomicUsize::new(0));
+        let catalogue_calls_task = Arc::clone(&catalogue_calls);
+        let (constructor_started, constructor_started_rx) = oneshot::channel();
+        let (finish_constructor, finish_constructor_rx) = oneshot::channel();
+        let _operation = registry
+            .begin_connect(source_id)
+            .expect("connect")
+            .spawn_staged(
+                ConstructionCancellationPolicy::FinishConstruction,
+                move |cancellation| async move {
+                    let _ = constructor_started.send(());
+                    let _ = finish_constructor_rx.await;
+                    assert!(cancellation.is_cancelled());
+                    AdapterTaskResult::constructed(adapter)
+                },
+                move |_adapter, _cancellation| async move {
+                    catalogue_calls_task.fetch_add(1, Ordering::AcqRel);
+                    RefreshTaskResult::Refreshed(Vec::new())
+                },
+            );
+        constructor_started_rx.await.expect("constructor started");
+
+        let waiter = registry.disconnect(source_id).expect("disconnect");
+        let repeated = registry.disconnect(source_id).expect("repeated disconnect");
+        assert_eq!(waiter.retirement_id(), repeated.retirement_id());
+        assert!(!waiter.is_complete());
+        assert!(!repeated.is_complete());
+
+        finish_constructor.send(()).expect("finish constructor");
+        fixture.probe.wait_for_calls(1).await;
+        assert_eq!(catalogue_calls.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.probe.calls(), 1);
+        assert!(!waiter.is_complete());
+        assert!(!repeated.is_complete());
+
+        fixture.allow_close();
+        let (left, right) = tokio::join!(waiter.wait(), repeated.wait());
+        assert_eq!(left, None);
+        assert_eq!(right, None);
+        assert_eq!(fixture.probe.calls(), 1);
+        assert_eq!(
+            registry.snapshot(source_id).expect("source").state,
+            SourceState::Dormant
+        );
+        assert!(registry.shutdown().is_complete());
+    }
+
+    #[tokio::test]
+    async fn disconnect_waiter_joins_superseded_and_current_protected_settlements() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        claim(&registry, source_id, SourceProvenance::Saved);
+        let mut superseded = AdapterFixture::held();
+        let mut current = AdapterFixture::held();
+        let superseded_adapter = superseded.take_raw();
+        let current_adapter = current.take_raw();
+        let catalogue_calls = Arc::new(AtomicUsize::new(0));
+
+        let (superseded_started, superseded_started_rx) = oneshot::channel();
+        let (finish_superseded, finish_superseded_rx) = oneshot::channel();
+        let superseded_catalogue_calls = Arc::clone(&catalogue_calls);
+        let _superseded_operation = registry
+            .begin_connect(source_id)
+            .expect("superseded connect")
+            .spawn_staged(
+                ConstructionCancellationPolicy::FinishConstruction,
+                move |cancellation| async move {
+                    let _ = superseded_started.send(());
+                    let _ = finish_superseded_rx.await;
+                    assert!(cancellation.is_cancelled());
+                    AdapterTaskResult::constructed(superseded_adapter)
+                },
+                move |_adapter, _cancellation| async move {
+                    superseded_catalogue_calls.fetch_add(1, Ordering::AcqRel);
+                    RefreshTaskResult::Refreshed(Vec::new())
+                },
+            );
+        superseded_started_rx
+            .await
+            .expect("superseded constructor started");
+
+        let (current_started, current_started_rx) = oneshot::channel();
+        let (finish_current, finish_current_rx) = oneshot::channel();
+        let current_catalogue_calls = Arc::clone(&catalogue_calls);
+        let _current_operation = registry
+            .begin_connect(source_id)
+            .expect("current connect")
+            .spawn_staged(
+                ConstructionCancellationPolicy::FinishConstruction,
+                move |cancellation| async move {
+                    let _ = current_started.send(());
+                    let _ = finish_current_rx.await;
+                    assert!(cancellation.is_cancelled());
+                    AdapterTaskResult::constructed(current_adapter)
+                },
+                move |_adapter, _cancellation| async move {
+                    current_catalogue_calls.fetch_add(1, Ordering::AcqRel);
+                    RefreshTaskResult::Refreshed(Vec::new())
+                },
+            );
+        current_started_rx
+            .await
+            .expect("current constructor started");
+
+        let waiter = registry.disconnect(source_id).expect("disconnect current");
+        assert!(!waiter.is_complete());
+        finish_current.send(()).expect("finish current constructor");
+        current.probe.wait_for_calls(1).await;
+        finish_superseded
+            .send(())
+            .expect("finish superseded constructor");
+        superseded.probe.wait_for_calls(1).await;
+        assert_eq!(catalogue_calls.load(Ordering::Acquire), 0);
+
+        current.allow_close();
+        current.probe.wait_for_completions(1).await;
+        assert!(
+            !waiter.is_complete(),
+            "late superseded close remains part of the exact disconnect"
+        );
+        superseded.allow_close();
+        assert_eq!(waiter.wait().await, None);
+        assert_eq!(superseded.probe.calls(), 1);
+        assert_eq!(current.probe.calls(), 1);
+        assert!(registry.shutdown().is_complete());
+    }
+
+    #[tokio::test]
+    async fn disconnect_waiter_reports_late_rejected_adapter_close_failure() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        claim(&registry, source_id, SourceProvenance::Saved);
+        let mut fixture = AdapterFixture::failing(FailureCategory::Timeout);
+        let adapter = fixture.take_raw();
+        let (constructor_started, constructor_started_rx) = oneshot::channel();
+        let (finish_constructor, finish_constructor_rx) = oneshot::channel();
+        let _operation = registry
+            .begin_connect(source_id)
+            .expect("connect")
+            .spawn_staged(
+                ConstructionCancellationPolicy::FinishConstruction,
+                move |cancellation| async move {
+                    let _ = constructor_started.send(());
+                    let _ = finish_constructor_rx.await;
+                    assert!(cancellation.is_cancelled());
+                    AdapterTaskResult::constructed(adapter)
+                },
+                |_adapter, _cancellation| async { RefreshTaskResult::Refreshed(Vec::new()) },
+            );
+        constructor_started_rx.await.expect("constructor started");
+
+        let waiter = registry.disconnect(source_id).expect("disconnect");
+        assert!(!waiter.is_complete());
+        finish_constructor.send(()).expect("finish constructor");
+        assert_eq!(
+            waiter.wait().await,
+            Some(SourceFailure::disconnect(FailureCategory::Timeout))
+        );
+        assert_eq!(fixture.probe.calls(), 1);
+        assert!(registry.shutdown().is_complete());
+    }
+
+    #[tokio::test]
+    async fn final_claim_release_prunes_after_settlement_only_disconnect() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let saved = claim(&registry, source_id, SourceProvenance::Saved);
+        let mut fixture = AdapterFixture::held();
+        let adapter = fixture.take_raw();
+        let (constructor_started, constructor_started_rx) = oneshot::channel();
+        let (finish_constructor, finish_constructor_rx) = oneshot::channel();
+        let _operation = registry
+            .begin_connect(source_id)
+            .expect("connect")
+            .spawn_staged(
+                ConstructionCancellationPolicy::FinishConstruction,
+                move |cancellation| async move {
+                    let _ = constructor_started.send(());
+                    let _ = finish_constructor_rx.await;
+                    assert!(cancellation.is_cancelled());
+                    AdapterTaskResult::constructed(adapter)
+                },
+                |_adapter, _cancellation| async { RefreshTaskResult::Refreshed(Vec::new()) },
+            );
+        constructor_started_rx.await.expect("constructor started");
+
+        let waiter = registry.disconnect(source_id).expect("explicit disconnect");
+        assert!(!waiter.is_complete());
+        assert!(registry.release_provenance(source_id, saved));
+        assert_eq!(
+            registry.snapshot(source_id).expect("retiring source").state,
+            SourceState::Retired
+        );
+        registry.schedule_prune_after_current_retirement(source_id);
+
+        finish_constructor.send(()).expect("finish constructor");
+        fixture.probe.wait_for_calls(1).await;
+        assert!(!waiter.is_complete());
+        fixture.allow_close();
+        assert_eq!(waiter.wait().await, None);
+        timeout(Duration::from_secs(2), async {
+            while registry.snapshot(source_id).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("settled provenance-free source pruned");
+        assert!(registry.shutdown().is_complete());
+    }
+
+    #[tokio::test]
     async fn protected_constructor_supersession_waits_then_retires_without_catalogue() {
         let registry = registry();
         let source_id = SourceId::random();
@@ -4131,6 +4716,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_disconnect_joins_dissociated_predecessor_and_protected_constructor() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        claim(&registry, source_id, SourceProvenance::Saved);
+        let mut predecessor = AdapterFixture::held();
+        let mut reconnect = AdapterFixture::held();
+        adopt(&registry, source_id, &mut predecessor, Vec::new());
+        let predecessor_waiter = registry
+            .disconnect(source_id)
+            .expect("predecessor disconnect");
+
+        let reconnect_adapter = reconnect.take_raw();
+        let (constructor_started, constructor_started_rx) = oneshot::channel();
+        let (finish_constructor, finish_constructor_rx) = oneshot::channel();
+        let _operation = registry
+            .begin_connect(source_id)
+            .expect("protected reconnect")
+            .spawn_staged(
+                ConstructionCancellationPolicy::FinishConstruction,
+                move |cancellation| async move {
+                    let _ = constructor_started.send(());
+                    let _ = finish_constructor_rx.await;
+                    assert!(cancellation.is_cancelled());
+                    AdapterTaskResult::constructed(reconnect_adapter)
+                },
+                |_adapter, _cancellation| async { RefreshTaskResult::Refreshed(Vec::new()) },
+            );
+        constructor_started_rx.await.expect("constructor started");
+
+        let composite = registry
+            .disconnect(source_id)
+            .expect("disconnect protected reconnect");
+        assert_eq!(
+            predecessor_waiter.retirement_id(),
+            composite.retirement_id()
+        );
+        finish_constructor.send(()).expect("finish constructor");
+        reconnect.probe.wait_for_calls(1).await;
+        reconnect.allow_close();
+        reconnect.probe.wait_for_completions(1).await;
+        assert!(
+            !composite.is_complete(),
+            "dissociated predecessor close remains part of the reconnect disconnect"
+        );
+
+        predecessor.allow_close();
+        let (predecessor_result, composite_result) =
+            tokio::join!(predecessor_waiter.wait(), composite.wait());
+        assert_eq!(predecessor_result, None);
+        assert_eq!(composite_result, None);
+        assert_eq!(predecessor.probe.calls(), 1);
+        assert_eq!(reconnect.probe.calls(), 1);
+        assert!(registry.shutdown().is_complete());
+    }
+
+    #[tokio::test]
     async fn successor_disconnect_waiter_is_not_completed_by_predecessor_close() {
         let registry = registry();
         let source_id = SourceId::random();
@@ -4306,10 +4947,10 @@ mod tests {
         let source_id = SourceId::random();
         claim(&registry, source_id, SourceProvenance::Saved);
         let mut predecessor = AdapterFixture::held();
-        adopt(&registry, source_id, &mut predecessor, Vec::new());
+        let (predecessor_epoch, _) = adopt(&registry, source_id, &mut predecessor, Vec::new());
 
         let request = registry
-            .resolve_http(source_id, |_adapter| async {
+            .resolve_http(source_id, predecessor_epoch, |_adapter| async {
                 ResolvedHttpRequest::new(
                     url::Url::parse("http://example.test/stream").expect("URL"),
                 )
@@ -4323,7 +4964,7 @@ mod tests {
         let (release_resolution, release_resolution_rx) = oneshot::channel();
         let delayed = tokio::spawn(async move {
             delayed_registry
-                .resolve_http(source_id, move |_adapter| async move {
+                .resolve_http(source_id, predecessor_epoch, move |_adapter| async move {
                     let _ = resolution_started.send(());
                     let _ = release_resolution_rx.await;
                     ResolvedHttpRequest::new(
@@ -4344,6 +4985,51 @@ mod tests {
         assert!(!request.is_active());
         release_resolution.send(()).expect("release resolution");
         assert!(delayed.await.expect("resolution task").is_err());
+        predecessor.allow_close();
+        predecessor.probe.wait_for_completions(1).await;
+        shutdown_immediate(&registry).await;
+    }
+
+    #[tokio::test]
+    async fn media_resolution_rejects_stale_expected_epoch_before_invoking_adapter() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        claim(&registry, source_id, SourceProvenance::Saved);
+        let mut predecessor = AdapterFixture::held();
+        let (predecessor_epoch, predecessor_lease) =
+            adopt(&registry, source_id, &mut predecessor, Vec::new());
+
+        let mut successor = AdapterFixture::immediate();
+        let (successor_epoch, _) = adopt(&registry, source_id, &mut successor, Vec::new());
+        assert_ne!(predecessor_epoch, successor_epoch);
+        assert!(!predecessor_lease.is_active());
+
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let stream_calls_in_resolver = Arc::clone(&stream_calls);
+        let stream = registry
+            .resolve_http(source_id, predecessor_epoch, move |_adapter| async move {
+                stream_calls_in_resolver.fetch_add(1, Ordering::AcqRel);
+                ResolvedHttpRequest::new(
+                    url::Url::parse("http://example.test/stale-stream").expect("URL"),
+                )
+            })
+            .await;
+        assert!(stream.is_err());
+        assert_eq!(stream_calls.load(Ordering::Acquire), 0);
+
+        let artwork_calls = Arc::new(AtomicUsize::new(0));
+        let artwork_calls_in_resolver = Arc::clone(&artwork_calls);
+        let artwork = registry
+            .resolve_optional_http(source_id, predecessor_epoch, move |_adapter| async move {
+                artwork_calls_in_resolver.fetch_add(1, Ordering::AcqRel);
+                Ok(Some(ResolvedHttpRequest::new(
+                    url::Url::parse("http://example.test/stale-artwork").expect("URL"),
+                )?))
+            })
+            .await;
+        assert!(artwork.is_err());
+        assert_eq!(artwork_calls.load(Ordering::Acquire), 0);
+
         predecessor.allow_close();
         predecessor.probe.wait_for_completions(1).await;
         shutdown_immediate(&registry).await;
@@ -4478,5 +5164,261 @@ mod tests {
             .iter()
             .any(|change| matches!(change.change, LifecycleChange::CatalogueAccepted { .. })));
         shutdown_immediate(&registry).await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_then_atomic_baseline_covers_queued_changes_and_next_revision() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let mut changes = registry.subscribe();
+        claim(&registry, source_id, SourceProvenance::Saved);
+
+        let baseline = registry.snapshot_all();
+        assert!(!baseline.shutting_down);
+        assert_eq!(baseline.sources.len(), 1);
+        assert_eq!(baseline.sources[0].0, source_id);
+        assert!(baseline.sources[0]
+            .1
+            .provenance
+            .contains(SourceProvenance::Saved));
+
+        let queued: Vec<_> = std::iter::from_fn(|| changes.try_recv().ok()).collect();
+        assert!(!queued.is_empty());
+        assert!(queued
+            .iter()
+            .all(|change| change.revision <= baseline.revision));
+
+        let owner = registry.begin_connect(source_id).expect("next connect");
+        let next = changes.recv().await.expect("post-baseline change");
+        assert!(next.revision > baseline.revision);
+        drop(owner);
+
+        let barrier = registry.shutdown();
+        let shutdown = registry.snapshot_all();
+        assert!(shutdown.shutting_down);
+        assert!(shutdown.revision >= next.revision);
+        barrier.wait().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_invalidates_empty_registry_observers() {
+        let registry = registry();
+        let mut invalidations = registry.subscribe_invalidations();
+        let baseline = registry.snapshot_all();
+
+        let barrier = registry.shutdown();
+        invalidations
+            .changed()
+            .await
+            .expect("shutdown invalidation remains observable");
+
+        let shutdown = registry.snapshot_all();
+        assert!(shutdown.shutting_down);
+        assert!(shutdown.revision > baseline.revision);
+        assert_eq!(*invalidations.borrow_and_update(), shutdown.revision);
+        barrier.wait().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_invalidates_observer_with_only_inert_retired_entry() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let claim = claim(&registry, source_id, SourceProvenance::Discovery);
+        assert!(registry.release_provenance(source_id, claim));
+        assert_eq!(
+            registry.snapshot(source_id).expect("retired row").state,
+            SourceState::Retired
+        );
+
+        let mut invalidations = registry.subscribe_invalidations();
+        let baseline = registry.snapshot_all();
+        invalidations.borrow_and_update();
+        let barrier = registry.shutdown();
+        invalidations
+            .changed()
+            .await
+            .expect("gate closure wakes inert-retired observer");
+
+        let shutdown = registry.snapshot_all();
+        assert!(shutdown.shutting_down);
+        assert!(shutdown.revision > baseline.revision);
+        barrier.wait().await;
+    }
+
+    #[tokio::test]
+    async fn prune_publishes_new_revision_and_authoritative_absence() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let claim = claim(&registry, source_id, SourceProvenance::Discovery);
+        let mut changes = registry.subscribe();
+        assert!(registry.release_provenance(source_id, claim));
+        let before_prune = registry.snapshot_all().revision;
+
+        assert_eq!(registry.prune_retired(), 1);
+        let after_prune = registry.snapshot_all();
+        assert!(after_prune.revision > before_prune);
+        assert!(after_prune.sources.is_empty());
+
+        let observed: Vec<_> = std::iter::from_fn(|| changes.try_recv().ok()).collect();
+        assert!(observed.iter().any(|change| {
+            change.source_id == source_id
+                && change.revision == after_prune.revision
+                && matches!(change.change, LifecycleChange::Pruned)
+        }));
+        assert!(registry.shutdown().is_complete());
+    }
+
+    #[tokio::test]
+    async fn read_only_disconnect_waiter_cannot_cancel_reappearing_successor() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let saved = claim(&registry, source_id, SourceProvenance::Saved);
+        let mut predecessor = AdapterFixture::held();
+        adopt(&registry, source_id, &mut predecessor, vec!["predecessor"]);
+
+        assert!(registry.release_provenance(source_id, saved));
+        predecessor.probe.wait_for_calls(1).await;
+        let waiter = registry
+            .current_disconnect_waiter(source_id)
+            .expect("existing close waiter");
+
+        let discovery = claim(&registry, source_id, SourceProvenance::Discovery);
+        let successor = registry
+            .begin_connect(source_id)
+            .expect("successor connect");
+        assert!(registry.current_disconnect_waiter(source_id).is_none());
+        assert_eq!(registry.prune_retired(), 0);
+
+        let mut successor_adapter = AdapterFixture::immediate();
+        assert!(matches!(
+            successor.submit_constructed(successor_adapter.take(), vec!["successor"]),
+            ConnectSubmission::Adopted { .. }
+        ));
+        predecessor.allow_close();
+        waiter.wait().await;
+
+        let snapshot = registry.snapshot(source_id).expect("successor retained");
+        assert_eq!(snapshot.state, SourceState::Ready);
+        assert_eq!(
+            snapshot
+                .catalogue
+                .expect("successor catalogue")
+                .value
+                .as_ref(),
+            &vec!["successor"]
+        );
+        assert_eq!(registry.prune_retired(), 0);
+
+        assert!(registry.release_provenance(source_id, discovery));
+        successor_adapter.probe.wait_for_completions(1).await;
+        assert_eq!(registry.prune_retired(), 1);
+        assert!(registry.shutdown().is_complete());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_owned_prune_removes_inert_final_claim_immediately() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let claim = claim(&registry, source_id, SourceProvenance::Discovery);
+
+        assert!(registry.release_provenance(source_id, claim));
+        registry.schedule_prune_after_current_retirement(source_id);
+
+        assert!(registry.snapshot(source_id).is_none());
+        assert!(registry.shutdown().is_complete());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_owned_prune_waits_for_active_retirement() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let claim = claim(&registry, source_id, SourceProvenance::Discovery);
+        let mut adapter = AdapterFixture::held();
+        adopt(&registry, source_id, &mut adapter, vec!["catalogue"]);
+
+        assert!(registry.release_provenance(source_id, claim));
+        registry.schedule_prune_after_current_retirement(source_id);
+        adapter.probe.wait_for_calls(1).await;
+        assert!(registry.snapshot(source_id).is_some());
+
+        adapter.allow_close();
+        adapter.probe.wait_for_completions(1).await;
+        timeout(Duration::from_secs(2), async {
+            while registry.snapshot(source_id).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retired source pruned after close");
+        assert!(registry.shutdown().is_complete());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_owned_prune_rechecks_reappearing_source() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let saved = claim(&registry, source_id, SourceProvenance::Saved);
+        let mut predecessor = AdapterFixture::held();
+        adopt(&registry, source_id, &mut predecessor, vec!["predecessor"]);
+
+        assert!(registry.release_provenance(source_id, saved));
+        registry.schedule_prune_after_current_retirement(source_id);
+        predecessor.probe.wait_for_calls(1).await;
+
+        let discovery = claim(&registry, source_id, SourceProvenance::Discovery);
+        let successor = registry
+            .begin_connect(source_id)
+            .expect("successor connect");
+        let mut successor_adapter = AdapterFixture::immediate();
+        assert!(matches!(
+            successor.submit_constructed(successor_adapter.take(), vec!["successor"]),
+            ConnectSubmission::Adopted { .. }
+        ));
+
+        predecessor.allow_close();
+        predecessor.probe.wait_for_completions(1).await;
+        tokio::task::yield_now().await;
+        let snapshot = registry.snapshot(source_id).expect("successor retained");
+        assert_eq!(snapshot.state, SourceState::Ready);
+        assert!(snapshot.provenance.contains(SourceProvenance::Discovery));
+
+        assert!(registry.release_provenance(source_id, discovery));
+        registry.schedule_prune_after_current_retirement(source_id);
+        successor_adapter.probe.wait_for_completions(1).await;
+        timeout(Duration::from_secs(2), async {
+            while registry.snapshot(source_id).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successor eventually pruned");
+        assert!(registry.shutdown().is_complete());
+    }
+
+    #[tokio::test]
+    async fn prune_maintenance_arc_does_not_suppress_last_handle_teardown() {
+        let registry = registry();
+        let retiring_id = SourceId::random();
+        let active_id = SourceId::random();
+        let retiring_claim = claim(&registry, retiring_id, SourceProvenance::Discovery);
+        claim(&registry, active_id, SourceProvenance::Saved);
+        let mut retiring = AdapterFixture::held();
+        let mut active = AdapterFixture::held();
+        adopt(&registry, retiring_id, &mut retiring, vec!["retiring"]);
+        adopt(&registry, active_id, &mut active, vec!["active"]);
+
+        assert!(registry.release_provenance(retiring_id, retiring_claim));
+        registry.schedule_prune_after_current_retirement(retiring_id);
+        retiring.probe.wait_for_calls(1).await;
+
+        drop(registry);
+        active.probe.wait_for_calls(1).await;
+        assert_eq!(retiring.probe.calls(), 1);
+        assert_eq!(active.probe.calls(), 1);
+
+        retiring.allow_close();
+        active.allow_close();
+        retiring.probe.wait_for_completions(1).await;
+        active.probe.wait_for_completions(1).await;
     }
 }

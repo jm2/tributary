@@ -25,14 +25,14 @@ Status summary:
 - [ ] P2 resilience and packaging complete
 - [ ] P3 architecture and integration coverage complete
 
-Progress snapshot (2026-07-17), recounted from the literal P0–P3 task checkboxes to correct the
+Progress snapshot (2026-07-18), recounted from the literal P0–P3 task checkboxes to correct the
 earlier numerator/denominator drift. The live protected-playback finding recorded under P2.11 now
 has eight independently verifiable tasks rather than the original three compound boxes. The
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**218/223 (97.8%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
-and **28/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**219/223 (98.2%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
+and **29/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -49,14 +49,40 @@ P3.5 now reports every Linux-host source area in one pinned aggregate, keeps dif
 source sets as informational reports, and enforces the baseline accepted by two exact pinned PR
 executions in PR #111.
 
-The current P3.1 partial slice deliberately leaves both centralized production wiring and the final
-implementation-record boxes unchecked, so the literal arithmetic remains **218/223 (97.8%)** and
-P3 remains **28/30**. It compiles an unwired lifecycle authority and fixes its migration contract
-without replacing the shipping standard or DAAP registries. Final local validation after rebasing
-onto merged PR #121 passes all 38 focused lifecycle tests;
-`cargo check --all-targets --all-features --locked`; formatting and diff checks; strict
-all-target/all-feature Clippy in debug and release; and the complete debug and release suites at 20
-library, 842 application, and 10 repository-metadata tests (**872 total per profile**).
+The current P3.1 production cutover closes the centralized refresh/cancellation/disconnect/failure
+box while deliberately leaving the final implementation-record box unchecked, so the literal
+arithmetic is now **219/223 (98.2%)** and P3 is **29/30**. `RemoteSourceRegistry` is the sole
+authenticated-remote lifecycle owner for Subsonic, Jellyfin, Plex, and DAAP. GTK catalogue rows and
+playback queues carry only `SourceId`, exact `TrackId`, and the non-secret publishing session epoch;
+they no longer carry an authenticated resolver URL or lease key. One baseline/watch reducer now
+projects connection, catalogue, sanitized failure, provenance, visibility, cancellation, and
+retirement state into GTK. Exact accepted catalogues clear their pending guard before rebind and
+reactivate an already-selected row once, while stale/superseded catalogues remain inactive;
+selection helpers also release `RefCell` borrows before GTK can synchronously re-enter them.
+Withdrawing Discovery clears the advertised route and revokes route-captured active/pending work
+even when Saved or Environment keeps the logical row visible. Every spawned connect generation has
+an exact settlement joined by the composite disconnect waiter, including superseded generations,
+late rejected-adapter close, and a dissociated predecessor; final-claim release retires and prunes a
+settlement-only disconnect without a second close. DAAP login is staged immediately after `mlid`,
+before update/database/item catalogue work, so cancellation, replacement, malformed catalogue
+responses, disconnect, route loss, and shutdown enter the same exactly-once bounded logout path.
+Interactive Jellyfin login likewise stages its newly minted session token before ping/catalogue work
+and gives registry retirement the only `Sessions/Logout` authority; a safely representable token is
+also logged out best-effort if final client construction fails, while a hostile control-byte token
+fails closed because it cannot safely form the exact logout header. Pre-existing Jellyfin API keys
+and Plex legacy tokens remain non-owned durable credentials. Menu and Ctrl+Q quit requests now close
+the active window through its `close-request` shutdown barrier rather than calling application quit
+directly; only the no-window case takes the direct path. The focused lifecycle module passes all 53
+tests. Locked debug and release suites each pass 20 library, 865 application, and 10
+repository-metadata tests (**895 total**), with locked all-target/all-feature check, strict
+warning-free Clippy, formatting, and diff checks green.
+PR #123's CodeQL follow-up replaces three credential-shaped password literals with runtime-generated
+fixture values, retaining the exact Jellyfin authentication/logout assertions without weakening or
+suppressing hard-coded-secret analysis.
+Comprehensive lifecycle, playback-boundary, reducer, provenance, Jellyfin, and actual-wire DAAP
+regressions cover the cutover. Radio, removable, and OS-opened external media still need
+registry-owned at-use locator adapters, and local embedded-art display still needs retained file
+authority; those keep the final P3.1 implementation record open.
 P3.3 is complete after combining the independently reviewed non-DAAP service fixture from
 `b80e534`, the DAAP adversarial fixture from `6f6c9ac`, and this representative cross-service
 behavior matrix. The matrix exercises rejected authentication, credential-safe authenticated and
@@ -206,6 +232,33 @@ snapshot now binds only the exact root key, marker identity, confirmation, avail
 complete-scan authority fields; its deterministic regression accepts timestamp-only drift and
 rejects each authority-field change independently. This review fix does not alter checklist
 arithmetic.
+The authenticated-remote lifecycle production cutover now closes the central P3.1 box and advances
+the literal total to **219/223 (98.2%)** with P3 at **29/30**. Subsonic, Jellyfin, Plex, and DAAP
+construction, initial catalogue ownership, sanitized failure, at-use resolution, disconnect, and
+shutdown all enter `RemoteSourceRegistry`; the old standard and DAAP registry paths are removed.
+The baseline/watch reducer is the sole GTK projection path for exact generation, epoch, catalogue,
+provenance, visibility, cancellation, and failure state. The exact accepted generation clears its
+pending guard before row rebind/selection and can reactivate its already-selected row once the
+catalogue is authoritative; stale/superseded generations remain inactive, and every synchronous
+selection path drops `RefCell` borrows before GTK signal re-entry. Saved-plus-discovered rows demote
+when the Saved claim is removed, while discovery route withdrawal clears the advertised route and
+revokes route-capturing active or pending work even if Saved/Environment keeps the row visible.
+Disconnect now joins the adopted close, a dissociated predecessor, and the exact settlement of every
+still-running connect generation—including superseded construction and late rejected-adapter close.
+The waiter reports any late close failure as a sanitized disconnect failure, and final claim release
+retires/prunes a settlement-only disconnect without a duplicate close. DAAP login now stops after
+`mlid`, before abortable catalogue work, and all later failure/retirement paths elect the same exact
+logout owner. Interactive Jellyfin stages its minted token before ping/catalogue work and retires it
+through one exact `Sessions/Logout`; if final authenticated-client construction fails after the token
+has a safe header representation, its exact pre-authentication route attempts bounded cleanup.
+Control-byte tokens instead fail closed without echo or unsafe transformed/raw logout, while existing
+Jellyfin API keys and Plex tokens are never mistaken for owned sessions. Menu and Ctrl+Q quit
+requests now close the active window and join its lifecycle shutdown barrier; direct application
+quit remains only for the no-window case. The focused lifecycle suite passes all 53 tests. Locked
+debug and release suites each pass 20 library, 865 application, and 10 repository-metadata tests
+(**895 total**), with locked all-target/all-feature check, strict warning-free Clippy, formatting,
+and diff checks green. The remaining radio/removable/external at-use adapters and local embedded-art
+retained authority keep P3.1's final implementation record open.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -465,19 +518,20 @@ Confirmed path, end to end:
 
 | Step | Location |
 |---|---|
-| Generic catalogue | Subsonic, Jellyfin, and Plex tracks keep `stream_url` and `cover_art_url` empty. Their backend caches retain backend-native stream locators and track-only artwork locators keyed by the exact bounded source-scoped `TrackId`, so a type-local album/artist ID cannot overwrite track art. DAAP continues to publish its already-credential-free live-session references. |
-| Source ownership | `source_registry.rs` retains an `Arc<dyn RemoteMediaResolver>` behind an exact source generation, random lease UUID, and revocable `MediaLease`. A replacement, release, discovery removal, manual deletion, or shutdown invalidates old references and already-resolved requests. DAAP retains its stateful session in its existing generation-scoped registry and now attaches the same revocable-request guarantee to media issued by that session. |
-| GTK publication | A current standard-remote sync is converted to `tributary-remote://<lease>/{stream,artwork}/id-<lowercase-hex-native-id>`. The reversible, non-dot segment contains no source address or credential and cannot path-normalize valid native IDs `.` or `..`; a queued sync is rejected unless its generation and lease still own that source. |
-| Playback and artwork | `ui/playback.rs` resolves the exact opaque standard or DAAP reference only when the item is consumed. Playback generations reject a result completed after Stop, Next, output replacement, or a newer replay; artwork repeats generation and lease checks before and after its worker fetch. |
+| Generic catalogue | Subsonic, Jellyfin, Plex, and DAAP tracks retain stable application identity and exact bounded source-scoped `TrackId`; their registry-owned adapters keep stream/artwork locators, authentication, routes, leases, and DAAP session state private. A type-local Subsonic album/artist ID therefore cannot overwrite track art. |
+| Source ownership | `RemoteSourceRegistry` owns the adapter, exact connection/catalogue generation, non-secret session epoch, random revocable `MediaLease`, immutable catalogue/failure state, and tracked retirement for all four authenticated backends. Replacement, release, discovery-route loss, manual deletion, or shutdown invalidates old media; DAAP's protocol-specific close performs one bounded logout through the same lifecycle. |
+| GTK publication | A current authenticated-remote catalogue is converted to pathless `(SourceId, TrackId, session epoch)` rows. No server address, credential, native locator, authenticated URI, random lease key, or DAAP session key enters the GTK object or playback queue. |
+| Playback and artwork | `ui/playback.rs` asks `RemoteSourceRegistry` to resolve the exact source/track/epoch only when the item is consumed. A stale epoch fails before adapter invocation; adapter, lease, and epoch are rechecked after await, and playback/artwork generations reject completion after Stop, Next, output replacement, or a newer replay. |
 | Credential isolation | `ResolvedHttpRequest` is deliberately non-debuggable and non-serializable. Plex uses a sensitive `X-Plex-Token` header and Jellyfin a sensitive `X-Emby-Authorization` header. Subsonic protocol authentication remains private query material (`u` plus `t`/`s` or HTTPS-only `p`), and DAAP's bearer `session-id` is now private query material too; each is appended only inside the app-owned proxy immediately before the exact-origin fetch. |
 | Output boundary | `AudioOutput::load_resolved` accepts the typed request. Chromecast, MPD, local GStreamer, and AirPlay exchange it for their existing opaque, receiver-reachable tickets; none can fall back to the clean endpoint or serialized credential state. |
 
-The opaque source reference and the output ticket are separate capabilities. The first identifies
-one track through one live app session and is useful only inside Tributary. Resolution produces a
-typed, revocable HTTP request, and only then does the selected output mint a ticket reachable by
-its receiver. Chromecast keeps its LAN IPv4 listener; MPD binds to the successful connection's
-local IP/address family; local `playbin3` and AirPlay `uridecodebin` use dedicated loopback-only
-proxies. All ticket routes use OS-assigned ports and unguessable UUIDs.
+The pathless source/track/epoch tuple and the output ticket are separate capabilities. The first is
+non-secret identity plus freshness evidence useful only inside Tributary; it does not authorize a
+request by itself. Exact current registry resolution produces a typed, revocable HTTP request, and
+only then does the selected output mint a ticket reachable by its receiver. Chromecast keeps its
+LAN IPv4 listener; MPD binds to the successful connection's local IP/address family; local
+`playbin3` and AirPlay `uridecodebin` use dedicated loopback-only proxies. All ticket routes use
+OS-assigned ports and unguessable UUIDs.
 
 - [x] Give the proxy local and upstream registration kinds. Local routes retain a bound path;
   upstream routes accept the legacy/direct `Url` or the current typed `ResolvedHttpRequest`, and
@@ -557,10 +611,10 @@ proxies. All ticket routes use OS-assigned ports and unguessable UUIDs.
 
 Acceptance criteria: no credential belonging to a remote backend is ever transmitted to a
 device or daemon Tributary does not own, retained in a generic catalogue/UI value, or serialized
-through an output boundary. **Complete:** standard remote tracks and GTK rows contain only stable
-identity plus opaque lease references; DAAP retains credential-free live-session references whose
-bearer ID is isolated only in a typed, revocable request at consumption time; all protected
-playback/artwork requests resolve through the current app-owned session and proxy;
+through an output boundary. **Complete:** authenticated-remote tracks and GTK rows contain only
+stable pathless identity plus a non-secret session epoch; DAAP's bearer session ID remains inside
+its registry-owned adapter and enters only a typed, revocable request at consumption time; all
+protected playback/artwork requests resolve through the exact current app-owned session and proxy;
 and Chromecast, MPD, local GStreamer, and AirPlay receive only their scoped tickets. P1.4 and P1.6
 are complete.
 
@@ -1512,16 +1566,21 @@ closed as a milestone.
   Runtime implementation is traceable through `79b9d0c`, `9bf87db`, `8232d90`, `432b66b`, and
   `269eb93`, with the accepted-reconnect follow-up in `4bb27a3` and final persisted-ID/route
   hardening in `208dbf4`; the combined milestone landed in PR #120.
-- [x] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source. P1.6 now
-  retains an `Arc<dyn RemoteMediaResolver>` behind an exact generation and random revocable lease
-  for each standard remote source; the existing DAAP registry retains its stateful live backend.
-- [x] Remove long-lived authenticated URLs from the generic `Track` model. Standard remote
-  catalogue models retain stable app identity and backend-private locators, not stream/artwork
-  requests; DAAP's generic values remain credential-free session references.
-- [x] Resolve remote playable URLs/tickets at playback time. The GTK/queue value is an opaque
-  exact-lease reference; consuming it yields a typed `ResolvedHttpRequest`, and the selected
-  output then mints its receiver-scoped proxy ticket. Stale playback and artwork completions are
-  generation- and lease-rejected.
+- [x] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source. P1.6 first
+  retained standard remote resolvers behind revocable leases; the authenticated-remote production
+  cutover now adopts Subsonic, Jellyfin, Plex, and DAAP adapters into the same
+  `RemoteSourceRegistry` entry with one exact session epoch, media lease, catalogue snapshot, and
+  registry-owned retirement path.
+- [x] Remove long-lived authenticated URLs from the generic `Track` model. Subsonic, Jellyfin,
+  Plex, and DAAP catalogue models retain stable application identity while their registry-owned
+  adapters keep native stream/artwork locators, authentication, routes, media leases, and DAAP
+  session state private.
+- [x] Resolve remote playable URLs/tickets at playback time. Authenticated-remote GTK rows and
+  queues are pathless: they retain `SourceId`, exact `TrackId`, and the non-secret session epoch
+  that published the catalogue. Stream and artwork consumption ask `RemoteSourceRegistry` to
+  resolve that exact epoch into a typed `ResolvedHttpRequest`; a stale epoch is rejected before
+  adapter invocation and the registry rechecks adapter, lease, and epoch after the await. The
+  selected output then mints its receiver-scoped proxy ticket.
 - [x] Resolve local/playlist media by stable track ID at playback, navigation, and receiver-load
   time so fallback reconciliation and outputs cannot retain dead or unauthorized file paths. The
   ADR makes playlists local-library views and confines fallback matching to committed reconciliation.
@@ -1552,49 +1611,68 @@ closed as a milestone.
   symlink-escape, receiver-ticket/revocation, and playlist-invalidation regressions. Embedded-art
   display still hands its UI helper the exact playback-time path rather than retained authority;
   that narrower boundary remains under the unfinished lifecycle/adapters work below.
-- [ ] Centralize source refresh, cancellation, disconnect, and failure state. Generation/lease
-  ownership and source-owned playback retirement are centralized, but environment startup,
-  interactive auth, manual add, refresh publication, and UI failure handling remain separate
-  paths, and DAAP still has a sibling registry because it owns an explicit logout lifecycle. A row
-  that is both discovered and saved also collapses both provenances into `manually_added`: Delete
-  cannot yet demote it to a still-live discovery publication, while discovery loss retires live
-  ownership even if the saved row remains. The ADR defines the target state machine, operation
-  generations, session epochs, provenance, and ownership.
-  The current partial slice adds an intentionally unwired, production-shaped
-  `SourceLifecycleRegistry` foundation. Each entry atomically owns its adapter, the existing
-  production `MediaLease`, and its session epoch. Exact connect/refresh authority carries global
-  generations and cancel-before-wait-safe observation, while only atomically admitted spawned
-  tasks and retirement tasks participate in the persistent shutdown barrier. Unspawned owners and
-  dropped task-cancellation capabilities are inert; they cannot hold shutdown open or start work
-  after admission closes. The last external registry handle also closes the gate, cancels tasks,
-  revokes leases, and starts fail-closed close tasks if ordinary shutdown was omitted.
+- [x] Centralize source refresh, cancellation, disconnect, and failure state. The production
+  `RemoteSourceRegistry` is now the sole adapter/session authority for Subsonic, Jellyfin, Plex,
+  and DAAP across environment startup, interactive authentication, manual Add, discovery,
+  catalogue publication, at-use stream/artwork resolution, disconnect, route loss, deletion, and
+  application shutdown. Each entry atomically owns its adapter, media lease, non-secret session
+  epoch, exact connect/catalogue generations, sanitized failure, immutable snapshot, keyed
+  provenance, and tracked retirement. The old standard/DAAP sibling registries and URL/lease-key
+  UI ownership are gone.
 
-  Framework-owned adapter wrapping and an unforgeable close capability make the registry the sole
-  teardown authority. A `FinishConstruction` phase lets a bounded sessionful login finish safely
-  after cancellation, stages the returned close-capable adapter synchronously, and only then makes
-  catalogue work abortable; staged drop, panic, cancellation, stale submission, replacement,
-  disconnect, and shutdown all enter one exactly-once retirement path. Repeated disconnect shares
-  one exact waiter that cannot wake until entry state/events are finalized and its close task has
-  left the shutdown barrier; reconnect dissociates an old close from successor state without
-  losing its waiter, and a later successor disconnect has a distinct completion. The at-use HTTP
-  bridge snapshots adapter/lease/epoch, rechecks the exact epoch and active lease after resolution,
-  and attaches that lease only to a current result. DAAP production wiring must split the present full
-  constructor: protected server-info/login returns immediately after parsing the session ID and is
-  staged before update, database discovery, items, or initial catalogue work. Using the existing
-  whole `DaapBackend::connect` call as the protected login closure would stage too late.
+  Sessionless standard constructors, protected interactive Jellyfin login, and DAAP's protected
+  constructor enter the same staged lifecycle. Jellyfin synchronously stages an
+  `AuthenticateByName` session token before ping/catalogue work and registry retirement sends the
+  exact `Sessions/Logout`. If the final authenticated HTTP client cannot be built after a safely
+  representable token was minted, the exact pre-authentication route attempts the same bounded
+  best-effort cleanup before returning the original redacted construction failure. A hostile token
+  containing control bytes cannot form the exact authorization header; that narrow case fails
+  closed without echoing, transforming, or sending the value, so no unsafe logout is attempted.
+  Pre-existing Jellyfin API keys and Plex legacy tokens are deliberately treated as non-owned
+  durable credentials. DAAP server-info/login now returns immediately after parsing `mlid`; the
+  registry installs its mandatory close guard before update, database discovery, items, or initial
+  catalogue work. A cancellation or failure after that boundary therefore revokes media and elects
+  exactly one bounded logout owner. Stale, cancelled, panicking, rejected, replaced, disconnected,
+  route-lost, and shutdown results share the framework's exactly-once close path.
 
-  Source-wide and exact `ViewOrigin` lanes retain independent accepted generations and snapshots.
-  Sanitized failure snapshots/events carry the exact generation and optional session epoch;
-  supersession publishes cancellation before the replacement start. Every Saved, Environment,
-  Discovery, BuiltIn, Removable, or External publisher owns an opaque keyed claim, so duplicate
-  publishers are reference-counted and a new claim during close reactivates the source without
-  allowing the old retirement to mutate a successor. Safe pruning admits only inert,
-  provenance-free retired entries. Thirty-eight deterministic tests cover construction-phase and
-  post-stage cancellation, panic, replacement, exact media/refresh ownership, correlated failures,
-  duplicate/reappearing provenance, reusable and successor retirement waiters, late task admission,
-  last-handle teardown, close, per-view, shutdown, and pruning races. No shipping adapter calls this
-  module yet: the standard and DAAP registries remain the sole production owners until follow-on
-  wiring lands, so this box correctly stays open.
+  Each spawned connect generation owns a settlement participant through construction. Before a
+  late adapter can be rejected, ownership transfers into its close job, leaving no false zero-count
+  window. Repeated disconnect callers share one composite waiter that joins the adopted adapter,
+  any dissociated predecessor close, and every still-active connect settlement in generation order,
+  including superseded generations. It completes only after constructors and closes settle and
+  returns a late rejected-adapter failure as a sanitized disconnect failure. A final provenance
+  release marks a settlement-only disconnect `Retired` and schedules lifecycle-owned pruning after
+  the existing waiter, without issuing another cancel or close. Shutdown joins the same admitted
+  work. Menu and Ctrl+Q quit requests close the active window so its `close-request` handler owns and
+  awaits that barrier; only a no-window application quits directly. Stream and artwork resolution
+  require the catalogue's exact epoch before adapter invocation and recheck the current
+  adapter/lease/epoch after asynchronous resolution.
+
+  One atomic lifecycle baseline plus a monotonic invalidation watch now drives a GTK reducer; the
+  UI no longer infers lifecycle authority from row spinners, URLs, or channel closure. Exact
+  generation-correlated cancellation and closed failure categories clear only their owning intent,
+  same-epoch catalogue refresh preserves playback/navigation, and a replacement epoch invalidates
+  stale media before publishing its successor. Catalogue acceptance clears its exact pending guard
+  before any connected-row rebind or selection. If the accepted row was already selected but that
+  guarded rebind did not activate the authoritative catalogue, selection is invalidated and restored
+  to the exact accepted index; stale/superseded catalogues cannot trigger that plan. Programmatic
+  selection and fallback helpers snapshot active navigation keys and release `RefCell` guards before
+  GTK emits synchronous callbacks. Saved, Environment, and Discovery publishers own independent
+  keyed/refcounted claims. Removing Saved demotes a still-discovered row instead of deleting it;
+  removing Discovery clears its advertised route and revokes any route-bound active or pending
+  adapter even when Saved or Environment keeps the logical row visible. The reducer owns the
+  corresponding cache, playback, navigation, and presentation demotion. Hidden or absent snapshots
+  authoritatively clear pending state, cache, playback, navigation, rows, and empty category headers.
+  Lifecycle-owned pruning waits for retirement without a second disconnect mutation.
+
+  Comprehensive deterministic foundation, registry-wrapper, reducer, playback-boundary,
+  provenance, shutdown, Jellyfin session-policy, and actual-wire DAAP tests cover protected login
+  cancellation, supersession, malformed post-login catalogue responses, exact logout, invalid
+  minted-token containment, durable credential non-revocation, stale-epoch stream/artwork rejection,
+  failure correlation, accepted-catalogue activation, demotion/visibility, and retirement races.
+  The focused lifecycle module passes all 53 tests. Locked debug and release suites each pass 20
+  library, 865 application, and 10 repository-metadata tests (**895 total**), with locked
+  all-target/all-feature check, strict warning-free Clippy, formatting, and diff checks green.
 - [x] Decide how local, radio, and external-file sources fit the same lifecycle. Local is one
   always-registered source, playlists are local views, Radio-Browser is one stateless source whose
   feeds are views, removable filesystems are generation-owned sources keyed by their existing
@@ -1608,11 +1686,12 @@ closed as a milestone.
   #86 and PR #113 closed the architecture boxes. PR #120 completes frozen identity types,
   saved-source migration/quarantine, stable source ownership, exact native IDs,
   `MediaKey`/`ViewOrigin` queues, and radio/removable/external identity. PR #121 closes exact
-  local/playlist ID-at-use plus retained root/file authority through every output. The unwired
-  registry foundation now fixes the central state/owner/task/provenance/shutdown API and race
-  contracts without creating split production authority. Standard remote and DAAP lifecycle
-  wiring, remaining source families, at-use radio/removable/external locators, and the local
-  embedded-art authority boundary must still land before P3.1 itself can be recorded complete.
+  local/playlist ID-at-use plus retained root/file authority through every output. PR #122 fixes
+  the central state/owner/task/provenance/shutdown API and race contracts; the following production
+  cutover makes that authority the sole owner for Subsonic, Jellyfin, Plex, and DAAP and moves GTK
+  to pathless epoch-bound catalogue/queue state. Remaining source families, at-use
+  radio/removable/external locators, and the local embedded-art authority boundary must still land
+  before P3.1 itself can be recorded complete.
 
 ### P3.2 Make the backend abstraction real and stable
 
@@ -2033,7 +2112,7 @@ CodeQL and all three static-analysis jobs passed; final Codex review of `91536ab
 issues after both earlier findings were fixed and resolved. P2.10 is complete at 198/223 overall
 and 76/79 P2; P3.5's exact-toolchain acceptance remains recorded by PR #111.
 
-Current local branch validation (2026-07-17, P3.1 local-authority review follow-up):
+PR #121 local branch validation (2026-07-17, P3.1 local-authority review follow-up):
 Gemini correctly identified that the resolver's post-acquisition whole-model comparison included
 `library_roots.last_checked_at`, even though ordinary successful scans refresh that observational
 timestamp and the existing root-trust contract explicitly excludes it from security state. A
@@ -2044,7 +2123,7 @@ every authority field to prove each still rejects. The focused regression passes
 release. `cargo test --all-targets --all-features --locked` passes in debug and release with 20
 library, 804 application, and 10 repository-metadata tests (834 total) per profile. Strict
 all-target/all-feature Clippy passes in debug and release; formatting and diff checks pass. The
-completed-box count remains 218/223 and P3 remains 28/30.
+completed-box count at that milestone was 218/223 and P3 was 28/30.
 
 Earlier local branch validation (2026-07-17, P3.1 stable-identity independent-review follow-up):
 `cargo check --all-targets --all-features --locked`, strict
@@ -2709,7 +2788,9 @@ Record scope or design decisions here so deferred work is explicit.
   and playback-time remote-resolution boxes. The later P3.1 identity milestone supplies stable
   source IDs, exact local/remote IDs, playlist/radio view identity, and removable/external
   identities; PR #121 then closes exact local/playlist ID-at-use and retained output authority.
-  P3.1 still needs centralized refresh/failure/provenance state and at-use
+  The authenticated-remote production cutover subsequently replaces the original standard lease
+  URI and sibling DAAP reference with pathless source/track/epoch queue state, one registry, and
+  centralized refresh/failure/provenance projection. P3.1 still needs at-use
   radio/removable/external locator adapters, including retained authority for local embedded art.
 - 2026-07-15 — A late PR #86 review found that Plex catalogue publication did not distinguish a
   track with no `Media`/`Part.key` from a resolvable track: GTK received a non-empty opaque
@@ -3027,3 +3108,4 @@ Add one line per completed task:
 | 2026-07-17 | P3.1 stable identity CI follow-up | PR #120 | Replaces the failed-atomic-migration fixture's Unix permission manipulation with an injected error at the loader's private save boundary. Privileged containers can bypass `chmod 0500`, but the new cross-platform fixture deterministically proves a failed replacement quarantines the configuration, publishes no migrated rows, and preserves the legacy bytes exactly. The focused regression passes in debug and release; it now also runs on Windows, changes no production migration behavior, and leaves checklist arithmetic unchanged. |
 | 2026-07-17 | P3.1 exact local/playlist ID-at-use and retained output authority | PR #121 | Preserves PR #120's exact SQLite IDs and typed local `MediaKey`/playlist `ViewOrigin`, keeps playback queues pathless, and resolves only the exact current row beneath the most-specific currently configured authoritative root. A typed `ResolvedLocalMedia` lease retains root, marker, ancestor, and exact file handles through local/AirPlay GStreamer, Chromecast, and MPD handle-backed tickets; path replacement cannot retarget admitted playback, explicit-offset full/Range reads cannot interfere through a shared cloned-handle cursor, and load replacement, Stop, error, terminal completion, ticket drop, and teardown revoke future lookup. Shared Chromecast cleanup revokes credential and retained-authority routes without changing the legacy explicit-file server-lifetime contract. Gemini's review follow-up replaced whole-row root equality with a semantic snapshot that ignores observational timestamp drift while binding every root-authority field. All 56 focused root/state recheck, no-fallback, symlink-escape, retained-file replacement, ticket/revocation, output-boundary, and playlist-ownership regressions pass alongside locked all-target check, formatting/diff checks, strict debug/release Clippy, and complete 834-test debug/release suites. Central lifecycle/provenance, nonlocal at-use locator adapters, and the path-based local embedded-art helper remain open. |
 | 2026-07-17 | P3.1 centralized lifecycle foundation (partial) | PR #122 | Adds an intentionally unwired `SourceLifecycleRegistry` with atomic adapter/production-lease/epoch ownership, framework-only construction and unforgeable close authority, phase-safe protected construction plus staged retirement, exact connect/refresh generations, correlated sanitized failures, keyed/refcounted provenance, exact reusable disconnect waiters, post-resolution lease/epoch rechecks, atomic task admission, a persistent shutdown barrier, and final-handle fail-closed teardown. Thirty-eight deterministic adversarial tests cover pre/post-stage cancellation and panic (including synchronous closure invocation), supersession ordering, stale media/refresh rejection, provenance reappearance, reconnect/disconnect close races and waiter/event/barrier finalization, late task admission, replacement, views, shutdown, and pruning. A Windows x86_64 CI interleaving exposed that waiter publication preceded release of the retirement task's barrier participant; the follow-up now finalizes state/events, releases barrier participation, and only then wakes the waiter, so waiter completion and shutdown completion agree. Standard/DAAP/GTK production owners remain unchanged, the DAAP login constructor still needs its required post-session-ID/pre-update split, and the centralization and final implementation boxes remain open. |
+| 2026-07-18 | P3.1 authenticated-remote lifecycle production cutover (partial) | PR #123 | Makes `RemoteSourceRegistry` the sole production owner for Subsonic, Jellyfin, Plex, and DAAP connection, catalogue, media epoch, failure, disconnect, and shutdown state; removes the sibling standard/DAAP registries; and makes GTK consume one atomic baseline/watch reducer. Exact accepted catalogues clear their pending guard before rebind and reactivate an already-selected row only after publication is authoritative; stale generations remain inactive, and programmatic selection releases `RefCell` guards before synchronous GTK re-entry. Independent Saved/Environment/Discovery claims drive demotion and visibility; discovery withdrawal clears its advertised route and revokes route-bound active/pending work even when another claim preserves the row. Per-generation connect settlements let one composite disconnect waiter join superseded construction, late rejected-adapter close, an adopted adapter, and a dissociated predecessor, propagate a sanitized late close failure, and let final-claim release retire/prune without duplicate close. DAAP stages exact close authority after `mlid` and before update/database/items. Interactive Jellyfin stages its owned token before ping/catalogue, cleans up a safely representable token if final client construction fails, never logs out a pre-existing API key, and fails closed without unsafe logout for the narrow control-byte-header case. Menu and Ctrl+Q quit requests enter the active window's shutdown barrier. The focused lifecycle module passes 53 tests; locked debug and release suites each pass 20 library, 865 application, and 10 repository-metadata tests (895 total), with locked check, strict Clippy, formatting, and diff checks green. Radio/removable/external at-use adapters and local embedded-art authority keep the final implementation box open at 219/223 overall and 29/30 P3. |

@@ -67,30 +67,42 @@ daap.songyear,daap.songformat,daap.songbitrate,daap.songsamplerate,\
 daap.songdatemodified";
 
 /// Holds DAAP session state and a reusable `reqwest::Client`.
-#[derive(Clone)]
 pub struct DaapClient {
     base_url: Url,
     session_id: u32,
-    revision: u32,
-    database_id: u32,
     http: Client,
     advertised_route: Option<AdvertisedHttpRoute>,
 }
 
+/// Catalogue coordinates discovered only after a logged-in DAAP session is
+/// under lifecycle ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DaapCatalogueScope {
+    revision: u32,
+    database_id: u32,
+}
+
+impl DaapCatalogueScope {
+    pub(crate) const fn database_id(self) -> u32 {
+        self.database_id
+    }
+}
+
 impl DaapClient {
-    /// Execute the full DAAP handshake and return a connected client.
+    /// Execute the bounded server-info/login phase and return immediately
+    /// after parsing the server-owned session ID.
     ///
     /// # Arguments
     /// * `server_url` — Base URL (e.g. `http://192.168.1.50:3689`)
     /// * `password` — Optional share password (DAAP uses password-only auth)
-    pub async fn connect(server_url: &str, password: Option<&str>) -> BackendResult<Self> {
-        Self::connect_with_route(server_url, password, None).await
+    pub async fn login(server_url: &str, password: Option<&str>) -> BackendResult<Self> {
+        Self::login_with_route(server_url, password, None).await
     }
 
     /// Connect while preserving an mDNS-advertised direct route for this
     /// exact DAAP origin. The URL hostname remains authoritative for HTTP and
     /// TLS; only direct socket resolution uses the retained addresses.
-    pub(crate) async fn connect_with_route(
+    pub(crate) async fn login_with_route(
         server_url: &str,
         password: Option<&str>,
         advertised_route: Option<AdvertisedHttpRoute>,
@@ -183,10 +195,21 @@ impl DaapClient {
 
         info!("DAAP login OK");
 
-        // Once login has minted a server-side session, every remaining
-        // handshake failure must close it. Keeping the session-bound steps in
-        // one result makes that cleanup cover HTTP, body, parse, and semantic
-        // failures without duplicating an easy-to-miss logout branch.
+        Ok(Self {
+            base_url,
+            session_id,
+            http,
+            advertised_route,
+        })
+    }
+
+    /// Discover update/database coordinates for this exact logged-in session.
+    /// The caller must already have placed this client under a staged
+    /// lifecycle guard so every error/cancellation has one close owner.
+    pub(super) async fn discover_catalogue_scope(&self) -> BackendResult<DaapCatalogueScope> {
+        let base_url = &self.base_url;
+        let session_id = self.session_id;
+        let http = &self.http;
         let session_details: BackendResult<(u32, u32)> = async {
             // ── Step C: Update ──────────────────────────────────────
             let update_url = format!(
@@ -281,37 +304,30 @@ impl DaapClient {
         }
         .await;
 
-        let (revision, database_id) = match session_details {
-            Ok(details) => details,
-            Err(error) => {
-                logout_session(&http, &base_url, session_id).await;
-                return Err(error);
-            }
-        };
+        let (revision, database_id) = session_details?;
 
         // ── Step E: Done ────────────────────────────────────────────
         info!(database_id, revision, "DAAP session established");
 
-        Ok(Self {
-            base_url,
-            session_id,
+        Ok(DaapCatalogueScope {
             revision,
             database_id,
-            http,
-            advertised_route,
         })
     }
 
     /// Fetch all tracks from the DAAP library.
     ///
     /// Returns a list of `mlit` node sets, each representing one track.
-    pub async fn fetch_tracks(&self) -> BackendResult<Vec<Vec<DmapNode>>> {
+    pub(super) async fn fetch_tracks(
+        &self,
+        scope: DaapCatalogueScope,
+    ) -> BackendResult<Vec<Vec<DmapNode>>> {
         let url = format!(
             "{}/databases/{}/items?session-id={}&revision-number={}&meta={}",
             self.base_url.as_str().trim_end_matches('/'),
-            self.database_id,
+            scope.database_id,
             self.session_id,
-            self.revision,
+            scope.revision,
             TRACK_META,
         );
         debug!(url = %redact_url_secrets(&url), "DAAP: fetching tracks");
@@ -386,9 +402,13 @@ impl DaapClient {
     /// DAAP serves artwork at `/databases/{db}/items/{id}/extra_data/artwork`.
     /// `mw` and `mh` remain public request-shaping fields. The bearer
     /// `session-id` stays isolated until Tributary performs the request.
-    pub(crate) fn cover_art_request(&self, song_id: u32) -> BackendResult<ResolvedHttpRequest> {
+    pub(super) fn cover_art_request(
+        &self,
+        scope: DaapCatalogueScope,
+        song_id: u32,
+    ) -> BackendResult<ResolvedHttpRequest> {
         let mut endpoint = self.base_url.clone();
-        let database_id = self.database_id.to_string();
+        let database_id = scope.database_id.to_string();
         let song_id = song_id.to_string();
         append_base_path_segments(
             &mut endpoint,
@@ -412,14 +432,15 @@ impl DaapClient {
     ///
     /// The untrusted format is encoded as part of one path segment, and the
     /// bearer `session-id` stays isolated until the app-owned fetch boundary.
-    pub(crate) fn stream_request(
+    pub(super) fn stream_request(
         &self,
+        scope: DaapCatalogueScope,
         song_id: u32,
         format: &str,
     ) -> BackendResult<ResolvedHttpRequest> {
         let mut endpoint = self.base_url.clone();
         let item = format!("{song_id}.{format}");
-        let database_id = self.database_id.to_string();
+        let database_id = scope.database_id.to_string();
         append_base_path_segments(
             &mut endpoint,
             ["databases", database_id.as_str(), "items", item.as_str()],
@@ -440,7 +461,7 @@ impl DaapClient {
     }
 
     /// Send a best-effort logout request to end the DAAP session.
-    pub async fn logout(&self) {
+    pub(crate) async fn logout(&self) {
         logout_session(&self.http, &self.base_url, self.session_id).await;
     }
 
@@ -501,12 +522,6 @@ impl DaapClient {
     /// The active session ID.
     pub fn session_id(&self) -> u32 {
         self.session_id
-    }
-
-    /// The database ID.
-    #[allow(dead_code)]
-    pub fn database_id(&self) -> u32 {
-        self.database_id
     }
 }
 
@@ -722,10 +737,15 @@ mod tests {
         DaapClient {
             base_url: base_url.clone(),
             session_id: 42,
-            revision: 2,
-            database_id: 1,
             http: build_http_client(&base_url, None).expect("DAAP client"),
             advertised_route: None,
+        }
+    }
+
+    const fn scope() -> DaapCatalogueScope {
+        DaapCatalogueScope {
+            revision: 2,
+            database_id: 1,
         }
     }
 
@@ -781,7 +801,7 @@ mod tests {
             server_url.set_path("/share/");
 
             let daap_request = client(server_url.as_str())
-                .stream_request(7, "flac")
+                .stream_request(scope(), 7, "flac")
                 .expect("DAAP stream request");
             assert_eq!(
                 daap_request.private_query_pairs(),
@@ -902,7 +922,9 @@ mod tests {
             ("http://music.test:3689/tenant%2Fmusic/", "/tenant%2Fmusic"),
         ] {
             let client = client(base);
-            let stream = client.stream_request(7, "flac").expect("stream request");
+            let stream = client
+                .stream_request(scope(), 7, "flac")
+                .expect("stream request");
             assert_eq!(
                 stream.endpoint().as_str(),
                 format!("http://music.test:3689{prefix}/databases/1/items/7.flac"),
@@ -910,7 +932,9 @@ mod tests {
             );
             assert_eq!(stream.required_headers(), daap_required_headers());
 
-            let artwork = client.cover_art_request(7).expect("artwork request");
+            let artwork = client
+                .cover_art_request(scope(), 7)
+                .expect("artwork request");
             assert_eq!(
                 artwork.endpoint().as_str(),
                 format!(
@@ -921,7 +945,7 @@ mod tests {
             assert_eq!(artwork.required_headers(), daap_required_headers());
 
             let malicious = client
-                .stream_request(7, "flac/../../logout")
+                .stream_request(scope(), 7, "flac/../../logout")
                 .expect("untrusted format is one segment");
             assert_eq!(
                 malicious.endpoint().as_str(),
@@ -970,14 +994,12 @@ mod tests {
         let client = DaapClient {
             base_url: base_url.clone(),
             session_id: 42,
-            revision: 2,
-            database_id: 1,
             http: build_http_client(&base_url, Some(&route)).expect("routed client"),
             advertised_route: Some(route.clone()),
         };
 
         let stream = client
-            .stream_request(7, "flac/../../logout")
+            .stream_request(scope(), 7, "flac/../../logout")
             .expect("stream request");
         assert_eq!(stream.endpoint().host_str(), Some("mini.local"));
         assert_eq!(stream.endpoint().port(), Some(3689));
@@ -989,7 +1011,9 @@ mod tests {
             &[("session-id".to_string(), "42".to_string())]
         );
 
-        let artwork = client.cover_art_request(7).expect("artwork request");
+        let artwork = client
+            .cover_art_request(scope(), 7)
+            .expect("artwork request");
         assert_eq!(artwork.endpoint().host_str(), Some("mini.local"));
         assert_eq!(
             artwork.endpoint().query_pairs().collect::<Vec<_>>(),

@@ -4,26 +4,16 @@
 //! that appear in the sidebar.
 
 use adw::prelude::*;
-use gtk::glib;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::architecture::{AdvertisedHttpRoute, SourceId};
 use crate::local::engine::LibraryEvent;
 
 use super::objects::SourceObject;
-
-type RemoteConnectResult = Result<
-    Option<(
-        Vec<crate::architecture::models::Track>,
-        crate::source_registry::RetainedSource,
-    )>,
-    (crate::architecture::error::BackendError, bool),
->;
 
 async fn authenticate_manual_jellyfin(
     server_url: &str,
@@ -330,6 +320,7 @@ fn existing_source_id_for_endpoint(
 /// persisted `SourceId`.
 fn upsert_saved_source_in_store(
     store: &gtk::gio::ListStore,
+    selection: Option<&gtk::SingleSelection>,
     saved: &SavedServer,
 ) -> Result<SourceObject, &'static str> {
     for index in 0..store.n_items() {
@@ -351,8 +342,13 @@ fn upsert_saved_source_in_store(
         // SourceObject fields are deliberately plain GTK-side state rather
         // than GObject properties. Reinsert the same object to refresh the
         // list-item binding without creating a second logical owner.
-        store.remove(index);
-        store.insert(index, &source);
+        if let Some(selection) = selection {
+            super::window::rebind_sidebar_source(store, selection, index, &source, true);
+        } else {
+            // Headless model tests do not initialize a GTK selection model.
+            store.remove(index);
+            store.insert(index, &source);
+        }
         return Ok(source);
     }
 
@@ -467,22 +463,29 @@ pub fn add_saved_server(
 }
 
 /// Remove a server from `servers.json` by stable source identity.
-pub fn remove_saved_server(source_id: SourceId) {
+///
+/// `true` means persisted absence was confirmed (either the entry was already
+/// absent or its removal committed). Callers release the Saved provenance
+/// claim only after this succeeds.
+pub fn remove_saved_server(source_id: SourceId) -> bool {
     let Some(path) = servers_json_path() else {
-        return;
+        return false;
     };
     let mut servers = match load_saved_servers_from(&path) {
         SavedServerLoad::Ready(servers) => servers,
-        SavedServerLoad::Quarantined => return,
+        SavedServerLoad::Quarantined => return false,
     };
     let before = servers.len();
     servers.retain(|server| server.source_id != source_id);
-    if servers.len() != before {
-        if save_servers_to(&path, &servers).is_ok() {
-            info!("Server removed from servers.json");
-        } else {
-            warn!("Could not persist saved server removal");
-        }
+    if servers.len() == before {
+        return true;
+    }
+    if save_servers_to(&path, &servers).is_ok() {
+        info!("Server removed from servers.json");
+        true
+    } else {
+        warn!("Could not persist saved server removal");
+        false
     }
 }
 
@@ -592,8 +595,10 @@ pub fn show_auth_dialog(
 pub fn show_add_server_dialog(
     window: &adw::ApplicationWindow,
     sidebar_store: &gtk::gio::ListStore,
+    sidebar_selection: &gtk::SingleSelection,
     engine_tx: &async_channel::Sender<LibraryEvent>,
-    rt_handle: &tokio::runtime::Handle,
+    remote_sources: &crate::source_registry::RemoteSourceRegistry,
+    remote_provenance: &crate::source_registry::ProvenanceClaims,
 ) {
     let dialog = adw::AlertDialog::builder()
         .heading(rust_i18n::t!("dialogs.add_server_heading").as_ref())
@@ -643,8 +648,10 @@ pub fn show_add_server_dialog(
     dialog.set_extra_child(Some(&vbox));
 
     let store = sidebar_store.clone();
+    let selection = sidebar_selection.clone();
     let engine_tx = engine_tx.clone();
-    let rt_handle = rt_handle.clone();
+    let remote_sources = remote_sources.clone();
+    let remote_provenance = remote_provenance.clone();
 
     let url_entry_c = url_entry.clone();
     let user_entry_c = user_entry.clone();
@@ -698,12 +705,20 @@ pub fn show_add_server_dialog(
                 return;
             }
         };
+        if !remote_provenance.ensure(
+            &remote_sources,
+            saved.source_id,
+            crate::source_lifecycle::SourceProvenance::Saved,
+            "saved-config",
+        ) {
+            tracing::debug!("Saved server persisted while remote lifecycle was closing");
+        }
 
         // Publish exactly one owner for this logical endpoint. A discovered
         // row's already-published identity was persisted above, so this path
         // does not mutate or attempt to transfer any identity-keyed route,
         // cache, navigation, playback, or registry state.
-        let saved_source = match upsert_saved_source_in_store(&store, &saved) {
+        let saved_source = match upsert_saved_source_in_store(&store, Some(&selection), &saved) {
             Ok(source) => source,
             Err(message) => {
                 tracing::warn!(error = message, "Manual server source ownership changed");
@@ -716,166 +731,89 @@ pub fn show_add_server_dialog(
         // starts; persistence stores identity and endpoint, never the route.
         let advertised_route = saved_source.advertised_route();
 
-        // One-shot to clear spinner on failure.
-        let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
-        let store_for_fail = store.clone();
-        let source_id_for_fail = saved.source_id;
-        glib::MainContext::default().spawn_local(async move {
-            if fail_rx.recv().await.is_ok() {
-                for i in 0..store_for_fail.n_items() {
-                    if let Some(src) = store_for_fail.item(i).and_downcast_ref::<SourceObject>() {
-                        if src.source_id() == Some(source_id_for_fail) {
-                            src.set_connecting(false);
-                            let src = src.clone();
-                            store_for_fail.remove(i);
-                            store_for_fail.insert(i, &src);
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        // Spawn auth + fetch on tokio.
-        let engine_tx = engine_tx.clone();
         let server_url = saved.url.clone();
         let server_name = saved.name.clone();
         let backend_type = backend_type.to_string();
         let source_id = saved.source_id;
-
-        rt_handle.spawn(async move {
-            let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
-                tracing::debug!("Skipping manual remote connect during shutdown");
-                return;
-            };
-            let result: RemoteConnectResult = match backend_type.as_str() {
-                "jellyfin" => {
-                    info!("Authenticating with Jellyfin (manual)...");
-                    match authenticate_manual_jellyfin(
-                        &server_url,
-                        &user,
-                        &pass,
-                        advertised_route.clone(),
-                    )
-                    .await
-                    {
-                        Ok(client) => {
-                            match crate::jellyfin::JellyfinBackend::from_client(
-                                &server_name,
-                                client,
-                            )
-                            .await
-                            {
-                                Ok(backend) => {
-                                    match crate::architecture::load_track_catalog(&backend).await {
-                                        Ok(tracks) => Ok(attempt
-                                            .retain(Arc::new(backend))
-                                            .filter(
-                                                crate::source_registry::RetainedSource::is_current,
-                                            )
-                                            .map(|source| (tracks, source))),
-                                        Err(error) => Err((error, attempt.is_latest())),
-                                    }
-                                }
-                                Err(e) => Err((e, attempt.is_latest())),
-                            }
-                        }
-                        Err(e) => Err((e, attempt.is_latest())),
-                    }
-                }
-                "plex" => {
-                    info!("Authenticating with Plex (manual)...");
-                    match authenticate_manual_plex(
-                        &server_url,
-                        &user,
-                        &pass,
-                        advertised_route.clone(),
-                    )
-                    .await
-                    {
-                        Ok(client) => {
-                            match crate::plex::PlexBackend::from_client(&server_name, client).await
-                            {
-                                Ok(backend) => {
-                                    match crate::architecture::load_track_catalog(&backend).await {
-                                        Ok(tracks) => Ok(attempt
-                                            .retain(Arc::new(backend))
-                                            .filter(
-                                                crate::source_registry::RetainedSource::is_current,
-                                            )
-                                            .map(|source| (tracks, source))),
-                                        Err(error) => Err((error, attempt.is_latest())),
-                                    }
-                                }
-                                Err(e) => Err((e, attempt.is_latest())),
-                            }
-                        }
-                        Err(e) => Err((e, attempt.is_latest())),
-                    }
-                }
-                _ => {
-                    info!("Authenticating with Subsonic (manual)...");
-                    match connect_manual_subsonic(
-                        &server_name,
-                        &server_url,
-                        &user,
-                        &pass,
-                        advertised_route.clone(),
-                    )
-                    .await
-                    {
-                        Ok(backend) => {
-                            match crate::architecture::load_track_catalog(&backend).await {
-                                Ok(tracks) => Ok(attempt
-                                    .retain(Arc::new(backend))
-                                    .filter(crate::source_registry::RetainedSource::is_current)
-                                    .map(|source| (tracks, source))),
-                                Err(error) => Err((error, attempt.is_latest())),
-                            }
-                        }
-                        Err(e) => Err((e, attempt.is_latest())),
-                    }
-                }
-            };
-
-            match result {
-                Ok(Some((tracks, source))) => {
-                    info!(
-                        backend = %backend_type,
-                        count = tracks.len(),
-                        "Manual server library fetched"
+        let source_for_generation = saved_source.clone();
+        let store_for_generation = store.clone();
+        let selection_for_generation = selection.clone();
+        let on_generation = move |generation| {
+            source_for_generation.set_connecting_generation(generation);
+            for index in 0..store_for_generation.n_items() {
+                let Some(source) = store_for_generation
+                    .item(index)
+                    .and_downcast::<SourceObject>()
+                else {
+                    continue;
+                };
+                if source.source_id() == Some(source_id) {
+                    super::window::rebind_sidebar_source(
+                        &store_for_generation,
+                        &selection_for_generation,
+                        index,
+                        &source_for_generation,
+                        true,
                     );
-                    let _ = engine_tx
-                        .send(LibraryEvent::RemoteSync {
-                            source_id,
-                            generation: source.generation(),
-                            lease_key: source.lease_key(),
-                            tracks,
-                        })
-                        .await;
-                }
-                Ok(None) => tracing::debug!(
-                    backend = %backend_type,
-                    "Manual remote connection was superseded"
-                ),
-                Err((_e, false)) => tracing::debug!(
-                    backend = %backend_type,
-                    "Ignoring superseded manual remote connection failure"
-                ),
-                Err((e, true)) => {
-                    let category = super::source_connect::remote_failure_category(&e);
-                    tracing::error!(
-                        backend = %backend_type,
-                        category = category.as_str(),
-                        "Manual remote source failed"
-                    );
-                    let _ = engine_tx
-                        .send(LibraryEvent::Error(category.user_message(&backend_type)))
-                        .await;
-                    let _ = fail_tx.send(()).await;
+                    return;
                 }
             }
-        });
+            debug_assert!(false, "persisted manual source row remains published");
+        };
+
+        let generation = match backend_type.as_str() {
+            "jellyfin" => remote_sources.connect_jellyfin_session(
+                source_id,
+                on_generation,
+                move || async move {
+                    info!("Authenticating with Jellyfin (manual)...");
+                    let client =
+                        authenticate_manual_jellyfin(&server_url, &user, &pass, advertised_route)
+                            .await?;
+                    Ok(crate::jellyfin::JellyfinBackend::stage_authenticated(
+                        &server_name,
+                        client,
+                    ))
+                },
+            ),
+            "plex" => {
+                remote_sources.connect_standard(source_id, on_generation, move || async move {
+                    info!("Authenticating with Plex (manual)...");
+                    let client =
+                        authenticate_manual_plex(&server_url, &user, &pass, advertised_route)
+                            .await?;
+                    crate::plex::PlexBackend::from_client(&server_name, client).await
+                })
+            }
+            _ => remote_sources.connect_standard(source_id, on_generation, move || async move {
+                info!("Authenticating with Subsonic (manual)...");
+                connect_manual_subsonic(&server_name, &server_url, &user, &pass, advertised_route)
+                    .await
+            }),
+        };
+
+        if generation.is_none() {
+            saved_source.set_connecting(false);
+            for index in 0..store.n_items() {
+                let Some(source) = store.item(index).and_downcast::<SourceObject>() else {
+                    continue;
+                };
+                if source.source_id() == Some(source_id) {
+                    super::window::rebind_sidebar_source(
+                        &store,
+                        &selection,
+                        index,
+                        &saved_source,
+                        true,
+                    );
+                    break;
+                }
+            }
+            tracing::debug!(
+                backend = %backend_type,
+                "Skipping manual remote connect during shutdown or after source retirement"
+            );
+        }
     });
 
     dialog.present(Some(window));
@@ -1196,13 +1134,14 @@ mod tests {
             source_id: SourceId::random(),
         };
 
-        let first = upsert_saved_source_in_store(&store, &saved).expect("first owner");
+        let first = upsert_saved_source_in_store(&store, None, &saved).expect("first owner");
         let equivalent = SavedServer {
             name: "Ignored duplicate name".to_string(),
             url: "https://music.example.test/base".to_string(),
             ..saved.clone()
         };
-        let second = upsert_saved_source_in_store(&store, &equivalent).expect("existing owner");
+        let second =
+            upsert_saved_source_in_store(&store, None, &equivalent).expect("existing owner");
 
         let owners: Vec<_> = (0..store.n_items())
             .filter_map(|index| store.item(index).and_downcast::<SourceObject>())
@@ -1258,7 +1197,8 @@ mod tests {
         let saved = loaded(&path).pop().expect("saved record");
         assert_eq!(saved.source_id, discovered_source_id);
 
-        let promoted = upsert_saved_source_in_store(&store, &saved).expect("promote same owner");
+        let promoted =
+            upsert_saved_source_in_store(&store, None, &saved).expect("promote same owner");
 
         let owner_count = (0..store.n_items())
             .filter_map(|index| store.item(index).and_downcast::<SourceObject>())
@@ -1315,7 +1255,8 @@ mod tests {
             Some(source_id),
         )
         .expect("persist discovered owner"));
-        let promoted = upsert_saved_source_in_store(&store, &servers[0]).expect("promote owner");
+        let promoted =
+            upsert_saved_source_in_store(&store, None, &servers[0]).expect("promote owner");
         let captured_route = promoted
             .advertised_route()
             .expect("promotion retains the discovery route");

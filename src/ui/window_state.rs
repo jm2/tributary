@@ -35,6 +35,12 @@ pub struct WindowState {
     /// Used by: source_connect (RemoteSync after auth).
     pub engine_tx: async_channel::Sender<LibraryEvent>,
 
+    /// Sole lifecycle/media authority for authenticated remote sources.
+    pub remote_sources: crate::source_registry::RemoteSourceRegistry,
+
+    /// Exact Saved/Environment/Discovery claim-token owners on the GTK side.
+    pub remote_provenance: crate::source_registry::ProvenanceClaims,
+
     // ── Track data ──────────────────────────────────────────────────
     /// Backing store for the tracklist `ColumnView`.
     /// Used by: discovery_handler, source_connect, context_menu, window (library events).

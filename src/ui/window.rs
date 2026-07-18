@@ -3,9 +3,8 @@
 //! media controls to the GTK main thread.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -38,7 +37,7 @@ use super::preferences;
 use super::root_trust;
 use super::server_dialogs::{load_saved_servers, remove_saved_server, show_add_server_dialog};
 use super::sidebar;
-use super::source_navigation::{PendingConnection, SourceNavigation};
+use super::source_navigation::{ConnectionIntentKind, PendingConnection, SourceNavigation};
 use super::tracklist;
 use super::window_state::WindowState;
 
@@ -87,7 +86,6 @@ fn remote_source_id(backend_type: &str, server_url: &str) -> crate::architecture
 #[derive(Clone, Copy)]
 struct EnvironmentConnectionAttempt {
     source_id: crate::architecture::SourceId,
-    ui_token: uuid::Uuid,
 }
 
 /// Add an environment-configured row or reuse the saved/discovered owner of
@@ -114,10 +112,8 @@ fn upsert_environment_source(
         let source_id = source
             .source_id()
             .expect("validated remote source has a stable identity");
-        return EnvironmentConnectionAttempt {
-            source_id,
-            ui_token: source.begin_connecting_attempt(),
-        };
+        source.set_connecting(true);
+        return EnvironmentConnectionAttempt { source_id };
     }
 
     ensure_category_header_vec(sources, backend_type);
@@ -125,12 +121,698 @@ fn upsert_environment_source(
     let source_id = source
         .source_id()
         .unwrap_or_else(|| remote_source_id(backend_type, server_url));
-    let ui_token = source.begin_connecting_attempt();
+    source.set_connecting(true);
     sources.push(source);
-    EnvironmentConnectionAttempt {
-        source_id,
-        ui_token,
+    EnvironmentConnectionAttempt { source_id }
+}
+
+fn set_remote_connecting_generation(
+    store: &gtk::gio::ListStore,
+    selection: &gtk::SingleSelection,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
+) {
+    for index in 0..store.n_items() {
+        let Some(source) = store.item(index).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if source.source_id() != Some(source_id) {
+            continue;
+        }
+        source.set_connecting_generation(generation);
+        rebind_sidebar_source(store, selection, index, &source, true);
+        return;
     }
+}
+
+#[derive(Clone)]
+struct RemoteReducerContext {
+    remote_sources: crate::source_registry::RemoteSourceRegistry,
+    sidebar_store: gtk::gio::ListStore,
+    sidebar_selection: gtk::SingleSelection,
+    source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    active_source_key: Rc<RefCell<String>>,
+    source_navigation: Rc<RefCell<SourceNavigation>>,
+    pending_connection: Rc<RefCell<Option<PendingConnection>>>,
+    track_store: gtk::gio::ListStore,
+    master_tracks: Rc<RefCell<Vec<TrackObject>>>,
+    browser_widget: gtk::Box,
+    browser_state: browser::BrowserState,
+    status_label: gtk::Label,
+    column_view: gtk::ColumnView,
+    invalidate_source_playback: SourcePlaybackInvalidator,
+}
+
+#[derive(Default)]
+struct RemoteReducerState {
+    published_catalogues: HashMap<crate::architecture::SourceId, (u64, u64)>,
+    seen_failures:
+        HashMap<crate::architecture::SourceId, (u64, crate::source_lifecycle::FailureCategory)>,
+}
+
+struct RemoteBaselinePlan {
+    present_sources: HashSet<crate::architecture::SourceId>,
+    hidden_sources: HashSet<crate::architecture::SourceId>,
+    clear_projections: Vec<crate::architecture::SourceId>,
+}
+
+impl RemoteBaselinePlan {
+    fn new(
+        reducer: &RemoteReducerState,
+        baseline: &crate::source_lifecycle::LifecycleBaseline<
+            Vec<crate::architecture::models::Track>,
+        >,
+    ) -> Self {
+        let mut present_sources = HashSet::new();
+        let mut catalogue_sources = HashSet::new();
+        let mut hidden_sources = HashSet::new();
+        for (source_id, snapshot) in &baseline.sources {
+            if snapshot.visibility == crate::source_lifecycle::SourceVisibility::Hidden {
+                hidden_sources.insert(*source_id);
+            } else {
+                present_sources.insert(*source_id);
+                if snapshot.catalogue.is_some() {
+                    catalogue_sources.insert(*source_id);
+                }
+            }
+        }
+
+        let mut clear_projections = hidden_sources.clone();
+        clear_projections.extend(
+            reducer
+                .published_catalogues
+                .keys()
+                .filter(|source_id| !catalogue_sources.contains(source_id))
+                .copied(),
+        );
+
+        let mut clear_projections: Vec<_> = clear_projections.into_iter().collect();
+        clear_projections.sort_by_key(ToString::to_string);
+        Self {
+            present_sources,
+            hidden_sources,
+            clear_projections,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemotePublicationSelection {
+    Inactive,
+    AlreadyActivated,
+    Select(u32),
+    Reactivate(u32),
+}
+
+impl RemotePublicationSelection {
+    fn activates(self) -> bool {
+        self != Self::Inactive
+    }
+
+    fn apply(self, mut select: impl FnMut(u32)) {
+        match self {
+            Self::Inactive | Self::AlreadyActivated => {}
+            Self::Select(index) => select(index),
+            Self::Reactivate(index) => {
+                select(gtk::INVALID_LIST_POSITION);
+                select(index);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AcceptedRemotePublication {
+    index: u32,
+    rebound: bool,
+}
+
+impl RemoteReducerContext {
+    fn from_window(
+        state: &WindowState,
+        invalidate_source_playback: SourcePlaybackInvalidator,
+    ) -> Self {
+        Self {
+            remote_sources: state.remote_sources.clone(),
+            sidebar_store: state.sidebar_store.clone(),
+            sidebar_selection: state.sidebar_selection.clone(),
+            source_tracks: state.source_tracks.clone(),
+            active_source_key: state.active_source_key.clone(),
+            source_navigation: state.source_navigation.clone(),
+            pending_connection: state.pending_connection.clone(),
+            track_store: state.track_store.clone(),
+            master_tracks: state.master_tracks.clone(),
+            browser_widget: state.browser_widget.clone(),
+            browser_state: state.browser_state.clone(),
+            status_label: state.status_label.clone(),
+            column_view: state.column_view.clone(),
+            invalidate_source_playback,
+        }
+    }
+}
+
+fn sidebar_source_by_id(
+    store: &gtk::gio::ListStore,
+    source_id: crate::architecture::SourceId,
+) -> Option<(u32, SourceObject)> {
+    (0..store.n_items()).find_map(|index| {
+        store
+            .item(index)
+            .and_downcast::<SourceObject>()
+            .filter(|source| source.source_id() == Some(source_id))
+            .map(|source| (index, source))
+    })
+}
+
+fn rebind_remote_source(
+    context: &RemoteReducerContext,
+    index: u32,
+    source: &SourceObject,
+    keep_selected: bool,
+) {
+    let was_selected = context.sidebar_selection.selected() == index;
+    rebind_sidebar_source(
+        &context.sidebar_store,
+        &context.sidebar_selection,
+        index,
+        source,
+        keep_selected,
+    );
+    if was_selected && !keep_selected {
+        restore_visible_sidebar_selection(context);
+    }
+}
+
+/// Refresh plain GTK-side source fields without letting remove/insert
+/// transiently select an adjacent row and re-enter source navigation.
+pub(super) fn rebind_sidebar_source(
+    store: &gtk::gio::ListStore,
+    selection: &gtk::SingleSelection,
+    index: u32,
+    source: &SourceObject,
+    keep_selected: bool,
+) {
+    let was_selected = selection.selected() == index;
+    if was_selected {
+        // Prevent GtkSingleSelection from transiently selecting the adjacent
+        // row while remove/insert refreshes plain GTK-side state.
+        selection.set_selected(gtk::INVALID_LIST_POSITION);
+    }
+    store.remove(index);
+    store.insert(index, source);
+    if was_selected && keep_selected {
+        selection.set_selected(index);
+    }
+}
+
+fn source_matches_navigation_key(source: &SourceObject, key: &str) -> bool {
+    if source.source_id().is_some_and(|id| id.to_string() == key) || source.source_key() == key {
+        return true;
+    }
+    let backend = source.backend_type();
+    (backend == "local" && key == "local")
+        || (backend.starts_with("radio-") && backend == key)
+        || (matches!(backend.as_str(), "playlist" | "smart-playlist")
+            && format!(
+                "{}{}",
+                super::playback::PLAYLIST_SOURCE_PREFIX,
+                source.playlist_id()
+            ) == key)
+}
+
+/// Restore a selection by stable navigation identity rather than a list
+/// position that category insertion/removal may have shifted asynchronously.
+pub(super) fn select_sidebar_source_key(
+    store: &gtk::gio::ListStore,
+    selection: &gtk::SingleSelection,
+    key: &str,
+) -> bool {
+    let Some(index) = (0..store.n_items()).find(|index| {
+        store
+            .item(*index)
+            .and_downcast_ref::<SourceObject>()
+            .is_some_and(|source| source_matches_navigation_key(source, key))
+    }) else {
+        return false;
+    };
+    if selection.selected() != index {
+        selection.set_selected(index);
+    }
+    true
+}
+
+fn restore_visible_sidebar_selection(context: &RemoteReducerContext) {
+    let key = context.active_source_key.borrow().clone();
+    if !select_sidebar_source_key(&context.sidebar_store, &context.sidebar_selection, &key) {
+        select_sidebar_source_key(&context.sidebar_store, &context.sidebar_selection, "local");
+    }
+}
+
+fn remote_backend_label(source: Option<&SourceObject>) -> &'static str {
+    match source.map(SourceObject::backend_type).as_deref() {
+        Some("subsonic") => "Subsonic",
+        Some("jellyfin") => "Jellyfin",
+        Some("plex") => "Plex",
+        Some("daap") => "DAAP",
+        _ => "Remote",
+    }
+}
+
+fn remote_failure_category(
+    category: crate::source_lifecycle::FailureCategory,
+) -> super::source_connect::RemoteFailureCategory {
+    use super::source_connect::RemoteFailureCategory;
+    use crate::source_lifecycle::FailureCategory;
+
+    match category {
+        FailureCategory::AuthenticationRejected => RemoteFailureCategory::Authentication,
+        FailureCategory::Connection => RemoteFailureCategory::Connection,
+        FailureCategory::Timeout => RemoteFailureCategory::Timeout,
+        FailureCategory::InvalidResponse => RemoteFailureCategory::Response,
+        FailureCategory::UnsupportedAuthentication => RemoteFailureCategory::AuthenticationMethod,
+        FailureCategory::UnavailableOrPermission | FailureCategory::Backend => {
+            RemoteFailureCategory::Backend
+        }
+    }
+}
+
+fn apply_local_navigation_fallback(
+    navigation: &mut SourceNavigation,
+    active_source_key: &mut String,
+    retired_key: &str,
+) -> bool {
+    if active_source_key != retired_key {
+        return false;
+    }
+    navigation.select("local");
+    *active_source_key = "local".to_string();
+    true
+}
+
+fn display_local_fallback(context: &RemoteReducerContext, retired_key: &str) {
+    // Drop both RefCell guards before changing GtkSingleSelection: its signal
+    // handlers run synchronously and may update these same navigation cells.
+    let changed = {
+        let mut navigation = context.source_navigation.borrow_mut();
+        let mut active_source_key = context.active_source_key.borrow_mut();
+        apply_local_navigation_fallback(&mut navigation, &mut active_source_key, retired_key)
+    };
+    if !changed {
+        return;
+    }
+    select_sidebar_source_key(&context.sidebar_store, &context.sidebar_selection, "local");
+    let local_tracks = context
+        .source_tracks
+        .borrow()
+        .get("local")
+        .cloned()
+        .unwrap_or_default();
+    display_tracks(
+        &local_tracks,
+        &context.track_store,
+        &context.master_tracks,
+        &context.browser_widget,
+        &context.browser_state,
+        &context.status_label,
+        &context.column_view,
+    );
+}
+
+fn clear_remote_projection(
+    context: &RemoteReducerContext,
+    source_id: crate::architecture::SourceId,
+) {
+    let source_key = source_id.to_string();
+    (context.invalidate_source_playback)(&source_key);
+    context
+        .source_navigation
+        .borrow_mut()
+        .invalidate_key(&source_key);
+    context.source_tracks.borrow_mut().remove(&source_key);
+    display_local_fallback(context, &source_key);
+}
+
+fn clear_remote_pending_intent(
+    context: &RemoteReducerContext,
+    source_id: crate::architecture::SourceId,
+) {
+    let source_key = source_id.to_string();
+    let pending = {
+        let mut slot = context.pending_connection.borrow_mut();
+        if slot
+            .as_ref()
+            .is_some_and(|pending| pending.source_key() == source_key)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if pending.as_ref().is_some_and(|pending| {
+        context
+            .source_navigation
+            .borrow()
+            .is_current(pending.request())
+    }) {
+        // A remote intent can be current while the previous projection stays
+        // visible during authentication. Return navigation ownership to that
+        // visible projection without manufacturing a stale remote request.
+        context
+            .source_navigation
+            .borrow_mut()
+            .select(context.active_source_key.borrow().clone());
+    }
+}
+
+fn reconcile_cancelled_remote_intent(
+    context: &RemoteReducerContext,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
+) {
+    let pending_was_current = context
+        .pending_connection
+        .borrow()
+        .as_ref()
+        .filter(|pending| pending.matches_lifecycle(source_id, generation))
+        .is_some_and(|pending| {
+            context
+                .source_navigation
+                .borrow()
+                .is_current(pending.request())
+        });
+    if !context
+        .pending_connection
+        .borrow()
+        .as_ref()
+        .is_some_and(|pending| pending.matches_lifecycle(source_id, generation))
+    {
+        return;
+    }
+    *context.pending_connection.borrow_mut() = None;
+
+    if let Some((index, source)) = sidebar_source_by_id(&context.sidebar_store, source_id) {
+        if source.clear_connecting_generation(generation) {
+            rebind_remote_source(context, index, &source, source.connected());
+        }
+    }
+    if pending_was_current {
+        restore_visible_sidebar_selection(context);
+    }
+    tracing::debug!(%source_id, generation, "Remote connection intent was cancelled");
+}
+
+fn reconcile_remote_failure(
+    context: &RemoteReducerContext,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
+    category: crate::source_lifecycle::FailureCategory,
+) {
+    let row = sidebar_source_by_id(&context.sidebar_store, source_id);
+    let pending = context
+        .pending_connection
+        .borrow()
+        .as_ref()
+        .filter(|pending| pending.matches_lifecycle(source_id, generation))
+        .cloned();
+    let pending_was_current = pending.as_ref().is_some_and(|pending| {
+        context
+            .source_navigation
+            .borrow()
+            .is_current(pending.request())
+    });
+    let passwordless_reprompt = pending.as_ref().is_some_and(|pending| {
+        pending.intent_kind_for(source_id, generation)
+            == Some(ConnectionIntentKind::PasswordlessDaap)
+            && category == crate::source_lifecycle::FailureCategory::AuthenticationRejected
+    });
+
+    if pending.is_some() {
+        *context.pending_connection.borrow_mut() = None;
+    }
+
+    if let Some((index, source)) = row.as_ref() {
+        if source.clear_connecting_generation(generation) {
+            if passwordless_reprompt {
+                source.set_requires_password(true);
+            }
+            rebind_remote_source(context, *index, source, source.connected());
+        }
+    }
+
+    if pending_was_current {
+        if passwordless_reprompt {
+            if let Some((index, _)) = sidebar_source_by_id(&context.sidebar_store, source_id) {
+                // The exact passwordless intent was rejected. Re-fire selection
+                // only after requires_password=true is visible, so the normal
+                // credential dialog owns the retry.
+                context.sidebar_selection.set_selected(index);
+            }
+        } else {
+            restore_visible_sidebar_selection(context);
+        }
+    }
+
+    let ui_category = remote_failure_category(category);
+    let backend = remote_backend_label(row.as_ref().map(|(_, source)| source));
+    tracing::error!(
+        %source_id,
+        generation,
+        category = ui_category.as_str(),
+        "Remote connection failed"
+    );
+    context
+        .status_label
+        .set_text(&ui_category.user_message(backend));
+}
+
+fn reconcile_remote_baseline(
+    context: &RemoteReducerContext,
+    reducer: &mut RemoteReducerState,
+    baseline: crate::source_lifecycle::LifecycleBaseline<Vec<crate::architecture::models::Track>>,
+) {
+    let RemoteBaselinePlan {
+        present_sources,
+        hidden_sources,
+        clear_projections,
+    } = RemoteBaselinePlan::new(reducer, &baseline);
+
+    // Projection loss is authoritative before any plain row-state rebind.
+    // In particular, a selected retained passwordless DAAP row must already
+    // have fallen back to Local before connected=false causes remove/insert;
+    // otherwise stable-key restoration can reselect it and start a new login.
+    for source_id in clear_projections {
+        reducer.published_catalogues.remove(&source_id);
+        if hidden_sources.contains(&source_id) {
+            reducer.seen_failures.remove(&source_id);
+            clear_remote_pending_intent(context, source_id);
+        }
+        clear_remote_projection(context, source_id);
+    }
+
+    for (source_id, snapshot) in baseline.sources {
+        if hidden_sources.contains(&source_id) {
+            continue;
+        }
+
+        let connect_failure = snapshot.failure.filter(|failure| {
+            failure.failure.operation() == crate::source_lifecycle::FailureOperation::Connect
+        });
+        if let Some(failure) = connect_failure {
+            let identity = (failure.correlation.generation, failure.failure.category());
+            if reducer.seen_failures.get(&source_id) != Some(&identity) {
+                reconcile_remote_failure(
+                    context,
+                    source_id,
+                    failure.correlation.generation,
+                    failure.failure.category(),
+                );
+                reducer.seen_failures.insert(source_id, identity);
+            }
+        } else {
+            reducer.seen_failures.remove(&source_id);
+        }
+
+        let pending_generation = {
+            context
+                .pending_connection
+                .borrow()
+                .as_ref()
+                .and_then(|pending| pending.lifecycle_generation_for(source_id))
+        };
+        if let Some(generation) = pending_generation {
+            let generation_still_owned = snapshot.pending_connect == Some(generation)
+                || snapshot
+                    .catalogue
+                    .as_ref()
+                    .is_some_and(|catalogue| catalogue.generation == generation)
+                || connect_failure
+                    .is_some_and(|failure| failure.correlation.generation == generation);
+            if !generation_still_owned {
+                reconcile_cancelled_remote_intent(context, source_id, generation);
+            }
+        }
+
+        if let Some((index, source)) = sidebar_source_by_id(&context.sidebar_store, source_id) {
+            let connected = snapshot.session_epoch.is_some();
+            let manually_added = snapshot
+                .provenance
+                .contains(crate::source_lifecycle::SourceProvenance::Saved);
+            let connected_changed = source.connected() != connected;
+            if connected_changed {
+                source.set_connected(connected);
+            }
+            let manually_added_changed = source.manually_added() != manually_added;
+            if manually_added_changed {
+                source.set_manually_added(manually_added);
+            }
+            let connecting_changed = if let Some(generation) = snapshot.pending_connect {
+                if source.connecting_generation() != Some(generation) {
+                    source.set_connecting_generation(generation);
+                    true
+                } else {
+                    false
+                }
+            } else if let Some(generation) = source.connecting_generation() {
+                source.clear_connecting_generation(generation);
+                true
+            } else {
+                false
+            };
+            let changed = connected_changed || manually_added_changed || connecting_changed;
+            if changed {
+                let ui_pending = context
+                    .pending_connection
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|pending| pending.source_key() == source_id.to_string());
+                rebind_remote_source(
+                    context,
+                    index,
+                    &source,
+                    connected || snapshot.pending_connect.is_some() || ui_pending,
+                );
+            }
+        }
+
+        if let Some(catalogue) = snapshot.catalogue {
+            let identity = (catalogue.generation, catalogue.session_epoch);
+            if reducer.published_catalogues.get(&source_id) != Some(&identity) {
+                if reducer
+                    .published_catalogues
+                    .get(&source_id)
+                    .is_some_and(|(_, previous_epoch)| *previous_epoch != catalogue.session_epoch)
+                {
+                    let source_key = source_id.to_string();
+                    (context.invalidate_source_playback)(&source_key);
+                    context.source_tracks.borrow_mut().remove(&source_key);
+                }
+                let objects: Vec<TrackObject> = catalogue
+                    .value
+                    .iter()
+                    .map(|track| arch_remote_track_to_object(track, catalogue.session_epoch))
+                    .collect();
+                publish_remote_library(
+                    source_id,
+                    catalogue.generation,
+                    objects,
+                    &context.source_tracks,
+                    &context.sidebar_store,
+                    &context.pending_connection,
+                    &context.sidebar_selection,
+                    &context.active_source_key,
+                    &context.source_navigation,
+                    &context.track_store,
+                    &context.master_tracks,
+                    &context.browser_widget,
+                    &context.browser_state,
+                    &context.status_label,
+                    &context.column_view,
+                );
+                reducer.published_catalogues.insert(source_id, identity);
+            }
+        }
+    }
+    reducer
+        .seen_failures
+        .retain(|source_id, _| present_sources.contains(source_id));
+
+    // A missing baseline row is authoritative proof that all provenance and
+    // retirement work for that source was pruned. Remove any stale remote UI
+    // row; Found/Add/environment publishers claim before inserting a row, so a
+    // legitimate new row cannot fall into this branch.
+    let mut index = context.sidebar_store.n_items();
+    while index > 0 {
+        index -= 1;
+        let Some(source) = context
+            .sidebar_store
+            .item(index)
+            .and_downcast::<SourceObject>()
+        else {
+            continue;
+        };
+        let backend = source.backend_type();
+        if !matches!(backend.as_str(), "subsonic" | "jellyfin" | "plex" | "daap") {
+            continue;
+        }
+        let Some(source_id) = source.source_id() else {
+            continue;
+        };
+        if present_sources.contains(&source_id) {
+            continue;
+        }
+        clear_remote_pending_intent(context, source_id);
+        let backend = source.backend_type();
+        if context.sidebar_selection.selected() == index {
+            select_sidebar_source_key(&context.sidebar_store, &context.sidebar_selection, "local");
+        }
+        context.sidebar_store.remove(index);
+        clear_remote_projection(context, source_id);
+        remove_empty_category_header(&context.sidebar_store, category_for_backend(&backend));
+    }
+
+    if baseline.shutting_down {
+        tracing::debug!(
+            revision = baseline.revision,
+            "Remote lifecycle reducer observed shutdown gate"
+        );
+    }
+}
+
+fn setup_remote_lifecycle_reducer(
+    state: &WindowState,
+    mut invalidations: tokio::sync::watch::Receiver<u64>,
+    invalidate_source_playback: SourcePlaybackInvalidator,
+) {
+    let context = RemoteReducerContext::from_window(state, invalidate_source_playback);
+    glib::MainContext::default().spawn_local(async move {
+        let mut reducer = RemoteReducerState::default();
+        let baseline = context.remote_sources.snapshot_all();
+        let mut revision = baseline.revision;
+        let shutting_down = baseline.shutting_down;
+        reconcile_remote_baseline(&context, &mut reducer, baseline);
+        if shutting_down {
+            return;
+        }
+
+        loop {
+            // Mark the newest watch value seen only after comparing it with
+            // our atomic baseline. This closes the subscribe/baseline race:
+            // an invalidation arriving between those operations is either in
+            // the baseline or remains strictly newer here.
+            let observed = *invalidations.borrow_and_update();
+            if observed <= revision && invalidations.changed().await.is_err() {
+                return;
+            }
+
+            let baseline = context.remote_sources.snapshot_all();
+            revision = baseline.revision;
+            let shutting_down = baseline.shutting_down;
+            reconcile_remote_baseline(&context, &mut reducer, baseline);
+            if shutting_down {
+                return;
+            }
+        }
+    });
 }
 
 /// Build and present the main Tributary window.
@@ -172,6 +854,13 @@ pub fn build_window(
     let daap_env =
         configured_server_url("DAAP_URL").map(|url| (url, std::env::var("DAAP_PASSWORD").ok()));
 
+    let remote_sources = crate::source_registry::RemoteSourceRegistry::new(rt_handle.clone());
+    // Subscribe before the first provenance claim or constructor. The GTK
+    // reducer takes an atomic baseline later, then discards queued revisions
+    // already represented by that baseline.
+    let remote_invalidations = remote_sources.subscribe_invalidations();
+    let remote_provenance = crate::source_registry::ProvenanceClaims::default();
+
     // ── Load and apply persisted preferences ─────────────────────────
     let app_config: Rc<RefCell<preferences::AppConfig>> =
         Rc::new(RefCell::new(preferences::load_config()));
@@ -189,6 +878,13 @@ pub fn build_window(
         ensure_category_header_vec(&mut sources, &entry.server_type);
         let src =
             SourceObject::manual(&entry.name, &entry.server_type, &entry.url, entry.source_id);
+        let claimed = remote_provenance.ensure(
+            &remote_sources,
+            entry.source_id,
+            crate::source_lifecycle::SourceProvenance::Saved,
+            "saved-config",
+        );
+        debug_assert!(claimed, "new lifecycle registry accepts saved provenance");
         sources.push(src);
         info!(
             name = %entry.name,
@@ -202,28 +898,68 @@ pub fn build_window(
     let subsonic_env_attempt = subsonic_env.as_ref().map(|(url, _user, _pass)| {
         upsert_environment_source(&mut sources, "Subsonic (env)", "subsonic", url)
     });
-    if subsonic_env_attempt.is_some() {
+    if let Some(attempt) = subsonic_env_attempt.as_ref() {
+        let claimed = remote_provenance.ensure(
+            &remote_sources,
+            attempt.source_id,
+            crate::source_lifecycle::SourceProvenance::Environment,
+            "environment:SUBSONIC_URL",
+        );
+        debug_assert!(
+            claimed,
+            "new lifecycle registry accepts environment provenance"
+        );
         info!("Subsonic server configured via env vars");
     }
 
     let jellyfin_env_attempt = jellyfin_env.as_ref().map(|(url, _key, _uid)| {
         upsert_environment_source(&mut sources, "Jellyfin (env)", "jellyfin", url)
     });
-    if jellyfin_env_attempt.is_some() {
+    if let Some(attempt) = jellyfin_env_attempt.as_ref() {
+        let claimed = remote_provenance.ensure(
+            &remote_sources,
+            attempt.source_id,
+            crate::source_lifecycle::SourceProvenance::Environment,
+            "environment:JELLYFIN_URL",
+        );
+        debug_assert!(
+            claimed,
+            "new lifecycle registry accepts environment provenance"
+        );
         info!("Jellyfin server configured via env vars");
     }
 
     let plex_env_attempt = plex_env
         .as_ref()
         .map(|(url, _token)| upsert_environment_source(&mut sources, "Plex (env)", "plex", url));
-    if plex_env_attempt.is_some() {
+    if let Some(attempt) = plex_env_attempt.as_ref() {
+        let claimed = remote_provenance.ensure(
+            &remote_sources,
+            attempt.source_id,
+            crate::source_lifecycle::SourceProvenance::Environment,
+            "environment:PLEX_URL",
+        );
+        debug_assert!(
+            claimed,
+            "new lifecycle registry accepts environment provenance"
+        );
         info!("Plex server configured via env vars");
     }
 
     let daap_env_attempt = daap_env
         .as_ref()
         .map(|(url, _password)| upsert_environment_source(&mut sources, "DAAP (env)", "daap", url));
-    if daap_env_attempt.is_some() {
+    if let Some(attempt) = daap_env_attempt.as_ref() {
+        let claimed = remote_provenance.ensure(
+            &remote_sources,
+            attempt.source_id,
+            crate::source_lifecycle::SourceProvenance::Environment,
+            "environment:DAAP_URL",
+        );
+        debug_assert!(
+            claimed,
+            "new lifecycle registry accepts environment provenance"
+        );
         info!("DAAP server configured via env vars");
     }
 
@@ -459,11 +1195,11 @@ pub fn build_window(
         window.maximize();
     }
 
-    // Save geometry, revoke standard remote leases, and explicitly close every
-    // retained DAAP session. Gate new connections synchronously, then let Tokio
-    // perform DAAP network I/O while GTK remains responsive. Once shutdown
-    // completes, close() re-enters this handler and is allowed to proceed.
-    let shutdown_handle = rt_handle.clone();
+    // Save geometry and synchronously close the sole remote lifecycle gate.
+    // Its persistent barrier joins every admitted constructor and owned
+    // adapter teardown, including DAAP and interactive Jellyfin logout, before
+    // close() is allowed to proceed.
+    let shutdown_sources = remote_sources.clone();
     let shutdown_started = Rc::new(Cell::new(false));
     let shutdown_complete = Rc::new(Cell::new(false));
     window.connect_close_request(move |w| {
@@ -473,20 +1209,11 @@ pub fn build_window(
         }
 
         if !shutdown_started.replace(true) {
-            crate::source_registry::begin_shutdown();
-            crate::daap::begin_shutdown();
-            let (done_tx, done_rx) = async_channel::bounded::<()>(1);
-            shutdown_handle.spawn(async move {
-                crate::daap::shutdown_all().await;
-                let _ = done_tx.send(()).await;
-            });
-
+            let barrier = shutdown_sources.shutdown();
             let window = w.clone();
             let shutdown_complete = shutdown_complete.clone();
             glib::MainContext::default().spawn_local(async move {
-                // A closed channel also unblocks the window if the runtime
-                // task unexpectedly terminates.
-                let _ = done_rx.recv().await;
+                barrier.wait().await;
                 shutdown_complete.set(true);
                 window.close();
             });
@@ -551,301 +1278,87 @@ pub fn build_window(
 
     // ── Start Subsonic backend if configured via env vars ──────────
     if let Some((url, user, pass)) = subsonic_env {
-        let tx = engine_tx.clone();
-        let EnvironmentConnectionAttempt {
+        let EnvironmentConnectionAttempt { source_id } =
+            subsonic_env_attempt.expect("configured Subsonic source attempt");
+        remote_sources.connect_standard(
             source_id,
-            ui_token,
-        } = subsonic_env_attempt.expect("configured Subsonic source attempt");
-        rt_handle.spawn(async move {
-            info!("Connecting to Subsonic server...");
-            let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
-                tracing::debug!("Skipping Subsonic connect during shutdown");
-                return;
-            };
-            match crate::subsonic::SubsonicBackend::connect("Subsonic", &url, &user, &pass).await {
-                Ok(backend) => {
-                    let tracks = match crate::architecture::load_track_catalog(&backend).await {
-                        Ok(tracks) => tracks,
-                        Err(error) => {
-                            if !attempt.is_latest() {
-                                tracing::debug!("Ignoring superseded Subsonic catalogue failure");
-                                return;
-                            }
-                            let category = super::source_connect::remote_failure_category(&error);
-                            tracing::error!(
-                                category = category.as_str(),
-                                "Subsonic catalogue load failed"
-                            );
-                            let _ = tx
-                                .send(LibraryEvent::RemoteConnectionFailed {
-                                    source_id,
-                                    attempt: ui_token,
-                                    message: category.user_message("Subsonic"),
-                                })
-                                .await;
-                            return;
-                        }
-                    };
-                    let Some(source) = attempt.retain(Arc::new(backend)) else {
-                        tracing::debug!("Subsonic connect was superseded");
-                        return;
-                    };
-                    if !source.is_current() {
-                        tracing::debug!("Subsonic sync was superseded");
-                        return;
-                    }
-                    info!(count = tracks.len(), "Subsonic library fetched");
-                    let _ = tx
-                        .send(LibraryEvent::RemoteSync {
-                            source_id,
-                            generation: source.generation(),
-                            lease_key: source.lease_key(),
-                            tracks,
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    if !attempt.is_latest() {
-                        tracing::debug!("Ignoring superseded Subsonic connection failure");
-                        return;
-                    }
-                    let category = super::source_connect::remote_failure_category(&e);
-                    tracing::error!(category = category.as_str(), "Subsonic connection failed");
-                    let _ = tx
-                        .send(LibraryEvent::RemoteConnectionFailed {
-                            source_id,
-                            attempt: ui_token,
-                            message: category.user_message("Subsonic"),
-                        })
-                        .await;
-                }
-            }
-        });
+            |generation| {
+                set_remote_connecting_generation(
+                    &sidebar_store,
+                    &sidebar_selection,
+                    source_id,
+                    generation,
+                );
+            },
+            move || async move {
+                info!("Connecting to Subsonic server...");
+                crate::subsonic::SubsonicBackend::connect("Subsonic", &url, &user, &pass).await
+            },
+        );
     }
 
     // ── Start Jellyfin backend if configured via env vars ──────────
     if let Some((url, api_key, user_id)) = jellyfin_env {
-        let tx = engine_tx.clone();
-        let EnvironmentConnectionAttempt {
+        let EnvironmentConnectionAttempt { source_id } =
+            jellyfin_env_attempt.expect("configured Jellyfin source attempt");
+        remote_sources.connect_jellyfin_api_key(
             source_id,
-            ui_token,
-        } = jellyfin_env_attempt.expect("configured Jellyfin source attempt");
-        rt_handle.spawn(async move {
-            info!("Connecting to Jellyfin server...");
-            let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
-                tracing::debug!("Skipping Jellyfin connect during shutdown");
-                return;
-            };
-            match crate::jellyfin::JellyfinBackend::connect("Jellyfin", &url, &api_key, &user_id)
-                .await
-            {
-                Ok(backend) => {
-                    let tracks = match crate::architecture::load_track_catalog(&backend).await {
-                        Ok(tracks) => tracks,
-                        Err(error) => {
-                            if !attempt.is_latest() {
-                                tracing::debug!("Ignoring superseded Jellyfin catalogue failure");
-                                return;
-                            }
-                            let category = super::source_connect::remote_failure_category(&error);
-                            tracing::error!(
-                                category = category.as_str(),
-                                "Jellyfin catalogue load failed"
-                            );
-                            let _ = tx
-                                .send(LibraryEvent::RemoteConnectionFailed {
-                                    source_id,
-                                    attempt: ui_token,
-                                    message: category.user_message("Jellyfin"),
-                                })
-                                .await;
-                            return;
-                        }
-                    };
-                    let Some(source) = attempt.retain(Arc::new(backend)) else {
-                        tracing::debug!("Jellyfin connect was superseded");
-                        return;
-                    };
-                    if !source.is_current() {
-                        tracing::debug!("Jellyfin sync was superseded");
-                        return;
-                    }
-                    info!(count = tracks.len(), "Jellyfin library fetched");
-                    let _ = tx
-                        .send(LibraryEvent::RemoteSync {
-                            source_id,
-                            generation: source.generation(),
-                            lease_key: source.lease_key(),
-                            tracks,
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    if !attempt.is_latest() {
-                        tracing::debug!("Ignoring superseded Jellyfin connection failure");
-                        return;
-                    }
-                    let category = super::source_connect::remote_failure_category(&e);
-                    tracing::error!(category = category.as_str(), "Jellyfin connection failed");
-                    let _ = tx
-                        .send(LibraryEvent::RemoteConnectionFailed {
-                            source_id,
-                            attempt: ui_token,
-                            message: category.user_message("Jellyfin"),
-                        })
-                        .await;
-                }
-            }
-        });
+            |generation| {
+                set_remote_connecting_generation(
+                    &sidebar_store,
+                    &sidebar_selection,
+                    source_id,
+                    generation,
+                );
+            },
+            move || async move {
+                info!("Connecting to Jellyfin server...");
+                crate::jellyfin::JellyfinBackend::connect("Jellyfin", &url, &api_key, &user_id)
+                    .await
+            },
+        );
     }
 
     // ── Start Plex backend if configured via env vars ──────────────
     if let Some((url, token)) = plex_env {
-        let tx = engine_tx.clone();
-        let EnvironmentConnectionAttempt {
+        let EnvironmentConnectionAttempt { source_id } =
+            plex_env_attempt.expect("configured Plex source attempt");
+        remote_sources.connect_standard(
             source_id,
-            ui_token,
-        } = plex_env_attempt.expect("configured Plex source attempt");
-        rt_handle.spawn(async move {
-            info!("Connecting to Plex server...");
-            let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
-                tracing::debug!("Skipping Plex connect during shutdown");
-                return;
-            };
-            match crate::plex::PlexBackend::connect("Plex", &url, &token).await {
-                Ok(backend) => {
-                    let tracks = match crate::architecture::load_track_catalog(&backend).await {
-                        Ok(tracks) => tracks,
-                        Err(error) => {
-                            if !attempt.is_latest() {
-                                tracing::debug!("Ignoring superseded Plex catalogue failure");
-                                return;
-                            }
-                            let category = super::source_connect::remote_failure_category(&error);
-                            tracing::error!(
-                                category = category.as_str(),
-                                "Plex catalogue load failed"
-                            );
-                            let _ = tx
-                                .send(LibraryEvent::RemoteConnectionFailed {
-                                    source_id,
-                                    attempt: ui_token,
-                                    message: category.user_message("Plex"),
-                                })
-                                .await;
-                            return;
-                        }
-                    };
-                    let Some(source) = attempt.retain(Arc::new(backend)) else {
-                        tracing::debug!("Plex connect was superseded");
-                        return;
-                    };
-                    if !source.is_current() {
-                        tracing::debug!("Plex sync was superseded");
-                        return;
-                    }
-                    info!(count = tracks.len(), "Plex library fetched");
-                    let _ = tx
-                        .send(LibraryEvent::RemoteSync {
-                            source_id,
-                            generation: source.generation(),
-                            lease_key: source.lease_key(),
-                            tracks,
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    if !attempt.is_latest() {
-                        tracing::debug!("Ignoring superseded Plex connection failure");
-                        return;
-                    }
-                    let category = super::source_connect::remote_failure_category(&e);
-                    tracing::error!(category = category.as_str(), "Plex connection failed");
-                    let _ = tx
-                        .send(LibraryEvent::RemoteConnectionFailed {
-                            source_id,
-                            attempt: ui_token,
-                            message: category.user_message("Plex"),
-                        })
-                        .await;
-                }
-            }
-        });
+            |generation| {
+                set_remote_connecting_generation(
+                    &sidebar_store,
+                    &sidebar_selection,
+                    source_id,
+                    generation,
+                );
+            },
+            move || async move {
+                info!("Connecting to Plex server...");
+                crate::plex::PlexBackend::connect("Plex", &url, &token).await
+            },
+        );
     }
 
     // ── Start DAAP backend if configured via env vars ──────────────
     if let Some((url, password)) = daap_env {
-        let tx = engine_tx.clone();
-        let EnvironmentConnectionAttempt {
+        let EnvironmentConnectionAttempt { source_id } =
+            daap_env_attempt.expect("configured DAAP source attempt");
+        remote_sources.connect_daap(
             source_id,
-            ui_token,
-        } = daap_env_attempt.expect("configured DAAP source attempt");
-        rt_handle.spawn(async move {
-            info!("Connecting to DAAP server...");
-            let Some(attempt) = crate::daap::begin_connect(source_id) else {
-                tracing::debug!("Skipping DAAP connect during shutdown");
-                return;
-            };
-            match crate::daap::DaapBackend::connect("DAAP", &url, password.as_deref()).await {
-                Ok(backend) => {
-                    let tracks = match crate::architecture::load_track_catalog(&backend).await {
-                        Ok(tracks) => tracks,
-                        Err(error) => {
-                            backend.disconnect().await;
-                            if !attempt.is_latest() {
-                                tracing::debug!("Ignoring superseded DAAP catalogue failure");
-                                return;
-                            }
-                            let category = super::source_connect::remote_failure_category(&error);
-                            tracing::error!(
-                                category = category.as_str(),
-                                "DAAP catalogue load failed"
-                            );
-                            let _ = tx
-                                .send(LibraryEvent::RemoteConnectionFailed {
-                                    source_id,
-                                    attempt: ui_token,
-                                    message: category.user_message("DAAP"),
-                                })
-                                .await;
-                            return;
-                        }
-                    };
-                    let Some(session) = attempt.retain(backend).await else {
-                        tracing::debug!("DAAP connect was superseded");
-                        return;
-                    };
-                    if !session.is_current() {
-                        tracing::debug!("DAAP sync was superseded");
-                        return;
-                    }
-                    info!(count = tracks.len(), "DAAP library fetched");
-                    let _ = tx
-                        .send(LibraryEvent::DaapSync {
-                            source_id,
-                            generation: session.generation(),
-                            session_key: session.session_key(),
-                            tracks,
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    if !attempt.is_latest() {
-                        tracing::debug!("Ignoring superseded DAAP connection failure");
-                        return;
-                    }
-                    let category = super::source_connect::remote_failure_category(&e);
-                    tracing::error!(category = category.as_str(), "DAAP connection failed");
-                    let _ = tx
-                        .send(LibraryEvent::RemoteConnectionFailed {
-                            source_id,
-                            attempt: ui_token,
-                            message: category.user_message("DAAP"),
-                        })
-                        .await;
-                }
-            }
-        });
+            |generation| {
+                set_remote_connecting_generation(
+                    &sidebar_store,
+                    &sidebar_selection,
+                    source_id,
+                    generation,
+                );
+            },
+            move || async move {
+                info!("Connecting to DAAP server...");
+                crate::daap::DaapBackend::login("DAAP", &url, password.as_deref()).await
+            },
+        );
     }
 
     // ── mDNS zero-config discovery ─────────────────────────────────
@@ -854,6 +1367,8 @@ pub fn build_window(
             window: window.clone(),
             rt_handle: rt_handle.clone(),
             engine_tx: engine_tx.clone(),
+            remote_sources: remote_sources.clone(),
+            remote_provenance: remote_provenance.clone(),
             track_store: track_store.clone(),
             master_tracks: master_tracks.clone(),
             source_tracks: source_tracks.clone(),
@@ -871,17 +1386,25 @@ pub fn build_window(
             pre_connect_selection: pre_connect_selection.clone(),
         },
         &hb.output_list,
-        invalidate_source_playback.clone(),
     );
 
     // ── Wire "+" add-server button ──────────────────────────────────
     {
         let win = window.clone();
         let store = sidebar_store.clone();
+        let selection = sidebar_selection.clone();
         let engine_tx = engine_tx.clone();
-        let rt_handle = rt_handle.clone();
+        let remote_sources = remote_sources.clone();
+        let remote_provenance = remote_provenance.clone();
         add_button.connect_clicked(move |_| {
-            show_add_server_dialog(&win, &store, &engine_tx, &rt_handle);
+            show_add_server_dialog(
+                &win,
+                &store,
+                &selection,
+                &engine_tx,
+                &remote_sources,
+                &remote_provenance,
+            );
         });
     }
 
@@ -905,19 +1428,8 @@ pub fn build_window(
 
     // ── Manual server delete (trash) handler ────────────────────────
     {
-        let sidebar_store = sidebar_store.clone();
-        let sidebar_selection = sidebar_selection.clone();
-        let source_tracks = source_tracks.clone();
-        let active_source_key = active_source_key.clone();
-        let source_navigation = source_navigation.clone();
-        let track_store = track_store.clone();
-        let master_tracks = master_tracks.clone();
-        let browser_widget = browser_widget.clone();
-        let browser_state = browser_state.clone();
-        let status_label = status_label.clone();
-        let column_view = column_view.clone();
-        let rt_handle = rt_handle.clone();
-        let invalidate_source_playback = invalidate_source_playback.clone();
+        let remote_sources = remote_sources.clone();
+        let remote_provenance = remote_provenance.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = delete_rx.recv().await {
@@ -926,74 +1438,30 @@ pub fn build_window(
                     tracing::warn!("Ignoring delete for invalid source identity");
                     continue;
                 };
-                invalidate_source_playback(&source_key);
-
-                // A connected DAAP source normally uses the eject action,
-                // but deletion must still transfer and close ownership if a
-                // stale/rebound row emits delete instead.
-                if let Some(backend) = crate::daap::release_source(source_id) {
-                    rt_handle.spawn(async move {
-                        backend.disconnect().await;
-                    });
+                // Persisted absence is the authority for releasing Saved.
+                // A failed write leaves both the row and claim untouched.
+                if !remove_saved_server(source_id) {
+                    tracing::warn!(%source_id, "Could not persist saved server removal");
+                    continue;
                 }
-                crate::source_registry::release_source(source_id);
-
-                // Remove from servers.json.
-                remove_saved_server(source_id);
-
-                // Remove from source_tracks map.
-                source_tracks.borrow_mut().remove(&source_key);
-
-                // Remove from sidebar.
-                for i in 0..sidebar_store.n_items() {
-                    if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-                        if src.source_id() == Some(source_id) {
-                            let backend = src.backend_type();
-                            sidebar_store.remove(i);
-                            let category = category_for_backend(&backend);
-                            remove_empty_category_header(&sidebar_store, category);
-                            break;
-                        }
-                    }
+                if !remote_provenance.release(
+                    &remote_sources,
+                    source_id,
+                    crate::source_lifecycle::SourceProvenance::Saved,
+                    "saved-config",
+                ) {
+                    tracing::warn!(%source_id, "Saved source claim was unavailable after removal");
                 }
 
-                // If this was the active source, switch to "local".
-                if *active_source_key.borrow() == source_key {
-                    source_navigation.borrow_mut().select("local");
-                    *active_source_key.borrow_mut() = "local".to_string();
-                    sidebar_selection.set_selected(1);
-
-                    let st = source_tracks.borrow();
-                    let local_tracks = st.get("local").cloned().unwrap_or_default();
-                    display_tracks(
-                        &local_tracks,
-                        &track_store,
-                        &master_tracks,
-                        &browser_widget,
-                        &browser_state,
-                        &status_label,
-                        &column_view,
-                    );
-                }
+                // The lifecycle baseline reducer owns Saved demotion, final
+                // projection clearing, row removal, and active-source fallback.
             }
         });
     }
 
     // ── DAAP disconnect (eject) handler ─────────────────────────────
     {
-        let sidebar_store = sidebar_store.clone();
-        let sidebar_selection = sidebar_selection.clone();
-        let source_tracks = source_tracks.clone();
-        let active_source_key = active_source_key.clone();
-        let source_navigation = source_navigation.clone();
-        let track_store = track_store.clone();
-        let master_tracks = master_tracks.clone();
-        let browser_widget = browser_widget.clone();
-        let browser_state = browser_state.clone();
-        let status_label = status_label.clone();
-        let column_view = column_view.clone();
-        let rt_handle = rt_handle.clone();
-        let invalidate_source_playback = invalidate_source_playback.clone();
+        let remote_sources = remote_sources.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = disconnect_rx.recv().await {
@@ -1002,59 +1470,8 @@ pub fn build_window(
                     tracing::warn!("Ignoring disconnect for invalid source identity");
                     continue;
                 };
-                invalidate_source_playback(&source_key);
-
-                // Transfer ownership out of the live-session registry before
-                // updating the UI. This makes a subsequent fast reconnect
-                // independent of the old session's asynchronous logout.
-                if let Some(backend) = crate::daap::release_source(source_id) {
-                    rt_handle.spawn(async move {
-                        backend.disconnect().await;
-                    });
-                } else {
-                    tracing::warn!("DAAP source had no retained session");
-                }
-
-                // 1. Remove from source_tracks map.
-                source_tracks.borrow_mut().remove(&source_key);
-
-                // 2. Reset the sidebar item back to discovered (unconnected)
-                //    state instead of removing it entirely.
-                for i in 0..sidebar_store.n_items() {
-                    if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-                        if src.source_id() == Some(source_id) {
-                            src.set_connected(false);
-                            src.set_connecting(false);
-                            src.set_icon_name("network-server-symbolic");
-                            // Force rebind by remove + re-insert.
-                            let src = src.clone();
-                            sidebar_store.remove(i);
-                            sidebar_store.insert(i, &src);
-                            break;
-                        }
-                    }
-                }
-
-                // 3. If this was the active source, switch to "local".
-                if *active_source_key.borrow() == source_key {
-                    source_navigation.borrow_mut().select("local");
-                    *active_source_key.borrow_mut() = "local".to_string();
-
-                    // Select the local source in the sidebar (index 1, after header).
-                    sidebar_selection.set_selected(1);
-
-                    // Display local tracks.
-                    let st = source_tracks.borrow();
-                    let local_tracks = st.get("local").cloned().unwrap_or_default();
-                    display_tracks(
-                        &local_tracks,
-                        &track_store,
-                        &master_tracks,
-                        &browser_widget,
-                        &browser_state,
-                        &status_label,
-                        &column_view,
-                    );
+                if remote_sources.disconnect(source_id).is_none() {
+                    tracing::warn!("DAAP source lifecycle entry was unavailable");
                 }
             }
         });
@@ -1069,6 +1486,8 @@ pub fn build_window(
         window: window.clone(),
         rt_handle: rt_handle.clone(),
         engine_tx: engine_tx.clone(),
+        remote_sources: remote_sources.clone(),
+        remote_provenance: remote_provenance.clone(),
         track_store: track_store.clone(),
         master_tracks: master_tracks.clone(),
         source_tracks: source_tracks.clone(),
@@ -1086,6 +1505,11 @@ pub fn build_window(
         pre_connect_selection: pre_connect_selection.clone(),
     };
     super::source_connect::setup_source_connect(&source_connection_state);
+    setup_remote_lifecycle_reducer(
+        &source_connection_state,
+        remote_invalidations,
+        invalidate_source_playback.clone(),
+    );
 
     // ═══════════════════════════════════════════════════════════════════
     // Phase 4: Audio Player + Desktop Integration
@@ -1128,7 +1552,6 @@ pub fn build_window(
                 pending_connection_for_events.clone(),
                 playback_session.clone(),
                 root_trust_prompts.clone(),
-                invalidate_source_playback.clone(),
                 app_config.clone(),
             );
             return;
@@ -1267,6 +1690,7 @@ pub fn build_window(
             let clear_playback_ui = clear_playback_ui.clone();
             let playback_rt = rt_handle.clone();
             let playback_config = app_config.clone();
+            let playback_remote_sources = remote_sources.clone();
 
             glib::MainContext::default().spawn_local(async move {
                 while let Ok(action) = media_rx.recv().await {
@@ -1283,6 +1707,7 @@ pub fn build_window(
                         app_config: playback_config.clone(),
                         rt_handle: playback_rt.clone(),
                         column_view: column_view_for_keys.clone(),
+                        remote_sources: playback_remote_sources.clone(),
                     };
                     match action {
                         MediaAction::Play => {
@@ -1360,6 +1785,7 @@ pub fn build_window(
         let column_view_c = column_view.clone();
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
+        let playback_remote_sources = remote_sources.clone();
 
         hb.play_button.connect_clicked(move |_| {
             toggle_or_start(
@@ -1375,6 +1801,7 @@ pub fn build_window(
                     app_config: playback_config.clone(),
                     rt_handle: playback_rt.clone(),
                     column_view: column_view_c.clone(),
+                    remote_sources: playback_remote_sources.clone(),
                 },
                 shuffle.is_active(),
             );
@@ -1498,6 +1925,7 @@ pub fn build_window(
         let cv = column_view.clone();
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
+        let playback_remote_sources = remote_sources.clone();
 
         column_view.connect_activate(move |_view, position| {
             play_track_at(
@@ -1514,6 +1942,7 @@ pub fn build_window(
                     app_config: playback_config.clone(),
                     rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
+                    remote_sources: playback_remote_sources.clone(),
                 },
             );
         });
@@ -1524,6 +1953,8 @@ pub fn build_window(
         window: window.clone(),
         rt_handle: rt_handle.clone(),
         engine_tx: engine_tx.clone(),
+        remote_sources: remote_sources.clone(),
+        remote_provenance: remote_provenance.clone(),
         track_store: track_store.clone(),
         master_tracks: master_tracks.clone(),
         source_tracks: source_tracks.clone(),
@@ -1556,6 +1987,7 @@ pub fn build_window(
         let cv = column_view.clone();
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
+        let playback_remote_sources = remote_sources.clone();
 
         hb.next_button.connect_clicked(move |_| {
             advance_track(
@@ -1571,6 +2003,7 @@ pub fn build_window(
                     app_config: playback_config.clone(),
                     rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
+                    remote_sources: playback_remote_sources.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
@@ -1593,6 +2026,7 @@ pub fn build_window(
         let cv = column_view.clone();
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
+        let playback_remote_sources = remote_sources.clone();
 
         hb.prev_button.connect_clicked(move |_| {
             // If more than 3 s into the track, restart it.
@@ -1615,6 +2049,7 @@ pub fn build_window(
                     app_config: playback_config.clone(),
                     rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
+                    remote_sources: playback_remote_sources.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
@@ -1651,6 +2086,7 @@ pub fn build_window(
         let toast_overlay = toast_overlay.clone();
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
+        let playback_remote_sources = remote_sources.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -1789,6 +2225,7 @@ pub fn build_window(
                                 app_config: playback_config.clone(),
                                 rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
+                                remote_sources: playback_remote_sources.clone(),
                             })
                         {
                             continue;
@@ -1808,6 +2245,7 @@ pub fn build_window(
                                 app_config: playback_config.clone(),
                                 rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
+                                remote_sources: playback_remote_sources.clone(),
                             },
                             mode,
                             shuffle.is_active(),
@@ -1911,6 +2349,7 @@ pub fn build_window(
         let cv = column_view.clone();
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
+        let playback_remote_sources = remote_sources.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
         play_pending.connect_activate(move |_, _| {
@@ -1933,6 +2372,7 @@ pub fn build_window(
                 app_config: playback_config.clone(),
                 rt_handle: playback_rt.clone(),
                 column_view: cv.clone(),
+                remote_sources: playback_remote_sources.clone(),
             };
             for path in paths {
                 if super::playback::play_local_file(&path, &ctx) {
@@ -1998,6 +2438,8 @@ pub fn build_window(
             window: window.clone(),
             rt_handle: rt_handle.clone(),
             engine_tx: engine_tx.clone(),
+            remote_sources: remote_sources.clone(),
+            remote_provenance: remote_provenance.clone(),
             track_store: track_store.clone(),
             master_tracks: master_tracks.clone(),
             source_tracks: source_tracks.clone(),
@@ -2036,7 +2478,6 @@ pub fn build_window(
         pending_connection_for_events,
         playback_session,
         root_trust_prompts,
-        invalidate_source_playback,
         app_config,
     );
 }
@@ -2152,7 +2593,6 @@ fn setup_library_events(
     pending_connection: Rc<RefCell<Option<PendingConnection>>>,
     playback_session: Rc<RefCell<PlaybackSession>>,
     root_trust_prompts: root_trust::RootTrustPromptController,
-    invalidate_source_playback: SourcePlaybackInvalidator,
     app_config: Rc<RefCell<preferences::AppConfig>>,
 ) {
     let browser_widget = browser_widget.clone();
@@ -2167,44 +2607,6 @@ fn setup_library_events(
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(event) = engine_rx.recv().await {
-            // A remote connection can be replaced while its track snapshot is
-            // queued for GTK. Validate exact ownership at the publication
-            // boundary so an older session cannot repopulate the source.
-            match &event {
-                LibraryEvent::RemoteSync {
-                    source_id,
-                    generation,
-                    lease_key,
-                    ..
-                } if !crate::source_registry::is_current_source(
-                    *source_id,
-                    *generation,
-                    *lease_key,
-                ) =>
-                {
-                    tracing::debug!(
-                        generation,
-                        %lease_key,
-                        "Ignoring stale remote library sync"
-                    );
-                    continue;
-                }
-                LibraryEvent::DaapSync {
-                    source_id,
-                    generation,
-                    session_key,
-                    ..
-                } if !crate::daap::is_current_session(*source_id, *generation, *session_key) => {
-                    tracing::debug!(
-                        generation,
-                        %session_key,
-                        "Ignoring stale DAAP library sync"
-                    );
-                    continue;
-                }
-                _ => {}
-            }
-
             match event {
                 LibraryEvent::FullSync(tracks) => {
                     info!(count = tracks.len(), "Received full library sync");
@@ -2237,56 +2639,6 @@ fn setup_library_events(
                             &column_view,
                         );
                     }
-                }
-
-                LibraryEvent::RemoteSync {
-                    source_id,
-                    generation: _,
-                    lease_key,
-                    tracks,
-                } => {
-                    let source_key = source_id.to_string();
-                    let replaces_current_queue = {
-                        let session = playback_session.borrow();
-                        session.current_identity().is_some_and(|identity| {
-                            identity.media_key.source_id == source_id
-                                && session.current().is_some_and(|item| {
-                                    !crate::source_registry::stream_reference_uses_lease(
-                                        item.uri(),
-                                        lease_key,
-                                    )
-                                })
-                        })
-                    };
-                    if replaces_current_queue {
-                        // Retargeting old queue IDs could cross into a new
-                        // login or library on the same URL. Stop it instead;
-                        // the newly published rows carry the replacement lease.
-                        invalidate_source_playback(&source_key);
-                    }
-
-                    info!(count = tracks.len(), "Received remote library sync");
-
-                    let objects: Vec<TrackObject> = tracks
-                        .iter()
-                        .map(|track| arch_remote_track_to_object(track, lease_key))
-                        .collect();
-                    publish_remote_library(
-                        source_key,
-                        objects,
-                        &source_tracks,
-                        &sidebar_store,
-                        &pending_connection,
-                        &sidebar_selection,
-                        &active_source_key,
-                        &source_navigation,
-                        &track_store,
-                        &master_tracks,
-                        &browser_widget,
-                        &browser_state,
-                        &status_label,
-                        &column_view,
-                    );
                 }
 
                 LibraryEvent::TrackUpserted(track) => {
@@ -2686,57 +3038,61 @@ fn setup_library_events(
                     }
                 }
 
-                LibraryEvent::RemoteConnectionFailed {
-                    source_id,
-                    attempt,
-                    message,
-                } => {
-                    tracing::error!(%source_id, error = %message, "Remote connection failed");
-                    clear_failed_remote_connection(&sidebar_store, source_id, attempt);
-                }
-
                 LibraryEvent::Error(msg) => {
                     tracing::error!(error = %msg, "Library engine error");
                     scan_spinner.set_spinning(false);
                     scan_spinner.set_visible(false);
                 }
 
-                LibraryEvent::DaapSync {
-                    source_id, tracks, ..
-                } => {
-                    let source_key = source_id.to_string();
-                    // DAAP publishes one snapshot per retained session. A new
-                    // snapshot for the same source therefore replaces the
-                    // session embedded in any captured `daap://` queue refs.
-                    invalidate_source_playback(&source_key);
-                    info!(count = tracks.len(), "Received DAAP library sync");
-                    let objects: Vec<TrackObject> =
-                        tracks.iter().map(arch_track_to_object).collect();
-                    publish_remote_library(
-                        source_key,
-                        objects,
-                        &source_tracks,
-                        &sidebar_store,
-                        &pending_connection,
-                        &sidebar_selection,
-                        &active_source_key,
-                        &source_navigation,
-                        &track_store,
-                        &master_tracks,
-                        &browser_widget,
-                        &browser_state,
-                        &status_label,
-                        &column_view,
-                    );
-                }
             }
         }
     });
 }
 
 #[allow(clippy::too_many_arguments)]
+fn plan_remote_publication_selection(
+    pending: Option<&PendingConnection>,
+    navigation: &SourceNavigation,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
+    source_key: &str,
+    accepted: AcceptedRemotePublication,
+    selected_before_accept: u32,
+    projection_active_after_accept: bool,
+) -> RemotePublicationSelection {
+    let Some(pending) = pending.filter(|pending| {
+        pending.matches_lifecycle(source_id, generation) && pending.source_key() == source_key
+    }) else {
+        return RemotePublicationSelection::Inactive;
+    };
+
+    // A row rebind performed by acceptance can synchronously activate and
+    // render the source after the pending guard is cleared. Do not activate it
+    // a second time merely because the original request is no longer current.
+    if accepted.rebound
+        && selected_before_accept == accepted.index
+        && projection_active_after_accept
+    {
+        return RemotePublicationSelection::AlreadyActivated;
+    }
+    if !pending.may_auto_select(source_key, navigation) {
+        return RemotePublicationSelection::Inactive;
+    }
+    if selected_before_accept == accepted.index {
+        // The reducer may already have rebound connected/spinner state while
+        // the pending guard intentionally suppressed that selection signal.
+        // Force one post-publication signal now that catalogue and guard state
+        // are authoritative.
+        RemotePublicationSelection::Reactivate(accepted.index)
+    } else {
+        RemotePublicationSelection::Select(accepted.index)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn publish_remote_library(
-    source_key: String,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
     objects: Vec<TrackObject>,
     source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
     sidebar_store: &gtk::gio::ListStore,
@@ -2751,30 +3107,44 @@ fn publish_remote_library(
     status_label: &gtk::Label,
     column_view: &gtk::ColumnView,
 ) {
+    let source_key = source_id.to_string();
     source_tracks
         .borrow_mut()
         .insert(source_key.clone(), objects.clone());
 
     let pending_intent = pending_connection.borrow().clone();
-    let should_auto_select = pending_intent
-        .as_ref()
-        .is_some_and(|pending| pending.may_auto_select(&source_key, &source_navigation.borrow()));
     let should_clear_pending = pending_intent
         .as_ref()
-        .is_some_and(|pending| pending.source_key() == source_key);
+        .is_some_and(|pending| pending.matches_lifecycle(source_id, generation));
     if should_clear_pending {
         // Clear before any programmatic selection: the selection handler
         // otherwise treats this completed connection as still pending.
         *pending_connection.borrow_mut() = None;
     }
 
-    let auto_selected =
-        accept_remote_publication(sidebar_store, &source_key).is_some_and(|index| {
-            if should_auto_select {
-                sidebar_selection.set_selected(index);
-            }
-            should_auto_select
-        });
+    let selected_before_accept = sidebar_selection.selected();
+    let accepted = accept_remote_publication(
+        sidebar_store,
+        Some(sidebar_selection),
+        source_id,
+        generation,
+    );
+    let projection_active_after_accept =
+        *active_source_key.borrow() == source_key && source_navigation.borrow().is_key(&source_key);
+    let selection_action = accepted.map_or(RemotePublicationSelection::Inactive, |accepted| {
+        plan_remote_publication_selection(
+            pending_intent.as_ref(),
+            &source_navigation.borrow(),
+            source_id,
+            generation,
+            &source_key,
+            accepted,
+            selected_before_accept,
+            projection_active_after_accept,
+        )
+    });
+    selection_action.apply(|index| sidebar_selection.set_selected(index));
+    let auto_selected = selection_action.activates();
 
     if !auto_selected
         && *active_source_key.borrow() == source_key
@@ -2799,28 +3169,43 @@ fn publish_remote_library(
 /// marked connected. The accepted replacement publication still completes
 /// that operation, so it must always clear the transient spinner even though
 /// the durable connected state does not need to change.
-fn accept_remote_publication(sidebar_store: &gtk::gio::ListStore, source_key: &str) -> Option<u32> {
+fn accept_remote_publication(
+    sidebar_store: &gtk::gio::ListStore,
+    sidebar_selection: Option<&gtk::SingleSelection>,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
+) -> Option<AcceptedRemotePublication> {
     for index in 0..sidebar_store.n_items() {
         let Some(source) = sidebar_store.item(index).and_downcast::<SourceObject>() else {
             continue;
         };
-        if source
-            .source_id()
-            .is_none_or(|id| id.to_string() != source_key)
-        {
+        if source.source_id() != Some(source_id) {
             continue;
         }
 
-        if !source.connected() {
+        let mut changed = if !source.connected() {
             source.set_connected(true);
-        }
-        source.set_connecting(false);
+            true
+        } else {
+            false
+        };
+        // A predecessor catalogue can remain authoritative while replacement
+        // generation G2 is pending. Publishing G1 must not clear G2's spinner.
+        changed |= source.clear_connecting_generation(generation);
 
-        // SourceObject fields are plain GTK-side state. Reinsert the same
-        // object so a bound sidebar row immediately drops its spinner.
-        sidebar_store.remove(index);
-        sidebar_store.insert(index, &source);
-        return Some(index);
+        if changed {
+            if let Some(selection) = sidebar_selection {
+                rebind_sidebar_source(sidebar_store, selection, index, &source, true);
+            } else {
+                // Headless model tests do not initialize a GTK selection model.
+                sidebar_store.remove(index);
+                sidebar_store.insert(index, &source);
+            }
+        }
+        return Some(AcceptedRemotePublication {
+            index,
+            rebound: changed,
+        });
     }
     None
 }
@@ -2831,10 +3216,11 @@ fn accept_remote_publication(sidebar_store: &gtk::gio::ListStore, source_key: &s
 /// The background task emits this transition only after its registry attempt
 /// proves it is still latest. Keeping the lookup source-scoped prevents one
 /// failed endpoint from disturbing another row or its retained session.
+#[cfg(test)]
 fn clear_failed_remote_connection(
     sidebar_store: &gtk::gio::ListStore,
     source_id: crate::architecture::SourceId,
-    attempt: uuid::Uuid,
+    generation: u64,
 ) -> Option<u32> {
     for index in 0..sidebar_store.n_items() {
         let Some(source) = sidebar_store.item(index).and_downcast::<SourceObject>() else {
@@ -2842,7 +3228,7 @@ fn clear_failed_remote_connection(
         };
         if source.source_id() != Some(source_id)
             || !source.connecting()
-            || !source.clear_connecting_attempt(attempt)
+            || !source.clear_connecting_generation(generation)
         {
             continue;
         }
@@ -2873,17 +3259,14 @@ pub fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObje
     track_to_object(t, &uri, t.cover_art_url.as_ref().map(url::Url::as_str))
 }
 
-/// Convert a standard remote track using only opaque registry references.
+/// Convert a remote track into a pathless row bound to one adopted session.
 fn arch_remote_track_to_object(
     track: &crate::architecture::models::Track,
-    lease_key: uuid::Uuid,
+    session_epoch: u64,
 ) -> TrackObject {
-    let Some(track_id) = track.native_track_id.as_ref() else {
-        return track_to_object(track, "", None);
-    };
-    let stream_reference = crate::source_registry::stream_reference(lease_key, track_id);
-    let artwork_reference = crate::source_registry::artwork_reference(lease_key, track_id);
-    track_to_object(track, &stream_reference, Some(&artwork_reference))
+    let object = track_to_object(track, "", None);
+    object.set_remote_session_epoch(session_epoch);
+    object
 }
 
 fn track_to_object(
@@ -3056,6 +3439,26 @@ mod identity_tests {
     use super::*;
     use crate::architecture::SourceId;
 
+    fn disconnected_visible_snapshot(
+        revision: u64,
+    ) -> crate::source_lifecycle::LifecycleSnapshot<Vec<crate::architecture::models::Track>> {
+        crate::source_lifecycle::LifecycleSnapshot {
+            revision,
+            state: crate::source_lifecycle::SourceState::Dormant,
+            session_epoch: None,
+            provenance: crate::source_lifecycle::ProvenanceSet::default(),
+            visibility: crate::source_lifecycle::SourceVisibility::Visible,
+            retention: crate::source_lifecycle::Retention::Retained,
+            catalogue: None,
+            views: HashMap::new(),
+            failure: None,
+            refresh_failures: HashMap::new(),
+            pending_connect: None,
+            pending_refreshes: HashMap::new(),
+            pending_retirements: 0,
+        }
+    }
+
     #[test]
     fn saved_and_environment_startup_share_the_persisted_source_owner() {
         let persisted = SourceId::random();
@@ -3116,14 +3519,21 @@ mod identity_tests {
         assert_eq!(connection_attempt.source_id, persisted);
         assert!(saved.connected());
         assert!(saved.connecting());
+        saved.set_connecting_generation(42);
 
         let store = gtk::gio::ListStore::new::<SourceObject>();
         for source in sources {
             store.append(&source);
         }
-        let accepted_index = accept_remote_publication(&store, &persisted.to_string());
+        let accepted_index = accept_remote_publication(&store, None, persisted, 42);
 
-        assert_eq!(accepted_index, Some(1));
+        assert_eq!(
+            accepted_index,
+            Some(AcceptedRemotePublication {
+                index: 1,
+                rebound: true,
+            })
+        );
         assert!(saved.connected());
         assert!(!saved.connecting());
     }
@@ -3139,10 +3549,10 @@ mod identity_tests {
             persisted,
         );
         saved.set_connected(true);
-        let failed_attempt = saved.begin_connecting_attempt();
+        saved.set_connecting_generation(41);
         let other =
             SourceObject::manual("Other", "subsonic", "https://other.example.test", other_id);
-        let other_attempt = other.begin_connecting_attempt();
+        other.set_connecting_generation(81);
 
         let store = gtk::gio::ListStore::new::<SourceObject>();
         store.append(&SourceObject::header("Subsonic"));
@@ -3151,14 +3561,11 @@ mod identity_tests {
 
         // Retry B takes over the same row after failure A was queued but
         // before GTK receives it. Failure A must not clear retry B's spinner.
-        let retry_attempt = saved.begin_connecting_attempt();
-        assert_eq!(
-            clear_failed_remote_connection(&store, persisted, failed_attempt),
-            None
-        );
+        saved.set_connecting_generation(42);
+        assert_eq!(clear_failed_remote_connection(&store, persisted, 41), None);
         assert!(saved.connecting());
         assert_eq!(
-            clear_failed_remote_connection(&store, persisted, retry_attempt),
+            clear_failed_remote_connection(&store, persisted, 42),
             Some(1)
         );
         assert!(
@@ -3167,26 +3574,223 @@ mod identity_tests {
         );
         assert!(!saved.connecting());
         assert!(other.connecting());
-        assert_eq!(
-            clear_failed_remote_connection(&store, persisted, retry_attempt),
-            None
-        );
+        assert_eq!(clear_failed_remote_connection(&store, persisted, 42), None);
         saved.set_connecting(true);
         assert_eq!(
-            clear_failed_remote_connection(&store, persisted, retry_attempt),
+            clear_failed_remote_connection(&store, persisted, 42),
             None,
             "a generic/manual retry invalidates the environment token"
         );
         assert!(saved.connecting());
         saved.set_connecting(false);
-        assert_eq!(
-            clear_failed_remote_connection(&store, other_id, uuid::Uuid::new_v4()),
-            None
-        );
+        assert_eq!(clear_failed_remote_connection(&store, other_id, 82), None);
         assert!(other.connecting());
         assert_eq!(
-            clear_failed_remote_connection(&store, other_id, other_attempt),
+            clear_failed_remote_connection(&store, other_id, 81),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn predecessor_publication_does_not_clear_replacement_spinner() {
+        let source_id = SourceId::random();
+        let source =
+            SourceObject::manual("Saved", "subsonic", "https://music.example.test", source_id);
+        source.set_connected(true);
+        source.set_connecting_generation(2);
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        store.append(&source);
+
+        assert_eq!(
+            accept_remote_publication(&store, None, source_id, 1),
+            Some(AcceptedRemotePublication {
+                index: 0,
+                rebound: false,
+            })
+        );
+        assert!(source.connected());
+        assert!(source.connecting());
+        assert_eq!(source.connecting_generation(), Some(2));
+
+        assert_eq!(
+            accept_remote_publication(&store, None, source_id, 2),
+            Some(AcceptedRemotePublication {
+                index: 0,
+                rebound: true,
+            })
+        );
+        assert!(!source.connecting());
+    }
+
+    #[test]
+    fn fallback_matching_uses_stable_source_key_not_row_position() {
+        let local = SourceObject::source("Local", "local", "folder-music-symbolic");
+        let remote = SourceObject::manual(
+            "Remote",
+            "subsonic",
+            "https://music.example.test",
+            SourceId::random(),
+        );
+
+        assert!(source_matches_navigation_key(&local, "local"));
+        assert!(source_matches_navigation_key(
+            &remote,
+            &remote.source_id().expect("remote identity").to_string()
+        ));
+        assert!(!source_matches_navigation_key(&remote, "local"));
+    }
+
+    #[test]
+    fn retained_passwordless_disconnect_falls_back_before_row_rebind_can_reconnect() {
+        let source_id = SourceId::random();
+        let source_key = source_id.to_string();
+        let mut reducer = RemoteReducerState::default();
+        reducer.published_catalogues.insert(source_id, (41, 7));
+        let baseline = crate::source_lifecycle::LifecycleBaseline {
+            revision: 9,
+            shutting_down: false,
+            sources: vec![(source_id, disconnected_visible_snapshot(9))],
+        };
+
+        let plan = RemoteBaselinePlan::new(&reducer, &baseline);
+        assert_eq!(plan.clear_projections, vec![source_id]);
+
+        let mut navigation = SourceNavigation::new(source_key.clone());
+        let mut active_source_key = source_key.clone();
+        assert!(apply_local_navigation_fallback(
+            &mut navigation,
+            &mut active_source_key,
+            &source_key,
+        ));
+        assert_eq!(active_source_key, "local");
+        assert!(navigation.is_key("local"));
+
+        // Model the stable-key restoration that follows connected=false row
+        // rebind. Because fallback was part of the authoritative baseline
+        // phase, it chooses Local and never re-enters passwordless DAAP.
+        let local = SourceObject::source("Local", "local", "folder-music-symbolic");
+        let remote = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
+        remote.set_requires_password(false);
+        remote.set_connected(false);
+        let restored = [&local, &remote]
+            .into_iter()
+            .find(|source| source_matches_navigation_key(source, &active_source_key))
+            .expect("visible fallback row");
+        let passwordless_reconnects = usize::from(
+            restored.backend_type() == "daap"
+                && !restored.connected()
+                && !restored.requires_password(),
+        );
+        assert_eq!(restored.backend_type(), "local");
+        assert_eq!(passwordless_reconnects, 0);
+    }
+
+    #[test]
+    fn accepted_selected_passwordless_generation_reactivates_once_without_reconnect() {
+        let remote = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
+        let source_id = remote.source_id().expect("stable source");
+        let source_key = source_id.to_string();
+        remote.set_requires_password(false);
+        remote.set_connecting_generation(41);
+
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        store.append(&SourceObject::source(
+            "Local",
+            "local",
+            "folder-music-symbolic",
+        ));
+        store.append(&remote);
+
+        let mut navigation = SourceNavigation::new("local");
+        let request = navigation.select(source_key.clone());
+        let mut pending = PendingConnection::new(source_key.clone(), request);
+        assert!(pending.bind_lifecycle(source_id, 41, ConnectionIntentKind::PasswordlessDaap,));
+
+        // The baseline reducer updates the row before catalogue publication;
+        // its keep-selected rebind is suppressed by the still-live pending
+        // guard. Acceptance therefore observes no remaining row mutation.
+        remote.set_connected(true);
+        assert!(remote.clear_connecting_generation(41));
+        let accepted =
+            accept_remote_publication(&store, None, source_id, 41).expect("accepted source row");
+        assert_eq!(
+            accepted,
+            AcceptedRemotePublication {
+                index: 1,
+                rebound: false,
+            }
+        );
+        assert!(remote.connected());
+        assert!(!remote.connecting());
+
+        let action = plan_remote_publication_selection(
+            Some(&pending),
+            &navigation,
+            source_id,
+            41,
+            &source_key,
+            accepted,
+            1,
+            false,
+        );
+        assert_eq!(action, RemotePublicationSelection::Reactivate(1));
+
+        let mut active_source_key = "local".to_string();
+        let mut selected = 1;
+        let mut activations = 0;
+        let mut passwordless_connects = 1; // the admitted generation G41
+        action.apply(|position| {
+            selected = position;
+            if position == gtk::INVALID_LIST_POSITION {
+                return;
+            }
+            let selected_source = store
+                .item(position)
+                .and_downcast::<SourceObject>()
+                .expect("selected source");
+            if selected_source.connected() {
+                active_source_key = source_key.clone();
+                navigation.select(source_key.clone());
+                activations += 1;
+            } else if selected_source.backend_type() == "daap"
+                && !selected_source.requires_password()
+            {
+                passwordless_connects += 1;
+            }
+        });
+
+        assert_eq!(selected, 1);
+        assert_eq!(activations, 1);
+        assert_eq!(passwordless_connects, 1);
+        assert_eq!(active_source_key, source_key);
+
+        assert_eq!(
+            plan_remote_publication_selection(
+                Some(&pending),
+                &navigation,
+                source_id,
+                42,
+                &source_key,
+                accepted,
+                1,
+                false,
+            ),
+            RemotePublicationSelection::Inactive,
+            "a stale lifecycle generation cannot reactivate"
+        );
+        assert_eq!(
+            plan_remote_publication_selection(
+                Some(&pending),
+                &navigation,
+                source_id,
+                41,
+                &source_key,
+                accepted,
+                1,
+                false,
+            ),
+            RemotePublicationSelection::Inactive,
+            "the reactivation superseded the deferred request exactly once"
         );
     }
 }
