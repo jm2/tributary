@@ -164,7 +164,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing malformed-reference regression pins that fail-closed boundary. Codex review found the
   failed saved-plus-environment spinner path; its reordered same-source and exact-owner regression
   proves cleanup neither clears a newer retry, disconnects the retained predecessor, nor mutates
-  another source row.
+  another source row. The failed-migration regression now injects the atomic-replacement error at
+  the loader's private persistence boundary instead of relying on directory permissions, which a
+  privileged Linux CI container can bypass. Linux, Windows, and unprivileged test runs therefore
+  exercise the same fail-closed no-publication/original-bytes contract without changing production
+  migration behavior.
 - **Source identity and lifecycle now have a recorded architecture contract** — The P3.1 decision
   defines immutable `SourceId` plus backend-native `TrackId` identity, deterministic migration for
   legacy saved sources, one registry-owned connection/refresh/cancellation/failure state machine,

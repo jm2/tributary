@@ -145,6 +145,13 @@ pub fn load_saved_servers() -> Vec<SavedServer> {
 }
 
 fn load_saved_servers_from(path: &Path) -> SavedServerLoad {
+    load_saved_servers_from_with(path, save_servers_to)
+}
+
+fn load_saved_servers_from_with(
+    path: &Path,
+    save_servers: impl FnOnce(&Path, &[SavedServer]) -> std::io::Result<()>,
+) -> SavedServerLoad {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -163,7 +170,7 @@ fn load_saved_servers_from(path: &Path) -> SavedServerLoad {
             Err(_) => return SavedServerLoad::Quarantined,
         };
         let (servers, removed) = migrate_legacy_servers(legacy);
-        if save_servers_to(path, &servers).is_err() {
+        if save_servers(path, &servers).is_err() {
             return SavedServerLoad::Quarantined;
         }
         if removed > 0 {
@@ -1129,22 +1136,17 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("read fixture"), original);
     }
 
-    #[cfg(unix)]
     #[test]
     fn failed_legacy_replacement_publishes_nothing_and_preserves_original_bytes() {
-        use std::os::unix::fs::PermissionsExt;
-
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("servers.json");
         let original = br#"[{"type":"subsonic","name":"Home","url":"https://music.example.test"}]"#;
         std::fs::write(&path, original).expect("write legacy fixture");
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500))
-            .expect("make directory read-only");
 
-        let result = load_saved_servers_from(&path);
+        let result = load_saved_servers_from_with(&path, |_path, _servers| {
+            Err(std::io::Error::other("injected atomic replacement failure"))
+        });
 
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("restore directory permissions");
         assert!(matches!(result, SavedServerLoad::Quarantined));
         assert_eq!(std::fs::read(&path).expect("read legacy fixture"), original);
     }
