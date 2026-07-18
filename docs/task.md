@@ -21,16 +21,17 @@ state.
 - Do not treat the order below as a release promise. It is a dependency-aware starting order and
   can change as issues receive product decisions and milestones.
 
-Current status: **2/35 (5.7%)** active implementation records complete. This percentage measures
+Current status: **3/35 (8.6%)** active implementation records complete. This percentage measures
 checklist completion, not equal engineering effort: several P3 records are deliberately large
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
 ## Current focus
 
-P1.1 and P1.2 are complete. Continue with the playback-history contract and migration foundation
-in P1.3. The rest of P1 builds on the source-scoped identity already present in the runtime, the
-now-bounded shuffle navigation semantics, and an honest local-only playlist interaction boundary.
+P1.1, P1.2, and the P1.3 playback-history contract/schema foundation are complete. Continue with
+authoritative per-occurrence persistence and live UI invalidation in the second P1.3 record. The
+rest of P1 builds on the source-scoped identity already present in the runtime, the now-bounded
+shuffle navigation semantics, and an honest local-only playlist interaction boundary.
 
 ## P1 — Correctness and shared feature foundations
 
@@ -86,16 +87,25 @@ now-bounded shuffle navigation semantics, and an honest local-only playlist inte
 
 ### P1.3 — Record trustworthy local playback history
 
-- [ ] Define and migrate the durable playback-history contract: counted-play threshold,
-  `last_played`, repeat/seek/restart semantics, clock representation, and legacy-row behavior.
+- [x] Define and migrate the durable playback-history contract: counted-play threshold,
+  `last_played`, repeat/seek/restart semantics, clock representation, and legacy-row behavior
+  ([contract](playback-history.md); implementing PR pending).
 - [ ] Persist play-count and last-played updates from authoritative playback events exactly once,
   without counting rejected loads, stale generations, or retries, and refresh affected UI state.
 - [ ] Make Recently Played and Top 25 reflect the new history contract deterministically, including
   live refresh, ordering, empty-state, migration, and regression coverage.
 
-  Today the schema and Plays column expose `play_count`, but production playback does not increment
-  it and there is no `last_played` field. The seeded playlists therefore exist but ordinarily stay
-  empty for local tracks.
+  Implemented foundation: local tracks now have a nullable UTC epoch-millisecond `last_played`
+  field, negative legacy counts are repaired without inventing timestamps, and a pure one-shot
+  occurrence state accounts only for observed forward playback. A positive duration counts at half
+  duration rounded up and capped at four minutes; missing/zero duration uses four minutes or an
+  unskipped authoritative natural end. Pause, buffering, seek jumps, restarts, and retries cannot
+  manufacture credit, while Repeat One creates a new occurrence. The complete contract and future
+  persistence/smart-playlist boundaries are recorded in [`playback-history.md`](playback-history.md).
+
+  Production playback still does not increment `play_count` or write `last_played`; that is the
+  second record. Recently Played and Top 25 therefore remain ordinarily empty until the second and
+  third records complete.
 
 ### P1.4 — Add ratings as a real library field
 
@@ -229,3 +239,4 @@ now-bounded shuffle navigation semantics, and an honest local-only playlist inte
 | 2026-07-18 | Backlog reset | — | Archived the holistic-review tracker and established the audited feature backlog; no implementation record completed. |
 | 2026-07-18 | P1.1 bounded shuffle history | [#132](https://github.com/jm2/tributary/pull/132) | Retained ten real prior occurrences, fixed forward traversal and complete Repeat All cycles, unified Previous dispatch, made toggle/reset semantics explicit, and added lifecycle/rollback regressions. |
 | 2026-07-18 | P1.2 honest unsupported playlist actions | [#133](https://github.com/jm2/tributary/pull/133) | Refused non-local Add to Playlist actions with an all-or-none localized dialog before database work, localized the existing context-menu labels, and regressed the fail-closed source policy plus every shipped catalog. |
+| 2026-07-18 | P1.3 playback-history contract and schema | Pending | Defined occurrence, threshold, duration, seek/retry/restart, clock, and legacy contracts; added migration 10 plus safe model conversion and a pure one-shot progress state. Production event writes and smart-playlist consumers remain the next two records. |

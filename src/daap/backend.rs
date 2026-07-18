@@ -176,6 +176,7 @@ impl DaapBackend {
                 sample_rate_hz: sample_rate,
                 format: Some(format.clone()),
                 play_count: None,
+                last_played: None,
             };
 
             let idx = all_tracks.len();

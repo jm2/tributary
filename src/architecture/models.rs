@@ -100,6 +100,12 @@ pub struct Track {
 
     /// Number of times this track has been played.
     pub play_count: Option<u32>,
+
+    /// UTC instant when this track most recently crossed Tributary's
+    /// counted-play threshold. Legacy and unplayed tracks leave this unset;
+    /// file metadata timestamps are never substituted for listening history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_played: Option<DateTime<Utc>>,
 }
 
 /// An album — a logical grouping of tracks.

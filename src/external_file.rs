@@ -154,6 +154,7 @@ impl ExternalFileCandidate {
             sample_rate_hz: parsed.sample_rate_hz,
             format: Some(parsed.format),
             play_count: None,
+            last_played: None,
         };
 
         ExternalFileAdapter {

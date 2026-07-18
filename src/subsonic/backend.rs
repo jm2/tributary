@@ -583,6 +583,7 @@ fn song_to_track(
         sample_rate_hz: None,
         format: song.suffix.clone(),
         play_count: song.play_count,
+        last_played: None,
     }
 }
 

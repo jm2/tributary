@@ -155,9 +155,10 @@ pub enum LimitUnit {
 
 /// How to select items when limiting.
 ///
-/// Recently-played sort variants are intentionally absent: tracks have
-/// no `last_played` column yet, so those modes would silently no-op.
-/// Re-add them once playback statistics are persisted.
+/// Recently-played sort variants remain intentionally absent: the durable
+/// field exists, but production playback does not populate it and smart-rule
+/// evaluation does not expose it yet. P1.3c adds both pieces together so the
+/// modes cannot silently no-op.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum LimitSort {
     Random,
