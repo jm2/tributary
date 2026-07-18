@@ -1935,8 +1935,8 @@ and 76/79 P2; P3.5's exact-toolchain acceptance remains recorded by PR #111.
 Current merged-branch validation (2026-07-17, P3.1 stable identity before PR #120):
 `cargo check --all-targets --all-features --locked`, strict
 `cargo clippy --all-targets --all-features --locked -- -D warnings`, and
-`cargo test --all-targets --all-features --locked` pass. The complete debug profile runs 20
-library, 793 application, and 10 repository-metadata tests (823 total). The 46-test identity filter
+`cargo test --all-targets --all-features --locked` pass in debug and release. Each complete profile
+runs 20 library, 793 application, and 10 repository-metadata tests (823 total). The 46-test identity filter
 passes together with focused production-queue capture, recycled-sidebar action, prefixed
 Jellyfin/Plex/Subsonic, native-ID artwork, DAAP adversarial/expiration, and already-connected
 reconnect-publication regressions. These post-merge tests exercise the P3.4 seams with typed media

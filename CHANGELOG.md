@@ -140,8 +140,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change, and each OS-opened file session mints independent random source and track IDs. The
   standard and DAAP registries and UI-owned lifecycle paths remain to be consolidated; radio,
   removable, and external queues still retain their current locator until their at-use adapters
-  land. After merging the completed P3.4 seams, the full debug repository suite passes 823 tests
-  and strict all-target/all-feature Clippy remains clean.
+  land. After merging the completed P3.4 seams, the full debug and release repository suites each
+  pass 823 tests and strict all-target/all-feature Clippy remains clean in both profiles.
 - **Source identity and lifecycle now have a recorded architecture contract** — The P3.1 decision
   defines immutable `SourceId` plus backend-native `TrackId` identity, deterministic migration for
   legacy saved sources, one registry-owned connection/refresh/cancellation/failure state machine,
