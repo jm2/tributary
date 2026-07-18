@@ -69,7 +69,8 @@ now-bounded shuffle navigation semantics, and an honest local-only playlist inte
 ### P1.2 — Make unsupported remote playlist actions honest
 
 - [x] When Add to Playlist cannot accept a remote row, show a localized, user-visible result
-  instead of only logging that the row was skipped ([#47](https://github.com/jm2/tributary/issues/47)).
+  instead of only logging that the row was skipped ([#47](https://github.com/jm2/tributary/issues/47);
+  [#133](https://github.com/jm2/tributary/pull/133)).
 
   Keep this slice migration-free. It closes the misleading current interaction while P1.5 designs
   full remote playlist persistence.
@@ -227,4 +228,4 @@ now-bounded shuffle navigation semantics, and an honest local-only playlist inte
 |---|---|---|---|
 | 2026-07-18 | Backlog reset | — | Archived the holistic-review tracker and established the audited feature backlog; no implementation record completed. |
 | 2026-07-18 | P1.1 bounded shuffle history | [#132](https://github.com/jm2/tributary/pull/132) | Retained ten real prior occurrences, fixed forward traversal and complete Repeat All cycles, unified Previous dispatch, made toggle/reset semantics explicit, and added lifecycle/rollback regressions. |
-| 2026-07-18 | P1.2 honest unsupported playlist actions | PR pending | Refused non-local Add to Playlist actions with an all-or-none localized dialog before database work, localized the existing context-menu labels, and regressed the fail-closed source policy plus every shipped catalog. |
+| 2026-07-18 | P1.2 honest unsupported playlist actions | [#133](https://github.com/jm2/tributary/pull/133) | Refused non-local Add to Playlist actions with an all-or-none localized dialog before database work, localized the existing context-menu labels, and regressed the fail-closed source policy plus every shipped catalog. |
