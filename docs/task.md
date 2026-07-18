@@ -79,33 +79,30 @@ warning-free Clippy, formatting, and diff checks green.
 PR #123's CodeQL follow-up replaces three credential-shaped password literals with runtime-generated
 fixture values, retaining the exact Jellyfin authentication/logout assertions without weakening or
 suppressing hard-coded-secret analysis.
-After that merge, the affected local `x86_64-pc-windows-gnullvm` packaging command reached the
-singleton Soup import gate but exposed a second failure at a still-positional call.
-`Invoke-BoundedPeImportBatch` declares a non-terminal `[string[]]` target parameter before its
-stopwatch, deadlines, and limits; the reported behavior is consistent with version-dependent
-PowerShell array binding/coercion treating a later control value as a target, which the inspector
-correctly rejected as non-absolute or nonexistent. The current follow-up names all seven arguments
-at both production call sites and pins the declaration plus each invocation independently.
-PowerShell 7 parses the complete script and all 11 focused Windows packaging contracts pass, but
-does not reproduce the affected host's behavior. The exact Windows PowerShell/MSYS2 packaging rerun
-therefore remains pending. This repairs an already-checked packaging implementation and changes no checkbox:
-the totals remain **219/223 (98.2%)**, **76/79 P2**, and **29/30 P3**. The locked all-target/all-feature
-check, strict debug/release Clippy, formatting, and whitespace gates pass; complete locked debug and
-release suites each pass 20 library, 866 application, and 10 repository-metadata tests (**896 total**).
-PR #124's CI run `29633729566` subsequently passed every job, including production bundle/probe
-execution on native x86_64 and ARM64 Windows runners. That proves the named calls on the CI
-PowerShell hosts. The exact affected-host rerun on 2026-07-18 passed dependency discovery, the
-release build, plugin synchronization, scanner replacement, and distribution-path resolution, but
-still rejected the singleton Soup inspection target with the same absolute/existing-file
-diagnostic. Explicit argument names therefore did **not** resolve the host-specific failure and the
-earlier array-binding explanation remains only a disproved working hypothesis. The script now
-needs a second repair that removes the ambiguous batch-target boundary or reports the exact failed
-predicate before live packaged-server playback can be recorded. This does not change checklist
-arithmetic.
+PR #124 named every PE-inspector argument and passed its native x86_64 and ARM64 package/probe jobs,
+but the 2026-07-18 affected-host rerun still rejected the singleton Soup target after dependency
+discovery, release compilation, plugin synchronization, scanner replacement, and distribution-path
+resolution. That exact result disproves the positional array-binding hypothesis; explicit names
+were not a complete repair. The current candidate removes the non-terminal `[string[]]` function
+boundary entirely. Callers now construct explicit `List[string]` instances for the Soup singleton,
+each closure round, and every bounded process batch. Before `llvm-readobj` receives a target, the
+validator distinguishes null/empty values, quotes or control characters, non-rooted paths,
+`GetFullPath` failures, non-DLL/EXE extensions, and missing files. Its bounded single-line
+diagnostic retains at most 192 sanitized target characters plus a fixed truncation marker. The
+nonexecuting inspector, exact architecture, batch/argument/output/time/process-tree limits, and
+fail-closed closure policy are unchanged.
+PowerShell 7 can exercise the new behavior regression away from Windows, but only the exact Windows
+PowerShell 5.1/MSYS2 rerun can confirm the host-specific failure is repaired. PowerShell's AST
+parser reports zero errors; formatting, diff, locked check, and strict debug/release Clippy pass;
+the current 14 `windows_*` and three `powershell_*` tests pass; and complete locked debug/release
+suites each pass 20 library, 896 application, and 10 repository-metadata tests (**926 total**) with
+zero failures or ignored tests. Native Windows package CI/Desktop PowerShell 5.1 execution and the
+exact affected-host rerun remain pending, so this is a repair candidate and changes no checkbox:
+the totals remain **219/223 (98.2%)**, **76/79 P2**, and **29/30 P3**.
 Comprehensive lifecycle, playback-boundary, reducer, provenance, Jellyfin, and actual-wire DAAP
 regressions cover the authenticated cutover. Removable and OS-opened external media still need
 registry-owned at-use locator adapters; those keep the final P3.1 implementation record open.
-The current P3.1 follow-up closes the separate local/playlist embedded-art authority boundary.
+PR #125 closed the separate local/playlist embedded-art authority boundary.
 Artwork begins only after exact-ID resolution is still current for the configured roots and the
 selected output accepts the load, then owns a cloned `ResolvedLocalMedia` through its background
 parse. Cloning revalidates the root marker, ancestor chain, and exact file, so path replacement
@@ -119,7 +116,7 @@ and the whitespace gate pass. Complete locked debug and release suites each pass
 application, and 10 repository-metadata tests (**902 total**). Because this is part of the still-open
 compound implementation record, the totals remain **219/223 (98.2%)**, **76/79 P2**, and
 **29/30 P3**.
-The current P3.1 Radio-Browser follow-up generalizes that owner to `SourceRegistry` and installs one
+PR #126 generalized that owner to `SourceRegistry` and installed one
 stateless built-in source whose Top Clicked, Top Voted, and Near Me feeds are exact independently
 cancellable `ViewOrigin` lanes. Accepted snapshots publish pathless tracks while a private payload
 retains validated station-ID-to-public-URL contributions. Resolution chooses the greatest accepted
@@ -1584,21 +1581,23 @@ failed through the separately resolved media path—but did not prove DNS was th
   that only PowerShell understands. This is a repair to the checked packaging implementation, not
   a new checklist closure.
   The next local run passed that path normalization and then failed inside the singleton Soup
-  inspection with the same fixed PE-target diagnostic. `Invoke-BoundedPeImportBatch` declares its
-  `[string[]] $Paths` parameter before a stopwatch and four integer controls, while both production
-  callers supplied the entire argument list positionally. The affected host's behavior is consistent
-  with version-dependent PowerShell array binding/coercion having sent a control value to the target
-  validator. The follow-up explicitly binds `Inspector`, `Paths`,
-  `ClosureClock`, both deadlines, the output cap, and the argument cap for the singleton and batched
-  paths. A static regression validates the declaration and both calls independently; a complete
-  PowerShell 7 AST parse and all 11 focused Windows platform-runtime tests pass on the development
-  host. Locked check, strict Clippy, and complete debug/release suites also pass, with 896 tests per
-  profile. This changes no import target, closure bound, runtime-copy policy, dependency, lockfile,
-  or checklist arithmetic. The subsequent exact Windows PowerShell/MSYS2 rerun reached the same
-  singleton Soup validation and failed with the same absolute/existing-target diagnostic despite
-  those named arguments. That falsifies the argument-binding repair as a complete fix. A follow-up
-  must remove the ambiguous array boundary (or first expose which exact invariant differs on that
-  host), pass the native package matrix, and then pass this exact host rerun.
+  inspection with the same fixed PE-target diagnostic. PR #124 named all seven arguments to the
+  non-terminal `[string[]] $Paths` boundary and passed both native CI package/probe jobs, but the
+  subsequent exact Windows PowerShell/MSYS2 rerun failed at the same singleton validation. That
+  result disproves positional array binding as the cause. The current candidate replaces the
+  function-boundary array with an explicit `List[string]` assembled by the caller for the Soup
+  singleton, each closure round, and every bounded inspector batch. Per-target validation now
+  identifies null/empty input, quotes or control characters, a non-rooted value, a
+  `GetFullPath` failure, a non-DLL/EXE extension, or a missing file before process launch. Its bounded
+  single-line diagnostic retains at most 192 sanitized target characters plus a fixed truncation
+  marker. The nonexecuting architecture-local `llvm-readobj` path and all existing command-line,
+  process-tree, batch, and whole-closure limits remain unchanged. The current focused filters pass
+  14 `windows_*` and three `powershell_*` tests; the target-batch behavior regression uses `pwsh`
+  away from Windows and is designed to require Desktop PowerShell 5.1 on native Windows. AST,
+  formatting/diff, locked check, strict debug/release Clippy, and both complete 926-test profiles
+  pass. Native package CI/Desktop PowerShell 5.1 execution and the exact affected-host rerun remain
+  required before calling this fixed. This changes no import target, runtime-copy policy,
+  dependency, lockfile, or checklist arithmetic.
 - [ ] Record live playback from a packaged Windows artifact against the reported DAAP and Subsonic
   servers, including catalogue connection, protected-media startup, audible playback, and useful
   URL-free failure diagnostics if either server cannot play. The automated package probe cannot
@@ -2100,6 +2099,18 @@ behavior, stale generation rejection, and bounded/checked raw MP4 fallback. This
 embedded-art portion of P3.1's compound final record, so the tracker remains **219/223 (98.2%)**
 overall, **76/79 P2**, and **29/30 P3** while Radio-Browser, removable, and external-file adapters
 remain.
+
+Current branch validation (2026-07-18, P2.11 Windows typed PE-target repair candidate):
+PowerShell 7's AST parser reports `parser_errors=0`; `cargo fmt --all -- --check`,
+`git diff --check`, locked all-target/all-feature check, and strict debug/release Clippy pass. The
+current focused filters pass 14 `windows_*` and three `powershell_*` platform-runtime tests. The
+new target-batch behavior regression executes through `pwsh` on non-Windows development hosts and
+is designed to require Desktop PowerShell 5.1 on native Windows. Complete locked debug and release
+suites each pass 20 library, 896 application, and 10 repository-metadata tests (**926 total**) with
+zero failures or ignored tests. Native package CI/Desktop PowerShell 5.1 execution and the exact
+affected Windows PowerShell/MSYS2 rerun remain pending. Consequently this evidence does not yet
+claim the reported host failure is fixed, and the tracker remains **219/223 (98.2%)** overall,
+**76/79 P2**, and **29/30 P3**.
 
 Accepted validation (2026-07-18, PR #124 P2.11 Windows PE-import named-binding follow-up):
 `cargo check --locked --all-targets --all-features`, strict all-target/all-feature Clippy in debug
@@ -3153,6 +3164,21 @@ Record scope or design decisions here so deferred work is explicit.
   PSDrive name from reaching `.NET` or an external executable. This fixes entry into the
   already-required packaged probe and does not substitute for the open live DAAP/Subsonic playback
   evidence.
+- 2026-07-18 — P2.11 treats PR #124's exact-host reproduction as evidence against its positional
+  array-binding hypothesis, not as a reason to weaken PE-target validation. The repair candidate
+  removes `[string[]]` from the function boundary and has each caller construct an explicit
+  `List[string]` for the singleton Soup check, a closure round, and every bounded process batch.
+  Each target is rejected before process launch if it is null/empty, contains a quote or control
+  character, is not rooted, cannot survive `GetFullPath`, is not a DLL/EXE, or is not an
+  existing file. The bounded single-line failure report preserves at most 192 sanitized target
+  characters plus a fixed truncation marker, so the affected host can identify the exact
+  predicate. The selected architecture's nonexecuting `llvm-readobj`, closure inputs, and all
+  established batching, argument, output, deadline, and process-tree bounds remain unchanged. A
+  live behavior
+  regression uses `pwsh` on non-Windows hosts and Desktop PowerShell 5.1 on Windows; neither that
+  coverage nor native package CI substitutes for rerunning the exact affected PowerShell/MSYS2
+  command. Checklist arithmetic therefore remains unchanged until the separate live-playback task
+  is actually satisfied.
 - 2026-07-15 — P2.11 treats repeated DAAP and Subsonic failures at exactly GStreamer's 15-second
   HTTP-source timeout as a shared protected-playback defect, not a protocol-authentication defect.
   The opaque loopback boundary remains necessary: handing backend requests directly to GStreamer
@@ -3260,6 +3286,7 @@ Add one line per completed task:
 | 2026-07-17 | P3.1 exact local/playlist ID-at-use and retained output authority | PR #121 | Preserves PR #120's exact SQLite IDs and typed local `MediaKey`/playlist `ViewOrigin`, keeps playback queues pathless, and resolves only the exact current row beneath the most-specific currently configured authoritative root. A typed `ResolvedLocalMedia` lease retains root, marker, ancestor, and exact file handles through local/AirPlay GStreamer, Chromecast, and MPD handle-backed tickets; path replacement cannot retarget admitted playback, explicit-offset full/Range reads cannot interfere through a shared cloned-handle cursor, and load replacement, Stop, error, terminal completion, ticket drop, and teardown revoke future lookup. Shared Chromecast cleanup revokes credential and retained-authority routes without changing the legacy explicit-file server-lifetime contract. Gemini's review follow-up replaced whole-row root equality with a semantic snapshot that ignores observational timestamp drift while binding every root-authority field. All 56 focused root/state recheck, no-fallback, symlink-escape, retained-file replacement, ticket/revocation, output-boundary, and playlist-ownership regressions pass alongside locked all-target check, formatting/diff checks, strict debug/release Clippy, and complete 834-test debug/release suites. Central lifecycle/provenance, nonlocal at-use locator adapters, and the path-based local embedded-art helper remain open. |
 | 2026-07-17 | P3.1 centralized lifecycle foundation (partial) | PR #122 | Adds an intentionally unwired `SourceLifecycleRegistry` with atomic adapter/production-lease/epoch ownership, framework-only construction and unforgeable close authority, phase-safe protected construction plus staged retirement, exact connect/refresh generations, correlated sanitized failures, keyed/refcounted provenance, exact reusable disconnect waiters, post-resolution lease/epoch rechecks, atomic task admission, a persistent shutdown barrier, and final-handle fail-closed teardown. Thirty-eight deterministic adversarial tests cover pre/post-stage cancellation and panic (including synchronous closure invocation), supersession ordering, stale media/refresh rejection, provenance reappearance, reconnect/disconnect close races and waiter/event/barrier finalization, late task admission, replacement, views, shutdown, and pruning. A Windows x86_64 CI interleaving exposed that waiter publication preceded release of the retirement task's barrier participant; the follow-up now finalizes state/events, releases barrier participation, and only then wakes the waiter, so waiter completion and shutdown completion agree. Standard/DAAP/GTK production owners remain unchanged, the DAAP login constructor still needs its required post-session-ID/pre-update split, and the centralization and final implementation boxes remain open. |
 | 2026-07-18 | P3.1 authenticated-remote lifecycle production cutover (partial) | PR #123 | Makes `RemoteSourceRegistry` the sole production owner for Subsonic, Jellyfin, Plex, and DAAP connection, catalogue, media epoch, failure, disconnect, and shutdown state; removes the sibling standard/DAAP registries; and makes GTK consume one atomic baseline/watch reducer. Exact accepted catalogues clear their pending guard before rebind and reactivate an already-selected row only after publication is authoritative; stale generations remain inactive, and programmatic selection releases `RefCell` guards before synchronous GTK re-entry. Independent Saved/Environment/Discovery claims drive demotion and visibility; discovery withdrawal clears its advertised route and revokes route-bound active/pending work even when another claim preserves the row. Per-generation connect settlements let one composite disconnect waiter join superseded construction, late rejected-adapter close, an adopted adapter, and a dissociated predecessor, propagate a sanitized late close failure, and let final-claim release retire/prune without duplicate close. DAAP stages exact close authority after `mlid` and before update/database/items. Interactive Jellyfin stages its owned token before ping/catalogue, cleans up a safely representable token if final client construction fails, never logs out a pre-existing API key, and fails closed without unsafe logout for the narrow control-byte-header case. Menu and Ctrl+Q quit requests enter the active window's shutdown barrier. The focused lifecycle module passes 53 tests; locked debug and release suites each pass 20 library, 865 application, and 10 repository-metadata tests (895 total), with locked check, strict Clippy, formatting, and diff checks green. Radio/removable/external at-use adapters and local embedded-art authority keep the final implementation box open at 219/223 overall and 29/30 P3. |
-| 2026-07-18 | P2.11 Windows PE-import argument-binding repair (follow-up) | PR #124 | Replaces positional calls to the non-terminal `[string[]] Paths` parameter with explicit names for every singleton and batch inspector argument, removing the suspected version-dependent route by which a deadline or limit could be treated as a PE target. The regression checks the declaration and each of the exactly two production calls independently. PowerShell 7 parses the complete script, all 11 focused Windows contracts pass, and locked debug/release suites each pass 20 library, 866 application, and 10 repository-metadata tests (896 total) with locked check and strict Clippy green. CI run `29633729566` passed every job, including production bundle/probe execution on native x86_64 and ARM64 Windows runners. Import targets, limits, and fail-closed validation are unchanged. The exact affected Windows PowerShell/MSYS2 build and the separate live DAAP/Subsonic playback proof remain pending, so checklist arithmetic stays at 219/223 overall and 76/79 P2. |
+| 2026-07-18 | P2.11 Windows PE-import argument-binding repair (follow-up) | PR #124 | Replaces positional calls to the non-terminal `[string[]] Paths` parameter with explicit names for every singleton and batch inspector argument. The regression checks the declaration and each of the exactly two production calls independently. PowerShell 7 parses the complete script, all 11 focused Windows contracts pass, and locked debug/release suites each pass 20 library, 866 application, and 10 repository-metadata tests (896 total) with locked check and strict Clippy green. CI run `29633729566` passed every job, including production bundle/probe execution on native x86_64 and ARM64 Windows runners. The later exact affected-host rerun nevertheless failed at the same singleton Soup validation, disproving the positional array-binding hypothesis and showing that named arguments were not a complete repair. The separate live DAAP/Subsonic proof remains pending, so checklist arithmetic stays at 219/223 overall and 76/79 P2. |
 | 2026-07-18 | P3.1 retained local/playlist embedded-art authority (partial) | PR #125 | Starts embedded-art work only after exact local resolution remains current and the selected output accepts its retained load, then gives a cloned `ResolvedLocalMedia` rather than a path/URI to the background worker. Clone-time root-marker, ancestor, and exact-file revalidation plus handle ownership through parsing make path replacement non-retargetable and authority drift fail closed. Cursor-safe Lofty parsing uses an extension hint with property reads disabled; its explicit MP4 reread and checked raw `covr` fallback use the same handle, cap the raw file at 256 MiB, and cap returned artwork at 32 MiB. Exact art generations reject delayed results. All 9 focused tests, locked check, strict debug/release Clippy, formatting/diff checks, and complete 902-test debug/release suites pass. The direct URI helper remains transitional only for removable/external files; Radio-Browser and those two adapters keep the compound P3.1 record open at 219/223 overall and 29/30 P3. |
 | 2026-07-18 | P3.1 Radio-Browser registry/view and public at-use authority (partial) | PR #126 | Generalizes `SourceRegistry` and installs one stateless built-in Radio-Browser session whose Top Clicked, Top Voted, and Near Me feeds are exact cancellable views. Accepted snapshots expose pathless tracks while validated public locators, per-view leases, and source-wide generations remain private. Playback resolves the greatest accepted contributing generation and rechecks that exact winner through weak registry authority immediately before direct output load; same-view replacement, a newer overlapping view, removal, disconnect, and last-registry-drop all revoke pending requests. The typed client uses a known HTTPS mirror without synchronous DNS, closed redacted failures, deadlines and body caps, validated coordinates/filters/URLs, and success-empty semantics. Near Me preserves partial successful tiers, deduplicates by tier precedence before stable global distance ordering, and GTK owns only translated consent/navigation. Independent review fixed an unrelated-invalidation race during first-use consent with an exact generation-owned prerequisite marker, then ensured automatic source loss restores Local's configured music-column and browser presentation; automated PR review cached one distance per accepted station instead of repeating Haversine/centroid work in every sort comparison. Locked all-target check, strict debug/release Clippy, formatting/diff checks, 53 lifecycle tests, 14 registry tests, 9 media tests, 37 radio-filtered tests, and complete 925-test debug/release suites pass. Removable and external-file at-use adapters keep the compound record open at 219/223 overall and 29/30 P3. |
+| 2026-07-18 | P2.11 typed Windows PE-target repair candidate | PR #127 | Removes the non-terminal array boundary by assembling explicit `List[string]` values for the Soup singleton, closure rounds, and bounded inspector batches. Per-target validation distinguishes null/empty, quote/control, rooted, normalization, extension, and existence failures. Its bounded single-line diagnostic retains at most 192 sanitized target characters plus a fixed truncation marker. The nonexecuting architecture-local inspector and every existing resource bound remain intact. AST parsing, formatting/diff, locked check, strict debug/release Clippy, 14 `windows_*` tests, three `powershell_*` tests, and complete 926-test debug/release profiles pass. Native package CI/Desktop PowerShell 5.1 execution and the exact affected-host rerun remain pending. This repair candidate leaves progress at 219/223 overall and 76/79 P2. |
