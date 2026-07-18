@@ -125,7 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   superseded dialog cannot suppress ordinary fallback. Automatic construction failure or later
   source loss now returns a selected radio lane to Local with the user's music-column names,
   column visibility, and browser visibility restored. The adapter tolerates partial successful
-  tiers, deduplicates by tier precedence, and then applies one stable global distance sort.
+  tiers, deduplicates by tier precedence, computes each retained station's distance once, and then
+  applies one stable global distance sort.
   Locked all-target/all-feature check, strict debug/release Clippy, formatting, and diff checks
   pass; complete locked debug and release suites each pass 20 library, 895 application, and 10
   repository-metadata tests (925 total). Independent integrated review found the consent race and

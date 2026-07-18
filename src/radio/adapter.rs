@@ -261,15 +261,16 @@ fn deduplicate_and_sort_nearby(
         }
         seen_ids.insert(station.stationuuid.clone());
         seen_urls.insert(station.url_resolved.clone());
-        unique.push(station);
+        let distance = estimate_station_distance(&station, location.latitude, location.longitude);
+        unique.push((distance, station));
     }
 
-    unique.sort_by(|left, right| {
-        estimate_station_distance(left, location.latitude, location.longitude).total_cmp(
-            &estimate_station_distance(right, location.latitude, location.longitude),
-        )
-    });
-    unique
+    // Distance estimation may perform centroid lookup and Haversine
+    // trigonometry. Decorate each accepted row once instead of repeating that
+    // work for every sort comparison; stable sorting preserves tier/server
+    // order when two rows have the same estimated distance.
+    unique.sort_by(|(left, _), (right, _)| left.total_cmp(right));
+    unique.into_iter().map(|(_, station)| station).collect()
 }
 
 fn deduplicate_in_source_order(stations: Vec<RadioStation>) -> Vec<RadioStation> {
