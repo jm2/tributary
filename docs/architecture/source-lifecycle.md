@@ -5,7 +5,8 @@
   packaged Windows DAAP/Subsonic playback validation remain tracked field work outside this
   decision.
 - Decision date: 2026-07-17
-- Tracker: [P3.1](../task.md#p31-introduce-a-sourcesession-registry)
+- Historical tracker:
+  [P3.1](../task-remediation-2026-07.md#p31-introduce-a-sourcesession-registry)
 - Review finding: [Architectural assessment](../../CODE_REVIEW_2026-07-10.md#architectural-assessment)
 
 ## Context
@@ -46,8 +47,9 @@ only at final playback use. OS-opened files use ephemeral registry-owned adapter
 and a retained exact-file capability through playback and artwork consumption. Mounted removable
 media uses the same registry lifecycle, pathless identity, session epoch, and typed file-resolution
 branch while retaining its protocol-specific GIO inventory and mount authority. This completes
-[P3.1](../task.md#p31-introduce-a-sourcesession-registry); the three remaining tracker items are
-physical or installed-environment validation, not an open lifecycle implementation boundary.
+[P3.1](../task-remediation-2026-07.md#p31-introduce-a-sourcesession-registry); the three remaining
+tracker items are physical or installed-environment validation, not an open lifecycle
+implementation boundary.
 
 ## Decision
 

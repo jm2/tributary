@@ -23,7 +23,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | GStreamer audio playback (`playbin3`) | ✅ |
 | MPRIS / SMTC / macOS Now Playing integration (`souvlaki`) | ✅ |
 | Playback controls (play/pause, next/prev, seek, volume) | ✅ |
-| Shuffle & repeat (off / all / one) with persistence | ✅ |
+| Shuffle & repeat (off / all / one) with actual Previous history and persistence | ✅ Bounded Repeat All/test hardening is tracked in [P1.1](docs/task.md#p11--harden-and-document-existing-shuffled-playback-history) |
 | Column sort persistence | ✅ |
 | Subsonic / Navidrome / Nextcloud Music backend | ✅ |
 | Jellyfin backend | ✅ |
@@ -38,7 +38,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Internet Radio (Top Clicked, Top Voted, Stations Near Me) | ✅ |
 | Tiered geo-location (geo-distance → state → country) | ✅ |
 | Column drag-and-drop reordering with persistence | ✅ |
-| Regular & smart playlists (iTunes-style rules engine) | ✅ |
+| Regular & smart playlists (iTunes-style rules engine) | ✅ Local-library playlists; remote persistence is planned ([#47](https://github.com/jm2/tributary/issues/47)) |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
 | Batch metadata editing (multi-select) | ✅ |
@@ -60,12 +60,16 @@ Tributary provides a unified interface for managing and streaming music from mul
 | USB file transfer (copy to device with progress) | ❌ Planned ([#8](https://github.com/jm2/tributary/issues/8)) |
 | Multiple music library directories | ✅ |
 | Playlist import/export (XSPF) | ✅ |
-| Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ |
+| Default smart playlists (Recently Added, Recently Played, Top 25) | ⚠️ Seeded; Recently Played and Top 25 need durable playback history ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
+| Track ratings | ❌ Planned ([#37](https://github.com/jm2/tributary/issues/37)) |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
 | Linux and macOS file associations | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
+
+See the [implementation roadmap](docs/roadmap.md) for the audited open-issue backlog, proposed
+ordering, and explicit current limitations. The countable working list is [`docs/task.md`](docs/task.md).
 
 ### MPD output safety
 
@@ -92,27 +96,26 @@ conservatively retains its queued ID rather than risking disruption of the forei
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   GTK4 / libadwaita UI              │
-│     (GtkColumnView, Browser, Sidebar, HeaderBar)    │
-├─────────────────────────────────────────────────────┤
-│              MediaBackend trait (async)             │
-├──────────┬──────────┬───────────┬──────┬────────────┤
-│  Local   │ Subsonic │  Jellyfin │ Plex │    DAAP    │
-│ (SQLite) │ (REST)   │  (REST)   │(REST)│(DMAP/mDNS) │
-├──────────┴──────────┴───────────┴──────┴────────────┤
-│           GStreamer (audio pipeline)                │
-├─────────────────────────────────────────────────────┤
-│    Platform: MPRIS │ SMTC │ MPNowPlayingInfoCenter  │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ GTK4 / libadwaita UI and platform media controls            │
+├──────────────────────────────────────────────────────────────┤
+│ SourceRegistry: identity, provenance, lifecycle, epochs      │
+│ and playback-time retained media resolution                  │
+├──────────────────────────────────────────────────────────────┤
+│ MediaBackend catalogue seam                                  │
+├────────┬──────────┬──────────┬──────┬──────┬────────┬────────┤
+│ Local  │ Subsonic │ Jellyfin │ Plex │ DAAP │ Radio  │ Device │
+├────────┴──────────┴──────────┴──────┴──────┴────────┴────────┤
+│ AudioOutput: Local/GStreamer │ MPD │ AirPlay 1 │ Chromecast  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-The diagram above is the **intended** architecture, and all five shipping backends implement the
-`MediaBackend` async trait. Complete track-catalogue publication is now a real shared seam: the
-scanner constructs `LocalBackend`, and local, Subsonic, Jellyfin, Plex, and DAAP snapshots all pass
-through the same `&dyn MediaBackend` boundary before reaching the UI. Source authentication,
-lifecycle retention, and some browsing paths still branch by concrete backend; that broader source
-identity and lifecycle convergence is tracked as P3.1 in [`docs/task.md`](docs/task.md).
+This is the shipping architecture. Local, Subsonic, Jellyfin, Plex, and DAAP publish complete
+catalogues through the shared `MediaBackend` boundary. `SourceRegistry` is the lifecycle and
+playback-authority owner for authenticated remotes, Radio-Browser views, removable mounts, and
+ephemeral operating-system-opened files. Generic GTK rows and playback queues retain stable
+`SourceId`, exact backend-native `TrackId`, and a non-secret publishing epoch rather than a server
+address, credential-bearing URL, mount path, or local file locator.
 
 The local backend's aggregate contract and complete-catalogue integration seam are now stable.
 Local artist and album IDs use a private, versioned UUIDv5 namespace with separate artist/album
@@ -128,19 +131,16 @@ instead of loading all track models. Unknown aggregate IDs return an empty list.
 Album year and genre are deterministic numeric and lexical minima, respectively, when track tags
 disagree, rather than values from an arbitrary SQLite row. `Album.artist_id` deliberately remains
 empty because a compilation's album artist is not necessarily any performing-artist entity.
-Identity-bearing metadata edits therefore
-produce a new aggregate ID, and malformed persisted local track IDs still use the pre-existing
-random fallback during model conversion. Persisting/repairing invalid `TrackId` values, resolving
-local and playlist media by ID at use time, and the broader shared source/session lifecycle remain
-tracked under P3.1; complete catalogue publication now uses `LocalBackend` through the common seam.
+Identity-bearing metadata edits therefore produce a new aggregate ID. Persisted local track IDs
+are preserved byte-for-byte; malformed legacy IDs use a frozen deterministic compatibility
+projection rather than a random fallback. Local and playlist queues resolve the exact current
+database row beneath retained, revalidated root and file authority at use time.
 
-The P3.1 [source identity and lifecycle decision](docs/architecture/source-lifecycle.md)
-defines the seam beneath that intended backend diagram: stable `SourceId` plus backend-native
-`TrackId` identity, one generation/cancellation/failure owner, explicit DAAP shutdown, and
-playback-time resolution for local, playlist, radio, removable, remote, and OS-opened media. It is
-an implementation plan, not a claim about the current runtime. Today remote sources are still
-keyed by URL, standard remote and DAAP sessions still use sibling registries, and direct-source
-queues still retain concrete locations; the remaining implementation is tracked under P3.1.
+The [source identity and lifecycle decision](docs/architecture/source-lifecycle.md) documents that
+implemented seam, including provenance, cancellation, explicit DAAP/Jellyfin session retirement,
+and retained at-use authority for every source kind. Product additions and the few explicitly
+deferred authority extensions are tracked in the [active backlog](docs/task.md), not in the
+historical remediation plan.
 
 ---
 
@@ -445,13 +445,18 @@ src/
 │   ├── mod.rs              # Module root & re-exports
 │   ├── models.rs           # Track, Album, Artist, SearchResults, LibraryStats
 │   ├── backend.rs          # MediaBackend async trait
+│   ├── identity.rs         # Stable source/media/view identity types
+│   ├── media.rs            # Retained resolved-media capabilities
 │   └── error.rs            # BackendError (thiserror)
+├── source_registry.rs      # Source lifecycle, provenance, epochs, at-use resolution
+├── removable.rs            # Retained removable-mount catalogue/media adapter
+├── external_file.rs        # Ephemeral retained OS-open file adapter
 ├── audio/
 │   ├── mod.rs              # GStreamer Player (playbin3, bus watch, position timer)
 │   ├── output.rs           # AudioOutput trait abstraction
 │   ├── local_output.rs     # Local GStreamer playback (AudioOutput impl)
 │   ├── mpd_output.rs       # MPD TCP output (AudioOutput impl)
-│   ├── airplay_output.rs   # AirPlay/RAOP output (scaffolding)
+│   ├── airplay_output.rs   # AirPlay 1/RAOP GStreamer output
 │   ├── chromecast_output.rs# Chromecast/Cast V2 output (local + remote)
 │   └── cast_http_server.rs # Embedded LAN-only HTTP server for Chromecast
 ├── db/
@@ -493,7 +498,7 @@ src/
 │   ├── client.rs           # HTTP client (5-step session handshake)
 │   └── backend.rs          # MediaBackend impl (in-memory cache)
 ├── device/
-│   ├── mod.rs              # DeviceInfo model for mounted browseable media
+│   ├── mod.rs              # DeviceInfo model for mounted browsable media
 │   └── usb.rs              # GIO mount filtering + logical removable-source identity
 ├── radio/
 │   ├── mod.rs              # Internet Radio module root
@@ -505,7 +510,7 @@ src/
     ├── window.rs           # Main window orchestration (GTK lifecycle + event wiring)
     ├── window_state.rs     # Shared WindowState struct (Rc/RefCell state bundle)
     ├── source_connect.rs   # Sidebar selection handler (source switching + auth flows)
-    ├── removable_media.rs  # Native mount monitoring + live sidebar reconciliation
+    ├── removable_media.rs  # Native mount monitoring + SourceRegistry reconciliation
     ├── discovery_handler.rs# mDNS/DNS-SD event handler (sidebar + output list)
     ├── context_menu.rs     # Tracklist right-click menu (playlist ops + properties)
     ├── playlist_actions.rs # Playlist CRUD (create, rename, delete, reorder)
@@ -565,37 +570,41 @@ heading exists only while at least one qualifying mount is present.
 
 The monitor reconciles mount-added, mount-changed, pre-unmount, and mount-removed notifications for
 the life of the window. A device keeps its best available logical source key separate from its
-native `PathBuf`: mount UUID is preferred, then volume UUID, Unix device identifier, and finally
-root URI.
-Rows sharing that key are deduplicated deterministically. A rename atomically replaces the row at
-the same position. Relocation of the same logical source retires its old scan and playback state,
-temporarily falls back to Local, and reselects it at the new path only if that exact automatic
-fallback is still current. A confirmed removal retires the matching path synchronously before the
-coalesced snapshot, so a rapid same-path reattach cannot preserve stale state; pre-unmount alone
-does not remove the row because the operation can fail. Unplugging an active source invalidates its
-pending navigation, cached tracks, and playback before removing the row and falling back to Local.
+private native mount path: mount UUID is preferred, then volume UUID, Unix device identifier, and
+finally root URI. Each eligible key maps deterministically to one `SourceId`. Mount arrival claims
+that identity in `SourceRegistry` and automatically begins one bounded, cancellable connection;
+selecting the row only displays the accepted catalogue and does not launch a second scanner.
 
-Selecting an uncached device starts a named background scan that streams parsed tracks through a
-bounded channel. Its empty projection is installed immediately, so rows from the previous source
-cannot be queued under the device identity while the scan runs. GTK checks source ownership while
-consuming it. Re-selecting the same logical device, relocating it, or unplugging it retires the old
-generation and closes the receiver so the producer stops cooperatively; navigating to a different
-source instead lets the newest scan finish into its cache without rendering it. The walk is lazy
-and does not follow directory or file symlinks, so links cannot escape the selected volume. It can
-still traverse a real nested mount, and cancellation cannot interrupt the one filesystem or
-tag-parser operation currently in progress.
+Construction runs on Tokio's blocking pool beneath retained authority for the exact observed mount.
+It follows neither directory nor file links, stays on the same filesystem, orders candidates
+deterministically, checks cancellation cooperatively, bounds tag metadata, and parses through exact
+already-open file handles. The accepted catalogue, GTK rows, caches, playback queue, and artwork
+requests contain only `SourceId`, a losslessly encoded mount-relative `TrackId`, metadata, and the
+publishing epoch—never an absolute mount path or `file://` locator.
+
+Playback and embedded artwork resolve an exact accepted ID at use time. The adapter revalidates the
+live epoch and lease, retained mount, ancestor namespace, containment, regular-file type, and exact
+file before returning one retained capability. Replacing a pathname therefore cannot retarget
+already admitted playback. Relocation disconnects the old adapter before reconnecting fresh
+inventory under a new epoch. Pre-unmount revokes scanning and file authority before UI/playback
+cleanup; if the unmount fails, fresh inventory may reconnect. Confirmed removal retires the source
+and releases its provenance claim before removing the row, so rapid same-path reattachment cannot
+revive stale state.
 
 The key is best-available logical identity, not proof of unique physical hardware: cloned
 filesystems may share a UUID, Unix-device and root-URI fallbacks can change with device/path
 assignment, and GIO's broad `can_unmount` signal can include a non-removable or native-path network
 mount when the backend supplies no class. Tributary does not mount unmounted volumes, eject
-devices, or browse MTP-only devices. Real USB add/change/unplug behavior still needs cross-platform
-hardware validation. In Flatpak, the inventory can still list an eligible native mount elsewhere,
+devices, cross nested filesystems, or browse MTP-only devices. Pathless removable rows deliberately
+omit Properties until a retained mutation authority exists. Real USB add/change/unplug behavior
+still needs cross-platform hardware validation. In Flatpak, the inventory can still list an eligible native mount elsewhere,
 but automatic Devices file access is read-only and limited to `/media`, `/run/media`, and `/mnt`;
 an inaccessible listed root cannot be scanned or played. Writable custom libraries require
 explicit selection through the folder portal as described in [Flatpak (Linux)](#flatpak-linux).
-The remaining local sandbox and physical-device smoke pass is tracked in
-[P2.5](docs/task.md#p25-repair-flatpak-behavior-and-local-build-path).
+The remaining physical-device and installed-sandbox smoke checks are preserved in the archived
+[P2.4](docs/task-remediation-2026-07.md#p24-make-removable-media-browsing-safe-and-asynchronous) and
+[P2.5](docs/task-remediation-2026-07.md#p25-repair-flatpak-behavior-and-local-build-path) records;
+they are validation work unless a real test exposes another defect.
 
 ### Connecting to Remote Servers
 
