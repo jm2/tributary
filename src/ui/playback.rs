@@ -213,6 +213,10 @@ pub struct QueueItem {
     /// Stable media identity remains `(SourceId, TrackId)`; the epoch prevents
     /// a captured queue from being retargeted to a replacement login.
     source_session_epoch: Option<u64>,
+    /// This exact queue item owns a hidden ephemeral external-file source.
+    /// Random SourceIds are also valid persisted remote identities, so source
+    /// shape alone cannot safely recover this lifecycle distinction later.
+    external_session: bool,
     uri: String,
     title: String,
     artist: String,
@@ -228,6 +232,7 @@ impl QueueItem {
             occurrence,
             row_instance_id: Some(track.row_instance_id()),
             source_session_epoch: track.source_session_epoch(),
+            external_session: false,
             // Local, playlist, and lifecycle-owned queues retain identity,
             // ordering, and metadata but never a locator. Every output load
             // resolves the exact source/track/epoch at the point of use.
@@ -243,21 +248,64 @@ impl QueueItem {
         }
     }
 
-    pub(crate) fn external(uri: String, title: String, artist: String, album: String) -> Self {
-        let source_id = SourceId::external();
-        let track_id = TrackId::external();
+    pub(crate) fn external(session: &crate::source_registry::ExternalFileSession) -> Self {
+        let track = session.track();
         Self {
             identity: PlaybackIdentity {
-                media_key: MediaKey::new(source_id, track_id),
+                media_key: MediaKey::new(session.source_id(), session.track_id().clone()),
+                view_origin: None,
+            },
+            occurrence: 0,
+            row_instance_id: None,
+            source_session_epoch: Some(session.session_epoch()),
+            external_session: true,
+            uri: String::new(),
+            title: track.title.clone(),
+            artist: track.artist_name.clone(),
+            album: track.album_title.clone(),
+            cover_art_url: String::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_for_test(
+        uri: String,
+        title: String,
+        artist: String,
+        album: String,
+    ) -> Self {
+        Self {
+            identity: PlaybackIdentity {
+                media_key: MediaKey::new(SourceId::random(), TrackId::external()),
                 view_origin: None,
             },
             occurrence: 0,
             row_instance_id: None,
             source_session_epoch: None,
+            external_session: false,
             uri,
             title,
             artist,
             album,
+            cover_art_url: String::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn external_for_test(source_id: SourceId, session_epoch: u64) -> Self {
+        Self {
+            identity: PlaybackIdentity {
+                media_key: MediaKey::new(source_id, TrackId::external()),
+                view_origin: None,
+            },
+            occurrence: 0,
+            row_instance_id: None,
+            source_session_epoch: Some(session_epoch),
+            external_session: true,
+            uri: String::new(),
+            title: "External".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
             cover_art_url: String::new(),
         }
     }
@@ -413,6 +461,31 @@ impl PlaybackSession {
 
     pub fn current_identity(&self) -> Option<&PlaybackIdentity> {
         self.current().map(|item| &item.identity)
+    }
+
+    /// Exact hidden external-file source currently owned by playback.
+    ///
+    /// This must be read before `clear`: baseline visibility is not terminal
+    /// ownership, and a random source identity is not by itself proof that a
+    /// queue item came from the OS-open adapter.
+    pub(crate) fn current_external_source_id(&self) -> Option<SourceId> {
+        self.current()
+            .filter(|item| item.external_session)
+            .map(|item| item.identity.media_key.source_id)
+    }
+
+    /// Decide terminal retirement from exact playback ownership.
+    ///
+    /// Repeat-one and repeat-all completion are not terminal. Delayed events
+    /// from an older output generation can never retire the current source.
+    pub(crate) fn external_source_for_terminal(
+        &self,
+        generation: PlayerEventGeneration,
+        repeated: bool,
+    ) -> Option<SourceId> {
+        (!repeated && self.accepts_event_generation(generation))
+            .then(|| self.current_external_source_id())
+            .flatten()
     }
 
     fn begin_event_generation(&mut self) -> PlayerEventGeneration {
@@ -834,7 +907,11 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         return false;
     }
 
+    // A visible-track selection is a newer playback intent than any
+    // OS-open admission still parsing in the background.
+    super::open_files::invalidate_admission();
     let previous = ctx.session.borrow().clone();
+    let previous_external = previous.current_external_source_id();
     if !ctx
         .session
         .borrow_mut()
@@ -843,8 +920,17 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         return false;
     }
 
+    if let Some(source_id) = previous_external {
+        let _ = ctx.source_registry.retire_external(source_id);
+    }
+
     if play_current(ctx) {
         true
+    } else if previous_external.is_some() {
+        // The previous external capability was explicitly retired above and
+        // must never be restored as a retry target.
+        ctx.session.borrow_mut().clear();
+        false
     } else {
         *ctx.session.borrow_mut() = previous;
         false
@@ -854,6 +940,9 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
 /// Resume the session's current item, or create a new queue from the visible
 /// model when playback is idle (including after an OS Stop action).
 pub fn play_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
+    // Play is a newer explicit playback intent than any OS-open delivery
+    // still parsing off the GTK thread.
+    super::open_files::invalidate_admission();
     if ctx.session.borrow().is_resolution_pending() {
         return true;
     }
@@ -875,6 +964,8 @@ pub fn play_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
 
 /// Header/OS-toggle behavior: toggle a loaded item, otherwise start a queue.
 pub fn toggle_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
+    // Toggle covers both explicit Pause and Play requests.
+    super::open_files::invalidate_admission();
     if ctx.session.borrow().is_resolution_pending() {
         true
     } else if ctx.session.borrow().resolution_failed {
@@ -890,8 +981,13 @@ pub fn toggle_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
 /// Invalidate the session before stopping the output so synchronously emitted
 /// Stopped events are already stale. The caller owns the widget reset.
 pub fn stop_playback(ctx: &PlaybackContext) {
+    super::open_files::invalidate_admission();
+    let external_source = ctx.session.borrow().current_external_source_id();
     let output = ctx.active_output.borrow();
     stop_owned_playback(&mut ctx.session.borrow_mut(), output.as_ref());
+    if let Some(source_id) = external_source {
+        let _ = ctx.source_registry.retire_external(source_id);
+    }
 }
 
 /// Load the current immutable queue item and refresh now-playing UI.
@@ -1008,6 +1104,8 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         let session = Rc::clone(&ctx.session);
         let active_output = Rc::clone(&ctx.active_output);
         let media_ctrl = Rc::clone(&ctx.media_ctrl);
+        let album_art = ctx.album_art.clone();
+        let external_session = item.external_session;
         glib::MainContext::default().spawn_local(async move {
             let resolved = source_registry
                 .resolve_stream(source_id, expected_session_epoch, track_id)
@@ -1018,35 +1116,82 @@ fn play_current(ctx: &PlaybackContext) -> bool {
                         return;
                     }
                     let accepted = match request {
-                        crate::architecture::media::MediaRequest::ProtectedHttp(request) => {
-                            active_output.borrow().load_resolved(*request)
-                        }
-                        crate::architecture::media::MediaRequest::PublicHttp(request) => {
-                            match request.consume() {
-                                Ok(url) => active_output.borrow().load_uri(url.as_str()),
-                                Err(error) => {
-                                    warn!(error = %error, "Public stream authority expired before output handoff");
-                                    let marked =
-                                        session.borrow_mut().mark_load_rejected(generation);
-                                    debug_assert!(
-                                        marked,
-                                        "expired public load remains retryable"
-                                    );
-                                    if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
-                                        ctrl.update_playback(false);
+                        crate::source_registry::ResolvedSourceStream::Http(request) => {
+                            match request {
+                                crate::architecture::media::MediaRequest::ProtectedHttp(request) => {
+                                    active_output.borrow().load_resolved(*request)
+                                }
+                                crate::architecture::media::MediaRequest::PublicHttp(request) => {
+                                    match request.consume() {
+                                        Ok(url) => active_output.borrow().load_uri(url.as_str()),
+                                        Err(error) => {
+                                            warn!(error = %error, "Public stream authority expired before output handoff");
+                                            let marked = session
+                                                .borrow_mut()
+                                                .mark_load_rejected(generation);
+                                            debug_assert!(
+                                                marked,
+                                                "expired public load remains retryable"
+                                            );
+                                            if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                                                ctrl.update_playback(false);
+                                            }
+                                            return;
+                                        }
                                     }
-                                    return;
                                 }
                             }
                         }
+                        crate::source_registry::ResolvedSourceStream::File(media) => {
+                            // AudioOutput consumes its retained capability. A
+                            // second clone is reserved for embedded art and is
+                            // used only after the output accepts the exact
+                            // object.
+                            let artwork_media = media.clone();
+                            let accepted = active_output.borrow().load_local(media);
+                            if accepted {
+                                album_art::update_resolved_file_album_art(
+                                    &album_art,
+                                    artwork_media,
+                                );
+                            }
+                            accepted
+                        }
                     };
                     if !accepted {
-                        let marked = session.borrow_mut().mark_load_rejected(generation);
-                        debug_assert!(marked, "current resolved load remains retryable");
+                        if external_session
+                            && session.borrow().accepts_event_generation(generation)
+                            && session.borrow().current_external_source_id() == Some(source_id)
+                        {
+                            super::open_files::invalidate_admission();
+                            session.borrow_mut().clear();
+                            let _ = source_registry.retire_external(source_id);
+                            active_output.borrow().stop();
+                            album_art::invalidate();
+                        } else {
+                            let marked = session.borrow_mut().mark_load_rejected(generation);
+                            debug_assert!(marked, "current resolved load remains retryable");
+                        }
+                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                            ctrl.update_playback(false);
+                        }
                     }
                 }
                 Err(error) => {
-                    if session.borrow_mut().fail_pending_resolution(generation) {
+                    let owns_external = external_session
+                        && session.borrow().accepts_event_generation(generation)
+                        && session.borrow().current_external_source_id() == Some(source_id);
+                    if owns_external {
+                        super::open_files::invalidate_admission();
+                        session.borrow_mut().clear();
+                        let _ = source_registry.retire_external(source_id);
+                        warn!(error = %error, "Could not resolve external media through its live source session");
+                        active_output.borrow().stop();
+                        album_art::invalidate();
+                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                            ctrl.update_playback(false);
+                        }
+                    } else if session.borrow_mut().fail_pending_resolution(generation) {
                         warn!(error = %error, "Could not resolve track through its live source session");
                         active_output.borrow().stop();
                         if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
@@ -1226,6 +1371,17 @@ pub fn advance_track(ctx: &PlaybackContext, repeat_mode: RepeatMode, shuffle: bo
     }
 }
 
+/// Explicit Next behavior. Natural EOS uses [`advance_track`] directly so an
+/// automatic transition cannot supersede a newer OS-open delivery.
+pub fn advance_track_from_user(
+    ctx: &PlaybackContext,
+    repeat_mode: RepeatMode,
+    shuffle: bool,
+) -> bool {
+    super::open_files::invalidate_admission();
+    advance_track(ctx, repeat_mode, shuffle)
+}
+
 /// Step back to the previous track, respecting repeat-all wrap-around.
 ///
 /// This is the positional inverse of [`advance_track`] and intentionally
@@ -1250,51 +1406,48 @@ pub fn previous_track(ctx: &PlaybackContext, repeat_mode: RepeatMode, shuffle: b
     }
 }
 
+/// Explicit Previous behavior, which supersedes an older OS-open delivery.
+pub fn previous_track_from_user(
+    ctx: &PlaybackContext,
+    repeat_mode: RepeatMode,
+    shuffle: bool,
+) -> bool {
+    super::open_files::invalidate_admission();
+    previous_track(ctx, repeat_mode, shuffle)
+}
+
 /// Replay the current queue item without consulting the mutable view.
 pub fn replay_current(ctx: &PlaybackContext) -> bool {
     play_current(ctx)
 }
 
-/// Play a local file directly, bypassing the library tracklist.
+/// Install one already-admitted, pathless external-file session as the exact
+/// one-item playback queue.
 ///
-/// Used by the OS "Open With" / `xdg-open` handler.  Reads tags via
-/// lofty, updates the now-playing UI (labels, album art, OS media
-/// overlay), and asks the active output to play the file. The file becomes a
-/// one-item external playback queue, so Next/Previous cannot jump into an
-/// unrelated visible source after it ends.
-///
-/// Returns `true` if playback was initiated, `false` if the file could
-/// not be parsed or has no playable URI representation.
-pub fn play_local_file(path: &std::path::Path, ctx: &PlaybackContext) -> bool {
-    let parsed = match crate::local::tag_parser::parse_audio_file(path) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "Open With: failed to parse audio file");
-            return false;
-        }
-    };
-
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let Ok(uri) = url::Url::from_file_path(&canonical) else {
-        warn!(path = %path.display(), "Open With: path cannot be represented as a file URI");
-        return false;
-    };
-    let item = QueueItem::external(
-        uri.to_string(),
-        parsed.title,
-        parsed.artist_name,
-        parsed.album_title,
-    );
-    let previous = ctx.session.borrow().clone();
+/// Opening, validation, and tag parsing happen before this GTK boundary. The
+/// queue retains only source/track identity and the publishing epoch; every
+/// output resolves the retained file capability at use time.
+pub fn play_external_session(
+    external: &crate::source_registry::ExternalFileSession,
+    ctx: &PlaybackContext,
+) -> bool {
+    // Consume the delivery generation before replacing terminal ownership.
+    // Any duplicate/late completion from the same delivery is now stale.
+    super::open_files::invalidate_admission();
+    let item = QueueItem::external(external);
+    let previous_external = ctx.session.borrow().current_external_source_id();
     if !ctx.session.borrow_mut().replace_queue(vec![item], 0) {
         return false;
     }
+    if let Some(source_id) = previous_external {
+        let _ = ctx.source_registry.retire_external(source_id);
+    }
     if !play_current(ctx) {
-        *ctx.session.borrow_mut() = previous;
+        ctx.session.borrow_mut().clear();
+        let _ = ctx.source_registry.retire_external(external.source_id());
         return false;
     }
-
-    tracing::info!(path = %path.display(), "Open With: playback started");
+    tracing::info!("OS-opened external playback started");
     true
 }
 
@@ -1421,6 +1574,7 @@ mod tests {
             occurrence: 0,
             row_instance_id: None,
             source_session_epoch: None,
+            external_session: false,
             uri: if is_library_source(view.source_id) {
                 String::new()
             } else {
@@ -1573,7 +1727,7 @@ mod tests {
     #[test]
     fn a_library_refresh_never_reinterprets_another_source_s_track_id() {
         let mut session = PlaybackSession::default();
-        let external = QueueItem::external(
+        let external = QueueItem::direct_for_test(
             "file:///downloads/a.flac".to_string(),
             "External".to_string(),
             "Artist".to_string(),
@@ -1941,7 +2095,7 @@ mod tests {
     #[test]
     fn external_file_is_a_one_item_queue() {
         let mut session = PlaybackSession::default();
-        let external = QueueItem::external(
+        let external = QueueItem::direct_for_test(
             "file:///tmp/example.flac".to_string(),
             "Example".to_string(),
             "Artist".to_string(),
@@ -1949,7 +2103,7 @@ mod tests {
         );
         let first_source = external.identity.media_key.source_id;
         let first_track = external.identity.media_key.track_id.clone();
-        let another = QueueItem::external(
+        let another = QueueItem::direct_for_test(
             "file:///tmp/example.flac".to_string(),
             "Example".to_string(),
             "Artist".to_string(),
@@ -1963,6 +2117,33 @@ mod tests {
         assert_ne!(current_source(&session), SourceId::local());
         assert_eq!(session.advance(RepeatMode::Off, false), None);
         assert_eq!(session.advance(RepeatMode::All, false), Some(0));
+    }
+
+    #[test]
+    fn managed_external_queue_is_pathless_epoch_bound_and_terminally_owned() {
+        let source_id = SourceId::external();
+        let external = QueueItem::external_for_test(source_id, 73);
+        assert!(external.uri().is_empty());
+        assert_eq!(external.source_session_epoch(), Some(73));
+
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![external], 0));
+        assert_eq!(session.current_external_source_id(), Some(source_id));
+        let generation = session.begin_pending_resolution();
+        assert!(session.accepts_event_generation(generation));
+        assert_eq!(
+            session.external_source_for_terminal(generation, false),
+            Some(source_id)
+        );
+        assert_eq!(session.external_source_for_terminal(generation, true), None);
+
+        session.clear();
+        assert_eq!(session.current_external_source_id(), None);
+        assert!(!session.accepts_event_generation(generation));
+        assert_eq!(
+            session.external_source_for_terminal(generation, false),
+            None
+        );
     }
 
     #[test]

@@ -29,9 +29,10 @@ use super::persistence::{
     restore_sort_state, save_repeat_mode, save_shuffle, save_sort_state, save_window_geometry,
 };
 use super::playback::{
-    advance_track, format_ms, play_or_start, play_track_at, previous_track,
-    refresh_projected_library_uris, replay_current, stop_playback, toggle_or_start,
-    BufferingTracker, PlaybackContext, PlaybackSession, QueueTrackRefresh, PLAYLIST_SOURCE_PREFIX,
+    advance_track, advance_track_from_user, format_ms, play_or_start, play_track_at,
+    previous_track_from_user, refresh_projected_library_uris, replay_current, stop_playback,
+    toggle_or_start, BufferingTracker, PlaybackContext, PlaybackSession, QueueTrackRefresh,
+    PLAYLIST_SOURCE_PREFIX,
 };
 use super::preferences;
 use super::root_trust;
@@ -203,6 +204,7 @@ impl SourceBaselinePlan {
         baseline: &crate::source_lifecycle::LifecycleBaseline<crate::source_registry::AcceptedView>,
         active_source_key: &str,
         radio_prerequisite_pending: bool,
+        ui_owned_sources: &HashSet<crate::architecture::SourceId>,
     ) -> Self {
         let mut present_sources = HashSet::new();
         let mut catalogue_sources = HashSet::new();
@@ -221,10 +223,15 @@ impl SourceBaselinePlan {
         }
 
         let radio_id = crate::architecture::SourceId::radio_browser();
+        // Hidden external-file registrations never publish an ordinary GTK
+        // projection. A formerly visible source can still own a sidebar,
+        // navigation, or pending-connection projection before its first
+        // catalogue; clear only those explicit UI owners plus catalogues the
+        // reducer actually published. Terminal external retirement belongs to
+        // playback hooks, not observer visibility.
         let mut clear_projections: HashSet<_> = hidden_sources
-            .iter()
+            .intersection(ui_owned_sources)
             .copied()
-            .filter(|source_id| *source_id != radio_id)
             .collect();
         clear_projections.extend(
             reducer
@@ -770,6 +777,29 @@ fn reconcile_source_baseline(
     reducer: &mut SourceReducerState,
     baseline: crate::source_lifecycle::LifecycleBaseline<crate::source_registry::AcceptedView>,
 ) {
+    let mut ui_owned_sources = HashSet::new();
+    for index in 0..context.sidebar_store.n_items() {
+        if let Some(source_id) = context
+            .sidebar_store
+            .item(index)
+            .and_downcast::<SourceObject>()
+            .and_then(|source| source.source_id())
+        {
+            ui_owned_sources.insert(source_id);
+        }
+    }
+    if let Some(source_id) = context
+        .pending_connection
+        .borrow()
+        .as_ref()
+        .and_then(|pending| pending.source_key().parse().ok())
+    {
+        ui_owned_sources.insert(source_id);
+    }
+    if let Ok(source_id) = context.active_source_key.borrow().parse() {
+        ui_owned_sources.insert(source_id);
+    }
+
     let radio_failure_was_selected = {
         let active = context.active_source_key.borrow();
         selected_radio_projection_owns_status(&active, &context.source_navigation.borrow())
@@ -794,6 +824,7 @@ fn reconcile_source_baseline(
         &baseline,
         &context.active_source_key.borrow(),
         radio_prerequisite_pending,
+        &ui_owned_sources,
     );
 
     // Projection loss is authoritative before any plain row-state rebind.
@@ -1458,6 +1489,7 @@ pub fn build_window(
     // adapter teardown, including DAAP and interactive Jellyfin logout, before
     // close() is allowed to proceed.
     let shutdown_sources = source_registry.clone();
+    let shutdown_playback = playback_session.clone();
     let shutdown_started = Rc::new(Cell::new(false));
     let shutdown_complete = Rc::new(Cell::new(false));
     window.connect_close_request(move |w| {
@@ -1467,6 +1499,12 @@ pub fn build_window(
         }
 
         if !shutdown_started.replace(true) {
+            super::open_files::invalidate_admission();
+            let external_source = shutdown_playback.borrow().current_external_source_id();
+            if let Some(source_id) = external_source {
+                shutdown_playback.borrow_mut().clear();
+                let _ = shutdown_sources.retire_external(source_id);
+            }
             let barrier = shutdown_sources.shutdown();
             let window = w.clone();
             let shutdown_complete = shutdown_complete.clone();
@@ -1978,6 +2016,7 @@ pub fn build_window(
                             }
                         }
                         MediaAction::Pause => {
+                            super::open_files::invalidate_admission();
                             if playback_session
                                 .borrow_mut()
                                 .cancel_pending_resolution_for_retry()
@@ -2005,17 +2044,21 @@ pub fn build_window(
                             clear_playback_ui();
                         }
                         MediaAction::Next => {
-                            advance_track(&ctx, repeat_mode.get(), shuffle.is_active());
+                            advance_track_from_user(&ctx, repeat_mode.get(), shuffle.is_active());
                         }
                         MediaAction::Previous => {
+                            super::open_files::invalidate_admission();
                             // Mirror the header-bar heuristic: if we're past
                             // the restart threshold, restart the current track.
                             let position_ms = active_output.borrow().position_ms().unwrap_or(0);
                             if position_ms > PREV_RESTART_THRESHOLD_MS {
                                 active_output.borrow().seek_to(0);
                             } else {
-                                let stepped =
-                                    previous_track(&ctx, repeat_mode.get(), shuffle.is_active());
+                                let stepped = previous_track_from_user(
+                                    &ctx,
+                                    repeat_mode.get(),
+                                    shuffle.is_active(),
+                                );
                                 if !stepped {
                                     active_output.borrow().seek_to(0);
                                 }
@@ -2092,6 +2135,7 @@ pub fn build_window(
             &event_sender,
             &hb.volume_scale,
             &rt_handle,
+            &source_registry,
         );
     }
 
@@ -2133,6 +2177,7 @@ pub fn build_window(
             if seeking.get() {
                 return;
             }
+            super::open_files::invalidate_admission();
             pending.set(Some(adj.value() as u64));
             if scheduled.replace(true) {
                 return;
@@ -2251,7 +2296,7 @@ pub fn build_window(
         let playback_source_registry = source_registry.clone();
 
         hb.next_button.connect_clicked(move |_| {
-            advance_track(
+            advance_track_from_user(
                 &PlaybackContext {
                     model: sm.clone(),
                     active_source_key: active_source_key.clone(),
@@ -2290,6 +2335,7 @@ pub fn build_window(
         let playback_source_registry = source_registry.clone();
 
         hb.prev_button.connect_clicked(move |_| {
+            super::open_files::invalidate_admission();
             // If more than 3 s into the track, restart it.
             let position_ms = active_output.borrow().position_ms().unwrap_or(0);
             if position_ms > PREV_RESTART_THRESHOLD_MS {
@@ -2297,7 +2343,7 @@ pub fn build_window(
                 return;
             }
 
-            let stepped = previous_track(
+            let stepped = previous_track_from_user(
                 &PlaybackContext {
                     model: sm.clone(),
                     active_source_key: active_source_key.clone(),
@@ -2518,8 +2564,17 @@ pub fn build_window(
                             // receiver-facing local-file lease after natural
                             // completion; any synchronous Stopped event is
                             // already stale.
+                            let external_source = playback_session
+                                .borrow()
+                                .external_source_for_terminal(event_generation, false);
+                            if external_source.is_some() {
+                                super::open_files::invalidate_admission();
+                            }
                             playback_session.borrow_mut().clear();
                             active_output.borrow().stop();
+                            if let Some(source_id) = external_source {
+                                let _ = playback_source_registry.retire_external(source_id);
+                            }
                             clear_playback_ui();
                         }
                     }
@@ -2533,6 +2588,17 @@ pub fn build_window(
                         // message is safe to display verbatim. Without this,
                         // a failed load is visible only in the logs.
                         toast_overlay.add_toast(adw::Toast::new(&message));
+                        let external_source = playback_session
+                            .borrow()
+                            .external_source_for_terminal(event_generation, false);
+                        if let Some(source_id) = external_source {
+                            super::open_files::invalidate_admission();
+                            playback_session.borrow_mut().clear();
+                            active_output.borrow().stop();
+                            let _ = playback_source_registry.retire_external(source_id);
+                            clear_playback_ui();
+                            continue;
+                        }
                         // A protected or exact-local resolver has already
                         // handed media to the output at this point. If that
                         // load fails, keep the queue item but force the next
@@ -2614,32 +2680,57 @@ pub fn build_window(
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
         play_pending.connect_activate(move |_, _| {
-            let paths = super::open_files::drain();
-            if paths.is_empty() {
+            let delivery = super::open_files::drain();
+            if delivery.is_empty() {
                 return;
             }
-            // Play only the first file for now.  If multiple files were
-            // delivered, the rest are dropped — multi-file Open With with
-            // a temp playlist is a separate feature.
-            let ctx = super::playback::PlaybackContext {
-                model: sm.clone(),
-                active_source_key: active_source_key.clone(),
-                active_output: active_output.clone(),
-                album_art: album_art.clone(),
-                title_label: title_label.clone(),
-                artist_label: artist_label.clone(),
-                media_ctrl: media_ctrl.clone(),
-                session: playback_session.clone(),
-                app_config: playback_config.clone(),
-                rt_handle: playback_rt.clone(),
-                column_view: cv.clone(),
-                source_registry: playback_source_registry.clone(),
-            };
-            for path in paths {
-                if super::playback::play_local_file(&path, &ctx) {
-                    break;
+
+            let generation = delivery.generation();
+            let registry = playback_source_registry.clone();
+            let admission = playback_rt.spawn_blocking(move || {
+                super::open_files::admit_first_accepted_audio(delivery, registry)
+            });
+
+            let active_output = active_output.clone();
+            let media_ctrl = media_ctrl.clone();
+            let album_art = album_art.clone();
+            let title_label = title_label.clone();
+            let artist_label = artist_label.clone();
+            let sm = sm.clone();
+            let active_source_key = active_source_key.clone();
+            let playback_session = playback_session.clone();
+            let cv = cv.clone();
+            let playback_rt = playback_rt.clone();
+            let playback_config = playback_config.clone();
+            let playback_source_registry = playback_source_registry.clone();
+            glib::MainContext::default().spawn_local(async move {
+                match admission.await {
+                    Ok(Some(pending)) if super::open_files::is_current(generation) => {
+                        let ctx = super::playback::PlaybackContext {
+                            model: sm,
+                            active_source_key,
+                            active_output,
+                            album_art,
+                            title_label,
+                            artist_label,
+                            media_ctrl,
+                            session: playback_session,
+                            app_config: playback_config,
+                            rt_handle: playback_rt,
+                            column_view: cv,
+                            source_registry: playback_source_registry,
+                        };
+                        if super::playback::play_external_session(pending.session(), &ctx) {
+                            pending.commit();
+                        }
+                    }
+                    Ok(Some(_) | None) => {}
+                    Err(_) => {
+                        // The worker owns no log-safe path or backend detail.
+                        warn!("External media admission worker stopped unexpectedly");
+                    }
                 }
-            }
+            });
         });
         app.add_action(&play_pending);
 
@@ -3914,7 +4005,8 @@ mod identity_tests {
             sources: vec![(source_id, disconnected_visible_snapshot(9))],
         };
 
-        let plan = SourceBaselinePlan::new(&reducer, &baseline, &source_key, false);
+        let plan =
+            SourceBaselinePlan::new(&reducer, &baseline, &source_key, false, &HashSet::new());
         assert_eq!(plan.clear_projections, vec![source_id]);
 
         let mut navigation = SourceNavigation::new(source_key.clone());
@@ -3948,6 +4040,56 @@ mod identity_tests {
     }
 
     #[test]
+    fn hidden_external_registration_is_not_a_published_projection_to_clear() {
+        let external_id = SourceId::external();
+        let mut external = disconnected_visible_snapshot(11);
+        external.visibility = crate::source_lifecycle::SourceVisibility::Hidden;
+        external.retention = crate::source_lifecycle::Retention::Ephemeral;
+        external.session_epoch = Some(29);
+        let baseline = crate::source_lifecycle::LifecycleBaseline {
+            revision: 11,
+            shutting_down: false,
+            sources: vec![(external_id, external)],
+        };
+
+        let plan = SourceBaselinePlan::new(
+            &SourceReducerState::default(),
+            &baseline,
+            "local",
+            false,
+            &HashSet::new(),
+        );
+
+        assert!(plan.hidden_sources.contains(&external_id));
+        assert!(plan.clear_projections.is_empty());
+        assert!(!plan.clear_radio_projection);
+    }
+
+    #[test]
+    fn hidden_pre_catalogue_source_clears_its_owned_sidebar_projection() {
+        let source_id = SourceId::random();
+        let mut hidden = disconnected_visible_snapshot(12);
+        hidden.visibility = crate::source_lifecycle::SourceVisibility::Hidden;
+        hidden.retention = crate::source_lifecycle::Retention::Ephemeral;
+        let baseline = crate::source_lifecycle::LifecycleBaseline {
+            revision: 12,
+            shutting_down: false,
+            sources: vec![(source_id, hidden)],
+        };
+        let ui_owned_sources = HashSet::from([source_id]);
+
+        let plan = SourceBaselinePlan::new(
+            &SourceReducerState::default(),
+            &baseline,
+            &source_id.to_string(),
+            false,
+            &ui_owned_sources,
+        );
+
+        assert_eq!(plan.clear_projections, vec![source_id]);
+    }
+
+    #[test]
     fn selected_radio_view_without_a_publication_is_invalidated_when_its_source_is_lost() {
         let radio_id = SourceId::radio_browser();
         let reducer = SourceReducerState::default();
@@ -3962,6 +4104,7 @@ mod identity_tests {
             &baseline,
             super::super::radio::TOP_VOTE_SOURCE_KEY,
             false,
+            &HashSet::new(),
         );
 
         assert!(plan.clear_radio_projection);
@@ -3997,6 +4140,7 @@ mod identity_tests {
             &baseline,
             super::super::radio::NEARME_SOURCE_KEY,
             true,
+            &HashSet::new(),
         );
         assert!(!plan.clear_radio_projection);
 

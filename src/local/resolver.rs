@@ -7,12 +7,13 @@
 
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sea_orm::{DatabaseConnection, DbErr, EntityTrait};
 use thiserror::Error;
 
+use crate::architecture::media::MediaLease;
 use crate::db::entities::{library_root, track};
 
 use super::root_authority::{BoundFile, RootAuthorityLease};
@@ -49,11 +50,19 @@ pub enum LocalMediaResolutionError {
     ChangedDuringResolution,
 }
 
+enum RetainedFileAuthority {
+    Local {
+        authority: Arc<RootAuthorityLease>,
+        file: BoundFile,
+        path: PathBuf,
+    },
+    OpenFile(File),
+}
+
 struct ResolvedLocalMediaInner {
-    authority: Arc<RootAuthorityLease>,
-    file: BoundFile,
-    path: PathBuf,
+    authority: RetainedFileAuthority,
     extension: Option<String>,
+    seek_consumers: Mutex<()>,
 }
 
 /// Security-relevant database state captured before filesystem authority is
@@ -92,15 +101,17 @@ impl ExpectedRootAuthorityState {
     }
 }
 
-/// Exact local file authority retained for one resolved media use.
+/// Exact file authority retained for one resolved media use.
 ///
-/// Clones share the same root, marker, ancestor, and file handles. Outputs,
+/// Local instances share the same root, marker, ancestor, and file handles;
+/// external instances share the exact already-open file object. Outputs,
 /// their receiver-facing ticket servers, and the in-process embedded-art
 /// reader keep a clone until their exact consumption finishes. No consumer
-/// reopens the database path.
+/// reopens a pathname.
 #[derive(Clone)]
 pub struct ResolvedLocalMedia {
     inner: Arc<ResolvedLocalMediaInner>,
+    lease: Option<MediaLease>,
 }
 
 impl std::fmt::Debug for ResolvedLocalMedia {
@@ -115,11 +126,44 @@ impl ResolvedLocalMedia {
     /// Clone the already-authorized file object for a new local consumer.
     ///
     /// Platform clone operations may share a cursor with the retained handle;
-    /// streaming consumers must use position-independent reads.
+    /// streaming consumers must use position-independent reads. Cursor-based
+    /// parsers must use [`Self::with_serialized_seekable_file`] instead.
     pub(crate) fn try_clone_file(&self) -> std::io::Result<File> {
-        self.inner
-            .file
-            .try_clone_for_consumption(&self.inner.authority)
+        self.require_active_lease()?;
+        let file = match &self.inner.authority {
+            RetainedFileAuthority::Local {
+                authority, file, ..
+            } => file.try_clone_for_consumption(authority)?,
+            RetainedFileAuthority::OpenFile(file) => {
+                let cloned = file.try_clone()?;
+                if !cloned.metadata()?.is_file() {
+                    return Err(std::io::Error::other(
+                        "retained media object is not a regular file",
+                    ));
+                }
+                cloned
+            }
+        };
+        self.require_active_lease()?;
+        Ok(file)
+    }
+
+    /// Run one cursor-based consumer against a clone of this exact file.
+    ///
+    /// `File::try_clone` may share its seek cursor with sibling handles. The
+    /// playback proxies use position-independent reads, while tag and artwork
+    /// parsers require ordinary `Read + Seek`; serialize those parsers so two
+    /// overlapping workers cannot disturb one another.
+    pub(crate) fn with_serialized_seekable_file<T>(
+        &self,
+        consume: impl FnOnce(File) -> T,
+    ) -> std::io::Result<T> {
+        let _guard =
+            self.inner.seek_consumers.lock().map_err(|_| {
+                std::io::Error::other("retained media seek authority is unavailable")
+            })?;
+        let file = self.try_clone_file()?;
+        Ok(consume(file))
     }
 
     /// Safe extension hint used to label an opaque media ticket and preserve
@@ -132,12 +176,64 @@ impl ResolvedLocalMedia {
     /// root for the resolved path. The caller performs this path-only check on
     /// the GTK thread immediately before handing the lease to an output.
     pub(crate) fn matches_current_configuration(&self, configured_roots: &[String]) -> bool {
+        let RetainedFileAuthority::Local {
+            authority, path, ..
+        } = &self.inner.authority
+        else {
+            return false;
+        };
         configured_roots
             .iter()
             .map(PathBuf::from)
-            .filter(|root| root.is_absolute() && self.inner.path.starts_with(root))
+            .filter(|root| root.is_absolute() && path.starts_with(root))
             .max_by_key(|root| root.components().count())
-            .is_some_and(|root| root == self.inner.authority.root())
+            .is_some_and(|root| root == authority.root())
+    }
+
+    /// Construct exact authority from a file object already opened and
+    /// validated by the caller's operating-system delivery boundary.
+    ///
+    /// The pathname is deliberately absent. The regular-file check occurs
+    /// before the capability can enter an adapter, and every later clone
+    /// repeats it against the retained object itself.
+    pub(crate) fn from_open_regular_file(
+        file: File,
+        extension: Option<String>,
+    ) -> std::io::Result<Self> {
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other(
+                "external media object is not a regular file",
+            ));
+        }
+        Ok(Self {
+            inner: Arc::new(ResolvedLocalMediaInner {
+                authority: RetainedFileAuthority::OpenFile(file),
+                extension,
+                seek_consumers: Mutex::new(()),
+            }),
+            lease: None,
+        })
+    }
+
+    /// Attach the lifecycle lease that owns this exact file capability.
+    pub(crate) fn with_lease(mut self, lease: MediaLease) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.lease.as_ref().is_none_or(MediaLease::is_active)
+    }
+
+    fn require_active_lease(&self) -> std::io::Result<()> {
+        if self.is_active() {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "retained media source is no longer active",
+            ))
+        }
     }
 
     /// Construct retained local authority without a database for focused
@@ -156,14 +252,22 @@ impl ResolvedLocalMedia {
             .map(str::to_owned);
         Ok(Self {
             inner: Arc::new(ResolvedLocalMediaInner {
-                authority,
-                file,
-                path: path.to_path_buf(),
+                authority: RetainedFileAuthority::Local {
+                    authority,
+                    file,
+                    path: path.to_path_buf(),
+                },
                 extension,
+                seek_consumers: Mutex::new(()),
             }),
+            lease: None,
         })
     }
 }
+
+/// General name for the exact retained file capability shared by local and
+/// lifecycle-owned filesystem adapters.
+pub type ResolvedFileMedia = ResolvedLocalMedia;
 
 fn configured_root_states<'a>(
     states: &'a [library_root::Model],
@@ -274,11 +378,15 @@ pub async fn resolve_track(
 
     Ok(ResolvedLocalMedia {
         inner: Arc::new(ResolvedLocalMediaInner {
-            authority: acquired.0,
-            file: acquired.1,
-            path,
+            authority: RetainedFileAuthority::Local {
+                authority: acquired.0,
+                file: acquired.1,
+                path,
+            },
             extension,
+            seek_consumers: Mutex::new(()),
         }),
+        lease: None,
     })
 }
 
@@ -286,6 +394,9 @@ pub async fn resolve_track(
 mod tests {
     use std::io::{Read, Seek, SeekFrom};
     use std::path::Path;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
     use sea_orm_migration::MigratorTrait;
@@ -347,6 +458,58 @@ mod tests {
         bytes
     }
 
+    fn local_media_path(media: &ResolvedLocalMedia) -> &Path {
+        match &media.inner.authority {
+            RetainedFileAuthority::Local { path, .. } => path,
+            RetainedFileAuthority::OpenFile(_) => panic!("fixture expected local authority"),
+        }
+    }
+
+    #[test]
+    fn cursor_based_consumers_are_serialized_for_one_retained_file() {
+        let directory = tempfile::tempdir().expect("retained media directory");
+        let path = directory.path().join("song.bin");
+        std::fs::write(&path, b"retained media").expect("write retained media");
+        let media = ResolvedLocalMedia::from_open_regular_file(
+            File::open(&path).expect("open retained media"),
+            Some("bin".to_string()),
+        )
+        .expect("construct retained media");
+
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first_media = media.clone();
+        let first = thread::spawn(move || {
+            first_media
+                .with_serialized_seekable_file(|_file| {
+                    first_entered_tx.send(()).expect("report first entry");
+                    release_first_rx.recv().expect("release first consumer");
+                })
+                .expect("run first seek consumer");
+        });
+        first_entered_rx.recv().expect("first consumer entered");
+
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let second = thread::spawn(move || {
+            media
+                .with_serialized_seekable_file(|_file| {
+                    second_entered_tx.send(()).expect("report second entry");
+                })
+                .expect("run second seek consumer");
+        });
+        assert_eq!(
+            second_entered_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        release_first_tx.send(()).expect("release first consumer");
+        first.join().expect("join first consumer");
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second consumer entered after release");
+        second.join().expect("join second consumer");
+    }
+
     #[test]
     fn root_authority_snapshot_ignores_timestamp_but_binds_every_authority_field() {
         let original = library_root::Model {
@@ -403,7 +566,7 @@ mod tests {
         let old_media = resolve_track(&db, "legacy:not-a-uuid", &roots)
             .await
             .expect("resolve original row");
-        assert_eq!(old_media.inner.path, old_path);
+        assert_eq!(local_media_path(&old_media), old_path);
         assert_eq!(read_media(&old_media), b"old");
 
         let mut active: track::ActiveModel = track::Entity::find_by_id("legacy:not-a-uuid")
@@ -418,7 +581,7 @@ mod tests {
         let current_media = resolve_track(&db, "legacy:not-a-uuid", &roots)
             .await
             .expect("resolve renamed row");
-        assert_eq!(current_media.inner.path, new_path);
+        assert_eq!(local_media_path(&current_media), new_path);
         assert_eq!(read_media(&current_media), b"new");
     }
 

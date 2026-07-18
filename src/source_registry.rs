@@ -1,13 +1,15 @@
 //! Production lifecycle service for every managed media source.
 //!
-//! Authenticated remotes and the built-in Radio-Browser adapter share one
-//! source/session authority. Catalogue rows and playback queues retain only
-//! `(SourceId, TrackId)`, an optional `ViewOrigin`, and the non-secret epoch
-//! that published them. Protected requests, public locators, credentials,
-//! leases, and adapter state stay behind this boundary until media use.
+//! Authenticated remotes, the built-in Radio-Browser adapter, and ephemeral
+//! OS-opened files share one source/session authority. Catalogue rows and
+//! playback queues retain only `(SourceId, TrackId)`, an optional
+//! `ViewOrigin`, and the non-secret epoch that published them. Protected
+//! requests, public locators, retained files, credentials, leases, and adapter
+//! state stay behind this boundary until media use.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -23,20 +25,43 @@ use crate::architecture::media::{
 };
 use crate::architecture::models::Track;
 use crate::architecture::{SourceId, TrackId, ViewOrigin};
+use crate::external_file::{ExternalFileCandidate, ExternalFileHint};
+use crate::local::resolver::ResolvedFileMedia;
 use crate::source_lifecycle::{
-    AdapterCloseFuture, AdapterTaskResult, CloseAuthority, ConstructionCancellationPolicy,
-    FailureCategory, LifecycleAdapter, LifecycleBaseline, LifecycleSnapshot, ProvenanceClaimId,
-    RefreshLane, RefreshTaskResult, RetirementWaiter, ShutdownBarrier, SourceLifecycleRegistry,
-    SourceProvenance,
+    AdapterCloseFuture, AdapterStream, AdapterTaskResult, CloseAuthority,
+    ConstructionCancellationPolicy, FailureCategory, LifecycleAdapter, LifecycleBaseline,
+    LifecycleSnapshot, ProvenanceClaimId, RefreshLane, RefreshTaskResult, RetirementWaiter,
+    ShutdownBarrier, SourceLifecycleRegistry, SourceProvenance,
 };
 use url::Url;
 
-type CatalogueFuture = Pin<Box<dyn Future<Output = BackendResult<Vec<Track>>> + Send + 'static>>;
+pub type CatalogueFuture =
+    Pin<Box<dyn Future<Output = BackendResult<Vec<Track>>> + Send + 'static>>;
 pub type ViewFuture = Pin<Box<dyn Future<Output = ViewLoadResult> + Send + 'static>>;
-type ProtectedStreamFuture =
-    Pin<Box<dyn Future<Output = BackendResult<ResolvedHttpRequest>> + Send + 'static>>;
+pub type StreamFuture =
+    Pin<Box<dyn Future<Output = BackendResult<AdapterStream>> + Send + 'static>>;
 type ArtworkFuture =
     Pin<Box<dyn Future<Output = BackendResult<Option<ResolvedHttpRequest>>> + Send + 'static>>;
+
+/// At-use stream resolved through the centralized source authority.
+///
+/// Existing authenticated and public-radio requests retain their exact
+/// `MediaRequest` behavior inside `Http`; filesystem adapters return a
+/// path-free retained capability in `File`.
+pub enum ResolvedSourceStream {
+    Http(MediaRequest),
+    File(ResolvedFileMedia),
+}
+
+impl ResolvedSourceStream {
+    #[cfg(test)]
+    pub fn is_active(&self) -> bool {
+        match self {
+            Self::Http(request) => request.is_active(),
+            Self::File(media) => media.is_active(),
+        }
+    }
+}
 
 /// One exact public locator contribution owned by an accepted source view.
 pub struct PublicStreamContribution {
@@ -192,10 +217,10 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
         Box::pin(async { ViewLoadResult::Failed(FailureCategory::Backend) })
     }
 
-    fn resolve_protected_stream(self: Arc<Self>, _track_id: TrackId) -> ProtectedStreamFuture {
+    fn resolve_stream(self: Arc<Self>, _track_id: TrackId) -> StreamFuture {
         Box::pin(async {
             Err(BackendError::Unsupported {
-                operation: "protected stream resolution".to_string(),
+                operation: "stream resolution".to_string(),
             })
         })
     }
@@ -220,12 +245,11 @@ macro_rules! standard_remote_adapter {
                 )
             }
 
-            fn resolve_protected_stream(
-                self: Arc<Self>,
-                track_id: TrackId,
-            ) -> ProtectedStreamFuture {
+            fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
                 Box::pin(async move {
-                    RemoteMediaResolver::resolve_stream(self.as_ref(), &track_id).await
+                    RemoteMediaResolver::resolve_stream(self.as_ref(), &track_id)
+                        .await
+                        .map(|request| AdapterStream::ProtectedHttp(Box::new(request)))
                 })
             }
 
@@ -263,8 +287,12 @@ impl ManagedSourceAdapter for crate::jellyfin::JellyfinBackend {
         })
     }
 
-    fn resolve_protected_stream(self: Arc<Self>, track_id: TrackId) -> ProtectedStreamFuture {
-        Box::pin(async move { RemoteMediaResolver::resolve_stream(self.as_ref(), &track_id).await })
+    fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
+        Box::pin(async move {
+            RemoteMediaResolver::resolve_stream(self.as_ref(), &track_id)
+                .await
+                .map(|request| AdapterStream::ProtectedHttp(Box::new(request)))
+        })
     }
 
     fn resolve_artwork(self: Arc<Self>, track_id: TrackId) -> ArtworkFuture {
@@ -299,8 +327,12 @@ impl ManagedSourceAdapter for crate::daap::DaapBackend {
         Box::pin(async move { self.load_catalogue().await })
     }
 
-    fn resolve_protected_stream(self: Arc<Self>, track_id: TrackId) -> ProtectedStreamFuture {
-        Box::pin(async move { RemoteMediaResolver::resolve_stream(self.as_ref(), &track_id).await })
+    fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
+        Box::pin(async move {
+            RemoteMediaResolver::resolve_stream(self.as_ref(), &track_id)
+                .await
+                .map(|request| AdapterStream::ProtectedHttp(Box::new(request)))
+        })
     }
 
     fn resolve_artwork(self: Arc<Self>, track_id: TrackId) -> ArtworkFuture {
@@ -318,6 +350,7 @@ struct BuiltInInstallation {
 struct SourceRegistryInner {
     lifecycle: SourceLifecycleRegistry<dyn ManagedSourceAdapter, AcceptedSourcePayload>,
     built_ins: Mutex<HashMap<SourceId, BuiltInInstallation>>,
+    external_sessions: Mutex<HashMap<SourceId, ProvenanceClaimId>>,
 }
 
 impl PublicHttpAuthority for SourceRegistryInner {
@@ -343,6 +376,52 @@ pub struct SourceRegistry {
     inner: Arc<SourceRegistryInner>,
 }
 
+/// Pathless identity and catalogue projection for one admitted OS-opened
+/// file. The registry retains all locator and provenance authority.
+#[derive(Clone)]
+pub struct ExternalFileSession {
+    source_id: SourceId,
+    track_id: TrackId,
+    session_epoch: u64,
+    track: Track,
+    #[cfg(test)]
+    close_probe: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ExternalFileSession {
+    pub const fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
+    pub fn track_id(&self) -> &TrackId {
+        &self.track_id
+    }
+
+    pub const fn session_epoch(&self) -> u64 {
+        self.session_epoch
+    }
+
+    pub fn track(&self) -> &Track {
+        &self.track
+    }
+
+    #[cfg(test)]
+    fn close_calls(&self) -> usize {
+        self.close_probe.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for ExternalFileSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalFileSession")
+            .field("source_id", &self.source_id)
+            .field("track_id", &self.track_id)
+            .field("session_epoch", &self.session_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SourceRegistry {
     pub fn new(runtime: tokio::runtime::Handle) -> Self {
         let lifecycle = SourceLifecycleRegistry::new(runtime);
@@ -362,8 +441,147 @@ impl SourceRegistry {
             inner: Arc::new(SourceRegistryInner {
                 lifecycle,
                 built_ins: Mutex::new(built_ins),
+                external_sessions: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Admit one already-open OS-delivered regular file as an independent,
+    /// hidden, ephemeral lifecycle source.
+    ///
+    /// Exact-handle parsing and all validation finish before random identity
+    /// is minted. The returned track is pathless and carries the exact epoch
+    /// required by [`Self::resolve_stream`]. This synchronous function is
+    /// `Send`-compatible and intended to run on a bounded blocking worker.
+    #[cfg(test)]
+    fn adopt_external_file(
+        &self,
+        file: File,
+        hint: ExternalFileHint,
+    ) -> BackendResult<ExternalFileSession> {
+        self.adopt_external_file_if_current(file, hint, || true)
+    }
+
+    /// Admit one exact candidate only if its delivery still owns playback at
+    /// the source-publication boundary.
+    ///
+    /// Validation and parsing happen before this predicate is evaluated. The
+    /// predicate then runs while the same gate that serializes registry
+    /// shutdown is held, before identity is minted or an adapter is created.
+    pub(crate) fn adopt_external_file_if_current<IsCurrent>(
+        &self,
+        file: File,
+        hint: ExternalFileHint,
+        is_current: IsCurrent,
+    ) -> BackendResult<ExternalFileSession>
+    where
+        IsCurrent: FnOnce() -> bool,
+    {
+        self.adopt_external_file_inner(file, hint, || {}, || {}, is_current)
+    }
+
+    fn adopt_external_file_inner<OnValidated, OnGate, IsCurrent>(
+        &self,
+        file: File,
+        hint: ExternalFileHint,
+        on_validated: OnValidated,
+        on_gate_acquired: OnGate,
+        is_current: IsCurrent,
+    ) -> BackendResult<ExternalFileSession>
+    where
+        OnValidated: FnOnce(),
+        OnGate: FnOnce(),
+        IsCurrent: FnOnce() -> bool,
+    {
+        let candidate = ExternalFileCandidate::validate(file, hint)?;
+        on_validated();
+
+        // Publication and explicit shutdown share this lock. Validation and
+        // parsing stay outside it; only the bounded lifecycle transaction is
+        // serialized.
+        let mut external_sessions = lock(&self.inner.external_sessions);
+        on_gate_acquired();
+        if self.inner.lifecycle.is_shutting_down() || !is_current() {
+            return Err(closed_external_admission_error());
+        }
+        let adapter = candidate.into_adapter();
+        let source_id = adapter.source_id();
+        let track_id = adapter.track_id().clone();
+        let track = adapter.track().clone();
+        #[cfg(test)]
+        let close_probe = adapter.close_probe();
+        let claim_id = self
+            .inner
+            .lifecycle
+            .claim_provenance(source_id, SourceProvenance::External)
+            .ok_or_else(closed_external_admission_error)?;
+        let adopted = self.inner.lifecycle.adopt_stateless_session(
+            source_id,
+            Box::new(adapter),
+            AcceptedSourcePayload::catalogue(vec![track.clone()]),
+        );
+        let Some((_, session_epoch)) = adopted else {
+            let _ = self.inner.lifecycle.release_provenance(source_id, claim_id);
+            self.inner
+                .lifecycle
+                .schedule_prune_after_current_retirement(source_id);
+            return Err(closed_external_admission_error());
+        };
+
+        let replaced = external_sessions.insert(source_id, claim_id);
+        debug_assert!(
+            replaced.is_none(),
+            "random external source identity is unique"
+        );
+        Ok(ExternalFileSession {
+            source_id,
+            track_id,
+            session_epoch,
+            track,
+            #[cfg(test)]
+            close_probe,
+        })
+    }
+
+    #[cfg(test)]
+    fn adopt_external_file_with_gate_hook<OnGate>(
+        &self,
+        file: File,
+        hint: ExternalFileHint,
+        on_gate_acquired: OnGate,
+    ) -> BackendResult<ExternalFileSession>
+    where
+        OnGate: FnOnce(),
+    {
+        self.adopt_external_file_inner(file, hint, || {}, on_gate_acquired, || true)
+    }
+
+    #[cfg(test)]
+    fn adopt_external_file_with_validation_hook<OnValidated>(
+        &self,
+        file: File,
+        hint: ExternalFileHint,
+        on_validated: OnValidated,
+    ) -> BackendResult<ExternalFileSession>
+    where
+        OnValidated: FnOnce(),
+    {
+        self.adopt_external_file_inner(file, hint, on_validated, || {}, || true)
+    }
+
+    /// Revoke and retire one exact external-file session.
+    ///
+    /// Claim removal is serialized before lifecycle teardown, making repeated
+    /// stop/EOS/failure/shutdown hooks harmless. Hidden baseline rows are not
+    /// owners and must not call this method merely because they are hidden.
+    pub fn retire_external(&self, source_id: SourceId) -> Option<RetirementWaiter> {
+        let claim_id = lock(&self.inner.external_sessions).remove(&source_id)?;
+        let waiter = self.inner.lifecycle.disconnect(source_id);
+        let _ = self.inner.lifecycle.release_provenance(source_id, claim_id);
+        self.inner
+            .lifecycle
+            .schedule_prune_after_current_retirement(source_id);
+        waiter
     }
 
     pub fn subscribe_invalidations(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -622,7 +840,14 @@ impl SourceRegistry {
     }
 
     pub fn shutdown(&self) -> ShutdownBarrier {
-        self.inner.lifecycle.shutdown()
+        // Serialize gate closure with external claim/adoption publication.
+        // Once shutdown owns this lock, a candidate can neither publish a
+        // post-shutdown claim nor leave stale explicit-retirement ownership.
+        let mut external_sessions = lock(&self.inner.external_sessions);
+        external_sessions.clear();
+        let barrier = self.inner.lifecycle.shutdown();
+        drop(external_sessions);
+        barrier
     }
 
     #[cfg(test)]
@@ -666,7 +891,7 @@ impl SourceRegistry {
         source_id: SourceId,
         expected_session_epoch: u64,
         track_id: TrackId,
-    ) -> BackendResult<MediaRequest> {
+    ) -> BackendResult<ResolvedSourceStream> {
         if let Some(resolved) = self.inner.lifecycle.resolve_latest_accepted_view(
             source_id,
             expected_session_epoch,
@@ -681,27 +906,34 @@ impl SourceRegistry {
             let authority: Arc<dyn PublicHttpAuthority> = self.inner.clone();
             let authority = Arc::downgrade(&authority);
             let (endpoint, lease) = resolved.value;
-            return Ok(MediaRequest::PublicHttp(ResolvedPublicHttpRequest::new(
-                endpoint,
-                lease,
-                authority,
-                source_id,
-                track_id,
-                resolved.session_epoch,
-                resolved.generation,
+            return Ok(ResolvedSourceStream::Http(MediaRequest::PublicHttp(
+                ResolvedPublicHttpRequest::new(
+                    endpoint,
+                    lease,
+                    authority,
+                    source_id,
+                    track_id,
+                    resolved.session_epoch,
+                    resolved.generation,
+                ),
             )));
         }
 
-        let request = self
+        let stream = self
             .inner
             .lifecycle
-            .resolve_http(
+            .resolve_stream(
                 source_id,
                 expected_session_epoch,
-                move |adapter| async move { adapter.resolve_protected_stream(track_id).await },
+                move |adapter| async move { adapter.resolve_stream(track_id).await },
             )
             .await?;
-        Ok(MediaRequest::ProtectedHttp(Box::new(request)))
+        Ok(match stream {
+            AdapterStream::ProtectedHttp(request) => {
+                ResolvedSourceStream::Http(MediaRequest::ProtectedHttp(request))
+            }
+            AdapterStream::File(media) => ResolvedSourceStream::File(media),
+        })
     }
 
     pub async fn resolve_artwork(
@@ -784,6 +1016,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn closed_external_admission_error() -> BackendError {
+    BackendError::Internal(anyhow::anyhow!("external media admission is unavailable"))
+}
+
 /// Reduce backend-specific errors to the closed categories retained by the
 /// lifecycle registry. No backend error chain crosses this boundary.
 pub fn failure_category(error: &BackendError) -> FailureCategory {
@@ -864,13 +1100,14 @@ impl ProvenanceClaims {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::io::{Read, Seek, SeekFrom};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use axum::http::{Method, StatusCode};
     use tokio::runtime::Handle;
-    use tokio::sync::watch;
+    use tokio::sync::{oneshot, watch};
     use tokio::time::{timeout, Duration};
     use url::Url;
     use uuid::Uuid;
@@ -1029,10 +1266,12 @@ mod tests {
             Box::pin(async { Ok(Vec::new()) })
         }
 
-        fn resolve_protected_stream(self: Arc<Self>, track_id: TrackId) -> ProtectedStreamFuture {
-            Box::pin(
-                async move { RemoteMediaResolver::resolve_stream(self.as_ref(), &track_id).await },
-            )
+        fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
+            Box::pin(async move {
+                RemoteMediaResolver::resolve_stream(self.as_ref(), &track_id)
+                    .await
+                    .map(|request| AdapterStream::ProtectedHttp(Box::new(request)))
+            })
         }
 
         fn resolve_artwork(self: Arc<Self>, track_id: TrackId) -> ArtworkFuture {
@@ -1076,6 +1315,49 @@ mod tests {
 
     fn registry() -> SourceRegistry {
         SourceRegistry::new(Handle::current())
+    }
+
+    fn minimal_wav_bytes(sample: u8) -> Vec<u8> {
+        let data_size = 1_u32;
+        let mut bytes = Vec::with_capacity(45);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_size).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&8_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_size.to_le_bytes());
+        bytes.push(sample);
+        bytes
+    }
+
+    fn external_fixture(directory: &tempfile::TempDir, sample: u8) -> (File, ExternalFileHint) {
+        let path = directory.path().join("fixture.wav");
+        std::fs::write(&path, minimal_wav_bytes(sample)).expect("write external WAV");
+        (
+            File::open(path).expect("open external WAV"),
+            ExternalFileHint::new("fixture.wav", Some("wav")).expect("safe external hint"),
+        )
+    }
+
+    fn read_file_stream(stream: &ResolvedSourceStream) -> Vec<u8> {
+        let ResolvedSourceStream::File(media) = stream else {
+            panic!("fixture expected retained file media");
+        };
+        let mut file = media
+            .try_clone_file()
+            .expect("clone retained external file");
+        file.seek(SeekFrom::Start(0))
+            .expect("rewind retained external file");
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .expect("read retained external file");
+        bytes
     }
 
     fn fixture_track(track_id: TrackId) -> Track {
@@ -1164,10 +1446,11 @@ mod tests {
         (source_id, session_epoch)
     }
 
-    fn consume_public(request: MediaRequest) -> BackendResult<Url> {
+    fn consume_public(request: ResolvedSourceStream) -> BackendResult<Url> {
         match request {
-            MediaRequest::PublicHttp(request) => request.consume(),
-            MediaRequest::ProtectedHttp(_) => panic!("fixture expected public media"),
+            ResolvedSourceStream::Http(MediaRequest::PublicHttp(request)) => request.consume(),
+            ResolvedSourceStream::Http(MediaRequest::ProtectedHttp(_))
+            | ResolvedSourceStream::File(_) => panic!("fixture expected public media"),
         }
     }
 
@@ -1191,10 +1474,11 @@ mod tests {
         .expect("fixture received request");
     }
 
-    fn protected_request_is_active(request: &MediaRequest) -> bool {
+    fn protected_request_is_active(request: &ResolvedSourceStream) -> bool {
         match request {
-            MediaRequest::ProtectedHttp(request) => request.is_active(),
-            MediaRequest::PublicHttp(_) => panic!("fixture expected protected media"),
+            ResolvedSourceStream::Http(MediaRequest::ProtectedHttp(request)) => request.is_active(),
+            ResolvedSourceStream::Http(MediaRequest::PublicHttp(_))
+            | ResolvedSourceStream::File(_) => panic!("fixture expected protected media"),
         }
     }
 
@@ -1862,5 +2146,224 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].uri.path(), "/System/Ping");
         service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn external_admission_is_pathless_exact_epoch_and_exact_track() {
+        let registry = registry();
+        let directory = tempfile::tempdir().expect("external fixture directory");
+        let expected = minimal_wav_bytes(128);
+        let (file, hint) = external_fixture(&directory, 128);
+        let session = registry
+            .adopt_external_file(file, hint)
+            .expect("admit external file");
+
+        let snapshot = registry
+            .snapshot(session.source_id())
+            .expect("external lifecycle snapshot");
+        assert_eq!(
+            snapshot.visibility,
+            crate::source_lifecycle::SourceVisibility::Hidden
+        );
+        assert_eq!(
+            snapshot.retention,
+            crate::source_lifecycle::Retention::Ephemeral
+        );
+        assert_eq!(snapshot.session_epoch, Some(session.session_epoch()));
+        assert!(snapshot.provenance.contains(SourceProvenance::External));
+        let catalogue = snapshot.catalogue.expect("external catalogue");
+        assert_eq!(catalogue.value.tracks().len(), 1);
+        let published = &catalogue.value.tracks()[0];
+        assert_eq!(published.native_track_id.as_ref(), Some(session.track_id()));
+        assert!(published.file_path.is_none());
+        assert!(published.stream_url.is_none());
+        assert!(published.cover_art_url.is_none());
+
+        let wrong_track = TrackId::external();
+        assert!(registry
+            .resolve_stream(session.source_id(), session.session_epoch(), wrong_track)
+            .await
+            .is_err());
+        assert!(registry
+            .resolve_stream(
+                session.source_id(),
+                session.session_epoch().wrapping_add(1),
+                session.track_id().clone(),
+            )
+            .await
+            .is_err());
+        let resolved = registry
+            .resolve_stream(
+                session.source_id(),
+                session.session_epoch(),
+                session.track_id().clone(),
+            )
+            .await
+            .expect("resolve exact external identity");
+        assert_eq!(read_file_stream(&resolved), expected);
+
+        registry
+            .retire_external(session.source_id())
+            .expect("retire external session")
+            .wait()
+            .await;
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_external_opens_are_independent_and_retire_exactly_once() {
+        let registry = registry();
+        let directory = tempfile::tempdir().expect("external fixture directory");
+        let path = directory.path().join("fixture.wav");
+        std::fs::write(&path, minimal_wav_bytes(192)).expect("write shared external WAV");
+        let first = registry
+            .adopt_external_file(
+                File::open(&path).expect("open first external handle"),
+                ExternalFileHint::new("fixture.wav", Some("wav")).expect("first hint"),
+            )
+            .expect("admit first external session");
+        let second = registry
+            .adopt_external_file(
+                File::open(&path).expect("open second external handle"),
+                ExternalFileHint::new("fixture.wav", Some("wav")).expect("second hint"),
+            )
+            .expect("admit second external session");
+        assert_ne!(first.source_id(), second.source_id());
+        assert_ne!(first.track_id(), second.track_id());
+
+        let pending = registry
+            .resolve_stream(
+                first.source_id(),
+                first.session_epoch(),
+                first.track_id().clone(),
+            )
+            .await
+            .expect("resolve first session");
+        let first_waiter = registry
+            .retire_external(first.source_id())
+            .expect("first retirement admitted");
+        assert!(registry.retire_external(first.source_id()).is_none());
+        first_waiter.wait().await;
+        assert_eq!(first.close_calls(), 1);
+        assert!(!pending.is_active());
+        let ResolvedSourceStream::File(media) = &pending else {
+            panic!("fixture expected retained file media");
+        };
+        let error = media
+            .try_clone_file()
+            .expect_err("retirement revokes future handle clones");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        registry
+            .retire_external(second.source_id())
+            .expect("second retirement admitted")
+            .wait()
+            .await;
+        assert_eq!(second.close_calls(), 1);
+        wait_until_pruned(&registry, first.source_id()).await;
+        wait_until_pruned(&registry, second.source_id()).await;
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn superseded_external_delivery_never_publishes_a_source() {
+        let registry = registry();
+        let directory = tempfile::tempdir().expect("external fixture directory");
+        let (file, hint) = external_fixture(&directory, 48);
+        let current = AtomicBool::new(true);
+
+        let result = registry.adopt_external_file_inner(
+            file,
+            hint,
+            || current.store(false, Ordering::Release),
+            || {},
+            || current.load(Ordering::Acquire),
+        );
+
+        assert!(result.is_err());
+        assert!(lock(&registry.inner.external_sessions).is_empty());
+        assert!(registry
+            .snapshot_all()
+            .sources
+            .into_iter()
+            .all(|(_, snapshot)| !snapshot.provenance.contains(SourceProvenance::External)));
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_serializes_with_external_publication_and_owns_retirement() {
+        let registry = registry();
+        let directory = tempfile::tempdir().expect("external fixture directory");
+        let (file, hint) = external_fixture(&directory, 96);
+        let (gate_acquired_tx, gate_acquired_rx) = oneshot::channel();
+        let (release_adoption_tx, release_adoption_rx) = oneshot::channel();
+        let adoption_registry = registry.clone();
+        let adoption = tokio::task::spawn_blocking(move || {
+            adoption_registry.adopt_external_file_with_gate_hook(file, hint, move || {
+                let _ = gate_acquired_tx.send(());
+                release_adoption_rx
+                    .blocking_recv()
+                    .expect("release external adoption");
+            })
+        });
+        gate_acquired_rx.await.expect("adoption owns gate");
+
+        let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
+        let shutdown_registry = registry.clone();
+        let shutdown = tokio::task::spawn_blocking(move || {
+            let _ = shutdown_started_tx.send(());
+            shutdown_registry.shutdown()
+        });
+        shutdown_started_rx.await.expect("shutdown started");
+        release_adoption_tx.send(()).expect("finish adoption");
+
+        let session = adoption
+            .await
+            .expect("adoption task")
+            .expect("adoption publishes before waiting shutdown");
+        let barrier = shutdown.await.expect("shutdown task");
+        barrier.wait().await;
+        assert_eq!(session.close_calls(), 1);
+        assert!(registry.retire_external(session.source_id()).is_none());
+        assert!(registry
+            .resolve_stream(
+                session.source_id(),
+                session.session_epoch(),
+                session.track_id().clone(),
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_winning_before_publication_drops_only_a_non_adapter_candidate() {
+        let registry = registry();
+        let directory = tempfile::tempdir().expect("external fixture directory");
+        let (file, hint) = external_fixture(&directory, 32);
+        let (validated_tx, validated_rx) = oneshot::channel();
+        let (release_candidate_tx, release_candidate_rx) = oneshot::channel();
+        let adoption_registry = registry.clone();
+        let adoption = tokio::task::spawn_blocking(move || {
+            adoption_registry.adopt_external_file_with_validation_hook(file, hint, move || {
+                let _ = validated_tx.send(());
+                release_candidate_rx
+                    .blocking_recv()
+                    .expect("release validated candidate");
+            })
+        });
+        validated_rx.await.expect("exact file validated");
+
+        let barrier = registry.shutdown();
+        barrier.wait().await;
+        release_candidate_tx
+            .send(())
+            .expect("release candidate after shutdown");
+        assert!(adoption.await.expect("adoption task").is_err());
+        assert!(lock(&registry.inner.external_sessions).is_empty());
+        assert!(registry
+            .snapshot_all()
+            .sources
+            .into_iter()
+            .all(|(_, snapshot)| !snapshot.provenance.contains(SourceProvenance::External)));
     }
 }

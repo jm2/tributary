@@ -57,6 +57,7 @@ mod desktop_integration;
 #[allow(dead_code)]
 mod device;
 mod discovery;
+mod external_file;
 pub(crate) mod http_body;
 pub(crate) mod http_security;
 #[cfg(test)]
@@ -351,13 +352,13 @@ fn main() {
         let mut paths = Vec::new();
         for file in files {
             if let Some(path) = file.path() {
-                info!(path = %path.display(), "File opened via OS handler");
                 paths.push(path);
             }
         }
         if paths.is_empty() {
             return;
         }
+        info!(count = paths.len(), "Files received via OS handler");
         ui::open_files::enqueue(paths);
 
         if app.active_window().is_none() {

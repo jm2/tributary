@@ -68,7 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Local and AirPlay GStreamer no longer receive backend credentials** — Before `playbin3` or AirPlay's `uridecodebin` can consume protected media, Tributary exchanges the playback-time typed request for an opaque ticket on a dedicated loopback-only server. The app-owned proxy fixes the upstream target, applies the exact-origin/no-`Referer` policy, and forwards only `Range`; credential-free radio, files, and library paths remain byte-for-byte direct. Malformed or unsupported protected media and missing runtime, bind, client, ticket, or active source-lease state fail closed with fixed URL-free events. Replacement by any direct, protected, or rejected load, Stop, source replacement/release, EOS/error, setup/preroll/start failure, output teardown, and proxy teardown revoke the route; pause, play, and seek retain it only within its hard 24-hour lifetime. Each load owns its server and cleanup is identity-checked, so a stale pipeline callback cannot revoke a newer ticket. Server binding and revocation run outside the short-held proxy-state mutex; generation ownership lets a newer load, Stop, or runtime replacement supersede an in-flight startup without waiting and prevents that older startup from installing afterward.
 - **Protected loopback tickets cannot escape through an ambient HTTP proxy** — GStreamer's `souphttpsrc` may consult process or operating-system proxy settings even for `127.0.0.1`; an empty proxy property still restores the default resolver under libsoup3. Local and AirPlay source-setup now recognizes only Tributary's exact HTTP loopback `/cast/<UUID[.extension]>` shape with an explicit port and no user-info, query, or fragment, installs the `direct://` resolver, disables retries, verifies its timeout/policy round trip, and posts a fixed error while locking the source in NULL if any property cannot be enforced. Ordinary files and internet radio retain their existing proxy behavior, while the app-owned upstream request may still use a legitimate configured proxy. An isolated child-process regression receives poisoned proxy variables before process creation, keeps the parent-owned proxy listener live through child completion, and starts the child-owned media listener's bounded window only after cold GStreamer plugin discovery, then proves the media fixture receives the ticket and the ambient proxy receives nothing.
 - **Protected DAAP and Subsonic playback now has a real-GStreamer regression** — One bounded child process constructs production backend-shaped requests and sends both sequentially through the real local `Player`, per-load app-owned proxy, `souphttpsrc`, FLAC decoder, and `fakesink` to a decoded-buffer handoff and generation-owned end-of-stream. The fixture proves exact upstream paths, private queries, DAAP protocol headers, absence of `Authorization`, `Proxy-Authorization`, `Cookie`, and `Referer` at the upstream fixture, opaque ticket containment, and source-setup's direct/zero-retry/30-second policy. Missing plugins, request drift, player errors, absent decoded audio/EOS, and native hangs fail rather than silently skipping. This regression runs against each build host's GStreamer installation; the packaged-Windows proof below independently covers the bundled plugin and DLL set.
-- **Windows packages prove protected playback uses only their bundled GStreamer runtime** — Before the portable ZIP is created, the finished distribution now runs its own hidden, headless probe from a fresh external registry with ambient GStreamer paths, proxy-resolver overrides, HTTP proxy variables, and MSYS2 DLL search paths removed. A bounded, deduplicated closure seeded by the app, scanner, and every plugin uses the selected architecture's absolute `llvm-readobj.exe` to inspect PE imports as data rather than executing arbitrary plugins through `ldd`; newly copied MSYS2 runtimes form the next exact closure round, with no broad `bin` sweep. The Soup plugin is inspected alone first so its direct `libsoup` edge must be observed, copied, and inspected. Remaining targets run in batches of at most 28 under command-line, output, per-process, process-tree, and five-minute whole-closure limits, with fixed-size failure diagnostics and Windows PowerShell 5.1-compatible process handling. This replaces an ARM64 `ldd` path that first missed path-only records and then hung for more than 33 minutes while executing `libgstencoding.dll`. The package places its exact-architecture `gst-plugin-scanner.exe` beside Tributary's root-level DLLs and executes that exact helper under a five-second deadline before GStreamer can fall back to in-process discovery; the probe's PATH contains only System32, so it receives no DLL-search assistance unavailable to an ordinary user launch. Every required factory and the selected FLAC decoder must resolve beneath the distribution's plugin directory. The probe sends an embedded FLAC through the production protected-loopback callback to a decoded buffer and EOS, verifies `souphttpsrc` retained direct routing, zero retries, and the 30-second timeout, proves a poisoned proxy received no connection, and proves an alternate source is locked in NULL with the fixed fail-closed error. Listener deadlines arm after cold factory discovery. Before transitioning GStreamer to NULL, the probe publishes a listener cancellation phase while both listeners remain accepting; afterward it publishes a separate final stop, drains and counts queued accepts until the nonblocking listener reports an empty queue, then joins and inspects. Only an already-accepted media request that ends with incomplete-header EOF, connection-aborted, or connection-reset I/O in the cancellation phase is cancellation. Malformed UTF-8, request-line, route, method, header, range, timeout, other I/O, accept, and response-write failures remain fatal even when teardown overlaps, while the poison observer covers the complete NULL transition. Deterministic server tests pin the production ordering, poison observation window, queued-accept drain, and semantic-failure boundary. A missing required DLL, plugin, or scanner, external provenance, a stale cache, request/policy drift, absent decode/EOS, crossing the 1 MiB output-flood threshold, native hangs, or a missing exact success sentinel fails packaging under independent Rust and 90-second process deadlines; captured diagnostics are fixed-size tails. Process-tree termination and exact argument passing feature-detect newer .NET APIs with bounded Windows PowerShell 5.1 fallbacks. CI and release workflows invoke the same pre-archive script on native x86_64 and ARM64 runners. After PR #124's named arguments passed both jobs but the affected host reproduced the same singleton-target failure, the current repair candidate replaces the function-boundary array with explicit `List[string]` singleton, round, and batch values and reports the exact failed target predicate with bounded single-line diagnostics. Its exact affected-host rerun and live packaged-Windows DAAP/Subsonic playback remain separate manual checks.
+- **Windows packages prove protected playback uses only their bundled GStreamer runtime** — Before the portable ZIP is created, the finished distribution now runs its own hidden, headless probe from a fresh external registry with ambient GStreamer paths, proxy-resolver overrides, HTTP proxy variables, and MSYS2 DLL search paths removed. A bounded, deduplicated closure seeded by the app, scanner, and every plugin uses the selected architecture's absolute `llvm-readobj.exe` to inspect PE imports as data rather than executing arbitrary plugins through `ldd`; newly copied MSYS2 runtimes form the next exact closure round, with no broad `bin` sweep. The Soup plugin is inspected alone first so its direct `libsoup` edge must be observed, copied, and inspected. Remaining targets run in batches of at most 28 under command-line, output, per-process, process-tree, and five-minute whole-closure limits, with fixed-size failure diagnostics and Windows PowerShell 5.1-compatible process handling. This replaces an ARM64 `ldd` path that first missed path-only records and then hung for more than 33 minutes while executing `libgstencoding.dll`. The package places its exact-architecture `gst-plugin-scanner.exe` beside Tributary's root-level DLLs and executes that exact helper under a five-second deadline before GStreamer can fall back to in-process discovery; the probe's PATH contains only System32, so it receives no DLL-search assistance unavailable to an ordinary user launch. Every required factory and the selected FLAC decoder must resolve beneath the distribution's plugin directory. The probe sends an embedded FLAC through the production protected-loopback callback to a decoded buffer and EOS, verifies `souphttpsrc` retained direct routing, zero retries, and the 30-second timeout, proves a poisoned proxy received no connection, and proves an alternate source is locked in NULL with the fixed fail-closed error. Listener deadlines arm after cold factory discovery. Before transitioning GStreamer to NULL, the probe publishes a listener cancellation phase while both listeners remain accepting; afterward it publishes a separate final stop, drains and counts queued accepts until the nonblocking listener reports an empty queue, then joins and inspects. Only an already-accepted media request that ends with incomplete-header EOF, connection-aborted, or connection-reset I/O in the cancellation phase is cancellation. Malformed UTF-8, request-line, route, method, header, range, timeout, other I/O, accept, and response-write failures remain fatal even when teardown overlaps, while the poison observer covers the complete NULL transition. Deterministic server tests pin the production ordering, poison observation window, queued-accept drain, and semantic-failure boundary. A missing required DLL, plugin, or scanner, external provenance, a stale cache, request/policy drift, absent decode/EOS, crossing the 1 MiB output-flood threshold, native hangs, or a missing exact success sentinel fails packaging under independent Rust and 90-second process deadlines; captured diagnostics are fixed-size tails. Process-tree termination and exact argument passing feature-detect newer .NET APIs with bounded Windows PowerShell 5.1 fallbacks. CI and release workflows invoke the same pre-archive script on native x86_64 and ARM64 runners. After PR #124's named arguments passed both jobs but the affected host reproduced the same singleton-target failure, PR #127 replaces the function-boundary array with explicit `List[string]` singleton, round, and batch values and reports the exact failed target predicate with bounded single-line diagnostics. Native x86_64 and ARM64 package CI, including the Desktop PowerShell 5.1 path, passed in run `29648906031`; the exact affected-host rerun and live packaged-Windows DAAP/Subsonic playback remain separate manual checks.
 - **Credential-bearing media tickets now expire** — Every upstream proxy ticket has a hard, absolute, non-sliding 24-hour lifetime from registration in addition to earlier playback-lifecycle revocation. It is usable only before its monotonic deadline; a lookup at or after that boundary atomically removes it and returns the same 404 as an unknown or revoked route. GET and byte-range requests, pause, seek, and receiver status do not renew the deadline, so a compromised receiver cannot perpetuate the bearer. A response admitted before expiry may finish afterward, but every later lookup fails. Local-file routes retain their existing server-lifetime behavior because they front no backend credential.
 
 ### Changed
@@ -131,8 +131,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass; complete locked debug and release suites each pass 20 library, 895 application, and 10
   repository-metadata tests (925 total). Independent integrated review found the consent race and
   the automatic-fallback presentation leak; both are fixed.
-  Removable and OS-opened external media still need registry-owned at-use
-  locator adapters; those two adapters keep P3.1's final implementation record open.
+  The OS-opened external-file adapter described below now closes that boundary; removable media is
+  the only source kind that still needs its registry-owned at-use locator adapter and keeps P3.1's
+  final implementation record open.
+- **OS-opened files now use an ephemeral registry-owned lifecycle instead of direct path queues** —
+  A delivery is processed sequentially on a blocking worker, preserving candidate order, skipping
+  files that cannot be opened, parsed as audio, or accepted by the metadata bounds, and stopping
+  after the first accepted candidate. A native non-UTF-8 leaf name becomes bounded lossy Unicode
+  only as a parser/presentation hint; the already-open handle remains the sole authority. Before
+  identity or adapter publication,
+  the worker must still own the delivery's exact admission generation under the shared
+  shutdown/publication gate. A newer delivery, every explicit Play/Pause/Next/Previous/scrub action,
+  Stop, a real output change, or shutdown supersedes older admission; selecting the already-active
+  output remains inert. Only a successfully parsed already-open regular file receives fresh random
+  source and track IDs. Its one-item queue carries those pathless IDs and the exact registry epoch,
+  while the hidden adapter retains the original handle behind a `MediaLease` checked both before and
+  after every file-handle clone. The closed stream resolver now returns either `Http` or a retained
+  `File` capability, so remote/radio behavior is unchanged and external playback never reconstructs
+  a URI. Cursor-based tag and artwork parsers serialize per retained capability, while every output
+  continues to consume the app-owned proxy's position-independent reads.
+  Embedded art receives a cloned capability only after the selected output accepts the load.
+  Replacement by another external or ordinary queue, Stop, unrepeated EOS, playback/load failure,
+  real output change, stale post-adoption admission, and shutdown explicitly retire the ephemeral
+  source idempotently. Registry shutdown and adoption serialize under the same gate; lifecycle
+  baselines clear hidden state only for real UI owners, so the intentionally hidden source cannot
+  invalidate its own playback. The OS-open callback now logs only a count and fixed status, never a
+  delivered path. Focused regressions cover ordering, exact admission and shutdown races, random
+  identity and epoch isolation, retained-handle path replacement, lease revocation,
+  hidden-baseline ownership, and exactly-once retirement; independent review covers the complete
+  intent/terminal wiring and post-accept artwork handoff. Locked debug and release suites each pass
+  940 tests, strict Clippy is clean in both profiles, and final independent integrated review is
+  clean.
 - **The centralized source-lifecycle foundation now backs the production source registry** —
   `SourceLifecycleRegistry` provides the atomic adapter, revocable media lease, session epoch,
   accepted catalogue/view snapshots, keyed/refcounted provenance, and generation-correlated
@@ -257,8 +286,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ownership, removable tracks use a lossless native mount-relative ID that survives a mount-point
   change, and each OS-opened file session mints independent random source and track IDs. The
   later authenticated-remote lifecycle cutover consolidates the standard and DAAP owners behind
-  `SourceRegistry`; the Radio-Browser follow-up makes its queues pathless as well. Removable and
-  external queues still retain their current locator until their at-use adapters land. After
+  `SourceRegistry`; the Radio-Browser follow-up makes its queues pathless as well. At that
+  identity-only cutover, removable and external queues still retained their current locators. After
   merging the completed P3.4 seams, the accepted
   pre-follow-up head passed 823 tests
   and strict all-target/all-feature Clippy in both profiles. The final identity review adds three
@@ -293,8 +322,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Subsonic, Jellyfin, Plex, and DAAP session, refresh/failure, provenance, and GTK projection
   ownership. At that cutover, embedded-art authority and the radio/removable/external at-use
   locator adapters remained implementation work tracked under P3.1. The retained-art and
-  Radio-Browser follow-ups close the local/playlist and public-radio boundaries; removable and
-  external-file adapters remain.
+  Radio-Browser follow-ups close the local/playlist and public-radio boundaries. The subsequent
+  external-file adapter closes OS-opened-file admission, retained capability, and retirement;
+  removable media alone remains.
 - **Local album and artist aggregates now have stable identities** — `LocalBackend` replaces its
   per-call random album/artist UUIDs with UUIDv5 values under a private versioned namespace. Artist
   and album domains are separate, every component is length-framed to prevent concatenation
@@ -375,15 +405,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit MP4 reread and raw `covr` fallback consume the same handle. The raw fallback reads at
   most 256 MiB, every parser path returns at most 32 MiB of artwork, and atom offsets, extended
   sizes, conversions, and additions are checked before slicing or allocation. Exact album-art
-  generations also reject a result superseded during parsing. The direct file-URI helper remains
-  only as a transitional boundary for removable and OS-opened external files until their source
-  adapters land. All 9 focused album-art tests pass, including real tagged FLAC, path replacement,
+  generations also reject a result superseded during parsing. At that retained-art slice, the
+  direct file-URI helper remained a transitional boundary for removable and OS-opened external
+  files. All 9 focused album-art tests pass, including real tagged FLAC, path replacement,
   authority drift, cursor restoration, delayed generation, and malformed MP4 bounds. Locked all-target/all-feature
   check, strict debug/release Clippy, formatting, and diff checks pass; locked debug and release
   suites each pass 20 library, 872 application, and 10 repository-metadata tests (902 total). This
   closes one part of P3.1's compound final record without changing **219/223 (98.2%)** overall or
-  **29/30 P3**. The Radio-Browser follow-up closes another part; removable and external-file
-  adapters remain.
+  **29/30 P3**. The Radio-Browser and external-file follow-ups close two more parts; only the
+  removable adapter remains.
 - **Subsonic failed envelopes no longer retain a server-controlled error message** — HTTP-200 API failures keep only the numeric Subsonic code in a fixed typed error; code 40 remains authentication rejection and code 41 remains the HTTPS-only legacy-auth negotiation signal. A malicious or broken peer can no longer echo a submitted password or arbitrary text into retained errors, logs, or UI-facing classification.
 - **Radio-Browser and geolocation no longer trust successful-looking JSON on an HTTP error** — Station and all three IP-geolocation provider paths now require a success status before their bounded response reader or deserializer can publish data. A `503` carrying a syntactically valid station or location is rejected, the geolocation cascade advances to its next provider, and late or oversized bodies remain bounded. Public same-origin/cross-origin redirects retain the existing no-`Referer`, no-HTTPS-downgrade policy.
 - **Jellyfin and Plex now preserve reverse-proxy base paths for every API and media request** — Both clients remove only one trailing empty base segment before appending API paths, so root, `/share`, `/share/`, and already-escaped prefixes do not gain a doubled slash or lose their prefix. Plex stream-part and thumbnail paths now append below that same configured base instead of replacing it; escaped bytes are preserved and normalized dot segments cannot escape the prefix. Root `//` and prefixed `/share//` regressions pin the same one-empty-segment rule across catalogue and protected-media construction. The rejection uses a fixed peer-path-free error. Complete prefixed backend fixtures prove authenticated ping/identity, discovery, pagination, stream, and artwork construction.
@@ -488,22 +518,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   visible. Local/playlist playback resolves exact stable IDs into retained root/file authority at
   use, and local/playlist embedded art now clones that same authority only after output acceptance
   and retains its exact handle through parsing. Radio queues are pathless and resolve the exact
-  current accepted-view locator at use. Removable and external queues have location-independent
-  identity but still retain their current locator; their embedded art therefore remains on the
-  transitional direct file-URI helper. Their refresh/retirement paths and some non-remote browsing
-  integration remain direct. Those two locator/adapter items remain P3.1 work; they do not
+  current accepted-view locator at use. External-file queues are likewise pathless and resolve a
+  registry-owned retained open-file capability at use; post-accept embedded art clones that same
+  authority, and replacement/terminal transitions retire it explicitly. Removable queues alone
+  still retain their current locator and transitional direct file-URI helper. Removable
+  refresh/retirement paths and some non-remote browsing integration remain direct. That final
+  locator/adapter item remains P3.1 work; it does not
   reintroduce backend credentials or local playback paths into authenticated-remote or
   local/playlist playback queue values.
 - **Credential-bearing media tickets remain replayable within their hard lifetime** — Each opaque output ticket is a bearer for one fixed media item and arbitrary byte ranges until the earlier of source-lease/lifecycle revocation or its absolute 24-hour expiry; it is not a one-shot token. Neither event cancels a response the proxy already admitted. Protected local/AirPlay tickets are reachable only through a dedicated loopback listener; a protected MPD load from an unspecified address, or a scoped/link-local IPv6 route, fails closed rather than exposing the upstream request. Playback-time local-authority tickets follow their owning load lifecycle; only legacy explicit-file routes retain the older server-lifetime capability contract.
 - **Live packaged-Windows protected-playback validation remains outstanding** — Fake DAAP and Subsonic streams traverse the complete production protected-player path through real GStreamer, and native x86_64 and ARM64 package jobs both prove their finished distribution supplies the selected HTTP source, scanner, decoder, required DLL closure, direct-loopback policy, alternate-source fail-closed path, and real FLAC decode to end-of-stream without borrowing the build host's runtime. That deterministic probe cannot establish compatibility with the reported live DAAP/Subsonic servers, `.local`/mDNS routing, TLS, physical audio output, firewall or endpoint-security policy, or the user's legitimate upstream proxy. Audible live playback from the packaged application remains to be recorded, and no automated result proves that DNS caused the original failures.
-  The exact affected Windows host currently reaches the copied Soup plugin and then rejects its
+  The exact affected Windows host previously reached the copied Soup plugin and then rejected its
   singleton PE-inspection target as non-absolute or nonexistent. PR #124's explicit argument
   binding passed both native CI package jobs but did not change that host result, disproving the
-  positional-binding hypothesis. A repair candidate now uses explicit `List[string]` values at
+  positional-binding hypothesis. PR #127 now uses explicit `List[string]` values at
   every singleton/round/batch boundary and emits predicate-specific, bounded single-line target
-  diagnostics while preserving nonexecuting inspection and every resource limit. Native package
-  CI/Desktop PowerShell 5.1 execution and the exact affected-host rerun are still pending; that
-  confirmation must precede the audible playback check.
+  diagnostics while preserving nonexecuting inspection and every resource limit. Native x86_64
+  and ARM64 package CI, including Desktop PowerShell 5.1 execution, passed in run `29648906031`.
+  The exact affected-host rerun remains pending and must precede the audible playback check.
 
 ---
 

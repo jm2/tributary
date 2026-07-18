@@ -53,6 +53,15 @@ enum OutputSelectionOutcome {
     Unavailable,
 }
 
+fn external_retirement_after_selection(
+    outcome: OutputSelectionOutcome,
+    external_source: Option<crate::architecture::SourceId>,
+) -> Option<crate::architecture::SourceId> {
+    (outcome == OutputSelectionOutcome::Changed)
+        .then_some(external_source)
+        .flatten()
+}
+
 fn output_type_for_target(target: &OutputTarget) -> OutputType {
     match target {
         OutputTarget::Local => OutputType::Local,
@@ -144,6 +153,7 @@ pub fn setup_output_selector(
     event_sender: &async_channel::Sender<PlayerEvent>,
     volume_scale: &gtk::Scale,
     rt_handle: &tokio::runtime::Handle,
+    source_registry: &crate::source_registry::SourceRegistry,
 ) {
     let active_output = active_output.clone();
     let parked_local = parked_local.clone();
@@ -152,6 +162,7 @@ pub fn setup_output_selector(
     let event_sender = event_sender.clone();
     let volume_scale = volume_scale.clone();
     let output_button = output_button.clone();
+    let source_registry = source_registry.clone();
     // Real runtime handle for embedded media servers used by remote outputs.
     let rt_handle = rt_handle.clone();
 
@@ -224,23 +235,30 @@ pub fn setup_output_selector(
             }
         };
 
-        let outcome = {
+        let (outcome, external_source) = {
             let mut target = active_target.borrow_mut();
             let mut session = playback_session.borrow_mut();
+            let external_source = session.current_external_source_id();
             let mut output = active_output.borrow_mut();
             let mut parked = parked_local.borrow_mut();
-            apply_output_selection(
+            let outcome = apply_output_selection(
                 &mut target,
                 requested_target,
                 &mut session,
                 &mut output,
                 &mut parked,
                 activation,
-            )
+            );
+            (outcome, external_source)
         };
         if outcome != OutputSelectionOutcome::Changed {
             warn!(?outcome, "Output selection could not be committed");
             return;
+        }
+
+        super::open_files::invalidate_admission();
+        if let Some(source_id) = external_retirement_after_selection(outcome, external_source) {
+            let _ = source_registry.retire_external(source_id);
         }
 
         clear_playback_ui();
@@ -532,11 +550,34 @@ mod tests {
     }
 
     #[test]
+    fn external_retirement_requires_a_committed_real_output_change() {
+        let source_id = crate::architecture::SourceId::external();
+        assert_eq!(
+            external_retirement_after_selection(OutputSelectionOutcome::Changed, Some(source_id)),
+            Some(source_id)
+        );
+        assert_eq!(
+            external_retirement_after_selection(
+                OutputSelectionOutcome::Reselected,
+                Some(source_id)
+            ),
+            None
+        );
+        assert_eq!(
+            external_retirement_after_selection(
+                OutputSelectionOutcome::Unavailable,
+                Some(source_id)
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn output_slots_preserve_reselect_retry_generation_and_local_restore_semantics() {
         let (mut active_output, local_state) = FakeOutput::boxed("local", OutputType::Local, 0);
         let mut parked_local = None;
         let mut active_target = OutputTarget::Local;
-        let queue_item = super::super::playback::QueueItem::external(
+        let queue_item = super::super::playback::QueueItem::direct_for_test(
             "file:///tmp/example.flac".to_string(),
             "Example".to_string(),
             "Artist".to_string(),
@@ -593,7 +634,7 @@ mod tests {
         assert!(!session.has_current());
         assert!(!session.accepts_event_generation(local_event.generation()));
 
-        let remote_item = super::super::playback::QueueItem::external(
+        let remote_item = super::super::playback::QueueItem::direct_for_test(
             "https://radio.invalid/live".to_string(),
             "Station".to_string(),
             "Remote".to_string(),
@@ -641,7 +682,7 @@ mod tests {
         assert!(!session.has_current());
         assert!(!session.accepts_event_generation(retry.generation));
 
-        let cast_item = super::super::playback::QueueItem::external(
+        let cast_item = super::super::playback::QueueItem::direct_for_test(
             "file:///tmp/cast.flac".to_string(),
             "Cast".to_string(),
             "Artist".to_string(),
@@ -693,7 +734,7 @@ mod tests {
         let mut active_target = OutputTarget::Local;
         let mut session = PlaybackSession::default();
         assert!(session.replace_queue(
-            vec![super::super::playback::QueueItem::external(
+            vec![super::super::playback::QueueItem::direct_for_test(
                 "file:///tmp/example.flac".to_string(),
                 "Example".to_string(),
                 "Artist".to_string(),
@@ -738,7 +779,7 @@ mod tests {
         let mut active_target = remote_target.clone();
         let mut session = PlaybackSession::default();
         assert!(session.replace_queue(
-            vec![super::super::playback::QueueItem::external(
+            vec![super::super::playback::QueueItem::direct_for_test(
                 "https://radio.invalid/live".to_string(),
                 "Station".to_string(),
                 "Remote".to_string(),

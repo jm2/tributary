@@ -184,9 +184,10 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
 /// Extract embedded album art from a direct file URI and display it on the
 /// header bar image widget.
 ///
-/// This transitional path is retained for removable and OS-opened files until
-/// their at-use adapters provide retained file authority. Local-library and
-/// playlist playback must use [`update_resolved_file_album_art`] instead.
+/// This transitional path is retained for removable-media rows until their
+/// at-use adapter provides retained file authority. Local-library, playlist,
+/// and OS-opened external playback use [`update_resolved_file_album_art`]
+/// instead.
 pub fn update_direct_file_album_art(image: &gtk::Image, uri: &str) {
     let generation = next_generation();
     let path = match url::Url::parse(uri) {
@@ -278,8 +279,13 @@ fn extract_direct_file_album_art_bytes(path: &std::path::Path) -> Option<Vec<u8>
 fn extract_resolved_file_album_art_bytes(
     media: &crate::local::resolver::ResolvedLocalMedia,
 ) -> Option<Vec<u8>> {
-    let mut file = media.try_clone_file().ok()?;
-    extract_album_art_bytes(&mut file, media.extension())
+    let extension = media.extension().map(str::to_owned);
+    media
+        .with_serialized_seekable_file(|mut file| {
+            extract_album_art_bytes(&mut file, extension.as_deref())
+        })
+        .ok()
+        .flatten()
 }
 
 fn bounded_local_art_bytes(data: &[u8], max_bytes: usize) -> Option<Vec<u8>> {
