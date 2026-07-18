@@ -89,7 +89,7 @@ shuffle navigation semantics, and an honest local-only playlist interaction boun
 
 - [x] Define and migrate the durable playback-history contract: counted-play threshold,
   `last_played`, repeat/seek/restart semantics, clock representation, and legacy-row behavior
-  ([contract](playback-history.md); implementing PR pending).
+  ([contract](playback-history.md); [#134](https://github.com/jm2/tributary/pull/134)).
 - [ ] Persist play-count and last-played updates from authoritative playback events exactly once,
   without counting rejected loads, stale generations, or retries, and refresh affected UI state.
 - [ ] Make Recently Played and Top 25 reflect the new history contract deterministically, including
@@ -239,4 +239,4 @@ shuffle navigation semantics, and an honest local-only playlist interaction boun
 | 2026-07-18 | Backlog reset | — | Archived the holistic-review tracker and established the audited feature backlog; no implementation record completed. |
 | 2026-07-18 | P1.1 bounded shuffle history | [#132](https://github.com/jm2/tributary/pull/132) | Retained ten real prior occurrences, fixed forward traversal and complete Repeat All cycles, unified Previous dispatch, made toggle/reset semantics explicit, and added lifecycle/rollback regressions. |
 | 2026-07-18 | P1.2 honest unsupported playlist actions | [#133](https://github.com/jm2/tributary/pull/133) | Refused non-local Add to Playlist actions with an all-or-none localized dialog before database work, localized the existing context-menu labels, and regressed the fail-closed source policy plus every shipped catalog. |
-| 2026-07-18 | P1.3 playback-history contract and schema | Pending | Defined occurrence, threshold, duration, seek/retry/restart, clock, and legacy contracts; added migration 10 plus safe model conversion and a pure one-shot progress state. Production event writes and smart-playlist consumers remain the next two records. |
+| 2026-07-18 | P1.3 playback-history contract and schema | [#134](https://github.com/jm2/tributary/pull/134) | Defined occurrence, threshold, duration, seek/retry/restart, clock, and legacy contracts; added migration 10 plus safe model conversion and a pure one-shot progress state. Production event writes and smart-playlist consumers remain the next two records. |
