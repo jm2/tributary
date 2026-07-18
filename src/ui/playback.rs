@@ -61,7 +61,7 @@ fn queue_view(source_key: &str) -> Option<QueueView> {
     if source_key.starts_with("radio-") {
         return Some(QueueView {
             source_id: SourceId::radio_browser(),
-            origin: Some(ViewOrigin::radio(source_key).ok()?),
+            origin: Some(super::radio::radio_view_origin(source_key)?),
         });
     }
     if let Ok(source_id) = source_key.parse::<SourceId>() {
@@ -83,8 +83,9 @@ fn identity_belongs_to_source(identity: &PlaybackIdentity, source_key: &str) -> 
     if let Some(playlist_id) = source_key.strip_prefix(PLAYLIST_SOURCE_PREFIX) {
         return identity.view_origin == Some(ViewOrigin::Playlist(playlist_id.to_string()));
     }
-    if source_key.starts_with("radio-") {
-        return identity.view_origin == Some(ViewOrigin::Radio(source_key.to_string()));
+    if super::radio::is_radio_backend(source_key) {
+        return super::radio::radio_view_origin(source_key).as_ref()
+            == identity.view_origin.as_ref();
     }
     identity.view_origin.is_none()
         && queue_view(source_key).is_some_and(|view| view.source_id == identity.media_key.source_id)
@@ -99,7 +100,9 @@ fn identity_belongs_to_source(identity: &PlaybackIdentity, source_key: &str) -> 
 fn identity_is_owned_by_source(identity: &PlaybackIdentity, source_key: &str) -> bool {
     let source_id = if source_key == LOCAL_SOURCE_KEY {
         Some(SourceId::local())
-    } else if source_key.starts_with(PLAYLIST_SOURCE_PREFIX) || source_key.starts_with("radio-") {
+    } else if source_key.starts_with(PLAYLIST_SOURCE_PREFIX)
+        || super::radio::is_radio_backend(source_key)
+    {
         None
     } else if let Ok(source_id) = source_key.parse::<SourceId>() {
         Some(source_id)
@@ -206,10 +209,10 @@ pub struct QueueItem {
     /// playlist entries while that source model is alive; `occurrence` remains
     /// a fallback if the view is rebuilt with fresh row objects.
     row_instance_id: Option<u64>,
-    /// Exact authenticated-remote session epoch that published this row.
+    /// Exact source session epoch that published this row.
     /// Stable media identity remains `(SourceId, TrackId)`; the epoch prevents
     /// a captured queue from being retargeted to a replacement login.
-    session_epoch: Option<u64>,
+    source_session_epoch: Option<u64>,
     uri: String,
     title: String,
     artist: String,
@@ -224,11 +227,11 @@ impl QueueItem {
             identity,
             occurrence,
             row_instance_id: Some(track.row_instance_id()),
-            session_epoch: track.remote_session_epoch(),
-            // Local and playlist queues retain identity, ordering, and a
-            // metadata snapshot but no file locator. Every output load
-            // resolves the exact database ID against the current row.
-            uri: if is_library {
+            source_session_epoch: track.source_session_epoch(),
+            // Local, playlist, and lifecycle-owned queues retain identity,
+            // ordering, and metadata but never a locator. Every output load
+            // resolves the exact source/track/epoch at the point of use.
+            uri: if is_library || track.source_session_epoch().is_some() {
                 String::new()
             } else {
                 track.uri()
@@ -250,7 +253,7 @@ impl QueueItem {
             },
             occurrence: 0,
             row_instance_id: None,
-            session_epoch: None,
+            source_session_epoch: None,
             uri,
             title,
             artist,
@@ -265,8 +268,8 @@ impl QueueItem {
     }
 
     #[cfg(test)]
-    pub(crate) const fn session_epoch(&self) -> Option<u64> {
-        self.session_epoch
+    pub(crate) const fn source_session_epoch(&self) -> Option<u64> {
+        self.source_session_epoch
     }
 }
 
@@ -432,7 +435,7 @@ impl PlaybackSession {
         output: &dyn AudioOutput,
     ) -> Option<DirectLoadAttempt> {
         let uri = self.current()?.uri.clone();
-        if uri.is_empty() || self.current()?.session_epoch.is_some() {
+        if uri.is_empty() || self.current()?.source_session_epoch.is_some() {
             return None;
         }
 
@@ -528,7 +531,7 @@ impl PlaybackSession {
             || !self.accepts_event_generation(generation)
             || !self.current().is_some_and(|item| {
                 is_library_source(item.identity.media_key.source_id)
-                    || item.session_epoch.is_some()
+                    || item.source_session_epoch.is_some()
             })
         {
             return false;
@@ -774,8 +777,8 @@ pub struct PlaybackContext {
     /// Tokio runtime used for exact local-database resolution without
     /// blocking GTK's main thread.
     pub rt_handle: tokio::runtime::Handle,
-    /// Sole authenticated-remote at-use resolver and lifecycle authority.
-    pub remote_sources: crate::source_registry::RemoteSourceRegistry,
+    /// Sole at-use resolver and lifecycle authority for source-owned media.
+    pub source_registry: crate::source_registry::SourceRegistry,
     /// The tracklist `ColumnView` — used to scroll the currently
     /// playing row into view on track change so the user doesn't lose
     /// their place when sequential / shuffled playback advances.
@@ -825,7 +828,7 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     let selected = &captured.items[captured.selected_index];
     if selected.uri.is_empty()
         && !is_library_source(selected.identity.media_key.source_id)
-        && selected.session_epoch.is_none()
+        && selected.source_session_epoch.is_none()
     {
         warn!("Track has no playable URI");
         return false;
@@ -987,7 +990,7 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         return true;
     }
 
-    if let Some(expected_session_epoch) = item.session_epoch {
+    if let Some(expected_session_epoch) = item.source_session_epoch {
         // Retire the prior output/ticket before awaiting the source resolver.
         // The Stop captures the old event generation; the new generation below
         // therefore rejects any delayed terminal event it produces.
@@ -998,34 +1001,48 @@ fn play_current(ctx: &PlaybackContext) -> bool {
 
         let identity = identity
             .as_ref()
-            .expect("remote queue item has stable media identity");
+            .expect("managed-source queue item has stable media identity");
         let source_id = identity.media_key.source_id;
         let track_id = identity.media_key.track_id.clone();
-        let remote_sources = ctx.remote_sources.clone();
+        let source_registry = ctx.source_registry.clone();
         let session = Rc::clone(&ctx.session);
         let active_output = Rc::clone(&ctx.active_output);
         let media_ctrl = Rc::clone(&ctx.media_ctrl);
         glib::MainContext::default().spawn_local(async move {
-            let resolved = remote_sources
+            let resolved = source_registry
                 .resolve_stream(source_id, expected_session_epoch, track_id)
                 .await;
             match resolved {
-                Ok(request) if request.is_active() => {
-                    if session.borrow_mut().finish_pending_resolution(generation) {
-                        let accepted = active_output.borrow().load_resolved(request);
-                        if !accepted {
-                            let marked = session.borrow_mut().mark_load_rejected(generation);
-                            debug_assert!(marked, "current resolved load remains retryable");
-                        }
+                Ok(request) => {
+                    if !session.borrow_mut().finish_pending_resolution(generation) {
+                        return;
                     }
-                }
-                Ok(_) => {
-                    if session.borrow_mut().fail_pending_resolution(generation) {
-                        warn!("Could not resolve track: source lease is inactive");
-                        active_output.borrow().stop();
-                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
-                            ctrl.update_playback(false);
+                    let accepted = match request {
+                        crate::architecture::media::MediaRequest::ProtectedHttp(request) => {
+                            active_output.borrow().load_resolved(*request)
                         }
+                        crate::architecture::media::MediaRequest::PublicHttp(request) => {
+                            match request.consume() {
+                                Ok(url) => active_output.borrow().load_uri(url.as_str()),
+                                Err(error) => {
+                                    warn!(error = %error, "Public stream authority expired before output handoff");
+                                    let marked =
+                                        session.borrow_mut().mark_load_rejected(generation);
+                                    debug_assert!(
+                                        marked,
+                                        "expired public load remains retryable"
+                                    );
+                                    if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                                        ctrl.update_playback(false);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    };
+                    if !accepted {
+                        let marked = session.borrow_mut().mark_load_rejected(generation);
+                        debug_assert!(marked, "current resolved load remains retryable");
                     }
                 }
                 Err(error) => {
@@ -1117,14 +1134,14 @@ fn update_now_playing_ui(
     }
 
     // ── Update album art ─────────────────────────────────────────
-    if let (Some(identity), Some(expected_session_epoch)) = (identity, item.session_epoch) {
+    if let (Some(identity), Some(expected_session_epoch)) = (identity, item.source_session_epoch) {
         let generation = album_art::begin_remote_album_art(&ctx.album_art);
-        let remote_sources = ctx.remote_sources.clone();
+        let source_registry = ctx.source_registry.clone();
         let source_id = identity.media_key.source_id;
         let track_id = identity.media_key.track_id.clone();
         let album_art = ctx.album_art.clone();
         glib::MainContext::default().spawn_local(async move {
-            match remote_sources
+            match source_registry
                 .resolve_artwork(source_id, expected_session_epoch, track_id)
                 .await
             {
@@ -1403,7 +1420,7 @@ mod tests {
             identity,
             occurrence: 0,
             row_instance_id: None,
-            session_epoch: None,
+            source_session_epoch: None,
             uri: if is_library_source(view.source_id) {
                 String::new()
             } else {
@@ -1419,7 +1436,7 @@ mod tests {
     fn protected_item(source: &str, id: &str) -> QueueItem {
         let mut item = item(source, id);
         item.uri.clear();
-        item.session_epoch = Some(7);
+        item.source_session_epoch = Some(7);
         item
     }
 
@@ -1616,9 +1633,9 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_remote_queue_capture_preserves_epoch_and_stays_pathless() {
+    fn managed_source_queue_capture_preserves_epoch_and_stays_pathless() {
         let remote = projected_row("native/remote.id", "");
-        remote.set_remote_session_epoch(77);
+        remote.set_source_session_epoch(77);
 
         let captured = item_from_row("https://server.invalid", &remote, 0);
 
@@ -1626,7 +1643,7 @@ mod tests {
             captured.identity.media_key.track_id.as_str(),
             "native/remote.id"
         );
-        assert_eq!(captured.session_epoch(), Some(77));
+        assert_eq!(captured.source_session_epoch(), Some(77));
         assert!(captured.uri().is_empty());
         assert!(captured.cover_art_url.is_empty());
 
@@ -1635,12 +1652,31 @@ mod tests {
             &projected_row("direct", "https://media.invalid/direct"),
             0,
         );
-        assert_eq!(direct.session_epoch(), None);
+        assert_eq!(direct.source_session_epoch(), None);
         assert_eq!(direct.uri(), "https://media.invalid/direct");
     }
 
     #[test]
-    fn authenticated_remote_item_cannot_bypass_resolution_with_a_cached_uri() {
+    fn radio_queue_capture_discards_a_projected_locator_and_retains_view_identity() {
+        let radio = projected_row("Case/Sensitive Station ID", "https://radio.invalid/live");
+        radio.set_source_session_epoch(88);
+
+        let captured = item_from_row(super::super::radio::TOP_VOTE_SOURCE_KEY, &radio, 0);
+
+        assert_eq!(
+            captured.identity.media_key.source_id,
+            SourceId::radio_browser()
+        );
+        assert_eq!(
+            captured.identity.view_origin,
+            Some(ViewOrigin::Radio("top-voted".to_string()))
+        );
+        assert_eq!(captured.source_session_epoch(), Some(88));
+        assert!(captured.uri().is_empty());
+    }
+
+    #[test]
+    fn managed_source_item_cannot_bypass_resolution_with_a_cached_uri() {
         let mut session = PlaybackSession::default();
         let mut remote = protected_item("https://server.invalid", "native/remote.id");
         remote.uri = "https://media.invalid/should-not-load".to_string();
@@ -1985,11 +2021,12 @@ mod tests {
         assert_eq!(identity.media_key.source_id, SourceId::radio_browser());
         assert_eq!(
             identity.view_origin,
-            Some(ViewOrigin::Radio("radio-topvote".to_string()))
+            Some(ViewOrigin::Radio("top-voted".to_string()))
         );
         assert!(!session.clear_if_source("radio-nearme"));
         assert!(!session.clear_if_source("radio-topvote"));
         assert!(session.clear_if_source(&SourceId::radio_browser().to_string()));
+        assert!(queue_view("radio-attacker-defined").is_none());
     }
 
     #[test]
@@ -2095,7 +2132,7 @@ mod tests {
         let mut daap = PlaybackSession::default();
         let mut daap_item = item("daap-source", "a");
         daap_item.uri.clear();
-        daap_item.session_epoch = Some(9);
+        daap_item.source_session_epoch = Some(9);
         assert!(daap.replace_queue(vec![daap_item], 0));
         let daap_load = daap.begin_event_generation();
         assert!(daap.mark_resolved_load_failed(daap_load));

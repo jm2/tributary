@@ -51,8 +51,8 @@ executions in PR #111.
 
 PR #123's P3.1 production cutover closes the centralized refresh/cancellation/disconnect/failure
 box while deliberately leaving the final implementation-record box unchecked, so the literal
-arithmetic is now **219/223 (98.2%)** and P3 is **29/30**. `RemoteSourceRegistry` is the sole
-authenticated-remote lifecycle owner for Subsonic, Jellyfin, Plex, and DAAP. GTK catalogue rows and
+arithmetic is now **219/223 (98.2%)** and P3 is **29/30**. `SourceRegistry` is the sole
+lifecycle owner for Subsonic, Jellyfin, Plex, DAAP, and the built-in Radio-Browser source. GTK catalogue rows and
 playback queues carry only `SourceId`, exact `TrackId`, and the non-secret publishing session epoch;
 they no longer carry an authenticated resolver URL or lease key. One baseline/watch reducer now
 projects connection, catalogue, sanitized failure, provenance, visibility, cancellation, and
@@ -94,9 +94,16 @@ check, strict debug/release Clippy, formatting, and whitespace gates pass; compl
 release suites each pass 20 library, 866 application, and 10 repository-metadata tests (**896 total**).
 PR #124's CI run `29633729566` subsequently passed every job, including production bundle/probe
 execution on native x86_64 and ARM64 Windows runners. That proves the named calls on the CI
-PowerShell hosts; it does not replace the still-pending exact rerun on the originally affected host.
+PowerShell hosts. The exact affected-host rerun on 2026-07-18 passed dependency discovery, the
+release build, plugin synchronization, scanner replacement, and distribution-path resolution, but
+still rejected the singleton Soup inspection target with the same absolute/existing-file
+diagnostic. Explicit argument names therefore did **not** resolve the host-specific failure and the
+earlier array-binding explanation remains only a disproved working hypothesis. The script now
+needs a second repair that removes the ambiguous batch-target boundary or reports the exact failed
+predicate before live packaged-server playback can be recorded. This does not change checklist
+arithmetic.
 Comprehensive lifecycle, playback-boundary, reducer, provenance, Jellyfin, and actual-wire DAAP
-regressions cover the cutover. Radio, removable, and OS-opened external media still need
+regressions cover the authenticated cutover. Removable and OS-opened external media still need
 registry-owned at-use locator adapters; those keep the final P3.1 implementation record open.
 The current P3.1 follow-up closes the separate local/playlist embedded-art authority boundary.
 Artwork begins only after exact-ID resolution is still current for the configured roots and the
@@ -112,6 +119,19 @@ and the whitespace gate pass. Complete locked debug and release suites each pass
 application, and 10 repository-metadata tests (**902 total**). Because this is part of the still-open
 compound implementation record, the totals remain **219/223 (98.2%)**, **76/79 P2**, and
 **29/30 P3**.
+The current P3.1 Radio-Browser follow-up generalizes that owner to `SourceRegistry` and installs one
+stateless built-in source whose Top Clicked, Top Voted, and Near Me feeds are exact independently
+cancellable `ViewOrigin` lanes. Accepted snapshots publish pathless tracks while a private payload
+retains validated station-ID-to-public-URL contributions. Resolution chooses the greatest accepted
+source-wide generation when views overlap, and final consumption rechecks that exact winner through
+weak registry authority plus source and per-view leases; replacement, removal, disconnect, a newer
+overlapping view, or dropping the last registry handle therefore revokes even an already-resolved
+request. GTK retains inactive caches, distinguishes an accepted empty view from a failed successor,
+and clears all three lanes plus playback on epoch loss/replacement. Near Me performs only translated
+consent/navigation in GTK; its adapter tolerates partial successful tiers, deduplicates by tier
+precedence before one stable global distance sort, and retains no locator in rows or queues. This is
+another part of the still-open compound record, so the literal totals remain **219/223 (98.2%)**,
+**76/79 P2**, and **29/30 P3** until the removable and external-file adapters also land.
 P3.3 is complete after combining the independently reviewed non-DAAP service fixture from
 `b80e534`, the DAAP adversarial fixture from `6f6c9ac`, and this representative cross-service
 behavior matrix. The matrix exercises rejected authentication, credential-safe authenticated and
@@ -264,7 +284,7 @@ arithmetic.
 The authenticated-remote lifecycle production cutover now closes the central P3.1 box and advances
 the literal total to **219/223 (98.2%)** with P3 at **29/30**. Subsonic, Jellyfin, Plex, and DAAP
 construction, initial catalogue ownership, sanitized failure, at-use resolution, disconnect, and
-shutdown all enter `RemoteSourceRegistry`; the old standard and DAAP registry paths are removed.
+shutdown all enter `SourceRegistry`; the old standard and DAAP registry paths are removed.
 The baseline/watch reducer is the sole GTK projection path for exact generation, epoch, catalogue,
 provenance, visibility, cancellation, and failure state. The exact accepted generation clears its
 pending guard before row rebind/selection and can reactivate its already-selected row once the
@@ -290,8 +310,9 @@ and diff checks green. At that cutover, the radio/removable/external at-use adap
 embedded-art authority kept P3.1's final implementation record open. The current retained-art
 follow-up removes paths from local/playlist embedded-art parsing: only a clone of the exact
 `ResolvedLocalMedia` accepted for output reaches the worker, which revalidates and owns its retained
-file through bounded parsing. Radio, removable, and external at-use adapters are now the remaining
-work in the compound record, so its checklist arithmetic does not yet change.
+file through bounded parsing. The Radio-Browser follow-up adds its stateless source, exact views,
+private public locators, and final-consumption authority. Removable and external at-use adapters are
+now the remaining work in the compound record, so its checklist arithmetic does not yet change.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -552,9 +573,9 @@ Confirmed path, end to end:
 | Step | Location |
 |---|---|
 | Generic catalogue | Subsonic, Jellyfin, Plex, and DAAP tracks retain stable application identity and exact bounded source-scoped `TrackId`; their registry-owned adapters keep stream/artwork locators, authentication, routes, leases, and DAAP session state private. A type-local Subsonic album/artist ID therefore cannot overwrite track art. |
-| Source ownership | `RemoteSourceRegistry` owns the adapter, exact connection/catalogue generation, non-secret session epoch, random revocable `MediaLease`, immutable catalogue/failure state, and tracked retirement for all four authenticated backends. Replacement, release, discovery-route loss, manual deletion, or shutdown invalidates old media; DAAP's protocol-specific close performs one bounded logout through the same lifecycle. |
+| Source ownership | `SourceRegistry` owns the adapter, exact connection/catalogue generation, non-secret session epoch, random revocable `MediaLease`, immutable catalogue/failure state, and tracked retirement for all four authenticated backends. Replacement, release, discovery-route loss, manual deletion, or shutdown invalidates old media; DAAP's protocol-specific close performs one bounded logout through the same lifecycle. |
 | GTK publication | A current authenticated-remote catalogue is converted to pathless `(SourceId, TrackId, session epoch)` rows. No server address, credential, native locator, authenticated URI, random lease key, or DAAP session key enters the GTK object or playback queue. |
-| Playback and artwork | `ui/playback.rs` asks `RemoteSourceRegistry` to resolve the exact source/track/epoch only when the item is consumed. A stale epoch fails before adapter invocation; adapter, lease, and epoch are rechecked after await, and playback/artwork generations reject completion after Stop, Next, output replacement, or a newer replay. |
+| Playback and artwork | `ui/playback.rs` asks `SourceRegistry` to resolve the exact source/track/epoch only when the item is consumed. A stale epoch fails before adapter invocation; adapter, lease, and epoch are rechecked after await, and playback/artwork generations reject completion after Stop, Next, output replacement, or a newer replay. |
 | Credential isolation | `ResolvedHttpRequest` is deliberately non-debuggable and non-serializable. Plex uses a sensitive `X-Plex-Token` header and Jellyfin a sensitive `X-Emby-Authorization` header. Subsonic protocol authentication remains private query material (`u` plus `t`/`s` or HTTPS-only `p`), and DAAP's bearer `session-id` is now private query material too; each is appended only inside the app-owned proxy immediately before the exact-origin fetch. |
 | Output boundary | `AudioOutput::load_resolved` accepts the typed request. Chromecast, MPD, local GStreamer, and AirPlay exchange it for their existing opaque, receiver-reachable tickets; none can fall back to the clean endpoint or serialized credential state. |
 
@@ -1568,8 +1589,11 @@ failed through the separately resolved media path—but did not prove DNS was th
   PowerShell 7 AST parse and all 11 focused Windows platform-runtime tests pass on the development
   host. Locked check, strict Clippy, and complete debug/release suites also pass, with 896 tests per
   profile. This changes no import target, closure bound, runtime-copy policy, dependency, lockfile,
-  or checklist arithmetic. The user's exact Windows PowerShell/MSYS2 build remains the end-to-end
-  confirmation.
+  or checklist arithmetic. The subsequent exact Windows PowerShell/MSYS2 rerun reached the same
+  singleton Soup validation and failed with the same absolute/existing-target diagnostic despite
+  those named arguments. That falsifies the argument-binding repair as a complete fix. A follow-up
+  must remove the ambiguous array boundary (or first expose which exact invariant differs on that
+  host), pass the native package matrix, and then pass this exact host rerun.
 - [ ] Record live playback from a packaged Windows artifact against the reported DAAP and Subsonic
   servers, including catalogue connection, protected-media startup, audible playback, and useful
   URL-free failure diagnostics if either server cannot play. The automated package probe cannot
@@ -1615,7 +1639,7 @@ closed as a milestone.
 - [x] Store `Arc<dyn MediaBackend>` or a deliberate session abstraction per source. P1.6 first
   retained standard remote resolvers behind revocable leases; the authenticated-remote production
   cutover now adopts Subsonic, Jellyfin, Plex, and DAAP adapters into the same
-  `RemoteSourceRegistry` entry with one exact session epoch, media lease, catalogue snapshot, and
+  `SourceRegistry` entry with one exact session epoch, media lease, catalogue snapshot, and
   registry-owned retirement path.
 - [x] Remove long-lived authenticated URLs from the generic `Track` model. Subsonic, Jellyfin,
   Plex, and DAAP catalogue models retain stable application identity while their registry-owned
@@ -1623,7 +1647,7 @@ closed as a milestone.
   session state private.
 - [x] Resolve remote playable URLs/tickets at playback time. Authenticated-remote GTK rows and
   queues are pathless: they retain `SourceId`, exact `TrackId`, and the non-secret session epoch
-  that published the catalogue. Stream and artwork consumption ask `RemoteSourceRegistry` to
+  that published the catalogue. Stream and artwork consumption ask `SourceRegistry` to
   resolve that exact epoch into a typed `ResolvedHttpRequest`; a stale epoch is rejected before
   adapter invocation and the registry rechecks adapter, lease, and epoch after the await. The
   selected output then mints its receiver-scoped proxy ticket.
@@ -1663,11 +1687,11 @@ closed as a milestone.
   at 256 MiB and uses checked atom arithmetic. The direct URI art helper remains only for removable
   and OS-opened external files until their at-use adapters land.
 - [x] Centralize source refresh, cancellation, disconnect, and failure state. The production
-  `RemoteSourceRegistry` is now the sole adapter/session authority for Subsonic, Jellyfin, Plex,
-  and DAAP across environment startup, interactive authentication, manual Add, discovery,
+  `SourceRegistry` is now the sole adapter/session authority for Subsonic, Jellyfin, Plex, DAAP,
+  and Radio-Browser across environment startup, interactive authentication, manual Add, discovery,
   catalogue publication, at-use stream/artwork resolution, disconnect, route loss, deletion, and
   application shutdown. Each entry atomically owns its adapter, media lease, non-secret session
-  epoch, exact connect/catalogue generations, sanitized failure, immutable snapshot, keyed
+  epoch, exact connect/catalogue/view generations, sanitized failure, immutable snapshot, keyed
   provenance, and tracked retirement. The old standard/DAAP sibling registries and URL/lease-key
   UI ownership are gone.
 
@@ -1699,6 +1723,15 @@ closed as a milestone.
   require the catalogue's exact epoch before adapter invocation and recheck the current
   adapter/lease/epoch after asynchronous resolution.
 
+  Radio-Browser is installed lazily as one stateless built-in session; no caller-supplied factory
+  or generation callback runs beneath its installation mutex. Each exact view refresh owns lifecycle
+  cancellation and publishes either an accepted pathless snapshot, a closed failure category, or
+  cancellation. Public locator contributions remain private and have their own accepted-view lease.
+  Overlapping station IDs resolve from the greatest accepted global generation and final
+  consumption rechecks that exact winning generation through weak registry authority, preventing a
+  pending request from retaining the registry or surviving view/source replacement. A failed
+  refresh preserves its predecessor while a successful empty feed replaces it authoritatively.
+
   One atomic lifecycle baseline plus a monotonic invalidation watch now drives a GTK reducer; the
   UI no longer infers lifecycle authority from row spinners, URLs, or channel closure. Exact
   generation-correlated cancellation and closed failure categories clear only their owning intent,
@@ -1729,7 +1762,8 @@ closed as a milestone.
   feeds are views, removable filesystems are generation-owned sources keyed by their existing
   logical GIO identity, and the first playable file in each OS-open delivery is an ephemeral
   one-item source. The local/playlist embedded-art authority boundary is now implemented;
-  Radio-Browser, removable, and external-file adapters remain on the current direct paths. Recorded
+  Radio-Browser now uses its specified registry/view adapter and at-use resolver. Removable and
+  external-file adapters remain on the current direct paths. Recorded
   in the [source-lifecycle decision](architecture/source-lifecycle.md), accepted in PR #113.
 - [x] Record architecture decision: [Source identity and lifecycle ownership](architecture/source-lifecycle.md).
   The document distinguishes accepted decisions, existing foundations, remaining implementation,
@@ -1741,10 +1775,11 @@ closed as a milestone.
   local/playlist ID-at-use plus retained root/file authority through every output. PR #122 fixes
   the central state/owner/task/provenance/shutdown API and race contracts; the following production
   cutover makes that authority the sole owner for Subsonic, Jellyfin, Plex, and DAAP and moves GTK
-  to pathless epoch-bound catalogue/queue state. The current follow-up moves local/playlist
-  embedded-art parsing onto cloned, revalidated `ResolvedLocalMedia` authority after output
-  acceptance. Radio-Browser's registry/view resolver plus retained removable and ephemeral
-  external-file at-use adapters must still land before P3.1 itself can be recorded complete.
+  to pathless epoch-bound catalogue/queue state. PR #125 moves local/playlist embedded-art parsing
+  onto cloned, revalidated `ResolvedLocalMedia` authority after output acceptance. The current
+  follow-up adds Radio-Browser's registry/view resolver; retained removable
+  and ephemeral external-file at-use adapters must still land before P3.1 itself can be recorded
+  complete.
 
 ### P3.2 Make the backend abstraction real and stable
 
@@ -2053,8 +2088,9 @@ stale build outputs from two already-merged worktrees and rerunning the same com
 source workaround, dependency, lockfile, packaging-policy, or checklist change resulted. Gemini's
 review found no issue, CodeQL passed, and CI run `29633729566` passed every job. Both native Windows
 architectures completed the production bundle/probe path with the named calls. The user's affected
-Windows PowerShell/MSYS2 rerun remains pending, so this CI proof does not close the separate live
-packaged-playback task.
+Windows PowerShell/MSYS2 rerun has since reproduced the singleton Soup-target failure, proving this
+CI/named-binding change is insufficient; a second packaging repair and another exact-host rerun are
+required before the separate live packaged-playback task can close.
 
 Accepted validation (2026-07-17, PR #114 P2.11 packaged-probe teardown hardening):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature

@@ -597,7 +597,7 @@ pub fn show_add_server_dialog(
     sidebar_store: &gtk::gio::ListStore,
     sidebar_selection: &gtk::SingleSelection,
     engine_tx: &async_channel::Sender<LibraryEvent>,
-    remote_sources: &crate::source_registry::RemoteSourceRegistry,
+    source_registry: &crate::source_registry::SourceRegistry,
     remote_provenance: &crate::source_registry::ProvenanceClaims,
 ) {
     let dialog = adw::AlertDialog::builder()
@@ -650,7 +650,7 @@ pub fn show_add_server_dialog(
     let store = sidebar_store.clone();
     let selection = sidebar_selection.clone();
     let engine_tx = engine_tx.clone();
-    let remote_sources = remote_sources.clone();
+    let source_registry = source_registry.clone();
     let remote_provenance = remote_provenance.clone();
 
     let url_entry_c = url_entry.clone();
@@ -706,7 +706,7 @@ pub fn show_add_server_dialog(
             }
         };
         if !remote_provenance.ensure(
-            &remote_sources,
+            &source_registry,
             saved.source_id,
             crate::source_lifecycle::SourceProvenance::Saved,
             "saved-config",
@@ -762,7 +762,7 @@ pub fn show_add_server_dialog(
         };
 
         let generation = match backend_type.as_str() {
-            "jellyfin" => remote_sources.connect_jellyfin_session(
+            "jellyfin" => source_registry.connect_jellyfin_session(
                 source_id,
                 on_generation,
                 move || async move {
@@ -777,7 +777,7 @@ pub fn show_add_server_dialog(
                 },
             ),
             "plex" => {
-                remote_sources.connect_standard(source_id, on_generation, move || async move {
+                source_registry.connect_standard(source_id, on_generation, move || async move {
                     info!("Authenticating with Plex (manual)...");
                     let client =
                         authenticate_manual_plex(&server_url, &user, &pass, advertised_route)
@@ -785,7 +785,7 @@ pub fn show_add_server_dialog(
                     crate::plex::PlexBackend::from_client(&server_name, client).await
                 })
             }
-            _ => remote_sources.connect_standard(source_id, on_generation, move || async move {
+            _ => source_registry.connect_standard(source_id, on_generation, move || async move {
                 info!("Authenticating with Subsonic (manual)...");
                 connect_manual_subsonic(&server_name, &server_url, &user, &pass, advertised_route)
                     .await

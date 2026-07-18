@@ -14,7 +14,7 @@ use crate::local::engine::LibraryEvent;
 use super::browser::BrowserState;
 use super::objects::TrackObject;
 use super::preferences;
-use super::source_navigation::{PendingConnection, SourceNavigation};
+use super::source_navigation::{PendingConnection, SourceNavigation, SourceRequest};
 
 /// Shared UI state for the main window.
 ///
@@ -35,8 +35,8 @@ pub struct WindowState {
     /// Used by: source_connect (RemoteSync after auth).
     pub engine_tx: async_channel::Sender<LibraryEvent>,
 
-    /// Sole lifecycle/media authority for authenticated remote sources.
-    pub remote_sources: crate::source_registry::RemoteSourceRegistry,
+    /// Sole lifecycle/media authority for source-owned media.
+    pub source_registry: crate::source_registry::SourceRegistry,
 
     /// Exact Saved/Environment/Discovery claim-token owners on the GTK side.
     pub remote_provenance: crate::source_registry::ProvenanceClaims,
@@ -65,6 +65,12 @@ pub struct WindowState {
     /// Generation-owned navigation state for async source loads.
     /// Used by: source_connect, radio, discovery_handler, window.
     pub source_navigation: Rc<RefCell<SourceNavigation>>,
+
+    /// Exact current Near Me request waiting on the user's location-consent
+    /// prerequisite. It is not a network operation or source authority; the
+    /// lifecycle reducer uses it only to avoid treating the deliberate
+    /// pre-construction dialog interval as source loss.
+    pub near_me_consent_request: Rc<RefCell<Option<SourceRequest>>>,
 
     // ── Sidebar ─────────────────────────────────────────────────────
     /// Sidebar backing store (list of `SourceObject`s with headers).

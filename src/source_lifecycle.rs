@@ -1,13 +1,13 @@
 //! Central source lifecycle ownership authority.
 //!
-//! The production remote-source service uses this generic registry for
-//! Subsonic, Jellyfin, Plex, and DAAP. One entry atomically owns its adapter,
-//! revocable media lease, session epoch, provenance, accepted snapshots, and
-//! generation-scoped operations. Every constructed adapter enters exactly-once
-//! retirement even when cancelled or stale, and shutdown joins all tracked
-//! construction/refresh/close work. Built-in local, radio, removable, and
-//! external-file adapters remain outside this remote production cutover for
-//! now, while sharing the same typed SourceId model.
+//! The production source service uses this generic registry for Subsonic,
+//! Jellyfin, Plex, DAAP, and the stateless built-in Radio-Browser adapter. One
+//! entry atomically owns its adapter, revocable media lease, session epoch,
+//! provenance, accepted snapshots, and generation-scoped operations. Every
+//! constructed adapter enters exactly-once retirement even when cancelled or
+//! stale, and shutdown joins all tracked construction/refresh/close work.
+//! Built-in local, removable, and external-file adapters remain outside this
+//! production cutover for now, while sharing the same typed `SourceId` model.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -525,6 +525,17 @@ pub struct AcceptedSnapshot<S> {
     pub generation: u64,
     pub session_epoch: u64,
     pub value: Arc<S>,
+}
+
+/// Value selected from the newest accepted view that contributes it.
+///
+/// View refresh generations are source-registry-global, so choosing the
+/// greatest accepted generation is deterministic even when overlapping views
+/// complete out of order.
+pub struct LatestAcceptedView<T> {
+    pub generation: u64,
+    pub session_epoch: u64,
+    pub value: T,
 }
 
 impl<S> Clone for AcceptedSnapshot<S> {
@@ -1846,6 +1857,60 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             .flatten()
     }
 
+    /// Select a contribution from the greatest-generation accepted view.
+    ///
+    /// The selector executes while the lifecycle state is locked and must be
+    /// a bounded, non-blocking projection over registry-owned immutable data.
+    /// This keeps the chosen value, generation, session epoch, and active
+    /// lease in one atomic observation.
+    pub(crate) fn resolve_latest_accepted_view<T, Select>(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        mut select: Select,
+    ) -> Option<LatestAcceptedView<T>>
+    where
+        Select: FnMut(&S) -> Option<T>,
+    {
+        let state = lock(&self.inner.state);
+        if state.gate != RegistryGate::Running {
+            return None;
+        }
+        let entry = state.entries.get(&source_id)?;
+        let active = entry.active.as_ref()?;
+        if active.epoch != expected_session_epoch || !active.lease.is_active() {
+            return None;
+        }
+
+        entry
+            .views
+            .values()
+            .filter(|accepted| accepted.session_epoch == expected_session_epoch)
+            .filter_map(|accepted| {
+                select(accepted.value.as_ref()).map(|value| LatestAcceptedView {
+                    generation: accepted.generation,
+                    session_epoch: accepted.session_epoch,
+                    value,
+                })
+            })
+            .max_by_key(|accepted| accepted.generation)
+    }
+
+    /// Recheck the exact newest accepted view generation at final use.
+    pub(crate) fn is_current_latest_accepted_view<Select>(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        winner_generation: u64,
+        select: Select,
+    ) -> bool
+    where
+        Select: FnMut(&S) -> Option<()>,
+    {
+        self.resolve_latest_accepted_view(source_id, expected_session_epoch, select)
+            .is_some_and(|accepted| accepted.generation == winner_generation)
+    }
+
     /// Validate one accepted catalogue identity without cloning its value.
     pub fn is_current_catalogue(
         &self,
@@ -2062,6 +2127,41 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             settlement,
             completed: false,
         })
+    }
+
+    /// Synchronously adopt one already-constructed stateless built-in source.
+    ///
+    /// The normal connect/adopt path still mints its generation, session
+    /// epoch, lease, events, and replacement retirement. No caller callback
+    /// runs while lifecycle or outer installation state is locked.
+    pub(crate) fn adopt_stateless_session(
+        &self,
+        source_id: SourceId,
+        adapter: Box<A>,
+        snapshot: S,
+    ) -> Option<(u64, u64)>
+    where
+        S: Send + Sync + 'static,
+    {
+        let owner = self.begin_connect(source_id)?;
+        let generation = owner.generation();
+        match owner.submit_constructed(ConstructedAdapter::from_box(adapter), snapshot) {
+            ConnectSubmission::Adopted { session_epoch, .. } => Some((generation, session_epoch)),
+            ConnectSubmission::Rejected => None,
+        }
+    }
+
+    /// Record failure to construct one stateless built-in adapter through the
+    /// ordinary connect-generation state transition.
+    pub(crate) fn fail_stateless_session(
+        &self,
+        source_id: SourceId,
+        category: FailureCategory,
+    ) -> Option<u64> {
+        let owner = self.begin_connect(source_id)?;
+        let generation = owner.generation();
+        owner.fail(category);
+        Some(generation)
     }
 
     /// Begin or supersede one refresh lane against the exact current epoch.

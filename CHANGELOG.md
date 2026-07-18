@@ -48,13 +48,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persistence, auth-dialog display, logs, discovery/UI publication, or connection ownership; raw
   Jellyfin UDP response bodies are never logged, and malformed input, userinfo, query, and fragment
   state produce one fixed error that cannot echo a rejected secret.
+- **Radio stream locators no longer enter GTK rows or playback queues** — Radio-Browser is one
+  stateless built-in `SourceRegistry` session whose Top Clicked, Top Voted, and Near Me feeds are
+  independently cancellable views. Accepted snapshots expose only pathless tracks and retain the
+  validated station-ID-to-public-URL map privately. If multiple views contribute the same station,
+  playback selects the greatest accepted source-wide generation. The resolved request remains
+  provisional until the output handoff: weak registry authority plus source and per-view leases
+  recheck that exact winner, so view replacement/removal, a newer overlapping view, source
+  disconnect/replacement, or dropping the last registry handle fails closed instead of replaying or
+  retargeting an obsolete locator. A pending request cannot itself keep that authority alive.
 - **Playback-time requests isolate protocol credentials** — Resolved requests are typed, non-serializable, and deliberately omit `Debug`. Their inspectable HTTP(S) endpoint rejects embedded credentials; Plex's token is held as a sensitive `X-Plex-Token` header and Jellyfin's as a sensitive `X-Emby-Authorization` header. Subsonic's `u` plus `t`/`s` or HTTPS-only legacy `p` values and DAAP's bearer `session-id` remain separate private query material and are appended only inside Tributary's app-owned proxy immediately before the exact-origin upstream fetch. DAAP's non-secret `Accept`, `User-Agent`, client-version, and access-index requirements now cross the same typed boundary through a separate exact-name allowlist shared by stream and artwork fetching; receiver, authentication, routing, proxy, framing, and arbitrary headers cannot enter that channel. A DAAP request also carries a revocable live-session lease, so replacement, release, discovery loss, disconnect, or shutdown invalidates an already-issued request. The proxy accepts only allowlisted trusted and authentication fields, installs request-owned values before the receiver's `Range`, forwards no other receiver header, and every output's typed load path fails closed instead of falling through to the clean endpoint.
 - **HTTP responses are bounded while streaming** — API, authentication, DAAP, radio, artwork, and metadata reads now count bytes as they arrive and stop at an endpoint-specific cap, with an end-to-end deadline in addition to the idle timeout. A hostile or broken server previously could exhaust memory by lying about `Content-Length` or by never ending a chunked body.
 - **Chromecast frame lengths are bounded before allocation** — `rust_cast 0.21` otherwise reads a peer's unsigned 32-bit Cast length and immediately reserves that many bytes. Tributary now wraps the decrypted worker-local stream with a framing guard that buffers the complete big-endian header and rejects control-message payloads above a deliberately generous 1 MiB before the upstream message manager sees the header or allocates. Accepted headers and payloads remain byte-for-byte unchanged, writes pass through unchanged, and an early EOF inside either the header or advertised payload fails closed and retires the poisoned session. Regressions through the real upstream manager cover oversized rejection without a payload read, an exactly-at-limit protobuf message, fragmented/truncated input, and consecutive frame reset.
 - **Third-party requests refuse plaintext downgrades** — Radio-Browser, IP geolocation, and MusicBrainz requests still follow the cross-host redirects those services depend on, but no longer follow one from HTTPS down to HTTP, and no longer send a `Referer`.
 - **Flatpak filesystem access is consent-based and narrowly scoped** — The sandbox no longer exposes the user's entire home directory, even read-only. XDG Music remains read/write; automatic Devices entries receive read-only file access only under the standard host mount roots `/media`, `/run/media`, and `/mnt`. The reviewed `org.gtk.vfs.*` session-bus namespace exposes host GVfs service methods for GIO's native mount inventory, which can still list an eligible inaccessible root elsewhere, while Tributary omits raw USB/all-device, UDisks, whole-host, and non-native GVfs filesystem grants. Selecting a custom library through Preferences requests a persistent read/write file-chooser portal grant, subject to ordinary host filesystem permissions. A fail-closed CI allowlist and adversarial fixtures reject every unreviewed Flatpak finish argument.
 - **Dependency-audit findings are resolved or explicitly time-bounded** — The yanked `spin 0.9.8` transitive dependency is updated to compatible `0.9.9`. The two remaining warnings (`paste` and `proc-macro-error2`, both unmaintained) have documented dependency paths, follow-ups, and review deadlines. The sole ignored vulnerability, `RUSTSEC-2023-0071` for `rsa`, exists only in `Cargo.lock` through inactive MySQL support: Tributary enables SQLite, but `cargo-audit` checks locked optional packages. Because no fixed release exists, the ignore remains until 2026-10-10 or the next release, whichever comes first, with immediate review if MySQL support is enabled.
-- **Chromecast no longer receives your server credentials** — Casting a track from Subsonic, Jellyfin, or Plex used to hand the Chromecast the stream URL with your credential still in it: your Plex token, your Jellyfin API key, or — with Subsonic's plaintext auth mode — your **actual password**, hex-encoded and trivially reversible. That credential went to a device Tributary does not control, over a LAN it does not control, and was retained in the device's media session. Tributary now resolves the live source inside the app, fetches the stream itself, and gives the device an opaque, revocable, single-media ticket; even a clean-looking resolved endpoint must take the typed proxy path. A new load (including direct or invalid media), user Stop, source-lease revocation, or output/server teardown retires the old route; pause and seek keep it available for byte-range refetches only within its hard lifetime. Internet radio and other unauthenticated streams are unaffected and still play directly.
+- **Chromecast no longer receives your server credentials** — Casting a track from Subsonic, Jellyfin, or Plex used to hand the Chromecast the stream URL with your credential still in it: your Plex token, your Jellyfin API key, or — with Subsonic's plaintext auth mode — your **actual password**, hex-encoded and trivially reversible. That credential went to a device Tributary does not control, over a LAN it does not control, and was retained in the device's media session. Tributary now resolves the live source inside the app, fetches the stream itself, and gives the device an opaque, revocable, single-media ticket; even a clean-looking resolved endpoint must take the typed proxy path. A new load (including direct or invalid media), user Stop, source-lease revocation, or output/server teardown retires the old route; pause and seek keep it available for byte-range refetches only within its hard lifetime. Internet radio still plays directly after its credential-free locator is resolved and revalidated at use, but that locator no longer lives in GTK or the queue.
 - **MPD no longer receives or stores backend credentials** — Remote playback is resolved from an opaque live-source reference into an app-private typed request before MPD is invoked; the legacy/direct URI classifier remains a fail-closed defense for DAAP and other supported protected inputs. After connecting, Tributary binds a dedicated proxy to the successful socket's local IPv4/IPv6 address and gives plaintext `addid` only a bracket-correct opaque ticket, so neither the endpoint nor credential crosses the MPD connection or lands in daemon queue state and logs. The protected upstream is fixed at registration, fetched by Tributary's no-`Referer` exact-origin client, and accepts only the receiver's `Range` header. Missing runtime or connection-address state, unusable scoped/link-local IPv6, bind/registration failure, malformed HTTP(S), unsupported credential schemes, an inactive source lease, and invalid generated arguments all fail closed. Tickets survive pause, seek, and a restartable remote Stop within their hard lifetime, but are revoked sooner on any replacement load, user Stop, source replacement/release, output drop, natural end, ownership loss, operation failure, worker shutdown, or stale generation; stale cleanup cannot revoke a newer ticket. Upstream body failures are reduced to URL-free diagnostics.
 - **Local and AirPlay GStreamer no longer receive backend credentials** — Before `playbin3` or AirPlay's `uridecodebin` can consume protected media, Tributary exchanges the playback-time typed request for an opaque ticket on a dedicated loopback-only server. The app-owned proxy fixes the upstream target, applies the exact-origin/no-`Referer` policy, and forwards only `Range`; credential-free radio, files, and library paths remain byte-for-byte direct. Malformed or unsupported protected media and missing runtime, bind, client, ticket, or active source-lease state fail closed with fixed URL-free events. Replacement by any direct, protected, or rejected load, Stop, source replacement/release, EOS/error, setup/preroll/start failure, output teardown, and proxy teardown revoke the route; pause, play, and seek retain it only within its hard 24-hour lifetime. Each load owns its server and cleanup is identity-checked, so a stale pipeline callback cannot revoke a newer ticket. Server binding and revocation run outside the short-held proxy-state mutex; generation ownership lets a newer load, Stop, or runtime replacement supersede an in-flight startup without waiting and prevents that older startup from installing afterward.
 - **Protected loopback tickets cannot escape through an ambient HTTP proxy** — GStreamer's `souphttpsrc` may consult process or operating-system proxy settings even for `127.0.0.1`; an empty proxy property still restores the default resolver under libsoup3. Local and AirPlay source-setup now recognizes only Tributary's exact HTTP loopback `/cast/<UUID[.extension]>` shape with an explicit port and no user-info, query, or fragment, installs the `direct://` resolver, disables retries, verifies its timeout/policy round trip, and posts a fixed error while locking the source in NULL if any property cannot be enforced. Ordinary files and internet radio retain their existing proxy behavior, while the app-owned upstream request may still use a legitimate configured proxy. An isolated child-process regression receives poisoned proxy variables before process creation, keeps the parent-owned proxy listener live through child completion, and starts the child-owned media listener's bounded window only after cold GStreamer plugin discovery, then proves the media fixture receives the ticket and the ambient proxy receives nothing.
@@ -63,8 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Credential-bearing media tickets now expire** — Every upstream proxy ticket has a hard, absolute, non-sliding 24-hour lifetime from registration in addition to earlier playback-lifecycle revocation. It is usable only before its monotonic deadline; a lookup at or after that boundary atomically removes it and returns the same 404 as an unknown or revoked route. GET and byte-range requests, pause, seek, and receiver status do not renew the deadline, so a compromised receiver cannot perpetuate the bearer. A response admitted before expiry may finish afterward, but every later lookup fails. Local-file routes retain their existing server-lifetime behavior because they front no backend credential.
 
 ### Changed
-- **Authenticated remote sources now share one production lifecycle authority** —
-  `RemoteSourceRegistry` is the sole adapter/session owner for Subsonic, Jellyfin, Plex, and DAAP
+- **Managed network sources now share one production lifecycle authority** —
+  `SourceRegistry` is the sole adapter/session owner for Subsonic, Jellyfin, Plex, DAAP, and the
+  built-in Radio-Browser source
   across environment startup, manual and interactive authentication, discovery, initial catalogue
   publication, at-use stream/artwork resolution, disconnect, route loss, deletion, and shutdown.
   The separate standard and DAAP registries and their URL/lease-key UI ownership have been removed.
@@ -106,14 +116,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at runtime instead of embedding credential-shaped literals, preserving the exact authentication
   and logout coverage without suppressing hard-coded-secret analysis. Lifecycle, registry,
   reducer, playback-boundary, provenance, shutdown,
-  interactive-Jellyfin, and actual-wire DAAP regressions cover the cutover. Radio, removable, and
-  OS-opened external media still need registry-owned at-use locator adapters. The retained-artwork
-  fix below closes the local/playlist path boundary, but those three adapters keep P3.1's final
-  implementation record open.
-- **The centralized source-lifecycle foundation now backs the production remote registry** —
+  interactive-Jellyfin, and actual-wire DAAP regressions cover the authenticated cutover.
+  Radio-Browser now uses three exact independently cancellable views, preserves a predecessor on
+  failed refresh, publishes accepted empty results authoritatively, and resolves public streams
+  from private locator contributions only at use. Near Me performs translated consent in GTK,
+  tolerates partial successful tiers, deduplicates by tier precedence, and then applies one stable
+  global distance sort. Removable and OS-opened external media still need registry-owned at-use
+  locator adapters; those two adapters keep P3.1's final implementation record open.
+- **The centralized source-lifecycle foundation now backs the production source registry** —
   `SourceLifecycleRegistry` provides the atomic adapter, revocable media lease, session epoch,
   accepted catalogue/view snapshots, keyed/refcounted provenance, and generation-correlated
-  sanitized failures used by `RemoteSourceRegistry`. Framework-owned adapter wrapping and an
+  sanitized failures used by `SourceRegistry`. Framework-owned adapter wrapping and an
   unforgeable close capability send rejected, stale, cancelled, panicking, replaced, disconnected,
   and shutdown sessions through one exactly-once tracked retirement path. Each spawned connection
   generation retains a settlement participant through construction and any late rejected-adapter
@@ -234,8 +247,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ownership, removable tracks use a lossless native mount-relative ID that survives a mount-point
   change, and each OS-opened file session mints independent random source and track IDs. The
   later authenticated-remote lifecycle cutover consolidates the standard and DAAP owners behind
-  `RemoteSourceRegistry`; radio, removable, and external queues still retain their current locator
-  until their at-use adapters land. After merging the completed P3.4 seams, the accepted
+  `SourceRegistry`; the Radio-Browser follow-up makes its queues pathless as well. Removable and
+  external queues still retain their current locator until their at-use adapters land. After
+  merging the completed P3.4 seams, the accepted
   pre-follow-up head passed 823 tests
   and strict all-target/all-feature Clippy in both profiles. The final identity review adds three
   regressions for the persisted-ID contract and promoted advertised route: the complete debug and
@@ -268,8 +282,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority through output consumption; and the authenticated-remote production cutover unifies
   Subsonic, Jellyfin, Plex, and DAAP session, refresh/failure, provenance, and GTK projection
   ownership. At that cutover, embedded-art authority and the radio/removable/external at-use
-  locator adapters remained implementation work tracked under P3.1. The retained-art follow-up
-  below closes the local/playlist boundary; the three non-remote adapters remain.
+  locator adapters remained implementation work tracked under P3.1. The retained-art and
+  Radio-Browser follow-ups close the local/playlist and public-radio boundaries; removable and
+  external-file adapters remain.
 - **Local album and artist aggregates now have stable identities** — `LocalBackend` replaces its
   per-call random album/artist UUIDs with UUIDv5 values under a private versioned namespace. Artist
   and album domains are separate, every component is length-framed to prevent concatenation
@@ -357,7 +372,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check, strict debug/release Clippy, formatting, and diff checks pass; locked debug and release
   suites each pass 20 library, 872 application, and 10 repository-metadata tests (902 total). This
   closes one part of P3.1's compound final record without changing **219/223 (98.2%)** overall or
-  **29/30 P3**; Radio-Browser, removable, and external-file adapters remain.
+  **29/30 P3**. The Radio-Browser follow-up closes another part; removable and external-file
+  adapters remain.
 - **Subsonic failed envelopes no longer retain a server-controlled error message** — HTTP-200 API failures keep only the numeric Subsonic code in a fixed typed error; code 40 remains authentication rejection and code 41 remains the HTTPS-only legacy-auth negotiation signal. A malicious or broken peer can no longer echo a submitted password or arbitrary text into retained errors, logs, or UI-facing classification.
 - **Radio-Browser and geolocation no longer trust successful-looking JSON on an HTTP error** — Station and all three IP-geolocation provider paths now require a success status before their bounded response reader or deserializer can publish data. A `503` carrying a syntactically valid station or location is rejected, the geolocation cascade advances to its next provider, and late or oversized bodies remain bounded. Public same-origin/cross-origin redirects retain the existing no-`Referer`, no-HTTPS-downgrade policy.
 - **Jellyfin and Plex now preserve reverse-proxy base paths for every API and media request** — Both clients remove only one trailing empty base segment before appending API paths, so root, `/share`, `/share/`, and already-escaped prefixes do not gain a doubled slash or lose their prefix. Plex stream-part and thumbnail paths now append below that same configured base instead of replacing it; escaped bytes are preserved and normalized dot segments cannot escape the prefix. Root `//` and prefixed `/share//` regressions pin the same one-empty-segment rule across catalogue and protected-media construction. The rejection uses a fixed peer-path-free error. Complete prefixed backend fixtures prove authenticated ping/identity, discovery, pagination, stream, and artwork construction.
@@ -385,8 +401,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process/current-location split inside a repository path containing spaces, proves a custom
   FileSystem PSDrive does not leak its provider-only drive name to `.NET` or external tools, and
   retains the caller-relative `dist\tributary-windows` workflow.
-- **Windows PE-import inspection no longer relies on version-dependent PowerShell positional
-  binding** — `Invoke-BoundedPeImportBatch` accepts a non-terminal `[string[]]` target parameter
+- **Windows PE-import inspection no longer uses positional argument binding, but the reported
+  host-specific failure remains open** — `Invoke-BoundedPeImportBatch` accepts a non-terminal
+  `[string[]]` target parameter
   followed by its closure stopwatch, deadlines, and resource limits. The singleton Soup inspection
   and later multi-target closure scan passed all seven values positionally; the reported Windows
   behavior is consistent with version-dependent PowerShell array binding/coercion treating a later
@@ -398,8 +415,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and release suites each pass 896 tests with strict Clippy. This changes neither the bounded
   inspector policy nor which plugins and DLLs enter the package; the affected Windows build remains
   the required end-to-end confirmation. PR #124's native x86_64 and ARM64 jobs both completed the
-  production bundle/probe path with the named calls; the originally affected local host still needs
-  the exact rerun.
+  production bundle/probe path with the named calls. The 2026-07-18 exact affected-host rerun still
+  rejected the singleton Soup target with the same diagnostic, however, so the positional-binding
+  explanation is disproved and named binding is not a complete repair. A follow-up must remove or
+  diagnose the remaining target-boundary difference before live packaged playback validation.
 - **Malformed or expired DAAP catalogue responses now fail closed** — Tributary's DMAP parser no longer accepts a valid item prefix while silently discarding a malformed or truncated remainder in a known nested container, and every known integer field must use its exact protocol width. Wrong or missing containers, truncated framing, excessive nesting, short or overlong `mstt`, and duplicate response statuses now produce fixed-size typed parse failures before a catalogue can be published or any media request can begin. HTTP 401/403 share one authentication/session-expiration classification across the post-login update, databases, and items routes; in-band `mstt` 401/403 has the same typed result, any other explicit non-200 `mstt` is a typed connection failure, and a missing status on login or later session responses remains compatible with older peers. Once login yields a usable session ID, any later failure performs one bounded best-effort logout even when update or database discovery prevents construction of a client. The socket fixture reads complete request headers in deterministic fragments under a 16 KiB cap and five-second deadline and owns its handlers; lifecycle regressions cover nine malformed catalogue forms, eight expiration route/status combinations, and a non-authentication status, proving direct failed initial sync returns no backend, begins no stream/artwork request, and issues exactly one logout. Separate registry tests prove only explicit successful retention installs a source, replacement logs out the displaced session, and shutdown/release races remain joined and exactly-once.
 - **Bundled runtime caches no longer modify the application install** — Windows and macOS now select GStreamer's writable registry before toolkit initialization under the operating system's per-user cache directory, separated by platform, architecture, and install path. Explicit unversioned or GStreamer 1.0-specific registry/plugin overrides—including an intentionally empty value—remain authoritative, and failure to establish the preferred Windows cache leaves GStreamer to its normal user-scoped default rather than falling back beside the executable in Program Files. Cache destinations are resolved through existing ancestors before creation and rejected if a normal or symlinked path would enter the application install. Portable regression fixtures derive native absolute paths on each host, so Windows CI exercises drive-qualified cache, install, and loader paths rather than Unix-shaped stand-ins.
   - The macOS launcher no longer exports a bundle-local GStreamer registry or copied `loaders.cache`. Instead, the signed app bundles and signs `gdk-pixbuf-query-loaders`; early startup invokes that exact helper with the exact absolute relocated loader modules and drains its output under a deadline and fixed memory bounds. Validation parses the cache's module/info/MIME/extension/signature record structure, including standalone quoted empty MIME or extension lists, instead of mistaking every standalone quoted line for a module. Exact absolute module records are retained; a safe helper-relative record is accepted only when resolving it against the signed helper's top level produces the exact expected loader set. Every accepted module is rewritten to its C-escaped absolute installed path, while malformed, incomplete, duplicate, traversal, or out-of-directory records fail closed before the user cache is atomically replaced. The old cache survives helper, validation, write, sync, or rename failure.
@@ -450,23 +469,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Source lifecycle is not yet unified across every source kind** — Stable typed source/media
   identity spans authenticated remotes, local/playlist views, Radio-Browser, removable media, and
   external files, and complete local and remote track-catalogue publication shares one
-  `MediaBackend` trait-object seam. Subsonic, Jellyfin, Plex, and DAAP now share one production
-  `RemoteSourceRegistry` for connection/catalogue generations, session epochs, cancellation,
+  `MediaBackend` trait-object seam. Subsonic, Jellyfin, Plex, DAAP, and Radio-Browser now share one
+  production `SourceRegistry` for connection/catalogue/view generations, session epochs, cancellation,
   sanitized failures, provenance, media revocation, disconnect, and shutdown. GTK renders its
   atomic baseline rather than owning a sibling registry or rebuilding state from row flags.
   Saved and Discovery claims remain independent, so removing Saved demotes a still-discovered row;
   discovery loss still revokes route-bound work while another claim may keep the logical row
   visible. Local/playlist playback resolves exact stable IDs into retained root/file authority at
   use, and local/playlist embedded art now clones that same authority only after output acceptance
-  and retains its exact handle through parsing. Radio, removable, and external queues have
-  location-independent identity but still retain their current locator instead of resolving it
-  through a registry adapter at use; removable/external embedded art therefore remains on the
+  and retains its exact handle through parsing. Radio queues are pathless and resolve the exact
+  current accepted-view locator at use. Removable and external queues have location-independent
+  identity but still retain their current locator; their embedded art therefore remains on the
   transitional direct file-URI helper. Their refresh/retirement paths and some non-remote browsing
-  integration remain direct. Those three locator/adapter items remain P3.1 work; they do not
+  integration remain direct. Those two locator/adapter items remain P3.1 work; they do not
   reintroduce backend credentials or local playback paths into authenticated-remote or
   local/playlist playback queue values.
 - **Credential-bearing media tickets remain replayable within their hard lifetime** — Each opaque output ticket is a bearer for one fixed media item and arbitrary byte ranges until the earlier of source-lease/lifecycle revocation or its absolute 24-hour expiry; it is not a one-shot token. Neither event cancels a response the proxy already admitted. Protected local/AirPlay tickets are reachable only through a dedicated loopback listener; a protected MPD load from an unspecified address, or a scoped/link-local IPv6 route, fails closed rather than exposing the upstream request. Playback-time local-authority tickets follow their owning load lifecycle; only legacy explicit-file routes retain the older server-lifetime capability contract.
 - **Live packaged-Windows protected-playback validation remains outstanding** — Fake DAAP and Subsonic streams traverse the complete production protected-player path through real GStreamer, and native x86_64 and ARM64 package jobs both prove their finished distribution supplies the selected HTTP source, scanner, decoder, required DLL closure, direct-loopback policy, alternate-source fail-closed path, and real FLAC decode to end-of-stream without borrowing the build host's runtime. That deterministic probe cannot establish compatibility with the reported live DAAP/Subsonic servers, `.local`/mDNS routing, TLS, physical audio output, firewall or endpoint-security policy, or the user's legitimate upstream proxy. Audible live playback from the packaged application remains to be recorded, and no automated result proves that DNS caused the original failures.
+  The exact affected Windows host currently reaches the copied Soup plugin and then rejects its
+  singleton PE-inspection target as non-absolute or nonexistent. PR #124's explicit argument
+  binding passed both native CI package jobs but did not change that host result, so a second
+  bundler repair and exact-host rerun must precede the audible playback check.
 
 ---
 

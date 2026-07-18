@@ -28,7 +28,7 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
     let store = state.sidebar_store.clone();
     let sidebar_selection = state.sidebar_selection.clone();
     let rt_handle = state.rt_handle.clone();
-    let remote_sources = state.remote_sources.clone();
+    let source_registry = state.source_registry.clone();
     let remote_provenance = state.remote_provenance.clone();
     let output_list = output_list.clone();
 
@@ -109,7 +109,7 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                             continue;
                         };
                         if !remote_provenance.ensure(
-                            &remote_sources,
+                            &source_registry,
                             source_id,
                             crate::source_lifecycle::SourceProvenance::Discovery,
                             publisher,
@@ -125,7 +125,7 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                                 // have captured the withdrawn address. Claims
                                 // and the logical row remain; only exact
                                 // lifecycle/session authority is revoked.
-                                let _ = remote_sources.disconnect(source_id);
+                                let _ = source_registry.disconnect(source_id);
                             },
                         );
                         if let Some(requires_password) = server.requires_password {
@@ -163,7 +163,7 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                         continue;
                     };
                     if !remote_provenance.ensure(
-                        &remote_sources,
+                        &source_registry,
                         source_id,
                         crate::source_lifecycle::SourceProvenance::Discovery,
                         publisher,
@@ -233,7 +233,7 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                         continue;
                     };
                     if !remote_provenance.release(
-                        &remote_sources,
+                        &source_registry,
                         source_id,
                         crate::source_lifecycle::SourceProvenance::Discovery,
                         &publisher,
@@ -245,7 +245,7 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                         continue;
                     }
 
-                    let remaining_provenance = remote_sources
+                    let remaining_provenance = source_registry
                         .snapshot(source_id)
                         .map(|snapshot| snapshot.provenance)
                         .unwrap_or_default();
@@ -261,7 +261,7 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                     // keeps the logical row visible. The lifecycle reducer
                     // owns pending/cache/playback/navigation cleanup and row
                     // demotion/removal from the resulting baseline.
-                    let _ = remote_sources.disconnect(source_id);
+                    let _ = source_registry.disconnect(source_id);
                     tracing::debug!(
                         backend = %service_type,
                         retained = !remaining_provenance.is_empty(),
