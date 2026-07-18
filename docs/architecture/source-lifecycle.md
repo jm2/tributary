@@ -375,8 +375,11 @@ Radio-Browser is one registered stateless source. Top Clicked, Top Voted, and Ne
 the geolocation/consent branch for Near Me, and each view retains its last successful snapshot
 during refresh. While first-use consent is open, an exact generation-owned prerequisite marker
 distinguishes that deliberate pre-construction interval from source loss; stale/superseded dialog
-requests cannot keep that exception current. `TrackId` is the station UUID; the current station URL is a locator in the source
-adapter and resolves only when playback starts. The adapter retains a locator while at least one
+requests cannot keep that exception current. Construction failure or later source loss returns a
+selected radio lane to Local and restores the user's normal music-column and browser-visibility
+preferences before rendering Local rows. `TrackId` is the station UUID; the current station URL is
+a locator in the source adapter and resolves only when playback starts. The adapter retains a
+locator while at least one
 current view snapshot contains that station. It retains contributions per `ViewOrigin`, tagged
 with the source-wide monotonically increasing operation generation that produced each accepted
 snapshot. If live views disagree about a station locator, resolution selects the contribution
@@ -459,7 +462,8 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
   greatest accepted source-wide generation and are rechecked again at final consumption through
   weak authority, so neither an obsolete view nor a pending request can retain or retarget a
   source. Near Me asks for translated location consent first, tolerates partial successful tiers,
-  deduplicates in tier order, and then applies one stable global distance ordering.
+  deduplicates in tier order, and then applies one stable global distance ordering. Automatic
+  source loss restores Local's configured music-column and browser presentation.
 - Source navigation rejects stale same-key and cross-source publications and preserves the newest
   cache independently of rendering.
 - Local database IDs and playlist foreign keys survive authoritative file/directory renames.
@@ -620,7 +624,8 @@ library, 895 application, and 10 repository-metadata tests (925 total). Focused 
 source-registry, media, radio-client/adapter, reducer, consent, queue, and playback tests cover
 cancellation, empty/failure distinction, cross-view winner ordering, final-use revocation,
 last-registry-drop, partial Near Me tiers, deduplication/distance ordering, pathless capture,
-pre-publication source loss, exact failure ownership, and the generation-owned consent prerequisite.
+pre-publication source loss, exact failure ownership, the generation-owned consent prerequisite,
+and complete restoration of Local presentation after automatic fallback.
 
 Each step must keep existing credential-isolation, exact-origin, root-authority, receiver-ticket,
 and generation-supersession tests green. Compatibility code is removed in the same milestone; two

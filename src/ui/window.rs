@@ -163,6 +163,7 @@ struct SourceReducerContext {
     browser_state: browser::BrowserState,
     status_label: gtk::Label,
     column_view: gtk::ColumnView,
+    app_config: Rc<RefCell<preferences::AppConfig>>,
     invalidate_source_playback: SourcePlaybackInvalidator,
 }
 
@@ -324,6 +325,7 @@ impl SourceReducerContext {
             browser_state: state.browser_state.clone(),
             status_label: state.status_label.clone(),
             column_view: state.column_view.clone(),
+            app_config: state.app_config.clone(),
             invalidate_source_playback,
         }
     }
@@ -479,6 +481,12 @@ fn display_local_fallback(context: &SourceReducerContext, retired_key: &str) {
         return;
     }
     select_sidebar_source_key(&context.sidebar_store, &context.sidebar_selection, "local");
+    if super::radio::is_radio_backend(retired_key) {
+        super::radio::apply_radio_columns(&context.column_view, false);
+        let config = context.app_config.borrow();
+        preferences::apply_column_visibility(&context.column_view, &config.visible_columns);
+        preferences::update_browser_visibility(&context.browser_widget, &config.browser_views);
+    }
     let local_tracks = context
         .source_tracks
         .borrow()

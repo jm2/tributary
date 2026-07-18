@@ -122,12 +122,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from private locator contributions only at use. Near Me performs translated consent in GTK; an
   exact generation-owned prerequisite marker prevents unrelated lifecycle invalidations from
   treating the deliberate pre-construction dialog interval as source loss, while a stale or
-  superseded dialog cannot suppress ordinary fallback. The adapter tolerates partial successful
+  superseded dialog cannot suppress ordinary fallback. Automatic construction failure or later
+  source loss now returns a selected radio lane to Local with the user's music-column names,
+  column visibility, and browser visibility restored. The adapter tolerates partial successful
   tiers, deduplicates by tier precedence, and then applies one stable global distance sort.
   Locked all-target/all-feature check, strict debug/release Clippy, formatting, and diff checks
   pass; complete locked debug and release suites each pass 20 library, 895 application, and 10
   repository-metadata tests (925 total). Independent integrated review found the consent race and
-  no other actionable issue.
+  the automatic-fallback presentation leak; both are fixed.
   Removable and OS-opened external media still need registry-owned at-use
   locator adapters; those two adapters keep P3.1's final implementation record open.
 - **The centralized source-lifecycle foundation now backs the production source registry** —
