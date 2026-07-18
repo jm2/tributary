@@ -286,6 +286,16 @@ fn revoke_upstreams_in(media: &DashMap<String, MediaSource>) {
     media.retain(|_, source| !matches!(source, MediaSource::Upstream { .. }));
 }
 
+/// Revoke routes whose authority belongs to the current playback load.
+///
+/// Legacy explicit-file routes intentionally retain their older
+/// server-lifetime capability contract. They contain no backend credential or
+/// retained library authority and may be reused by their original caller for
+/// as long as this server remains alive.
+fn revoke_playback_routes_in(media: &DashMap<String, MediaSource>) {
+    media.retain(|_, source| matches!(source, MediaSource::LocalPath(_)));
+}
+
 /// Resolve one ticket using a caller-supplied monotonic clock.
 ///
 /// The borrowed-key lookup avoids allocating a `String` for every media
@@ -563,9 +573,10 @@ impl CastHttpServer {
         revoke_upstreams_in(&self.media);
     }
 
-    /// Revoke every route owned by this output generation.
-    pub(crate) fn revoke_all(&self) {
-        self.media.clear();
+    /// Revoke every credential or retained-authority route owned by the
+    /// current output generation, preserving legacy explicit-file routes.
+    pub(crate) fn revoke_playback_routes(&self) {
+        revoke_playback_routes_in(&self.media);
     }
 
     fn ticket_url(&self, ticket: &str) -> String {
@@ -1287,7 +1298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorized_local_ticket_serves_retained_file_and_revokes() {
+    async fn playback_route_revocation_preserves_legacy_explicit_files() {
         let root = tempfile::tempdir().expect("temporary library root");
         let marker = format!("marker:v1:{}", Uuid::new_v4());
         std::fs::write(
@@ -1314,13 +1325,25 @@ mod tests {
             media: registry,
             upstream: UpstreamMediaClient::new().expect("test upstream client"),
         };
+        let legacy_path = root.path().join("legacy.flac");
+        std::fs::write(&legacy_path, b"legacy").expect("write legacy explicit file");
+        let legacy_ticket = server.register_file(&legacy_path);
         let ticket = server.register_local(media);
-        let ticket_id = Url::parse(&ticket)
-            .expect("parse ticket URL")
-            .path_segments()
-            .and_then(|mut segments| segments.next_back())
-            .expect("ticket path")
-            .to_string();
+        let upstream_ticket = server.register_upstream(
+            &Url::parse("https://music.test/protected.flac?api_key=secret")
+                .expect("parse protected upstream"),
+        );
+        let ticket_id = |ticket: &str| {
+            Url::parse(ticket)
+                .expect("parse ticket URL")
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .expect("ticket path")
+                .to_string()
+        };
+        let legacy_ticket_id = ticket_id(&legacy_ticket);
+        let upstream_ticket_id = ticket_id(&upstream_ticket);
+        let ticket_id = ticket_id(&ticket);
 
         match std::fs::rename(&path, &displaced) {
             Ok(()) => {
@@ -1384,9 +1407,30 @@ mod tests {
             b"authorized"
         );
 
-        server.revoke_all();
+        server.revoke_playback_routes();
         let revoked = serve_media(State(state.clone()), Path(ticket_id), HeaderMap::new()).await;
         assert_eq!(revoked.status(), StatusCode::NOT_FOUND);
+        let upstream_revoked = serve_media(
+            State(state.clone()),
+            Path(upstream_ticket_id),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(upstream_revoked.status(), StatusCode::NOT_FOUND);
+        let legacy = serve_media(
+            State(state.clone()),
+            Path(legacy_ticket_id),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(legacy.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(legacy.into_body(), usize::MAX)
+                .await
+                .expect("read legacy explicit file")
+                .as_ref(),
+            b"legacy"
+        );
 
         #[cfg(unix)]
         {

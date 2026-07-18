@@ -584,7 +584,7 @@ impl MpdMediaTicket for CastMpdMediaTicket {
     }
 
     fn revoke(&self) {
-        self.server.revoke_all();
+        self.server.revoke_playback_routes();
     }
 }
 

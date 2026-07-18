@@ -1960,7 +1960,7 @@ impl ChromecastOutput {
     fn revoke_proxy_tickets(&self) {
         if let Ok(guard) = self.cast_server.lock() {
             if let Some(server) = guard.as_ref() {
-                server.revoke_all();
+                server.revoke_playback_routes();
             }
         }
     }
@@ -3880,6 +3880,13 @@ mod tests {
                 ))))
                 .expect("loopback cast server"),
         );
+        let explicit_file = tempfile::NamedTempFile::new().expect("legacy explicit file");
+        {
+            let guard = output.cast_server.lock().expect("cast server lock");
+            let server = guard.as_ref().expect("cast server");
+            let _ = server.register_file(explicit_file.path());
+            assert_eq!(server.registered_route_count(), 1);
+        }
         let endpoint = url::Url::parse("https://music.test/clean/track.flac?track=42")
             .expect("clean endpoint");
         let request = ResolvedHttpRequest::new(endpoint.clone()).expect("resolved request");
@@ -3889,6 +3896,28 @@ mod tests {
         assert!(ticket.starts_with("http://127.0.0.1:"));
         assert!(!ticket.contains("music.test"));
         assert!(!ticket.contains("track=42"));
+        {
+            let guard = output.cast_server.lock().expect("cast server lock");
+            assert_eq!(
+                guard
+                    .as_ref()
+                    .expect("cast server")
+                    .registered_route_count(),
+                2,
+                "a protected replacement must retain the legacy explicit-file route"
+            );
+        }
+
+        output.revoke_proxy_tickets();
+        let guard = output.cast_server.lock().expect("cast server lock");
+        assert_eq!(
+            guard
+                .as_ref()
+                .expect("cast server")
+                .registered_route_count(),
+            1,
+            "output cleanup must revoke only the protected playback route"
+        );
     }
 
     #[test]

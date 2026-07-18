@@ -28,9 +28,10 @@ asynchronous publications. Local renames preserve database track IDs, and remova
 generation-owned and cancelled on relocation or removal.
 
 This decision defines how those foundations converge; it does **not** claim that its broader
-source/session lifecycle is implemented. PR #120 implements the stable-identity migration, but the
-single lifecycle boundary and retained local file authority remain open. When this decision was
-recorded, `MediaBackend` was not an integration seam at all. P3.2 has since completed its bounded
+source/session lifecycle is implemented. PR #120 implements the stable-identity migration, and PR
+#121 adds retained local file authority through output consumption; the single lifecycle boundary
+remains open. When this decision was recorded, `MediaBackend` was not an integration seam at all.
+P3.2 has since completed its bounded
 backend-abstraction scope: scanner snapshots construct `LocalBackend`, and all five shipping
 backends publish complete track catalogues through one `&dyn MediaBackend` adapter.
 Authentication, registry/session lifecycle, refresh/failure ownership, and some browsing paths
@@ -413,8 +414,10 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
   exchange that handle for an opaque app-owned ticket whose bounded explicit-offset stream keeps
   full and Range requests independent even when cloned OS handles share a cursor. Every
   replacement, Stop, error, terminal queue completion, ticket drop, or output teardown retires
-  future lookups. Playlist queue identity uses the local source plus a separate `ViewOrigin`, so
-  generic local retirement also retires a playlist-origin queue without losing view navigation.
+  future lookups. Shared Chromecast cleanup retains legacy explicit-file routes while revoking
+  credential and retained-authority routes. Playlist queue identity uses the local source plus a
+  separate `ViewOrigin`, so generic local retirement also retires a playlist-origin queue without
+  losing view navigation.
 - Removable sources derive `SourceId` from the best-available logical key and exact `TrackId` from
   the losslessly encoded mount-relative native path. Relocation/removal still retires scans, cache,
   and playback. Radio queues share the built-in Radio-Browser source and reject empty/oversized

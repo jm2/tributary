@@ -62,7 +62,7 @@ impl GstreamerMediaTicket {
     }
 
     pub(super) fn revoke(&self) {
-        self.server.revoke_all();
+        self.server.revoke_playback_routes();
     }
 }
 
@@ -188,7 +188,7 @@ impl GstreamerMediaProxy {
         let server = start_server(&runtime).map_err(|_| MEDIA_PREPARATION_FAILED)?;
         let uri = server.register_local(media);
         if !valid_loopback_ticket(server.addr(), &uri) {
-            server.revoke_all();
+            server.revoke_playback_routes();
             return Err(MEDIA_PREPARATION_FAILED);
         }
 

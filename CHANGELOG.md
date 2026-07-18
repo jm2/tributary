@@ -236,9 +236,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pathname cannot retarget an admitted load, while root or marker loss blocks later handle clones.
   Replacement, Stop, load or playback failure, terminal queue completion, ticket drop, and
   output/server teardown revoke future lookup; a failed item remains retryable through a fresh
-  exact-ID resolution. GTK rows may still retain current paths for non-playback display and file
-  management, and embedded-art display still gives its helper the exact playback-time path rather
-  than retained authority. Fifty-five focused exact-ID, root-authority, queue/view-ownership,
+  exact-ID resolution. Shared Chromecast cleanup revokes credential and retained-authority routes
+  while preserving the documented server-lifetime contract of legacy explicit-file routes. GTK
+  rows may still retain current paths for non-playback display and file management, and embedded-art
+  display still gives its helper the exact playback-time path rather than retained authority.
+  Fifty-five focused exact-ID, root-authority, queue/view-ownership,
   handle-streaming, GStreamer-ticket, and MPD-ticket regressions pass with the locked all-target
   compile, formatting/diff gates, and strict warning-free Clippy in both profiles. The complete
   debug and release suites each pass 20 library, 803 application, and 10 repository-metadata tests
