@@ -126,6 +126,43 @@ pub(super) fn remote_failure_category(
     }
 }
 
+pub(super) const fn lifecycle_failure_category(
+    category: crate::source_lifecycle::FailureCategory,
+) -> RemoteFailureCategory {
+    use crate::source_lifecycle::FailureCategory;
+
+    match category {
+        FailureCategory::AuthenticationRejected => RemoteFailureCategory::Authentication,
+        FailureCategory::Connection => RemoteFailureCategory::Connection,
+        FailureCategory::Timeout => RemoteFailureCategory::Timeout,
+        FailureCategory::InvalidResponse => RemoteFailureCategory::Response,
+        FailureCategory::UnsupportedAuthentication => RemoteFailureCategory::AuthenticationMethod,
+        FailureCategory::UnavailableOrPermission | FailureCategory::Backend => {
+            RemoteFailureCategory::Backend
+        }
+    }
+}
+
+/// Return the retained, sanitized construction failure for one removable
+/// source. Mount scanning starts before row selection, so an inactive failure
+/// must remain available for the first later selection instead of looking like
+/// an accepted empty catalogue.
+fn retained_removable_connect_failure(
+    source_registry: &crate::source_registry::SourceRegistry,
+    source_id: crate::architecture::SourceId,
+) -> Option<RemoteFailureCategory> {
+    let snapshot = source_registry.snapshot(source_id)?;
+    if !snapshot
+        .provenance
+        .contains(crate::source_lifecycle::SourceProvenance::Removable)
+    {
+        return None;
+    }
+    let failure = snapshot.failure?;
+    (failure.failure.operation() == crate::source_lifecycle::FailureOperation::Connect)
+        .then(|| lifecycle_failure_category(failure.failure.category()))
+}
+
 fn resolve_source_key(
     explicit_key: &str,
     stable_source_id: &str,
@@ -569,6 +606,10 @@ pub fn setup_source_connect(state: &WindowState) {
             *active_source_key.borrow_mut() = key.clone();
             pre_connect_selection.set(sel.selected());
 
+            let retained_failure = src.source_id().and_then(|source_id| {
+                retained_removable_connect_failure(&source_registry, source_id)
+            });
+
             // Restore music column layout if coming from radio.
             apply_radio_columns(&column_view, false);
             let cfg = app_config.borrow();
@@ -594,6 +635,9 @@ pub fn setup_source_connect(state: &WindowState) {
                 &status_label,
                 &column_view,
             );
+            if let Some(category) = retained_failure {
+                status_label.set_text(&category.user_message("Removable media"));
+            }
             return;
         }
 
@@ -1010,8 +1054,9 @@ mod tests {
 
     use super::{
         cache_source_completion, evict_source_completion, prepare_remote_auth_submission,
-        remote_failure_category, resolve_source_key, with_active_source_key_snapshot,
-        PendingConnection, RemoteFailureCategory, SourceNavigation, TrackObject,
+        remote_failure_category, resolve_source_key, retained_removable_connect_failure,
+        with_active_source_key_snapshot, PendingConnection, RemoteFailureCategory,
+        SourceNavigation, TrackObject,
     };
     use crate::architecture::error::BackendError;
     use crate::architecture::AdvertisedHttpRoute;
@@ -1123,6 +1168,50 @@ mod tests {
             source_tracks.borrow()["radio-topvote"][0].title(),
             "background"
         );
+    }
+
+    #[tokio::test]
+    async fn removable_selection_replays_a_retained_background_scan_failure() {
+        let registry =
+            crate::source_registry::SourceRegistry::new(tokio::runtime::Handle::current());
+        let source_id = crate::architecture::SourceId::removable("test:retained-scan-failure")
+            .expect("removable source identity");
+        let claim = registry
+            .claim_provenance(
+                source_id,
+                crate::source_lifecycle::SourceProvenance::Removable,
+            )
+            .expect("claim removable provenance");
+        let missing_mount = std::env::temp_dir().join(format!(
+            "tributary-missing-removable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        registry
+            .connect_removable(source_id, missing_mount, |_| {})
+            .expect("admit failing removable scan");
+
+        let category = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(category) = retained_removable_connect_failure(&registry, source_id) {
+                    break category;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("removable failure becomes visible");
+        assert_eq!(category, RemoteFailureCategory::Backend);
+        let message = category.user_message("Removable media");
+        assert!(message.contains("Removable media"));
+        assert!(!message.contains("tributary-missing-removable"));
+        assert_eq!(
+            retained_removable_connect_failure(&registry, source_id),
+            Some(RemoteFailureCategory::Backend),
+            "reading the UI status must not consume the retained lifecycle failure"
+        );
+
+        assert!(registry.release_provenance(source_id, claim));
+        registry.shutdown().wait().await;
     }
 
     fn advertised_route(address: &str) -> AdvertisedHttpRoute {

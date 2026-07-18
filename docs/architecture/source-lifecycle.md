@@ -721,11 +721,12 @@ integrated review covers sequential first-accepted candidate handling, the same-
 and post-accept artwork wiring.
 
 The mounted-removable cutover passes the locked all-target/all-feature check, strict debug Clippy,
-formatting, and whitespace checks. The complete locked debug suite passes 20 library, 925
-application, and 10 repository-metadata tests (955 total). Focused identity, mounted-authority,
+formatting, and whitespace checks. The complete locked debug suite passes 20 library, 926
+application, and 10 repository-metadata tests (956 total). Focused identity, mounted-authority,
 adapter, registry, navigation, reducer, context-menu, and playback regressions cover pathless
 catalogues, exact membership, retained-handle resolution, cancellation, reconnect epoch isolation,
-shutdown settlement, relocation/removal ownership, and safe omission of path-based mutation. The
+shutdown settlement, relocation/removal ownership, retained failure replay on later selection, and
+safe omission of path-based mutation. The
 three remaining tracker tasks require physical removable hardware, an installed interactive
 Flatpak environment, or packaged Windows DAAP/Subsonic servers and are not unimplemented P3.1
 lifecycle work.

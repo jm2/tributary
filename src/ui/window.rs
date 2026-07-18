@@ -449,19 +449,7 @@ fn remote_backend_label(source: Option<&SourceObject>) -> &'static str {
 fn remote_failure_category(
     category: crate::source_lifecycle::FailureCategory,
 ) -> super::source_connect::RemoteFailureCategory {
-    use super::source_connect::RemoteFailureCategory;
-    use crate::source_lifecycle::FailureCategory;
-
-    match category {
-        FailureCategory::AuthenticationRejected => RemoteFailureCategory::Authentication,
-        FailureCategory::Connection => RemoteFailureCategory::Connection,
-        FailureCategory::Timeout => RemoteFailureCategory::Timeout,
-        FailureCategory::InvalidResponse => RemoteFailureCategory::Response,
-        FailureCategory::UnsupportedAuthentication => RemoteFailureCategory::AuthenticationMethod,
-        FailureCategory::UnavailableOrPermission | FailureCategory::Backend => {
-            RemoteFailureCategory::Backend
-        }
-    }
+    super::source_connect::lifecycle_failure_category(category)
 }
 
 fn apply_local_navigation_fallback(

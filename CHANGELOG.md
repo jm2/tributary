@@ -193,9 +193,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unmount reconnects only through a fresh inventory observation and new epoch, and confirmed removal
   releases the claim after retirement. Deterministic lifecycle tests cover accepted publication,
   unlisted-track rejection, stale lease and epoch rejection, reconnect, queued-scan cancellation,
-  and shutdown joining. Together with mounted-authority, identity, adapter, and GTK coverage, the
-  complete serial locked debug suite passes 20 library, 925 application, and 10 metadata tests (955
-  total). Locked all-target/all-feature check, strict debug Clippy, formatting, and diff checks are
+  shutdown joining, and replay of a retained background scan failure when its inactive row is later
+  selected. Together with mounted-authority, identity, adapter, and GTK coverage, the complete
+  serial locked debug suite passes 20 library, 926 application, and 10 metadata tests (956 total).
+  Locked all-target/all-feature check, strict debug Clippy, formatting, and diff checks are
   green. A release-suite attempt was interrupted when partial artifacts exhausted temporary
   workspace disk quota; no release validation result is claimed from that environmental failure.
   This completes P3 at 30/30 and advances the remediation tracker to 220/223 (98.7%); only three
