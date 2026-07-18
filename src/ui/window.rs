@@ -84,6 +84,12 @@ fn remote_source_id(backend_type: &str, server_url: &str) -> crate::architecture
         .expect("supported remote backend produces a stable source ID")
 }
 
+#[derive(Clone, Copy)]
+struct EnvironmentConnectionAttempt {
+    source_id: crate::architecture::SourceId,
+    ui_token: uuid::Uuid,
+}
+
 /// Add an environment-configured row or reuse the saved/discovered owner of
 /// the same canonical `(backend, endpoint)` pair.
 ///
@@ -96,7 +102,7 @@ fn upsert_environment_source(
     name: &str,
     backend_type: &str,
     server_url: &str,
-) -> crate::architecture::SourceId {
+) -> EnvironmentConnectionAttempt {
     if let Some(source) = sources.iter().find(|source| {
         super::server_dialogs::same_remote_endpoint(
             &source.backend_type(),
@@ -105,20 +111,26 @@ fn upsert_environment_source(
             server_url,
         )
     }) {
-        source.set_connecting(true);
-        return source
+        let source_id = source
             .source_id()
             .expect("validated remote source has a stable identity");
+        return EnvironmentConnectionAttempt {
+            source_id,
+            ui_token: source.begin_connecting_attempt(),
+        };
     }
 
     ensure_category_header_vec(sources, backend_type);
     let source = SourceObject::discovered(name, backend_type, server_url);
-    source.set_connecting(true);
     let source_id = source
         .source_id()
         .unwrap_or_else(|| remote_source_id(backend_type, server_url));
+    let ui_token = source.begin_connecting_attempt();
     sources.push(source);
-    source_id
+    EnvironmentConnectionAttempt {
+        source_id,
+        ui_token,
+    }
 }
 
 /// Build and present the main Tributary window.
@@ -187,31 +199,31 @@ pub fn build_window(
 
     // If env vars are set, add pre-configured remote server entries
     // under their respective category headers.
-    let subsonic_env_source_id = subsonic_env.as_ref().map(|(url, _user, _pass)| {
+    let subsonic_env_attempt = subsonic_env.as_ref().map(|(url, _user, _pass)| {
         upsert_environment_source(&mut sources, "Subsonic (env)", "subsonic", url)
     });
-    if subsonic_env_source_id.is_some() {
+    if subsonic_env_attempt.is_some() {
         info!("Subsonic server configured via env vars");
     }
 
-    let jellyfin_env_source_id = jellyfin_env.as_ref().map(|(url, _key, _uid)| {
+    let jellyfin_env_attempt = jellyfin_env.as_ref().map(|(url, _key, _uid)| {
         upsert_environment_source(&mut sources, "Jellyfin (env)", "jellyfin", url)
     });
-    if jellyfin_env_source_id.is_some() {
+    if jellyfin_env_attempt.is_some() {
         info!("Jellyfin server configured via env vars");
     }
 
-    let plex_env_source_id = plex_env
+    let plex_env_attempt = plex_env
         .as_ref()
         .map(|(url, _token)| upsert_environment_source(&mut sources, "Plex (env)", "plex", url));
-    if plex_env_source_id.is_some() {
+    if plex_env_attempt.is_some() {
         info!("Plex server configured via env vars");
     }
 
-    let daap_env_source_id = daap_env
+    let daap_env_attempt = daap_env
         .as_ref()
         .map(|(url, _password)| upsert_environment_source(&mut sources, "DAAP (env)", "daap", url));
-    if daap_env_source_id.is_some() {
+    if daap_env_attempt.is_some() {
         info!("DAAP server configured via env vars");
     }
 
@@ -540,7 +552,10 @@ pub fn build_window(
     // ── Start Subsonic backend if configured via env vars ──────────
     if let Some((url, user, pass)) = subsonic_env {
         let tx = engine_tx.clone();
-        let source_id = subsonic_env_source_id.expect("configured Subsonic source ID");
+        let EnvironmentConnectionAttempt {
+            source_id,
+            ui_token,
+        } = subsonic_env_attempt.expect("configured Subsonic source attempt");
         rt_handle.spawn(async move {
             info!("Connecting to Subsonic server...");
             let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
@@ -562,7 +577,11 @@ pub fn build_window(
                                 "Subsonic catalogue load failed"
                             );
                             let _ = tx
-                                .send(LibraryEvent::Error(category.user_message("Subsonic")))
+                                .send(LibraryEvent::RemoteConnectionFailed {
+                                    source_id,
+                                    attempt: ui_token,
+                                    message: category.user_message("Subsonic"),
+                                })
                                 .await;
                             return;
                         }
@@ -593,7 +612,11 @@ pub fn build_window(
                     let category = super::source_connect::remote_failure_category(&e);
                     tracing::error!(category = category.as_str(), "Subsonic connection failed");
                     let _ = tx
-                        .send(LibraryEvent::Error(category.user_message("Subsonic")))
+                        .send(LibraryEvent::RemoteConnectionFailed {
+                            source_id,
+                            attempt: ui_token,
+                            message: category.user_message("Subsonic"),
+                        })
                         .await;
                 }
             }
@@ -603,7 +626,10 @@ pub fn build_window(
     // ── Start Jellyfin backend if configured via env vars ──────────
     if let Some((url, api_key, user_id)) = jellyfin_env {
         let tx = engine_tx.clone();
-        let source_id = jellyfin_env_source_id.expect("configured Jellyfin source ID");
+        let EnvironmentConnectionAttempt {
+            source_id,
+            ui_token,
+        } = jellyfin_env_attempt.expect("configured Jellyfin source attempt");
         rt_handle.spawn(async move {
             info!("Connecting to Jellyfin server...");
             let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
@@ -627,7 +653,11 @@ pub fn build_window(
                                 "Jellyfin catalogue load failed"
                             );
                             let _ = tx
-                                .send(LibraryEvent::Error(category.user_message("Jellyfin")))
+                                .send(LibraryEvent::RemoteConnectionFailed {
+                                    source_id,
+                                    attempt: ui_token,
+                                    message: category.user_message("Jellyfin"),
+                                })
                                 .await;
                             return;
                         }
@@ -658,7 +688,11 @@ pub fn build_window(
                     let category = super::source_connect::remote_failure_category(&e);
                     tracing::error!(category = category.as_str(), "Jellyfin connection failed");
                     let _ = tx
-                        .send(LibraryEvent::Error(category.user_message("Jellyfin")))
+                        .send(LibraryEvent::RemoteConnectionFailed {
+                            source_id,
+                            attempt: ui_token,
+                            message: category.user_message("Jellyfin"),
+                        })
                         .await;
                 }
             }
@@ -668,7 +702,10 @@ pub fn build_window(
     // ── Start Plex backend if configured via env vars ──────────────
     if let Some((url, token)) = plex_env {
         let tx = engine_tx.clone();
-        let source_id = plex_env_source_id.expect("configured Plex source ID");
+        let EnvironmentConnectionAttempt {
+            source_id,
+            ui_token,
+        } = plex_env_attempt.expect("configured Plex source attempt");
         rt_handle.spawn(async move {
             info!("Connecting to Plex server...");
             let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
@@ -690,7 +727,11 @@ pub fn build_window(
                                 "Plex catalogue load failed"
                             );
                             let _ = tx
-                                .send(LibraryEvent::Error(category.user_message("Plex")))
+                                .send(LibraryEvent::RemoteConnectionFailed {
+                                    source_id,
+                                    attempt: ui_token,
+                                    message: category.user_message("Plex"),
+                                })
                                 .await;
                             return;
                         }
@@ -721,7 +762,11 @@ pub fn build_window(
                     let category = super::source_connect::remote_failure_category(&e);
                     tracing::error!(category = category.as_str(), "Plex connection failed");
                     let _ = tx
-                        .send(LibraryEvent::Error(category.user_message("Plex")))
+                        .send(LibraryEvent::RemoteConnectionFailed {
+                            source_id,
+                            attempt: ui_token,
+                            message: category.user_message("Plex"),
+                        })
                         .await;
                 }
             }
@@ -731,7 +776,10 @@ pub fn build_window(
     // ── Start DAAP backend if configured via env vars ──────────────
     if let Some((url, password)) = daap_env {
         let tx = engine_tx.clone();
-        let source_id = daap_env_source_id.expect("configured DAAP source ID");
+        let EnvironmentConnectionAttempt {
+            source_id,
+            ui_token,
+        } = daap_env_attempt.expect("configured DAAP source attempt");
         rt_handle.spawn(async move {
             info!("Connecting to DAAP server...");
             let Some(attempt) = crate::daap::begin_connect(source_id) else {
@@ -754,7 +802,11 @@ pub fn build_window(
                                 "DAAP catalogue load failed"
                             );
                             let _ = tx
-                                .send(LibraryEvent::Error(category.user_message("DAAP")))
+                                .send(LibraryEvent::RemoteConnectionFailed {
+                                    source_id,
+                                    attempt: ui_token,
+                                    message: category.user_message("DAAP"),
+                                })
                                 .await;
                             return;
                         }
@@ -785,7 +837,11 @@ pub fn build_window(
                     let category = super::source_connect::remote_failure_category(&e);
                     tracing::error!(category = category.as_str(), "DAAP connection failed");
                     let _ = tx
-                        .send(LibraryEvent::Error(category.user_message("DAAP")))
+                        .send(LibraryEvent::RemoteConnectionFailed {
+                            source_id,
+                            attempt: ui_token,
+                            message: category.user_message("DAAP"),
+                        })
                         .await;
                 }
             }
@@ -2611,6 +2667,15 @@ fn setup_library_events(
                     }
                 }
 
+                LibraryEvent::RemoteConnectionFailed {
+                    source_id,
+                    attempt,
+                    message,
+                } => {
+                    tracing::error!(%source_id, error = %message, "Remote connection failed");
+                    clear_failed_remote_connection(&sidebar_store, source_id, attempt);
+                }
+
                 LibraryEvent::Error(msg) => {
                     tracing::error!(error = %msg, "Library engine error");
                     scan_spinner.set_spinning(false);
@@ -2731,6 +2796,37 @@ fn accept_remote_publication(sidebar_store: &gtk::gio::ListStore, source_key: &s
             source.set_connected(true);
         }
         source.set_connecting(false);
+
+        // SourceObject fields are plain GTK-side state. Reinsert the same
+        // object so a bound sidebar row immediately drops its spinner.
+        sidebar_store.remove(index);
+        sidebar_store.insert(index, &source);
+        return Some(index);
+    }
+    None
+}
+
+/// Retire the transient spinner for the exact environment-configured owner
+/// whose newest connection attempt failed.
+///
+/// The background task emits this transition only after its registry attempt
+/// proves it is still latest. Keeping the lookup source-scoped prevents one
+/// failed endpoint from disturbing another row or its retained session.
+fn clear_failed_remote_connection(
+    sidebar_store: &gtk::gio::ListStore,
+    source_id: crate::architecture::SourceId,
+    attempt: uuid::Uuid,
+) -> Option<u32> {
+    for index in 0..sidebar_store.n_items() {
+        let Some(source) = sidebar_store.item(index).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if source.source_id() != Some(source_id)
+            || !source.connecting()
+            || !source.clear_connecting_attempt(attempt)
+        {
+            continue;
+        }
 
         // SourceObject fields are plain GTK-side state. Reinsert the same
         // object so a bound sidebar row immediately drops its spinner.
@@ -2954,7 +3050,7 @@ mod identity_tests {
             ),
         ];
 
-        let connection_source_id = upsert_environment_source(
+        let connection_attempt = upsert_environment_source(
             &mut sources,
             "Subsonic (env)",
             "subsonic",
@@ -2973,7 +3069,7 @@ mod identity_tests {
             })
             .collect();
         assert_eq!(owners.len(), 1);
-        assert_eq!(connection_source_id, persisted);
+        assert_eq!(connection_attempt.source_id, persisted);
         assert_eq!(owners[0].source_id(), Some(persisted));
         assert!(owners[0].manually_added());
         assert!(owners[0].connecting());
@@ -2991,14 +3087,14 @@ mod identity_tests {
         saved.set_connected(true);
         let mut sources = vec![SourceObject::header("Subsonic"), saved.clone()];
 
-        let connection_source_id = upsert_environment_source(
+        let connection_attempt = upsert_environment_source(
             &mut sources,
             "Subsonic (env)",
             "subsonic",
             "https://music.example.test/base",
         );
 
-        assert_eq!(connection_source_id, persisted);
+        assert_eq!(connection_attempt.source_id, persisted);
         assert!(saved.connected());
         assert!(saved.connecting());
 
@@ -3011,5 +3107,67 @@ mod identity_tests {
         assert_eq!(accepted_index, Some(1));
         assert!(saved.connected());
         assert!(!saved.connecting());
+    }
+
+    #[test]
+    fn failed_environment_reconnect_clears_only_the_exact_owner_spinner() {
+        let persisted = SourceId::random();
+        let other_id = SourceId::random();
+        let saved = SourceObject::manual(
+            "Saved",
+            "subsonic",
+            "https://music.example.test/base",
+            persisted,
+        );
+        saved.set_connected(true);
+        let failed_attempt = saved.begin_connecting_attempt();
+        let other =
+            SourceObject::manual("Other", "subsonic", "https://other.example.test", other_id);
+        let other_attempt = other.begin_connecting_attempt();
+
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        store.append(&SourceObject::header("Subsonic"));
+        store.append(&saved);
+        store.append(&other);
+
+        // Retry B takes over the same row after failure A was queued but
+        // before GTK receives it. Failure A must not clear retry B's spinner.
+        let retry_attempt = saved.begin_connecting_attempt();
+        assert_eq!(
+            clear_failed_remote_connection(&store, persisted, failed_attempt),
+            None
+        );
+        assert!(saved.connecting());
+        assert_eq!(
+            clear_failed_remote_connection(&store, persisted, retry_attempt),
+            Some(1)
+        );
+        assert!(
+            saved.connected(),
+            "a failed reconnect keeps the prior session"
+        );
+        assert!(!saved.connecting());
+        assert!(other.connecting());
+        assert_eq!(
+            clear_failed_remote_connection(&store, persisted, retry_attempt),
+            None
+        );
+        saved.set_connecting(true);
+        assert_eq!(
+            clear_failed_remote_connection(&store, persisted, retry_attempt),
+            None,
+            "a generic/manual retry invalidates the environment token"
+        );
+        assert!(saved.connecting());
+        saved.set_connecting(false);
+        assert_eq!(
+            clear_failed_remote_connection(&store, other_id, uuid::Uuid::new_v4()),
+            None
+        );
+        assert!(other.connecting());
+        assert_eq!(
+            clear_failed_remote_connection(&store, other_id, other_attempt),
+            Some(2)
+        );
     }
 }

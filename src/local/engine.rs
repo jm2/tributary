@@ -64,6 +64,14 @@ pub enum LibraryEvent {
         session_key: Uuid,
         tracks: Vec<Track>,
     },
+    /// The newest environment-configured connection attempt failed before it
+    /// could publish a catalogue. GTK uses the exact logical owner to retire
+    /// only that row's transient connecting state.
+    RemoteConnectionFailed {
+        source_id: SourceId,
+        attempt: Uuid,
+        message: String,
+    },
     /// A single track was added or updated.
     TrackUpserted(Box<Track>),
     /// A track was removed (by file_path).

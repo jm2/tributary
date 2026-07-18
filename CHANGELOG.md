@@ -141,7 +141,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   playback, or registry state or discarding discovery-only reachability. An accepted
   reconnect publication always clears the canonical row's transient connecting state—even when a
   prior session still marks it connected—so repeated Add, promotion, and environment reconnects
-  cannot leave the sidebar spinner stuck. Playlist queues now carry local media identity plus their
+  cannot leave the sidebar spinner stuck. A newest environment authentication or catalogue
+  failure now carries its exact `SourceId` and opaque UI-attempt token back to GTK and clears only
+  that attempt's transient spinner while preserving any prior connected session. An attempt
+  already superseded at the registry publishes no failure transition; if a retry starts after an
+  older failure is queued, its new token prevents that stale event from clearing the retry.
+  Playlist queues now carry local media identity plus their
   playlist origin, overlapping radio feeds share station media identity without sharing view
   ownership, removable tracks use a lossless native mount-relative ID that survives a mount-point
   change, and each OS-opened file session mints independent random source and track IDs. The
@@ -150,13 +155,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   land. After merging the completed P3.4 seams, the accepted pre-follow-up head passed 823 tests
   and strict all-target/all-feature Clippy in both profiles. The final identity review adds three
   regressions for the persisted-ID contract and promoted advertised route: the complete debug and
-  release suites now pass 826 tests each, the 48-test identity filter is clean, and strict Clippy
+  release suites now pass 827 tests each, the 49-test identity filter is clean, and strict Clippy
   passes in both profiles. The promoted-route regression generates its disposable authentication
   secret at runtime instead of embedding a credential-shaped literal, keeping the security scan
   meaningful without changing production authentication behavior.
   Automated review also removed a redundant copy of each accepted Radio-Browser native ID.
   Remote-reference decoding deliberately continues to reject uppercase hex as noncanonical; an
-  existing malformed-reference regression pins that fail-closed boundary.
+  existing malformed-reference regression pins that fail-closed boundary. Codex review found the
+  failed saved-plus-environment spinner path; its reordered same-source and exact-owner regression
+  proves cleanup neither clears a newer retry, disconnects the retained predecessor, nor mutates
+  another source row.
 - **Source identity and lifecycle now have a recorded architecture contract** — The P3.1 decision
   defines immutable `SourceId` plus backend-native `TrackId` identity, deterministic migration for
   legacy saved sources, one registry-owned connection/refresh/cancellation/failure state machine,
