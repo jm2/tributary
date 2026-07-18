@@ -1566,7 +1566,7 @@ mod tests {
             "$dllScanQueue = [System.Collections.Queue]::new()",
             "$knownDllScanTargets = @{}",
             "Invoke-BoundedPeImportBatch `",
-            "$peImportInspector @($requiredSoupPluginFull)",
+            "-Paths @($requiredSoupPluginFull)",
             "$scannedDllTargets[$requiredSoupPluginFull] = $true",
             "while ($dllScanQueue.Count -gt 0)",
             "$roundTargets = @()",
@@ -1606,6 +1606,166 @@ mod tests {
         assert!(!script.contains("$ldd"));
         assert!(!script.contains("ReadToEnd"));
         assert!(!script.contains("DataReceived"));
+    }
+
+    #[test]
+    fn windows_pe_import_batches_use_explicit_parameter_binding() {
+        fn compact_parameter_contract(script: &str) -> String {
+            let function = script
+                .split_once("function Invoke-BoundedPeImportBatch")
+                .expect("PE-import batch function declaration")
+                .1;
+            let parameter_start = function
+                .find("param")
+                .expect("PE-import batch parameter declaration");
+            let parameters = &function[parameter_start..];
+            let open = parameters
+                .find('(')
+                .expect("PE-import batch parameter-list opening delimiter");
+            let mut depth = 0usize;
+            let mut close = None;
+            for (offset, character) in parameters[open..].char_indices() {
+                match character {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth = depth
+                            .checked_sub(1)
+                            .expect("balanced PE-import batch parameter delimiters");
+                        if depth == 0 {
+                            close = Some(open + offset + character.len_utf8());
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            parameters[..close.expect("PE-import batch parameter-list closing delimiter")]
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect()
+        }
+
+        fn production_invocations(script: &str) -> Vec<String> {
+            const COMMAND: &str = "Invoke-BoundedPeImportBatch";
+
+            let lines: Vec<_> = script.lines().collect();
+            let mut invocations = Vec::new();
+            let mut index = 0usize;
+            while index < lines.len() {
+                let line = lines[index];
+                let trimmed = line.trim_start();
+                let Some(command_offset) = line.find(COMMAND) else {
+                    index += 1;
+                    continue;
+                };
+                if trimmed.starts_with('#') || trimmed.starts_with("function ") {
+                    index += 1;
+                    continue;
+                }
+
+                let mut invocation = String::new();
+                let mut fragment = &line[command_offset..];
+                loop {
+                    let trimmed_fragment = fragment.trim();
+                    let continued = trimmed_fragment.ends_with('`');
+                    let content = trimmed_fragment
+                        .strip_suffix('`')
+                        .unwrap_or(trimmed_fragment)
+                        .trim_end();
+                    invocation.push_str(content);
+                    invocation.push(' ');
+                    index += 1;
+                    if !continued || index == lines.len() {
+                        break;
+                    }
+                    fragment = lines[index];
+                }
+
+                let invocation = invocation.trim();
+                invocations.push(
+                    invocation
+                        .strip_suffix(')')
+                        .unwrap_or(invocation)
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+            invocations
+        }
+
+        let script = include_str!("../scripts/build-windows.ps1");
+        assert_eq!(
+            compact_parameter_contract(script),
+            "param([string]$Inspector,[string[]]$Paths,[System.Diagnostics.Stopwatch]$ClosureClock,[int]$ClosureDeadlineMs,[int]$ProcessDeadlineMs,[int64]$OutputByteLimit,[int]$ArgumentCharacterLimit)",
+            "named calls and the PowerShell parameter declaration must remain one exact typed contract"
+        );
+
+        let invocations = production_invocations(script);
+        assert_eq!(
+            invocations.len(),
+            2,
+            "every production PE-import batch call must be covered"
+        );
+
+        let expected_shared_bindings = [
+            ("-Inspector", "$peImportInspector"),
+            ("-ClosureClock", "$peInspectorClosureClock"),
+            ("-ClosureDeadlineMs", "$peInspectorClosureDeadlineMs"),
+            ("-ProcessDeadlineMs", "$peInspectorBatchDeadlineMs"),
+            ("-OutputByteLimit", "$maxPeInspectorBatchOutputBytes"),
+            (
+                "-ArgumentCharacterLimit",
+                "$maxPeInspectorArgumentCharacters",
+            ),
+        ];
+        let mut path_bindings = std::collections::BTreeSet::new();
+        for (invocation_index, invocation) in invocations.iter().enumerate() {
+            let tokens: Vec<_> = invocation.split_whitespace().collect();
+            assert_eq!(tokens.first(), Some(&"Invoke-BoundedPeImportBatch"));
+            assert_eq!(
+                (tokens.len() - 1) % 2,
+                0,
+                "invocation {invocation_index} must contain only named parameter/value pairs: {invocation}"
+            );
+
+            let mut bindings = std::collections::BTreeMap::new();
+            for pair in tokens[1..].chunks_exact(2) {
+                assert!(
+                    pair[0].starts_with('-'),
+                    "invocation {invocation_index} contains a positional argument: {invocation}"
+                );
+                assert!(
+                    bindings.insert(pair[0], pair[1]).is_none(),
+                    "invocation {invocation_index} binds {} more than once",
+                    pair[0]
+                );
+            }
+            assert_eq!(
+                bindings.len(),
+                expected_shared_bindings.len() + 1,
+                "invocation {invocation_index} has an unknown or missing binding: {invocation}"
+            );
+            for (parameter, value) in expected_shared_bindings {
+                assert_eq!(
+                    bindings.get(parameter),
+                    Some(&value),
+                    "invocation {invocation_index} must bind {parameter} explicitly"
+                );
+            }
+            path_bindings.insert(
+                *bindings
+                    .get("-Paths")
+                    .unwrap_or_else(|| panic!("invocation {invocation_index} must bind -Paths")),
+            );
+        }
+        assert_eq!(
+            path_bindings,
+            std::collections::BTreeSet::from([
+                "$batchTargets",
+                "@($requiredSoupPluginFull)",
+            ]),
+            "the singleton Soup proof and closure batches must each bind their own exact path array"
+        );
     }
 
     #[test]
