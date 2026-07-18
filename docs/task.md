@@ -76,6 +76,9 @@ directly; only the no-window case takes the direct path. The focused lifecycle m
 tests. Locked debug and release suites each pass 20 library, 865 application, and 10
 repository-metadata tests (**895 total**), with locked all-target/all-feature check, strict
 warning-free Clippy, formatting, and diff checks green.
+PR #123's CodeQL follow-up replaces three credential-shaped password literals with runtime-generated
+fixture values, retaining the exact Jellyfin authentication/logout assertions without weakening or
+suppressing hard-coded-secret analysis.
 Comprehensive lifecycle, playback-boundary, reducer, provenance, Jellyfin, and actual-wire DAAP
 regressions cover the cutover. Radio, removable, and OS-opened external media still need
 registry-owned at-use locator adapters, and local embedded-art display still needs retained file

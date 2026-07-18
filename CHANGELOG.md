@@ -102,7 +102,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no window quits directly. The focused lifecycle module passes all 53 tests. Locked debug and
   release suites each pass 20 library, 865 application, and 10 repository-metadata tests (895
   total), with locked all-target/all-feature compile, strict warning-free Clippy, formatting, and
-  diff checks green. Lifecycle, registry, reducer, playback-boundary, provenance, shutdown,
+  diff checks green. The CodeQL review follow-up generates all three password-bearing test inputs
+  at runtime instead of embedding credential-shaped literals, preserving the exact authentication
+  and logout coverage without suppressing hard-coded-secret analysis. Lifecycle, registry,
+  reducer, playback-boundary, provenance, shutdown,
   interactive-Jellyfin, and actual-wire DAAP regressions cover the cutover. Radio, removable, and
   OS-opened external media still need registry-owned at-use locator adapters, and local embedded
   artwork still needs retained file authority, so P3.1's final implementation record remains open.

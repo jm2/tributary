@@ -737,10 +737,10 @@ mod tests {
         ])
         .await;
 
-        let client =
-            JellyfinClient::authenticate(&service.base_url(), "fixture-user", "fixture-password")
-                .await
-                .expect("interactive client");
+        let password = uuid::Uuid::new_v4().to_string();
+        let client = JellyfinClient::authenticate(&service.base_url(), "fixture-user", &password)
+            .await
+            .expect("interactive client");
         client
             .logout_owned_session()
             .await
@@ -835,9 +835,9 @@ mod tests {
         })))])
         .await;
 
+        let password = uuid::Uuid::new_v4().to_string();
         let result =
-            JellyfinClient::authenticate(&service.base_url(), "fixture-user", "fixture-password")
-                .await;
+            JellyfinClient::authenticate(&service.base_url(), "fixture-user", &password).await;
         let error = result.err().expect("invalid token header must fail");
         let rendered = error.to_string();
         assert!(rendered.contains("Invalid auth header value"));

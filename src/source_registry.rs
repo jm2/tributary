@@ -903,6 +903,7 @@ mod tests {
             .claim_provenance(source_id, SourceProvenance::Saved)
             .expect("saved claim");
         let server_url = service.base_url();
+        let password = Uuid::new_v4().to_string();
         registry
             .connect_jellyfin_session(
                 source_id,
@@ -911,7 +912,7 @@ mod tests {
                     let client = crate::jellyfin::client::JellyfinClient::authenticate(
                         &server_url,
                         "fixture-user",
-                        "fixture-password",
+                        &password,
                     )
                     .await?;
                     Ok(crate::jellyfin::JellyfinBackend::stage_authenticated(
