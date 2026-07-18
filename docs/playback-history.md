@@ -93,10 +93,12 @@ Migration 10 has intentionally conservative legacy behavior:
 - never infer listening history from date-added, date-modified, file mtime, or playlist dates.
 
 The migration validates an already-present column before completing an interrupted SQLite upgrade
-and supports down/up retry. Rolling it down necessarily discards stored last-played timestamps but
-preserves tracks and play counts; reapplying starts those timestamps as null. No history index is
-added yet because smart playlists currently materialize the local table before evaluation; an
-index would add write cost without serving the current query path.
+and supports down/up retry. Fresh schema uses the declared `BIGINT` spelling; validation also accepts
+SQLite's equivalent nullable, default-free `INTEGER` spelling while rejecting incompatible type,
+nullability, default, or primary-key shapes. Rolling the migration down necessarily discards stored
+last-played timestamps but preserves tracks and play counts; reapplying starts those timestamps as
+null. No history index is added yet because smart playlists currently materialize the local table
+before evaluation; an index would add write cost without serving the current query path.
 
 The persistence slice must atomically saturate `play_count` at `i32::MAX` and set
 `last_played_at_ms` to `max(existing, event_timestamp)`. This prevents integer overflow and keeps a

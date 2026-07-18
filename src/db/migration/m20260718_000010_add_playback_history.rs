@@ -78,11 +78,13 @@ async fn validate_last_played_column(manager: &SchemaManager<'_>) -> Result<(), 
     let not_null: i32 = row.try_get("", "notnull")?;
     let default: Option<String> = row.try_get("", "dflt_value")?;
     let primary_key: i32 = row.try_get("", "pk")?;
-    if !column_type.eq_ignore_ascii_case("bigint")
-        || not_null != 0
-        || default.is_some()
-        || primary_key != 0
-    {
+    // SQLite gives BIGINT and INTEGER the same signed 64-bit integer
+    // affinity. Fresh Tributary migrations declare BIGINT, but accepting the
+    // equivalent INTEGER spelling keeps an interrupted/manual compatible
+    // schema usable across SeaQuery declaration changes.
+    let compatible_integer =
+        column_type.eq_ignore_ascii_case("bigint") || column_type.eq_ignore_ascii_case("integer");
+    if !compatible_integer || not_null != 0 || default.is_some() || primary_key != 0 {
         return Err(DbErr::Migration(format!(
             "tracks.last_played_at_ms has an unexpected schema: \
              type={column_type:?}, not_null={not_null}, default={default:?}, \
@@ -233,6 +235,26 @@ mod tests {
             .try_get("", "play_count")
             .expect("read unchanged play count");
         assert_eq!(count, -4, "validation must precede legacy repair");
+    }
+
+    #[tokio::test]
+    async fn up_accepts_sqlites_equivalent_nullable_integer_spelling() {
+        let db = database_before_playback_history_migration().await;
+        insert_track(&db, "negative", -4).await;
+        db.execute_unprepared("ALTER TABLE tracks ADD COLUMN last_played_at_ms INTEGER")
+            .await
+            .expect("install compatible SQLite integer column");
+
+        Migrator::up(&db, Some(1))
+            .await
+            .expect("accept equivalent SQLite integer declaration");
+
+        assert!(migration_is_applied(&db).await);
+        let (column_type, not_null, default) =
+            playback_column(&db).await.expect("playback column exists");
+        assert!(column_type.eq_ignore_ascii_case("integer"));
+        assert_eq!((not_null, default), (0, None));
+        assert_eq!(track_history(&db, "negative").await, (0, None));
     }
 
     #[tokio::test]
