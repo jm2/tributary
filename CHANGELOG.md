@@ -149,9 +149,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removable, and external queues still retain their current locator until their at-use adapters
   land. After merging the completed P3.4 seams, the accepted pre-follow-up head passed 823 tests
   and strict all-target/all-feature Clippy in both profiles. The final identity review adds three
-  regressions for the persisted-ID contract and promoted advertised route: the complete debug suite
-  now passes 826 tests, the 48-test identity filter and strict debug Clippy are clean, and the
-  matching release rerun is an integration-head validation step.
+  regressions for the persisted-ID contract and promoted advertised route: the complete debug and
+  release suites now pass 826 tests each, the 48-test identity filter is clean, and strict Clippy
+  passes in both profiles.
 - **Source identity and lifecycle now have a recorded architecture contract** — The P3.1 decision
   defines immutable `SourceId` plus backend-native `TrackId` identity, deterministic migration for
   legacy saved sources, one registry-owned connection/refresh/cancellation/failure state machine,
