@@ -941,13 +941,18 @@ fn play_current(ctx: &PlaybackContext) -> bool {
                     if media.matches_current_configuration(&app_config.borrow().library_paths) =>
                 {
                     if session.borrow_mut().finish_pending_resolution(generation) {
-                        let artwork_uri = media.file_uri().as_str().to_string();
+                        let artwork_media = media.clone();
                         let accepted = active_output.borrow().load_local(media);
                         if !accepted {
                             let marked = session.borrow_mut().mark_load_rejected(generation);
                             debug_assert!(marked, "current local load remains retryable");
+                            album_art::invalidate();
+                        } else {
+                            album_art::update_resolved_file_album_art(
+                                &album_art,
+                                artwork_media,
+                            );
                         }
-                        album_art::update_album_art(&album_art, &artwork_uri);
                     }
                 }
                 Ok(Ok(_)) => {
@@ -1135,8 +1140,9 @@ fn update_now_playing_ui(
     } else if !item.cover_art_url.is_empty() {
         album_art::fetch_remote_album_art(&ctx.album_art, &item.cover_art_url);
     } else if let Some(playback_uri) = direct_playback_uri {
-        // Local track — extract from embedded tags.
-        album_art::update_album_art(&ctx.album_art, playback_uri);
+        // Transitional direct file sources extract from their locator until
+        // their source adapters provide retained file authority.
+        album_art::update_direct_file_album_art(&ctx.album_art, playback_uri);
     } else {
         album_art::invalidate();
         ctx.album_art
@@ -1579,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn local_and_playlist_queue_capture_discards_the_row_file_uri() {
+    fn local_and_playlist_queue_capture_discards_the_row_locator() {
         let local = projected_row("legacy:local-id", "file:///music/captured.flac");
         let playlist = projected_row("legacy:local-id", "file:///music/captured.flac");
         let remote = projected_row("remote-id", "https://media.invalid/stream");
