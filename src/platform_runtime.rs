@@ -1549,8 +1549,15 @@ mod tests {
             "[System.IO.Path]::IsPathRooted($peImportInspector)",
             "Required PE import inspector not found",
             "$PkgPrefix-llvm package",
+            "function Format-PeImportTargetForDiagnostic",
+            "...[truncated]",
+            "function ConvertTo-BoundedPeImportArgumentBatch",
+            "[System.Collections.Generic.List[string]]$TargetBatch",
             "function Invoke-BoundedPeImportBatch",
-            "PE import-inspection target must be an absolute existing DLL or EXE",
+            "PE import-inspection target #$targetNumber is not absolute",
+            "PE import-inspection target #$targetNumber is not a DLL or EXE",
+            "PE import-inspection target #$targetNumber is not an existing file",
+            "[System.IO.File]::Exists($normalizedTarget)",
             "Start-Process -FilePath $Inspector -ArgumentList $arguments",
             "-RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath",
             "while (-not $process.WaitForExit(50))",
@@ -1566,11 +1573,16 @@ mod tests {
             "$dllScanQueue = [System.Collections.Queue]::new()",
             "$knownDllScanTargets = @{}",
             "Invoke-BoundedPeImportBatch `",
-            "-Paths @($requiredSoupPluginFull)",
+            "$soupInspectorTargets = [System.Collections.Generic.List[string]]::new()",
+            "$soupInspectorTargets.Add($requiredSoupPluginFull)",
+            "-TargetBatch $soupInspectorTargets",
             "$scannedDllTargets[$requiredSoupPluginFull] = $true",
             "while ($dllScanQueue.Count -gt 0)",
-            "$roundTargets = @()",
-            "$batchTargets.Count -lt $maxPeInspectorBatchTargets",
+            "$roundTargets = [System.Collections.Generic.List[string]]::new()",
+            "$roundTargets.Add($bin)",
+            "$batchTargets = [System.Collections.Generic.List[string]]::new()",
+            "$batchTargets.Add($candidate)",
+            "-TargetBatch $batchTargets",
             "Add-PeImportDependencies $batchLines $batchNames",
             "Add-DllScanTarget $Queue $Known $destPath $TargetLimit",
             "if ($ClosureClock.ElapsedMilliseconds -ge $ClosureDeadlineMs)",
@@ -1609,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_pe_import_batches_use_explicit_parameter_binding() {
+    fn windows_pe_import_batches_use_explicit_typed_list_binding() {
         fn compact_parameter_contract(script: &str) -> String {
             let function = script
                 .split_once("function Invoke-BoundedPeImportBatch")
@@ -1696,8 +1708,8 @@ mod tests {
         let script = include_str!("../scripts/build-windows.ps1");
         assert_eq!(
             compact_parameter_contract(script),
-            "param([string]$Inspector,[string[]]$Paths,[System.Diagnostics.Stopwatch]$ClosureClock,[int]$ClosureDeadlineMs,[int]$ProcessDeadlineMs,[int64]$OutputByteLimit,[int]$ArgumentCharacterLimit)",
-            "named calls and the PowerShell parameter declaration must remain one exact typed contract"
+            "param([string]$Inspector,[AllowNull()][System.Collections.Generic.List[string]]$TargetBatch,[System.Diagnostics.Stopwatch]$ClosureClock,[int]$ClosureDeadlineMs,[int]$ProcessDeadlineMs,[int64]$OutputByteLimit,[int]$ArgumentCharacterLimit)",
+            "named calls and the PowerShell parameter declaration must preserve one exact typed-list contract"
         );
 
         let invocations = production_invocations(script);
@@ -1718,7 +1730,7 @@ mod tests {
                 "$maxPeInspectorArgumentCharacters",
             ),
         ];
-        let mut path_bindings = std::collections::BTreeSet::new();
+        let mut target_bindings = std::collections::BTreeSet::new();
         for (invocation_index, invocation) in invocations.iter().enumerate() {
             let tokens: Vec<_> = invocation.split_whitespace().collect();
             assert_eq!(tokens.first(), Some(&"Invoke-BoundedPeImportBatch"));
@@ -1752,19 +1764,158 @@ mod tests {
                     "invocation {invocation_index} must bind {parameter} explicitly"
                 );
             }
-            path_bindings.insert(
-                *bindings
-                    .get("-Paths")
-                    .unwrap_or_else(|| panic!("invocation {invocation_index} must bind -Paths")),
+            target_bindings.insert(
+                *bindings.get("-TargetBatch").unwrap_or_else(|| {
+                    panic!("invocation {invocation_index} must bind -TargetBatch")
+                }),
             );
         }
         assert_eq!(
-            path_bindings,
-            std::collections::BTreeSet::from([
-                "$batchTargets",
-                "@($requiredSoupPluginFull)",
-            ]),
-            "the singleton Soup proof and closure batches must each bind their own exact path array"
+            target_bindings,
+            std::collections::BTreeSet::from(["$batchTargets", "$soupInspectorTargets"]),
+            "the singleton Soup proof and closure batches must each bind their own exact typed list"
+        );
+        assert!(!script.contains("[string[]]$Paths"));
+        assert!(!script.contains("-Paths @($requiredSoupPluginFull)"));
+    }
+
+    #[test]
+    fn powershell_pe_import_target_batch_preserves_lists_and_bounds_diagnostics() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        let helpers_start = script
+            .find("function Format-PeImportTargetForDiagnostic")
+            .expect("bounded PE target formatter");
+        let helpers_end = script[helpers_start..]
+            .find("function Add-PeImportDependencies")
+            .expect("PE target helper boundary")
+            + helpers_start;
+        let helpers = &script[helpers_start..helpers_end];
+
+        let temp = tempfile::tempdir().unwrap();
+        let valid_dll = temp.path().join("valid target with spaces.dll");
+        let valid_exe = temp.path().join("valid-target.exe");
+        let wrong_extension = temp.path().join("wrong-extension.txt");
+        let missing_dll = temp.path().join("missing-target.dll");
+        fs::write(&valid_dll, b"not executed").unwrap();
+        fs::write(&valid_exe, b"not executed").unwrap();
+        fs::write(&wrong_extension, b"not executed").unwrap();
+
+        let command = [
+            "$ErrorActionPreference = \"Stop\"\n",
+            helpers,
+            r#"
+function Assert-TargetFailure {
+    param(
+        [System.Collections.Generic.List[string]]$Targets,
+        [string]$Expected
+    )
+    $failure = $null
+    try {
+        $null = ConvertTo-BoundedPeImportArgumentBatch `
+            -TargetBatch $Targets -ArgumentCharacterLimit 4096
+    }
+    catch {
+        $failure = $_.Exception.Message
+    }
+    if ($null -eq $failure) { throw "expected target validation failure: $Expected" }
+    if (-not $failure.Contains($Expected)) {
+        throw "target validation failure did not contain '$Expected': $failure"
+    }
+    if ($failure.Length -gt 384) {
+        throw "target validation diagnostic was not bounded: $($failure.Length) characters"
+    }
+    if ($failure.Contains([string][char]10) -or $failure.Contains([string][char]13)) {
+        throw "target validation diagnostic was not single-line"
+    }
+}
+
+function Assert-InvokeTargetFailure {
+    param(
+        [System.Collections.Generic.List[string]]$Targets,
+        [string]$Expected
+    )
+    $failure = $null
+    try {
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $null = Invoke-BoundedPeImportBatch `
+            -Inspector "not-started" -TargetBatch $Targets -ClosureClock $clock `
+            -ClosureDeadlineMs 1000 -ProcessDeadlineMs 1000 `
+            -OutputByteLimit 4096 -ArgumentCharacterLimit 4096
+    }
+    catch {
+        $failure = $_.Exception.Message
+    }
+    if ($null -eq $failure -or -not $failure.Contains($Expected)) {
+        throw "Invoke target boundary did not preserve '$Expected': $failure"
+    }
+    if ($failure.Length -gt 384 -or $failure.Contains([string][char]10) -or
+        $failure.Contains([string][char]13)) {
+        throw "Invoke target boundary emitted an unbounded diagnostic"
+    }
+}
+
+$validTargets = [System.Collections.Generic.List[string]]::new()
+$validTargets.Add($env:TRIBUTARY_VALID_DLL)
+$validTargets.Add($env:TRIBUTARY_VALID_EXE)
+$batch = ConvertTo-BoundedPeImportArgumentBatch `
+    -TargetBatch $validTargets -ArgumentCharacterLimit 4096
+if ($batch.Label -ne "valid target with spaces.dll, valid-target.exe") {
+    throw "typed target list changed shape: $($batch.Label)"
+}
+foreach ($target in $validTargets) {
+    $quoted = '"' + [System.IO.Path]::GetFullPath($target) + '"'
+    if (-not $batch.Arguments.Contains($quoted)) {
+        throw "validated target was absent from inspector arguments: $target"
+    }
+}
+
+$emptyTarget = [System.Collections.Generic.List[string]]::new()
+$emptyTarget.Add("")
+Assert-TargetFailure $emptyTarget "target #1 was empty"
+
+$relativeTarget = [System.Collections.Generic.List[string]]::new()
+$relativeTarget.Add(("x" * 1024) + ".dll")
+Assert-InvokeTargetFailure $relativeTarget "target #1 is not absolute"
+
+$wrongExtension = [System.Collections.Generic.List[string]]::new()
+$wrongExtension.Add($env:TRIBUTARY_WRONG_EXTENSION)
+Assert-TargetFailure $wrongExtension "target #1 is not a DLL or EXE"
+
+$missingTarget = [System.Collections.Generic.List[string]]::new()
+$missingTarget.Add($env:TRIBUTARY_MISSING_DLL)
+Assert-TargetFailure $missingTarget "target #1 is not an existing file"
+
+$newlineTarget = [System.Collections.Generic.List[string]]::new()
+$newlineTarget.Add($env:TRIBUTARY_VALID_DLL + [char]10 + "forged diagnostic.dll")
+Assert-TargetFailure $newlineTarget "target #1 contains an unsupported quote or control character"
+"#,
+        ]
+        .concat();
+
+        let run = |program: &str| {
+            std::process::Command::new(program)
+                .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+                .env("TRIBUTARY_VALID_DLL", &valid_dll)
+                .env("TRIBUTARY_VALID_EXE", &valid_exe)
+                .env("TRIBUTARY_WRONG_EXTENSION", &wrong_extension)
+                .env("TRIBUTARY_MISSING_DLL", &missing_dll)
+                .output()
+        };
+        let output = match run("pwsh") {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match run("powershell") {
+                Ok(output) => output,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) => panic!("could not run Windows PowerShell target regression: {error}"),
+            },
+            Err(error) => panic!("could not run PowerShell target regression: {error}"),
+        };
+
+        assert!(
+            output.status.success(),
+            "PowerShell PE target regression failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

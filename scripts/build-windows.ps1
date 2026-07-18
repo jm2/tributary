@@ -567,6 +567,95 @@ function Add-DllScanTarget {
     $Queue.Enqueue($fullPath)
 }
 
+# Render an untrusted target path in a bounded, single-line diagnostic. The
+# import inspector only receives paths assembled by this script, but keeping
+# this formatter bounded prevents a malformed filesystem entry from flooding
+# CI logs or injecting a second diagnostic line.
+function Format-PeImportTargetForDiagnostic {
+    param(
+        [AllowNull()][string]$Target,
+        [int]$Limit = 192
+    )
+    if ($null -eq $Target) { return "<null>" }
+
+    $safe = [System.Text.RegularExpressions.Regex]::Replace(
+        $Target,
+        '[\p{Cc}\p{Zl}\p{Zp}"]',
+        '?'
+    )
+    if ($safe.Length -gt $Limit) {
+        $safe = $safe.Substring(0, $Limit) + "...[truncated]"
+    }
+    return "'$safe'"
+}
+
+# Validate and quote one strongly typed target batch. The exact-host failure
+# persisted after named parameter binding, so the collection shape cannot stay
+# implicit at this boundary. A List[string] crosses it as one object, while
+# each normalized member is still passed to llvm-readobj as a separately
+# quoted argument.
+function ConvertTo-BoundedPeImportArgumentBatch {
+    param(
+        [AllowNull()][System.Collections.Generic.List[string]]$TargetBatch,
+        [int]$ArgumentCharacterLimit
+    )
+    if ($null -eq $TargetBatch) {
+        throw "PE import-inspection target batch was null"
+    }
+
+    $quotedTargets = [System.Collections.Generic.List[string]]::new()
+    $targetNames = [System.Collections.Generic.List[string]]::new()
+    for ($targetIndex = 0; $targetIndex -lt $TargetBatch.Count; $targetIndex++) {
+        $target = $TargetBatch[$targetIndex]
+        $targetNumber = $targetIndex + 1
+        $targetLabel = Format-PeImportTargetForDiagnostic $target
+
+        if ([string]::IsNullOrWhiteSpace($target)) {
+            throw "PE import-inspection target #$targetNumber was empty ($targetLabel)"
+        }
+        if ([System.Text.RegularExpressions.Regex]::IsMatch(
+                $target,
+                '[\p{Cc}\p{Zl}\p{Zp}"]'
+            )) {
+            throw "PE import-inspection target #$targetNumber contains an unsupported quote or control character ($targetLabel)"
+        }
+        if (-not [System.IO.Path]::IsPathRooted($target)) {
+            throw "PE import-inspection target #$targetNumber is not absolute ($targetLabel)"
+        }
+
+        try {
+            $normalizedTarget = [System.IO.Path]::GetFullPath($target)
+        }
+        catch {
+            throw "PE import-inspection target #$targetNumber is not a valid filesystem path ($targetLabel)"
+        }
+        $extension = [System.IO.Path]::GetExtension($normalizedTarget)
+        if ($extension -ine ".dll" -and $extension -ine ".exe") {
+            throw "PE import-inspection target #$targetNumber is not a DLL or EXE ($targetLabel)"
+        }
+        if (-not [System.IO.File]::Exists($normalizedTarget)) {
+            throw "PE import-inspection target #$targetNumber is not an existing file ($targetLabel)"
+        }
+
+        $quotedTargets.Add('"' + $normalizedTarget + '"')
+        if ($targetNames.Count -lt 3) {
+            $targetNames.Add([System.IO.Path]::GetFileName($normalizedTarget))
+        }
+    }
+
+    $arguments = "--coff-imports " + ($quotedTargets -join " ")
+    if ($arguments.Length -gt $ArgumentCharacterLimit) {
+        throw "PE import-inspection batch exceeded its $ArgumentCharacterLimit-character command-line limit"
+    }
+
+    $batchLabel = $targetNames -join ", "
+    if ($TargetBatch.Count -gt $targetNames.Count) { $batchLabel += ", ..." }
+    return [PSCustomObject]@{
+        Arguments = $arguments
+        Label = $batchLabel
+    }
+}
+
 # Inspect a bounded batch without ever loading or executing a target DLL.
 # Start-Process redirects both streams straight to files, avoiding deadlocks
 # from synchronous whole-stream pipe reads. File sizes
@@ -575,39 +664,23 @@ function Add-DllScanTarget {
 function Invoke-BoundedPeImportBatch {
     param(
         [string]$Inspector,
-        [string[]]$Paths,
+        [AllowNull()][System.Collections.Generic.List[string]]$TargetBatch,
         [System.Diagnostics.Stopwatch]$ClosureClock,
         [int]$ClosureDeadlineMs,
         [int]$ProcessDeadlineMs,
         [int64]$OutputByteLimit,
         [int]$ArgumentCharacterLimit
     )
-    if ($Paths.Count -eq 0) { return @() }
-
-    $quotedPaths = @()
-    foreach ($path in $Paths) {
-        $extension = [System.IO.Path]::GetExtension($path)
-        if (-not [System.IO.Path]::IsPathRooted($path) -or
-            -not (Test-Path -LiteralPath $path -PathType Leaf) -or
-            ($extension -ine ".dll" -and $extension -ine ".exe")) {
-            throw "PE import-inspection target must be an absolute existing DLL or EXE"
-        }
-        if ($path.IndexOf([char]34) -ge 0 -or $path.IndexOf([char]13) -ge 0 -or
-            $path.IndexOf([char]10) -ge 0) {
-            throw "PE import-inspection path contains an unsupported quote or newline"
-        }
-        $quotedPaths += '"' + $path + '"'
+    if ($null -eq $TargetBatch) {
+        throw "PE import-inspection target batch was null"
     }
-    $arguments = "--coff-imports " + ($quotedPaths -join " ")
-    if ($arguments.Length -gt $ArgumentCharacterLimit) {
-        throw "PE import-inspection batch exceeded its $ArgumentCharacterLimit-character command-line limit"
-    }
+    if ($TargetBatch.Count -eq 0) { return @() }
 
-    $batchNames = @($Paths | Select-Object -First 3 | ForEach-Object {
-        [System.IO.Path]::GetFileName($_)
-    })
-    $batchLabel = $batchNames -join ", "
-    if ($Paths.Count -gt $batchNames.Count) { $batchLabel += ", ..." }
+    $argumentBatch = ConvertTo-BoundedPeImportArgumentBatch `
+        -TargetBatch $TargetBatch `
+        -ArgumentCharacterLimit $ArgumentCharacterLimit
+    $arguments = $argumentBatch.Arguments
+    $batchLabel = $argumentBatch.Label
 
     $token = [Guid]::NewGuid().ToString("N")
     $tempRoot = [System.IO.Path]::GetTempPath()
@@ -832,6 +905,8 @@ $soupPluginScanned = $false
 $soupRuntimeDependencyObserved = $false
 $peInspectorOutputLineCount = 0
 $peInspectorClosureClock = [System.Diagnostics.Stopwatch]::StartNew()
+$soupInspectorTargets = [System.Collections.Generic.List[string]]::new()
+$soupInspectorTargets.Add($requiredSoupPluginFull)
 
 # Inspect Soup alone first. That singleton output proves libsoup is a direct
 # import of libgstsoup rather than merely an import of some unrelated member
@@ -840,7 +915,7 @@ Write-Host "  inspecting required Soup plugin imports..."
 try {
     $soupInspectorLines = @(Invoke-BoundedPeImportBatch `
         -Inspector $peImportInspector `
-        -Paths @($requiredSoupPluginFull) `
+        -TargetBatch $soupInspectorTargets `
         -ClosureClock $peInspectorClosureClock `
         -ClosureDeadlineMs $peInspectorClosureDeadlineMs `
         -ProcessDeadlineMs $peInspectorBatchDeadlineMs `
@@ -873,12 +948,12 @@ while ($dllScanQueue.Count -gt 0) {
         Write-Err "PE import dependency closure exceeded its $peInspectorClosureDeadlineMs-millisecond deadline."
     }
     $peInspectorRound++
-    $roundTargets = @()
+    $roundTargets = [System.Collections.Generic.List[string]]::new()
     while ($dllScanQueue.Count -gt 0) {
         $bin = [string]$dllScanQueue.Dequeue()
         if ($scannedDllTargets.ContainsKey($bin)) { continue }
         $scannedDllTargets[$bin] = $true
-        $roundTargets += $bin
+        $roundTargets.Add($bin)
     }
     if ($roundTargets.Count -eq 0) { continue }
     Write-Host "  import round ${peInspectorRound}: $($roundTargets.Count) binary target(s)"
@@ -887,7 +962,7 @@ while ($dllScanQueue.Count -gt 0) {
     $batchNumber = 0
     while ($offset -lt $roundTargets.Count) {
         $batchNumber++
-        $batchTargets = @()
+        $batchTargets = [System.Collections.Generic.List[string]]::new()
         $batchArgumentCharacters = "--coff-imports ".Length
         while ($offset -lt $roundTargets.Count -and
             $batchTargets.Count -lt $maxPeInspectorBatchTargets) {
@@ -899,7 +974,7 @@ while ($dllScanQueue.Count -gt 0) {
                 }
                 break
             }
-            $batchTargets += $candidate
+            $batchTargets.Add($candidate)
             $batchArgumentCharacters += $candidateCharacters
             $offset++
         }
@@ -908,7 +983,7 @@ while ($dllScanQueue.Count -gt 0) {
         try {
             $batchLines = @(Invoke-BoundedPeImportBatch `
                 -Inspector $peImportInspector `
-                -Paths $batchTargets `
+                -TargetBatch $batchTargets `
                 -ClosureClock $peInspectorClosureClock `
                 -ClosureDeadlineMs $peInspectorClosureDeadlineMs `
                 -ProcessDeadlineMs $peInspectorBatchDeadlineMs `
