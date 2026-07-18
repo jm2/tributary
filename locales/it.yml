@@ -172,6 +172,8 @@ context:
   properties: "Proprietà…"
   add_to_playlist: "Aggiungi alla playlist"
   remove_from_playlist: "Rimuovi dalla playlist"
+  playlist_add_unsupported_heading: "I brani non sono stati aggiunti"
+  playlist_add_unsupported_body: "Al momento, è possibile aggiungere alle playlist solo i brani della libreria locale di Tributary. Non è stato aggiunto nulla da questa sorgente."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

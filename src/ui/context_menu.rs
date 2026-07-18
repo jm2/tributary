@@ -70,6 +70,65 @@ impl ContextMenuPopupPlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaylistAddSupport {
+    LocalLibrary,
+    UnsupportedSource,
+}
+
+impl PlaylistAddSupport {
+    fn from_source_key(source_key: &str) -> Self {
+        if source_key == "local" {
+            Self::LocalLibrary
+        } else {
+            Self::UnsupportedSource
+        }
+    }
+
+    fn activation(self) -> PlaylistAddActivation {
+        match self {
+            Self::LocalLibrary => PlaylistAddActivation::WriteLocalPlaylist,
+            Self::UnsupportedSource => PlaylistAddActivation::ExplainUnsupportedSource,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaylistAddActivation {
+    WriteLocalPlaylist,
+    ExplainUnsupportedSource,
+}
+
+#[derive(Clone, Copy)]
+struct PlaylistAddInteraction<'a> {
+    window: &'a gtk::glib::WeakRef<adw::ApplicationWindow>,
+    support: PlaylistAddSupport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnsupportedPlaylistAddCopy {
+    heading: String,
+    body: String,
+}
+
+fn unsupported_playlist_add_copy(locale: &str) -> UnsupportedPlaylistAddCopy {
+    UnsupportedPlaylistAddCopy {
+        heading: rust_i18n::t!("context.playlist_add_unsupported_heading", locale = locale)
+            .into_owned(),
+        body: rust_i18n::t!("context.playlist_add_unsupported_body", locale = locale).into_owned(),
+    }
+}
+
+fn show_unsupported_playlist_add_dialog(window: &adw::ApplicationWindow) {
+    let copy = unsupported_playlist_add_copy(&rust_i18n::locale());
+    let dialog = adw::AlertDialog::builder()
+        .heading(&copy.heading)
+        .body(&copy.body)
+        .build();
+    dialog.add_response("ok", rust_i18n::t!("dialogs.ok").as_ref());
+    dialog.present(Some(window));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyboardContextMenuPropagation {
     Proceed,
     Stop,
@@ -124,6 +183,9 @@ fn expose_context_menu_accessibility(column_view: &gtk::ColumnView) {
 /// open the same selection-snapshotted action model relative to the focused
 /// tracklist, and are consumed only when a non-empty menu was opened.
 pub fn setup_context_menu(state: &WindowState) {
+    // The controllers retaining `popup_menu` live below this window. Keep a
+    // weak handle so the action factory cannot form a window ownership cycle.
+    let window = state.window.downgrade();
     let sm = state.sort_model.clone();
     let sidebar_store = state.sidebar_store.clone();
     let active_source_key = state.active_source_key.clone();
@@ -140,6 +202,7 @@ pub fn setup_context_menu(state: &WindowState) {
         move |cv: &gtk::ColumnView, anchor: Option<gtk::gdk::Rectangle>| {
             let active_key = active_source_key.borrow().clone();
             let is_playlist_view = active_key.starts_with("playlist:");
+            let playlist_add_support = PlaylistAddSupport::from_source_key(&active_key);
 
             // Collect selected track URIs from the MultiSelection model.
             let selection_model = cv.model();
@@ -182,6 +245,10 @@ pub fn setup_context_menu(state: &WindowState) {
                     &sm,
                     &popup_plan.selection,
                     &rt_handle,
+                    PlaylistAddInteraction {
+                        window: &window,
+                        support: playlist_add_support,
+                    },
                 );
             }
 
@@ -425,7 +492,7 @@ fn build_remove_from_playlist_action(
     });
     action_group.add_action(&remove_action);
     menu.append(
-        Some("Remove from Playlist"),
+        Some(rust_i18n::t!("context.remove_from_playlist").as_ref()),
         Some("tracklist-ctx.remove-from-playlist"),
     );
 }
@@ -438,6 +505,7 @@ fn build_add_to_playlist_actions(
     sm: &gtk::SortListModel,
     selection: &SelectionSnapshot,
     rt_handle: &tokio::runtime::Handle,
+    interaction: PlaylistAddInteraction<'_>,
 ) {
     let mut has_playlists = false;
 
@@ -454,7 +522,7 @@ fn build_add_to_playlist_actions(
                     header_action.set_enabled(false);
                     action_group.add_action(&header_action);
                     menu.append(
-                        Some("Add to Playlist"),
+                        Some(rust_i18n::t!("context.add_to_playlist").as_ref()),
                         Some("tracklist-ctx.add-to-playlist-header"),
                     );
                 }
@@ -470,7 +538,16 @@ fn build_add_to_playlist_actions(
                 let add_action = gtk::gio::SimpleAction::new(&action_name, None);
                 let uris = selected_uris;
                 let pid = pl_id.clone();
+                let window = interaction.window.clone();
+                let activation = interaction.support.activation();
                 add_action.connect_activate(move |_, _| {
+                    if activation == PlaylistAddActivation::ExplainUnsupportedSource {
+                        if let Some(window) = window.upgrade() {
+                            show_unsupported_playlist_add_dialog(&window);
+                        }
+                        return;
+                    }
+
                     let uris = uris.clone();
                     let pid = pid.clone();
                     rt.spawn(async move {
@@ -598,7 +675,10 @@ fn build_properties_action(
     });
 
     action_group.add_action(&props_action);
-    menu.append(Some("Properties…"), Some("tracklist-ctx.properties"));
+    menu.append(
+        Some(rust_i18n::t!("context.properties").as_ref()),
+        Some("tracklist-ctx.properties"),
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -682,6 +762,64 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn playlist_add_support_is_exactly_local_and_fail_closed() {
+        assert_eq!(
+            PlaylistAddSupport::from_source_key("local"),
+            PlaylistAddSupport::LocalLibrary
+        );
+        assert_eq!(
+            PlaylistAddSupport::from_source_key("local").activation(),
+            PlaylistAddActivation::WriteLocalPlaylist
+        );
+
+        let remote = crate::architecture::SourceId::remote(
+            "subsonic",
+            &url::Url::parse("https://music.example.test/root/").expect("remote URL"),
+        )
+        .expect("remote source ID")
+        .to_string();
+        let radio = crate::architecture::SourceId::radio_browser().to_string();
+        let removable = crate::architecture::SourceId::removable("device:opaque-id")
+            .expect("removable source ID")
+            .to_string();
+
+        for source_key in [
+            remote.as_str(),
+            radio.as_str(),
+            removable.as_str(),
+            "playlist:local-view",
+            "remote-looking-but-malformed",
+            "",
+        ] {
+            assert_eq!(
+                PlaylistAddSupport::from_source_key(source_key),
+                PlaylistAddSupport::UnsupportedSource,
+                "{source_key:?} must not enter the local-only playlist write path"
+            );
+            assert_eq!(
+                PlaylistAddSupport::from_source_key(source_key).activation(),
+                PlaylistAddActivation::ExplainUnsupportedSource
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_playlist_add_copy_is_localized_for_every_catalog() {
+        let english = unsupported_playlist_add_copy("en");
+        assert!(!english.heading.is_empty());
+        assert!(!english.body.is_empty());
+
+        for locale in rust_i18n::available_locales!() {
+            let localized = unsupported_playlist_add_copy(&locale);
+            assert!(!localized.heading.is_empty(), "{locale}: empty heading");
+            assert!(!localized.body.is_empty(), "{locale}: empty body");
+            if locale != "en" {
+                assert_ne!(localized, english, "{locale} must not fall back to English");
+            }
+        }
+    }
 
     #[test]
     fn properties_path_conversion_is_local_and_fail_closed() {

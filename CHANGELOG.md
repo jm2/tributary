@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Unsupported playlist additions now fail visibly and atomically** — Choosing Add to Playlist
+  from an authenticated remote, internet-radio, removable-media, or unknown/pathless source now
+  shows a localized explanation before any runtime task, database connection, or playlist write.
+  Tributary therefore adds nothing instead of silently skipping unsupported rows or modifying only
+  an unexpected subset. The existing Add to Playlist, Remove from Playlist, and Properties context
+  labels now use their shipped translations as well, and the refusal copy is covered across all 13
+  locale catalogs. Local-library playlist behavior is unchanged; durable source-scoped remote
+  playlist entries remain planned separately.
 - **Shuffled Previous and Next now follow a bounded real playback timeline** — Tributary retains
   the current queue occurrence plus ten actual predecessors, walks backward without fabricating a
   random track at the oldest boundary, and replays fixed forward history before drawing again.

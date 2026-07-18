@@ -172,6 +172,8 @@ context:
   properties: "Свойства…"
   add_to_playlist: "Добавить в плейлист"
   remove_from_playlist: "Удалить из плейлиста"
+  playlist_add_unsupported_heading: "Композиции не добавлены"
+  playlist_add_unsupported_body: "Сейчас в плейлисты можно добавлять только композиции из локальной медиатеки Tributary. Из этого источника ничего не добавлено."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

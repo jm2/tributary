@@ -38,7 +38,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Internet Radio (Top Clicked, Top Voted, Stations Near Me) | ✅ |
 | Tiered geo-location (geo-distance → state → country) | ✅ |
 | Column drag-and-drop reordering with persistence | ✅ |
-| Regular & smart playlists (iTunes-style rules engine) | ✅ Local-library playlists; remote persistence is planned ([#47](https://github.com/jm2/tributary/issues/47)) |
+| Regular & smart playlists (iTunes-style rules engine) | ✅ Local-library playlists; unsupported source additions are explicitly refused, and remote persistence is planned ([#47](https://github.com/jm2/tributary/issues/47)) |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
 | Batch metadata editing (multi-select) | ✅ |
@@ -653,6 +653,12 @@ Tributary supports regular and smart playlists for the local library:
 
 - **Regular playlists** — Right-click the Playlists header in the sidebar to create a new playlist. Right-click tracks in the tracklist to add them. Playlists survive library folder changes via fingerprint-based track matching.
 - **Smart playlists** — iTunes-style rules engine with filterable metadata fields, text/numeric/date operators, sorting, and result limiting. Smart playlists are evaluated against the current local library whenever they are opened or exported; they are not stored snapshots. Create them via the sidebar context menu.
+
+**Add to Playlist** currently accepts tracks only from the built-in local library. Invoking it from
+an authenticated remote, internet-radio, removable-media, or other unsupported source shows a
+localized explanation and adds nothing; it never silently writes only a subset. Persisting
+source-scoped remote tracks and importing or synchronizing server-native playlists remain planned
+under [P1.5](docs/task.md#p15--persist-source-scoped-playlists).
 
 #### Importing and exporting playlists
 

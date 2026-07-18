@@ -172,6 +172,8 @@ context:
   properties: "Propiedades…"
   add_to_playlist: "Añadir a lista de reproducción"
   remove_from_playlist: "Quitar de lista de reproducción"
+  playlist_add_unsupported_heading: "No se añadieron pistas"
+  playlist_add_unsupported_body: "Por ahora, solo se pueden añadir a las listas de reproducción pistas de la biblioteca local de Tributary. No se añadió nada de esta fuente."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

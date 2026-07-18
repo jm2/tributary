@@ -6,7 +6,7 @@ This document explains the product and engineering work that remains **after** t
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
 remediation record is preserved separately in
 [`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **220/223 (98.7%)**, with only three
-real-environment validation records left. The feature backlog is now **1/35 (2.9%)** complete. Neither
+real-environment validation records left. The feature backlog is now **2/35 (5.7%)** complete. Neither
 percentage estimates equal engineering effort, and the historical percentage is not a claim that
 Tributary has implemented every requested product feature.
 
@@ -25,7 +25,9 @@ starts. Historical holistic-review documents are point-in-time findings, not act
   files use the common `SourceRegistry` lifecycle and playback-time authority model.
 - AirPlay 1/RAOP, Chromecast, MPD, and local playback are implemented. AirPlay 2/HomeKit is not.
 - Regular playlists are local-library projections. Remote tracks cannot currently be persisted in
-  them, and Subsonic server-side playlists are not imported.
+  them, and Subsonic server-side playlists are not imported. An Add to Playlist attempt from any
+  unsupported source now explains that boundary in the user's language and performs no database
+  work instead of silently skipping rows.
 - XSPF v1 import/export is implemented with exact path and deterministic normalized-metadata
   matching. Apple/iTunes XML, Google Takeout CSV, M3U, service URLs, and fuzzy matching are not
   direct input modes.
@@ -47,11 +49,11 @@ before starting large protocol or transfer subsystems.
    retained boundary, and starts complete Repeat All cycles without an immediate repeat. Shuffle
    toggles, rollback, lifecycle resets, duplicate occurrences, small queues, and the shared
    header/OS Previous dispatcher are covered by regressions.
-2. **Make remote-to-playlist behavior explicit ([#47]).** The current Add to Playlist action is
-   offered for remote selections, but unsupported rows are only counted in a log message. The
-   smallest slice is a user-visible refusal. Full support is separate: regular playlist entries
-   need persistent source-scoped `(SourceId, TrackId)` identity, disconnected-source semantics,
-   and playback-time resolution; Subsonic server-native playlist import/sync is another slice.
+2. **Completed: make remote-to-playlist behavior explicit ([#47]).** Add to Playlist now snapshots
+   the active source and refuses every non-local selection with a localized, all-or-none dialog
+   before database work. Full support remains separate: regular playlist entries need persistent
+   source-scoped `(SourceId, TrackId)` identity, disconnected-source semantics, and playback-time
+   resolution; Subsonic server-native playlist import/sync is another slice.
 3. **Implement trustworthy local playback history.** The database and UI expose `play_count`, but
    production playback does not increment it and there is no `last_played` field. Consequently the
    seeded Recently Played and Top 25 playlists are present but ordinarily empty for local music.
