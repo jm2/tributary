@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use sea_orm::{DatabaseConnection, DbErr, EntityTrait};
 use thiserror::Error;
-use url::Url;
 
 use crate::db::entities::{library_root, track};
 
@@ -48,15 +47,12 @@ pub enum LocalMediaResolutionError {
     AuthorityCheckTimedOut,
     #[error("local track or root changed while media authority was acquired")]
     ChangedDuringResolution,
-    #[error("local media path cannot be represented as a file URI")]
-    InvalidPath,
 }
 
 struct ResolvedLocalMediaInner {
     authority: Arc<RootAuthorityLease>,
     file: BoundFile,
     path: PathBuf,
-    file_uri: Url,
     extension: Option<String>,
 }
 
@@ -96,11 +92,12 @@ impl ExpectedRootAuthorityState {
     }
 }
 
-/// Exact local file authority retained for one output load.
+/// Exact local file authority retained for one resolved media use.
 ///
-/// Clones share the same root, marker, ancestor, and file handles. Outputs and
-/// their receiver-facing ticket servers keep a clone until replacement, Stop,
-/// completion, failure, or teardown. No consumer reopens the database path.
+/// Clones share the same root, marker, ancestor, and file handles. Outputs,
+/// their receiver-facing ticket servers, and the in-process embedded-art
+/// reader keep a clone until their exact consumption finishes. No consumer
+/// reopens the database path.
 #[derive(Clone)]
 pub struct ResolvedLocalMedia {
     inner: Arc<ResolvedLocalMediaInner>,
@@ -125,15 +122,8 @@ impl ResolvedLocalMedia {
             .try_clone_for_consumption(&self.inner.authority)
     }
 
-    /// File URI for application-owned display/artwork helpers only.
-    ///
-    /// Playback outputs receive the owned lease through `load_local`, never
-    /// this locator.
-    pub(crate) fn file_uri(&self) -> &Url {
-        &self.inner.file_uri
-    }
-
-    /// Safe extension hint used only to label an opaque media ticket.
+    /// Safe extension hint used to label an opaque media ticket and preserve
+    /// the tag parser's format-specific behavior without exposing a path.
     pub(crate) fn extension(&self) -> Option<&str> {
         self.inner.extension.as_deref()
     }
@@ -160,12 +150,6 @@ impl ResolvedLocalMedia {
     ) -> std::io::Result<Self> {
         let authority = Arc::new(RootAuthorityLease::acquire(root, expected_marker)?);
         let file = authority.open_regular_file(path)?;
-        let file_uri = Url::from_file_path(path).map_err(|()| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "test media path cannot be represented as a file URI",
-            )
-        })?;
         let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -175,7 +159,6 @@ impl ResolvedLocalMedia {
                 authority,
                 file,
                 path: path.to_path_buf(),
-                file_uri,
                 extension,
             }),
         })
@@ -284,8 +267,6 @@ pub async fn resolve_track(
         return Err(LocalMediaResolutionError::ChangedDuringResolution);
     }
 
-    let file_uri =
-        Url::from_file_path(&path).map_err(|()| LocalMediaResolutionError::InvalidPath)?;
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -296,7 +277,6 @@ pub async fn resolve_track(
             authority: acquired.0,
             file: acquired.1,
             path,
-            file_uri,
             extension,
         }),
     })
@@ -423,10 +403,7 @@ mod tests {
         let old_media = resolve_track(&db, "legacy:not-a-uuid", &roots)
             .await
             .expect("resolve original row");
-        assert_eq!(
-            old_media.file_uri().to_file_path().ok().as_deref(),
-            Some(old_path.as_path())
-        );
+        assert_eq!(old_media.inner.path, old_path);
         assert_eq!(read_media(&old_media), b"old");
 
         let mut active: track::ActiveModel = track::Entity::find_by_id("legacy:not-a-uuid")
@@ -441,10 +418,7 @@ mod tests {
         let current_media = resolve_track(&db, "legacy:not-a-uuid", &roots)
             .await
             .expect("resolve renamed row");
-        assert_eq!(
-            current_media.file_uri().to_file_path().ok().as_deref(),
-            Some(new_path.as_path())
-        );
+        assert_eq!(current_media.inner.path, new_path);
         assert_eq!(read_media(&current_media), b"new");
     }
 
