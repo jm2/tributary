@@ -763,8 +763,8 @@ where
             return;
         }
         self.completed = true;
-        self.inner.finish_retirement(self.retirement_id, result);
-        self.participant.take();
+        self.inner
+            .finish_retirement(self.retirement_id, result, &mut self.participant);
     }
 }
 
@@ -772,9 +772,11 @@ impl<A: LifecycleAdapter + ?Sized, S> Drop for RetirementJob<A, S> {
     fn drop(&mut self) {
         if !self.completed {
             self.completed = true;
-            self.inner
-                .finish_retirement(self.retirement_id, Err(FailureCategory::Backend));
-            self.participant.take();
+            self.inner.finish_retirement(
+                self.retirement_id,
+                Err(FailureCategory::Backend),
+                &mut self.participant,
+            );
         }
     }
 }
@@ -1064,7 +1066,12 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
         }
     }
 
-    fn finish_retirement(&self, retirement_id: u64, result: Result<(), FailureCategory>) {
+    fn finish_retirement(
+        &self,
+        retirement_id: u64,
+        result: Result<(), FailureCategory>,
+        participant: &mut Option<OperationParticipant>,
+    ) {
         let mut state = lock(&self.state);
         let Some(record) = state.retirements.remove(&retirement_id) else {
             return;
@@ -1122,9 +1129,12 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
             };
             self.transition_locked(&mut state, record.source_id, next);
         }
-        // Publish completion only after all entry bookkeeping, typed events,
-        // and the terminal state transition are visible. A waiter waking on
-        // another runtime thread may immediately snapshot the finalized row.
+        // End shutdown-barrier participation only after all entry bookkeeping,
+        // typed events, and the terminal state transition are visible, then
+        // publish waiter completion. A waiter waking on another runtime thread
+        // may therefore immediately snapshot the finalized row and observe a
+        // complete shutdown barrier.
+        participant.take();
         record
             .outcome
             .send_replace(RetirementOutcome::Finished(failure));

@@ -54,7 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancelled, panicking, replaced, disconnected, and shutdown sessions through one exactly-once
   tracked retirement path; panic isolation covers both synchronous closure invocation and future
   polling. Repeated disconnect callers share an exact waiter that wakes only after retirement
-  bookkeeping, typed events, and the terminal snapshot are finalized. Reconnect can adopt a
+  bookkeeping, typed events, the terminal snapshot, and that close task's shutdown-barrier
+  participation are finalized. Reconnect can adopt a
   successor while the predecessor closes without letting old success or failure mutate the new
   session, and a later successor disconnect has its own completion. Every associated predecessor
   close publishes its old session epoch so a pending-retirement count change advances the snapshot
