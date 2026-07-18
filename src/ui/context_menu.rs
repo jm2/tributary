@@ -538,11 +538,16 @@ fn build_add_to_playlist_actions(
                 let add_action = gtk::gio::SimpleAction::new(&action_name, None);
                 let uris = selected_uris;
                 let pid = pl_id.clone();
-                let window = interaction.window.clone();
+                // Materialize a fresh owned weak handle for the `'static`
+                // action closure; never let the borrowed factory input escape.
+                let window = interaction
+                    .window
+                    .upgrade()
+                    .map(|window| window.downgrade());
                 let activation = interaction.support.activation();
                 add_action.connect_activate(move |_, _| {
                     if activation == PlaylistAddActivation::ExplainUnsupportedSource {
-                        if let Some(window) = window.upgrade() {
+                        if let Some(window) = window.as_ref().and_then(|window| window.upgrade()) {
                             show_unsupported_playlist_add_dialog(&window);
                         }
                         return;
