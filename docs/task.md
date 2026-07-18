@@ -128,7 +128,9 @@ weak registry authority plus source and per-view leases; replacement, removal, d
 overlapping view, or dropping the last registry handle therefore revokes even an already-resolved
 request. GTK retains inactive caches, distinguishes an accepted empty view from a failed successor,
 and clears all three lanes plus playback on epoch loss/replacement. Near Me performs only translated
-consent/navigation in GTK; its adapter tolerates partial successful tiers, deduplicates by tier
+consent/navigation in GTK; an exact generation-owned prerequisite marker prevents unrelated
+lifecycle invalidations from misclassifying the deliberate pre-construction dialog interval as
+source loss, while a stale/superseded dialog cannot suppress ordinary fallback. Its adapter tolerates partial successful tiers, deduplicates by tier
 precedence before one stable global distance sort, and retains no locator in rows or queues. This is
 another part of the still-open compound record, so the literal totals remain **219/223 (98.2%)**,
 **76/79 P2**, and **29/30 P3** until the removable and external-file adapters also land.

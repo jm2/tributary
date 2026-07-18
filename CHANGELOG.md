@@ -119,9 +119,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interactive-Jellyfin, and actual-wire DAAP regressions cover the authenticated cutover.
   Radio-Browser now uses three exact independently cancellable views, preserves a predecessor on
   failed refresh, publishes accepted empty results authoritatively, and resolves public streams
-  from private locator contributions only at use. Near Me performs translated consent in GTK,
-  tolerates partial successful tiers, deduplicates by tier precedence, and then applies one stable
-  global distance sort. Removable and OS-opened external media still need registry-owned at-use
+  from private locator contributions only at use. Near Me performs translated consent in GTK; an
+  exact generation-owned prerequisite marker prevents unrelated lifecycle invalidations from
+  treating the deliberate pre-construction dialog interval as source loss, while a stale or
+  superseded dialog cannot suppress ordinary fallback. The adapter tolerates partial successful
+  tiers, deduplicates by tier precedence, and then applies one stable global distance sort.
+  Removable and OS-opened external media still need registry-owned at-use
   locator adapters; those two adapters keep P3.1's final implementation record open.
 - **The centralized source-lifecycle foundation now backs the production source registry** —
   `SourceLifecycleRegistry` provides the atomic adapter, revocable media lease, session epoch,

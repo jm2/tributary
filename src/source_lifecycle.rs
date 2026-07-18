@@ -2145,7 +2145,10 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
     {
         let owner = self.begin_connect(source_id)?;
         let generation = owner.generation();
-        match owner.submit_constructed(ConstructedAdapter::from_box(adapter), snapshot) {
+        let settlement = Arc::clone(&owner.settlement);
+        let submission = owner.submit_constructed(ConstructedAdapter::from_box(adapter), snapshot);
+        self.remove_inactive_connect_settlement(source_id, generation, &settlement);
+        match submission {
             ConnectSubmission::Adopted { session_epoch, .. } => Some((generation, session_epoch)),
             ConnectSubmission::Rejected => None,
         }
@@ -2160,8 +2163,32 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
     ) -> Option<u64> {
         let owner = self.begin_connect(source_id)?;
         let generation = owner.generation();
+        let settlement = Arc::clone(&owner.settlement);
         owner.fail(category);
+        self.remove_inactive_connect_settlement(source_id, generation, &settlement);
         Some(generation)
+    }
+
+    fn remove_inactive_connect_settlement(
+        &self,
+        source_id: SourceId,
+        generation: u64,
+        settlement: &Arc<ConnectSettlement>,
+    ) {
+        if settlement.active() != 0 {
+            return;
+        }
+        let mut state = lock(&self.inner.state);
+        let Some(entry) = state.entries.get_mut(&source_id) else {
+            return;
+        };
+        let is_exact = entry
+            .connect_settlements
+            .get(&generation)
+            .is_some_and(|current| Arc::ptr_eq(current, settlement));
+        if is_exact {
+            entry.connect_settlements.remove(&generation);
+        }
     }
 
     /// Begin or supersede one refresh lane against the exact current epoch.

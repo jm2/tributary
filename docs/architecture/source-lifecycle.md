@@ -373,7 +373,9 @@ Radio-Browser is one registered stateless source. Top Clicked, Top Voted, and Ne
 `ViewOrigin` queries, not three sources; the same station UUID therefore denotes the same
 `MediaKey` in every result set. Fetching a feed is a cancellable generation-owned query, including
 the geolocation/consent branch for Near Me, and each view retains its last successful snapshot
-during refresh. `TrackId` is the station UUID; the current station URL is a locator in the source
+during refresh. While first-use consent is open, an exact generation-owned prerequisite marker
+distinguishes that deliberate pre-construction interval from source loss; stale/superseded dialog
+requests cannot keep that exception current. `TrackId` is the station UUID; the current station URL is a locator in the source
 adapter and resolves only when playback starts. The adapter retains a locator while at least one
 current view snapshot contains that station. It retains contributions per `ViewOrigin`, tagged
 with the source-wide monotonically increasing operation generation that produced each accepted
