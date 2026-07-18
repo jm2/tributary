@@ -179,10 +179,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   atomic replacement, deterministic duplicate collapse, and fail-closed whole-file conflict
   quarantine. Overlapping radio views retain separate locator contributions and choose the newest
   initiated accepted refresh deterministically rather than completion order.
-  PR #113 recorded this decision only. PR #120 now implements its stable source/media identity and
-  saved-source migration, while sibling standard/DAAP registries, split refresh/failure ownership,
-  unified provenance, retained local root/file authority, and several at-use locator adapters
-  remain implementation work tracked under P3.1.
+  PR #113 recorded this decision only. PR #120 implements its stable source/media identity and
+  saved-source migration; PR #121 adds exact local/playlist resolution plus retained root/file
+  authority through output consumption. Sibling standard/DAAP registries, split refresh/failure
+  ownership, unified provenance, embedded-art authority, and several nonlocal at-use locator
+  adapters remain implementation work tracked under P3.1.
 - **Local album and artist aggregates now have stable identities** — `LocalBackend` replaces its
   per-call random album/artist UUIDs with UUIDv5 values under a private versioned namespace. Artist
   and album domains are separate, every component is length-framed to prevent concatenation
@@ -205,7 +206,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     aggregate identity. The common complete-catalogue backend seam was completed later in this
     development cycle. The P3.1 stable-identity milestone subsequently preserved exact persisted
     local track-ID strings and replaced the random malformed-UUID fallback with a frozen
-    deterministic compatibility projection; current root/file authority and lifetime remain open.
+    deterministic compatibility projection. PR #121 subsequently adds current root/file authority
+    and retains it through the complete playback-output lifetime.
 - **Minimum supported Rust version raised to 1.92** — Originally raised to 1.85 in this cycle, but the gtk-rs 0.11 release series (gtk4, glib, gstreamer) requires rustc 1.92, so 1.85 had been unbuildable fiction since that upgrade. The declaration now matches reality and a dedicated CI job compile-proves the MSRV against the committed lockfile on every push, so it cannot silently drift again.
 - **The local validation gate is now enforced by CI** — Debug-profile `cargo test --all-targets` (release-only testing compiled out `debug_assert!` bodies and overflow checks), fuzz-workspace `fmt`/`clippy` against its committed lockfile (which had already drifted past the supported toolchain unnoticed), strict no-diagnostics `desktop-file-validate`, and `appstreamcli validate` all run on every push and pull request. Repository-level tests also pin the Rust/API floor, native package requirements, desktop launch field, and main category together so those declarations cannot silently diverge again. Their workflow inspection is line-ending agnostic and explicitly exercises a synthesized CRLF checkout, so Windows cannot report a missing job merely because Git converted the YAML file. Windows architecture jobs now finish independently instead of matrix fail-fast cancelling the surviving diagnostic signal, and the ARM runner skips setup-msys2's optional package cache after its `paccache` cleanup intermittently failed even though package installation had succeeded; Cargo retains its separate architecture-specific cache.
 - **Flatpak source generation is consistent across local and CI builds** — The exact checksum-pinned `flatpak-cargo-generator` revision is now vendored with provenance, an MIT license notice, and update instructions. One repository-root-independent helper verifies those bytes, Python 3.9+, and the exact direct dependency versions before always generating `build-aux/flatpak/cargo-sources.json`; the Linux build helper and CI both call it instead of downloading the generator or writing the manifest to the wrong directory. The Python transitive dependency graph is not hash-locked. Local instructions keep those packages in an XDG cache virtual environment and configure Flathub. Flatpak-only mode now bypasses native Rust/GTK prerequisite checks, the directory source excludes known VCS/agent/generated state (including host `target/`), the builder installs the runtime, SDK, and Rust extension from Flathub, and the single-file bundle records that runtime repository. The release workflow remains deliberately unchanged for now and continues to download and verify the identical immutable generator revision before use.
@@ -214,27 +216,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Playlist import matching is deterministic, ambiguity-safe, and indexed** — An exact path decoded from a valid local `file:` URI—including Windows drive-letter form—wins first; non-file and malformed locations are not treated as filesystem paths. Otherwise title and artist, plus album when supplied, must match exactly after trimming and case normalization; matching is deliberately not fuzzy. A supplied duration is a hard inclusive ±5-second gate and only the unique nearest candidate wins, while an equal-nearest tie or duplicate metadata without duration remains unmatched. Import and later orphan reconciliation use the same resolver and build its path/normalized-metadata index once per library snapshot, so the result cannot change merely because two call paths ranked candidates differently and large playlists do not repeatedly scan and normalize the entire library. Path authority is retained only from imported location evidence; metadata-only imports and manually added entries remain fingerprint-only across repeated relinks, preventing a different song at a reused library path from silently taking over the entry. Corrupt negative or out-of-schema library durations are omitted from match evidence instead of wrapping or blocking reconciliation, and already-corrupt negative entry evidence is treated as absent.
 
 ### Fixed
-- **Local and playlist playback no longer depends on a file URI captured when the queue was
-  built** — Local architecture rows now preserve the exact SQLite `tracks.id` string, including
-  legacy non-UUID values, and malformed UUID compatibility conversion is deterministic instead of
-  minting a different random identity on every read. Local and playlist queue items retain that
-  ID, ordering, duplicate occurrence, and display metadata but deliberately omit the file
-  location. Initial play, Next, Previous when it selects another queue item, repeat/replay, and
-  every selected-output load perform an asynchronous exact-ID database lookup, verify under a
-  five-second budget that the current path is a regular file, and only then hand its file URI to
-  the output; a deleted row, empty ID, dead
-  path, timed-out check, stale completion, or resolver failure cannot fall back to queue history,
-  playlist fingerprints, metadata, or another track. Playlist rows may still retain a current
-  path for display and file-management actions. If an output later reports a load error, the next
-  Play resolves the same ID again instead of trying to resume an empty or failed output.
-  Playlist queues now use the same local `SourceId` and `TrackId` as the library plus a separate
-  `ViewOrigin`: local-source retirement clears every local projection, while deleting or
-  refreshing one playlist cannot claim a sibling view. Retaining a root-authority/file lease
-  through the output's complete consumption remains open P3.1 work. The current resolver also
-  does not yet acquire the currently authorized root, prove the database path is contained beneath
-  it, or acquire exact file authority; its five-second check is regular-file metadata evidence,
-  not a containment or retained-authority proof. The local-resolution compound task therefore
-  remains unchecked even though the stable-identity compound task is complete.
+- **Local and playlist playback now resolves exact identity into retained file authority at use** —
+  PR #120 preserves the exact SQLite `tracks.id` string—including legacy non-UUID values—uses a
+  frozen deterministic malformed-ID compatibility projection, and gives playlist rows the local
+  `MediaKey` plus a separate `ViewOrigin`. Queue snapshots retain that identity, order, duplicate
+  occurrence, and display metadata but deliberately omit the playback path. Initial Play, newly
+  selected Next/Previous, repeat/replay, and output retries asynchronously re-read only the exact
+  row, choose the most-specific root that is both currently configured and backed by complete,
+  available, identity-confirmed state, and reject missing, empty, dead, timed-out, stale, or
+  displaced authority without metadata, fingerprint, saved-path, or alternate-track fallback.
+  Resolution retains the exact root, marker, ancestor chain, and regular-file handle under a
+  five-second outer budget and rechecks the exact track path plus the root key, marker identity,
+  confirmation, availability, and complete-scan authority state before publication. The
+  observational `last_checked_at` scan timestamp is deliberately excluded from that authority
+  snapshot, so a concurrent successful scan cannot reject playback merely by refreshing metadata;
+  any authority-relevant drift still fails closed. The GTK
+  handoff rechecks that the retained root is still the most-specific configured match without
+  touching the filesystem, and the bounded ticket worker revalidates physical authority before
+  every retained-handle clone. Local and AirPlay GStreamer, Chromecast, and MPD receive a typed
+  lease and consume it through an opaque handle-backed app ticket, never by reopening the database
+  path. The bounded two-chunk stream uses explicit-offset reads, so sequential or concurrent full
+  and Range requests cannot corrupt one another through an OS-cloned shared cursor. Replacing a
+  pathname cannot retarget an admitted load, while root or marker loss blocks later handle clones.
+  Replacement, Stop, load or playback failure, terminal queue completion, ticket drop, and
+  output/server teardown revoke future lookup; a failed item remains retryable through a fresh
+  exact-ID resolution. Shared Chromecast cleanup revokes credential and retained-authority routes
+  while preserving the documented server-lifetime contract of legacy explicit-file routes. GTK
+  rows may still retain current paths for non-playback display and file management, and embedded-art
+  display still gives its helper the exact playback-time path rather than retained authority.
+  Fifty-six focused exact-ID, root-authority, queue/view-ownership,
+  handle-streaming, GStreamer-ticket, and MPD-ticket regressions pass with the locked all-target
+  compile, formatting/diff gates, and strict warning-free Clippy in both profiles. The complete
+  debug and release suites each pass 20 library, 804 application, and 10 repository-metadata tests
+  (834 total), including every socket-bearing regression. Gemini's review follow-up is covered by
+  a deterministic regression that accepts timestamp-only drift while independently rejecting
+  changes to every retained root-authority field.
 - **Subsonic failed envelopes no longer retain a server-controlled error message** — HTTP-200 API failures keep only the numeric Subsonic code in a fixed typed error; code 40 remains authentication rejection and code 41 remains the HTTPS-only legacy-auth negotiation signal. A malicious or broken peer can no longer echo a submitted password or arbitrary text into retained errors, logs, or UI-facing classification.
 - **Radio-Browser and geolocation no longer trust successful-looking JSON on an HTTP error** — Station and all three IP-geolocation provider paths now require a success status before their bounded response reader or deserializer can publish data. A `503` carrying a syntactically valid station or location is rejected, the geolocation cascade advances to its next provider, and late or oversized bodies remain bounded. Public same-origin/cross-origin redirects retain the existing no-`Referer`, no-HTTPS-downgrade policy.
 - **Jellyfin and Plex now preserve reverse-proxy base paths for every API and media request** — Both clients remove only one trailing empty base segment before appending API paths, so root, `/share`, `/share/`, and already-escaped prefixes do not gain a doubled slash or lose their prefix. Plex stream-part and thumbnail paths now append below that same configured base instead of replacing it; escaped bytes are preserved and normalized dot segments cannot escape the prefix. Root `//` and prefixed `/share//` regressions pin the same one-empty-segment rule across catalogue and protected-media construction. The rejection uses a fixed peer-path-free error. Complete prefixed backend fixtures prove authenticated ping/identity, discovery, pagination, stream, and artwork construction.
@@ -315,17 +331,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MediaBackend` trait-object seam. Authentication, registry/session lifecycle, refresh/failure
   ownership, and some browsing paths still branch by concrete backend; the standard and DAAP
   registries remain separate, and environment, interactive, and manual connection paths are
-  duplicated. Local and playlist playback resolves the exact current database row by ID and checks
-  regular-file metadata, but does not yet acquire the currently authorized root, prove that the
-  database path is contained beneath it, acquire exact file authority, or retain root/file
-  authority through the output's complete consumption. A row that is both discovered and saved
-  also has only one `manually_added` flag: deleting the saved provenance cannot yet demote it back
-  to a still-live discovery publication, and discovery loss deliberately retires live ownership
-  even when the saved row remains. Radio, removable, and external queues have location-independent
-  identity but still retain their current locator instead of resolving it through a shared adapter
-  at use. Unified provenance and those lifecycle/authority items remain P3.1 work; they do not
-  reintroduce backend credentials into generic values.
-- **Credential-bearing media tickets remain replayable within their hard lifetime** — Each opaque output ticket is a bearer for one fixed media item and arbitrary byte ranges until the earlier of source-lease/lifecycle revocation or its absolute 24-hour expiry; it is not a one-shot token. Neither event cancels a response the proxy already admitted. Protected local/AirPlay tickets are reachable only through a dedicated loopback listener; a protected MPD load from an unspecified address, or a scoped/link-local IPv6 route, fails closed rather than exposing the upstream request. Local-file routes are separate session-lifetime capabilities because they front no backend credential.
+  duplicated. Local/playlist playback now resolves exact stable IDs into retained root/file
+  authority at use, but embedded-art display still gives its helper the exact playback-time path
+  rather than retained authority. A row that is both discovered and saved also has only one
+  `manually_added` flag: deleting saved provenance cannot yet demote it back to a still-live
+  discovery publication, and discovery loss deliberately retires live ownership even when the
+  saved row remains. Radio, removable, and external queues have location-independent identity but
+  still retain their current locator instead of resolving it through a shared adapter at use.
+  Unified provenance and those lifecycle/adapter items remain P3.1 work; they do not reintroduce
+  backend credentials or local playback paths into generic queue values.
+- **Credential-bearing media tickets remain replayable within their hard lifetime** — Each opaque output ticket is a bearer for one fixed media item and arbitrary byte ranges until the earlier of source-lease/lifecycle revocation or its absolute 24-hour expiry; it is not a one-shot token. Neither event cancels a response the proxy already admitted. Protected local/AirPlay tickets are reachable only through a dedicated loopback listener; a protected MPD load from an unspecified address, or a scoped/link-local IPv6 route, fails closed rather than exposing the upstream request. Playback-time local-authority tickets follow their owning load lifecycle; only legacy explicit-file routes retain the older server-lifetime capability contract.
 - **Live packaged-Windows protected-playback validation remains outstanding** — Fake DAAP and Subsonic streams traverse the complete production protected-player path through real GStreamer, and native x86_64 and ARM64 package jobs both prove their finished distribution supplies the selected HTTP source, scanner, decoder, required DLL closure, direct-loopback policy, alternate-source fail-closed path, and real FLAC decode to end-of-stream without borrowing the build host's runtime. That deterministic probe cannot establish compatibility with the reported live DAAP/Subsonic servers, `.local`/mDNS routing, TLS, physical audio output, firewall or endpoint-security policy, or the user's legitimate upstream proxy. Audible live playback from the packaged application remains to be recorded, and no automated result proves that DNS caused the original failures.
 
 ---

@@ -1266,6 +1266,7 @@ pub fn build_window(
             let column_view_for_keys = column_view.clone();
             let clear_playback_ui = clear_playback_ui.clone();
             let playback_rt = rt_handle.clone();
+            let playback_config = app_config.clone();
 
             glib::MainContext::default().spawn_local(async move {
                 while let Ok(action) = media_rx.recv().await {
@@ -1279,6 +1280,7 @@ pub fn build_window(
                         artist_label: artist_label.clone(),
                         media_ctrl: ctrl_for_ctx.clone(),
                         session: playback_session.clone(),
+                        app_config: playback_config.clone(),
                         rt_handle: playback_rt.clone(),
                         column_view: column_view_for_keys.clone(),
                     };
@@ -1357,6 +1359,7 @@ pub fn build_window(
         let shuffle = hb.shuffle_button.clone();
         let column_view_c = column_view.clone();
         let playback_rt = rt_handle.clone();
+        let playback_config = app_config.clone();
 
         hb.play_button.connect_clicked(move |_| {
             toggle_or_start(
@@ -1369,6 +1372,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    app_config: playback_config.clone(),
                     rt_handle: playback_rt.clone(),
                     column_view: column_view_c.clone(),
                 },
@@ -1493,6 +1497,7 @@ pub fn build_window(
         let playback_session = playback_session.clone();
         let cv = column_view.clone();
         let playback_rt = rt_handle.clone();
+        let playback_config = app_config.clone();
 
         column_view.connect_activate(move |_view, position| {
             play_track_at(
@@ -1506,6 +1511,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    app_config: playback_config.clone(),
                     rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
                 },
@@ -1549,6 +1555,7 @@ pub fn build_window(
         let shuffle = hb.shuffle_button.clone();
         let cv = column_view.clone();
         let playback_rt = rt_handle.clone();
+        let playback_config = app_config.clone();
 
         hb.next_button.connect_clicked(move |_| {
             advance_track(
@@ -1561,6 +1568,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    app_config: playback_config.clone(),
                     rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
                 },
@@ -1584,6 +1592,7 @@ pub fn build_window(
         let shuffle = hb.shuffle_button.clone();
         let cv = column_view.clone();
         let playback_rt = rt_handle.clone();
+        let playback_config = app_config.clone();
 
         hb.prev_button.connect_clicked(move |_| {
             // If more than 3 s into the track, restart it.
@@ -1603,6 +1612,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    app_config: playback_config.clone(),
                     rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
                 },
@@ -1640,6 +1650,7 @@ pub fn build_window(
         let clear_playback_ui = clear_playback_ui.clone();
         let toast_overlay = toast_overlay.clone();
         let playback_rt = rt_handle.clone();
+        let playback_config = app_config.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -1775,6 +1786,7 @@ pub fn build_window(
                                 artist_label: artist_label.clone(),
                                 media_ctrl: media_ctrl.clone(),
                                 session: playback_session.clone(),
+                                app_config: playback_config.clone(),
                                 rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
                             })
@@ -1793,6 +1805,7 @@ pub fn build_window(
                                 artist_label: artist_label.clone(),
                                 media_ctrl: media_ctrl.clone(),
                                 session: playback_session.clone(),
+                                app_config: playback_config.clone(),
                                 rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
                             },
@@ -1802,8 +1815,12 @@ pub fn build_window(
 
                         if !advanced {
                             // End of playlist — invalidate the event generation
-                            // before resetting every async/visible UI surface.
+                            // before stopping the output. This also revokes a
+                            // receiver-facing local-file lease after natural
+                            // completion; any synchronous Stopped event is
+                            // already stale.
                             playback_session.borrow_mut().clear();
+                            active_output.borrow().stop();
                             clear_playback_ui();
                         }
                     }
@@ -1893,6 +1910,7 @@ pub fn build_window(
         let playback_session = playback_session.clone();
         let cv = column_view.clone();
         let playback_rt = rt_handle.clone();
+        let playback_config = app_config.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
         play_pending.connect_activate(move |_, _| {
@@ -1912,6 +1930,7 @@ pub fn build_window(
                 artist_label: artist_label.clone(),
                 media_ctrl: media_ctrl.clone(),
                 session: playback_session.clone(),
+                app_config: playback_config.clone(),
                 rt_handle: playback_rt.clone(),
                 column_view: cv.clone(),
             };

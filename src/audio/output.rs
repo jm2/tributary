@@ -30,6 +30,7 @@
 
 use super::{PlayerEventGeneration, PlayerState};
 use crate::architecture::media::ResolvedHttpRequest;
+use crate::local::resolver::ResolvedLocalMedia;
 
 /// Identifies the type of an audio output for UI purposes (icon, label).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +94,14 @@ pub trait AudioOutput {
     /// The return value has the same synchronous-acceptance contract as
     /// [`load_uri`](Self::load_uri).
     fn load_resolved(&self, request: ResolvedHttpRequest) -> bool;
+
+    /// Load one playback-time authorized local-library file.
+    ///
+    /// The owned value retains the exact root, marker, ancestors, and file
+    /// handle selected by stable track ID. Implementations must keep that
+    /// authority alive for the complete output/ticket lifecycle and must not
+    /// recover or reopen a pathname from generic queue state.
+    fn load_local(&self, media: ResolvedLocalMedia) -> bool;
 
     /// Tag subsequent events with the playback load that owns them.
     ///

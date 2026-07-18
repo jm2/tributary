@@ -53,6 +53,7 @@ use gtk::glib;
 use tracing::{debug, error, info, warn};
 
 use crate::architecture::media::ResolvedHttpRequest;
+use crate::local::resolver::ResolvedLocalMedia;
 
 /// Active AirPlay session: the dedicated GStreamer RAOP pipeline.
 struct Session {
@@ -180,6 +181,16 @@ impl AirPlayOutput {
         let prepared = self
             .media_proxy
             .prepare_resolved(request)
+            .map_err(|_| "AirPlay media preparation failed".to_string())?;
+        self.open_prepared_media(prepared)
+    }
+
+    fn open_local_session(&self, media: ResolvedLocalMedia) -> Result<(), String> {
+        self.close_session();
+        Self::ensure_raopsink(Self::raopsink_available())?;
+        let prepared = self
+            .media_proxy
+            .prepare_local(media)
             .map_err(|_| "AirPlay media preparation failed".to_string())?;
         self.open_prepared_media(prepared)
     }
@@ -451,6 +462,16 @@ impl AudioOutput for AirPlayOutput {
             .event_tx
             .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
         self.finish_load(generation, self.open_resolved_session(request));
+        true
+    }
+
+    fn load_local(&self, media: ResolvedLocalMedia) -> bool {
+        info!("AirPlay: loading authorized local media");
+        let generation = self.event_generation();
+        let _ = self
+            .event_tx
+            .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
+        self.finish_load(generation, self.open_local_session(media));
         true
     }
 

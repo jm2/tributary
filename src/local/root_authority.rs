@@ -181,6 +181,25 @@ impl BoundFile {
         self.object.file.try_clone()
     }
 
+    /// Clone the exact file retained at authorization time for media use.
+    ///
+    /// Unlike [`Self::validate`], this deliberately does not require the old
+    /// pathname still to name the file. A committed library rename may move a
+    /// track while an already-admitted playback or receiver range request is
+    /// consuming it. The retained file object remains the authority in that
+    /// case: it cannot turn into a replacement subsequently installed at the
+    /// old path. The root, marker, retained parent chain, and lease token must
+    /// all remain valid before another handle is issued.
+    pub(super) fn try_clone_for_consumption(&self, lease: &RootAuthorityLease) -> io::Result<File> {
+        lease.validate_bound_token(self.lease_token)?;
+        self.object.validate_live()?;
+        validate_retained_objects(&self.parent_guards)?;
+        lease.validate()?;
+        let file = self.object.file.try_clone()?;
+        lease.validate()?;
+        Ok(file)
+    }
+
     /// Verify that the exact path still names this retained regular file.
     pub(super) fn validate(&self, lease: &RootAuthorityLease) -> io::Result<()> {
         lease.validate_bound_token(self.lease_token)?;

@@ -454,6 +454,10 @@ mod tests {
             false
         }
 
+        fn load_local(&self, _media: crate::local::resolver::ResolvedLocalMedia) -> bool {
+            false
+        }
+
         fn set_event_generation(&self, generation: PlayerEventGeneration) {
             self.state.borrow_mut().generations.push(generation);
         }
