@@ -1804,6 +1804,13 @@ mod tests {
             "$ErrorActionPreference = \"Stop\"\n",
             helpers,
             r#"
+if ($env:TRIBUTARY_REQUIRE_DESKTOP_POWERSHELL -eq "1" -and
+    ($PSVersionTable.PSEdition -ne "Desktop" -or
+     $PSVersionTable.PSVersion.Major -ne 5 -or
+     $PSVersionTable.PSVersion.Minor -ne 1)) {
+    throw "target regression did not run under Windows PowerShell 5.1"
+}
+
 function Assert-TargetFailure {
     param(
         [System.Collections.Generic.List[string]]$Targets,
@@ -1899,16 +1906,29 @@ Assert-TargetFailure $newlineTarget "target #1 contains an unsupported quote or 
                 .env("TRIBUTARY_VALID_EXE", &valid_exe)
                 .env("TRIBUTARY_WRONG_EXTENSION", &wrong_extension)
                 .env("TRIBUTARY_MISSING_DLL", &missing_dll)
+                .env(
+                    "TRIBUTARY_REQUIRE_DESKTOP_POWERSHELL",
+                    if cfg!(target_os = "windows") {
+                        "1"
+                    } else {
+                        "0"
+                    },
+                )
                 .output()
         };
-        let output = match run("pwsh") {
+        let program = if cfg!(target_os = "windows") {
+            "powershell.exe"
+        } else {
+            "pwsh"
+        };
+        let output = match run(program) {
             Ok(output) => output,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match run("powershell") {
-                Ok(output) => output,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-                Err(error) => panic!("could not run Windows PowerShell target regression: {error}"),
-            },
-            Err(error) => panic!("could not run PowerShell target regression: {error}"),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && !cfg!(target_os = "windows") =>
+            {
+                return;
+            }
+            Err(error) => panic!("could not run {program} PE target regression: {error}"),
         };
 
         assert!(
