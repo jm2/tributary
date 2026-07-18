@@ -191,3 +191,15 @@ When an item becomes active:
 3. link the design document when protocol, schema, authority, or cross-output behavior is involved;
 4. update this roadmap, README feature status, and `CHANGELOG.md` in the implementing PR; and
 5. close or narrow the issue only when the shipped behavior and documentation match.
+
+[#8]: https://github.com/jm2/tributary/issues/8
+[#11]: https://github.com/jm2/tributary/issues/11
+[#14]: https://github.com/jm2/tributary/issues/14
+[#29]: https://github.com/jm2/tributary/issues/29
+[#37]: https://github.com/jm2/tributary/issues/37
+[#39]: https://github.com/jm2/tributary/issues/39
+[#46]: https://github.com/jm2/tributary/issues/46
+[#47]: https://github.com/jm2/tributary/issues/47
+[#49]: https://github.com/jm2/tributary/issues/49
+[#50]: https://github.com/jm2/tributary/issues/50
+[#57]: https://github.com/jm2/tributary/issues/57
