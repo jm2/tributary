@@ -24,7 +24,7 @@ use super::source_navigation::{PendingConnection, SourceNavigation, SourceReques
 pub struct WindowState {
     // ── Top-level GTK handles ───────────────────────────────────────
     /// The main application window.
-    /// Used by: source_connect (auth dialogs), playlist_actions (dialogs).
+    /// Used by: source_connect (auth dialogs), playlist_actions (dialogs), context_menu (results).
     pub window: adw::ApplicationWindow,
 
     /// Tokio runtime handle for spawning async background work.

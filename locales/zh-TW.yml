@@ -172,6 +172,8 @@ context:
   properties: "內容…"
   add_to_playlist: "加入播放清單"
   remove_from_playlist: "從播放清單移除"
+  playlist_add_unsupported_heading: "曲目未加入"
+  playlist_add_unsupported_body: "目前，只有 Tributary 本機音樂庫中的曲目才能加入播放清單。此資料來源中的內容均未加入。"
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

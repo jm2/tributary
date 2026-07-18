@@ -172,6 +172,8 @@ context:
   properties: "Eigenschappen…"
   add_to_playlist: "Toevoegen aan afspeellijst"
   remove_from_playlist: "Verwijderen uit afspeellijst"
+  playlist_add_unsupported_heading: "Nummers zijn niet toegevoegd"
+  playlist_add_unsupported_body: "Op dit moment kunnen alleen nummers uit de lokale bibliotheek van Tributary aan afspeellijsten worden toegevoegd. Er is niets uit deze bron toegevoegd."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

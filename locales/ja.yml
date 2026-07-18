@@ -172,6 +172,8 @@ context:
   properties: "プロパティ…"
   add_to_playlist: "プレイリストに追加"
   remove_from_playlist: "プレイリストから削除"
+  playlist_add_unsupported_heading: "曲は追加されませんでした"
+  playlist_add_unsupported_body: "現在プレイリストに追加できるのは、Tributary のローカルライブラリにある曲だけです。このソースからは何も追加されませんでした。"
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

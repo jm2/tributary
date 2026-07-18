@@ -21,16 +21,16 @@ state.
 - Do not treat the order below as a release promise. It is a dependency-aware starting order and
   can change as issues receive product decisions and milestones.
 
-Current status: **1/35 (2.9%)** active implementation records complete. This percentage measures
+Current status: **2/35 (5.7%)** active implementation records complete. This percentage measures
 checklist completion, not equal engineering effort: several P3 records are deliberately large
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
 ## Current focus
 
-P1.1 is complete. Continue with the bounded P1.2 interaction fix, then the playback-history
-foundation in P1.3. The rest of P1 builds on the source-scoped identity already present in the
-runtime and the now-bounded shuffle navigation semantics.
+P1.1 and P1.2 are complete. Continue with the playback-history contract and migration foundation
+in P1.3. The rest of P1 builds on the source-scoped identity already present in the runtime, the
+now-bounded shuffle navigation semantics, and an honest local-only playlist interaction boundary.
 
 ## P1 — Correctness and shared feature foundations
 
@@ -68,11 +68,21 @@ runtime and the now-bounded shuffle navigation semantics.
 
 ### P1.2 — Make unsupported remote playlist actions honest
 
-- [ ] When Add to Playlist cannot accept a remote row, show a localized, user-visible result
-  instead of only logging that the row was skipped ([#47](https://github.com/jm2/tributary/issues/47)).
+- [x] When Add to Playlist cannot accept a remote row, show a localized, user-visible result
+  instead of only logging that the row was skipped ([#47](https://github.com/jm2/tributary/issues/47);
+  [#133](https://github.com/jm2/tributary/pull/133)).
 
   Keep this slice migration-free. It closes the misleading current interaction while P1.5 designs
   full remote playlist persistence.
+
+  Implemented contract: the context menu snapshots the active source together with its selection.
+  Only the exact built-in `local` view may enter the local-playlist database path. Choosing a
+  destination playlist from an authenticated remote, Radio-Browser, removable source, or any
+  unknown/pathless view now presents a localized all-or-none explanation before a runtime task or
+  database connection is created, so no unsupported selection can be partially written. Existing
+  Add/Remove/Properties menu labels now use their shipped translations as well. Policy regressions
+  fail closed across exact remote/radio/removable identities and malformed keys, and all 13 locale
+  catalogs carry non-fallback result copy. Persistent remote playlist entries remain P1.5.
 
 ### P1.3 — Record trustworthy local playback history
 
@@ -218,3 +228,4 @@ runtime and the now-bounded shuffle navigation semantics.
 |---|---|---|---|
 | 2026-07-18 | Backlog reset | — | Archived the holistic-review tracker and established the audited feature backlog; no implementation record completed. |
 | 2026-07-18 | P1.1 bounded shuffle history | [#132](https://github.com/jm2/tributary/pull/132) | Retained ten real prior occurrences, fixed forward traversal and complete Repeat All cycles, unified Previous dispatch, made toggle/reset semantics explicit, and added lifecycle/rollback regressions. |
+| 2026-07-18 | P1.2 honest unsupported playlist actions | [#133](https://github.com/jm2/tributary/pull/133) | Refused non-local Add to Playlist actions with an all-or-none localized dialog before database work, localized the existing context-menu labels, and regressed the fail-closed source policy plus every shipped catalog. |

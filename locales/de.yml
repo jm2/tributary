@@ -172,6 +172,8 @@ context:
   properties: "Eigenschaften…"
   add_to_playlist: "Zur Wiedergabeliste hinzufügen"
   remove_from_playlist: "Aus Wiedergabeliste entfernen"
+  playlist_add_unsupported_heading: "Titel wurden nicht hinzugefügt"
+  playlist_add_unsupported_body: "Derzeit können nur Titel aus der lokalen Bibliothek von Tributary zu Wiedergabelisten hinzugefügt werden. Aus dieser Quelle wurde nichts hinzugefügt."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:
