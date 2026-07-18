@@ -16,7 +16,7 @@ use tokio::task::JoinSet;
 
 use crate::architecture::SourceId;
 use crate::source_lifecycle::{FailureCategory, SourceProvenance};
-use crate::source_registry::RemoteSourceRegistry;
+use crate::source_registry::SourceRegistry;
 
 use super::DaapBackend;
 
@@ -379,18 +379,18 @@ fn tlv_u32(tag: &[u8; 4], value: u32) -> Vec<u8> {
     tlv(tag, &value.to_be_bytes())
 }
 
-fn registry() -> RemoteSourceRegistry {
-    RemoteSourceRegistry::new(tokio::runtime::Handle::current())
+fn registry() -> SourceRegistry {
+    SourceRegistry::new(tokio::runtime::Handle::current())
 }
 
-fn claim_saved(registry: &RemoteSourceRegistry, source_id: SourceId) {
+fn claim_saved(registry: &SourceRegistry, source_id: SourceId) {
     assert!(registry
         .claim_provenance(source_id, SourceProvenance::Saved)
         .is_some());
 }
 
 fn connect_daap(
-    registry: &RemoteSourceRegistry,
+    registry: &SourceRegistry,
     source_id: SourceId,
     name: &'static str,
     base_url: String,
@@ -405,7 +405,7 @@ fn connect_daap(
 }
 
 async fn wait_for_catalogue(
-    registry: &RemoteSourceRegistry,
+    registry: &SourceRegistry,
     source_id: SourceId,
     generation: u64,
 ) -> (u64, Arc<Vec<crate::architecture::models::Track>>) {
@@ -417,7 +417,7 @@ async fn wait_for_catalogue(
                 .and_then(|snapshot| snapshot.catalogue)
                 .filter(|catalogue| catalogue.generation == generation)
             {
-                return (catalogue.session_epoch, catalogue.value);
+                return (catalogue.session_epoch, catalogue.value.tracks_arc());
             }
             assert!(
                 invalidations.changed().await.is_ok(),
@@ -430,9 +430,9 @@ async fn wait_for_catalogue(
 }
 
 async fn wait_for_failed_retirement(
-    registry: &RemoteSourceRegistry,
+    registry: &SourceRegistry,
     source_id: SourceId,
-) -> crate::source_lifecycle::LifecycleSnapshot<Vec<crate::architecture::models::Track>> {
+) -> crate::source_lifecycle::LifecycleSnapshot<crate::source_registry::AcceptedView> {
     let mut invalidations = registry.subscribe_invalidations();
     tokio::time::timeout(MOCK_DEADLINE, async {
         loop {

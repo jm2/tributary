@@ -16,9 +16,7 @@ use crate::local::engine::LibraryEvent;
 use super::objects::{SourceObject, TrackObject};
 use super::playback::refresh_projected_library_uris;
 use super::preferences;
-use super::radio::{
-    apply_radio_columns, handle_radio_nearme, is_radio_backend, radio_station_to_track_object,
-};
+use super::radio::{apply_radio_columns, handle_radio_nearme, is_radio_backend, radio_view_origin};
 use super::server_dialogs::{show_auth_dialog, validate_remote_server_url};
 use super::source_navigation::{
     CompletionDisposition, ConnectionIntentKind, PendingConnection, SourceNavigation, SourceRequest,
@@ -420,6 +418,7 @@ pub fn setup_source_connect(state: &WindowState) {
     let source_tracks = state.source_tracks.clone();
     let active_source_key = state.active_source_key.clone();
     let source_navigation = state.source_navigation.clone();
+    let near_me_consent_request = state.near_me_consent_request.clone();
     let browser_widget = state.browser_widget.clone();
     let browser_state = state.browser_state.clone();
     let status_label = state.status_label.clone();
@@ -428,7 +427,7 @@ pub fn setup_source_connect(state: &WindowState) {
     let sidebar_store = state.sidebar_store.clone();
     let pending_connection = state.pending_connection.clone();
     let pre_connect_selection = state.pre_connect_selection.clone();
-    let remote_sources = state.remote_sources.clone();
+    let source_registry = state.source_registry.clone();
 
     sel.connect_selection_changed(move |sel, _, _| {
         let Some(item) = sel.selected_item() else {
@@ -772,7 +771,7 @@ pub fn setup_source_connect(state: &WindowState) {
             return;
         }
 
-        // ── Radio source: fetch stations ────────────────────────
+        // ── Radio source: request one lifecycle-owned view ──────
         if is_radio_backend(&backend_type) {
             let request = source_navigation.borrow_mut().select(backend_type.clone());
             *active_source_key.borrow_mut() = backend_type.clone();
@@ -801,10 +800,27 @@ pub fn setup_source_connect(state: &WindowState) {
                 *master_tracks.borrow_mut() = Vec::new();
             }
 
-            // Handle "Stations Near Me" with geo consent.
+            let view_origin = radio_view_origin(&backend_type)
+                .expect("exact built-in radio keys have a typed view origin");
+            let registry = source_registry.clone();
+            let refresh = Rc::new(move || {
+                if registry
+                    .refresh_builtin_radio_view(view_origin.clone())
+                    .is_none()
+                {
+                    // Constructor failures are retained and deduplicated by
+                    // the lifecycle reducer. `None` can also mean shutdown,
+                    // so this call site must not manufacture a second or
+                    // stale user-visible error.
+                    tracing::debug!(view = ?view_origin, "Radio view refresh was not admitted");
+                }
+            });
+
+            // Near Me requires explicit location consent before the registry
+            // may ask its adapter to perform geolocation. The other static
+            // views have no GTK-side prerequisite.
             if backend_type == super::radio::NEARME_SOURCE_KEY {
                 let app_config = app_config.clone();
-                let rt_handle = rt_handle.clone();
                 let track_store = track_store.clone();
                 let master_tracks = master_tracks.clone();
                 let browser_widget = browser_widget.clone();
@@ -813,14 +829,15 @@ pub fn setup_source_connect(state: &WindowState) {
                 let column_view = column_view.clone();
                 let active_source_key = active_source_key.clone();
                 let source_navigation = source_navigation.clone();
+                let near_me_consent_request = near_me_consent_request.clone();
                 let sidebar_selection = sel.clone();
                 let source_tracks = source_tracks.clone();
+                let sidebar_store = sidebar_store.clone();
                 let win = win.clone();
 
                 handle_radio_nearme(
                     &win,
                     app_config,
-                    rt_handle,
                     track_store,
                     master_tracks,
                     browser_widget,
@@ -830,63 +847,14 @@ pub fn setup_source_connect(state: &WindowState) {
                     active_source_key,
                     source_navigation,
                     request,
+                    near_me_consent_request,
+                    sidebar_store,
                     sidebar_selection,
                     source_tracks,
+                    refresh,
                 );
             } else {
-                // Top Clicked or Top Voted — fetch directly.
-                let bt = backend_type.clone();
-                let rt_handle = rt_handle.clone();
-                let track_store = track_store.clone();
-                let master_tracks = master_tracks.clone();
-                let browser_widget = browser_widget.clone();
-                let browser_state = browser_state.clone();
-                let status_label = status_label.clone();
-                let column_view = column_view.clone();
-                let active_source_key = active_source_key.clone();
-                let source_navigation = source_navigation.clone();
-                let source_tracks = source_tracks.clone();
-
-                let (stations_tx, stations_rx) = async_channel::bounded::<String>(1);
-
-                rt_handle.spawn(async move {
-                    let stations = match crate::radio::RadioBrowserClient::new() {
-                        Ok(client) if bt == "radio-topclick" => client.fetch_top_click(None).await,
-                        Ok(client) => client.fetch_top_vote(None).await,
-                        Err(_) => {
-                            tracing::error!("Could not build the Radio-Browser HTTP client");
-                            Vec::new()
-                        }
-                    };
-                    let json = serde_json::to_string(&stations).unwrap_or_default();
-                    let _ = stations_tx.send(json).await;
-                });
-
-                glib::MainContext::default().spawn_local(async move {
-                    if let Ok(json) = stations_rx.recv().await {
-                        let stations: Vec<crate::radio::RadioStation> =
-                            serde_json::from_str(&json).unwrap_or_default();
-                        let objects: Vec<TrackObject> =
-                            stations.iter().map(radio_station_to_track_object).collect();
-                        if cache_source_completion(
-                            &source_navigation,
-                            &request,
-                            &source_tracks,
-                            &objects,
-                            &active_source_key,
-                        ) {
-                            display_tracks(
-                                &objects,
-                                &track_store,
-                                &master_tracks,
-                                &browser_widget,
-                                &browser_state,
-                                &status_label,
-                                &column_view,
-                            );
-                        }
-                    }
-                });
+                refresh();
             }
             return;
         }
@@ -971,7 +939,7 @@ pub fn setup_source_connect(state: &WindowState) {
             let sidebar_selection_for_generation = sel.clone();
             let pending_for_generation = pending_connection.clone();
             let request_for_generation = connection_request.clone();
-            let generation = remote_sources.connect_daap(
+            let generation = source_registry.connect_daap(
                 source_id,
                 move |generation| {
                     let bound = pending_for_generation
@@ -1061,7 +1029,7 @@ pub fn setup_source_connect(state: &WindowState) {
             }
         };
         let navigation_for_submit = source_navigation.clone();
-        let remote_sources_for_auth = remote_sources.clone();
+        let source_registry_for_auth = source_registry.clone();
         let selection_for_auth = (*sel).clone();
 
         show_auth_dialog(
@@ -1127,7 +1095,7 @@ pub fn setup_source_connect(state: &WindowState) {
                 };
 
                 let generation = match backend_type.as_str() {
-                    "jellyfin" => remote_sources_for_auth.connect_jellyfin_session(
+                    "jellyfin" => source_registry_for_auth.connect_jellyfin_session(
                         source_id,
                         on_generation,
                         move || async move {
@@ -1146,7 +1114,7 @@ pub fn setup_source_connect(state: &WindowState) {
                             ))
                         },
                     ),
-                    "plex" => remote_sources_for_auth.connect_standard(
+                    "plex" => source_registry_for_auth.connect_standard(
                         source_id,
                         on_generation,
                         move || async move {
@@ -1161,7 +1129,7 @@ pub fn setup_source_connect(state: &WindowState) {
                             crate::plex::PlexBackend::from_client(&server_name, client).await
                         },
                     ),
-                    "daap" => remote_sources_for_auth.connect_daap(
+                    "daap" => source_registry_for_auth.connect_daap(
                         source_id,
                         on_generation,
                         move || async move {
@@ -1176,7 +1144,7 @@ pub fn setup_source_connect(state: &WindowState) {
                             .await
                         },
                     ),
-                    _ => remote_sources_for_auth.connect_standard(
+                    _ => source_registry_for_auth.connect_standard(
                         source_id,
                         on_generation,
                         move || async move {

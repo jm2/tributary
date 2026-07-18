@@ -37,7 +37,9 @@ use super::preferences;
 use super::root_trust;
 use super::server_dialogs::{load_saved_servers, remove_saved_server, show_add_server_dialog};
 use super::sidebar;
-use super::source_navigation::{ConnectionIntentKind, PendingConnection, SourceNavigation};
+use super::source_navigation::{
+    ConnectionIntentKind, PendingConnection, SourceNavigation, SourceRequest,
+};
 use super::tracklist;
 use super::window_state::WindowState;
 
@@ -146,13 +148,14 @@ fn set_remote_connecting_generation(
 }
 
 #[derive(Clone)]
-struct RemoteReducerContext {
-    remote_sources: crate::source_registry::RemoteSourceRegistry,
+struct SourceReducerContext {
+    source_registry: crate::source_registry::SourceRegistry,
     sidebar_store: gtk::gio::ListStore,
     sidebar_selection: gtk::SingleSelection,
     source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
     active_source_key: Rc<RefCell<String>>,
     source_navigation: Rc<RefCell<SourceNavigation>>,
+    near_me_consent_request: Rc<RefCell<Option<SourceRequest>>>,
     pending_connection: Rc<RefCell<Option<PendingConnection>>>,
     track_store: gtk::gio::ListStore,
     master_tracks: Rc<RefCell<Vec<TrackObject>>>,
@@ -160,28 +163,46 @@ struct RemoteReducerContext {
     browser_state: browser::BrowserState,
     status_label: gtk::Label,
     column_view: gtk::ColumnView,
+    app_config: Rc<RefCell<preferences::AppConfig>>,
     invalidate_source_playback: SourcePlaybackInvalidator,
 }
 
 #[derive(Default)]
-struct RemoteReducerState {
+struct SourceReducerState {
     published_catalogues: HashMap<crate::architecture::SourceId, (u64, u64)>,
+    published_views: HashMap<
+        (
+            crate::architecture::SourceId,
+            crate::architecture::ViewOrigin,
+        ),
+        (u64, u64),
+    >,
+    radio_session_epoch: Option<u64>,
     seen_failures:
         HashMap<crate::architecture::SourceId, (u64, crate::source_lifecycle::FailureCategory)>,
+    seen_refresh_failures: HashMap<
+        (
+            crate::architecture::SourceId,
+            crate::architecture::ViewOrigin,
+        ),
+        (u64, crate::source_lifecycle::FailureCategory),
+    >,
 }
 
-struct RemoteBaselinePlan {
+struct SourceBaselinePlan {
     present_sources: HashSet<crate::architecture::SourceId>,
     hidden_sources: HashSet<crate::architecture::SourceId>,
     clear_projections: Vec<crate::architecture::SourceId>,
+    clear_radio_projection: bool,
+    radio_session_epoch: Option<u64>,
 }
 
-impl RemoteBaselinePlan {
+impl SourceBaselinePlan {
     fn new(
-        reducer: &RemoteReducerState,
-        baseline: &crate::source_lifecycle::LifecycleBaseline<
-            Vec<crate::architecture::models::Track>,
-        >,
+        reducer: &SourceReducerState,
+        baseline: &crate::source_lifecycle::LifecycleBaseline<crate::source_registry::AcceptedView>,
+        active_source_key: &str,
+        radio_prerequisite_pending: bool,
     ) -> Self {
         let mut present_sources = HashSet::new();
         let mut catalogue_sources = HashSet::new();
@@ -191,13 +212,20 @@ impl RemoteBaselinePlan {
                 hidden_sources.insert(*source_id);
             } else {
                 present_sources.insert(*source_id);
-                if snapshot.catalogue.is_some() {
+                if *source_id != crate::architecture::SourceId::radio_browser()
+                    && snapshot.catalogue.is_some()
+                {
                     catalogue_sources.insert(*source_id);
                 }
             }
         }
 
-        let mut clear_projections = hidden_sources.clone();
+        let radio_id = crate::architecture::SourceId::radio_browser();
+        let mut clear_projections: HashSet<_> = hidden_sources
+            .iter()
+            .copied()
+            .filter(|source_id| *source_id != radio_id)
+            .collect();
         clear_projections.extend(
             reducer
                 .published_catalogues
@@ -208,10 +236,40 @@ impl RemoteBaselinePlan {
 
         let mut clear_projections: Vec<_> = clear_projections.into_iter().collect();
         clear_projections.sort_by_key(ToString::to_string);
+        let radio_snapshot = baseline
+            .sources
+            .iter()
+            .find(|(source_id, _)| *source_id == radio_id)
+            .map(|(_, snapshot)| snapshot);
+        let radio_session_epoch = radio_snapshot
+            .filter(|snapshot| {
+                snapshot.visibility != crate::source_lifecycle::SourceVisibility::Hidden
+            })
+            .and_then(|snapshot| snapshot.session_epoch);
+        let radio_connect_pending = radio_snapshot.is_some_and(|snapshot| {
+            snapshot.visibility != crate::source_lifecycle::SourceVisibility::Hidden
+                && snapshot.pending_connect.is_some()
+        });
+        let radio_was_projected = reducer
+            .published_views
+            .keys()
+            .any(|(source_id, _)| *source_id == radio_id);
+        let radio_is_selected = super::radio::is_radio_backend(active_source_key);
+        let radio_epoch_replaced = reducer
+            .radio_session_epoch
+            .zip(radio_session_epoch)
+            .is_some_and(|(previous, current)| previous != current);
+        let radio_source_lost = radio_session_epoch.is_none()
+            && !radio_connect_pending
+            && !radio_prerequisite_pending
+            && (reducer.radio_session_epoch.is_some() || radio_was_projected || radio_is_selected);
+
         Self {
             present_sources,
             hidden_sources,
             clear_projections,
+            clear_radio_projection: radio_epoch_replaced || radio_source_lost,
+            radio_session_epoch,
         }
     }
 }
@@ -247,18 +305,19 @@ struct AcceptedRemotePublication {
     rebound: bool,
 }
 
-impl RemoteReducerContext {
+impl SourceReducerContext {
     fn from_window(
         state: &WindowState,
         invalidate_source_playback: SourcePlaybackInvalidator,
     ) -> Self {
         Self {
-            remote_sources: state.remote_sources.clone(),
+            source_registry: state.source_registry.clone(),
             sidebar_store: state.sidebar_store.clone(),
             sidebar_selection: state.sidebar_selection.clone(),
             source_tracks: state.source_tracks.clone(),
             active_source_key: state.active_source_key.clone(),
             source_navigation: state.source_navigation.clone(),
+            near_me_consent_request: state.near_me_consent_request.clone(),
             pending_connection: state.pending_connection.clone(),
             track_store: state.track_store.clone(),
             master_tracks: state.master_tracks.clone(),
@@ -266,6 +325,7 @@ impl RemoteReducerContext {
             browser_state: state.browser_state.clone(),
             status_label: state.status_label.clone(),
             column_view: state.column_view.clone(),
+            app_config: state.app_config.clone(),
             invalidate_source_playback,
         }
     }
@@ -285,7 +345,7 @@ fn sidebar_source_by_id(
 }
 
 fn rebind_remote_source(
-    context: &RemoteReducerContext,
+    context: &SourceReducerContext,
     index: u32,
     source: &SourceObject,
     keep_selected: bool,
@@ -361,7 +421,7 @@ pub(super) fn select_sidebar_source_key(
     true
 }
 
-fn restore_visible_sidebar_selection(context: &RemoteReducerContext) {
+fn restore_visible_sidebar_selection(context: &SourceReducerContext) {
     let key = context.active_source_key.borrow().clone();
     if !select_sidebar_source_key(&context.sidebar_store, &context.sidebar_selection, &key) {
         select_sidebar_source_key(&context.sidebar_store, &context.sidebar_selection, "local");
@@ -409,7 +469,7 @@ fn apply_local_navigation_fallback(
     true
 }
 
-fn display_local_fallback(context: &RemoteReducerContext, retired_key: &str) {
+fn display_local_fallback(context: &SourceReducerContext, retired_key: &str) {
     // Drop both RefCell guards before changing GtkSingleSelection: its signal
     // handlers run synchronously and may update these same navigation cells.
     let changed = {
@@ -421,6 +481,12 @@ fn display_local_fallback(context: &RemoteReducerContext, retired_key: &str) {
         return;
     }
     select_sidebar_source_key(&context.sidebar_store, &context.sidebar_selection, "local");
+    if super::radio::is_radio_backend(retired_key) {
+        super::radio::apply_radio_columns(&context.column_view, false);
+        let config = context.app_config.borrow();
+        preferences::apply_column_visibility(&context.column_view, &config.visible_columns);
+        preferences::update_browser_visibility(&context.browser_widget, &config.browser_views);
+    }
     let local_tracks = context
         .source_tracks
         .borrow()
@@ -439,7 +505,7 @@ fn display_local_fallback(context: &RemoteReducerContext, retired_key: &str) {
 }
 
 fn clear_remote_projection(
-    context: &RemoteReducerContext,
+    context: &SourceReducerContext,
     source_id: crate::architecture::SourceId,
 ) {
     let source_key = source_id.to_string();
@@ -452,8 +518,35 @@ fn clear_remote_projection(
     display_local_fallback(context, &source_key);
 }
 
+/// Revoke every Radio-Browser projection together because all three lanes
+/// share one source epoch and one playback authority.
+fn clear_radio_projections(context: &SourceReducerContext) {
+    let source_id = crate::architecture::SourceId::radio_browser();
+    (context.invalidate_source_playback)(&source_id.to_string());
+
+    let active_radio_key = {
+        let active = context.active_source_key.borrow();
+        super::radio::is_radio_backend(&active).then(|| active.clone())
+    };
+    for key in [
+        super::radio::TOP_CLICK_SOURCE_KEY,
+        super::radio::TOP_VOTE_SOURCE_KEY,
+        super::radio::NEARME_SOURCE_KEY,
+    ] {
+        context.source_navigation.borrow_mut().invalidate_key(key);
+        context.source_tracks.borrow_mut().remove(key);
+    }
+
+    // Include the selected exact view even before its first accepted refresh.
+    // Otherwise source-construction failure/loss would leave a blank radio
+    // projection selected indefinitely merely because no cache existed yet.
+    if let Some(active_radio_key) = active_radio_key {
+        display_local_fallback(context, &active_radio_key);
+    }
+}
+
 fn clear_remote_pending_intent(
-    context: &RemoteReducerContext,
+    context: &SourceReducerContext,
     source_id: crate::architecture::SourceId,
 ) {
     let source_key = source_id.to_string();
@@ -485,7 +578,7 @@ fn clear_remote_pending_intent(
 }
 
 fn reconcile_cancelled_remote_intent(
-    context: &RemoteReducerContext,
+    context: &SourceReducerContext,
     source_id: crate::architecture::SourceId,
     generation: u64,
 ) {
@@ -522,10 +615,11 @@ fn reconcile_cancelled_remote_intent(
 }
 
 fn reconcile_remote_failure(
-    context: &RemoteReducerContext,
+    context: &SourceReducerContext,
     source_id: crate::architecture::SourceId,
     generation: u64,
     category: crate::source_lifecycle::FailureCategory,
+    show_status: bool,
 ) {
     let row = sidebar_source_by_id(&context.sidebar_store, source_id);
     let pending = context
@@ -573,28 +667,134 @@ fn reconcile_remote_failure(
     }
 
     let ui_category = remote_failure_category(category);
-    let backend = remote_backend_label(row.as_ref().map(|(_, source)| source));
+    let backend = if source_id == crate::architecture::SourceId::radio_browser() {
+        "Radio-Browser"
+    } else {
+        remote_backend_label(row.as_ref().map(|(_, source)| source))
+    };
     tracing::error!(
         %source_id,
         generation,
         category = ui_category.as_str(),
-        "Remote connection failed"
+        "Source connection failed"
     );
-    context
-        .status_label
-        .set_text(&ui_category.user_message(backend));
+    if show_status {
+        context
+            .status_label
+            .set_text(&ui_category.user_message(backend));
+    }
 }
 
-fn reconcile_remote_baseline(
-    context: &RemoteReducerContext,
-    reducer: &mut RemoteReducerState,
-    baseline: crate::source_lifecycle::LifecycleBaseline<Vec<crate::architecture::models::Track>>,
+fn reconcile_radio_refresh_failure(
+    context: &SourceReducerContext,
+    view: &crate::architecture::ViewOrigin,
+    generation: u64,
+    category: crate::source_lifecycle::FailureCategory,
 ) {
-    let RemoteBaselinePlan {
+    let Some(source_key) = super::radio::radio_source_key(view) else {
+        return;
+    };
+    tracing::error!(
+        source = %crate::architecture::SourceId::radio_browser(),
+        ?view,
+        generation,
+        category = ?category,
+        "Radio-Browser view refresh failed"
+    );
+    if *context.active_source_key.borrow() == source_key
+        && context.source_navigation.borrow().is_key(source_key)
+    {
+        // A failed refresh is not an accepted empty feed. Preserve any last
+        // accepted rows in the cache/tracklist and expose a retryable error.
+        let category = remote_failure_category(category);
+        context
+            .status_label
+            .set_text(&category.user_message("Radio-Browser"));
+    }
+}
+
+fn selected_radio_projection_owns_status(
+    active_source_key: &str,
+    navigation: &SourceNavigation,
+) -> bool {
+    super::radio::is_radio_backend(active_source_key) && navigation.is_key(active_source_key)
+}
+
+fn current_near_me_prerequisite(
+    active_source_key: &str,
+    navigation: &SourceNavigation,
+    pending: Option<&SourceRequest>,
+) -> bool {
+    active_source_key == super::radio::NEARME_SOURCE_KEY
+        && pending.is_some_and(|request| navigation.is_current(request))
+}
+
+fn publish_radio_view(
+    context: &SourceReducerContext,
+    view: &crate::architecture::ViewOrigin,
+    accepted: &crate::source_lifecycle::AcceptedSnapshot<crate::source_registry::AcceptedView>,
+) {
+    let Some(source_key) = super::radio::radio_source_key(view) else {
+        return;
+    };
+    let objects: Vec<TrackObject> = accepted
+        .value
+        .tracks()
+        .iter()
+        .map(|track| arch_remote_track_to_object(track, accepted.session_epoch))
+        .collect();
+    context
+        .source_tracks
+        .borrow_mut()
+        .insert(source_key.to_string(), objects.clone());
+
+    if *context.active_source_key.borrow() == source_key
+        && context.source_navigation.borrow().is_key(source_key)
+    {
+        // This deliberately publishes an accepted empty feed as an empty
+        // tracklist. Refresh failures take the separate stale-preserving path.
+        display_tracks(
+            &objects,
+            &context.track_store,
+            &context.master_tracks,
+            &context.browser_widget,
+            &context.browser_state,
+            &context.status_label,
+            &context.column_view,
+        );
+    }
+}
+
+fn reconcile_source_baseline(
+    context: &SourceReducerContext,
+    reducer: &mut SourceReducerState,
+    baseline: crate::source_lifecycle::LifecycleBaseline<crate::source_registry::AcceptedView>,
+) {
+    let radio_failure_was_selected = {
+        let active = context.active_source_key.borrow();
+        selected_radio_projection_owns_status(&active, &context.source_navigation.borrow())
+    };
+    let radio_prerequisite_pending = {
+        let active = context.active_source_key.borrow().clone();
+        let pending = context.near_me_consent_request.borrow().clone();
+        current_near_me_prerequisite(
+            &active,
+            &context.source_navigation.borrow(),
+            pending.as_ref(),
+        )
+    };
+    let SourceBaselinePlan {
         present_sources,
         hidden_sources,
         clear_projections,
-    } = RemoteBaselinePlan::new(reducer, &baseline);
+        clear_radio_projection,
+        radio_session_epoch,
+    } = SourceBaselinePlan::new(
+        reducer,
+        &baseline,
+        &context.active_source_key.borrow(),
+        radio_prerequisite_pending,
+    );
 
     // Projection loss is authoritative before any plain row-state rebind.
     // In particular, a selected retained passwordless DAAP row must already
@@ -608,6 +808,16 @@ fn reconcile_remote_baseline(
         }
         clear_remote_projection(context, source_id);
     }
+    if clear_radio_projection {
+        clear_radio_projections(context);
+        reducer.published_views.retain(|(source_id, _), _| {
+            *source_id != crate::architecture::SourceId::radio_browser()
+        });
+        reducer.seen_refresh_failures.retain(|(source_id, _), _| {
+            *source_id != crate::architecture::SourceId::radio_browser()
+        });
+    }
+    reducer.radio_session_epoch = radio_session_epoch;
 
     for (source_id, snapshot) in baseline.sources {
         if hidden_sources.contains(&source_id) {
@@ -625,6 +835,8 @@ fn reconcile_remote_baseline(
                     source_id,
                     failure.correlation.generation,
                     failure.failure.category(),
+                    source_id != crate::architecture::SourceId::radio_browser()
+                        || radio_failure_was_selected,
                 );
                 reducer.seen_failures.insert(source_id, identity);
             }
@@ -694,7 +906,10 @@ fn reconcile_remote_baseline(
             }
         }
 
-        if let Some(catalogue) = snapshot.catalogue {
+        if let Some(catalogue) = (source_id != crate::architecture::SourceId::radio_browser())
+            .then_some(snapshot.catalogue)
+            .flatten()
+        {
             let identity = (catalogue.generation, catalogue.session_epoch);
             if reducer.published_catalogues.get(&source_id) != Some(&identity) {
                 if reducer
@@ -708,6 +923,7 @@ fn reconcile_remote_baseline(
                 }
                 let objects: Vec<TrackObject> = catalogue
                     .value
+                    .tracks()
                     .iter()
                     .map(|track| arch_remote_track_to_object(track, catalogue.session_epoch))
                     .collect();
@@ -730,6 +946,47 @@ fn reconcile_remote_baseline(
                 );
                 reducer.published_catalogues.insert(source_id, identity);
             }
+        }
+
+        if source_id == crate::architecture::SourceId::radio_browser() {
+            for (view, accepted) in &snapshot.views {
+                if super::radio::radio_source_key(view).is_none() {
+                    continue;
+                }
+                let key = (source_id, view.clone());
+                let identity = (accepted.generation, accepted.session_epoch);
+                if reducer.published_views.get(&key) == Some(&identity) {
+                    continue;
+                }
+                publish_radio_view(context, view, accepted);
+                reducer.published_views.insert(key, identity);
+            }
+
+            let mut live_failures = HashSet::new();
+            for (lane, failure) in &snapshot.refresh_failures {
+                let crate::source_lifecycle::RefreshLane::View(view) = lane else {
+                    continue;
+                };
+                if super::radio::radio_source_key(view).is_none() {
+                    continue;
+                }
+                let key = (source_id, view.clone());
+                live_failures.insert(key.clone());
+                let identity = (failure.correlation.generation, failure.failure.category());
+                if reducer.seen_refresh_failures.get(&key) == Some(&identity) {
+                    continue;
+                }
+                reconcile_radio_refresh_failure(
+                    context,
+                    view,
+                    failure.correlation.generation,
+                    failure.failure.category(),
+                );
+                reducer.seen_refresh_failures.insert(key, identity);
+            }
+            reducer
+                .seen_refresh_failures
+                .retain(|key, _| key.0 != source_id || live_failures.contains(key));
         }
     }
     reducer
@@ -773,23 +1030,23 @@ fn reconcile_remote_baseline(
     if baseline.shutting_down {
         tracing::debug!(
             revision = baseline.revision,
-            "Remote lifecycle reducer observed shutdown gate"
+            "Source lifecycle reducer observed shutdown gate"
         );
     }
 }
 
-fn setup_remote_lifecycle_reducer(
+fn setup_source_lifecycle_reducer(
     state: &WindowState,
     mut invalidations: tokio::sync::watch::Receiver<u64>,
     invalidate_source_playback: SourcePlaybackInvalidator,
 ) {
-    let context = RemoteReducerContext::from_window(state, invalidate_source_playback);
+    let context = SourceReducerContext::from_window(state, invalidate_source_playback);
     glib::MainContext::default().spawn_local(async move {
-        let mut reducer = RemoteReducerState::default();
-        let baseline = context.remote_sources.snapshot_all();
+        let mut reducer = SourceReducerState::default();
+        let baseline = context.source_registry.snapshot_all();
         let mut revision = baseline.revision;
         let shutting_down = baseline.shutting_down;
-        reconcile_remote_baseline(&context, &mut reducer, baseline);
+        reconcile_source_baseline(&context, &mut reducer, baseline);
         if shutting_down {
             return;
         }
@@ -804,10 +1061,10 @@ fn setup_remote_lifecycle_reducer(
                 return;
             }
 
-            let baseline = context.remote_sources.snapshot_all();
+            let baseline = context.source_registry.snapshot_all();
             revision = baseline.revision;
             let shutting_down = baseline.shutting_down;
-            reconcile_remote_baseline(&context, &mut reducer, baseline);
+            reconcile_source_baseline(&context, &mut reducer, baseline);
             if shutting_down {
                 return;
             }
@@ -854,11 +1111,11 @@ pub fn build_window(
     let daap_env =
         configured_server_url("DAAP_URL").map(|url| (url, std::env::var("DAAP_PASSWORD").ok()));
 
-    let remote_sources = crate::source_registry::RemoteSourceRegistry::new(rt_handle.clone());
+    let source_registry = crate::source_registry::SourceRegistry::new(rt_handle.clone());
     // Subscribe before the first provenance claim or constructor. The GTK
     // reducer takes an atomic baseline later, then discards queued revisions
     // already represented by that baseline.
-    let remote_invalidations = remote_sources.subscribe_invalidations();
+    let source_invalidations = source_registry.subscribe_invalidations();
     let remote_provenance = crate::source_registry::ProvenanceClaims::default();
 
     // ── Load and apply persisted preferences ─────────────────────────
@@ -879,7 +1136,7 @@ pub fn build_window(
         let src =
             SourceObject::manual(&entry.name, &entry.server_type, &entry.url, entry.source_id);
         let claimed = remote_provenance.ensure(
-            &remote_sources,
+            &source_registry,
             entry.source_id,
             crate::source_lifecycle::SourceProvenance::Saved,
             "saved-config",
@@ -900,7 +1157,7 @@ pub fn build_window(
     });
     if let Some(attempt) = subsonic_env_attempt.as_ref() {
         let claimed = remote_provenance.ensure(
-            &remote_sources,
+            &source_registry,
             attempt.source_id,
             crate::source_lifecycle::SourceProvenance::Environment,
             "environment:SUBSONIC_URL",
@@ -917,7 +1174,7 @@ pub fn build_window(
     });
     if let Some(attempt) = jellyfin_env_attempt.as_ref() {
         let claimed = remote_provenance.ensure(
-            &remote_sources,
+            &source_registry,
             attempt.source_id,
             crate::source_lifecycle::SourceProvenance::Environment,
             "environment:JELLYFIN_URL",
@@ -934,7 +1191,7 @@ pub fn build_window(
         .map(|(url, _token)| upsert_environment_source(&mut sources, "Plex (env)", "plex", url));
     if let Some(attempt) = plex_env_attempt.as_ref() {
         let claimed = remote_provenance.ensure(
-            &remote_sources,
+            &source_registry,
             attempt.source_id,
             crate::source_lifecycle::SourceProvenance::Environment,
             "environment:PLEX_URL",
@@ -951,7 +1208,7 @@ pub fn build_window(
         .map(|(url, _password)| upsert_environment_source(&mut sources, "DAAP (env)", "daap", url));
     if let Some(attempt) = daap_env_attempt.as_ref() {
         let claimed = remote_provenance.ensure(
-            &remote_sources,
+            &source_registry,
             attempt.source_id,
             crate::source_lifecycle::SourceProvenance::Environment,
             "environment:DAAP_URL",
@@ -1068,6 +1325,7 @@ pub fn build_window(
         Rc::new(RefCell::new(HashMap::new()));
     let active_source_key: Rc<RefCell<String>> = Rc::new(RefCell::new("local".to_string()));
     let source_navigation = Rc::new(RefCell::new(SourceNavigation::new("local")));
+    let near_me_consent_request: Rc<RefCell<Option<SourceRequest>>> = Rc::new(RefCell::new(None));
 
     // ── Browser (starts empty, updated by FullSync) ──────────────────
     let track_store_for_filter = track_store.clone();
@@ -1195,11 +1453,11 @@ pub fn build_window(
         window.maximize();
     }
 
-    // Save geometry and synchronously close the sole remote lifecycle gate.
+    // Save geometry and synchronously close the sole source lifecycle gate.
     // Its persistent barrier joins every admitted constructor and owned
     // adapter teardown, including DAAP and interactive Jellyfin logout, before
     // close() is allowed to proceed.
-    let shutdown_sources = remote_sources.clone();
+    let shutdown_sources = source_registry.clone();
     let shutdown_started = Rc::new(Cell::new(false));
     let shutdown_complete = Rc::new(Cell::new(false));
     window.connect_close_request(move |w| {
@@ -1280,7 +1538,7 @@ pub fn build_window(
     if let Some((url, user, pass)) = subsonic_env {
         let EnvironmentConnectionAttempt { source_id } =
             subsonic_env_attempt.expect("configured Subsonic source attempt");
-        remote_sources.connect_standard(
+        source_registry.connect_standard(
             source_id,
             |generation| {
                 set_remote_connecting_generation(
@@ -1301,7 +1559,7 @@ pub fn build_window(
     if let Some((url, api_key, user_id)) = jellyfin_env {
         let EnvironmentConnectionAttempt { source_id } =
             jellyfin_env_attempt.expect("configured Jellyfin source attempt");
-        remote_sources.connect_jellyfin_api_key(
+        source_registry.connect_jellyfin_api_key(
             source_id,
             |generation| {
                 set_remote_connecting_generation(
@@ -1323,7 +1581,7 @@ pub fn build_window(
     if let Some((url, token)) = plex_env {
         let EnvironmentConnectionAttempt { source_id } =
             plex_env_attempt.expect("configured Plex source attempt");
-        remote_sources.connect_standard(
+        source_registry.connect_standard(
             source_id,
             |generation| {
                 set_remote_connecting_generation(
@@ -1344,7 +1602,7 @@ pub fn build_window(
     if let Some((url, password)) = daap_env {
         let EnvironmentConnectionAttempt { source_id } =
             daap_env_attempt.expect("configured DAAP source attempt");
-        remote_sources.connect_daap(
+        source_registry.connect_daap(
             source_id,
             |generation| {
                 set_remote_connecting_generation(
@@ -1367,13 +1625,14 @@ pub fn build_window(
             window: window.clone(),
             rt_handle: rt_handle.clone(),
             engine_tx: engine_tx.clone(),
-            remote_sources: remote_sources.clone(),
+            source_registry: source_registry.clone(),
             remote_provenance: remote_provenance.clone(),
             track_store: track_store.clone(),
             master_tracks: master_tracks.clone(),
             source_tracks: source_tracks.clone(),
             active_source_key: active_source_key.clone(),
             source_navigation: source_navigation.clone(),
+            near_me_consent_request: near_me_consent_request.clone(),
             sidebar_store: sidebar_store.clone(),
             sidebar_selection: sidebar_selection.clone(),
             browser_widget: browser_widget.clone(),
@@ -1394,7 +1653,7 @@ pub fn build_window(
         let store = sidebar_store.clone();
         let selection = sidebar_selection.clone();
         let engine_tx = engine_tx.clone();
-        let remote_sources = remote_sources.clone();
+        let source_registry = source_registry.clone();
         let remote_provenance = remote_provenance.clone();
         add_button.connect_clicked(move |_| {
             show_add_server_dialog(
@@ -1402,7 +1661,7 @@ pub fn build_window(
                 &store,
                 &selection,
                 &engine_tx,
-                &remote_sources,
+                &source_registry,
                 &remote_provenance,
             );
         });
@@ -1428,7 +1687,7 @@ pub fn build_window(
 
     // ── Manual server delete (trash) handler ────────────────────────
     {
-        let remote_sources = remote_sources.clone();
+        let source_registry = source_registry.clone();
         let remote_provenance = remote_provenance.clone();
 
         glib::MainContext::default().spawn_local(async move {
@@ -1445,7 +1704,7 @@ pub fn build_window(
                     continue;
                 }
                 if !remote_provenance.release(
-                    &remote_sources,
+                    &source_registry,
                     source_id,
                     crate::source_lifecycle::SourceProvenance::Saved,
                     "saved-config",
@@ -1461,7 +1720,7 @@ pub fn build_window(
 
     // ── DAAP disconnect (eject) handler ─────────────────────────────
     {
-        let remote_sources = remote_sources.clone();
+        let source_registry = source_registry.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = disconnect_rx.recv().await {
@@ -1470,7 +1729,7 @@ pub fn build_window(
                     tracing::warn!("Ignoring disconnect for invalid source identity");
                     continue;
                 };
-                if remote_sources.disconnect(source_id).is_none() {
+                if source_registry.disconnect(source_id).is_none() {
                     tracing::warn!("DAAP source lifecycle entry was unavailable");
                 }
             }
@@ -1486,13 +1745,14 @@ pub fn build_window(
         window: window.clone(),
         rt_handle: rt_handle.clone(),
         engine_tx: engine_tx.clone(),
-        remote_sources: remote_sources.clone(),
+        source_registry: source_registry.clone(),
         remote_provenance: remote_provenance.clone(),
         track_store: track_store.clone(),
         master_tracks: master_tracks.clone(),
         source_tracks: source_tracks.clone(),
         active_source_key: active_source_key.clone(),
         source_navigation: source_navigation.clone(),
+        near_me_consent_request: near_me_consent_request.clone(),
         sidebar_store: sidebar_store.clone(),
         sidebar_selection: sidebar_selection.clone(),
         browser_widget: browser_widget.clone(),
@@ -1505,9 +1765,9 @@ pub fn build_window(
         pre_connect_selection: pre_connect_selection.clone(),
     };
     super::source_connect::setup_source_connect(&source_connection_state);
-    setup_remote_lifecycle_reducer(
+    setup_source_lifecycle_reducer(
         &source_connection_state,
-        remote_invalidations,
+        source_invalidations,
         invalidate_source_playback.clone(),
     );
 
@@ -1690,7 +1950,7 @@ pub fn build_window(
             let clear_playback_ui = clear_playback_ui.clone();
             let playback_rt = rt_handle.clone();
             let playback_config = app_config.clone();
-            let playback_remote_sources = remote_sources.clone();
+            let playback_source_registry = source_registry.clone();
 
             glib::MainContext::default().spawn_local(async move {
                 while let Ok(action) = media_rx.recv().await {
@@ -1707,7 +1967,7 @@ pub fn build_window(
                         app_config: playback_config.clone(),
                         rt_handle: playback_rt.clone(),
                         column_view: column_view_for_keys.clone(),
-                        remote_sources: playback_remote_sources.clone(),
+                        source_registry: playback_source_registry.clone(),
                     };
                     match action {
                         MediaAction::Play => {
@@ -1785,7 +2045,7 @@ pub fn build_window(
         let column_view_c = column_view.clone();
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
-        let playback_remote_sources = remote_sources.clone();
+        let playback_source_registry = source_registry.clone();
 
         hb.play_button.connect_clicked(move |_| {
             toggle_or_start(
@@ -1801,7 +2061,7 @@ pub fn build_window(
                     app_config: playback_config.clone(),
                     rt_handle: playback_rt.clone(),
                     column_view: column_view_c.clone(),
-                    remote_sources: playback_remote_sources.clone(),
+                    source_registry: playback_source_registry.clone(),
                 },
                 shuffle.is_active(),
             );
@@ -1925,7 +2185,7 @@ pub fn build_window(
         let cv = column_view.clone();
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
-        let playback_remote_sources = remote_sources.clone();
+        let playback_source_registry = source_registry.clone();
 
         column_view.connect_activate(move |_view, position| {
             play_track_at(
@@ -1942,7 +2202,7 @@ pub fn build_window(
                     app_config: playback_config.clone(),
                     rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
-                    remote_sources: playback_remote_sources.clone(),
+                    source_registry: playback_source_registry.clone(),
                 },
             );
         });
@@ -1953,13 +2213,14 @@ pub fn build_window(
         window: window.clone(),
         rt_handle: rt_handle.clone(),
         engine_tx: engine_tx.clone(),
-        remote_sources: remote_sources.clone(),
+        source_registry: source_registry.clone(),
         remote_provenance: remote_provenance.clone(),
         track_store: track_store.clone(),
         master_tracks: master_tracks.clone(),
         source_tracks: source_tracks.clone(),
         active_source_key: active_source_key.clone(),
         source_navigation: source_navigation.clone(),
+        near_me_consent_request: near_me_consent_request.clone(),
         sidebar_store: sidebar_store_for_events.clone(),
         sidebar_selection: sidebar_sel_for_events.clone(),
         browser_widget: browser_widget.clone(),
@@ -1987,7 +2248,7 @@ pub fn build_window(
         let cv = column_view.clone();
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
-        let playback_remote_sources = remote_sources.clone();
+        let playback_source_registry = source_registry.clone();
 
         hb.next_button.connect_clicked(move |_| {
             advance_track(
@@ -2003,7 +2264,7 @@ pub fn build_window(
                     app_config: playback_config.clone(),
                     rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
-                    remote_sources: playback_remote_sources.clone(),
+                    source_registry: playback_source_registry.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
@@ -2026,7 +2287,7 @@ pub fn build_window(
         let cv = column_view.clone();
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
-        let playback_remote_sources = remote_sources.clone();
+        let playback_source_registry = source_registry.clone();
 
         hb.prev_button.connect_clicked(move |_| {
             // If more than 3 s into the track, restart it.
@@ -2049,7 +2310,7 @@ pub fn build_window(
                     app_config: playback_config.clone(),
                     rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
-                    remote_sources: playback_remote_sources.clone(),
+                    source_registry: playback_source_registry.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
@@ -2086,7 +2347,7 @@ pub fn build_window(
         let toast_overlay = toast_overlay.clone();
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
-        let playback_remote_sources = remote_sources.clone();
+        let playback_source_registry = source_registry.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -2225,7 +2486,7 @@ pub fn build_window(
                                 app_config: playback_config.clone(),
                                 rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
-                                remote_sources: playback_remote_sources.clone(),
+                                source_registry: playback_source_registry.clone(),
                             })
                         {
                             continue;
@@ -2245,7 +2506,7 @@ pub fn build_window(
                                 app_config: playback_config.clone(),
                                 rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
-                                remote_sources: playback_remote_sources.clone(),
+                                source_registry: playback_source_registry.clone(),
                             },
                             mode,
                             shuffle.is_active(),
@@ -2349,7 +2610,7 @@ pub fn build_window(
         let cv = column_view.clone();
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
-        let playback_remote_sources = remote_sources.clone();
+        let playback_source_registry = source_registry.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
         play_pending.connect_activate(move |_, _| {
@@ -2372,7 +2633,7 @@ pub fn build_window(
                 app_config: playback_config.clone(),
                 rt_handle: playback_rt.clone(),
                 column_view: cv.clone(),
-                remote_sources: playback_remote_sources.clone(),
+                source_registry: playback_source_registry.clone(),
             };
             for path in paths {
                 if super::playback::play_local_file(&path, &ctx) {
@@ -2438,13 +2699,14 @@ pub fn build_window(
             window: window.clone(),
             rt_handle: rt_handle.clone(),
             engine_tx: engine_tx.clone(),
-            remote_sources: remote_sources.clone(),
+            source_registry: source_registry.clone(),
             remote_provenance: remote_provenance.clone(),
             track_store: track_store.clone(),
             master_tracks: master_tracks.clone(),
             source_tracks: source_tracks.clone(),
             active_source_key: active_source_key.clone(),
             source_navigation: source_navigation.clone(),
+            near_me_consent_request: near_me_consent_request.clone(),
             sidebar_store: sidebar_store_for_events.clone(),
             sidebar_selection: sidebar_sel_for_events.clone(),
             browser_widget: browser_widget.clone(),
@@ -3265,7 +3527,7 @@ fn arch_remote_track_to_object(
     session_epoch: u64,
 ) -> TrackObject {
     let object = track_to_object(track, "", None);
-    object.set_remote_session_epoch(session_epoch);
+    object.set_source_session_epoch(session_epoch);
     object
 }
 
@@ -3441,7 +3703,7 @@ mod identity_tests {
 
     fn disconnected_visible_snapshot(
         revision: u64,
-    ) -> crate::source_lifecycle::LifecycleSnapshot<Vec<crate::architecture::models::Track>> {
+    ) -> crate::source_lifecycle::LifecycleSnapshot<crate::source_registry::AcceptedView> {
         crate::source_lifecycle::LifecycleSnapshot {
             revision,
             state: crate::source_lifecycle::SourceState::Dormant,
@@ -3644,7 +3906,7 @@ mod identity_tests {
     fn retained_passwordless_disconnect_falls_back_before_row_rebind_can_reconnect() {
         let source_id = SourceId::random();
         let source_key = source_id.to_string();
-        let mut reducer = RemoteReducerState::default();
+        let mut reducer = SourceReducerState::default();
         reducer.published_catalogues.insert(source_id, (41, 7));
         let baseline = crate::source_lifecycle::LifecycleBaseline {
             revision: 9,
@@ -3652,7 +3914,7 @@ mod identity_tests {
             sources: vec![(source_id, disconnected_visible_snapshot(9))],
         };
 
-        let plan = RemoteBaselinePlan::new(&reducer, &baseline);
+        let plan = SourceBaselinePlan::new(&reducer, &baseline, &source_key, false);
         assert_eq!(plan.clear_projections, vec![source_id]);
 
         let mut navigation = SourceNavigation::new(source_key.clone());
@@ -3683,6 +3945,83 @@ mod identity_tests {
         );
         assert_eq!(restored.backend_type(), "local");
         assert_eq!(passwordless_reconnects, 0);
+    }
+
+    #[test]
+    fn selected_radio_view_without_a_publication_is_invalidated_when_its_source_is_lost() {
+        let radio_id = SourceId::radio_browser();
+        let reducer = SourceReducerState::default();
+        let baseline = crate::source_lifecycle::LifecycleBaseline {
+            revision: 3,
+            shutting_down: false,
+            sources: vec![(radio_id, disconnected_visible_snapshot(3))],
+        };
+
+        let plan = SourceBaselinePlan::new(
+            &reducer,
+            &baseline,
+            super::super::radio::TOP_VOTE_SOURCE_KEY,
+            false,
+        );
+
+        assert!(plan.clear_radio_projection);
+        assert!(reducer.published_views.is_empty());
+        assert_eq!(plan.radio_session_epoch, None);
+    }
+
+    #[test]
+    fn exact_current_near_me_consent_prerequisite_is_not_misclassified_as_source_loss() {
+        let radio_id = SourceId::radio_browser();
+        let reducer = SourceReducerState::default();
+        let baseline = crate::source_lifecycle::LifecycleBaseline {
+            revision: 3,
+            shutting_down: false,
+            sources: vec![(radio_id, disconnected_visible_snapshot(3))],
+        };
+        let mut navigation = SourceNavigation::new("local");
+        let stale = navigation.select(super::super::radio::NEARME_SOURCE_KEY);
+        let current = navigation.select(super::super::radio::NEARME_SOURCE_KEY);
+
+        assert!(!current_near_me_prerequisite(
+            super::super::radio::NEARME_SOURCE_KEY,
+            &navigation,
+            Some(&stale),
+        ));
+        assert!(current_near_me_prerequisite(
+            super::super::radio::NEARME_SOURCE_KEY,
+            &navigation,
+            Some(&current),
+        ));
+        let plan = SourceBaselinePlan::new(
+            &reducer,
+            &baseline,
+            super::super::radio::NEARME_SOURCE_KEY,
+            true,
+        );
+        assert!(!plan.clear_radio_projection);
+
+        navigation.select("local");
+        assert!(!current_near_me_prerequisite(
+            super::super::radio::NEARME_SOURCE_KEY,
+            &navigation,
+            Some(&current),
+        ));
+    }
+
+    #[test]
+    fn only_the_selected_exact_radio_intent_may_surface_a_setup_failure() {
+        let selected = SourceNavigation::new(super::super::radio::TOP_CLICK_SOURCE_KEY);
+        assert!(selected_radio_projection_owns_status(
+            super::super::radio::TOP_CLICK_SOURCE_KEY,
+            &selected,
+        ));
+        assert!(!selected_radio_projection_owns_status("local", &selected));
+
+        let superseded = SourceNavigation::new("local");
+        assert!(!selected_radio_projection_owns_status(
+            super::super::radio::TOP_CLICK_SOURCE_KEY,
+            &superseded,
+        ));
     }
 
     #[test]
