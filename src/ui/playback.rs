@@ -358,14 +358,16 @@ impl ShuffleState {
     }
 
     fn record_selection(&mut self, selected: usize) {
-        debug_assert_eq!(self.cursor + 1, self.history.len());
+        debug_assert_eq!(self.cursor.checked_add(1), Some(self.history.len()));
         self.history.push_back(selected);
-        self.cursor += 1;
         if self.history.len() > SHUFFLE_TIMELINE_CAPACITY {
             let removed = self.history.pop_front();
             debug_assert!(removed.is_some());
-            self.cursor -= 1;
         }
+        // A recorded selection is always the timeline frontier. Deriving the
+        // cursor from the retained deque avoids arithmetic underflow while
+        // restoring that invariant even if a caller arrived with stale state.
+        self.cursor = self.history.len() - 1;
     }
 }
 
