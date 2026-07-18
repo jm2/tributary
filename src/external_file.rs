@@ -48,20 +48,18 @@ impl ExternalFileHint {
             return Err(closed_validation_error());
         }
 
-        let extension = extension.map(|value| {
-            let normalized = value.to_ascii_lowercase();
-            if normalized.is_empty()
-                || normalized.len() > MAX_EXTENSION_HINT_BYTES
-                || !normalized.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            {
-                return Err(closed_validation_error());
-            }
-            Ok(normalized)
-        });
-        let extension = match extension {
-            Some(extension) => Some(extension?),
-            None => None,
-        };
+        let extension = extension
+            .map(|value| {
+                let normalized = value.to_ascii_lowercase();
+                if normalized.is_empty()
+                    || normalized.len() > MAX_EXTENSION_HINT_BYTES
+                    || !normalized.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                {
+                    return Err(closed_validation_error());
+                }
+                Ok(normalized)
+            })
+            .transpose()?;
 
         Ok(Self {
             display_name,
@@ -110,12 +108,13 @@ impl ExternalFileCandidate {
     pub fn validate(file: File, hint: ExternalFileHint) -> BackendResult<Self> {
         let media = ResolvedFileMedia::from_open_regular_file(file, hint.extension.clone())
             .map_err(|_| closed_validation_error())?;
-        let parse_file = media
-            .try_clone_file()
+        let parser_hint = hint.parser_hint();
+        let parsed = media
+            .with_serialized_seekable_file(|parse_file| {
+                crate::local::tag_parser::parse_audio_file_from_file(parse_file, &parser_hint)
+            })
+            .map_err(|_| closed_validation_error())?
             .map_err(|_| closed_validation_error())?;
-        let parsed =
-            crate::local::tag_parser::parse_audio_file_from_file(parse_file, &hint.parser_hint())
-                .map_err(|_| closed_validation_error())?;
         validate_parsed_metadata(&parsed)?;
 
         Ok(Self { media, parsed })
@@ -296,6 +295,8 @@ mod tests {
             ExternalFileHint::new("song.wav", Some("wav")).expect("safe hint"),
         )
         .expect("validate original WAV");
+        assert_eq!(candidate.parsed.artist_name, "Unknown Artist");
+        assert_eq!(candidate.parsed.album_title, "Unknown Album");
 
         let replaced = match std::fs::rename(&path, &displaced) {
             Ok(()) => {

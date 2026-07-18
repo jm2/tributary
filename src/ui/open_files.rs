@@ -134,7 +134,10 @@ pub(super) fn admit_first_accepted_audio(
             return None;
         }
 
-        let Some(display_name) = path.file_name().and_then(|name| name.to_str()) else {
+        let Some(display_name) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        else {
             continue;
         };
         let extension = path.extension().and_then(|extension| extension.to_str());

@@ -423,13 +423,16 @@ shutdown. A newer OS delivery, any explicit
 Play/Pause/Next/Previous/scrub action, Stop, a real output change, or shutdown advances that
 generation, so superseded parsing cannot become visible. Same-output reselection is deliberately
 inert. Logs report only a count and fixed outcome; an OS-delivered path or derived direct URI never
-enters diagnostics.
+enters diagnostics. A native non-UTF-8 leaf name becomes bounded lossy Unicode only as a parser and
+presentation hint; it never replaces the already-open handle as authority.
 
 Only after the exact already-open file parses successfully does Tributary mint random `SourceId`
 and `TrackId` values and atomically adopt an ephemeral hidden adapter. That adapter owns the
 original open regular-file handle and a revocable `MediaLease`; `try_clone_file` checks the lease
-both before and after cloning the handle. The one-item queue carries only those random IDs and the
-exact session epoch—no path or URI—and generic resolution returns the typed
+both before and after cloning the handle. Cursor-based tag and artwork consumers serialize across
+their complete clone-and-parse operation, while output proxies keep using position-independent
+reads. The one-item queue carries only those random IDs and the exact session epoch—no path or
+URI—and generic resolution returns the typed
 `ResolvedSourceStream::File` capability. HTTP-backed sources continue through the sibling
 `ResolvedSourceStream::Http` branch. Embedded-art parsing receives a clone of the retained file
 only after the selected output has accepted the load, preventing rejected or stale work from
@@ -677,11 +680,12 @@ and complete restoration of Local presentation after automatic fallback.
 
 The external-file adapter cutover passes the locked all-target/all-feature check, strict Clippy in
 debug and release, formatting, and whitespace checks. Complete locked debug and release suites each
-pass 938 tests. An independent integrated review is clean after its findings were resolved. Focused
+pass 940 tests. An independent integrated review is clean after its findings were resolved. Focused
 coverage proves delivery-order and exact-generation state, shutdown/adoption serialization, random
 pathless identity, epoch isolation, retained-handle path-replacement resistance, lease checks,
-hidden-baseline behavior, and explicit idempotent retirement; integrated review covers sequential
-first-accepted candidate handling, the same-output boundary, and post-accept artwork wiring.
+serialized cursor-based consumers, hidden-baseline behavior, and explicit idempotent retirement;
+integrated review covers sequential first-accepted candidate handling, the same-output boundary,
+and post-accept artwork wiring.
 
 Each step must keep existing credential-isolation, exact-origin, root-authority, receiver-ticket,
 and generation-supersession tests green. Compatibility code is removed in the same milestone; two

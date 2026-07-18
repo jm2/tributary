@@ -279,8 +279,13 @@ fn extract_direct_file_album_art_bytes(path: &std::path::Path) -> Option<Vec<u8>
 fn extract_resolved_file_album_art_bytes(
     media: &crate::local::resolver::ResolvedLocalMedia,
 ) -> Option<Vec<u8>> {
-    let mut file = media.try_clone_file().ok()?;
-    extract_album_art_bytes(&mut file, media.extension())
+    let extension = media.extension().map(str::to_owned);
+    media
+        .with_serialized_seekable_file(|mut file| {
+            extract_album_art_bytes(&mut file, extension.as_deref())
+        })
+        .ok()
+        .flatten()
 }
 
 fn bounded_local_art_bytes(data: &[u8], max_bytes: usize) -> Option<Vec<u8>> {

@@ -137,7 +137,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OS-opened files now use an ephemeral registry-owned lifecycle instead of direct path queues** —
   A delivery is processed sequentially on a blocking worker, preserving candidate order, skipping
   files that cannot be opened, parsed as audio, or accepted by the metadata bounds, and stopping
-  after the first accepted candidate. Before identity or adapter publication,
+  after the first accepted candidate. A native non-UTF-8 leaf name becomes bounded lossy Unicode
+  only as a parser/presentation hint; the already-open handle remains the sole authority. Before
+  identity or adapter publication,
   the worker must still own the delivery's exact admission generation under the shared
   shutdown/publication gate. A newer delivery, every explicit Play/Pause/Next/Previous/scrub action,
   Stop, a real output change, or shutdown supersedes older admission; selecting the already-active
@@ -146,7 +148,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the hidden adapter retains the original handle behind a `MediaLease` checked both before and
   after every file-handle clone. The closed stream resolver now returns either `Http` or a retained
   `File` capability, so remote/radio behavior is unchanged and external playback never reconstructs
-  a URI.
+  a URI. Cursor-based tag and artwork parsers serialize per retained capability, while every output
+  continues to consume the app-owned proxy's position-independent reads.
   Embedded art receives a cloned capability only after the selected output accepts the load.
   Replacement by another external or ordinary queue, Stop, unrepeated EOS, playback/load failure,
   real output change, stale post-adoption admission, and shutdown explicitly retire the ephemeral
@@ -157,7 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity and epoch isolation, retained-handle path replacement, lease revocation,
   hidden-baseline ownership, and exactly-once retirement; independent review covers the complete
   intent/terminal wiring and post-accept artwork handoff. Locked debug and release suites each pass
-  938 tests, strict Clippy is clean in both profiles, and final independent integrated review is
+  940 tests, strict Clippy is clean in both profiles, and final independent integrated review is
   clean.
 - **The centralized source-lifecycle foundation now backs the production source registry** —
   `SourceLifecycleRegistry` provides the atomic adapter, revocable media lease, session epoch,

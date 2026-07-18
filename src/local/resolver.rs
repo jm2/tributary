@@ -7,7 +7,7 @@
 
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sea_orm::{DatabaseConnection, DbErr, EntityTrait};
@@ -62,6 +62,7 @@ enum RetainedFileAuthority {
 struct ResolvedLocalMediaInner {
     authority: RetainedFileAuthority,
     extension: Option<String>,
+    seek_consumers: Mutex<()>,
 }
 
 /// Security-relevant database state captured before filesystem authority is
@@ -125,7 +126,8 @@ impl ResolvedLocalMedia {
     /// Clone the already-authorized file object for a new local consumer.
     ///
     /// Platform clone operations may share a cursor with the retained handle;
-    /// streaming consumers must use position-independent reads.
+    /// streaming consumers must use position-independent reads. Cursor-based
+    /// parsers must use [`Self::with_serialized_seekable_file`] instead.
     pub(crate) fn try_clone_file(&self) -> std::io::Result<File> {
         self.require_active_lease()?;
         let file = match &self.inner.authority {
@@ -144,6 +146,24 @@ impl ResolvedLocalMedia {
         };
         self.require_active_lease()?;
         Ok(file)
+    }
+
+    /// Run one cursor-based consumer against a clone of this exact file.
+    ///
+    /// `File::try_clone` may share its seek cursor with sibling handles. The
+    /// playback proxies use position-independent reads, while tag and artwork
+    /// parsers require ordinary `Read + Seek`; serialize those parsers so two
+    /// overlapping workers cannot disturb one another.
+    pub(crate) fn with_serialized_seekable_file<T>(
+        &self,
+        consume: impl FnOnce(File) -> T,
+    ) -> std::io::Result<T> {
+        let _guard =
+            self.inner.seek_consumers.lock().map_err(|_| {
+                std::io::Error::other("retained media seek authority is unavailable")
+            })?;
+        let file = self.try_clone_file()?;
+        Ok(consume(file))
     }
 
     /// Safe extension hint used to label an opaque media ticket and preserve
@@ -189,6 +209,7 @@ impl ResolvedLocalMedia {
             inner: Arc::new(ResolvedLocalMediaInner {
                 authority: RetainedFileAuthority::OpenFile(file),
                 extension,
+                seek_consumers: Mutex::new(()),
             }),
             lease: None,
         })
@@ -237,6 +258,7 @@ impl ResolvedLocalMedia {
                     path: path.to_path_buf(),
                 },
                 extension,
+                seek_consumers: Mutex::new(()),
             }),
             lease: None,
         })
@@ -362,6 +384,7 @@ pub async fn resolve_track(
                 path,
             },
             extension,
+            seek_consumers: Mutex::new(()),
         }),
         lease: None,
     })
@@ -371,6 +394,9 @@ pub async fn resolve_track(
 mod tests {
     use std::io::{Read, Seek, SeekFrom};
     use std::path::Path;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
     use sea_orm_migration::MigratorTrait;
@@ -437,6 +463,51 @@ mod tests {
             RetainedFileAuthority::Local { path, .. } => path,
             RetainedFileAuthority::OpenFile(_) => panic!("fixture expected local authority"),
         }
+    }
+
+    #[test]
+    fn cursor_based_consumers_are_serialized_for_one_retained_file() {
+        let directory = tempfile::tempdir().expect("retained media directory");
+        let path = directory.path().join("song.bin");
+        std::fs::write(&path, b"retained media").expect("write retained media");
+        let media = ResolvedLocalMedia::from_open_regular_file(
+            File::open(&path).expect("open retained media"),
+            Some("bin".to_string()),
+        )
+        .expect("construct retained media");
+
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first_media = media.clone();
+        let first = thread::spawn(move || {
+            first_media
+                .with_serialized_seekable_file(|_file| {
+                    first_entered_tx.send(()).expect("report first entry");
+                    release_first_rx.recv().expect("release first consumer");
+                })
+                .expect("run first seek consumer");
+        });
+        first_entered_rx.recv().expect("first consumer entered");
+
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let second = thread::spawn(move || {
+            media
+                .with_serialized_seekable_file(|_file| {
+                    second_entered_tx.send(()).expect("report second entry");
+                })
+                .expect("run second seek consumer");
+        });
+        assert_eq!(
+            second_entered_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        release_first_tx.send(()).expect("release first consumer");
+        first.join().expect("join first consumer");
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second consumer entered after release");
+        second.join().expect("join second consumer");
     }
 
     #[test]
