@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::architecture::ResolvedHttpRequest;
+use crate::architecture::{ResolvedHttpRequest, SourceId};
 
 use super::DaapBackend;
 
@@ -38,9 +38,9 @@ struct ActiveSession {
 struct SessionRegistry {
     gate: RegistryGate,
     next_generation: u64,
-    latest_generation: HashMap<String, u64>,
-    pending_attempts: HashSet<(String, u64)>,
-    by_source: HashMap<String, ActiveSession>,
+    latest_generation: HashMap<SourceId, u64>,
+    pending_attempts: HashSet<(SourceId, u64)>,
+    by_source: HashMap<SourceId, ActiveSession>,
     by_session: HashMap<Uuid, Arc<DaapBackend>>,
     /// Backends displaced or released but not yet fully logged out. Keeping
     /// ownership here lets controlled shutdown join every in-flight logout.
@@ -66,7 +66,7 @@ fn lock_registry() -> MutexGuard<'static, SessionRegistry> {
 /// A generation-scoped connection attempt registered before network I/O.
 /// Shutdown waits for every live attempt to finish or be dropped.
 pub struct ConnectionAttempt {
-    source_key: String,
+    source_id: SourceId,
     generation: u64,
     completed: bool,
 }
@@ -76,7 +76,7 @@ impl ConnectionAttempt {
     pub fn is_latest(&self) -> bool {
         let sessions = lock_registry();
         sessions.gate == RegistryGate::Running
-            && sessions.latest_generation.get(&self.source_key) == Some(&self.generation)
+            && sessions.latest_generation.get(&self.source_id) == Some(&self.generation)
     }
 
     /// Install the connected backend only if this attempt remains current.
@@ -89,15 +89,15 @@ impl ConnectionAttempt {
             let mut sessions = lock_registry();
             sessions
                 .pending_attempts
-                .remove(&(self.source_key.clone(), self.generation));
+                .remove(&(self.source_id, self.generation));
             self.completed = true;
 
             let accepted = sessions.gate == RegistryGate::Running
-                && sessions.latest_generation.get(&self.source_key) == Some(&self.generation);
+                && sessions.latest_generation.get(&self.source_id) == Some(&self.generation);
 
             if accepted {
                 let replaced = sessions.by_source.insert(
-                    self.source_key.clone(),
+                    self.source_id,
                     ActiveSession {
                         generation: self.generation,
                         backend: Arc::clone(&backend),
@@ -132,7 +132,7 @@ impl ConnectionAttempt {
         }
 
         Some(RetainedSession {
-            source_key: self.source_key.clone(),
+            source_id: self.source_id,
             generation: self.generation,
             session_key,
             backend,
@@ -148,20 +148,20 @@ impl Drop for ConnectionAttempt {
         let mut sessions = lock_registry();
         sessions
             .pending_attempts
-            .remove(&(self.source_key.clone(), self.generation));
+            .remove(&(self.source_id, self.generation));
         if sessions.gate == RegistryGate::Running
-            && sessions.latest_generation.get(&self.source_key) == Some(&self.generation)
+            && sessions.latest_generation.get(&self.source_id) == Some(&self.generation)
         {
             if let Some(active_generation) = sessions
                 .by_source
-                .get(&self.source_key)
+                .get(&self.source_id)
                 .map(|entry| entry.generation)
             {
                 sessions
                     .latest_generation
-                    .insert(self.source_key.clone(), active_generation);
+                    .insert(self.source_id, active_generation);
             } else {
-                sessions.latest_generation.remove(&self.source_key);
+                sessions.latest_generation.remove(&self.source_id);
             }
         }
         drop(sessions);
@@ -172,7 +172,7 @@ impl Drop for ConnectionAttempt {
 /// A retained backend plus the generation needed to validate queued UI work.
 #[derive(Clone)]
 pub struct RetainedSession {
-    source_key: String,
+    source_id: SourceId,
     generation: u64,
     session_key: Uuid,
     backend: Arc<DaapBackend>,
@@ -187,8 +187,12 @@ impl RetainedSession {
         self.session_key
     }
 
+    pub fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
     pub fn is_current(&self) -> bool {
-        is_current_session(&self.source_key, self.generation, self.session_key)
+        is_current_session(self.source_id, self.generation, self.session_key)
     }
 }
 
@@ -214,7 +218,7 @@ impl ReleasedSession {
 
 /// Register an attempt before starting the DAAP handshake. Returns `None`
 /// after controlled shutdown has closed the connection gate.
-pub fn begin_connect(source_key: String) -> Option<ConnectionAttempt> {
+pub fn begin_connect(source_id: SourceId) -> Option<ConnectionAttempt> {
     let generation = {
         let mut sessions = lock_registry();
         if sessions.gate != RegistryGate::Running {
@@ -222,17 +226,13 @@ pub fn begin_connect(source_key: String) -> Option<ConnectionAttempt> {
         }
         sessions.next_generation = sessions.next_generation.wrapping_add(1).max(1);
         let generation = sessions.next_generation;
-        sessions
-            .latest_generation
-            .insert(source_key.clone(), generation);
-        sessions
-            .pending_attempts
-            .insert((source_key.clone(), generation));
+        sessions.latest_generation.insert(source_id, generation);
+        sessions.pending_attempts.insert((source_id, generation));
         generation
     };
     registry_notify().notify_waiters();
     Some(ConnectionAttempt {
-        source_key,
+        source_id,
         generation,
         completed: false,
     })
@@ -240,11 +240,11 @@ pub fn begin_connect(source_key: String) -> Option<ConnectionAttempt> {
 
 /// Invalidate pending attempts and transfer an active source into registry-
 /// owned retirement before scheduling its logout.
-pub fn release_source(source_key: &str) -> Option<ReleasedSession> {
+pub fn release_source(source_id: SourceId) -> Option<ReleasedSession> {
     let backend = {
         let mut sessions = lock_registry();
-        sessions.latest_generation.remove(source_key);
-        let entry = sessions.by_source.remove(source_key)?;
+        sessions.latest_generation.remove(&source_id);
+        let entry = sessions.by_source.remove(&source_id)?;
         entry.backend.revoke_media();
         sessions.by_session.remove(&entry.backend.session_key());
         sessions
@@ -257,13 +257,13 @@ pub fn release_source(source_key: &str) -> Option<ReleasedSession> {
 }
 
 /// Verify that a queued DAAP sync still belongs to the current source owner.
-pub fn is_current_session(source_key: &str, generation: u64, session_key: Uuid) -> bool {
+pub fn is_current_session(source_id: SourceId, generation: u64, session_key: Uuid) -> bool {
     let sessions = lock_registry();
     if sessions.gate != RegistryGate::Running {
         return false;
     }
-    sessions.latest_generation.get(source_key) == Some(&generation)
-        && sessions.by_source.get(source_key).is_some_and(|entry| {
+    sessions.latest_generation.get(&source_id) == Some(&generation)
+        && sessions.by_source.get(&source_id).is_some_and(|entry| {
             entry.generation == generation && entry.backend.session_key() == session_key
         })
 }
@@ -733,18 +733,18 @@ mod tests {
     async fn discovery_loss_invalidates_an_attempt_before_handshake_start() {
         let _registry_guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry().await;
-        let source_key = "queued-daap-then-lost";
-        let attempt = begin_connect(source_key.to_string()).expect("queued DAAP attempt");
+        let source_id = SourceId::random();
+        let attempt = begin_connect(source_id).expect("queued DAAP attempt");
 
         // No session exists to return, but release still removes the current
         // generation. A queued task that begins afterward must fail closed.
-        assert!(release_source(source_key).is_none());
+        assert!(release_source(source_id).is_none());
         assert!(!attempt.is_latest());
         drop(attempt);
         assert!(!lock_registry()
             .pending_attempts
             .iter()
-            .any(|(key, _)| key == source_key));
+            .any(|(key, _)| *key == source_id));
         reset_registry().await;
     }
 
@@ -848,8 +848,6 @@ mod tests {
         for (case, response) in malformed_items_responses() {
             let server = MockDaapServer::start().await;
             server.enqueue(MockEndpoint::Items, response);
-            let source_key = format!("adversarial:{case}");
-            let attempt = begin_connect(source_key.clone()).expect("register connection attempt");
 
             let outcome = tokio::time::timeout(
                 MOCK_DEADLINE,
@@ -862,11 +860,6 @@ mod tests {
             };
             assert_bounded_parse_error(error, case);
 
-            drop(attempt);
-            assert!(
-                release_source(&source_key).is_none(),
-                "{case}: failed initial sync must not enter the session registry"
-            );
             server.wait_for_requests(MockEndpoint::Logout, 1).await;
             assert_eq!(server.request_count(MockEndpoint::Items), 1, "{case}");
             assert_eq!(logout_count(&server), 1, "{case}");
@@ -935,8 +928,6 @@ mod tests {
         for (case, endpoint, response) in cases {
             let server = MockDaapServer::start().await;
             server.enqueue(endpoint, response);
-            let source_key = format!("expired:{case}");
-            let attempt = begin_connect(source_key.clone()).expect("register connection attempt");
 
             let outcome = tokio::time::timeout(
                 MOCK_DEADLINE,
@@ -956,11 +947,6 @@ mod tests {
                 "{case}: unexpected expiration error: {error}"
             );
 
-            drop(attempt);
-            assert!(
-                release_source(&source_key).is_none(),
-                "{case}: failed session must never enter the registry"
-            );
             server.wait_for_requests(MockEndpoint::Logout, 1).await;
             assert_eq!(server.request_count(MockEndpoint::ServerInfo), 1, "{case}");
             assert_eq!(server.request_count(MockEndpoint::Login), 1, "{case}");
@@ -990,8 +976,6 @@ mod tests {
         reset_registry().await;
         let server = MockDaapServer::start().await;
         server.enqueue(MockEndpoint::Items, in_band_items_status(500));
-        let source_key = "non-auth-status".to_string();
-        let attempt = begin_connect(source_key.clone()).expect("register connection attempt");
 
         let outcome = tokio::time::timeout(
             MOCK_DEADLINE,
@@ -1010,8 +994,6 @@ mod tests {
             } if message == "DAAP items returned status 500"
         ));
 
-        drop(attempt);
-        assert!(release_source(&source_key).is_none());
         server.wait_for_requests(MockEndpoint::Logout, 1).await;
         assert_eq!(logout_count(&server), 1);
         assert_eq!(server.request_count(MockEndpoint::Stream), 0);
@@ -1032,6 +1014,13 @@ mod tests {
             .await
             .expect("read DAAP track catalogue");
         assert_eq!(tracks.len(), 1);
+        assert_eq!(
+            tracks[0]
+                .native_track_id
+                .as_ref()
+                .map(crate::architecture::TrackId::as_str),
+            Some("9")
+        );
 
         let stream_reference = tracks[0]
             .stream_url
@@ -1055,7 +1044,8 @@ mod tests {
             direct_stream.private_query_pairs(),
             &[("session-id".to_string(), "42".to_string())]
         );
-        let retained = begin_connect(server.base_url.clone())
+        let source_id = SourceId::random();
+        let retained = begin_connect(source_id)
             .expect("open connection gate")
             .retain(backend)
             .await
@@ -1094,12 +1084,8 @@ mod tests {
             &[("session-id".to_string(), "42".to_string())]
         );
 
-        let owned = release_source(&server.base_url).expect("retained source");
-        assert!(!is_current_session(
-            &server.base_url,
-            generation,
-            session_key
-        ));
+        let owned = release_source(source_id).expect("retained source");
+        assert!(!is_current_session(source_id, generation, session_key));
         assert!(!stream_request.is_active());
         assert!(!artwork_request.is_active());
         assert!(resolve_stream_reference(stream_reference.as_str()).is_err());
@@ -1136,8 +1122,8 @@ mod tests {
         let backend = DaapBackend::connect("Shutdown DAAP", &server.base_url, None)
             .await
             .expect("connect and sync");
-        let source_key = format!("shutdown:{}", server.base_url);
-        let retained = begin_connect(source_key)
+        let source_id = SourceId::random();
+        let retained = begin_connect(source_id)
             .expect("open connection gate")
             .retain(backend)
             .await
@@ -1149,7 +1135,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(logout_count(&server), 1);
-        assert!(begin_connect("after-shutdown".to_string()).is_none());
+        assert!(begin_connect(SourceId::random()).is_none());
 
         reset_registry().await;
     }
@@ -1160,12 +1146,12 @@ mod tests {
         reset_registry().await;
         let first_server = MockDaapServer::start().await;
         let second_server = MockDaapServer::start().await;
-        let source_key = "daap://logical-source".to_string();
+        let source_id = SourceId::random();
 
         let first_backend = DaapBackend::connect("First", &first_server.base_url, None)
             .await
             .expect("connect first session");
-        let first = begin_connect(source_key.clone())
+        let first = begin_connect(source_id)
             .expect("open first attempt")
             .retain(first_backend)
             .await
@@ -1176,14 +1162,14 @@ mod tests {
         let second_backend = DaapBackend::connect("Second", &second_server.base_url, None)
             .await
             .expect("connect second session");
-        let second = begin_connect(source_key.clone())
+        let second = begin_connect(source_id)
             .expect("open replacement attempt")
             .retain(second_backend)
             .await
             .expect("retain replacement session");
 
         assert!(!is_current_session(
-            &source_key,
+            source_id,
             first_generation,
             first_session_key
         ));
@@ -1191,7 +1177,7 @@ mod tests {
         assert_eq!(logout_count(&first_server), 1);
         assert_eq!(logout_count(&second_server), 0);
 
-        release_source(&source_key)
+        release_source(source_id)
             .expect("release replacement")
             .disconnect()
             .await;
@@ -1205,12 +1191,12 @@ mod tests {
         reset_registry().await;
         let first_server = MockDaapServer::start().await;
         let second_server = MockDaapServer::start().await;
-        let source_key = "daap://queued-sync-source".to_string();
+        let source_id = SourceId::random();
 
         let first_backend = DaapBackend::connect("First", &first_server.base_url, None)
             .await
             .expect("connect first session");
-        let first = begin_connect(source_key.clone())
+        let first = begin_connect(source_id)
             .expect("open first attempt")
             .retain(first_backend)
             .await
@@ -1225,7 +1211,7 @@ mod tests {
             .clone()
             .expect("queued stream reference");
         assert!(is_current_session(
-            &source_key,
+            source_id,
             queued_generation,
             queued_session_key
         ));
@@ -1233,25 +1219,25 @@ mod tests {
         let second_backend = DaapBackend::connect("Second", &second_server.base_url, None)
             .await
             .expect("connect replacement session");
-        let second = begin_connect(source_key.clone())
+        let second = begin_connect(source_id)
             .expect("open replacement attempt")
             .retain(second_backend)
             .await
             .expect("retain replacement session");
 
         assert!(!is_current_session(
-            &source_key,
+            source_id,
             queued_generation,
             queued_session_key
         ));
         assert!(resolve_stream_reference(queued_reference.as_str()).is_err());
         assert!(is_current_session(
-            &source_key,
+            source_id,
             second.generation(),
             second.session_key()
         ));
 
-        release_source(&source_key)
+        release_source(source_id)
             .expect("release replacement")
             .disconnect()
             .await;
@@ -1263,8 +1249,7 @@ mod tests {
         let _registry_guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry().await;
         let server = MockDaapServer::start().await;
-        let source_key = "daap://retain-shutdown-race".to_string();
-        let attempt = begin_connect(source_key).expect("open connection attempt");
+        let attempt = begin_connect(SourceId::random()).expect("open connection attempt");
         let backend = DaapBackend::connect("Racing", &server.base_url, None)
             .await
             .expect("connect session");
@@ -1306,11 +1291,11 @@ mod tests {
         let _registry_guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry().await;
         let server = MockDaapServer::start().await;
-        let source_key = "daap://release-shutdown-race".to_string();
+        let source_id = SourceId::random();
         let backend = DaapBackend::connect("Racing", &server.base_url, None)
             .await
             .expect("connect session");
-        let retained = begin_connect(source_key.clone())
+        let retained = begin_connect(source_id)
             .expect("open connection attempt")
             .retain(backend)
             .await
@@ -1321,7 +1306,7 @@ mod tests {
         let release_barrier = Arc::clone(&barrier);
         let release_task = tokio::spawn(async move {
             release_barrier.wait().await;
-            if let Some(released) = release_source(&source_key) {
+            if let Some(released) = release_source(source_id) {
                 released.disconnect().await;
             }
         });

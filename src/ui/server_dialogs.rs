@@ -6,9 +6,13 @@
 use adw::prelude::*;
 use gtk::glib;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::architecture::{AdvertisedHttpRoute, SourceId};
 use crate::local::engine::LibraryEvent;
 
 use super::objects::SourceObject;
@@ -20,6 +24,53 @@ type RemoteConnectResult = Result<
     )>,
     (crate::architecture::error::BackendError, bool),
 >;
+
+async fn authenticate_manual_jellyfin(
+    server_url: &str,
+    username: &str,
+    password: &str,
+    advertised_route: Option<AdvertisedHttpRoute>,
+) -> crate::architecture::backend::BackendResult<crate::jellyfin::client::JellyfinClient> {
+    crate::jellyfin::client::JellyfinClient::authenticate_with_route(
+        server_url,
+        username,
+        password,
+        advertised_route,
+    )
+    .await
+}
+
+async fn authenticate_manual_plex(
+    server_url: &str,
+    username: &str,
+    password: &str,
+    advertised_route: Option<AdvertisedHttpRoute>,
+) -> crate::architecture::backend::BackendResult<crate::plex::client::PlexClient> {
+    crate::plex::client::PlexClient::authenticate_with_route(
+        server_url,
+        username,
+        password,
+        advertised_route,
+    )
+    .await
+}
+
+async fn connect_manual_subsonic(
+    server_name: &str,
+    server_url: &str,
+    username: &str,
+    password: &str,
+    advertised_route: Option<AdvertisedHttpRoute>,
+) -> crate::architecture::backend::BackendResult<crate::subsonic::SubsonicBackend> {
+    crate::subsonic::SubsonicBackend::connect_with_route(
+        server_name,
+        server_url,
+        username,
+        password,
+        advertised_route,
+    )
+    .await
+}
 
 /// Validate a standard remote backend URL before it reaches persistence,
 /// logs, an auth dialog, or connection ownership state.
@@ -33,15 +84,41 @@ pub(super) fn validate_remote_server_url(server_url: &str) -> Result<(), &'stati
 // ── SavedServer persistence ─────────────────────────────────────────
 
 /// A saved server entry in `servers.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SavedServer {
-    /// Backend type: `"subsonic"`, `"jellyfin"`, or `"plex"`.
+    /// Backend type: `"subsonic"`, `"jellyfin"`, `"plex"`, or `"daap"`.
     #[serde(rename = "type")]
     pub server_type: String,
     /// Human-readable display name.
     pub name: String,
     /// Server URL.
     pub url: String,
+    /// Stable source identity, independent of endpoint spelling or rebinding.
+    pub source_id: SourceId,
+}
+
+const SAVED_SERVER_SCHEMA_VERSION: u32 = 1;
+const SAVED_SERVER_CONFIG_UNAVAILABLE: &str = "Saved server configuration is unavailable";
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacySavedServer {
+    #[serde(rename = "type")]
+    server_type: String,
+    name: String,
+    url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedServerEnvelope {
+    schema_version: u32,
+    servers: Vec<SavedServer>,
+}
+
+enum SavedServerLoad {
+    Ready(Vec<SavedServer>),
+    Quarantined,
 }
 
 /// Path to `servers.json`: `<data_dir>/tributary/servers.json`.
@@ -49,36 +126,267 @@ fn servers_json_path() -> Option<std::path::PathBuf> {
     dirs::data_dir().map(|d| d.join("tributary").join("servers.json"))
 }
 
-/// Load saved servers from `servers.json`, returning an empty vec on error.
+/// Load, validate, and (when needed) migrate saved servers.
+///
+/// Invalid or unavailable configuration is quarantined in place and publishes
+/// no rows into the live source registry.
 pub fn load_saved_servers() -> Vec<SavedServer> {
-    let mut servers: Vec<SavedServer> = servers_json_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    let before = servers.len();
-    servers.retain(|server| validate_remote_server_url(&server.url).is_ok());
-    if servers.len() != before {
-        // Remove legacy unsafe rows from disk without ever formatting their
-        // values into a diagnostic.
-        save_servers(&servers);
-        tracing::warn!(
-            removed = before - servers.len(),
-            "Removed invalid saved server entries"
-        );
+    let Some(path) = servers_json_path() else {
+        warn!("Saved server configuration path is unavailable");
+        return Vec::new();
+    };
+    match load_saved_servers_from(&path) {
+        SavedServerLoad::Ready(servers) => servers,
+        SavedServerLoad::Quarantined => {
+            warn!("Saved server configuration was quarantined");
+            Vec::new()
+        }
     }
-    servers
 }
 
-/// Save the list of servers to `servers.json`.
-fn save_servers(servers: &[SavedServer]) {
-    if let Some(path) = servers_json_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+fn load_saved_servers_from(path: &Path) -> SavedServerLoad {
+    load_saved_servers_from_with(path, save_servers_to)
+}
+
+fn load_saved_servers_from_with(
+    path: &Path,
+    save_servers: impl FnOnce(&Path, &[SavedServer]) -> std::io::Result<()>,
+) -> SavedServerLoad {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return SavedServerLoad::Ready(Vec::new())
         }
-        if let Ok(json) = serde_json::to_string_pretty(servers) {
-            let _ = std::fs::write(path, json);
+        Err(_) => return SavedServerLoad::Quarantined,
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return SavedServerLoad::Quarantined,
+    };
+
+    if value.is_array() {
+        let legacy: Vec<LegacySavedServer> = match serde_json::from_value(value) {
+            Ok(legacy) => legacy,
+            Err(_) => return SavedServerLoad::Quarantined,
+        };
+        let (servers, removed) = migrate_legacy_servers(legacy);
+        if save_servers(path, &servers).is_err() {
+            return SavedServerLoad::Quarantined;
         }
+        if removed > 0 {
+            warn!(
+                removed,
+                "Removed invalid or duplicate legacy saved server entries"
+            );
+        }
+        return SavedServerLoad::Ready(servers);
     }
+
+    let envelope: SavedServerEnvelope = match serde_json::from_value::<SavedServerEnvelope>(value) {
+        Ok(envelope) if envelope.schema_version == SAVED_SERVER_SCHEMA_VERSION => envelope,
+        Ok(_) | Err(_) => return SavedServerLoad::Quarantined,
+    };
+    validate_version_one_servers(envelope.servers)
+        .map(SavedServerLoad::Ready)
+        .unwrap_or(SavedServerLoad::Quarantined)
+}
+
+fn migrate_legacy_servers(legacy: Vec<LegacySavedServer>) -> (Vec<SavedServer>, usize) {
+    let original_len = legacy.len();
+    let mut seen = HashSet::new();
+    let mut servers = Vec::with_capacity(original_len);
+    for row in legacy {
+        let Some((url, endpoint_key)) = validated_endpoint(&row.server_type, &row.url) else {
+            continue;
+        };
+        let key = (row.server_type.clone(), endpoint_key);
+        if !seen.insert(key) {
+            continue;
+        }
+        let source_id = SourceId::remote(&row.server_type, &url)
+            .expect("validated backend and remote URL produce a source ID");
+        servers.push(SavedServer {
+            server_type: row.server_type,
+            name: row.name,
+            url: row.url,
+            source_id,
+        });
+    }
+    let removed = original_len.saturating_sub(servers.len());
+    (servers, removed)
+}
+
+fn validate_version_one_servers(servers: Vec<SavedServer>) -> Option<Vec<SavedServer>> {
+    let mut by_endpoint: HashMap<(String, String), SourceId> = HashMap::new();
+    let mut by_id: HashMap<SourceId, (String, String)> = HashMap::new();
+    let mut accepted = Vec::with_capacity(servers.len());
+
+    for server in servers {
+        let (base_url, canonical) = validated_endpoint(&server.server_type, &server.url)?;
+        if !server
+            .source_id
+            .is_valid_persisted_remote_for(&server.server_type, &base_url)
+        {
+            return None;
+        }
+        let endpoint = (server.server_type.clone(), canonical);
+        if let Some(existing) = by_endpoint.get(&endpoint) {
+            if *existing != server.source_id {
+                return None;
+            }
+            // An exact duplicate describes one source. Preserve the first
+            // file-order row and its display name without rewriting the file.
+            continue;
+        }
+        if let Some(existing) = by_id.get(&server.source_id) {
+            if existing != &endpoint {
+                return None;
+            }
+        }
+        by_endpoint.insert(endpoint.clone(), server.source_id);
+        by_id.insert(server.source_id, endpoint);
+        accepted.push(server);
+    }
+    Some(accepted)
+}
+
+fn validated_endpoint(server_type: &str, raw_url: &str) -> Option<(url::Url, String)> {
+    if !matches!(server_type, "subsonic" | "jellyfin" | "plex" | "daap") {
+        return None;
+    }
+    let parsed = crate::http_security::parse_base_url(raw_url).ok()?;
+    let canonical = crate::architecture::identity::canonical_remote_base_url(&parsed).ok()?;
+    Some((parsed, canonical))
+}
+
+/// Whether two validated remote descriptions name the same logical source.
+///
+/// The backend is part of identity: two protocols may legitimately be
+/// advertised at the same origin. Endpoint spelling is not identity, so the
+/// comparison uses the shared canonical base-URL policy.
+pub(super) fn same_remote_endpoint(
+    left_type: &str,
+    left_url: &str,
+    right_type: &str,
+    right_url: &str,
+) -> bool {
+    if left_type != right_type {
+        return false;
+    }
+    validated_endpoint(left_type, left_url)
+        .zip(validated_endpoint(right_type, right_url))
+        .is_some_and(|((_, left), (_, right))| left == right)
+}
+
+fn source_owns_remote_endpoint(source: &SourceObject, server_type: &str, server_url: &str) -> bool {
+    same_remote_endpoint(
+        &source.backend_type(),
+        &source.server_url(),
+        server_type,
+        server_url,
+    )
+}
+
+/// Return the one already-published identity for a canonical endpoint before
+/// persistence assigns ownership.
+///
+/// Promotion must persist this ID rather than minting a replacement: the
+/// existing value may already own navigation generations, cached tracks,
+/// pending authentication, playback, and a retained backend session. A
+/// missing, reserved, or duplicate live owner is not safe to promote.
+fn existing_source_id_for_endpoint(
+    store: &gtk::gio::ListStore,
+    server_type: &str,
+    server_url: &str,
+) -> Result<Option<SourceId>, &'static str> {
+    let (base_url, _) =
+        validated_endpoint(server_type, server_url).ok_or(SAVED_SERVER_CONFIG_UNAVAILABLE)?;
+    let mut owner = None;
+    for index in 0..store.n_items() {
+        let Some(source) = store.item(index).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if !source_owns_remote_endpoint(&source, server_type, server_url) {
+            continue;
+        }
+        if owner.is_some() {
+            return Err(SAVED_SERVER_CONFIG_UNAVAILABLE);
+        }
+        let source_id = source
+            .source_id()
+            .filter(|source_id| source_id.is_valid_persisted_remote_for(server_type, &base_url))
+            .ok_or(SAVED_SERVER_CONFIG_UNAVAILABLE)?;
+        owner = Some(source_id);
+    }
+    Ok(owner)
+}
+
+/// Publish a saved source without allowing another sidebar row to own the
+/// same canonical `(backend, endpoint)` pair.
+///
+/// A discovered row is promoted in place so its stable identity and ephemeral
+/// advertised route survive. Re-adding an already-saved endpoint updates the
+/// same object and therefore leaves deletion keyed by one unambiguous
+/// persisted `SourceId`.
+fn upsert_saved_source_in_store(
+    store: &gtk::gio::ListStore,
+    saved: &SavedServer,
+) -> Result<SourceObject, &'static str> {
+    for index in 0..store.n_items() {
+        let Some(source) = store.item(index).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if !source_owns_remote_endpoint(&source, &saved.server_type, &saved.url) {
+            continue;
+        }
+
+        if source.source_id() != Some(saved.source_id) {
+            return Err(SAVED_SERVER_CONFIG_UNAVAILABLE);
+        }
+        source.set_name(&saved.name);
+        source.set_server_url(&saved.url);
+        source.set_manually_added(true);
+        source.set_connecting(true);
+
+        // SourceObject fields are deliberately plain GTK-side state rather
+        // than GObject properties. Reinsert the same object to refresh the
+        // list-item binding without creating a second logical owner.
+        store.remove(index);
+        store.insert(index, &source);
+        return Ok(source);
+    }
+
+    let insert_pos = super::window::ensure_category_header_store(store, &saved.server_type);
+    let source = SourceObject::manual(&saved.name, &saved.server_type, &saved.url, saved.source_id);
+    source.set_connecting(true);
+    store.insert(insert_pos, &source);
+    Ok(source)
+}
+
+/// Save one complete v1 envelope through a same-directory atomic replacement.
+fn save_servers_to(path: &Path, servers: &[SavedServer]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent directory")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let envelope = SavedServerEnvelope {
+        schema_version: SAVED_SERVER_SCHEMA_VERSION,
+        servers: servers.to_vec(),
+    };
+    let mut json = serde_json::to_vec_pretty(&envelope).map_err(std::io::Error::other)?;
+    json.push(b'\n');
+
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(&json)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+
+    #[cfg(unix)]
+    {
+        let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+    }
+    Ok(())
 }
 
 fn add_saved_server_to(
@@ -86,39 +394,95 @@ fn add_saved_server_to(
     server_type: &str,
     name: &str,
     url: &str,
+    existing_source_id: Option<SourceId>,
 ) -> Result<bool, &'static str> {
     validate_remote_server_url(url)?;
-    if servers.iter().any(|server| server.url == url) {
+    let Some((base_url, canonical)) = validated_endpoint(server_type, url) else {
+        return Err("Unsupported remote server type");
+    };
+    if servers.iter().any(|server| {
+        validated_endpoint(&server.server_type, &server.url)
+            .is_some_and(|(_, existing)| server.server_type == server_type && existing == canonical)
+    }) {
         return Ok(false);
     }
 
+    let source_id = if let Some(source_id) = existing_source_id {
+        if !source_id.is_valid_persisted_remote_for(server_type, &base_url)
+            || servers.iter().any(|server| server.source_id == source_id)
+        {
+            return Err(SAVED_SERVER_CONFIG_UNAVAILABLE);
+        }
+        source_id
+    } else {
+        loop {
+            let candidate = SourceId::random();
+            if !servers.iter().any(|server| server.source_id == candidate) {
+                break candidate;
+            }
+        }
+    };
     servers.push(SavedServer {
         server_type: server_type.to_string(),
         name: name.to_string(),
         url: url.to_string(),
+        source_id,
     });
     Ok(true)
 }
 
-/// Add a validated server to `servers.json` (dedup by URL).
-pub fn add_saved_server(server_type: &str, name: &str, url: &str) -> Result<bool, &'static str> {
-    let mut servers = load_saved_servers();
-    let added = add_saved_server_to(&mut servers, server_type, name, url)?;
+/// Add a validated server to `servers.json` (dedup by canonical endpoint).
+/// An already-published owner is persisted verbatim instead of being
+/// reassigned during discovered/environment-to-saved promotion.
+pub fn add_saved_server(
+    server_type: &str,
+    name: &str,
+    url: &str,
+    existing_source_id: Option<SourceId>,
+) -> Result<SavedServer, &'static str> {
+    let Some(path) = servers_json_path() else {
+        return Err(SAVED_SERVER_CONFIG_UNAVAILABLE);
+    };
+    let mut servers = match load_saved_servers_from(&path) {
+        SavedServerLoad::Ready(servers) => servers,
+        SavedServerLoad::Quarantined => return Err(SAVED_SERVER_CONFIG_UNAVAILABLE),
+    };
+    let added = add_saved_server_to(&mut servers, server_type, name, url, existing_source_id)?;
+    if added && save_servers_to(&path, &servers).is_err() {
+        return Err(SAVED_SERVER_CONFIG_UNAVAILABLE);
+    }
     if added {
-        save_servers(&servers);
         info!("Server added to servers.json");
     }
-    Ok(added)
+    let (_, canonical) =
+        validated_endpoint(server_type, url).ok_or("Unsupported remote server type")?;
+    servers
+        .into_iter()
+        .find(|server| {
+            server.server_type == server_type
+                && validated_endpoint(&server.server_type, &server.url)
+                    .is_some_and(|(_, existing)| existing == canonical)
+        })
+        .ok_or(SAVED_SERVER_CONFIG_UNAVAILABLE)
 }
 
-/// Remove a server from `servers.json` by URL.
-pub fn remove_saved_server(url: &str) {
-    let mut servers = load_saved_servers();
+/// Remove a server from `servers.json` by stable source identity.
+pub fn remove_saved_server(source_id: SourceId) {
+    let Some(path) = servers_json_path() else {
+        return;
+    };
+    let mut servers = match load_saved_servers_from(&path) {
+        SavedServerLoad::Ready(servers) => servers,
+        SavedServerLoad::Quarantined => return,
+    };
     let before = servers.len();
-    servers.retain(|s| s.url != url);
+    servers.retain(|server| server.source_id != source_id);
     if servers.len() != before {
-        save_servers(&servers);
-        info!("Server removed from servers.json");
+        if save_servers_to(&path, &servers).is_ok() {
+            info!("Server removed from servers.json");
+        } else {
+            warn!("Could not persist saved server removal");
+        }
     }
 }
 
@@ -315,27 +679,52 @@ pub fn show_add_server_dialog(
         // Validate before persistence, sidebar publication, connection state,
         // or URL-bearing logs. Rejected text may itself contain a credential,
         // so only the fixed validation message may cross this boundary.
-        if let Err(message) = add_saved_server(backend_type, &display_name, &url) {
-            tracing::warn!(error = message, "Manual server URL rejected");
-            let _ = engine_tx.try_send(LibraryEvent::Error(message.to_string()));
-            return;
-        }
+        let existing_source_id = match existing_source_id_for_endpoint(&store, backend_type, &url) {
+            Ok(source_id) => source_id,
+            Err(message) => {
+                tracing::warn!(
+                    error = message,
+                    "Manual server source ownership is unavailable"
+                );
+                let _ = engine_tx.try_send(LibraryEvent::Error(message.to_string()));
+                return;
+            }
+        };
+        let saved = match add_saved_server(backend_type, &display_name, &url, existing_source_id) {
+            Ok(saved) => saved,
+            Err(message) => {
+                tracing::warn!(error = message, "Manual server URL rejected");
+                let _ = engine_tx.try_send(LibraryEvent::Error(message.to_string()));
+                return;
+            }
+        };
 
-        // Add to sidebar as a manual server.
-        let insert_pos = super::window::ensure_category_header_store(&store, backend_type);
-        let src = SourceObject::manual(&display_name, backend_type, &url);
-        src.set_connecting(true);
-        store.insert(insert_pos, &src);
+        // Publish exactly one owner for this logical endpoint. A discovered
+        // row's already-published identity was persisted above, so this path
+        // does not mutate or attempt to transfer any identity-keyed route,
+        // cache, navigation, playback, or registry state.
+        let saved_source = match upsert_saved_source_in_store(&store, &saved) {
+            Ok(source) => source,
+            Err(message) => {
+                tracing::warn!(error = message, "Manual server source ownership changed");
+                let _ = engine_tx.try_send(LibraryEvent::Error(message.to_string()));
+                return;
+            }
+        };
+        // Promotion deliberately reuses the discovered SourceObject. Snapshot
+        // its ephemeral route for this immediate connection before async work
+        // starts; persistence stores identity and endpoint, never the route.
+        let advertised_route = saved_source.advertised_route();
 
         // One-shot to clear spinner on failure.
         let (fail_tx, fail_rx) = async_channel::bounded::<()>(1);
         let store_for_fail = store.clone();
-        let url_for_fail = url.clone();
+        let source_id_for_fail = saved.source_id;
         glib::MainContext::default().spawn_local(async move {
             if fail_rx.recv().await.is_ok() {
                 for i in 0..store_for_fail.n_items() {
                     if let Some(src) = store_for_fail.item(i).and_downcast_ref::<SourceObject>() {
-                        if src.server_url() == url_for_fail {
+                        if src.source_id() == Some(source_id_for_fail) {
                             src.set_connecting(false);
                             let src = src.clone();
                             store_for_fail.remove(i);
@@ -349,22 +738,24 @@ pub fn show_add_server_dialog(
 
         // Spawn auth + fetch on tokio.
         let engine_tx = engine_tx.clone();
-        let server_url = url.clone();
-        let server_name = display_name.clone();
+        let server_url = saved.url.clone();
+        let server_name = saved.name.clone();
         let backend_type = backend_type.to_string();
+        let source_id = saved.source_id;
 
         rt_handle.spawn(async move {
-            let Some(attempt) = crate::source_registry::begin_connect(server_url.clone()) else {
+            let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
                 tracing::debug!("Skipping manual remote connect during shutdown");
                 return;
             };
             let result: RemoteConnectResult = match backend_type.as_str() {
                 "jellyfin" => {
                     info!("Authenticating with Jellyfin (manual)...");
-                    match crate::jellyfin::client::JellyfinClient::authenticate(
+                    match authenticate_manual_jellyfin(
                         &server_url,
                         &user,
                         &pass,
+                        advertised_route.clone(),
                     )
                     .await
                     {
@@ -394,8 +785,13 @@ pub fn show_add_server_dialog(
                 }
                 "plex" => {
                     info!("Authenticating with Plex (manual)...");
-                    match crate::plex::client::PlexClient::authenticate(&server_url, &user, &pass)
-                        .await
+                    match authenticate_manual_plex(
+                        &server_url,
+                        &user,
+                        &pass,
+                        advertised_route.clone(),
+                    )
+                    .await
                     {
                         Ok(client) => {
                             match crate::plex::PlexBackend::from_client(&server_name, client).await
@@ -419,11 +815,12 @@ pub fn show_add_server_dialog(
                 }
                 _ => {
                     info!("Authenticating with Subsonic (manual)...");
-                    match crate::subsonic::SubsonicBackend::connect(
+                    match connect_manual_subsonic(
                         &server_name,
                         &server_url,
                         &user,
                         &pass,
+                        advertised_route.clone(),
                     )
                     .await
                     {
@@ -450,7 +847,7 @@ pub fn show_add_server_dialog(
                     );
                     let _ = engine_tx
                         .send(LibraryEvent::RemoteSync {
-                            source_key: server_url,
+                            source_id,
                             generation: source.generation(),
                             lease_key: source.lease_key(),
                             tracks,
@@ -488,6 +885,473 @@ pub fn show_add_server_dialog(
 mod tests {
     use super::*;
 
+    fn loaded(path: &Path) -> Vec<SavedServer> {
+        match load_saved_servers_from(path) {
+            SavedServerLoad::Ready(servers) => servers,
+            SavedServerLoad::Quarantined => panic!("fixture was quarantined"),
+        }
+    }
+
+    #[test]
+    fn legacy_array_is_migrated_atomically_before_rows_are_published() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("servers.json");
+        let legacy = serde_json::json!([
+            {
+                "type": "subsonic",
+                "name": "First spelling wins",
+                "url": "HTTPS://MUSIC.EXAMPLE.TEST:443/base/"
+            },
+            {
+                "type": "subsonic",
+                "name": "Duplicate",
+                "url": "https://music.example.test/base"
+            },
+            {
+                "type": "jellyfin",
+                "name": "Same URL, distinct backend",
+                "url": "https://music.example.test/base"
+            },
+            {
+                "type": "unsupported",
+                "name": "Dropped",
+                "url": "https://ignored.example.test"
+            }
+        ]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("legacy JSON"),
+        )
+        .expect("write legacy file");
+
+        let servers = loaded(&path);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name, "First spelling wins");
+        assert_eq!(
+            servers[0].source_id.to_string(),
+            "71bd3508-1650-530c-8f0e-a06a72c64e3b"
+        );
+        assert_ne!(servers[0].source_id, servers[1].source_id);
+
+        let migrated: SavedServerEnvelope =
+            serde_json::from_slice(&std::fs::read(&path).expect("read migration"))
+                .expect("v1 envelope");
+        assert_eq!(migrated.schema_version, 1);
+        assert_eq!(migrated.servers, servers);
+    }
+
+    #[test]
+    fn unknown_malformed_and_conflicting_v1_files_are_quarantined_unchanged() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("servers.json");
+        let source_a = SourceId::random();
+        let source_b = SourceId::random();
+        let other_endpoint_owner = SourceId::remote(
+            "subsonic",
+            &url::Url::parse("https://other.example.test").expect("other endpoint"),
+        )
+        .expect("other endpoint owner");
+        let removable_owner =
+            SourceId::removable("device:uuid:01234567-89ab-cdef-0123-456789abcdef")
+                .expect("removable owner");
+        let fixtures = [
+            serde_json::json!({ "schema_version": 99, "servers": [] }),
+            serde_json::json!({
+                "schema_version": 1,
+                "servers": [{
+                    "type": "subsonic",
+                    "name": "Missing identity",
+                    "url": "https://music.example.test"
+                }]
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "servers": [
+                    {
+                        "type": "subsonic",
+                        "name": "First",
+                        "url": "https://music.example.test",
+                        "source_id": source_a
+                    },
+                    {
+                        "type": "subsonic",
+                        "name": "Conflicting endpoint owner",
+                        "url": "HTTPS://MUSIC.EXAMPLE.TEST:443/",
+                        "source_id": source_b
+                    }
+                ]
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "servers": [
+                    {
+                        "type": "subsonic",
+                        "name": "First",
+                        "url": "https://first.example.test",
+                        "source_id": source_a
+                    },
+                    {
+                        "type": "plex",
+                        "name": "Conflicting ID owner",
+                        "url": "https://second.example.test",
+                        "source_id": source_a
+                    }
+                ]
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "servers": [{
+                    "type": "subsonic",
+                    "name": "Cannot impersonate local",
+                    "url": "https://music.example.test",
+                    "source_id": SourceId::local()
+                }]
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "servers": [{
+                    "type": "jellyfin",
+                    "name": "Cannot impersonate radio",
+                    "url": "https://video.example.test",
+                    "source_id": SourceId::radio_browser()
+                }]
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "servers": [{
+                    "type": "plex",
+                    "name": "Nil is reserved",
+                    "url": "https://plex.example.test",
+                    "source_id": SourceId::from_uuid(uuid::Uuid::nil())
+                }]
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "servers": [{
+                    "type": "subsonic",
+                    "name": "Cannot claim another endpoint owner",
+                    "url": "https://music.example.test",
+                    "source_id": other_endpoint_owner
+                }]
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "servers": [{
+                    "type": "subsonic",
+                    "name": "Cannot claim a removable owner",
+                    "url": "https://music.example.test",
+                    "source_id": removable_owner
+                }]
+            }),
+            serde_json::json!({
+                "schema_version": 1,
+                "servers": [{
+                    "type": "subsonic",
+                    "name": "Only random v4 or exact remote v5 is valid",
+                    "url": "https://music.example.test",
+                    "source_id": SourceId::from_uuid(uuid::Uuid::from_u128(
+                        0x0000_0000_0000_1000_8000_0000_0000_0001
+                    ))
+                }]
+            }),
+        ];
+
+        for fixture in fixtures {
+            let original = serde_json::to_vec_pretty(&fixture).expect("fixture JSON");
+            std::fs::write(&path, &original).expect("write fixture");
+            assert!(matches!(
+                load_saved_servers_from(&path),
+                SavedServerLoad::Quarantined
+            ));
+            assert_eq!(std::fs::read(&path).expect("read fixture"), original);
+        }
+    }
+
+    #[test]
+    fn version_one_accepts_random_or_exact_canonical_remote_identity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("servers.json");
+        let deterministic_url =
+            url::Url::parse("https://discovered.example.test/base").expect("endpoint");
+        let deterministic =
+            SourceId::remote("subsonic", &deterministic_url).expect("deterministic owner");
+        let random = SourceId::random();
+        let envelope = serde_json::json!({
+            "schema_version": 1,
+            "servers": [
+                {
+                    "type": "subsonic",
+                    "name": "Promoted discovery",
+                    "url": "HTTPS://DISCOVERED.EXAMPLE.TEST:443/base/",
+                    "source_id": deterministic
+                },
+                {
+                    "type": "plex",
+                    "name": "Manual source",
+                    "url": "https://manual.example.test",
+                    "source_id": random
+                }
+            ]
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&envelope).expect("fixture JSON"),
+        )
+        .expect("write fixture");
+
+        let servers = loaded(&path);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].source_id, deterministic);
+        assert_eq!(servers[1].source_id, random);
+    }
+
+    #[test]
+    fn exact_v1_duplicates_preserve_the_first_row_without_changing_the_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("servers.json");
+        let source_id = SourceId::random();
+        let envelope = serde_json::json!({
+            "schema_version": 1,
+            "servers": [
+                {
+                    "type": "subsonic",
+                    "name": "First",
+                    "url": "https://music.example.test/base/",
+                    "source_id": source_id
+                },
+                {
+                    "type": "subsonic",
+                    "name": "Duplicate",
+                    "url": "HTTPS://MUSIC.EXAMPLE.TEST:443/base",
+                    "source_id": source_id
+                }
+            ]
+        });
+        let original = serde_json::to_vec_pretty(&envelope).expect("fixture JSON");
+        std::fs::write(&path, &original).expect("write fixture");
+
+        let servers = loaded(&path);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "First");
+        assert_eq!(std::fs::read(&path).expect("read fixture"), original);
+    }
+
+    #[test]
+    fn failed_legacy_replacement_publishes_nothing_and_preserves_original_bytes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("servers.json");
+        let original = br#"[{"type":"subsonic","name":"Home","url":"https://music.example.test"}]"#;
+        std::fs::write(&path, original).expect("write legacy fixture");
+
+        let result = load_saved_servers_from_with(&path, |_path, _servers| {
+            Err(std::io::Error::other("injected atomic replacement failure"))
+        });
+
+        assert!(matches!(result, SavedServerLoad::Quarantined));
+        assert_eq!(std::fs::read(&path).expect("read legacy fixture"), original);
+    }
+
+    #[test]
+    fn in_memory_add_deduplicates_canonical_endpoint_and_mints_a_persistable_id() {
+        let mut servers = Vec::new();
+        assert!(add_saved_server_to(
+            &mut servers,
+            "subsonic",
+            "Home",
+            "HTTPS://MUSIC.EXAMPLE.TEST:443/base/",
+            None,
+        )
+        .expect("valid server"));
+        assert!(!add_saved_server_to(
+            &mut servers,
+            "subsonic",
+            "Duplicate",
+            "https://music.example.test/base",
+            None,
+        )
+        .expect("duplicate server"));
+        assert!(add_saved_server_to(
+            &mut servers,
+            "plex",
+            "Other backend",
+            "https://music.example.test/base",
+            None,
+        )
+        .expect("distinct backend"));
+        assert_eq!(servers.len(), 2);
+        assert_ne!(servers[0].source_id, servers[1].source_id);
+        assert!(serde_json::to_value(&servers[0])
+            .expect("serialize row")
+            .get("source_id")
+            .is_some());
+    }
+
+    #[test]
+    fn repeated_manual_add_reuses_one_sidebar_owner_and_persisted_id() {
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        let saved = SavedServer {
+            server_type: "subsonic".to_string(),
+            name: "Home".to_string(),
+            url: "HTTPS://MUSIC.EXAMPLE.TEST:443/base/".to_string(),
+            source_id: SourceId::random(),
+        };
+
+        let first = upsert_saved_source_in_store(&store, &saved).expect("first owner");
+        let equivalent = SavedServer {
+            name: "Ignored duplicate name".to_string(),
+            url: "https://music.example.test/base".to_string(),
+            ..saved.clone()
+        };
+        let second = upsert_saved_source_in_store(&store, &equivalent).expect("existing owner");
+
+        let owners: Vec<_> = (0..store.n_items())
+            .filter_map(|index| store.item(index).and_downcast::<SourceObject>())
+            .filter(|source| {
+                source_owns_remote_endpoint(
+                    source,
+                    &saved.server_type,
+                    "https://music.example.test/base",
+                )
+            })
+            .collect();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].source_id(), Some(saved.source_id));
+        assert_eq!(first.source_id(), second.source_id());
+    }
+
+    #[test]
+    fn saving_a_discovered_endpoint_persists_and_keeps_its_published_identity() {
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        let insert_pos = super::super::window::ensure_category_header_store(&store, "subsonic");
+        let discovered = SourceObject::discovered(
+            "Discovered name",
+            "subsonic",
+            "HTTPS://MUSIC.EXAMPLE.TEST:443/base/",
+        );
+        let discovered_source_id = discovered.source_id().expect("deterministic source ID");
+        let origin = url::Url::parse("https://music.example.test/base").expect("origin");
+        let route = crate::architecture::AdvertisedHttpRoute::new(
+            &origin,
+            ["192.0.2.9:443".parse().expect("socket address")],
+        )
+        .expect("route");
+        discovered.set_advertised_route(Some(route.clone()));
+        store.insert(insert_pos, &discovered);
+
+        let existing_source_id =
+            existing_source_id_for_endpoint(&store, "subsonic", "https://music.example.test/base")
+                .expect("unambiguous live owner");
+        assert_eq!(existing_source_id, Some(discovered_source_id));
+
+        let mut servers = Vec::new();
+        assert!(add_saved_server_to(
+            &mut servers,
+            "subsonic",
+            "Saved name",
+            "https://music.example.test/base",
+            existing_source_id,
+        )
+        .expect("save discovered owner"));
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("servers.json");
+        save_servers_to(&path, &servers).expect("persist saved owner");
+        let saved = loaded(&path).pop().expect("saved record");
+        assert_eq!(saved.source_id, discovered_source_id);
+
+        let promoted = upsert_saved_source_in_store(&store, &saved).expect("promote same owner");
+
+        let owner_count = (0..store.n_items())
+            .filter_map(|index| store.item(index).and_downcast::<SourceObject>())
+            .filter(|source| source_owns_remote_endpoint(source, &saved.server_type, &saved.url))
+            .count();
+        assert_eq!(owner_count, 1);
+        assert_eq!(promoted.source_id(), Some(discovered_source_id));
+        assert_eq!(discovered.source_id(), Some(discovered_source_id));
+        assert_eq!(promoted.advertised_route(), Some(route));
+        assert!(promoted.manually_added());
+        assert!(promoted.connecting());
+    }
+
+    #[tokio::test]
+    async fn promoted_discovery_route_reaches_the_immediate_manual_connection() {
+        use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
+
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/rest/ping.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": { "status": "ok" }
+            }))),
+            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artists": { "index": [] }
+                }
+            }))),
+        ])
+        .await;
+        let address: std::net::SocketAddr = service
+            .base_url()
+            .strip_prefix("http://")
+            .expect("fixture HTTP origin")
+            .parse()
+            .expect("fixture socket address");
+        let server_url = format!("http://promoted.invalid:{}", address.port());
+        let origin = url::Url::parse(&server_url).expect("non-resolvable advertised origin");
+        let route = crate::architecture::AdvertisedHttpRoute::new(&origin, [address])
+            .expect("loopback advertised route");
+
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        let insert_pos = super::super::window::ensure_category_header_store(&store, "subsonic");
+        let discovered = SourceObject::discovered("Discovered", "subsonic", server_url.as_str());
+        let source_id = discovered.source_id().expect("discovered source ID");
+        discovered.set_advertised_route(Some(route.clone()));
+        store.insert(insert_pos, &discovered);
+
+        let mut servers = Vec::new();
+        assert!(add_saved_server_to(
+            &mut servers,
+            "subsonic",
+            "Saved",
+            &server_url,
+            Some(source_id),
+        )
+        .expect("persist discovered owner"));
+        let promoted = upsert_saved_source_in_store(&store, &servers[0]).expect("promote owner");
+        let captured_route = promoted
+            .advertised_route()
+            .expect("promotion retains the discovery route");
+        assert_eq!(captured_route, route);
+
+        let fixture_password = uuid::Uuid::new_v4().to_string();
+        let connection = connect_manual_subsonic(
+            "Saved",
+            &server_url,
+            "fixture-user",
+            &fixture_password,
+            Some(captured_route),
+        )
+        .await;
+
+        let requests = service.requests();
+        let connection_error = connection.as_ref().err().map(ToString::to_string);
+        assert!(
+            connection.is_ok(),
+            "immediate manual connection uses the retained route: {connection_error:?}; requests: {requests:?}"
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].uri.path(), "/rest/ping.view");
+        let expected_host = format!("promoted.invalid:{}", address.port());
+        for request in requests {
+            assert_eq!(
+                request
+                    .headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected_host.as_str())
+            );
+        }
+        service.finish().await;
+    }
+
     #[test]
     fn rejected_server_urls_never_enter_the_persistence_snapshot() {
         let secret = uuid::Uuid::new_v4().to_string();
@@ -495,6 +1359,7 @@ mod tests {
             server_type: "subsonic".to_string(),
             name: "Existing".to_string(),
             url: "https://existing.example.test".to_string(),
+            source_id: SourceId::random(),
         }];
         let before = serde_json::to_string(&servers).expect("serialize original snapshot");
 
@@ -503,7 +1368,7 @@ mod tests {
             format!("https://music.example.test?api_key={secret}"),
             format!("https://music.example.test#{secret}"),
         ] {
-            let result = add_saved_server_to(&mut servers, "subsonic", "Rejected", &rejected);
+            let result = add_saved_server_to(&mut servers, "subsonic", "Rejected", &rejected, None);
             assert!(result.is_err());
             assert_eq!(
                 serde_json::to_string(&servers).expect("serialize unchanged snapshot"),

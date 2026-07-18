@@ -78,12 +78,12 @@ impl RemoteConnectionAttempt {
 
 fn begin_remote_connection(
     backend_type: &str,
-    source_key: String,
+    source_id: crate::architecture::SourceId,
 ) -> Option<RemoteConnectionAttempt> {
     if backend_type == "daap" {
-        crate::daap::begin_connect(source_key).map(RemoteConnectionAttempt::Daap)
+        crate::daap::begin_connect(source_id).map(RemoteConnectionAttempt::Daap)
     } else {
-        crate::source_registry::begin_connect(source_key).map(RemoteConnectionAttempt::Standard)
+        crate::source_registry::begin_connect(source_id).map(RemoteConnectionAttempt::Standard)
     }
 }
 
@@ -213,13 +213,20 @@ const USB_SCAN_CHANNEL_CAPACITY: usize = 64;
 /// walk itself can still remain blocked in the kernel until that call returns.
 const USB_SCAN_CANCELLATION_POLL: Duration = Duration::from_millis(50);
 
-fn resolve_source_key(explicit_key: &str, server_url: &str, backend_type: &str) -> String {
-    if !explicit_key.is_empty() {
+fn resolve_source_key(
+    explicit_key: &str,
+    stable_source_id: &str,
+    server_url: &str,
+    backend_type: &str,
+) -> String {
+    if backend_type == "local" || backend_type.is_empty() {
+        "local".to_string()
+    } else if !explicit_key.is_empty() {
         explicit_key.to_string()
+    } else if !server_url.is_empty() && !stable_source_id.is_empty() {
+        stable_source_id.to_string()
     } else if !server_url.is_empty() {
         server_url.to_string()
-    } else if backend_type == "local" || backend_type.is_empty() {
-        "local".to_string()
     } else {
         backend_type.to_string()
     }
@@ -273,7 +280,12 @@ fn restore_pending_selection(
             sidebar_store
                 .item(*position)
                 .and_downcast_ref::<SourceObject>()
-                .is_some_and(|source| source.server_url() == pending_source_key)
+                .is_some_and(|source| {
+                    source
+                        .source_id()
+                        .is_some_and(|id| id.to_string() == pending_source_key)
+                        || source.source_key() == pending_source_key
+                })
         })
         .unwrap_or(fallback_position);
     if selection.selected() != position {
@@ -499,7 +511,10 @@ pub fn setup_source_connect(state: &WindowState) {
             let pending = pending_connection.borrow().clone();
             if let Some(pending) = pending {
                 // If clicking the same server that's already connecting, just ignore.
-                if src.server_url() == pending.source_key() {
+                if src
+                    .source_id()
+                    .is_some_and(|id| id.to_string() == pending.source_key())
+                {
                     return;
                 }
                 // If clicking a different server while one is connecting,
@@ -518,12 +533,14 @@ pub fn setup_source_connect(state: &WindowState) {
 
         let backend_type = src.backend_type();
 
-        // Determine the source key. Device rows carry an explicit logical key;
-        // legacy/remote rows fall back to their server URL, while local static
-        // sources use the backend type so they do not collapse into "local".
+        // Determine the navigation/cache key. Device rows carry an explicit
+        // logical key and remote rows prefer their stable SourceId; only a
+        // malformed legacy remote row can fall back to its server URL. Local
+        // static sources retain the built-in "local" view key.
         let explicit_key = src.source_key();
+        let stable_source_id = src.source_id().map(|id| id.to_string()).unwrap_or_default();
         let url = src.server_url();
-        let key = resolve_source_key(&explicit_key, &url, &backend_type);
+        let key = resolve_source_key(&explicit_key, &stable_source_id, &url, &backend_type);
 
         // ── Local source: switch to local view ───────────────────
         if key == "local" {
@@ -681,6 +698,7 @@ pub fn setup_source_connect(state: &WindowState) {
                     u32,
                     String,
                     String,
+                    crate::architecture::TrackId,
                 );
                 let (scan_tx, scan_rx) =
                     async_channel::bounded::<ScanRow>(USB_SCAN_CHANNEL_CAPACITY);
@@ -696,6 +714,11 @@ pub fn setup_source_connect(state: &WindowState) {
                                 break;
                             }
                             let path = path.as_path();
+                            let Ok(track_id) =
+                                crate::architecture::TrackId::removable_relative(&mount, path)
+                            else {
+                                continue;
+                            };
                             if let Ok(parsed) = crate::local::tag_parser::parse_audio_file(path) {
                                 let uri = url::Url::from_file_path(path)
                                     .map(|u| u.to_string())
@@ -714,6 +737,7 @@ pub fn setup_source_connect(state: &WindowState) {
                                     parsed.sample_rate_hz.unwrap_or(0),
                                     parsed.format,
                                     uri,
+                                    track_id,
                                 );
                                 if scan_tx.send_blocking(row).is_err() {
                                     break;
@@ -758,6 +782,7 @@ pub fn setup_source_connect(state: &WindowState) {
                                     row.0, &row.1, row.2, &row.3, &row.4, &row.5, &row.6, row.7,
                                     &row.8, row.9, row.10, 0, &row.11, &row.12,
                                 );
+                                obj.set_track_id(row.13.as_str());
                                 objects.push(obj);
                             }
                             futures::future::Either::Left((Err(_), _)) => break,
@@ -974,7 +999,7 @@ pub fn setup_source_connect(state: &WindowState) {
         // Backend/session generations protect remote ownership, but they do
         // not say whether the user still wants this pending connection to
         // change the selected source when it completes.
-        let connection_request = source_navigation.borrow_mut().select(server_url.clone());
+        let connection_request = source_navigation.borrow_mut().select(key.clone());
 
         // For passwordless DAAP servers, bypass the dialog entirely
         // and connect directly.
@@ -982,12 +1007,16 @@ pub fn setup_source_connect(state: &WindowState) {
             // Mint ownership before queuing the task. A final mDNS Lost event
             // can now invalidate this generation even if Tokio has not yet
             // started the handshake.
-            let Some(attempt) = crate::daap::begin_connect(url_for_closure.clone()) else {
+            let Some(source_id) = src.source_id() else {
+                tracing::warn!("Remote source has no stable identity");
+                return;
+            };
+            let Some(attempt) = crate::daap::begin_connect(source_id) else {
                 tracing::debug!("Skipping DAAP connect during shutdown");
                 return;
             };
             *pending_connection.borrow_mut() = Some(PendingConnection::new(
-                url_for_closure.clone(),
+                key.clone(),
                 connection_request.clone(),
             ));
 
@@ -1127,7 +1156,7 @@ pub fn setup_source_connect(state: &WindowState) {
                         info!(count = tracks.len(), "DAAP library fetched (no password)");
                         let _ = engine_tx
                             .send(LibraryEvent::DaapSync {
-                                source_key: server_url,
+                                source_id: session.source_id(),
                                 generation: session.generation(),
                                 session_key: session.session_key(),
                                 tracks,
@@ -1168,7 +1197,7 @@ pub fn setup_source_connect(state: &WindowState) {
         // ignored at the top of this handler. The submit closure and
         // the cancel callback below clear it when appropriate.
         *pending_connection.borrow_mut() = Some(PendingConnection::new(
-            url_for_closure.clone(),
+            key.clone(),
             connection_request.clone(),
         ));
 
@@ -1232,8 +1261,12 @@ pub fn setup_source_connect(state: &WindowState) {
                     return;
                 };
                 let advertised_route = submitted_source.advertised_route();
-                let Some(connection_attempt) =
-                    begin_remote_connection(&backend_type, server_url.clone())
+                let Some(source_id) = submitted_source.source_id() else {
+                    *pending_for_auth.borrow_mut() = None;
+                    tracing::warn!("Remote source has no stable identity");
+                    return;
+                };
+                let Some(connection_attempt) = begin_remote_connection(&backend_type, source_id)
                 else {
                     // Controlled shutdown closed the registry. The submission
                     // still owns this exact pending guard, so release it
@@ -1477,7 +1510,7 @@ pub fn setup_source_connect(state: &WindowState) {
                                     (
                                         count,
                                         LibraryEvent::RemoteSync {
-                                            source_key: server_url,
+                                            source_id,
                                             generation,
                                             lease_key,
                                             tracks,
@@ -1493,7 +1526,7 @@ pub fn setup_source_connect(state: &WindowState) {
                                     (
                                         count,
                                         LibraryEvent::DaapSync {
-                                            source_key: server_url,
+                                            source_id,
                                             generation,
                                             session_key,
                                             tracks,
@@ -1598,16 +1631,24 @@ mod tests {
     #[test]
     fn explicit_source_identity_precedes_legacy_fallbacks() {
         assert_eq!(
-            resolve_source_key("device:uuid:123", "file:///legacy", "usb-device"),
+            resolve_source_key(
+                "device:uuid:123",
+                "stable-id",
+                "file:///legacy",
+                "usb-device"
+            ),
             "device:uuid:123"
         );
         assert_eq!(
-            resolve_source_key("", "https://music.example.test", "subsonic"),
-            "https://music.example.test"
+            resolve_source_key("", "stable-id", "https://music.example.test", "subsonic"),
+            "stable-id"
         );
-        assert_eq!(resolve_source_key("", "", "radio-topvote"), "radio-topvote");
-        assert_eq!(resolve_source_key("", "", "local"), "local");
-        assert_eq!(resolve_source_key("", "", ""), "local");
+        assert_eq!(
+            resolve_source_key("", "", "", "radio-topvote"),
+            "radio-topvote"
+        );
+        assert_eq!(resolve_source_key("", "stable-id", "", "local"), "local");
+        assert_eq!(resolve_source_key("", "", "", ""), "local");
     }
 
     #[test]
@@ -1687,7 +1728,12 @@ mod tests {
     #[test]
     fn auth_submission_snapshots_the_current_discovery_route() {
         let store = gtk::gio::ListStore::new::<super::SourceObject>();
-        let source = super::SourceObject::manual("Subsonic", "subsonic", "http://mini.local:4533");
+        let source = super::SourceObject::manual(
+            "Subsonic",
+            "subsonic",
+            "http://mini.local:4533",
+            crate::architecture::SourceId::random(),
+        );
         source.set_advertised_route(Some(advertised_route("127.0.0.1:1")));
         store.append(&source);
 

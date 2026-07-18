@@ -77,6 +77,62 @@ fn configured_server_url(variable: &'static str) -> Option<String> {
     }
 }
 
+fn remote_source_id(backend_type: &str, server_url: &str) -> crate::architecture::SourceId {
+    let parsed = crate::http_security::parse_base_url(server_url)
+        .expect("configured and discovered remote URLs are prevalidated");
+    crate::architecture::SourceId::remote(backend_type, &parsed)
+        .expect("supported remote backend produces a stable source ID")
+}
+
+#[derive(Clone, Copy)]
+struct EnvironmentConnectionAttempt {
+    source_id: crate::architecture::SourceId,
+    ui_token: uuid::Uuid,
+}
+
+/// Add an environment-configured row or reuse the saved/discovered owner of
+/// the same canonical `(backend, endpoint)` pair.
+///
+/// Saved rows are loaded first, so their persisted identity wins over the
+/// deterministic environment identity. The returned ID must be used by the
+/// connection attempt; recomputing it from the URL would split one logical
+/// source across two registry owners.
+fn upsert_environment_source(
+    sources: &mut Vec<SourceObject>,
+    name: &str,
+    backend_type: &str,
+    server_url: &str,
+) -> EnvironmentConnectionAttempt {
+    if let Some(source) = sources.iter().find(|source| {
+        super::server_dialogs::same_remote_endpoint(
+            &source.backend_type(),
+            &source.server_url(),
+            backend_type,
+            server_url,
+        )
+    }) {
+        let source_id = source
+            .source_id()
+            .expect("validated remote source has a stable identity");
+        return EnvironmentConnectionAttempt {
+            source_id,
+            ui_token: source.begin_connecting_attempt(),
+        };
+    }
+
+    ensure_category_header_vec(sources, backend_type);
+    let source = SourceObject::discovered(name, backend_type, server_url);
+    let source_id = source
+        .source_id()
+        .unwrap_or_else(|| remote_source_id(backend_type, server_url));
+    let ui_token = source.begin_connecting_attempt();
+    sources.push(source);
+    EnvironmentConnectionAttempt {
+        source_id,
+        ui_token,
+    }
+}
+
 /// Build and present the main Tributary window.
 pub fn build_window(
     app: &adw::Application,
@@ -131,7 +187,8 @@ pub fn build_window(
     let saved_servers = load_saved_servers();
     for entry in &saved_servers {
         ensure_category_header_vec(&mut sources, &entry.server_type);
-        let src = SourceObject::manual(&entry.name, &entry.server_type, &entry.url);
+        let src =
+            SourceObject::manual(&entry.name, &entry.server_type, &entry.url, entry.source_id);
         sources.push(src);
         info!(
             name = %entry.name,
@@ -142,38 +199,31 @@ pub fn build_window(
 
     // If env vars are set, add pre-configured remote server entries
     // under their respective category headers.
-    if let Some((url, _user, _pass)) = subsonic_env.as_ref() {
-        ensure_category_header_vec(&mut sources, "subsonic");
-        let src = SourceObject::discovered("Subsonic (env)", "subsonic", url);
-        src.set_connecting(true);
-        sources.push(src);
+    let subsonic_env_attempt = subsonic_env.as_ref().map(|(url, _user, _pass)| {
+        upsert_environment_source(&mut sources, "Subsonic (env)", "subsonic", url)
+    });
+    if subsonic_env_attempt.is_some() {
         info!("Subsonic server configured via env vars");
     }
 
-    if let Some((url, _key, _uid)) = jellyfin_env.as_ref() {
-        ensure_category_header_vec(&mut sources, "jellyfin");
-        let src = SourceObject::discovered("Jellyfin (env)", "jellyfin", url);
-        src.set_connecting(true);
-        sources.push(src);
+    let jellyfin_env_attempt = jellyfin_env.as_ref().map(|(url, _key, _uid)| {
+        upsert_environment_source(&mut sources, "Jellyfin (env)", "jellyfin", url)
+    });
+    if jellyfin_env_attempt.is_some() {
         info!("Jellyfin server configured via env vars");
     }
 
-    if let Some((url, _token)) = plex_env.as_ref() {
-        ensure_category_header_vec(&mut sources, "plex");
-        let src = SourceObject::discovered("Plex (env)", "plex", url);
-        src.set_connecting(true);
-        sources.push(src);
+    let plex_env_attempt = plex_env
+        .as_ref()
+        .map(|(url, _token)| upsert_environment_source(&mut sources, "Plex (env)", "plex", url));
+    if plex_env_attempt.is_some() {
         info!("Plex server configured via env vars");
     }
 
-    if let Some((url, _password)) = daap_env.as_ref() {
-        ensure_category_header_vec(&mut sources, "daap");
-        // Keep the configured URL as the source identity so the retained
-        // session, generation-scoped sync event, sidebar row, and disconnect action all
-        // address the same owner.
-        let src = SourceObject::discovered("DAAP (env)", "daap", url);
-        src.set_connecting(true);
-        sources.push(src);
+    let daap_env_attempt = daap_env
+        .as_ref()
+        .map(|(url, _password)| upsert_environment_source(&mut sources, "DAAP (env)", "daap", url));
+    if daap_env_attempt.is_some() {
         info!("DAAP server configured via env vars");
     }
 
@@ -268,15 +318,16 @@ pub fn build_window(
     };
 
     // ── Connection guard ─────────────────────────────────────────────
-    // Tracks which server URL is currently being connected to, and the
-    // sidebar position that was active before the connection attempt.
+    // Tracks which stable source identity is currently being connected, and
+    // the sidebar position that was active before the connection attempt.
     // Used to (a) only auto-select on a remote sync if the source matches
     // the pending connection, and (b) revert the sidebar on failure.
     let pending_connection = Rc::new(RefCell::new(None));
     let pre_connect_selection: Rc<Cell<u32>> = Rc::new(Cell::new(1)); // default: local (index 1)
 
     // ── Per-source track storage ────────────────────────────────────
-    // Key: "local" for local filesystem, or server URL for remote.
+    // Key: "local" for the built-in local view, stable SourceId text for
+    // remotes, and the explicit view/device keys documented by WindowState.
     let source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>> =
         Rc::new(RefCell::new(HashMap::new()));
     let active_source_key: Rc<RefCell<String>> = Rc::new(RefCell::new("local".to_string()));
@@ -501,9 +552,13 @@ pub fn build_window(
     // ── Start Subsonic backend if configured via env vars ──────────
     if let Some((url, user, pass)) = subsonic_env {
         let tx = engine_tx.clone();
+        let EnvironmentConnectionAttempt {
+            source_id,
+            ui_token,
+        } = subsonic_env_attempt.expect("configured Subsonic source attempt");
         rt_handle.spawn(async move {
             info!("Connecting to Subsonic server...");
-            let Some(attempt) = crate::source_registry::begin_connect(url.clone()) else {
+            let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
                 tracing::debug!("Skipping Subsonic connect during shutdown");
                 return;
             };
@@ -522,7 +577,11 @@ pub fn build_window(
                                 "Subsonic catalogue load failed"
                             );
                             let _ = tx
-                                .send(LibraryEvent::Error(category.user_message("Subsonic")))
+                                .send(LibraryEvent::RemoteConnectionFailed {
+                                    source_id,
+                                    attempt: ui_token,
+                                    message: category.user_message("Subsonic"),
+                                })
                                 .await;
                             return;
                         }
@@ -538,7 +597,7 @@ pub fn build_window(
                     info!(count = tracks.len(), "Subsonic library fetched");
                     let _ = tx
                         .send(LibraryEvent::RemoteSync {
-                            source_key: url.clone(),
+                            source_id,
                             generation: source.generation(),
                             lease_key: source.lease_key(),
                             tracks,
@@ -553,7 +612,11 @@ pub fn build_window(
                     let category = super::source_connect::remote_failure_category(&e);
                     tracing::error!(category = category.as_str(), "Subsonic connection failed");
                     let _ = tx
-                        .send(LibraryEvent::Error(category.user_message("Subsonic")))
+                        .send(LibraryEvent::RemoteConnectionFailed {
+                            source_id,
+                            attempt: ui_token,
+                            message: category.user_message("Subsonic"),
+                        })
                         .await;
                 }
             }
@@ -563,9 +626,13 @@ pub fn build_window(
     // ── Start Jellyfin backend if configured via env vars ──────────
     if let Some((url, api_key, user_id)) = jellyfin_env {
         let tx = engine_tx.clone();
+        let EnvironmentConnectionAttempt {
+            source_id,
+            ui_token,
+        } = jellyfin_env_attempt.expect("configured Jellyfin source attempt");
         rt_handle.spawn(async move {
             info!("Connecting to Jellyfin server...");
-            let Some(attempt) = crate::source_registry::begin_connect(url.clone()) else {
+            let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
                 tracing::debug!("Skipping Jellyfin connect during shutdown");
                 return;
             };
@@ -586,7 +653,11 @@ pub fn build_window(
                                 "Jellyfin catalogue load failed"
                             );
                             let _ = tx
-                                .send(LibraryEvent::Error(category.user_message("Jellyfin")))
+                                .send(LibraryEvent::RemoteConnectionFailed {
+                                    source_id,
+                                    attempt: ui_token,
+                                    message: category.user_message("Jellyfin"),
+                                })
                                 .await;
                             return;
                         }
@@ -602,7 +673,7 @@ pub fn build_window(
                     info!(count = tracks.len(), "Jellyfin library fetched");
                     let _ = tx
                         .send(LibraryEvent::RemoteSync {
-                            source_key: url.clone(),
+                            source_id,
                             generation: source.generation(),
                             lease_key: source.lease_key(),
                             tracks,
@@ -617,7 +688,11 @@ pub fn build_window(
                     let category = super::source_connect::remote_failure_category(&e);
                     tracing::error!(category = category.as_str(), "Jellyfin connection failed");
                     let _ = tx
-                        .send(LibraryEvent::Error(category.user_message("Jellyfin")))
+                        .send(LibraryEvent::RemoteConnectionFailed {
+                            source_id,
+                            attempt: ui_token,
+                            message: category.user_message("Jellyfin"),
+                        })
                         .await;
                 }
             }
@@ -627,9 +702,13 @@ pub fn build_window(
     // ── Start Plex backend if configured via env vars ──────────────
     if let Some((url, token)) = plex_env {
         let tx = engine_tx.clone();
+        let EnvironmentConnectionAttempt {
+            source_id,
+            ui_token,
+        } = plex_env_attempt.expect("configured Plex source attempt");
         rt_handle.spawn(async move {
             info!("Connecting to Plex server...");
-            let Some(attempt) = crate::source_registry::begin_connect(url.clone()) else {
+            let Some(attempt) = crate::source_registry::begin_connect(source_id) else {
                 tracing::debug!("Skipping Plex connect during shutdown");
                 return;
             };
@@ -648,7 +727,11 @@ pub fn build_window(
                                 "Plex catalogue load failed"
                             );
                             let _ = tx
-                                .send(LibraryEvent::Error(category.user_message("Plex")))
+                                .send(LibraryEvent::RemoteConnectionFailed {
+                                    source_id,
+                                    attempt: ui_token,
+                                    message: category.user_message("Plex"),
+                                })
                                 .await;
                             return;
                         }
@@ -664,7 +747,7 @@ pub fn build_window(
                     info!(count = tracks.len(), "Plex library fetched");
                     let _ = tx
                         .send(LibraryEvent::RemoteSync {
-                            source_key: url.clone(),
+                            source_id,
                             generation: source.generation(),
                             lease_key: source.lease_key(),
                             tracks,
@@ -679,7 +762,11 @@ pub fn build_window(
                     let category = super::source_connect::remote_failure_category(&e);
                     tracing::error!(category = category.as_str(), "Plex connection failed");
                     let _ = tx
-                        .send(LibraryEvent::Error(category.user_message("Plex")))
+                        .send(LibraryEvent::RemoteConnectionFailed {
+                            source_id,
+                            attempt: ui_token,
+                            message: category.user_message("Plex"),
+                        })
                         .await;
                 }
             }
@@ -689,9 +776,13 @@ pub fn build_window(
     // ── Start DAAP backend if configured via env vars ──────────────
     if let Some((url, password)) = daap_env {
         let tx = engine_tx.clone();
+        let EnvironmentConnectionAttempt {
+            source_id,
+            ui_token,
+        } = daap_env_attempt.expect("configured DAAP source attempt");
         rt_handle.spawn(async move {
             info!("Connecting to DAAP server...");
-            let Some(attempt) = crate::daap::begin_connect(url.clone()) else {
+            let Some(attempt) = crate::daap::begin_connect(source_id) else {
                 tracing::debug!("Skipping DAAP connect during shutdown");
                 return;
             };
@@ -711,7 +802,11 @@ pub fn build_window(
                                 "DAAP catalogue load failed"
                             );
                             let _ = tx
-                                .send(LibraryEvent::Error(category.user_message("DAAP")))
+                                .send(LibraryEvent::RemoteConnectionFailed {
+                                    source_id,
+                                    attempt: ui_token,
+                                    message: category.user_message("DAAP"),
+                                })
                                 .await;
                             return;
                         }
@@ -727,7 +822,7 @@ pub fn build_window(
                     info!(count = tracks.len(), "DAAP library fetched");
                     let _ = tx
                         .send(LibraryEvent::DaapSync {
-                            source_key: url.clone(),
+                            source_id,
                             generation: session.generation(),
                             session_key: session.session_key(),
                             tracks,
@@ -742,7 +837,11 @@ pub fn build_window(
                     let category = super::source_connect::remote_failure_category(&e);
                     tracing::error!(category = category.as_str(), "DAAP connection failed");
                     let _ = tx
-                        .send(LibraryEvent::Error(category.user_message("DAAP")))
+                        .send(LibraryEvent::RemoteConnectionFailed {
+                            source_id,
+                            attempt: ui_token,
+                            message: category.user_message("DAAP"),
+                        })
                         .await;
                 }
             }
@@ -823,20 +922,24 @@ pub fn build_window(
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = delete_rx.recv().await {
                 info!("Manual server delete requested");
+                let Ok(source_id) = source_key.parse::<crate::architecture::SourceId>() else {
+                    tracing::warn!("Ignoring delete for invalid source identity");
+                    continue;
+                };
                 invalidate_source_playback(&source_key);
 
                 // A connected DAAP source normally uses the eject action,
                 // but deletion must still transfer and close ownership if a
                 // stale/rebound row emits delete instead.
-                if let Some(backend) = crate::daap::release_source(&source_key) {
+                if let Some(backend) = crate::daap::release_source(source_id) {
                     rt_handle.spawn(async move {
                         backend.disconnect().await;
                     });
                 }
-                crate::source_registry::release_source(&source_key);
+                crate::source_registry::release_source(source_id);
 
                 // Remove from servers.json.
-                remove_saved_server(&source_key);
+                remove_saved_server(source_id);
 
                 // Remove from source_tracks map.
                 source_tracks.borrow_mut().remove(&source_key);
@@ -844,7 +947,7 @@ pub fn build_window(
                 // Remove from sidebar.
                 for i in 0..sidebar_store.n_items() {
                     if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-                        if src.server_url() == source_key {
+                        if src.source_id() == Some(source_id) {
                             let backend = src.backend_type();
                             sidebar_store.remove(i);
                             let category = category_for_backend(&backend);
@@ -895,12 +998,16 @@ pub fn build_window(
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = disconnect_rx.recv().await {
                 info!("DAAP disconnect requested");
+                let Ok(source_id) = source_key.parse::<crate::architecture::SourceId>() else {
+                    tracing::warn!("Ignoring disconnect for invalid source identity");
+                    continue;
+                };
                 invalidate_source_playback(&source_key);
 
                 // Transfer ownership out of the live-session registry before
                 // updating the UI. This makes a subsequent fast reconnect
                 // independent of the old session's asynchronous logout.
-                if let Some(backend) = crate::daap::release_source(&source_key) {
+                if let Some(backend) = crate::daap::release_source(source_id) {
                     rt_handle.spawn(async move {
                         backend.disconnect().await;
                     });
@@ -915,7 +1022,7 @@ pub fn build_window(
                 //    state instead of removing it entirely.
                 for i in 0..sidebar_store.n_items() {
                     if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-                        if src.server_url() == source_key {
+                        if src.source_id() == Some(source_id) {
                             src.set_connected(false);
                             src.set_connecting(false);
                             src.set_icon_name("network-server-symbolic");
@@ -1158,6 +1265,7 @@ pub fn build_window(
             let ctrl_for_ctx = media_ctrl.clone();
             let column_view_for_keys = column_view.clone();
             let clear_playback_ui = clear_playback_ui.clone();
+            let playback_rt = rt_handle.clone();
 
             glib::MainContext::default().spawn_local(async move {
                 while let Ok(action) = media_rx.recv().await {
@@ -1171,6 +1279,7 @@ pub fn build_window(
                         artist_label: artist_label.clone(),
                         media_ctrl: ctrl_for_ctx.clone(),
                         session: playback_session.clone(),
+                        rt_handle: playback_rt.clone(),
                         column_view: column_view_for_keys.clone(),
                     };
                     match action {
@@ -1247,6 +1356,7 @@ pub fn build_window(
         let playback_session = playback_session.clone();
         let shuffle = hb.shuffle_button.clone();
         let column_view_c = column_view.clone();
+        let playback_rt = rt_handle.clone();
 
         hb.play_button.connect_clicked(move |_| {
             toggle_or_start(
@@ -1259,6 +1369,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    rt_handle: playback_rt.clone(),
                     column_view: column_view_c.clone(),
                 },
                 shuffle.is_active(),
@@ -1381,6 +1492,7 @@ pub fn build_window(
         let active_source_key = active_source_key.clone();
         let playback_session = playback_session.clone();
         let cv = column_view.clone();
+        let playback_rt = rt_handle.clone();
 
         column_view.connect_activate(move |_view, position| {
             play_track_at(
@@ -1394,6 +1506,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
                 },
             );
@@ -1435,6 +1548,7 @@ pub fn build_window(
         let repeat_mode = hb.repeat_mode.clone();
         let shuffle = hb.shuffle_button.clone();
         let cv = column_view.clone();
+        let playback_rt = rt_handle.clone();
 
         hb.next_button.connect_clicked(move |_| {
             advance_track(
@@ -1447,6 +1561,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
                 },
                 repeat_mode.get(),
@@ -1468,6 +1583,7 @@ pub fn build_window(
         let repeat_mode = hb.repeat_mode.clone();
         let shuffle = hb.shuffle_button.clone();
         let cv = column_view.clone();
+        let playback_rt = rt_handle.clone();
 
         hb.prev_button.connect_clicked(move |_| {
             // If more than 3 s into the track, restart it.
@@ -1487,6 +1603,7 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
                 },
                 repeat_mode.get(),
@@ -1522,6 +1639,7 @@ pub fn build_window(
         let buffering_tracker = buffering_tracker.clone();
         let clear_playback_ui = clear_playback_ui.clone();
         let toast_overlay = toast_overlay.clone();
+        let playback_rt = rt_handle.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -1657,6 +1775,7 @@ pub fn build_window(
                                 artist_label: artist_label.clone(),
                                 media_ctrl: media_ctrl.clone(),
                                 session: playback_session.clone(),
+                                rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
                             })
                         {
@@ -1674,6 +1793,7 @@ pub fn build_window(
                                 artist_label: artist_label.clone(),
                                 media_ctrl: media_ctrl.clone(),
                                 session: playback_session.clone(),
+                                rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
                             },
                             mode,
@@ -1697,14 +1817,15 @@ pub fn build_window(
                         // message is safe to display verbatim. Without this,
                         // a failed load is visible only in the logs.
                         toast_overlay.add_toast(adw::Toast::new(&message));
-                        // A protected resolver has already handed its request
-                        // to the output at this point. If that load fails, keep
-                        // the queue item but force the next Play through a new
-                        // resolution instead of calling `play()` on an output
-                        // that may never have accepted media.
+                        // A protected or exact-local resolver has already
+                        // handed media to the output at this point. If that
+                        // load fails, keep the queue item but force the next
+                        // Play through a new resolution instead of calling
+                        // `play()` on an output that may never have accepted
+                        // media.
                         if playback_session
                             .borrow_mut()
-                            .mark_protected_load_failed(event_generation)
+                            .mark_resolved_load_failed(event_generation)
                         {
                             active_output.borrow().stop();
                         }
@@ -1771,6 +1892,7 @@ pub fn build_window(
         let active_source_key = active_source_key.clone();
         let playback_session = playback_session.clone();
         let cv = column_view.clone();
+        let playback_rt = rt_handle.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
         play_pending.connect_activate(move |_, _| {
@@ -1790,6 +1912,7 @@ pub fn build_window(
                 artist_label: artist_label.clone(),
                 media_ctrl: media_ctrl.clone(),
                 session: playback_session.clone(),
+                rt_handle: playback_rt.clone(),
                 column_view: cv.clone(),
             };
             for path in paths {
@@ -1945,8 +2068,10 @@ fn refresh_playback_queue(session: &Rc<RefCell<PlaybackSession>>, objects: &[Tra
         // owns.
         let mut updates = HashMap::with_capacity(queue_ids.len());
         for track in objects {
-            let track_id = track.track_id();
-            if queue_ids.contains(track_id.as_str()) {
+            let Ok(track_id) = crate::architecture::TrackId::new(track.track_id()) else {
+                continue;
+            };
+            if queue_ids.contains(&track_id) {
                 updates.insert(track_id, QueueTrackRefresh::from_track(track));
             }
         }
@@ -2028,12 +2153,12 @@ fn setup_library_events(
             // boundary so an older session cannot repopulate the source.
             match &event {
                 LibraryEvent::RemoteSync {
-                    source_key,
+                    source_id,
                     generation,
                     lease_key,
                     ..
                 } if !crate::source_registry::is_current_source(
-                    source_key,
+                    *source_id,
                     *generation,
                     *lease_key,
                 ) =>
@@ -2046,11 +2171,11 @@ fn setup_library_events(
                     continue;
                 }
                 LibraryEvent::DaapSync {
-                    source_key,
+                    source_id,
                     generation,
                     session_key,
                     ..
-                } if !crate::daap::is_current_session(source_key, *generation, *session_key) => {
+                } if !crate::daap::is_current_session(*source_id, *generation, *session_key) => {
                     tracing::debug!(
                         generation,
                         %session_key,
@@ -2096,15 +2221,16 @@ fn setup_library_events(
                 }
 
                 LibraryEvent::RemoteSync {
-                    source_key,
+                    source_id,
                     generation: _,
                     lease_key,
                     tracks,
                 } => {
+                    let source_key = source_id.to_string();
                     let replaces_current_queue = {
                         let session = playback_session.borrow();
                         session.current_identity().is_some_and(|identity| {
-                            identity.source_id.as_str() == source_key.as_str()
+                            identity.media_key.source_id == source_id
                                 && session.current().is_some_and(|item| {
                                     !crate::source_registry::stream_reference_uses_lease(
                                         item.uri(),
@@ -2541,6 +2667,15 @@ fn setup_library_events(
                     }
                 }
 
+                LibraryEvent::RemoteConnectionFailed {
+                    source_id,
+                    attempt,
+                    message,
+                } => {
+                    tracing::error!(%source_id, error = %message, "Remote connection failed");
+                    clear_failed_remote_connection(&sidebar_store, source_id, attempt);
+                }
+
                 LibraryEvent::Error(msg) => {
                     tracing::error!(error = %msg, "Library engine error");
                     scan_spinner.set_spinning(false);
@@ -2548,8 +2683,9 @@ fn setup_library_events(
                 }
 
                 LibraryEvent::DaapSync {
-                    source_key, tracks, ..
+                    source_id, tracks, ..
                 } => {
+                    let source_key = source_id.to_string();
                     // DAAP publishes one snapshot per retained session. A new
                     // snapshot for the same source therefore replaces the
                     // session embedded in any captured `daap://` queue refs.
@@ -2613,23 +2749,13 @@ fn publish_remote_library(
         *pending_connection.borrow_mut() = None;
     }
 
-    let mut auto_selected = false;
-    for i in 0..sidebar_store.n_items() {
-        if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-            if src.server_url() == source_key && !src.connected() {
-                src.set_connected(true);
-                src.set_connecting(false);
-                let src = src.clone();
-                sidebar_store.remove(i);
-                sidebar_store.insert(i, &src);
-                if should_auto_select {
-                    sidebar_selection.set_selected(i);
-                    auto_selected = true;
-                }
-                break;
+    let auto_selected =
+        accept_remote_publication(sidebar_store, &source_key).is_some_and(|index| {
+            if should_auto_select {
+                sidebar_selection.set_selected(index);
             }
-        }
-    }
+            should_auto_select
+        });
 
     if !auto_selected
         && *active_source_key.borrow() == source_key
@@ -2645,6 +2771,70 @@ fn publish_remote_library(
             column_view,
         );
     }
+}
+
+/// Apply the sidebar state transition for an accepted remote publication.
+///
+/// A repeated Add, environment reconnect, or discovered-to-saved promotion
+/// can submit another connection for a row whose previous session is still
+/// marked connected. The accepted replacement publication still completes
+/// that operation, so it must always clear the transient spinner even though
+/// the durable connected state does not need to change.
+fn accept_remote_publication(sidebar_store: &gtk::gio::ListStore, source_key: &str) -> Option<u32> {
+    for index in 0..sidebar_store.n_items() {
+        let Some(source) = sidebar_store.item(index).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if source
+            .source_id()
+            .is_none_or(|id| id.to_string() != source_key)
+        {
+            continue;
+        }
+
+        if !source.connected() {
+            source.set_connected(true);
+        }
+        source.set_connecting(false);
+
+        // SourceObject fields are plain GTK-side state. Reinsert the same
+        // object so a bound sidebar row immediately drops its spinner.
+        sidebar_store.remove(index);
+        sidebar_store.insert(index, &source);
+        return Some(index);
+    }
+    None
+}
+
+/// Retire the transient spinner for the exact environment-configured owner
+/// whose newest connection attempt failed.
+///
+/// The background task emits this transition only after its registry attempt
+/// proves it is still latest. Keeping the lookup source-scoped prevents one
+/// failed endpoint from disturbing another row or its retained session.
+fn clear_failed_remote_connection(
+    sidebar_store: &gtk::gio::ListStore,
+    source_id: crate::architecture::SourceId,
+    attempt: uuid::Uuid,
+) -> Option<u32> {
+    for index in 0..sidebar_store.n_items() {
+        let Some(source) = sidebar_store.item(index).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if source.source_id() != Some(source_id)
+            || !source.connecting()
+            || !source.clear_connecting_attempt(attempt)
+        {
+            continue;
+        }
+
+        // SourceObject fields are plain GTK-side state. Reinsert the same
+        // object so a bound sidebar row immediately drops its spinner.
+        sidebar_store.remove(index);
+        sidebar_store.insert(index, &source);
+        return Some(index);
+    }
+    None
 }
 
 /// Convert an architecture `Track` to a UI `TrackObject`.
@@ -2669,8 +2859,11 @@ fn arch_remote_track_to_object(
     track: &crate::architecture::models::Track,
     lease_key: uuid::Uuid,
 ) -> TrackObject {
-    let stream_reference = crate::source_registry::stream_reference(lease_key, track.id);
-    let artwork_reference = crate::source_registry::artwork_reference(lease_key, track.id);
+    let Some(track_id) = track.native_track_id.as_ref() else {
+        return track_to_object(track, "", None);
+    };
+    let stream_reference = crate::source_registry::stream_reference(lease_key, track_id);
+    let artwork_reference = crate::source_registry::artwork_reference(lease_key, track_id);
     track_to_object(track, &stream_reference, Some(&artwork_reference))
 }
 
@@ -2698,7 +2891,14 @@ fn track_to_object(
         uri,
     );
 
-    obj.set_track_id(&t.id.to_string());
+    if let Some(native_track_id) = &t.native_track_id {
+        obj.set_track_id(native_track_id.as_str());
+    } else {
+        // A missing/invalid native identity is deliberately unplayable. Do
+        // not substitute the compatibility UUID: doing so silently routes a
+        // different identity through remote and playlist queues.
+        obj.set_track_id("");
+    }
 
     if let Some(artwork_reference) = artwork_reference {
         obj.set_cover_art_url(artwork_reference);
@@ -2831,3 +3031,143 @@ pub fn remove_empty_category_header(store: &gtk::gio::ListStore, category: &str)
 }
 
 // ── Popover scrollbar fix ───────────────────────────────────────────
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::architecture::SourceId;
+
+    #[test]
+    fn saved_and_environment_startup_share_the_persisted_source_owner() {
+        let persisted = SourceId::random();
+        let mut sources = vec![
+            SourceObject::header("Subsonic"),
+            SourceObject::manual(
+                "Saved",
+                "subsonic",
+                "HTTPS://MUSIC.EXAMPLE.TEST:443/base/",
+                persisted,
+            ),
+        ];
+
+        let connection_attempt = upsert_environment_source(
+            &mut sources,
+            "Subsonic (env)",
+            "subsonic",
+            "https://music.example.test/base",
+        );
+
+        let owners: Vec<_> = sources
+            .iter()
+            .filter(|source| {
+                super::super::server_dialogs::same_remote_endpoint(
+                    &source.backend_type(),
+                    &source.server_url(),
+                    "subsonic",
+                    "https://music.example.test/base",
+                )
+            })
+            .collect();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(connection_attempt.source_id, persisted);
+        assert_eq!(owners[0].source_id(), Some(persisted));
+        assert!(owners[0].manually_added());
+        assert!(owners[0].connecting());
+    }
+
+    #[test]
+    fn accepted_reconnect_clears_connecting_on_an_already_connected_owner() {
+        let persisted = SourceId::random();
+        let saved = SourceObject::manual(
+            "Saved",
+            "subsonic",
+            "HTTPS://MUSIC.EXAMPLE.TEST:443/base/",
+            persisted,
+        );
+        saved.set_connected(true);
+        let mut sources = vec![SourceObject::header("Subsonic"), saved.clone()];
+
+        let connection_attempt = upsert_environment_source(
+            &mut sources,
+            "Subsonic (env)",
+            "subsonic",
+            "https://music.example.test/base",
+        );
+
+        assert_eq!(connection_attempt.source_id, persisted);
+        assert!(saved.connected());
+        assert!(saved.connecting());
+
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        for source in sources {
+            store.append(&source);
+        }
+        let accepted_index = accept_remote_publication(&store, &persisted.to_string());
+
+        assert_eq!(accepted_index, Some(1));
+        assert!(saved.connected());
+        assert!(!saved.connecting());
+    }
+
+    #[test]
+    fn failed_environment_reconnect_clears_only_the_exact_owner_spinner() {
+        let persisted = SourceId::random();
+        let other_id = SourceId::random();
+        let saved = SourceObject::manual(
+            "Saved",
+            "subsonic",
+            "https://music.example.test/base",
+            persisted,
+        );
+        saved.set_connected(true);
+        let failed_attempt = saved.begin_connecting_attempt();
+        let other =
+            SourceObject::manual("Other", "subsonic", "https://other.example.test", other_id);
+        let other_attempt = other.begin_connecting_attempt();
+
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        store.append(&SourceObject::header("Subsonic"));
+        store.append(&saved);
+        store.append(&other);
+
+        // Retry B takes over the same row after failure A was queued but
+        // before GTK receives it. Failure A must not clear retry B's spinner.
+        let retry_attempt = saved.begin_connecting_attempt();
+        assert_eq!(
+            clear_failed_remote_connection(&store, persisted, failed_attempt),
+            None
+        );
+        assert!(saved.connecting());
+        assert_eq!(
+            clear_failed_remote_connection(&store, persisted, retry_attempt),
+            Some(1)
+        );
+        assert!(
+            saved.connected(),
+            "a failed reconnect keeps the prior session"
+        );
+        assert!(!saved.connecting());
+        assert!(other.connecting());
+        assert_eq!(
+            clear_failed_remote_connection(&store, persisted, retry_attempt),
+            None
+        );
+        saved.set_connecting(true);
+        assert_eq!(
+            clear_failed_remote_connection(&store, persisted, retry_attempt),
+            None,
+            "a generic/manual retry invalidates the environment token"
+        );
+        assert!(saved.connecting());
+        saved.set_connecting(false);
+        assert_eq!(
+            clear_failed_remote_connection(&store, other_id, uuid::Uuid::new_v4()),
+            None
+        );
+        assert!(other.connecting());
+        assert_eq!(
+            clear_failed_remote_connection(&store, other_id, other_attempt),
+            Some(2)
+        );
+    }
+}

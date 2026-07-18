@@ -55,11 +55,15 @@ fn sidebar_button_action(source: &SourceObject) -> Option<SidebarButtonAction> {
     }
 
     if source.backend_type() == "daap" && source.connected() {
-        return Some(SidebarButtonAction::Disconnect(source.server_url()));
+        return source
+            .source_id()
+            .map(|id| SidebarButtonAction::Disconnect(id.to_string()));
     }
 
     if source.manually_added() && (source.connected() || !source.server_url().is_empty()) {
-        return Some(SidebarButtonAction::Delete(source.server_url()));
+        return source
+            .source_id()
+            .map(|id| SidebarButtonAction::Delete(id.to_string()));
     }
 
     None
@@ -206,9 +210,9 @@ fn playlist_creation_action_group(
 ///
 /// Returns `(sidebar_box, ListStore, SingleSelection, disconnect_rx, delete_rx, add_button, playlist_action_rx)`.
 ///
-/// * `disconnect_rx` emits the `server_url` of a DAAP source when the
+/// * `disconnect_rx` emits the stable `SourceId` of a DAAP source when the
 ///   user clicks its eject button.
-/// * `delete_rx` emits the `server_url` of a manually-added source when
+/// * `delete_rx` emits the stable `SourceId` of a manually-added source when
 ///   the user clicks its trash button.
 /// * `add_button` is the `+` button for adding manual servers (wired in `window.rs`).
 /// * `playlist_action_rx` emits playlist CRUD actions from the context menu.
@@ -602,9 +606,15 @@ mod tests {
             action.activate(Some(&target));
         };
 
-        let manual_a = SourceObject::manual("Manual A", "subsonic", "https://a.example");
+        let manual_source_id = crate::architecture::SourceId::random();
+        let manual_a = SourceObject::manual(
+            "Manual A",
+            "subsonic",
+            "https://a.example",
+            manual_source_id,
+        );
         activate(Some(&manual_a));
-        assert_eq!(delete_rx.try_recv().unwrap(), "https://a.example");
+        assert_eq!(delete_rx.try_recv().unwrap(), manual_source_id.to_string());
         assert_empty(&delete_rx);
         assert_empty(&disconnect_rx);
 
@@ -626,16 +636,20 @@ mod tests {
         activate(None);
         manual_a.set_connecting(false);
         activate(Some(&manual_a));
-        assert_eq!(delete_rx.try_recv().unwrap(), "https://a.example");
+        assert_eq!(delete_rx.try_recv().unwrap(), manual_source_id.to_string());
         assert_empty(&delete_rx);
         assert_empty(&disconnect_rx);
 
         // Recycle the item for a different connected DAAP source. Only that
         // source's eject event is emitted; Manual A is never deleted again.
         let daap_b = SourceObject::discovered("DAAP B", "daap", "http://b.example:3689");
+        let daap_source_id = daap_b.source_id().expect("derived DAAP source ID");
         daap_b.set_connected(true);
         activate(Some(&daap_b));
-        assert_eq!(disconnect_rx.try_recv().unwrap(), "http://b.example:3689");
+        assert_eq!(
+            disconnect_rx.try_recv().unwrap(),
+            daap_source_id.to_string()
+        );
         assert_empty(&disconnect_rx);
         assert_empty(&delete_rx);
 

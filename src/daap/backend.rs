@@ -184,6 +184,7 @@ impl DaapBackend {
 
             let track = Track {
                 id: track_uuid,
+                native_track_id: crate::architecture::TrackId::remote(daap_id.to_string()).ok(),
                 title,
                 artist_name: artist_name.clone(),
                 album_artist_name: None,

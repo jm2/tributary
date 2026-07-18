@@ -94,19 +94,18 @@ pub fn setup_discovery(
                         None => None,
                     };
 
-                    // A URL remains the logical source key. An updated mDNS
-                    // publication refreshes only this row's ephemeral route;
-                    // an already-connected backend retains the immutable route
-                    // snapshot owned by its current generation.
-                    let existing = remote_source_for_url(&store, &server.url);
+                    // Stable SourceId owns the logical source. Canonical
+                    // `(backend, endpoint)` is only the discovery lookup key:
+                    // an updated publication refreshes this row's ephemeral
+                    // route while a connected generation keeps its immutable
+                    // route snapshot.
+                    let existing = remote_source_at(
+                        &store,
+                        &server.url,
+                        &server.service_type,
+                    )
+                    .map(|(_, source)| source);
                     if let Some(source) = existing {
-                        if source.backend_type() != server.service_type {
-                            tracing::warn!(
-                                backend = %server.service_type,
-                                "Ignoring discovered server whose URL is already owned by another backend"
-                            );
-                            continue;
-                        }
                         let route_changed = source.advertised_route() != advertised_route;
                         source.set_advertised_route(advertised_route.clone());
                         if let Some(requires_password) = server.requires_password {
@@ -178,10 +177,9 @@ pub fn setup_discovery(
                         continue;
                     }
 
-                    // URL keys cannot represent two backend protocols at the
-                    // same origin. A cross-backend mDNS alias is rejected on
-                    // Found above, and its Lost event must not retire the row,
-                    // registry, or credentials owned by the accepted backend.
+                    // Endpoint lookup includes the backend protocol. A Lost
+                    // event must retire only the exact row and stable owner
+                    // claimed by that `(backend, canonical endpoint)` pair.
                     let Some((source_index, source)) =
                         remote_source_at(&store, &url, &service_type)
                     else {
@@ -191,7 +189,11 @@ pub fn setup_discovery(
                         );
                         continue;
                     };
-                    let source_key = source.server_url();
+                    let Some(source_id) = source.source_id() else {
+                        tracing::warn!("Ignoring discovered source without stable identity");
+                        continue;
+                    };
+                    let source_key = source_id.to_string();
 
                     let lost_pending = pending_connection
                         .borrow()
@@ -214,13 +216,13 @@ pub fn setup_discovery(
                     // publish a library or issue playable requests.
                     invalidate_source_playback(&source_key);
                     if service_type == "daap" {
-                        if let Some(session) = crate::daap::release_source(&source_key) {
+                        if let Some(session) = crate::daap::release_source(source_id) {
                             rt_handle.spawn(async move {
                                 session.disconnect().await;
                             });
                         }
                     } else {
-                        crate::source_registry::release_source(&source_key);
+                        crate::source_registry::release_source(source_id);
                     }
 
                     info!(
@@ -428,15 +430,6 @@ fn handle_airplay_lost(output_list: &gtk::ListBox, url: &str) {
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-fn remote_source_for_url(store: &gtk::gio::ListStore, server_url: &str) -> Option<SourceObject> {
-    (0..store.n_items()).find_map(|index| {
-        store
-            .item(index)
-            .and_downcast::<SourceObject>()
-            .filter(|source| same_remote_server_url(&source.server_url(), server_url))
-    })
-}
-
 pub(super) fn remote_source_at(
     store: &gtk::gio::ListStore,
     server_url: &str,
@@ -458,6 +451,11 @@ fn same_remote_server_url(left: &str, right: &str) -> bool {
     crate::http_security::parse_base_url(left)
         .ok()
         .zip(crate::http_security::parse_base_url(right).ok())
+        .and_then(|(left, right)| {
+            crate::architecture::identity::canonical_remote_base_url(&left)
+                .ok()
+                .zip(crate::architecture::identity::canonical_remote_base_url(&right).ok())
+        })
         .is_some_and(|(left, right)| left == right)
 }
 
@@ -555,25 +553,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_origin_cross_backend_alias_does_not_own_the_existing_row() {
+    fn same_origin_rows_are_namespaced_by_backend_protocol() {
         let store = gtk::gio::ListStore::new::<SourceObject>();
-        let source = SourceObject::manual("Subsonic", "subsonic", "http://mini.local:4533");
-        store.append(&source);
+        let subsonic = SourceObject::manual(
+            "Subsonic",
+            "subsonic",
+            "http://mini.local:4533",
+            crate::architecture::SourceId::random(),
+        );
+        let daap = SourceObject::manual(
+            "DAAP",
+            "daap",
+            "http://mini.local:4533",
+            crate::architecture::SourceId::random(),
+        );
+        store.append(&subsonic);
+        store.append(&daap);
 
         assert!(remote_source_at(&store, "http://mini.local:4533", "subsonic").is_some());
-        assert!(remote_source_at(&store, "http://mini.local:4533", "daap").is_none());
-        assert_eq!(
-            remote_source_for_url(&store, "http://mini.local:4533")
-                .expect("URL owner")
-                .backend_type(),
-            "subsonic"
-        );
+        assert!(remote_source_at(&store, "http://mini.local:4533", "daap").is_some());
+        assert_ne!(subsonic.source_id(), daap.source_id());
     }
 
     #[test]
     fn root_url_spelling_matches_discovery_without_changing_the_owned_key() {
         let store = gtk::gio::ListStore::new::<SourceObject>();
-        let source = SourceObject::manual("DAAP", "daap", "HTTP://MINI.LOCAL:80/");
+        let source = SourceObject::manual(
+            "DAAP",
+            "daap",
+            "HTTP://MINI.LOCAL:80/",
+            crate::architecture::SourceId::random(),
+        );
         store.append(&source);
 
         let (_, owner) = remote_source_at(&store, "http://mini.local", "daap")

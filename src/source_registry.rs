@@ -12,8 +12,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::architecture::media::{MediaLease, RemoteMediaResolver, ResolvedHttpRequest};
+use crate::architecture::{SourceId, TrackId};
 
 const MEDIA_REFERENCE_SCHEME: &str = "tributary-remote";
+const MEDIA_TRACK_SEGMENT_PREFIX: &str = "id-";
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 enum RegistryGate {
@@ -29,7 +31,7 @@ struct ActiveSource {
 }
 
 struct LeaseOwner {
-    source_key: String,
+    source_id: SourceId,
     generation: u64,
     media_lease: MediaLease,
     resolver: Arc<dyn RemoteMediaResolver>,
@@ -39,9 +41,9 @@ struct LeaseOwner {
 struct SourceRegistry {
     gate: RegistryGate,
     next_generation: u64,
-    latest_generation: HashMap<String, u64>,
-    pending_attempts: HashSet<(String, u64)>,
-    by_source: HashMap<String, ActiveSource>,
+    latest_generation: HashMap<SourceId, u64>,
+    pending_attempts: HashSet<(SourceId, u64)>,
+    by_source: HashMap<SourceId, ActiveSource>,
     by_lease: HashMap<Uuid, LeaseOwner>,
 }
 
@@ -60,7 +62,7 @@ fn lock_registry() -> MutexGuard<'static, SourceRegistry> {
 /// Dropping an unfinished attempt removes it and restores any still-active
 /// predecessor as the current owner.
 pub struct ConnectionAttempt {
-    source_key: String,
+    source_id: SourceId,
     generation: u64,
     completed: bool,
 }
@@ -70,7 +72,7 @@ impl ConnectionAttempt {
     pub fn is_latest(&self) -> bool {
         let sources = lock_registry();
         sources.gate == RegistryGate::Running
-            && sources.latest_generation.get(&self.source_key) == Some(&self.generation)
+            && sources.latest_generation.get(&self.source_id) == Some(&self.generation)
     }
 
     /// Retain a resolver if this connection attempt still owns the source.
@@ -80,16 +82,16 @@ impl ConnectionAttempt {
         let mut sources = lock_registry();
         sources
             .pending_attempts
-            .remove(&(self.source_key.clone(), self.generation));
+            .remove(&(self.source_id, self.generation));
         self.completed = true;
 
         let accepted = sources.gate == RegistryGate::Running
-            && sources.latest_generation.get(&self.source_key) == Some(&self.generation);
+            && sources.latest_generation.get(&self.source_id) == Some(&self.generation);
         if !accepted {
             return None;
         }
 
-        if let Some(previous) = sources.by_source.remove(&self.source_key) {
+        if let Some(previous) = sources.by_source.remove(&self.source_id) {
             previous.media_lease.revoke();
             sources.by_lease.remove(&previous.lease_key);
         }
@@ -106,7 +108,7 @@ impl ConnectionAttempt {
         let media_lease = MediaLease::new();
 
         sources.by_source.insert(
-            self.source_key.clone(),
+            self.source_id,
             ActiveSource {
                 generation: self.generation,
                 lease_key,
@@ -116,7 +118,7 @@ impl ConnectionAttempt {
         sources.by_lease.insert(
             lease_key,
             LeaseOwner {
-                source_key: self.source_key.clone(),
+                source_id: self.source_id,
                 generation: self.generation,
                 media_lease,
                 resolver,
@@ -124,7 +126,7 @@ impl ConnectionAttempt {
         );
 
         Some(RetainedSource {
-            source_key: self.source_key.clone(),
+            source_id: self.source_id,
             generation: self.generation,
             lease_key,
         })
@@ -140,20 +142,20 @@ impl Drop for ConnectionAttempt {
         let mut sources = lock_registry();
         sources
             .pending_attempts
-            .remove(&(self.source_key.clone(), self.generation));
+            .remove(&(self.source_id, self.generation));
         if sources.gate == RegistryGate::Running
-            && sources.latest_generation.get(&self.source_key) == Some(&self.generation)
+            && sources.latest_generation.get(&self.source_id) == Some(&self.generation)
         {
             if let Some(active_generation) = sources
                 .by_source
-                .get(&self.source_key)
+                .get(&self.source_id)
                 .map(|source| source.generation)
             {
                 sources
                     .latest_generation
-                    .insert(self.source_key.clone(), active_generation);
+                    .insert(self.source_id, active_generation);
             } else {
-                sources.latest_generation.remove(&self.source_key);
+                sources.latest_generation.remove(&self.source_id);
             }
         }
     }
@@ -162,7 +164,7 @@ impl Drop for ConnectionAttempt {
 /// Proof that one standard remote source owns a generation and opaque lease.
 #[derive(Clone)]
 pub struct RetainedSource {
-    source_key: String,
+    source_id: SourceId,
     generation: u64,
     lease_key: Uuid,
 }
@@ -177,13 +179,13 @@ impl RetainedSource {
     }
 
     pub fn is_current(&self) -> bool {
-        is_current_source(&self.source_key, self.generation, self.lease_key)
+        is_current_source(self.source_id, self.generation, self.lease_key)
     }
 }
 
 /// Register source ownership before starting authentication or other network
 /// I/O. Returns `None` after controlled shutdown closes the registry gate.
-pub fn begin_connect(source_key: String) -> Option<ConnectionAttempt> {
+pub fn begin_connect(source_id: SourceId) -> Option<ConnectionAttempt> {
     let mut sources = lock_registry();
     if sources.gate != RegistryGate::Running {
         return None;
@@ -191,25 +193,21 @@ pub fn begin_connect(source_key: String) -> Option<ConnectionAttempt> {
 
     sources.next_generation = sources.next_generation.wrapping_add(1).max(1);
     let generation = sources.next_generation;
-    sources
-        .latest_generation
-        .insert(source_key.clone(), generation);
-    sources
-        .pending_attempts
-        .insert((source_key.clone(), generation));
+    sources.latest_generation.insert(source_id, generation);
+    sources.pending_attempts.insert((source_id, generation));
 
     Some(ConnectionAttempt {
-        source_key,
+        source_id,
         generation,
         completed: false,
     })
 }
 
 /// Revoke the active lease and invalidate pending attempts for one source.
-pub fn release_source(source_key: &str) -> bool {
+pub fn release_source(source_id: SourceId) -> bool {
     let mut sources = lock_registry();
-    sources.latest_generation.remove(source_key);
-    let Some(source) = sources.by_source.remove(source_key) else {
+    sources.latest_generation.remove(&source_id);
+    let Some(source) = sources.by_source.remove(&source_id) else {
         return false;
     };
     source.media_lease.revoke();
@@ -218,12 +216,12 @@ pub fn release_source(source_key: &str) -> bool {
 }
 
 /// Verify ownership carried by a queued remote-library publication.
-pub fn is_current_source(source_key: &str, generation: u64, lease_key: Uuid) -> bool {
+pub fn is_current_source(source_id: SourceId, generation: u64, lease_key: Uuid) -> bool {
     let sources = lock_registry();
     sources.gate == RegistryGate::Running
         && sources
             .by_source
-            .get(source_key)
+            .get(&source_id)
             .is_some_and(|source| source.generation == generation && source.lease_key == lease_key)
 }
 
@@ -245,20 +243,68 @@ pub fn begin_shutdown() {
 
 /// Build an opaque playable reference. It contains no source address or
 /// credentials and is useful only while its exact registry lease is active.
-pub fn stream_reference(lease_key: Uuid, track_id: Uuid) -> String {
+pub fn stream_reference(lease_key: Uuid, track_id: &TrackId) -> String {
     media_reference(lease_key, MediaKind::Stream, track_id)
 }
 
 /// Build an opaque artwork reference with the same lease isolation as streams.
-pub fn artwork_reference(lease_key: Uuid, track_id: Uuid) -> String {
+pub fn artwork_reference(lease_key: Uuid, track_id: &TrackId) -> String {
     media_reference(lease_key, MediaKind::Artwork, track_id)
 }
 
-fn media_reference(lease_key: Uuid, kind: MediaKind, track_id: Uuid) -> String {
+fn media_reference(lease_key: Uuid, kind: MediaKind, track_id: &TrackId) -> String {
     format!(
-        "{MEDIA_REFERENCE_SCHEME}://{lease_key}/{}/{track_id}",
-        kind.path_component()
+        "{MEDIA_REFERENCE_SCHEME}://{lease_key}/{}/{}",
+        kind.path_component(),
+        encode_track_segment(track_id)
     )
+}
+
+/// Encode an exact UTF-8 native identifier into one URL segment that cannot
+/// be interpreted as `.` or `..` by an RFC 3986 parser.
+///
+/// The fixed non-dot prefix and lowercase hex alphabet make the representation
+/// canonical, reversible, and independent of percent-decoder behavior.
+fn encode_track_segment(track_id: &TrackId) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = track_id.as_str().as_bytes();
+    let mut encoded = String::with_capacity(
+        MEDIA_TRACK_SEGMENT_PREFIX
+            .len()
+            .saturating_add(bytes.len().saturating_mul(2)),
+    );
+    encoded.push_str(MEDIA_TRACK_SEGMENT_PREFIX);
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_track_segment(segment: &str) -> Result<TrackId, MediaReferenceError> {
+    let encoded = segment
+        .strip_prefix(MEDIA_TRACK_SEGMENT_PREFIX)
+        .ok_or(MediaReferenceError::Malformed)?;
+    if encoded.is_empty() || !encoded.len().is_multiple_of(2) {
+        return Err(MediaReferenceError::Malformed);
+    }
+
+    let mut decoded = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = decode_hex_nibble(pair[0]).ok_or(MediaReferenceError::Malformed)?;
+        let low = decode_hex_nibble(pair[1]).ok_or(MediaReferenceError::Malformed)?;
+        decoded.push((high << 4) | low);
+    }
+    let value = String::from_utf8(decoded).map_err(|_| MediaReferenceError::Malformed)?;
+    TrackId::remote(value).map_err(|_| MediaReferenceError::Malformed)
+}
+
+const fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 /// Return true for references owned by this registry, including malformed
@@ -333,7 +379,7 @@ impl MediaKind {
 
 struct ParsedReference {
     lease_key: Uuid,
-    track_id: Uuid,
+    track_id: TrackId,
 }
 
 fn parse_reference(
@@ -367,11 +413,8 @@ fn parse_reference(
     if kind != expected_kind {
         return Err(MediaReferenceError::WrongKind);
     }
-    let track_id = segments
-        .next()
-        .ok_or(MediaReferenceError::Malformed)?
-        .parse::<Uuid>()
-        .map_err(|_| MediaReferenceError::Malformed)?;
+    let encoded_track_id = segments.next().ok_or(MediaReferenceError::Malformed)?;
+    let track_id = decode_track_segment(encoded_track_id)?;
     if segments.next().is_some() {
         return Err(MediaReferenceError::Malformed);
     }
@@ -395,7 +438,7 @@ fn resolver_for(
         .ok_or(MediaReferenceError::Unavailable)?;
     let current = sources
         .by_source
-        .get(&owner.source_key)
+        .get(&owner.source_id)
         .is_some_and(|source| {
             source.generation == owner.generation && source.lease_key == reference.lease_key
         });
@@ -413,7 +456,7 @@ fn ensure_current(reference: &ParsedReference) -> Result<(), MediaReferenceError
     let current = sources.gate == RegistryGate::Running
         && sources
             .by_source
-            .get(&owner.source_key)
+            .get(&owner.source_id)
             .is_some_and(|source| {
                 source.generation == owner.generation && source.lease_key == reference.lease_key
             });
@@ -463,6 +506,11 @@ mod tests {
         endpoint: Url,
     }
 
+    struct CapturingResolver {
+        seen_streams: Arc<Mutex<Vec<TrackId>>>,
+        seen_artwork: Arc<Mutex<Vec<TrackId>>>,
+    }
+
     impl MockResolver {
         fn new(marker: &str) -> Self {
             Self {
@@ -474,15 +522,38 @@ mod tests {
 
     #[async_trait]
     impl RemoteMediaResolver for MockResolver {
-        async fn resolve_stream(&self, _track_id: &Uuid) -> BackendResult<ResolvedHttpRequest> {
+        async fn resolve_stream(&self, _track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
             ResolvedHttpRequest::new(self.endpoint.clone())
         }
 
         async fn resolve_artwork(
             &self,
-            _media_id: &Uuid,
+            _media_id: &TrackId,
         ) -> BackendResult<Option<ResolvedHttpRequest>> {
             ResolvedHttpRequest::new(self.endpoint.clone()).map(Some)
+        }
+    }
+
+    #[async_trait]
+    impl RemoteMediaResolver for CapturingResolver {
+        async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
+            self.seen_streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(track_id.clone());
+            ResolvedHttpRequest::new(Url::parse("https://media.invalid/exact").expect("URL"))
+        }
+
+        async fn resolve_artwork(
+            &self,
+            track_id: &TrackId,
+        ) -> BackendResult<Option<ResolvedHttpRequest>> {
+            self.seen_artwork
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(track_id.clone());
+            ResolvedHttpRequest::new(Url::parse("https://media.invalid/artwork").expect("URL"))
+                .map(Some)
         }
     }
 
@@ -494,25 +565,30 @@ mod tests {
         *sources = SourceRegistry::default();
     }
 
-    fn retain(source_key: &str, marker: &str) -> RetainedSource {
-        begin_connect(source_key.to_string())
+    fn retain(source_id: SourceId, marker: &str) -> RetainedSource {
+        begin_connect(source_id)
             .expect("connection attempt")
             .retain(Arc::new(MockResolver::new(marker)))
             .expect("retained source")
+    }
+
+    fn track_id() -> TrackId {
+        TrackId::remote(Uuid::new_v4().to_string()).expect("test track ID")
     }
 
     #[tokio::test]
     async fn same_key_replacement_revokes_old_lease_and_reference() {
         let _guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry();
-        let track_id = Uuid::new_v4();
-        let first = retain("same-source", "first");
-        let old_reference = stream_reference(first.lease_key(), track_id);
+        let track_id = track_id();
+        let source_id = SourceId::random();
+        let first = retain(source_id, "first");
+        let old_reference = stream_reference(first.lease_key(), &track_id);
         let old_request = resolve_stream_reference(&old_reference)
             .await
             .expect("first request");
 
-        let second = retain("same-source", "second");
+        let second = retain(source_id, "second");
         assert!(!first.is_current());
         assert!(second.is_current());
         assert!(!stream_reference_uses_lease(
@@ -524,7 +600,7 @@ mod tests {
             resolve_stream_reference(&old_reference).await,
             Err(MediaReferenceError::Unavailable)
         ));
-        let new_reference = stream_reference(second.lease_key(), track_id);
+        let new_reference = stream_reference(second.lease_key(), &track_id);
         assert!(stream_reference_uses_lease(
             &new_reference,
             second.lease_key()
@@ -542,8 +618,9 @@ mod tests {
     async fn stale_retain_cannot_replace_a_newer_attempt() {
         let _guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry();
-        let stale = begin_connect("source".to_string()).expect("stale attempt");
-        let current = begin_connect("source".to_string()).expect("current attempt");
+        let source_id = SourceId::random();
+        let stale = begin_connect(source_id).expect("stale attempt");
+        let current = begin_connect(source_id).expect("current attempt");
 
         assert!(stale.retain(Arc::new(MockResolver::new("stale"))).is_none());
         let current = current
@@ -557,12 +634,12 @@ mod tests {
     async fn discovery_loss_invalidates_an_attempt_before_network_start() {
         let _guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry();
-        let source_key = "queued-then-lost";
-        let attempt = begin_connect(source_key.to_string()).expect("queued attempt");
+        let source_id = SourceId::random();
+        let attempt = begin_connect(source_id).expect("queued attempt");
 
         // No backend is active yet, but release must still retire the minted
         // generation so a task first polled afterward cannot resurrect it.
-        assert!(!release_source(source_key));
+        assert!(!release_source(source_id));
         assert!(!attempt.is_latest());
         assert!(attempt
             .retain(Arc::new(MockResolver::new("withdrawn")))
@@ -570,7 +647,7 @@ mod tests {
         assert!(!lock_registry()
             .pending_attempts
             .iter()
-            .any(|(key, _)| key == source_key));
+            .any(|(key, _)| *key == source_id));
         reset_registry();
     }
 
@@ -578,13 +655,14 @@ mod tests {
     async fn release_invalidates_references_and_issued_requests() {
         let _guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry();
-        let source = retain("released-source", "released");
-        let reference = stream_reference(source.lease_key(), Uuid::new_v4());
+        let source_id = SourceId::random();
+        let source = retain(source_id, "released");
+        let reference = stream_reference(source.lease_key(), &track_id());
         let request = resolve_stream_reference(&reference)
             .await
             .expect("issued request");
 
-        assert!(release_source("released-source"));
+        assert!(release_source(source_id));
         assert!(!source.is_current());
         assert!(!request.is_active());
         assert!(matches!(
@@ -598,11 +676,13 @@ mod tests {
     async fn source_leases_are_collision_isolated() {
         let _guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry();
-        let track_id = Uuid::new_v4();
-        let first = retain("first-source", "first");
-        let second = retain("second-source", "second");
-        let first_reference = stream_reference(first.lease_key(), track_id);
-        let second_reference = stream_reference(second.lease_key(), track_id);
+        let track_id = track_id();
+        let first_source_id = SourceId::random();
+        let second_source_id = SourceId::random();
+        let first = retain(first_source_id, "first");
+        let second = retain(second_source_id, "second");
+        let first_reference = stream_reference(first.lease_key(), &track_id);
+        let second_reference = stream_reference(second.lease_key(), &track_id);
 
         assert_ne!(first.lease_key(), second.lease_key());
         assert!(resolve_stream_reference(&first_reference)
@@ -617,7 +697,7 @@ mod tests {
             .endpoint()
             .path()
             .ends_with("/second"));
-        assert!(release_source("first-source"));
+        assert!(release_source(first_source_id));
         assert!(resolve_stream_reference(&second_reference).await.is_ok());
         reset_registry();
     }
@@ -626,23 +706,24 @@ mod tests {
     async fn references_expose_only_lease_kind_and_track_identity() {
         let _guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry();
-        let source = retain("https://user:secret@private.example", "artwork");
-        let track_id = Uuid::new_v4();
-        let stream = stream_reference(source.lease_key(), track_id);
-        let artwork = artwork_reference(source.lease_key(), track_id);
+        let source = retain(SourceId::random(), "artwork");
+        let track_id = TrackId::remote(" Case/Sensitive + Unicode ☃").expect("test track ID");
+        let stream = stream_reference(source.lease_key(), &track_id);
+        let artwork = artwork_reference(source.lease_key(), &track_id);
+        let encoded_track_id = encode_track_segment(&track_id);
 
         assert_eq!(
             stream,
             format!(
-                "{MEDIA_REFERENCE_SCHEME}://{}/stream/{track_id}",
-                source.lease_key()
+                "{MEDIA_REFERENCE_SCHEME}://{}/stream/{encoded_track_id}",
+                source.lease_key(),
             )
         );
         assert_eq!(
             artwork,
             format!(
-                "{MEDIA_REFERENCE_SCHEME}://{}/artwork/{track_id}",
-                source.lease_key()
+                "{MEDIA_REFERENCE_SCHEME}://{}/artwork/{encoded_track_id}",
+                source.lease_key(),
             )
         );
         for reference in [&stream, &artwork] {
@@ -659,13 +740,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reference_round_trip_preserves_the_exact_backend_native_id() {
+        let _guard = REGISTRY_TEST_LOCK.lock().await;
+        reset_registry();
+        let seen_streams = Arc::new(Mutex::new(Vec::new()));
+        let seen_artwork = Arc::new(Mutex::new(Vec::new()));
+        let source = begin_connect(SourceId::random())
+            .expect("connection attempt")
+            .retain(Arc::new(CapturingResolver {
+                seen_streams: Arc::clone(&seen_streams),
+                seen_artwork: Arc::clone(&seen_artwork),
+            }))
+            .expect("retained source");
+        let track_ids = [
+            TrackId::remote(".").expect("dot track ID"),
+            TrackId::remote("..").expect("dot-dot track ID"),
+        ];
+
+        for track_id in &track_ids {
+            let stream = stream_reference(source.lease_key(), track_id);
+            let artwork = artwork_reference(source.lease_key(), track_id);
+            assert!(!stream.contains("/./"));
+            assert!(!stream.contains("/../"));
+            assert!(!artwork.contains("/./"));
+            assert!(!artwork.contains("/../"));
+
+            resolve_stream_reference(&stream)
+                .await
+                .expect("resolve exact stream ID");
+            assert!(resolve_artwork_reference(&artwork)
+                .await
+                .expect("resolve exact artwork ID")
+                .is_some());
+        }
+
+        assert_eq!(
+            seen_streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            track_ids.as_slice()
+        );
+        assert_eq!(
+            seen_artwork
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            track_ids.as_slice()
+        );
+        reset_registry();
+    }
+
+    #[tokio::test]
     async fn malformed_and_wrong_kind_references_fail_closed() {
         let _guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry();
-        let source = retain("source", "media");
-        let track_id = Uuid::new_v4();
-        let stream = stream_reference(source.lease_key(), track_id);
-        let artwork = artwork_reference(source.lease_key(), track_id);
+        let source = retain(SourceId::random(), "media");
+        let track_id = track_id();
+        let stream = stream_reference(source.lease_key(), &track_id);
+        let artwork = artwork_reference(source.lease_key(), &track_id);
 
         assert!(is_media_reference(&stream));
         assert!(matches!(
@@ -679,10 +812,16 @@ mod tests {
         for malformed in [
             "not-a-reference",
             "tributary-remote://%",
-            "tributary-remote:///stream/not-a-uuid",
-            "tributary-remote://not-a-uuid/stream/not-a-uuid",
-            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/00000000-0000-4000-8000-000000000002/extra",
-            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/00000000-0000-4000-8000-000000000002?secret=no",
+            "tributary-remote:///stream/track",
+            "tributary-remote://not-a-uuid/stream/track",
+            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/",
+            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/%FF",
+            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/id-",
+            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/id-0",
+            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/id-2E",
+            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/id-ff",
+            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/track/extra",
+            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/track?secret=no",
         ] {
             if malformed.starts_with("tributary-remote:") {
                 assert!(is_media_reference(malformed));
@@ -696,10 +835,11 @@ mod tests {
     async fn failed_new_attempt_restores_existing_owner() {
         let _guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry();
-        let track_id = Uuid::new_v4();
-        let existing = retain("source", "existing");
-        let reference = stream_reference(existing.lease_key(), track_id);
-        let failed = begin_connect("source".to_string()).expect("replacement attempt");
+        let track_id = track_id();
+        let source_id = SourceId::random();
+        let existing = retain(source_id, "existing");
+        let reference = stream_reference(existing.lease_key(), &track_id);
+        let failed = begin_connect(source_id).expect("replacement attempt");
         assert!(existing.is_current());
         assert!(resolve_stream_reference(&reference).await.is_ok());
         drop(failed);
@@ -715,19 +855,19 @@ mod tests {
     async fn shutdown_revokes_active_and_rejects_pending_ownership() {
         let _guard = REGISTRY_TEST_LOCK.lock().await;
         reset_registry();
-        let source = retain("source", "active");
-        let reference = stream_reference(source.lease_key(), Uuid::new_v4());
+        let source = retain(SourceId::random(), "active");
+        let reference = stream_reference(source.lease_key(), &track_id());
         let request = resolve_stream_reference(&reference)
             .await
             .expect("active request");
-        let pending = begin_connect("pending".to_string()).expect("pending attempt");
+        let pending = begin_connect(SourceId::random()).expect("pending attempt");
 
         begin_shutdown();
 
         assert!(!source.is_current());
         assert!(!request.is_active());
         assert!(!pending.is_latest());
-        assert!(begin_connect("after-shutdown".to_string()).is_none());
+        assert!(begin_connect(SourceId::random()).is_none());
         assert!(matches!(
             resolve_stream_reference(&reference).await,
             Err(MediaReferenceError::Unavailable)

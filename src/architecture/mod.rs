@@ -6,8 +6,10 @@
 
 pub mod backend;
 pub mod error;
+pub mod identity;
 pub mod media;
 pub mod models;
 
 pub use backend::{load_track_catalog, MediaBackend};
+pub use identity::{MediaKey, SourceId, TrackId, ViewOrigin};
 pub use media::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest};

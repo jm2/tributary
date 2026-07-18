@@ -90,7 +90,12 @@ pub fn radio_station_to_track_object(station: &crate::radio::RadioStation) -> Tr
         &station.codec,   // format = codec
         &station.url_resolved,
     );
-    track.set_track_id(&station.stationuuid);
+    // Explicit empty identity makes malformed server rows unqueueable instead
+    // of silently falling back to their stream URL as a different identity.
+    match crate::architecture::TrackId::remote(station.stationuuid.clone()) {
+        Ok(track_id) => track.set_track_id(track_id.as_str()),
+        Err(_) => track.set_track_id(""),
+    }
     track
 }
 
@@ -439,7 +444,7 @@ fn estimate_station_distance(
 
 #[cfg(test)]
 mod tests {
-    use super::estimate_station_distance;
+    use super::{estimate_station_distance, radio_station_to_track_object};
     use crate::radio::RadioStation;
 
     /// Helper to build a minimal `RadioStation` for testing.
@@ -508,5 +513,19 @@ mod tests {
         let dist = estimate_station_distance(&s, 39.77, -86.16);
         // Should fall through to state centroid, not use (0,0).
         assert!(dist < 100.0, "dist = {dist}");
+    }
+
+    #[test]
+    fn radio_rows_preserve_valid_native_ids_and_quarantine_invalid_ones() {
+        let mut valid = station(None, None, "", "");
+        valid.stationuuid = "Case/Sensitive Station ID".to_string();
+        valid.url_resolved = "https://radio.example.test/live".to_string();
+        assert_eq!(
+            radio_station_to_track_object(&valid).track_id(),
+            "Case/Sensitive Station ID"
+        );
+
+        valid.stationuuid.clear();
+        assert!(radio_station_to_track_object(&valid).track_id().is_empty());
     }
 }
