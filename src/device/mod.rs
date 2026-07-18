@@ -7,8 +7,8 @@
 //! hotplug updates. Filesystem traversal remains separate background work.
 //!
 //! This layer currently supports browsing mounted filesystems. Device sync,
-//! transfer, and mounting an unmounted volume remain outside its scope (tracked
-//! in GitHub issues #1 and #8).
+//! transfer, MTP-only access, and mounting an unmounted volume remain outside
+//! its scope; see GitHub issue #8 and `docs/roadmap.md`.
 
 pub mod usb;
 

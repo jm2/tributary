@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.5.1] — Unreleased
 
 ### Added
+- **An audited implementation roadmap and clean active backlog** — `docs/roadmap.md` now separates
+  product work from the completed holistic-review remediation and classifies all 11 open GitHub
+  issues, their current implementation state, dependencies, and likely delivery shape. The active
+  `docs/task.md` is reset to 35 countable feature records ordered by correctness foundations,
+  bounded user-facing enhancements, and larger data-movement epics. Its first record captures
+  hardening for the existing occurrence-aware shuffled Previous/Next history—including bounded
+  Repeat All growth, retained-boundary behavior, real UI/media-control path regressions, forward
+  traversal after Previous, duplicates, repeat modes, and queue/session resets—rather than
+  claiming the feature is absent. The former 220/223 remediation tracker remains intact as
+  `docs/task-remediation-2026-07.md`, with its three hardware/installed/live validation records
+  explicitly excluded from the new feature percentage.
 - **Remote-service tests share bounded protocol-appropriate fixtures and a completed behavior matrix** — Subsonic's ad hoc server is replaced with a reusable loopback service whose method, exact path, and decoded query-subset routes are independent of arrival order. It records bounded request bodies and headers, queues exact response counts, can delay a response body under test-owned deadlines, rejects unexpected or ambiguous requests, verifies every expectation at explicit bounded shutdown, and aborts safely if a test unwinds. Complete production paths cover Subsonic token-query derivation and partial artist/album failure, Jellyfin and Plex authenticated multi-page catalogue loading, Plex atomic per-section failure, Radio-Browser filtering and public redirects, and the geolocation provider cascade; DAAP retains its separately appropriate endpoint-scripted raw-socket fixture for malformed containers and session expiration. The representative matrix covers rejected authentication, credential-safe redirect behavior, finite deadlines, streaming body caps, pagination, partial failure, and root/trailing-slash/escaped reverse-proxy bases without claiming every redundant Cartesian pairing. Twelve additional regressions bring the completion branch to 787 debug and 787 release tests plus strict Clippy in both profiles.
 - **Track actions and playback sliders are now accessible without a pointer** — With focus in the
   track list, either the unmodified platform Context Menu key or Shift+F10 opens the same
@@ -93,6 +104,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Credential-bearing media tickets now expire** — Every upstream proxy ticket has a hard, absolute, non-sliding 24-hour lifetime from registration in addition to earlier playback-lifecycle revocation. It is usable only before its monotonic deadline; a lookup at or after that boundary atomically removes it and returns the same 404 as an unknown or revoked route. GET and byte-range requests, pause, seek, and receiver status do not renew the deadline, so a compromised receiver cannot perpetuate the bearer. A response admitted before expiry may finish afterward, but every later lookup fails. Local-file routes retain their existing server-lifetime behavior because they front no backend credential.
 
 ### Changed
+- **Project documentation now describes the shipping source architecture and remaining work** — The
+  README no longer presents the implemented P3.1 lifecycle as a future URL-keyed design or labels
+  AirPlay 1 as scaffolding. Its architecture diagram, project tree, removable-media lifecycle,
+  pathless retained authority, smart-playlist limitations, ratings status, playlist scope, and
+  shuffle-history status now match the code. The source-lifecycle ADR links its archived tracker;
+  Subsonic, Jellyfin, Plex, and device module docs now describe current protected at-use resolution,
+  catalogue publication, and the still-unimplemented transfer/MTP scope without referencing closed
+  issue #1.
 - **Managed network sources now share one production lifecycle authority** —
   `SourceRegistry` is the sole adapter/session owner for Subsonic, Jellyfin, Plex, DAAP, and the
   built-in Radio-Browser source
