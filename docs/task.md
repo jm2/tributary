@@ -23,7 +23,7 @@ Status summary:
 - [ ] P0 release blockers complete
 - [x] P1 correctness and security complete
 - [ ] P2 resilience and packaging complete
-- [ ] P3 architecture and integration coverage complete
+- [x] P3 architecture and integration coverage complete
 
 Progress snapshot (2026-07-18), recounted from the literal P0–P3 task checkboxes to correct the
 earlier numerator/denominator drift. The live protected-playback finding recorded under P2.11 now
@@ -31,8 +31,8 @@ has eight independently verifiable tasks rather than the original three compound
 in-scope counts exclude the two deferred P0.7
 live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
 global-validation gate boxes are not task progress:
-**219/223 (98.2%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
-and **29/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+**220/223 (98.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
+and **30/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
 closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
 ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
@@ -49,9 +49,9 @@ P3.5 now reports every Linux-host source area in one pinned aggregate, keeps dif
 source sets as informational reports, and enforces the baseline accepted by two exact pinned PR
 executions in PR #111.
 
-PR #123's P3.1 production cutover closes the centralized refresh/cancellation/disconnect/failure
-box while deliberately leaving the final implementation-record box unchecked, so the literal
-arithmetic is now **219/223 (98.2%)** and P3 is **29/30**. `SourceRegistry` is the sole
+PR #123's P3.1 production cutover closed the centralized refresh/cancellation/disconnect/failure
+box while deliberately leaving the final implementation-record box unchecked, so at that cutover
+the literal arithmetic was **219/223 (98.2%)** and P3 was **29/30**. `SourceRegistry` became the sole
 lifecycle owner for Subsonic, Jellyfin, Plex, DAAP, the built-in Radio-Browser source, and admitted
 hidden external-file sessions. GTK catalogue rows and playback queues carry only `SourceId`, exact
 `TrackId`, and the non-secret publishing session epoch;
@@ -99,11 +99,11 @@ and strict debug/release Clippy pass; all 14 `windows_*` and three `powershell_*
 complete locked debug/release suites each pass 20 library, 896 application, and 10
 repository-metadata tests (**926 total**) with zero failures or ignored tests. Only rerunning the
 exact affected Windows PowerShell/MSYS2 command can confirm the host-specific failure is repaired.
-That field proof remains pending, so PR #127 changes no checkbox: the totals remain **219/223
-(98.2%)**, **76/79 P2**, and **29/30 P3**.
+That field proof remains pending, so PR #127 changed no checkbox: the totals at that point remained
+**219/223 (98.2%)**, **76/79 P2**, and **29/30 P3**.
 Comprehensive lifecycle, playback-boundary, reducer, provenance, Jellyfin, and actual-wire DAAP
-regressions cover the authenticated cutover. Only removable media still needs its registry-owned
-at-use locator adapter; that keeps the final P3.1 implementation record open.
+regressions cover the authenticated cutover. At that point only removable media still needed its
+registry-owned at-use locator adapter, keeping the final P3.1 implementation record open.
 PR #125 closed the separate local/playlist embedded-art authority boundary.
 Artwork begins only after exact-ID resolution is still current for the configured roots and the
 selected output accepts the load, then owns a cloned `ResolvedLocalMedia` through its background
@@ -115,9 +115,9 @@ fallback, whose complete-file and image caps are 256 MiB and 32 MiB with checked
 the ordinary parser applies the same image cap. Exact art generations discard stale results. All 9
 focused art tests, the locked all-target/all-feature check, strict debug/release Clippy, formatting,
 and the whitespace gate pass. Complete locked debug and release suites each pass 20 library, 872
-application, and 10 repository-metadata tests (**902 total**). Because this is part of the still-open
-compound implementation record, the totals remain **219/223 (98.2%)**, **76/79 P2**, and
-**29/30 P3**.
+application, and 10 repository-metadata tests (**902 total**). Because this was part of the
+still-open compound implementation record, that slice left the totals at **219/223 (98.2%)**,
+**76/79 P2**, and **29/30 P3**.
 PR #126 generalized that owner to `SourceRegistry` and installed one
 stateless built-in source whose Top Clicked, Top Voted, and Near Me feeds are exact independently
 cancellable `ViewOrigin` lanes. Accepted snapshots publish pathless tracks while a private payload
@@ -134,7 +134,7 @@ construction failure or later source loss returns a selected radio lane to Local
 user's music-column and browser-visibility preferences. Its adapter tolerates partial successful
 tiers, deduplicates by tier precedence, computes each retained distance once before one stable
 global sort, and retains no locator in rows or queues.
-The current external-file follow-up replaces OS-open direct-URI playback with one hidden,
+PR #128's external-file follow-up replaces OS-open direct-URI playback with one hidden,
 registry-owned ephemeral source per admitted file. Each OS delivery is drained in order on a
 blocking worker, skips invalid candidates, and publishes only the first exact open handle whose
 audio parsing and bounded metadata validation succeed. Source and track IDs are minted only after
@@ -156,9 +156,46 @@ then made the parser hint tolerant of native non-UTF-8 leaf names and serialized
 parsers across clone and consumption. Formatting/diff, locked check, strict debug/release Clippy,
 and serial complete debug/release suites are green; each profile passes 20 library, 910 application,
 and 10 repository-metadata tests (**940 total**).
-This closes the external-file portion of the compound record without changing literal arithmetic:
-**219/223 (98.2%)** overall, **76/79 P2**, and **29/30 P3**. Only the removable-media adapter
-remains before P3.1's final implementation record can close.
+That closed the external-file portion of the compound record without changing literal arithmetic:
+**219/223 (98.2%)** overall, **76/79 P2**, and **29/30 P3**. At that point only the
+removable-media adapter remained before P3.1's final implementation record could close.
+
+The current removable-media follow-up closes that final adapter and P3.1's compound implementation
+record. A mount event now claims the deterministic removable `SourceId` and asks `SourceRegistry`
+to construct the source on its blocking runtime. The accepted catalogue and every queue item are
+pathless: GTK retains only the source ID, a lossless native mount-relative `TrackId`, and the exact
+publishing epoch. The adapter privately retains mounted-root authority, walks deterministically
+without following links or crossing filesystems, parses tags through exact already-open handles,
+and admits only bounded metadata. At use, registry resolution enforces exact catalogue membership,
+epoch, and lease ownership before returning a retained file capability for playback or embedded
+art. Only the private filesystem authority decodes the relative identity; no mount path or
+`file://` locator enters rows, queues, or output consumers. Pre-unmount, relocation, removal, source
+replacement, and shutdown disconnect lifecycle authority before cache, navigation, playback, or
+row invalidation. A failed unmount can reconnect from the fresh inventory under a new epoch, while
+confirmed removal releases the logical-key provenance claim. Because pathless removable rows do not
+yet carry typed mutation authority, their context menu deliberately omits Properties instead of
+reintroducing a host path.
+
+Independent security review hardened both platform boundaries. Unix mounted roots normalize only
+semantically redundant trailing slash and `/.` spellings before the no-follow open, preventing a
+symlink root from bypassing the root check. Windows traversal pins the exact root and ancestor
+namespace without delete sharing until the final no-follow file is retained, rejects directory
+symlinks, and follows a final reparse root only after Windows verifies it as a volume mount point;
+the retained final file remains shareable so ordinary device eject is not held open unnecessarily.
+Focused identity, mounted-authority, adapter, registry-lifecycle, and GTK tests cover malformed and
+native non-Unicode IDs, containment, replacement, unlisted-track rejection, reconnect epochs,
+queued-scan cancellation, shutdown joining, and exact UI invalidation. The complete serial locked
+debug suite passes 20 library, 925 application, and 10 repository-metadata tests (**955 total**),
+with locked all-target/all-feature check, strict debug Clippy, formatting, and diff checks green.
+The release suite was not completed because partial release artifacts exhausted the temporary
+workspace quota; that is a validation-environment limitation, not a code-test failure, and no
+release result is claimed here.
+
+This advances literal progress to **220/223 (98.7%)** overall and completes P3 at **30/30**.
+The only remaining in-scope checklist items are the three P2 field checks: physical removable-media
+lifecycle validation, an installed Flatpak portal/USB/custom-library smoke test, and live packaged
+Windows DAAP/Subsonic playback. The release-workflow run remains deliberately deferred and excluded
+from this arithmetic.
 P3.3 is complete after combining the independently reviewed non-DAAP service fixture from
 `b80e534`, the DAAP adversarial fixture from `6f6c9ac`, and this representative cross-service
 behavior matrix. The matrix exercises rejected authentication, credential-safe authenticated and
@@ -341,8 +378,10 @@ file through bounded parsing. The Radio-Browser follow-up adds its stateless sou
 private public locators, and final-consumption authority. The external-file follow-up adds hidden
 ephemeral registry sessions, ordered first-accepted-audio OS-delivery admission, pathless queue
 identity, retained file authority, admission supersession at explicit playback intents, and exact
-retirement at terminal boundaries. Only the removable at-use adapter now remains in the compound
-record, so its checklist arithmetic does not yet change.
+retirement at terminal boundaries. The current removable follow-up completes the compound record
+with registry-owned mounted-root authority, pathless epoch-bound catalogues, membership-gated
+retained file resolution, and disconnect-first hotplug lifecycle ordering. Progress is therefore
+**220/223 (98.7%)** overall and **30/30 P3**; only three manual P2 validation items remain.
 The release-workflow dry run remains deliberately deferred rather than being counted as unfinished
 P0 remediation.
 
@@ -976,23 +1015,24 @@ history, or playlist links.
 
 ### P2.4 Make removable-media browsing safe and asynchronous
 
-Re-scoped 2026-07-13 and completed in two stages. PR #92 first moved the old platform-directory and
-drive-letter probes to a one-shot worker. The current slice removes those heuristics entirely:
-`device/usb.rs` projects cached native `gio::VolumeMonitor` metadata into plain `DeviceInfo` values
-on GTK's main thread and performs no filesystem I/O. Recursive audio traversal remains a separate,
-bounded background operation in `ui/source_connect.rs`, where the original symlink defect lived.
+Re-scoped 2026-07-13. PR #92 first moved the old platform-directory and drive-letter probes to a
+one-shot worker, and PR #93 replaced those heuristics with live GIO inventory. The final P3.1
+follow-up now moves recursive traversal out of GTK entirely: `device/usb.rs` still projects cached
+native `gio::VolumeMonitor` metadata into plain `DeviceInfo` values on the main thread, while the
+registry-owned removable adapter acquires retained mounted-root authority and scans on Tokio's
+blocking runtime. The implementation is complete; only the physical-device field record below
+remains open.
 
-- [x] Disable symlink following during device scans. The walk used
+- [x] Disable symlink following during device scans. The old walk used
   `WalkDir::new(mount_path).follow_links(true)`, so a USB stick containing `music -> /home/user`
-  made Tributary walk the entire home directory and index it as "on the device". The traversal is
-  now extracted into `enumerate_device_audio_files`, uses `.follow_links(false)`, and tests
-  `entry.file_type()` rather than `Path::is_file()` — the latter follows the link anyway and would
-  still have pulled in an individual file symlinked from off the device. This matches the library
-  scanner's no-follow policy.
-- [x] Verify descendants remain on the selected mount/device, for the symlink case: nothing outside
-  the mount can now be reached through a link. (A bind mount or a nested real filesystem under the
-  mount point is still followed; the library scanner's `filesystem_boundary_id` check is the model
-  to copy if that matters here.)
+  could index the home directory as part of the device. The registry-owned walker now opens every
+  ancestor and final file without following links and parses through that exact retained handle;
+  neither a directory link nor an individual file link can enter the catalogue.
+- [x] Verify descendants remain on the selected mount/device. The mounted-root authority binds the
+  scan to the root filesystem identity and rejects descendants on a different filesystem as well as
+  symlink escapes. Resolution later revalidates the same root/ancestor/file boundary and admits only
+  a `TrackId` from the exact accepted catalogue, so a replacement or unlisted relative path cannot
+  become playable.
 - [x] Keep mount discovery from blocking GTK. PR #92's interim implementation isolated every
   heuristic filesystem probe on one named `usb-discovery` worker behind a capacity-one snapshot.
   The final implementation has no discovery worker or path probe to strand: `VolumeMonitor`, its
@@ -1000,15 +1040,16 @@ bounded background operation in `ui/source_connect.rs`, where the original symli
   metadata probing, directory enumeration, and tag parsing never occur in monitor callbacks.
 - [x] Use native platform mount/volume APIs and reconcile live hotplug/unplug updates. One
   window-owned controller takes an initial `VolumeMonitor::mounts()` snapshot, then coalesces
-  mount-added and mount-changed signals onto an idle reconciliation pass. Mount-removed retires and
-  removes the matching tracked path synchronously before scheduling that pass, so remove/re-add at
-  the same key and path cannot be coalesced into a false no-op. Mount-pre-unmount invalidates a
-  matching scan, cache, and playback before its namespace disappears, but deliberately retains the
-  row and inventory until removal is confirmed because an unmount can fail. Signal closures hold
-  only a weak controller; window destruction invalidates every device scan generation and
-  disconnects every handler. The Devices header follows the empty/non-empty inventory, rows are
-  inserted deterministically by logical key, and name changes atomically replace the row at the
-  same position.
+  mount-added and mount-changed signals onto an idle reconciliation pass. Mount-pre-unmount and
+  relocation first disconnect the exact registry source, then invalidate its cache, navigation,
+  playback, and row projection before the namespace can disappear. Pre-unmount retains inventory
+  because the operation can fail; a fresh snapshot may reconnect it under a new epoch. Confirmed
+  removal completes retirement and releases the keyed provenance claim before reconciliation, so a
+  remove/re-add at the same logical key and path cannot inherit the old catalogue or media lease.
+  Signal closures hold only a weak controller; window destruction disconnects every claimed source
+  before removing every handler. The Devices header follows the empty/non-empty inventory, rows are
+  inserted deterministically by logical inventory key while navigation uses the stable source ID,
+  and name changes replace the presentation without changing either identity.
 
   The best available logical key is kept separate from the current native `PathBuf`. The priority
   is opaque mount UUID, volume UUID, Unix device identifier, then root URI. Shadowed and pathless
@@ -1027,35 +1068,36 @@ bounded background operation in `ui/source_connect.rs`, where the original symli
   aliases; and distinguish root-URI fallbacks. Pure inventory tests cover idempotence, add/rename/
   remove ordering, active removal/relocation, confirmed remove followed by same-path reattach,
   cancelled pre-unmount retention, and exact-generation reactivation that yields to later user
-  navigation. There is no longer a pre-publication filesystem liveness probe: GIO removal signals
-  reconcile a stale snapshot, while navigation generations prevent its retired scan from later
-  caching or rendering.
+  navigation. Registry lifecycle tests additionally prove exact accepted publication, reconnect
+  epoch replacement, stale lease rejection, queued-scan cancellation without a false failure, and
+  shutdown joining. There is no pre-publication filesystem liveness probe on GTK: GIO inventory
+  drives claims while the registry rejects a retired constructor or catalogue before publication.
 - [ ] Record implementation and manual validation: symlink containment landed in commit `1886847`;
-  PR #92 supplied the nonblocking one-shot bridge; PR #93 supplies the native monitor and live
-  hotplug lifecycle. The final working tree passes `cargo check` and strict all-target Clippy in
-  debug and release. Both profiles pass 18 library plus 557 application tests (575 each).
-  Formatting, `git diff --check`, AppStream validation, and `cargo audit` also pass; the audit
-  reports exactly the two already
-  accepted unmaintained warnings. Twenty-six focused P2.4 tests cover traversal, native policy,
-  source identity/path ownership, invalidation, bounded scanning, and lifecycle reconciliation. A
-  live add, rename/change, relocation, active pre-unmount, and removal pass with real removable
-  hardware is still required before this record can close. P2.5 now supplies the Flatpak
-  permission/portal policy, but its installed-sandbox smoke pass also remains open.
+  PR #92 supplied the nonblocking bridge; PR #93 supplied the native monitor and live hotplug
+  lifecycle; and the current PR (#TBD) supplies registry-owned scanning, pathless epoch-bound
+  catalogue/queue identity, retained mounted-root/file authority, exact membership-gated at-use
+  playback and artwork, and lifecycle-ordered disconnect/reconnect/removal. The current branch
+  passes locked all-target/all-feature check, strict debug Clippy, formatting, diff checks, focused
+  removable identity/authority/adapter/registry/UI coverage, and the complete 955-test serial debug
+  suite. Release validation was interrupted by temporary workspace disk quota and is not claimed.
+  A live add, rename/change, relocation, active pre-unmount, failed-unmount/reconnect, playback, and
+  confirmed-removal pass with real removable hardware is still required before this record can
+  close. P2.5 supplies the Flatpak permission/portal policy, but its installed-sandbox smoke pass
+  also remains open.
 
 Acceptance criteria for the implemented portion: discovery reads only cached native mount metadata
 on GTK's main thread; add/change/pre-unmount/remove signals keep the sidebar inventory live without
-filesystem work in callbacks; logical identity and native paths remain distinct; removal or
-relocation invalidates pending navigation, track cache, and source-owned playback; an active removed
-source falls back to Local, while an immediately reappearing active logical source is reselected at
-its new path for a fresh scan only if the exact automatic Local fallback remains current. An
-uncached device clears the prior source projection before scanning. Device audio is streamed lazily
-from a named worker through a capacity-64 channel; ownership is polled every 50 ms and after every
-row, closing the receiver when the generation is retired so a blocked producer wakes and stops;
-its select loop uses the receive future directly and does not allocate once per discovered track.
-GTK objects remain main-thread-only and symlinks are not followed. Cancellation is cooperative
-rather than a hard interrupt of an in-progress kernel or tag-parser call. This is not proof of
-unique physical-device identity, automount/eject/MTP support, a nested-filesystem boundary, or
-sandbox-permission implementation; real-hardware validation is still outstanding.
+filesystem work in callbacks; logical identity and native paths remain distinct; and registry
+construction/scanning occurs only on the blocking runtime. Accepted rows and queues contain no host
+path or URI. The adapter retains exact mounted-root/file authority, does not follow links or cross
+the root filesystem, uses deterministic bounded metadata admission, and resolves only accepted
+lossless relative IDs under the exact live epoch and lease. Removal or relocation disconnects that
+authority before invalidating navigation, cache, and source-owned playback; failed unmount can
+reconnect from fresh inventory under a new epoch, while confirmed removal releases provenance. GTK
+objects remain main-thread-only. Cancellation is cooperative rather than a hard interrupt of an
+in-progress kernel or tag-parser call. This is not proof of unique physical-device identity,
+automount/eject/MTP support, or installed-sandbox behavior; physical and Flatpak validation remain
+outstanding.
 
 ### P2.5 Repair Flatpak behavior and local build path
 
@@ -1716,12 +1758,13 @@ closed as a milestone.
   ancestor, and exact-file authority at clone, retains that handle throughout parsing, rewinds the
   shared cursor, and rejects stale generations. Lofty's bounded handle reader and the same-handle
   raw MP4 fallback cap returned art at 32 MiB; the raw fallback additionally caps the complete file
-  at 256 MiB and uses checked atom arithmetic. The direct URI art helper now remains only for
-  removable files until their at-use adapter lands; OS-opened external files use the retained
-  file-capability path for both playback and embedded art.
+  at 256 MiB and uses checked atom arithmetic. OS-opened external and mounted removable files now
+  use their registry-owned retained file-capability paths for both playback and embedded art; the
+  direct URI helper is no longer an authority path for either source kind.
 - [x] Centralize source refresh, cancellation, disconnect, and failure state. The production
   `SourceRegistry` is now the sole adapter/session authority for Subsonic, Jellyfin, Plex, DAAP,
-  Radio-Browser, and admitted OS-opened external files across environment startup, interactive
+  Radio-Browser, admitted OS-opened external files, and mounted removable sources across
+  environment startup, interactive
   authentication, manual Add, discovery, catalogue publication, at-use stream/artwork resolution,
   disconnect, route loss, deletion, and application shutdown. Each entry atomically owns its
   adapter, media lease, non-secret session epoch, exact connect/catalogue/view generations,
@@ -1776,6 +1819,18 @@ closed as a milestone.
   of inserting a dead session. Explicit retirement is idempotent and revokes pending resolution,
   retained playback/artwork authority, and the hidden source exactly once.
 
+  Each accepted removable mount is a provenance-claimed lifecycle source whose deterministic
+  `SourceId` stays separate from the inventory's logical GIO key and current native mount path.
+  Construction acquires retained mounted-root authority on the blocking runtime, walks exact
+  descendants without following links or crossing filesystems, parses bounded metadata through
+  exact file handles, and publishes pathless lossless mount-relative track IDs. Resolution accepts
+  only a member of that exact catalogue under the current epoch and media lease, revalidates root,
+  ancestors, and file, and returns the same typed retained file capability used by playback and
+  embedded art. Pre-unmount and relocation disconnect before UI/playback invalidation; a failed
+  unmount can reconnect from fresh inventory under a new epoch, while confirmed removal releases
+  the claim. Pathless removable rows deliberately omit Properties until a separate typed mutation
+  capability exists.
+
   One atomic lifecycle baseline plus a monotonic invalidation watch now drives a GTK reducer; the
   UI no longer infers lifecycle authority from row spinners, URLs, or channel closure. Exact
   generation-correlated cancellation and closed failure categories clear only their owning intent,
@@ -1801,11 +1856,14 @@ closed as a milestone.
   External-file regressions additionally cover delivery-order and exact admission state,
   identity/epoch/track matching, path replacement after handle admission,
   lease revocation, publication-versus-shutdown races, terminal retirement, hidden-source reducer
-  ownership, same-output reselection, and serialized cursor-based retained-file consumers. The
-  current complete debug and release suites each pass 20 library, 910 application, and 10
-  repository-metadata tests (**940 total**), with locked
-  all-target/all-feature check, strict warning-free Clippy in both profiles, formatting, and diff
-  checks green.
+  ownership, same-output reselection, and serialized cursor-based retained-file consumers.
+  Removable regressions add lossless-ID rejection, root/ancestor/file containment and replacement,
+  exact accepted-catalogue membership, reconnect epoch invalidation, deterministic queued-scan
+  cancellation, shutdown joining, and UI lifecycle ordering. The current complete serial debug
+  suite passes 20 library, 925 application, and 10 repository-metadata tests (**955 total**), with
+  locked all-target/all-feature check, strict warning-free debug Clippy, formatting, and diff checks
+  green. The release suite did not complete because temporary workspace disk quota was exhausted;
+  no release result is claimed.
 - [x] Decide how local, radio, and external-file sources fit the same lifecycle. Local is one
   always-registered source, playlists are local views, Radio-Browser is one stateless source whose
   feeds are views, removable filesystems are generation-owned sources keyed by their existing
@@ -1814,13 +1872,15 @@ closed as a milestone.
   now implemented;
   Radio-Browser now uses its specified registry/view adapter and at-use resolver. OS-opened files
   now use their specified pathless registry adapter, retained file capability, and explicit
-  retirement boundaries. Only the removable-file adapter remains on its transitional direct path.
+  retirement boundaries. Removable filesystems now use the same lifecycle shape with deterministic
+  source identity, pathless epoch-bound catalogues, mounted-root/file authority, and explicit
+  pre-unmount/relocation/removal ordering.
   Recorded in the [source-lifecycle decision](architecture/source-lifecycle.md), accepted in PR
   #113.
 - [x] Record architecture decision: [Source identity and lifecycle ownership](architecture/source-lifecycle.md).
   The document distinguishes accepted decisions, existing foundations, remaining implementation,
   migration, and completion tests. Accepted in PR #113 after the full native/package matrix passed.
-- [ ] Record implementation: P1.6 completed the remote resolver/session ownership subset in PR
+- [x] Record implementation: P1.6 completed the remote resolver/session ownership subset in PR
   #86 and PR #113 closed the architecture boxes. PR #120 completes frozen identity types,
   saved-source migration/quarantine, stable source ownership, exact native IDs,
   `MediaKey`/`ViewOrigin` queues, and radio/removable/external identity. PR #121 closes exact
@@ -1829,11 +1889,16 @@ closed as a milestone.
   cutover makes that authority the sole owner for Subsonic, Jellyfin, Plex, and DAAP and moves GTK
   to pathless epoch-bound catalogue/queue state. PR #125 moves local/playlist embedded-art parsing
   onto cloned, revalidated `ResolvedLocalMedia` authority after output acceptance. PR #126 adds
-  Radio-Browser's registry/view resolver. The current external-file follow-up adds ordered
+  Radio-Browser's registry/view resolver. PR #128 adds ordered
   first-accepted-audio OS-delivery admission, hidden ephemeral registry sessions, exact pathless
   source/track/epoch queue ownership, retained file streams for playback/art, and explicit
-  intent/terminal/output/shutdown retirement. The retained removable-media at-use adapter must still
-  land before P3.1 itself can be recorded complete.
+  intent/terminal/output/shutdown retirement. The current PR (#TBD) completes the record with a
+  registry-owned removable adapter, deterministic source claim, lossless pathless relative track
+  IDs, retained mounted-root and exact-file authority, no-follow/same-filesystem traversal, exact
+  accepted-catalogue membership, epoch/lease-gated playback and art, and disconnect-first
+  pre-unmount/relocation/removal lifecycle. P3.1 is complete; Properties remains deliberately
+  unavailable for pathless removable rows until a typed mutation authority is designed, and the
+  separate physical-hardware validation item remains open under P2.4.
 
 ### P3.2 Make the backend abstraction real and stable
 
@@ -2114,7 +2179,38 @@ PR #94's containerized Flatpak build proved the manifest-local source generation
 policy, but a local installed interactive portal/physical-media smoke pass remains outstanding,
 as does the deliberately deferred live release-workflow run.
 
-Current branch validation (2026-07-18, P3.1 external-file at-use adapter):
+Current branch validation (2026-07-18, P3.1 removable-media lifecycle/at-use adapter):
+`cargo fmt --all -- --check`, `git diff --check`,
+`cargo check --locked --all-targets --all-features`, and strict warning-free
+`cargo clippy --locked --all-targets --all-features -- -D warnings` pass. The complete serial
+locked debug suite passes 20 library, 925 application, and 10 repository-metadata tests
+(**955 total**) with zero failures or ignored tests. Focused coverage includes 21 mounted-root
+authority tests, 21 removable-filtered identity/UI/registry tests, five adapter tests, and four
+registry lifecycle integrations. It proves lossless native relative-ID round trips and malformed-ID
+rejection; root, ancestor, symlink, filesystem-boundary, file-replacement, and exact-membership
+containment; pathless accepted catalogues; stale lease/epoch rejection; reconnect under a new epoch;
+deterministic queued-scan disconnect cancellation; shutdown joining; and disconnect-before-cache,
+navigation, playback, and row invalidation. The release suite did not complete because partial
+release artifacts exhausted the temporary workspace disk quota. That is an environmental
+validation interruption rather than a code-test failure; release validation is not claimed here.
+Windows-only namespace pinning and verified-volume-mount code must additionally compile and run in
+native CI because this workspace has only the Linux Rust target installed.
+
+Security review found and fixed two containment gaps plus one Windows policy gap. On Unix, a
+symlink root spelled with a trailing slash or `/.` could otherwise change the no-follow behavior;
+the authority now removes only those semantically redundant native-byte suffixes before opening the
+root. On Windows, traversal temporarily pins the exact root and ancestor namespace without delete
+sharing until the final no-follow file has been retained, preventing an intermediate junction from
+being swapped during path-based descent. A final reparse root is accepted only when the platform
+identifies it as a volume mount point, and directory symlinks are rejected. The short-lived
+ancestor guards are released after the retained final file is secured, preserving ordinary device
+eject behavior.
+
+This closes P3.1's final compound implementation record and advances progress to **220/223
+(98.7%)** overall, **76/79 P2**, and **30/30 P3**. The only remaining in-scope tasks are the three
+manual P2 field validations; the release-workflow run remains deliberately deferred and excluded.
+
+PR #128 validation (2026-07-18, P3.1 external-file at-use adapter):
 `cargo fmt --all -- --check`, `git diff --check`, and
 `cargo check --locked --all-targets --all-features` pass. Strict warning-free
 `cargo clippy --locked --all-targets --all-features -- -D warnings` and its
@@ -2146,9 +2242,9 @@ published or is still UI-owned, preventing hidden external adoption from invalid
 External publication and shutdown now serialize through one gate, preventing a stale ownership-map
 insertion after lifecycle shutdown. Finally, lifecycle resolution attaches the lease internally and
 returns one typed file capability, so registry callers cannot separate raw adapter output from the
-authority that revokes it. This closes only the external-file portion of P3.1's compound final
-record: literal progress remains **219/223 (98.2%)** overall, **76/79 P2**, and **29/30 P3**. Only
-the removable-file at-use adapter remains.
+authority that revokes it. That closed only the external-file portion of P3.1's compound final
+record: literal progress at PR #128 remained **219/223 (98.2%)** overall, **76/79 P2**, and
+**29/30 P3**; the removable-file at-use adapter still remained at that point.
 
 PR #126 validation (2026-07-18, P3.1 Radio-Browser registry/view adapter):
 `cargo check --locked --all-targets --all-features`, strict all-target/all-feature Clippy in debug
@@ -3406,3 +3502,4 @@ Add one line per completed task:
 | 2026-07-18 | P3.1 Radio-Browser registry/view and public at-use authority (partial) | PR #126 | Generalizes `SourceRegistry` and installs one stateless built-in Radio-Browser session whose Top Clicked, Top Voted, and Near Me feeds are exact cancellable views. Accepted snapshots expose pathless tracks while validated public locators, per-view leases, and source-wide generations remain private. Playback resolves the greatest accepted contributing generation and rechecks that exact winner through weak registry authority immediately before direct output load; same-view replacement, a newer overlapping view, removal, disconnect, and last-registry-drop all revoke pending requests. The typed client uses a known HTTPS mirror without synchronous DNS, closed redacted failures, deadlines and body caps, validated coordinates/filters/URLs, and success-empty semantics. Near Me preserves partial successful tiers, deduplicates by tier precedence before stable global distance ordering, and GTK owns only translated consent/navigation. Independent review fixed an unrelated-invalidation race during first-use consent with an exact generation-owned prerequisite marker, then ensured automatic source loss restores Local's configured music-column and browser presentation; automated PR review cached one distance per accepted station instead of repeating Haversine/centroid work in every sort comparison. Locked all-target check, strict debug/release Clippy, formatting/diff checks, 53 lifecycle tests, 14 registry tests, 9 media tests, 37 radio-filtered tests, and complete 925-test debug/release suites pass. Removable and external-file at-use adapters keep the compound record open at 219/223 overall and 29/30 P3. |
 | 2026-07-18 | P2.11 typed Windows PE-target repair | PR #127 | Removes the non-terminal array boundary by assembling explicit `List[string]` values for the Soup singleton, closure rounds, and bounded inspector batches. Per-target validation distinguishes null/empty, quote/control, rooted, normalization, extension, and existence failures. Its bounded single-line diagnostic retains at most 192 sanitized target characters plus a fixed truncation marker. The nonexecuting architecture-local inspector and every existing resource bound remain intact. AST parsing, formatting/diff, locked check, strict debug/release Clippy, 14 `windows_*` tests, three `powershell_*` tests, and complete 926-test debug/release profiles pass. CI run `29648906031` passed native x86_64 and ARM64 packages/probes, including the x86_64 Desktop PowerShell 5.1 behavior regression. The exact affected-host PowerShell/MSYS2 rerun remains pending, so this merged repair leaves progress at 219/223 overall and 76/79 P2. |
 | 2026-07-18 | P3.1 external-file at-use adapter (partial) | PR #128 | Replaces OS-open direct-URI playback with ordered first-accepted-audio admission into hidden, ephemeral registry sources. Exact-handle parsing and bounded metadata validation precede random source/track identity; accepted tracks and queues are pathless and bind the exact session epoch. One inseparable lease-bearing file capability drives output loading and post-acceptance embedded art, with pre/post-file-handle-clone revocation checks and no path/URI diagnostics. Native non-UTF-8 leaf names use a bounded lossy parser/presentation hint without replacing handle authority. Newer OS deliveries, explicit playback intents including scrubber seek, Stop, real output transfer, and shutdown reject stale admission; queue replacement, unrepeated EOS, player/load error, output transfer, and shutdown retire the exact source idempotently while same-output reselection is inert. Automatic EOS replay/advance deliberately does not invalidate in-flight admission. Independent review tightened the admission-gate predicate, hidden UI-owner filter, shutdown/publication serialization, and nonseparable resolver lease boundary, and verified sequential invalid-candidate handling plus the post-accept art handoff. Automated review simplified optional-extension validation; shared parser defaults already admit missing artist/album tags, position-independent proxy reads isolate playback from artwork seek, and a per-capability mutex plus deterministic regression serializes overlapping cursor-based parsers. Formatting/diff, locked check, strict debug/release Clippy, and serial complete 940-test debug/release suites pass. Only the removable adapter keeps P3.1's final record open, so progress remains 219/223 overall and 29/30 P3. |
+| 2026-07-18 | P3.1 removable-media lifecycle/at-use adapter (completion) | PR #TBD | Completes P3.1 by claiming each eligible mount's deterministic source identity into `SourceRegistry`, scanning beneath retained mounted-root authority on the blocking runtime, and publishing only pathless lossless relative track IDs under an exact session epoch. Deterministic no-follow, same-filesystem traversal parses bounded metadata through exact file handles; at-use resolution rejects malformed or unlisted IDs and rechecks the live epoch and lease before returning one retained file capability for playback and embedded art. Pre-unmount, relocation, confirmed removal, replacement, and shutdown disconnect authority before UI/playback invalidation; failed unmount reconnects from fresh inventory under a new epoch, and confirmed removal releases provenance. Pathless removable rows omit Properties until typed mutation authority exists. Security review hardened Unix trailing-slash/`/.` no-follow roots and Windows intermediate-junction races by pinning the root/ancestor namespace, rejecting directory symlinks, and following a final reparse root only when Windows verifies a volume mount point. Locked check, strict debug Clippy, formatting/diff checks, focused authority/adapter/registry/UI coverage, and the complete 955-test serial debug suite pass. Release validation was interrupted by temporary workspace disk quota and is not claimed. This closes P3 at 30/30 and advances total progress to 220/223 (98.7%); only three manual P2 validation records remain. |

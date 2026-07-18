@@ -6,8 +6,9 @@
 //! provenance, accepted snapshots, and generation-scoped operations. Every
 //! constructed adapter enters exactly-once retirement even when cancelled or
 //! stale, and shutdown joins all tracked construction/refresh/close work.
-//! The ephemeral external-file adapter also uses this authority; built-in
-//! local and removable adapters remain outside the production cutover for now.
+//! Ephemeral external-file and mounted removable adapters also use this
+//! authority. The built-in local engine keeps its specialized scan lifecycle
+//! while sharing the retained typed-file consumption boundary.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;

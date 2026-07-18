@@ -1,17 +1,20 @@
 //! Native removable-volume monitoring and sidebar reconciliation.
 //!
 //! `gio::VolumeMonitor` and every object it returns stay on GTK's main
-//! thread. The monitor supplies cached mount metadata only; filesystem walks
-//! and tag parsing remain in `source_connect`'s bounded worker handoff.
+//! thread. The monitor supplies cached mount metadata and lifecycle intent;
+//! the source registry owns cancellable filesystem walks, tag parsing,
+//! accepted catalogues, at-use file authority, and retirement.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
 use gtk::prelude::*;
 use gtk::{gio, glib};
 
+use crate::architecture::SourceId;
 use crate::device::DeviceInfo;
+use crate::source_lifecycle::SourceProvenance;
 
 use super::objects::SourceObject;
 use super::source_navigation::{SourceNavigation, SourceRequest};
@@ -51,8 +54,32 @@ fn pending_reactivation_key(
 fn inventory(devices: Vec<DeviceInfo>) -> BTreeMap<String, DeviceInfo> {
     devices
         .into_iter()
-        .map(|device| (device.source_key.clone(), device))
+        .filter_map(|device| {
+            removable_ui_key(&device.source_key).map(|_| (device.source_key.clone(), device))
+        })
         .collect()
+}
+
+fn removable_source_id(source_key: &str) -> Option<SourceId> {
+    SourceId::removable(source_key).ok()
+}
+
+fn removable_ui_key(source_key: &str) -> Option<String> {
+    removable_source_id(source_key).map(|source_id| source_id.to_string())
+}
+
+fn planned_reconnections(
+    pending: &HashSet<String>,
+    next: &BTreeMap<String, DeviceInfo>,
+    replaced: &[String],
+) -> Vec<String> {
+    let mut keys: Vec<_> = pending
+        .iter()
+        .filter(|key| next.contains_key(*key) && !replaced.contains(*key))
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
 }
 
 fn device_keys_at_mount_point(
@@ -93,7 +120,7 @@ fn plan_reconciliation(
             Some(new) if old.mount_point != new.mount_point => {
                 plan.retired_keys.push(key.clone());
                 plan.upserts.push(new.clone());
-                if key == active_source_key {
+                if removable_ui_key(key).as_deref() == Some(active_source_key) {
                     plan.reactivate_key = Some(key.clone());
                 }
             }
@@ -118,6 +145,7 @@ struct RemovableMediaController {
     stopped: Cell<bool>,
     reconcile_scheduled: Cell<bool>,
     devices: RefCell<BTreeMap<String, DeviceInfo>>,
+    pending_reconnect: RefCell<HashSet<String>>,
     pending_reactivation: RefCell<Option<PendingReactivation>>,
     devices_heading: String,
     device_fallback_name: String,
@@ -126,6 +154,8 @@ struct RemovableMediaController {
     source_tracks: Rc<RefCell<std::collections::HashMap<String, Vec<super::objects::TrackObject>>>>,
     active_source_key: Rc<RefCell<String>>,
     source_navigation: Rc<RefCell<SourceNavigation>>,
+    source_registry: crate::source_registry::SourceRegistry,
+    source_provenance: crate::source_registry::ProvenanceClaims,
     invalidate_source_playback: SourcePlaybackInvalidator,
 }
 
@@ -141,6 +171,7 @@ impl RemovableMediaController {
             stopped: Cell::new(false),
             reconcile_scheduled: Cell::new(false),
             devices: RefCell::new(BTreeMap::new()),
+            pending_reconnect: RefCell::new(HashSet::new()),
             pending_reactivation: RefCell::new(None),
             devices_heading: rust_i18n::t!("sidebar.devices").into_owned(),
             device_fallback_name: rust_i18n::t!("sidebar.usb_device").into_owned(),
@@ -149,6 +180,8 @@ impl RemovableMediaController {
             source_tracks: state.source_tracks.clone(),
             active_source_key: state.active_source_key.clone(),
             source_navigation: state.source_navigation.clone(),
+            source_registry: state.source_registry.clone(),
+            source_provenance: state.remote_provenance.clone(),
             invalidate_source_playback,
         })
     }
@@ -222,17 +255,31 @@ impl RemovableMediaController {
         }
 
         let next = inventory(crate::device::usb::mounted_devices(&self.monitor));
+        let current = self.devices.borrow().clone();
         let active = self.active_source_key.borrow().clone();
-        let plan = plan_reconciliation(&self.devices.borrow(), &next, &active);
+        let plan = plan_reconciliation(&current, &next, &active);
+        let reconnect_keys =
+            planned_reconnections(&self.pending_reconnect.borrow(), &next, &plan.retired_keys);
         let pending_reactivation = self.pending_reactivation.borrow_mut().take();
 
-        let _ = self.retire_sources(&plan.retired_keys);
+        let _ = self.retire_sources(&plan.retired_keys, false);
 
         for key in &plan.removed_keys {
+            self.release_source_claim(key);
             self.remove_device_row(key);
         }
         for device in &plan.upserts {
+            let needs_connection = !current.contains_key(&device.source_key)
+                || plan.retired_keys.contains(&device.source_key);
+            if needs_connection {
+                self.connect_source(device);
+            }
             self.upsert_device_row(device);
+        }
+        for key in reconnect_keys {
+            if let Some(device) = next.get(&key) {
+                self.connect_source(device);
+            }
         }
         self.sync_device_header(!next.is_empty());
         *self.devices.borrow_mut() = next;
@@ -247,14 +294,21 @@ impl RemovableMediaController {
         }
     }
 
-    fn pre_unmount(&self, mount_point: &std::path::Path) {
+    fn pre_unmount(self: &Rc<Self>, mount_point: &std::path::Path) {
         if self.stopped.get() {
             return;
         }
         let keys = device_keys_at_mount_point(&self.devices.borrow(), mount_point);
-        if let Some(pending) = self.retire_sources(&keys) {
+        self.pending_reconnect
+            .borrow_mut()
+            .extend(keys.iter().cloned());
+        if let Some(pending) = self.retire_sources(&keys, false) {
             *self.pending_reactivation.borrow_mut() = Some(pending);
         }
+        // A pre-unmount notification is advisory and the unmount may fail.
+        // Only a fresh mounted-device snapshot may create the replacement
+        // epoch; a confirmed removal clears the pending reconnect first.
+        self.schedule_reconciliation();
     }
 
     fn mount_removed(&self, mount_point: &std::path::Path) {
@@ -263,7 +317,7 @@ impl RemovableMediaController {
         }
 
         let keys = remove_devices_at_mount_point(&mut self.devices.borrow_mut(), mount_point);
-        if let Some(pending) = self.retire_sources(&keys) {
+        if let Some(pending) = self.retire_sources(&keys, true) {
             *self.pending_reactivation.borrow_mut() = Some(pending);
         }
         for key in &keys {
@@ -272,16 +326,24 @@ impl RemovableMediaController {
         self.sync_device_header(!self.devices.borrow().is_empty());
     }
 
-    fn retire_sources(&self, source_keys: &[String]) -> Option<PendingReactivation> {
-        let active_source_key = self.active_source_key.borrow().clone();
-        let mut active_was_retired = false;
+    fn retire_sources(
+        &self,
+        source_keys: &[String],
+        release_claims: bool,
+    ) -> Option<PendingReactivation> {
+        let mut active_logical_key = None;
         for key in source_keys {
-            active_was_retired |= self.retire_source(key);
+            if self.retire_source(key) {
+                active_logical_key = Some(key.clone());
+            }
+            if release_claims {
+                self.release_source_claim(key);
+            }
         }
-        if active_was_retired {
+        if let Some(source_key) = active_logical_key {
             let fallback_request = self.select_local_source();
             Some(PendingReactivation {
-                source_key: active_source_key,
+                source_key,
                 fallback_request,
             })
         } else {
@@ -289,13 +351,63 @@ impl RemovableMediaController {
         }
     }
 
-    fn retire_source(&self, source_key: &str) -> bool {
+    fn retire_source(&self, logical_key: &str) -> bool {
+        let Some(source_id) = removable_source_id(logical_key) else {
+            return false;
+        };
+        let source_key = source_id.to_string();
+
+        // Disconnect synchronously cancels the exact scan, clears accepted
+        // snapshots, and revokes media leases before GTK cache/playback state
+        // can observe the retired namespace.
+        let _ = self.source_registry.disconnect(source_id);
         self.source_navigation
             .borrow_mut()
-            .invalidate_key(source_key);
-        self.source_tracks.borrow_mut().remove(source_key);
-        (self.invalidate_source_playback)(source_key);
+            .invalidate_key(&source_key);
+        self.source_tracks.borrow_mut().remove(&source_key);
+        (self.invalidate_source_playback)(&source_key);
         *self.active_source_key.borrow() == source_key
+    }
+
+    fn connect_source(&self, device: &DeviceInfo) {
+        let Some(source_id) = removable_source_id(&device.source_key) else {
+            return;
+        };
+        if !self.source_provenance.ensure(
+            &self.source_registry,
+            source_id,
+            SourceProvenance::Removable,
+            device.source_key.clone(),
+        ) {
+            return;
+        }
+
+        if self
+            .source_registry
+            .connect_removable(source_id, device.mount_point.clone(), |_| {})
+            .is_some()
+        {
+            self.pending_reconnect
+                .borrow_mut()
+                .remove(&device.source_key);
+        } else {
+            self.pending_reconnect
+                .borrow_mut()
+                .insert(device.source_key.clone());
+        }
+    }
+
+    fn release_source_claim(&self, logical_key: &str) {
+        self.pending_reconnect.borrow_mut().remove(logical_key);
+        let Some(source_id) = removable_source_id(logical_key) else {
+            return;
+        };
+        let _ = self.source_provenance.release(
+            &self.source_registry,
+            source_id,
+            SourceProvenance::Removable,
+            logical_key,
+        );
     }
 
     fn select_local_source(&self) -> SourceRequest {
@@ -413,15 +525,17 @@ impl RemovableMediaController {
         if self.stopped.replace(true) {
             return;
         }
-        // Let any live scan observe lost ownership and close its bounded
-        // receiver if the main context gets another iteration during window
-        // teardown. If it does not, dropping the task closes the receiver.
+        // Stop accepting mount reconciliation before invalidating the
+        // controller-owned navigation and cache state below.
         let keys: Vec<_> = self.devices.borrow().keys().cloned().collect();
         let mut navigation = self.source_navigation.borrow_mut();
         for key in &keys {
-            navigation.invalidate_key(key);
+            if let Some(key) = removable_ui_key(key) {
+                navigation.invalidate_key(&key);
+            }
         }
         drop(navigation);
+        self.pending_reconnect.borrow_mut().clear();
         let _ = self.pending_reactivation.borrow_mut().take();
 
         for handler in self.monitor_handlers.borrow_mut().drain(..) {
@@ -452,14 +566,15 @@ pub(super) fn setup_removable_media(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use std::path::PathBuf;
 
     use crate::device::DeviceInfo;
 
     use super::{
         device_keys_at_mount_point, inventory, pending_reactivation_key, plan_reconciliation,
-        remove_devices_at_mount_point, PendingReactivation, ReconciliationPlan, SourceNavigation,
+        planned_reconnections, removable_ui_key, remove_devices_at_mount_point,
+        PendingReactivation, ReconciliationPlan, SourceNavigation,
     };
 
     fn device(key: &str, name: &str, path: &str) -> DeviceInfo {
@@ -477,6 +592,29 @@ mod tests {
         assert_eq!(
             plan_reconciliation(&current, &current, "local"),
             ReconciliationPlan::default()
+        );
+    }
+
+    #[test]
+    fn removable_navigation_uses_source_identity_not_the_logical_gio_key() {
+        let logical_key = "device:opaque-id";
+        let ui_key = removable_ui_key(logical_key).expect("removable UI key");
+
+        assert_ne!(ui_key, logical_key);
+        assert_eq!(
+            ui_key,
+            crate::architecture::SourceId::removable(logical_key)
+                .expect("source identity")
+                .to_string()
+        );
+
+        let devices = inventory(vec![
+            device("", "Missing identity", "/media/missing"),
+            device(logical_key, "Player", "/media/player"),
+        ]);
+        assert_eq!(
+            devices.keys().cloned().collect::<Vec<_>>(),
+            vec![logical_key.to_string()]
         );
     }
 
@@ -509,9 +647,10 @@ mod tests {
     fn active_relocation_retires_old_state_and_reselects_the_same_identity() {
         let current = inventory(vec![device("device:a", "A", "/media/old")]);
         let next = inventory(vec![device("device:a", "A", "/media/new")]);
+        let active = removable_ui_key("device:a").expect("active UI key");
 
         assert_eq!(
-            plan_reconciliation(&current, &next, "device:a"),
+            plan_reconciliation(&current, &next, &active),
             ReconciliationPlan {
                 retired_keys: vec!["device:a".to_string()],
                 removed_keys: Vec::new(),
@@ -525,9 +664,10 @@ mod tests {
     fn active_removal_falls_back_without_reactivating() {
         let current = inventory(vec![device("device:a", "A", "/media/a")]);
         let next = BTreeMap::new();
+        let active = removable_ui_key("device:a").expect("active UI key");
 
         assert_eq!(
-            plan_reconciliation(&current, &next, "device:a"),
+            plan_reconciliation(&current, &next, &active),
             ReconciliationPlan {
                 retired_keys: vec!["device:a".to_string()],
                 removed_keys: vec!["device:a".to_string()],
@@ -568,10 +708,24 @@ mod tests {
     }
 
     #[test]
+    fn pre_unmount_reconnects_only_from_a_fresh_matching_inventory() {
+        let pending = HashSet::from(["device:a".to_string(), "device:gone".to_string()]);
+        let next = inventory(vec![device("device:a", "A", "/media/a")]);
+
+        assert_eq!(
+            planned_reconnections(&pending, &next, &[]),
+            vec!["device:a".to_string()]
+        );
+        assert!(planned_reconnections(&pending, &next, &["device:a".to_string()]).is_empty());
+        assert!(planned_reconnections(&pending, &BTreeMap::new(), &[]).is_empty());
+    }
+
+    #[test]
     fn immediate_same_identity_reattach_restores_only_the_untouched_fallback() {
         let mut navigation = SourceNavigation::new("local");
-        navigation.select("device:a");
-        navigation.invalidate_key("device:a");
+        let device_ui_key = removable_ui_key("device:a").expect("device UI key");
+        navigation.select(device_ui_key.clone());
+        navigation.invalidate_key(&device_ui_key);
         let fallback_request = navigation.select("local");
         let pending = PendingReactivation {
             source_key: "device:a".to_string(),

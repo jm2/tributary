@@ -182,32 +182,78 @@ impl TrackId {
             return Err(IdentityError::Track);
         }
 
+        Self::new(encode_removable_relative_path(&normalized)?)
+    }
+
+    /// Decode this platform's canonical removable-media identity into its
+    /// mount-relative native path.
+    ///
+    /// The result is still only a relative locator. Callers must resolve it
+    /// beneath the exact live mount authority before use. Re-encoding must
+    /// reproduce the identity byte-for-byte, which rejects alternate
+    /// separators, redundant components, and every other non-canonical path
+    /// spelling rather than silently normalizing it.
+    pub(crate) fn removable_relative_path(&self) -> Result<PathBuf, IdentityError> {
         #[cfg(unix)]
-        let value = {
-            use std::os::unix::ffi::OsStrExt;
-            let bytes = normalized.as_os_str().as_bytes();
-            validate_encoded_length("unix:", bytes.len())?;
-            format!("unix:{}", encode_hex(bytes))
+        let decoded = {
+            use std::os::unix::ffi::OsStringExt;
+
+            let payload = self.0.strip_prefix("unix:").ok_or(IdentityError::Track)?;
+            let bytes = decode_hex(payload)?;
+            if bytes.contains(&0) {
+                return Err(IdentityError::Track);
+            }
+            PathBuf::from(std::ffi::OsString::from_vec(bytes))
         };
         #[cfg(windows)]
-        let value = {
-            use std::os::windows::ffi::OsStrExt;
-            let bytes: Vec<u8> = normalized
-                .as_os_str()
-                .encode_wide()
-                .flat_map(u16::to_le_bytes)
+        let decoded = {
+            use std::os::windows::ffi::OsStringExt;
+
+            let payload = self
+                .0
+                .strip_prefix("windows-utf16le:")
+                .ok_or(IdentityError::Track)?;
+            let bytes = decode_hex(payload)?;
+            if !bytes.len().is_multiple_of(2) {
+                return Err(IdentityError::Track);
+            }
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                 .collect();
-            validate_encoded_length("windows-utf16le:", bytes.len())?;
-            format!("windows-utf16le:{}", encode_hex(&bytes))
+            if units.contains(&0) {
+                return Err(IdentityError::Track);
+            }
+            PathBuf::from(std::ffi::OsString::from_wide(&units))
         };
         #[cfg(not(any(unix, windows)))]
-        let value = {
-            let bytes = normalized.to_str().ok_or(IdentityError::Track)?.as_bytes();
-            validate_encoded_length("portable-utf8:", bytes.len())?;
-            format!("portable-utf8:{}", encode_hex(bytes))
+        let decoded = {
+            let payload = self
+                .0
+                .strip_prefix("portable-utf8:")
+                .ok_or(IdentityError::Track)?;
+            let bytes = decode_hex(payload)?;
+            if bytes.contains(&0) {
+                return Err(IdentityError::Track);
+            }
+            PathBuf::from(String::from_utf8(bytes).map_err(|_| IdentityError::Track)?)
         };
 
-        Self::new(value)
+        let mut canonical = PathBuf::new();
+        for component in decoded.components() {
+            match component {
+                Component::Normal(value) => canonical.push(value),
+                Component::CurDir
+                | Component::ParentDir
+                | Component::RootDir
+                | Component::Prefix(_) => return Err(IdentityError::Track),
+            }
+        }
+        if canonical.as_os_str().is_empty() || encode_removable_relative_path(&canonical)? != self.0
+        {
+            return Err(IdentityError::Track);
+        }
+        Ok(canonical)
     }
 
     fn with_bound(value: String, maximum: usize) -> Result<Self, IdentityError> {
@@ -219,6 +265,35 @@ impl TrackId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+fn encode_removable_relative_path(path: &Path) -> Result<String, IdentityError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = path.as_os_str().as_bytes();
+        validate_encoded_length("unix:", bytes.len())?;
+        Ok(format!("unix:{}", encode_hex(bytes)))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        let bytes: Vec<u8> = path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        validate_encoded_length("windows-utf16le:", bytes.len())?;
+        Ok(format!("windows-utf16le:{}", encode_hex(&bytes)))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let bytes = path.to_str().ok_or(IdentityError::Track)?.as_bytes();
+        validate_encoded_length("portable-utf8:", bytes.len())?;
+        Ok(format!("portable-utf8:{}", encode_hex(bytes)))
     }
 }
 
@@ -241,6 +316,29 @@ fn encode_hex(bytes: &[u8]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+fn decode_hex(encoded: &str) -> Result<Vec<u8>, IdentityError> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err(IdentityError::Track);
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = decode_hex_nibble(pair[0])?;
+            let low = decode_hex_nibble(pair[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn decode_hex_nibble(value: u8) -> Result<u8, IdentityError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(IdentityError::Track),
+    }
 }
 
 impl fmt::Debug for TrackId {
@@ -498,6 +596,10 @@ mod tests {
         )
         .expect("second identity");
         assert_eq!(first, second);
+        assert_eq!(
+            first.removable_relative_path().expect("decoded path"),
+            relative
+        );
         assert!(TrackId::removable_relative(
             Path::new("/media/one"),
             Path::new("/outside/Track.flac")
@@ -519,9 +621,56 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let root = Path::new("/media/device");
-        let path = root.join(std::ffi::OsString::from_vec(vec![b'a', 0xff, b'.', b'f']));
+        let native_name = std::ffi::OsString::from_vec(vec![b'a', 0xff, b'.', b'f']);
+        let path = root.join(&native_name);
         let identity = TrackId::removable_relative(root, &path).expect("native identity");
         assert_eq!(identity.as_str(), "unix:61ff2e66");
+        assert_eq!(
+            identity.removable_relative_path().expect("native path"),
+            PathBuf::from(native_name)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removable_path_decoder_rejects_noncanonical_or_unsafe_unix_spelling() {
+        fn identity(bytes: &[u8]) -> TrackId {
+            TrackId::new(format!("unix:{}", encode_hex(bytes))).expect("bounded fixture")
+        }
+
+        for malformed in [
+            "windows-utf16le:6100",
+            "portable-utf8:61",
+            "unix:0",
+            "unix:gg",
+            "unix:AF",
+        ] {
+            assert!(
+                TrackId::new(malformed)
+                    .expect("bounded malformed fixture")
+                    .removable_relative_path()
+                    .is_err(),
+                "{malformed} must fail closed"
+            );
+        }
+
+        for unsafe_path in [
+            b"".as_slice(),
+            b"\0track".as_slice(),
+            b"/track".as_slice(),
+            b".".as_slice(),
+            b"./track".as_slice(),
+            b"artist/./track".as_slice(),
+            b"..".as_slice(),
+            b"artist/../track".as_slice(),
+            b"artist//track".as_slice(),
+            b"artist/track/".as_slice(),
+        ] {
+            assert!(
+                identity(unsafe_path).removable_relative_path().is_err(),
+                "unsafe native path must fail closed"
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -532,8 +681,97 @@ mod tests {
         let root = Path::new(r"C:\media\device");
         let native_name = std::ffi::OsString::from_wide(&[0x0061, 0xd800, 0x002e, 0x0066]);
         let identity =
-            TrackId::removable_relative(root, &root.join(native_name)).expect("native identity");
+            TrackId::removable_relative(root, &root.join(&native_name)).expect("native identity");
         assert_eq!(identity.as_str(), "windows-utf16le:610000d82e006600");
+        assert_eq!(
+            identity.removable_relative_path().expect("native path"),
+            PathBuf::from(native_name)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removable_path_decoder_rejects_noncanonical_or_unsafe_windows_spelling() {
+        fn identity(units: &[u16]) -> TrackId {
+            let bytes: Vec<u8> = units.iter().copied().flat_map(u16::to_le_bytes).collect();
+            TrackId::new(format!("windows-utf16le:{}", encode_hex(&bytes)))
+                .expect("bounded fixture")
+        }
+
+        fn path(value: &str) -> TrackId {
+            identity(&value.encode_utf16().collect::<Vec<_>>())
+        }
+
+        for malformed in [
+            "unix:61",
+            "portable-utf8:61",
+            "windows-utf16le:0",
+            "windows-utf16le:00",
+            "windows-utf16le:000",
+            "windows-utf16le:gg00",
+            "windows-utf16le:AF00",
+        ] {
+            assert!(
+                TrackId::new(malformed)
+                    .expect("bounded malformed fixture")
+                    .removable_relative_path()
+                    .is_err(),
+                "{malformed} must fail closed"
+            );
+        }
+
+        assert!(identity(&[]).removable_relative_path().is_err());
+        assert!(identity(&[0, b'a' as u16])
+            .removable_relative_path()
+            .is_err());
+        for unsafe_path in [
+            r"\track",
+            r"C:\track",
+            r"C:track",
+            ".",
+            r".\track",
+            r"artist\.\track",
+            "..",
+            r"artist\..\track",
+            r"artist\\track",
+            r"artist\track\",
+            "artist/track",
+        ] {
+            assert!(
+                path(unsafe_path).removable_relative_path().is_err(),
+                "{unsafe_path} must fail closed"
+            );
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    #[test]
+    fn removable_path_decoder_rejects_noncanonical_or_unsafe_portable_spelling() {
+        fn identity(value: &str) -> TrackId {
+            TrackId::new(format!("portable-utf8:{}", encode_hex(value.as_bytes())))
+                .expect("bounded fixture")
+        }
+
+        for malformed in ["unix:61", "windows-utf16le:6100", "portable-utf8:0"] {
+            assert!(TrackId::new(malformed)
+                .expect("bounded malformed fixture")
+                .removable_relative_path()
+                .is_err());
+        }
+        for unsafe_path in [
+            "",
+            "\0track",
+            "/track",
+            ".",
+            "./track",
+            "artist/./track",
+            "..",
+            "artist/../track",
+            "artist//track",
+            "artist/track/",
+        ] {
+            assert!(identity(unsafe_path).removable_relative_path().is_err());
+        }
     }
 
     #[test]

@@ -16,6 +16,7 @@ use thiserror::Error;
 use crate::architecture::media::MediaLease;
 use crate::db::entities::{library_root, track};
 
+pub use super::root_authority::MountedRootAuthority;
 use super::root_authority::{BoundFile, RootAuthorityLease};
 
 /// A dead or remote filesystem must not leave GTK waiting indefinitely for a
@@ -55,6 +56,10 @@ enum RetainedFileAuthority {
         authority: Arc<RootAuthorityLease>,
         file: BoundFile,
         path: PathBuf,
+    },
+    Mounted {
+        authority: Arc<MountedRootAuthority>,
+        file: BoundFile,
     },
     OpenFile(File),
 }
@@ -104,10 +109,11 @@ impl ExpectedRootAuthorityState {
 /// Exact file authority retained for one resolved media use.
 ///
 /// Local instances share the same root, marker, ancestor, and file handles;
-/// external instances share the exact already-open file object. Outputs,
-/// their receiver-facing ticket servers, and the in-process embedded-art
-/// reader keep a clone until their exact consumption finishes. No consumer
-/// reopens a pathname.
+/// mounted instances share their exact marker-free mount-root and descendant
+/// handles; external instances share the exact already-open file object.
+/// Outputs, their receiver-facing ticket servers, and the in-process
+/// embedded-art reader keep a clone until their exact consumption finishes.
+/// No consumer reopens a pathname.
 #[derive(Clone)]
 pub struct ResolvedLocalMedia {
     inner: Arc<ResolvedLocalMediaInner>,
@@ -134,6 +140,9 @@ impl ResolvedLocalMedia {
             RetainedFileAuthority::Local {
                 authority, file, ..
             } => file.try_clone_for_consumption(authority)?,
+            RetainedFileAuthority::Mounted { authority, file } => {
+                file.try_clone_for_mounted_consumption(authority)?
+            }
             RetainedFileAuthority::OpenFile(file) => {
                 let cloned = file.try_clone()?;
                 if !cloned.metadata()?.is_file() {
@@ -208,6 +217,28 @@ impl ResolvedLocalMedia {
         Ok(Self {
             inner: Arc::new(ResolvedLocalMediaInner {
                 authority: RetainedFileAuthority::OpenFile(file),
+                extension,
+                seek_consumers: Mutex::new(()),
+            }),
+            lease: None,
+        })
+    }
+
+    /// Resolve one native relative path beneath an exact retained mount root.
+    ///
+    /// The path is consumed only inside the retained filesystem authority and
+    /// is never exposed as a playable locator. Every later handle clone
+    /// revalidates the mounted root, its filesystem boundary, ancestor chain,
+    /// exact file object, and optional lifecycle lease.
+    pub(crate) fn from_mounted_relative_path(
+        authority: Arc<MountedRootAuthority>,
+        relative_path: &std::path::Path,
+        extension: Option<String>,
+    ) -> std::io::Result<Self> {
+        let file = authority.open_relative_regular_file(relative_path)?;
+        Ok(Self {
+            inner: Arc::new(ResolvedLocalMediaInner {
+                authority: RetainedFileAuthority::Mounted { authority, file },
                 extension,
                 seek_consumers: Mutex::new(()),
             }),
@@ -461,7 +492,9 @@ mod tests {
     fn local_media_path(media: &ResolvedLocalMedia) -> &Path {
         match &media.inner.authority {
             RetainedFileAuthority::Local { path, .. } => path,
-            RetainedFileAuthority::OpenFile(_) => panic!("fixture expected local authority"),
+            RetainedFileAuthority::Mounted { .. } | RetainedFileAuthority::OpenFile(_) => {
+                panic!("fixture expected local authority")
+            }
         }
     }
 
@@ -508,6 +541,64 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("second consumer entered after release");
         second.join().expect("join second consumer");
+    }
+
+    #[test]
+    fn mounted_media_retains_the_exact_file_and_observes_lease_revocation() {
+        let directory = tempfile::tempdir().expect("mounted media directory");
+        let path = directory.path().join("song.flac");
+        let displaced = directory.path().join("original.flac");
+        std::fs::write(&path, b"mounted original").expect("write mounted media");
+        let authority = Arc::new(
+            MountedRootAuthority::acquire(directory.path()).expect("acquire mounted authority"),
+        );
+        let media = ResolvedLocalMedia::from_mounted_relative_path(
+            authority,
+            Path::new("song.flac"),
+            Some("flac".to_string()),
+        )
+        .expect("resolve mounted media");
+        assert_eq!(media.extension(), Some("flac"));
+        assert!(!media.matches_current_configuration(&configured(directory.path())));
+
+        std::fs::rename(&path, &displaced).expect("displace mounted media");
+        std::fs::write(&path, b"mounted replacement").expect("replace mounted media");
+        assert_eq!(read_media(&media), b"mounted original");
+
+        let lease = MediaLease::new();
+        let leased = media.with_lease(lease.clone());
+        assert_eq!(read_media(&leased), b"mounted original");
+        lease.revoke();
+        assert!(leased.try_clone_file().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mounted_media_fails_closed_after_root_replacement() {
+        let directory = tempfile::tempdir().expect("mounted media directory");
+        let replacement = tempfile::tempdir().expect("replacement mounted directory");
+        std::fs::write(directory.path().join("song.flac"), b"mounted original")
+            .expect("write mounted media");
+        std::fs::write(replacement.path().join("song.flac"), b"replacement")
+            .expect("write replacement media");
+        let authority = Arc::new(
+            MountedRootAuthority::acquire(directory.path()).expect("acquire mounted authority"),
+        );
+        let media = ResolvedLocalMedia::from_mounted_relative_path(
+            authority,
+            Path::new("song.flac"),
+            Some("flac".to_string()),
+        )
+        .expect("resolve mounted media");
+        let displaced = directory.path().with_extension("displaced");
+        std::fs::rename(directory.path(), &displaced).expect("displace mounted root");
+        std::fs::rename(replacement.path(), directory.path()).expect("install replacement root");
+
+        assert!(media.try_clone_file().is_err());
+
+        drop(media);
+        std::fs::rename(directory.path(), replacement.path()).expect("restore replacement root");
+        std::fs::rename(&displaced, directory.path()).expect("restore mounted root");
     }
 
     #[test]

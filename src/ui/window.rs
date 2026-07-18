@@ -441,6 +441,7 @@ fn remote_backend_label(source: Option<&SourceObject>) -> &'static str {
         Some("jellyfin") => "Jellyfin",
         Some("plex") => "Plex",
         Some("daap") => "DAAP",
+        Some("usb-device") => "Removable media",
         _ => "Remote",
     }
 }
@@ -727,6 +728,21 @@ fn selected_radio_projection_owns_status(
     super::radio::is_radio_backend(active_source_key) && navigation.is_key(active_source_key)
 }
 
+fn source_connect_failure_owns_status(
+    source_id: crate::architecture::SourceId,
+    removable: bool,
+    active_source_key: &str,
+    navigation: &SourceNavigation,
+    radio_failure_was_selected: bool,
+) -> bool {
+    if removable {
+        let source_key = source_id.to_string();
+        return active_source_key == source_key && navigation.is_key(&source_key);
+    }
+
+    source_id != crate::architecture::SourceId::radio_browser() || radio_failure_was_selected
+}
+
 fn current_near_me_prerequisite(
     active_source_key: &str,
     navigation: &SourceNavigation,
@@ -861,13 +877,22 @@ fn reconcile_source_baseline(
         if let Some(failure) = connect_failure {
             let identity = (failure.correlation.generation, failure.failure.category());
             if reducer.seen_failures.get(&source_id) != Some(&identity) {
+                let removable = snapshot
+                    .provenance
+                    .contains(crate::source_lifecycle::SourceProvenance::Removable);
+                let show_status = source_connect_failure_owns_status(
+                    source_id,
+                    removable,
+                    &context.active_source_key.borrow(),
+                    &context.source_navigation.borrow(),
+                    radio_failure_was_selected,
+                );
                 reconcile_remote_failure(
                     context,
                     source_id,
                     failure.correlation.generation,
                     failure.failure.category(),
-                    source_id != crate::architecture::SourceId::radio_browser()
-                        || radio_failure_was_selected,
+                    show_status,
                 );
                 reducer.seen_failures.insert(source_id, identity);
             }
@@ -1820,8 +1845,8 @@ pub fn build_window(
     info!("Main window presented");
 
     // GVolumeMonitor must stay on the GTK main thread. Its cached mount
-    // metadata drives an idempotent sidebar reconciliation, while selecting a
-    // device still performs filesystem walking/tag parsing on a bounded worker.
+    // metadata drives idempotent lifecycle reconciliation; each eligible mount
+    // starts its registry-owned walk/tag parse on a bounded blocking worker.
     super::removable_media::setup_removable_media(
         &source_connection_state,
         invalidate_source_playback.clone(),
@@ -4165,6 +4190,36 @@ mod identity_tests {
         assert!(!selected_radio_projection_owns_status(
             super::super::radio::TOP_CLICK_SOURCE_KEY,
             &superseded,
+        ));
+    }
+
+    #[test]
+    fn only_the_selected_exact_removable_source_may_surface_a_scan_failure() {
+        let source_id = crate::architecture::SourceId::removable("test:failure-owner")
+            .expect("removable identity");
+        let source_key = source_id.to_string();
+
+        let local = SourceNavigation::new("local");
+        assert!(!source_connect_failure_owns_status(
+            source_id, true, "local", &local, false,
+        ));
+
+        let selected = SourceNavigation::new(source_key.clone());
+        assert!(source_connect_failure_owns_status(
+            source_id,
+            true,
+            &source_key,
+            &selected,
+            false,
+        ));
+
+        let superseded = SourceNavigation::new("local");
+        assert!(!source_connect_failure_owns_status(
+            source_id,
+            true,
+            &source_key,
+            &superseded,
+            false,
         ));
     }
 
