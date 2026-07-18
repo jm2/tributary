@@ -27,10 +27,16 @@ retains its stateful session and performs explicit logout. Source navigation rej
 asynchronous publications. Local renames preserve database track IDs, and removable scans are
 generation-owned and cancelled on relocation or removal.
 
-This decision defines how those foundations converge. Identity migration is implemented, but the
-single lifecycle boundary and retained local file authority are not. The decision also does not
-make the current `MediaBackend` trait the integration seam; that separate work remains
-[P3.2](../task.md#p32-make-the-backend-abstraction-real-and-stable).
+This decision defines how those foundations converge; it does **not** claim that its broader
+source/session lifecycle is implemented. PR #120 implements the stable-identity migration, but the
+single lifecycle boundary and retained local file authority remain open. When this decision was
+recorded, `MediaBackend` was not an integration seam at all. P3.2 has since completed its bounded
+backend-abstraction scope: scanner snapshots construct `LocalBackend`, and all five shipping
+backends publish complete track catalogues through one `&dyn MediaBackend` adapter.
+Authentication, registry/session lifecycle, refresh/failure ownership, and some browsing paths
+still use concrete backend-specific integration, so this decision does not claim the broader
+convergence complete. That remaining work stays tracked under
+[P3.1](../task.md#p31-introduce-a-sourcesession-registry).
 
 ## Decision
 
@@ -166,8 +172,8 @@ different logical server.
 
 One application-owned registry is authoritative for every `SourceId`. It stores a deliberate
 `SourceSession`/resolver abstraction, not necessarily `Arc<dyn MediaBackend>`. That distinction
-allows local, radio, removable, and external-file adapters to participate before P3.2 finishes the
-browsing trait.
+allows local, radio, removable, and external-file adapters to participate without forcing every
+source lifecycle through `MediaBackend`; P3.2's bounded complete-catalogue seam is already complete.
 
 The externally visible state machine is:
 

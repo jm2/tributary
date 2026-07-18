@@ -388,6 +388,36 @@ impl PlaybackSession {
         self.event_generation
     }
 
+    /// Hand the current direct item to an output under a fresh event owner.
+    ///
+    /// This is the production boundary shared by initial playback, queue
+    /// navigation, EOS replay, and a retry after synchronous rejection. The
+    /// queue cursor supplies the URI; callers cannot accidentally load a row
+    /// from the mutable GTK projection instead. A rejected load retains that
+    /// exact item and generation as retryable, while a later attempt advances
+    /// ownership before it calls the output again.
+    pub(super) fn load_current_direct(
+        &mut self,
+        output: &dyn AudioOutput,
+    ) -> Option<DirectLoadAttempt> {
+        let uri = self.current()?.uri.clone();
+        if uri.is_empty() || crate::source_registry::is_media_reference(&uri) {
+            return None;
+        }
+
+        let generation = self.begin_event_generation();
+        output.set_event_generation(generation);
+        let accepted = output.load_uri(&uri);
+        if !accepted {
+            let marked = self.mark_load_rejected(generation);
+            debug_assert!(marked, "current direct load remains retryable");
+        }
+        Some(DirectLoadAttempt {
+            generation,
+            accepted,
+        })
+    }
+
     fn begin_pending_resolution(&mut self) -> PlayerEventGeneration {
         let generation = self.begin_event_generation();
         self.pending_resolution = Some(generation);
@@ -601,6 +631,66 @@ impl PlaybackSession {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DirectLoadAttempt {
+    pub(super) generation: PlayerEventGeneration,
+    pub(super) accepted: bool,
+}
+
+#[derive(Debug)]
+struct CapturedQueue {
+    items: Vec<QueueItem>,
+    selected_index: usize,
+}
+
+/// Capture the current sorted/filtered projection as a playback-owned queue.
+///
+/// All entry points that start playback from the track list go through this
+/// function. Once returned, the queue has no dependency on the mutable GTK
+/// model: sorting, filtering, rebuilding, or navigating to another source can
+/// no longer change the current identity or the meaning of Next/Previous.
+fn capture_visible_queue(
+    model: &impl IsA<gtk::gio::ListModel>,
+    source_key: &str,
+    selected_position: u32,
+) -> Option<CapturedQueue> {
+    let view = queue_view(source_key)?;
+    let mut selected_index = None;
+    let mut items = Vec::with_capacity(model.n_items() as usize);
+    let mut occurrences: HashMap<MediaKey, usize> = HashMap::new();
+
+    for model_index in 0..model.n_items() {
+        let Some(track) = model.item(model_index).and_downcast::<TrackObject>() else {
+            continue;
+        };
+        let Ok(track_id) = TrackId::new(track.track_id()) else {
+            continue;
+        };
+        if model_index == selected_position {
+            selected_index = Some(items.len());
+        }
+        let identity = PlaybackIdentity::new(&view, track_id);
+        let occurrence = occurrences.entry(identity.media_key.clone()).or_default();
+        items.push(QueueItem::from_track(identity, &track, *occurrence));
+        *occurrence += 1;
+    }
+
+    Some(CapturedQueue {
+        items,
+        selected_index: selected_index?,
+    })
+}
+
+/// Retire queue/event ownership before asking the active output to stop.
+///
+/// Both the explicit Stop control and output replacement use this ordering, so
+/// a backend that publishes `Stopped` synchronously cannot mutate the cleared
+/// or replacement session.
+pub(super) fn stop_owned_playback(session: &mut PlaybackSession, output: &dyn AudioOutput) {
+    session.clear();
+    output.stop();
+}
+
 /// Debounce state for the play-button buffering spinner.
 ///
 /// A reset or newer player state increments the token. Timeout callbacks keep
@@ -694,36 +784,11 @@ fn resolve_session_play_request(
 /// starts the selected item. Later view mutations do not alter that queue.
 pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     let source_key = ctx.active_source_key.borrow().clone();
-    let Some(view) = queue_view(&source_key) else {
-        warn!("Active source has no valid media identity");
+    let Some(captured) = capture_visible_queue(&ctx.model, &source_key, position) else {
         return false;
     };
-    let mut selected_index = None;
-    let mut queue = Vec::with_capacity(ctx.model.n_items() as usize);
-    let mut occurrences: HashMap<MediaKey, usize> = HashMap::new();
-
-    for model_index in 0..ctx.model.n_items() {
-        let Some(track) = ctx.model.item(model_index).and_downcast::<TrackObject>() else {
-            continue;
-        };
-        let Ok(track_id) = TrackId::new(track.track_id()) else {
-            continue;
-        };
-        if model_index == position {
-            selected_index = Some(queue.len());
-        }
-        let identity = PlaybackIdentity::new(&view, track_id);
-        let occurrence = occurrences.entry(identity.media_key.clone()).or_default();
-        queue.push(QueueItem::from_track(identity, &track, *occurrence));
-        *occurrence += 1;
-    }
-
-    let Some(selected_index) = selected_index else {
-        return false;
-    };
-    if queue[selected_index].uri.is_empty()
-        && !is_library_source(queue[selected_index].identity.media_key.source_id)
-    {
+    let selected = &captured.items[captured.selected_index];
+    if selected.uri.is_empty() && !is_library_source(selected.identity.media_key.source_id) {
         warn!("Track has no playable URI");
         return false;
     }
@@ -732,7 +797,7 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     if !ctx
         .session
         .borrow_mut()
-        .replace_queue(queue, selected_index)
+        .replace_queue(captured.items, captured.selected_index)
     {
         return false;
     }
@@ -784,8 +849,8 @@ pub fn toggle_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
 /// Invalidate the session before stopping the output so synchronously emitted
 /// Stopped events are already stale. The caller owns the widget reset.
 pub fn stop_playback(ctx: &PlaybackContext) {
-    ctx.session.borrow_mut().clear();
-    ctx.active_output.borrow().stop();
+    let output = ctx.active_output.borrow();
+    stop_owned_playback(&mut ctx.session.borrow_mut(), output.as_ref());
 }
 
 /// Load the current immutable queue item and refresh now-playing UI.
@@ -925,13 +990,21 @@ fn play_current(ctx: &PlaybackContext) -> bool {
 
     tracing::debug!("Playing track");
 
-    let generation = ctx.session.borrow_mut().begin_event_generation();
-    ctx.active_output.borrow().set_event_generation(generation);
-    let accepted = ctx.active_output.borrow().load_uri(&playback_uri);
-    if !accepted {
-        let marked = ctx.session.borrow_mut().mark_load_rejected(generation);
-        debug_assert!(marked, "current direct load remains retryable");
-    }
+    let load = {
+        let output = ctx.active_output.borrow();
+        ctx.session
+            .borrow_mut()
+            .load_current_direct(output.as_ref())
+    };
+    let Some(load) = load else {
+        debug_assert!(false, "current direct queue item is loadable");
+        return false;
+    };
+    tracing::debug!(
+        generation = ?load.generation,
+        accepted = load.accepted,
+        "Direct queue item handed to output"
+    );
     update_now_playing_ui(ctx, &item, identity.as_ref(), Some(&playback_uri));
 
     true
@@ -1152,9 +1225,98 @@ pub fn format_ms(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashSet;
 
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct RecordingOutputState {
+        generations: Vec<PlayerEventGeneration>,
+        loads: Vec<String>,
+        stops: usize,
+    }
+
+    struct RecordingOutput {
+        state: Rc<RefCell<RecordingOutputState>>,
+        reject_loads: Cell<usize>,
+        volume: f64,
+    }
+
+    impl RecordingOutput {
+        fn new(reject_loads: usize) -> (Self, Rc<RefCell<RecordingOutputState>>) {
+            let state = Rc::new(RefCell::new(RecordingOutputState::default()));
+            (
+                Self {
+                    state: Rc::clone(&state),
+                    reject_loads: Cell::new(reject_loads),
+                    volume: 0.5,
+                },
+                state,
+            )
+        }
+    }
+
+    impl AudioOutput for RecordingOutput {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn output_type(&self) -> crate::audio::output::OutputType {
+            crate::audio::output::OutputType::Local
+        }
+
+        fn supports_volume(&self) -> bool {
+            true
+        }
+
+        fn load_uri(&self, uri: &str) -> bool {
+            self.state.borrow_mut().loads.push(uri.to_string());
+            let remaining = self.reject_loads.get();
+            if remaining == 0 {
+                true
+            } else {
+                self.reject_loads.set(remaining - 1);
+                false
+            }
+        }
+
+        fn load_resolved(&self, _request: crate::architecture::media::ResolvedHttpRequest) -> bool {
+            false
+        }
+
+        fn set_event_generation(&self, generation: PlayerEventGeneration) {
+            self.state.borrow_mut().generations.push(generation);
+        }
+
+        fn play(&self) {}
+
+        fn pause(&self) {}
+
+        fn stop(&self) {
+            self.state.borrow_mut().stops += 1;
+        }
+
+        fn toggle_play_pause(&self) {}
+
+        fn seek_to(&self, _position_ms: u64) {}
+
+        fn set_volume(&mut self, level: f64) {
+            self.volume = level;
+        }
+
+        fn volume(&self) -> f64 {
+            self.volume
+        }
+
+        fn state(&self) -> crate::audio::PlayerState {
+            crate::audio::PlayerState::Stopped
+        }
+
+        fn position_ms(&self) -> Option<u64> {
+            None
+        }
+    }
 
     fn item(source: &str, id: &str) -> QueueItem {
         let view = queue_view(source).expect("test source identity");
@@ -1190,6 +1352,10 @@ mod tests {
         );
         row.set_track_id(id);
         row
+    }
+
+    fn playback_row(id: &str) -> TrackObject {
+        projected_row(id, &format!("file:///music/{id}.flac"))
     }
 
     fn ids(session: &PlaybackSession) -> Vec<String> {
@@ -1411,6 +1577,105 @@ mod tests {
 
         assert_eq!(session.advance(RepeatMode::Off, false), Some(2));
         assert_eq!(current_id(&session), "c");
+    }
+
+    #[test]
+    fn production_snapshot_survives_sort_filter_navigation_and_owns_output_events() {
+        let source_key = "fixture-device-a";
+        let store = gtk::gio::ListStore::new::<TrackObject>();
+        for id in ["a", "b", "c"] {
+            store.append(&playback_row(id));
+        }
+        let captured = capture_visible_queue(&store, source_key, 1).expect("visible B is captured");
+        assert_eq!(
+            captured
+                .items
+                .iter()
+                .map(|entry| entry.identity.media_key.track_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(captured.items, captured.selected_index));
+        let (output, output_state) = RecordingOutput::new(0);
+        let first = session
+            .load_current_direct(&output)
+            .expect("captured B reaches the output");
+        assert!(first.accepted);
+        let stale_b_event = crate::audio::PlayerEvent::ended(first.generation);
+        assert_eq!(
+            current_source(&session),
+            SourceId::removable(source_key).expect("fixture source ID")
+        );
+        assert_eq!(current_id(&session), "b");
+
+        // Exercise the same ListModel projection boundary consumed from
+        // production's SortListModel, without constructing a display-bound
+        // GTK widget/model in headless CI.
+        store.remove_all();
+        for id in ["c", "b", "a"] {
+            store.append(&playback_row(id));
+        }
+        assert_eq!(
+            (0..store.n_items())
+                .map(|index| {
+                    store
+                        .item(index)
+                        .and_downcast::<TrackObject>()
+                        .expect("sorted TrackObject")
+                        .track_id()
+                })
+                .collect::<Vec<_>>(),
+            ["c", "b", "a"]
+        );
+
+        // Browser filtering rebuilds the underlying projection. Remove B and
+        // prove Next still follows the playback-owned A/B/C snapshot.
+        store.remove(1);
+        assert_eq!(store.n_items(), 2);
+        assert_eq!(session.advance(RepeatMode::Off, false), Some(2));
+        let c_load = session
+            .load_current_direct(&output)
+            .expect("filtered-out queue neighbor does not retarget Next");
+        assert!(c_load.accepted);
+        assert_eq!(current_id(&session), "c");
+        assert!(!session.accepts_event_generation(stale_b_event.generation()));
+        assert!(session.accepts_event_generation(c_load.generation));
+
+        // Sidebar navigation replaces the projection and source key, but does
+        // not install a queue until the user explicitly starts one there.
+        store.remove_all();
+        store.append(&playback_row("remote-x"));
+        let remote_projection =
+            capture_visible_queue(&store, "remote-server", 0).expect("remote view captures");
+        assert_eq!(
+            remote_projection.items[0].identity.media_key.source_id,
+            SourceId::removable("remote-server").expect("replacement source ID")
+        );
+        assert_eq!(session.previous(RepeatMode::Off, false), Some(1));
+        let b_again = session
+            .load_current_direct(&output)
+            .expect("Previous loads B from the local snapshot, not remote view");
+        assert_eq!(
+            current_source(&session),
+            SourceId::removable(source_key).expect("fixture source ID")
+        );
+        assert_eq!(current_id(&session), "b");
+        assert!(session.accepts_event_generation(b_again.generation));
+        assert_eq!(
+            output_state.borrow().loads,
+            [
+                "file:///music/b.flac",
+                "file:///music/c.flac",
+                "file:///music/b.flac"
+            ]
+        );
+
+        stop_owned_playback(&mut session, &output);
+        assert!(!session.has_current());
+        assert!(!session.accepts_event_generation(b_again.generation));
+        assert_eq!(output_state.borrow().stops, 1);
     }
 
     #[test]

@@ -334,12 +334,6 @@ impl SubsonicBackend {
 
         Ok(())
     }
-
-    /// Return all tracks from the cache as Tributary `Track` models.
-    /// Used by the integration layer to send a FullSync to the UI.
-    pub async fn all_tracks(&self) -> Vec<Track> {
-        self.cache.read().await.tracks.clone()
-    }
 }
 
 // ── MediaBackend trait implementation ────────────────────────────────────
@@ -444,6 +438,10 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
         }
 
         Ok(results)
+    }
+
+    async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
+        Ok(self.cache.read().await.tracks.clone())
     }
 
     async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
@@ -604,91 +602,13 @@ fn album_entry_to_album(entry: &AlbumEntry, id: Uuid, artist_id: Option<Uuid>) -
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
-
-    use axum::extract::OriginalUri;
     use axum::http::StatusCode;
-    use axum::response::{IntoResponse, Response};
-    use axum::routing::get;
-    use axum::{Json, Router};
+    use md5::{Digest as _, Md5};
 
     use crate::architecture::MediaBackend as _;
+    use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
 
     use super::*;
-
-    async fn overlapping_id_fixture(OriginalUri(uri): OriginalUri) -> Response {
-        let body = match uri.path() {
-            "/rest/ping.view" => serde_json::json!({
-                "subsonic-response": { "status": "ok" }
-            }),
-            "/rest/getArtists.view" => serde_json::json!({
-                "subsonic-response": {
-                    "status": "ok",
-                    "artists": {
-                        "index": [{
-                            "artist": [{
-                                "id": "shared-native-id",
-                                "name": "Artist",
-                                "coverArt": "full-artist-cover"
-                            }]
-                        }]
-                    }
-                }
-            }),
-            "/rest/getArtist.view" => serde_json::json!({
-                "subsonic-response": {
-                    "status": "ok",
-                    "artist": {
-                        "id": "shared-native-id",
-                        "name": "Artist",
-                        "album": [{
-                            "id": "shared-native-id",
-                            "name": "Album",
-                            "coverArt": "full-album-cover"
-                        }]
-                    }
-                }
-            }),
-            "/rest/getAlbum.view" => serde_json::json!({
-                "subsonic-response": {
-                    "status": "ok",
-                    "album": {
-                        "id": "shared-native-id",
-                        "name": "Album",
-                        "song": [{
-                            "id": "shared-native-id",
-                            "title": "Song",
-                            "coverArt": "full-song-cover"
-                        }]
-                    }
-                }
-            }),
-            "/rest/search3.view" => serde_json::json!({
-                "subsonic-response": {
-                    "status": "ok",
-                    "searchResult3": {
-                        "artist": [{
-                            "id": "shared-native-id",
-                            "name": "Artist",
-                            "coverArt": "search-artist-cover"
-                        }],
-                        "album": [{
-                            "id": "shared-native-id",
-                            "name": "Album",
-                            "coverArt": "search-album-cover"
-                        }],
-                        "song": [{
-                            "id": "shared-native-id",
-                            "title": "Song",
-                            "coverArt": "search-song-cover"
-                        }]
-                    }
-                }
-            }),
-            _ => return StatusCode::NOT_FOUND.into_response(),
-        };
-        Json(body).into_response()
-    }
 
     fn resolved_media_id(request: &ResolvedHttpRequest) -> String {
         request
@@ -729,28 +649,88 @@ mod tests {
 
     #[tokio::test]
     async fn track_artwork_survives_same_native_album_and_artist_ids() {
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("bind Subsonic fixture");
-        let address = listener.local_addr().expect("fixture address");
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                Router::new().fallback(get(overlapping_id_fixture)),
-            )
-            .await
-            .expect("serve Subsonic fixture");
-        });
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/rest/ping.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": { "status": "ok" }
+            }))),
+            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artists": {
+                        "index": [{
+                            "artist": [{
+                                "id": "shared-native-id",
+                                "name": "Artist",
+                                "coverArt": "full-artist-cover"
+                            }]
+                        }]
+                    }
+                }
+            }))),
+            MockRoute::get("/rest/getArtist.view")
+                .with_query("id", "shared-native-id")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artist": {
+                            "id": "shared-native-id",
+                            "name": "Artist",
+                            "album": [{
+                                "id": "shared-native-id",
+                                "name": "Album",
+                                "coverArt": "full-album-cover"
+                            }]
+                        }
+                    }
+                }))),
+            MockRoute::get("/rest/getAlbum.view")
+                .with_query("id", "shared-native-id")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "album": {
+                            "id": "shared-native-id",
+                            "name": "Album",
+                            "song": [{
+                                "id": "shared-native-id",
+                                "title": "Song",
+                                "coverArt": "full-song-cover"
+                            }]
+                        }
+                    }
+                }))),
+            MockRoute::get("/rest/search3.view")
+                .with_query("query", "Song")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "searchResult3": {
+                            "artist": [{
+                                "id": "shared-native-id",
+                                "name": "Artist",
+                                "coverArt": "search-artist-cover"
+                            }],
+                            "album": [{
+                                "id": "shared-native-id",
+                                "name": "Album",
+                                "coverArt": "search-album-cover"
+                            }],
+                            "song": [{
+                                "id": "shared-native-id",
+                                "title": "Song",
+                                "coverArt": "search-song-cover"
+                            }]
+                        }
+                    }
+                }))),
+        ])
+        .await;
 
         let fixture_secret = Uuid::new_v4().to_string();
-        let backend = SubsonicBackend::connect(
-            "fixture",
-            &format!("http://{address}"),
-            "user",
-            &fixture_secret,
-        )
-        .await
-        .expect("connect to fixture");
+        let backend =
+            SubsonicBackend::connect("fixture", &service.base_url(), "user", &fixture_secret)
+                .await
+                .expect("connect to fixture");
         let shared_id = TrackId::remote("shared-native-id").expect("track ID");
 
         let initial = backend
@@ -771,6 +751,151 @@ mod tests {
             .expect("searched artwork");
         assert_eq!(resolved_media_id(&searched), "search-song-cover");
 
-        server.abort();
+        let requests = service.requests();
+        assert_eq!(requests.len(), 5);
+        for request in requests {
+            let query = request
+                .uri
+                .query()
+                .map(|query| {
+                    url::form_urlencoded::parse(query.as_bytes())
+                        .into_owned()
+                        .collect::<HashMap<_, _>>()
+                })
+                .expect("Subsonic fixture request query");
+            assert_eq!(query.get("u").map(String::as_str), Some("user"));
+            assert_eq!(query.get("v").map(String::as_str), Some("1.16.1"));
+            assert_eq!(query.get("c").map(String::as_str), Some("Tributary"));
+            assert_eq!(query.get("f").map(String::as_str), Some("json"));
+            assert!(!query.contains_key("p"));
+            let salt = query.get("s").expect("token-auth salt");
+            let expected_token = Md5::digest(format!("{fixture_secret}{salt}")).iter().fold(
+                String::new(),
+                |mut token, byte| {
+                    use std::fmt::Write as _;
+                    let _ = write!(token, "{byte:02x}");
+                    token
+                },
+            );
+            assert_eq!(query.get("t"), Some(&expected_token));
+            assert!(request.body.is_empty());
+        }
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_token_auth_stops_before_catalogue_fetch() {
+        let password = Uuid::new_v4().to_string();
+        let service = MockHttpService::start(vec![MockRoute::get("/rest/ping.view").reply(
+            MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "failed",
+                    "error": {"code": 40, "message": password.clone()}
+                }
+            })),
+        )])
+        .await;
+        let error = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
+            .await
+            .err()
+            .expect("fixture authentication must fail");
+
+        assert!(matches!(error, BackendError::AuthenticationFailed { .. }));
+        assert!(!error.to_string().contains(&password));
+        assert_eq!(service.requests().len(), 1);
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn prefixed_catalogue_keeps_healthy_items_after_bounded_partial_failures() {
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/gateway/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/gateway/rest/getArtists.view").reply(MockResponse::json(
+                serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artists": {"index": [{"artist": [
+                            {"id": "healthy-artist", "name": "Healthy Artist"},
+                            {"id": "failed-artist", "name": "Failed Artist"}
+                        ]}]}
+                    }
+                }),
+            )),
+            MockRoute::get("/gateway/rest/getArtist.view")
+                .with_query("id", "healthy-artist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artist": {
+                            "id": "healthy-artist",
+                            "name": "Healthy Artist",
+                            "album": [
+                                {"id": "healthy-album", "name": "Healthy Album"},
+                                {"id": "failed-album", "name": "Failed Album"}
+                            ]
+                        }
+                    }
+                }))),
+            MockRoute::get("/gateway/rest/getArtist.view")
+                .with_query("id", "failed-artist")
+                .reply(MockResponse::status(StatusCode::SERVICE_UNAVAILABLE)),
+            MockRoute::get("/gateway/rest/getAlbum.view")
+                .with_query("id", "healthy-album")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "album": {
+                            "id": "healthy-album",
+                            "name": "Healthy Album",
+                            "song": [{
+                                "id": "healthy-track",
+                                "title": "Healthy Track",
+                                "artist": "Healthy Artist",
+                                "album": "Healthy Album"
+                            }]
+                        }
+                    }
+                }))),
+            MockRoute::get("/gateway/rest/getAlbum.view")
+                .with_query("id", "failed-album")
+                .reply(MockResponse::status(StatusCode::BAD_GATEWAY)),
+        ])
+        .await;
+        let password = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect(
+            "fixture",
+            &format!("{}/gateway/", service.base_url()),
+            "user",
+            &password,
+        )
+        .await
+        .expect("partial failures must retain the healthy catalogue subset");
+
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), 1);
+        assert_eq!(cache.tracks[0].title, "Healthy Track");
+        assert_eq!(cache.albums.len(), 1);
+        assert_eq!(cache.albums[0].title, "Healthy Album");
+        assert_eq!(cache.artists.len(), 1);
+        assert_eq!(cache.artists[0].name, "Healthy Artist");
+        assert_eq!(cache.artists[0].album_count, 2);
+        let track_id = cache.tracks[0]
+            .native_track_id
+            .clone()
+            .expect("fixture track retains its native ID");
+        drop(cache);
+        assert_eq!(
+            backend
+                .resolve_stream(&track_id)
+                .await
+                .expect("resolve healthy stream")
+                .endpoint()
+                .path(),
+            "/gateway/rest/stream.view"
+        );
+        assert_eq!(service.requests().len(), 6);
+        service.finish().await;
     }
 }

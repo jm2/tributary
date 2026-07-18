@@ -13,8 +13,8 @@ use crate::architecture::error::BackendError;
 use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
-    apply_advertised_http_route, authenticated_client_builder, redact_url_secrets,
-    strip_request_url, validate_base_url,
+    append_base_path_segments, apply_advertised_http_route, authenticated_client_builder,
+    redact_url_secrets, strip_request_url, validate_base_url,
 };
 
 use super::api::{JellyfinAuthRequest, JellyfinAuthResponse};
@@ -169,13 +169,7 @@ impl JellyfinClient {
 
         // POST /Users/AuthenticateByName
         let mut auth_url = base_url.clone();
-        {
-            let mut segments = auth_url
-                .path_segments_mut()
-                .expect("base URL cannot-be-a-base");
-            segments.push("Users");
-            segments.push("AuthenticateByName");
-        }
+        append_base_path_segments(&mut auth_url, ["Users", "AuthenticateByName"]);
 
         let body = JellyfinAuthRequest {
             username: username.to_string(),
@@ -269,14 +263,10 @@ impl JellyfinClient {
     /// `Users/{id}/Views`. It will be appended to the base URL.
     pub fn api_url(&self, endpoint: &str) -> Url {
         let mut url = self.base_url.clone();
-        {
-            let mut segments = url.path_segments_mut().expect("base URL cannot-be-a-base");
-            for part in endpoint.split('/') {
-                if !part.is_empty() {
-                    segments.push(part);
-                }
-            }
-        }
+        append_base_path_segments(
+            &mut url,
+            endpoint.split('/').filter(|part| !part.is_empty()),
+        );
         url
     }
 
@@ -488,6 +478,10 @@ fn response_body_error(context: &str, error: ResponseBodyError) -> BackendError 
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
+    use axum::http::{Method, StatusCode};
+
+    use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
+
     use super::*;
 
     fn advertised_route(origin: &str) -> AdvertisedHttpRoute {
@@ -545,6 +539,72 @@ mod tests {
                 .expect("auth header");
             assert!(value.is_sensitive());
         }
+    }
+
+    #[test]
+    fn api_and_media_paths_preserve_reverse_proxy_prefixes_exactly() {
+        for (base, prefix) in [
+            ("https://media.example.test", ""),
+            ("https://media.example.test/share", "/share"),
+            ("https://media.example.test/share/", "/share"),
+            (
+                "https://media.example.test/tenant%2Fmusic/",
+                "/tenant%2Fmusic",
+            ),
+        ] {
+            let client = JellyfinClient::new(base, "api-key", "user-id").expect("client");
+            assert_eq!(
+                client.api_url("System/Ping").as_str(),
+                format!("https://media.example.test{prefix}/System/Ping"),
+                "base URL: {base}"
+            );
+            assert_eq!(
+                client
+                    .resolved_stream_request("track-id")
+                    .expect("stream request")
+                    .endpoint()
+                    .as_str(),
+                format!("https://media.example.test{prefix}/Audio/track-id/stream?static=true"),
+                "base URL: {base}"
+            );
+            assert_eq!(
+                client
+                    .resolved_artwork_request("album-id")
+                    .expect("artwork request")
+                    .endpoint()
+                    .as_str(),
+                format!("https://media.example.test{prefix}/Items/album-id/Images/Primary"),
+                "base URL: {base}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_auth_uses_prefixed_endpoint_and_returns_typed_redacted_error() {
+        let service = MockHttpService::start(vec![MockRoute::new(
+            Method::POST,
+            "/gateway/Users/AuthenticateByName",
+        )
+        .reply(MockResponse::status(StatusCode::UNAUTHORIZED))])
+        .await;
+        let username = uuid::Uuid::new_v4().to_string();
+        let password = uuid::Uuid::new_v4().to_string();
+        let result = JellyfinClient::authenticate(
+            &format!("{}/gateway/", service.base_url()),
+            &username,
+            &password,
+        )
+        .await;
+        let error = result.err().expect("fixture authentication must fail");
+
+        assert!(matches!(error, BackendError::AuthenticationFailed { .. }));
+        let rendered = error.to_string();
+        assert!(!rendered.contains(&username));
+        assert!(!rendered.contains(&password));
+        let requests = service.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].uri.path(), "/gateway/Users/AuthenticateByName");
+        service.finish().await;
     }
 
     #[test]

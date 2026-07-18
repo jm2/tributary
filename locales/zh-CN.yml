@@ -17,6 +17,8 @@ header:
   output: "音频输出"
   add_output: "添加输出"
   main_menu: "主菜单"
+  playback_position: "播放位置"
+  volume: "音量"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:

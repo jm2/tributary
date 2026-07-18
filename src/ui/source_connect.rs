@@ -187,6 +187,23 @@ pub(super) fn remote_failure_category(
     }
 }
 
+/// Publish one passwordless-DAAP failure and wake the GTK cleanup owner.
+///
+/// The background task cannot touch GObjects directly. Keeping the user error
+/// and the one-shot cleanup signal together prevents a newly fallible stage
+/// between authentication and publication from leaving the sidebar spinner or
+/// pending navigation guard live forever.
+async fn signal_passwordless_daap_failure(
+    engine_tx: &async_channel::Sender<LibraryEvent>,
+    fail_tx: &async_channel::Sender<()>,
+    category: RemoteFailureCategory,
+) {
+    let _ = engine_tx
+        .send(LibraryEvent::Error(category.user_message("DAAP")))
+        .await;
+    let _ = fail_tx.send(()).await;
+}
+
 /// Bound parsed USB rows so a fast filesystem cannot grow memory without
 /// limit while GTK is busy. Closing the receiver wakes a blocked producer.
 const USB_SCAN_CHANNEL_CAPACITY: usize = 64;
@@ -1110,11 +1127,28 @@ pub fn setup_source_connect(state: &WindowState) {
                 .await
                 {
                     Ok(backend) => {
+                        let tracks = match crate::architecture::load_track_catalog(&backend).await {
+                            Ok(tracks) => tracks,
+                            Err(error) => {
+                                backend.disconnect().await;
+                                if !attempt.is_latest() {
+                                    tracing::debug!("Ignoring superseded DAAP catalogue failure");
+                                    return;
+                                }
+                                let category = remote_failure_category(&error);
+                                tracing::error!(
+                                    category = category.as_str(),
+                                    "DAAP catalogue load failed"
+                                );
+                                signal_passwordless_daap_failure(&engine_tx, &fail_tx, category)
+                                    .await;
+                                return;
+                            }
+                        };
                         let Some(session) = attempt.retain(backend).await else {
                             tracing::debug!("DAAP connect was superseded");
                             return;
                         };
-                        let tracks = session.all_tracks().await;
                         if !session.is_current() {
                             tracing::debug!("DAAP sync was superseded");
                             return;
@@ -1149,10 +1183,7 @@ pub fn setup_source_connect(state: &WindowState) {
                             category = category.as_str(),
                             "Passwordless DAAP connection failed"
                         );
-                        let _ = engine_tx
-                            .send(LibraryEvent::Error(category.user_message("DAAP")))
-                            .await;
-                        let _ = fail_tx.send(()).await;
+                        signal_passwordless_daap_failure(&engine_tx, &fail_tx, category).await;
                     }
                 }
             });
@@ -1318,18 +1349,23 @@ pub fn setup_source_connect(state: &WindowState) {
                                     .await
                                     {
                                         Ok(backend) => {
-                                            let tracks = backend.all_tracks().await;
-                                            Ok(attempt.retain(Arc::new(backend)).and_then(
-                                                |source| {
-                                                    source.is_current().then(|| {
-                                                        RemoteLibrarySnapshot::Standard {
-                                                            tracks,
-                                                            generation: source.generation(),
-                                                            lease_key: source.lease_key(),
-                                                        }
-                                                    })
-                                                },
-                                            ))
+                                            match crate::architecture::load_track_catalog(&backend)
+                                                .await
+                                            {
+                                                Ok(tracks) => Ok(attempt
+                                                    .retain(Arc::new(backend))
+                                                    .and_then(|source| {
+                                                        source.is_current().then(|| {
+                                                            RemoteLibrarySnapshot::Standard {
+                                                                tracks,
+                                                                generation: source.generation(),
+                                                                lease_key: source.lease_key(),
+                                                            }
+                                                        })
+                                                    })),
+                                                Err(_) if !attempt.is_latest() => Ok(None),
+                                                Err(error) => Err(error),
+                                            }
                                         }
                                         Err(_) if !attempt.is_latest() => Ok(None),
                                         Err(e) => Err(e),
@@ -1358,18 +1394,23 @@ pub fn setup_source_connect(state: &WindowState) {
                                     .await
                                     {
                                         Ok(backend) => {
-                                            let tracks = backend.all_tracks().await;
-                                            Ok(attempt.retain(Arc::new(backend)).and_then(
-                                                |source| {
-                                                    source.is_current().then(|| {
-                                                        RemoteLibrarySnapshot::Standard {
-                                                            tracks,
-                                                            generation: source.generation(),
-                                                            lease_key: source.lease_key(),
-                                                        }
-                                                    })
-                                                },
-                                            ))
+                                            match crate::architecture::load_track_catalog(&backend)
+                                                .await
+                                            {
+                                                Ok(tracks) => Ok(attempt
+                                                    .retain(Arc::new(backend))
+                                                    .and_then(|source| {
+                                                        source.is_current().then(|| {
+                                                            RemoteLibrarySnapshot::Standard {
+                                                                tracks,
+                                                                generation: source.generation(),
+                                                                lease_key: source.lease_key(),
+                                                            }
+                                                        })
+                                                    })),
+                                                Err(_) if !attempt.is_latest() => Ok(None),
+                                                Err(error) => Err(error),
+                                            }
                                         }
                                         Err(_) if !attempt.is_latest() => Ok(None),
                                         Err(e) => Err(e),
@@ -1395,21 +1436,28 @@ pub fn setup_source_connect(state: &WindowState) {
                             )
                             .await
                             {
-                                Ok(backend) => match attempt.retain(backend).await {
-                                    Some(session) => {
-                                        let tracks = session.all_tracks().await;
-                                        if session.is_current() {
-                                            Ok(Some(RemoteLibrarySnapshot::Daap {
-                                                tracks,
-                                                generation: session.generation(),
-                                                session_key: session.session_key(),
-                                            }))
-                                        } else {
-                                            Ok(None)
+                                Ok(backend) => {
+                                    match crate::architecture::load_track_catalog(&backend).await {
+                                        Ok(tracks) => match attempt.retain(backend).await {
+                                            Some(session) if session.is_current() => {
+                                                Ok(Some(RemoteLibrarySnapshot::Daap {
+                                                    tracks,
+                                                    generation: session.generation(),
+                                                    session_key: session.session_key(),
+                                                }))
+                                            }
+                                            Some(_) | None => Ok(None),
+                                        },
+                                        Err(error) => {
+                                            backend.disconnect().await;
+                                            if attempt.is_latest() {
+                                                Err(error)
+                                            } else {
+                                                Ok(None)
+                                            }
                                         }
                                     }
-                                    None => Ok(None),
-                                },
+                                }
                                 Err(_) if !attempt.is_latest() => Ok(None),
                                 Err(error) => Err(error),
                             }
@@ -1428,16 +1476,21 @@ pub fn setup_source_connect(state: &WindowState) {
                             .await
                             {
                                 Ok(backend) => {
-                                    let tracks = backend.all_tracks().await;
-                                    Ok(attempt.retain(Arc::new(backend)).and_then(|source| {
-                                        source.is_current().then(|| {
-                                            RemoteLibrarySnapshot::Standard {
-                                                tracks,
-                                                generation: source.generation(),
-                                                lease_key: source.lease_key(),
-                                            }
-                                        })
-                                    }))
+                                    match crate::architecture::load_track_catalog(&backend).await {
+                                        Ok(tracks) => Ok(attempt
+                                            .retain(Arc::new(backend))
+                                            .and_then(|source| {
+                                                source.is_current().then(|| {
+                                                    RemoteLibrarySnapshot::Standard {
+                                                        tracks,
+                                                        generation: source.generation(),
+                                                        lease_key: source.lease_key(),
+                                                    }
+                                                })
+                                            })),
+                                        Err(_) if !attempt.is_latest() => Ok(None),
+                                        Err(error) => Err(error),
+                                    }
                                 }
                                 Err(_) if !attempt.is_latest() => Ok(None),
                                 Err(e) => Err(e),
@@ -1538,18 +1591,42 @@ fn enumerate_device_audio_files(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
 
     use url::Url;
 
     use crate::architecture::error::BackendError;
     use crate::architecture::AdvertisedHttpRoute;
+    use crate::local::engine::LibraryEvent;
 
     use super::{
-        enumerate_device_audio_files, prepare_remote_auth_submission, remote_failure_category,
-        resolve_source_key, PendingConnection, RemoteFailureCategory, SourceNavigation,
+        cache_source_completion, enumerate_device_audio_files, evict_source_completion,
+        prepare_remote_auth_submission, remote_failure_category, resolve_source_key,
+        signal_passwordless_daap_failure, PendingConnection, RemoteFailureCategory,
+        SourceNavigation, TrackObject,
     };
+
+    fn projected_track(label: &str) -> TrackObject {
+        TrackObject::new(
+            1,
+            label,
+            60,
+            "Fixture Artist",
+            "Fixture Album",
+            "Fixture Genre",
+            "",
+            2026,
+            "2026-07-17",
+            320,
+            48_000,
+            0,
+            "flac",
+            &format!("file:///fixture/{label}.flac"),
+        )
+    }
 
     #[test]
     fn explicit_source_identity_precedes_legacy_fallbacks() {
@@ -1572,6 +1649,72 @@ mod tests {
         );
         assert_eq!(resolve_source_key("", "stable-id", "", "local"), "local");
         assert_eq!(resolve_source_key("", "", "", ""), "local");
+    }
+
+    #[test]
+    fn production_completion_boundary_rejects_reversed_source_results() {
+        let navigation = Rc::new(RefCell::new(SourceNavigation::new("local")));
+        let source_tracks = Rc::new(RefCell::new(HashMap::new()));
+        let active_source_key = Rc::new(RefCell::new("local".to_string()));
+
+        let stale = navigation.borrow_mut().select("playlist:fixture");
+        navigation.borrow_mut().select("local");
+        let current = navigation.borrow_mut().select("playlist:fixture");
+        *active_source_key.borrow_mut() = "playlist:fixture".to_string();
+
+        assert!(cache_source_completion(
+            &navigation,
+            &current,
+            &source_tracks,
+            &[projected_track("current")],
+            &active_source_key,
+        ));
+        assert!(!cache_source_completion(
+            &navigation,
+            &stale,
+            &source_tracks,
+            &[projected_track("stale")],
+            &active_source_key,
+        ));
+        assert!(
+            !evict_source_completion(&navigation, &stale, &source_tracks, &active_source_key,),
+            "a stale missing-result callback must not evict the newer projection"
+        );
+        assert_eq!(
+            source_tracks.borrow()["playlist:fixture"][0].title(),
+            "current"
+        );
+
+        let background = navigation.borrow_mut().select("radio-topvote");
+        navigation.borrow_mut().select("local");
+        *active_source_key.borrow_mut() = "local".to_string();
+        assert!(!cache_source_completion(
+            &navigation,
+            &background,
+            &source_tracks,
+            &[projected_track("background")],
+            &active_source_key,
+        ));
+        assert_eq!(
+            source_tracks.borrow()["radio-topvote"][0].title(),
+            "background"
+        );
+    }
+
+    #[tokio::test]
+    async fn passwordless_daap_failure_publishes_error_and_ui_cleanup_signal() {
+        let (engine_tx, engine_rx) = async_channel::bounded(1);
+        let (fail_tx, fail_rx) = async_channel::bounded(1);
+        let category = RemoteFailureCategory::Backend;
+        let expected_message = category.user_message("DAAP");
+
+        signal_passwordless_daap_failure(&engine_tx, &fail_tx, category).await;
+
+        match engine_rx.recv().await.expect("receive library error") {
+            LibraryEvent::Error(message) => assert_eq!(message, expected_message),
+            event => panic!("unexpected library event: {event:?}"),
+        }
+        fail_rx.recv().await.expect("receive GTK cleanup signal");
     }
 
     fn advertised_route(address: &str) -> AdvertisedHttpRoute {

@@ -1,23 +1,129 @@
-//! Right-click context menu on the tracklist ColumnView.
+//! Pointer and keyboard context menu on the tracklist `ColumnView`.
 //!
 //! Handles "Remove from Playlist", "Add to Playlist", and "Properties…"
-//! actions triggered from right-clicking selected tracks.
+//! actions triggered from right-clicking selected tracks or pressing the
+//! platform context-menu key / Shift+F10.
 
 use adw::prelude::*;
 use sea_orm::{EntityTrait, QueryFilter};
+use std::rc::Rc;
 
 use super::browser;
 use super::objects::{SourceObject, TrackObject};
 use super::tracklist;
 use super::window_state::WindowState;
 
-/// Wire the right-click context menu on the tracklist `ColumnView`.
+const CONTEXT_MENU_ACTION_GROUP: &str = "tracklist-ctx";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextMenuControllerPlan {
+    EventControllerKeyBubble,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextMenuActionOwner {
+    Popover,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContextMenuInteractionPlan {
+    keyboard_controller: ContextMenuControllerPlan,
+    has_popup: bool,
+    accessible_key_shortcuts: &'static str,
+    action_owner: ContextMenuActionOwner,
+}
+
+const CONTEXT_MENU_INTERACTION: ContextMenuInteractionPlan = ContextMenuInteractionPlan {
+    keyboard_controller: ContextMenuControllerPlan::EventControllerKeyBubble,
+    has_popup: true,
+    // GTK/GDK calls the physical key `Menu`; the GTK accessible shortcut
+    // grammar uses the standardized `ContextMenu` token.
+    accessible_key_shortcuts: "Shift+F10 ContextMenu",
+    action_owner: ContextMenuActionOwner::Popover,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionSnapshot {
+    positions: Vec<u32>,
+}
+
+impl SelectionSnapshot {
+    fn from_positions(positions: impl IntoIterator<Item = u32>) -> Option<Self> {
+        let positions = positions.into_iter().collect::<Vec<_>>();
+        (!positions.is_empty()).then_some(Self { positions })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextMenuPopupPlan {
+    selection: SelectionSnapshot,
+    action_owner: ContextMenuActionOwner,
+}
+
+impl ContextMenuPopupPlan {
+    fn from_positions(positions: impl IntoIterator<Item = u32>) -> Option<Self> {
+        Some(Self {
+            selection: SelectionSnapshot::from_positions(positions)?,
+            action_owner: CONTEXT_MENU_INTERACTION.action_owner,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyboardContextMenuPropagation {
+    Proceed,
+    Stop,
+}
+
+impl KeyboardContextMenuPropagation {
+    fn into_gtk(self) -> gtk::glib::Propagation {
+        match self {
+            Self::Proceed => gtk::glib::Propagation::Proceed,
+            Self::Stop => gtk::glib::Propagation::Stop,
+        }
+    }
+}
+
+fn keyboard_context_menu_propagation(
+    is_trigger: bool,
+    popup_opened: bool,
+) -> KeyboardContextMenuPropagation {
+    if is_trigger && popup_opened {
+        KeyboardContextMenuPropagation::Stop
+    } else {
+        KeyboardContextMenuPropagation::Proceed
+    }
+}
+
+fn is_keyboard_context_menu_trigger(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
+    use gtk::gdk::ModifierType;
+
+    // Lock/legacy modifier state (for example NumLock's X11 Mod2 bit) is
+    // ambient, not a chord. Keep only modifiers that participate in shortcuts,
+    // then accept the exact standard bindings: unmodified Menu or Shift+F10.
+    // In particular, Shift+Menu remains available to an ancestor binding.
+    let effective = modifiers
+        & (ModifierType::SHIFT_MASK
+            | ModifierType::CONTROL_MASK
+            | ModifierType::ALT_MASK
+            | ModifierType::SUPER_MASK);
+    (key == gtk::gdk::Key::Menu && effective.is_empty())
+        || (key == gtk::gdk::Key::F10 && effective == ModifierType::SHIFT_MASK)
+}
+
+fn expose_context_menu_accessibility(column_view: &gtk::ColumnView) {
+    column_view.update_property(&[
+        gtk::accessible::Property::HasPopup(CONTEXT_MENU_INTERACTION.has_popup),
+        gtk::accessible::Property::KeyShortcuts(CONTEXT_MENU_INTERACTION.accessible_key_shortcuts),
+    ]);
+}
+
+/// Wire pointer and keyboard context-menu access on the tracklist.
 ///
-/// Adds a gesture controller that shows a popover menu with actions
-/// relevant to the current selection and source context.
+/// Right-click retains its exact pointer anchor. The Menu key and Shift+F10
+/// open the same selection-snapshotted action model relative to the focused
+/// tracklist, and are consumed only when a non-empty menu was opened.
 pub fn setup_context_menu(state: &WindowState) {
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(3); // right-click
     let sm = state.sort_model.clone();
     let sidebar_store = state.sidebar_store.clone();
     let active_source_key = state.active_source_key.clone();
@@ -30,88 +136,134 @@ pub fn setup_context_menu(state: &WindowState) {
     let browser_widget = state.browser_widget.clone();
     let browser_state = state.browser_state.clone();
 
-    gesture.connect_pressed(move |gesture, _n_press, x, y| {
-        let Some(widget) = gesture.widget() else {
-            return;
-        };
-        let Ok(cv) = widget.downcast::<gtk::ColumnView>() else {
-            return;
-        };
+    let popup_menu = Rc::new(
+        move |cv: &gtk::ColumnView, anchor: Option<gtk::gdk::Rectangle>| {
+            let active_key = active_source_key.borrow().clone();
+            let is_playlist_view = active_key.starts_with("playlist:");
 
-        let active_key = active_source_key.borrow().clone();
-        let is_playlist_view = active_key.starts_with("playlist:");
+            // Collect selected track URIs from the MultiSelection model.
+            let selection_model = cv.model();
+            let Some(sel) = selection_model.and_then(|m| m.downcast::<gtk::MultiSelection>().ok())
+            else {
+                return false;
+            };
 
-        // Collect selected track URIs from the MultiSelection model.
-        let selection_model = cv.model();
-        let Some(sel) = selection_model.and_then(|m| m.downcast::<gtk::MultiSelection>().ok())
-        else {
-            return;
-        };
+            let selected = sel.selection();
+            let Some(popup_plan) = ContextMenuPopupPlan::from_positions(
+                (0..sm.n_items()).filter(|position| selected.contains(*position)),
+            ) else {
+                return false;
+            };
 
-        let selected = sel.selection();
-        if selected.is_empty() {
-            return;
-        }
+            let menu = gtk::gio::Menu::new();
+            let action_group = gtk::gio::SimpleActionGroup::new();
 
-        let menu = gtk::gio::Menu::new();
-        let action_group = gtk::gio::SimpleActionGroup::new();
+            if is_playlist_view {
+                build_remove_from_playlist_action(
+                    &menu,
+                    &action_group,
+                    &active_key,
+                    &sm,
+                    &popup_plan.selection,
+                    &rt_handle,
+                    &track_store,
+                    &source_tracks,
+                    &source_navigation,
+                    &master_tracks,
+                    &status_label,
+                    &browser_widget,
+                    &browser_state,
+                );
+            } else {
+                build_add_to_playlist_actions(
+                    &menu,
+                    &action_group,
+                    &sidebar_store,
+                    &sm,
+                    &popup_plan.selection,
+                    &rt_handle,
+                );
+            }
 
-        if is_playlist_view {
-            build_remove_from_playlist_action(
+            // ── Properties… ──────────────────────────────────────────
+            let automatic_device = active_source_is_automatic_device(&sidebar_store, &active_key);
+            build_properties_action(
                 &menu,
                 &action_group,
-                &active_key,
+                cv,
                 &sm,
-                &selected,
-                &rt_handle,
-                &track_store,
-                &source_tracks,
-                &source_navigation,
-                &master_tracks,
-                &status_label,
-                &browser_widget,
-                &browser_state,
+                &popup_plan.selection,
+                automatic_device,
             );
-        } else {
-            build_add_to_playlist_actions(
-                &menu,
-                &action_group,
-                &sidebar_store,
-                &sm,
-                &selected,
-                &rt_handle,
-            );
-        }
 
-        // ── Properties… ──────────────────────────────────────────
-        let automatic_device = active_source_is_automatic_device(&sidebar_store, &active_key);
-        build_properties_action(
-            &menu,
-            &action_group,
-            gesture,
-            &sm,
-            &selected,
-            automatic_device,
-        );
+            if menu.n_items() == 0 {
+                return false;
+            }
 
-        if menu.n_items() == 0 {
-            return;
-        }
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(cv);
+            match popup_plan.action_owner {
+                ContextMenuActionOwner::Popover => {
+                    popover.insert_action_group(CONTEXT_MENU_ACTION_GROUP, Some(&action_group));
+                }
+            }
+            if let Some(anchor) = anchor {
+                popover.set_pointing_to(Some(&anchor));
+            }
 
-        cv.insert_action_group("tracklist-ctx", Some(&action_group));
+            // Disable the internal ScrolledWindow that GTK4 PopoverMenu
+            // creates — it adds unnecessary scrollbars for small menus.
+            disable_popover_scrollbars(&popover);
 
-        let popover = gtk::PopoverMenu::from_model(Some(&menu));
-        popover.set_parent(&cv);
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            // Popovers created for a snapshot are one-shot. Explicitly detach the
+            // closed widget so repeated keyboard or pointer invocations do not
+            // retain obsolete action groups or captured selections.
+            popover.connect_closed(|popover| popover.unparent());
+            popover.popup();
+            true
+        },
+    );
 
-        // Disable the internal ScrolledWindow that GTK4 PopoverMenu
-        // creates — it adds unnecessary scrollbars for small menus.
-        disable_popover_scrollbars(&popover);
-
-        popover.popup();
-    });
-
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3); // right-click
+    {
+        let popup_menu = Rc::clone(&popup_menu);
+        gesture.connect_pressed(move |gesture, _n_press, x, y| {
+            let Some(cv) = gesture
+                .widget()
+                .and_then(|widget| widget.downcast::<gtk::ColumnView>().ok())
+            else {
+                return;
+            };
+            let anchor = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+            popup_menu(&cv, Some(anchor));
+        });
+    }
     state.column_view.add_controller(gesture);
+
+    let key_controller = match CONTEXT_MENU_INTERACTION.keyboard_controller {
+        ContextMenuControllerPlan::EventControllerKeyBubble => {
+            let controller = gtk::EventControllerKey::new();
+            controller.set_propagation_phase(gtk::PropagationPhase::Bubble);
+            controller
+        }
+    };
+    key_controller.connect_key_pressed(move |controller, key, _keycode, modifiers| {
+        let is_trigger = is_keyboard_context_menu_trigger(key, modifiers);
+        if !is_trigger {
+            return keyboard_context_menu_propagation(false, false).into_gtk();
+        }
+        let Some(cv) = controller
+            .widget()
+            .and_then(|widget| widget.downcast::<gtk::ColumnView>().ok())
+        else {
+            return keyboard_context_menu_propagation(true, false).into_gtk();
+        };
+
+        keyboard_context_menu_propagation(true, popup_menu(&cv, None)).into_gtk()
+    });
+    state.column_view.add_controller(key_controller);
+    expose_context_menu_accessibility(&state.column_view);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -125,7 +277,7 @@ fn build_remove_from_playlist_action(
     action_group: &gtk::gio::SimpleActionGroup,
     active_key: &str,
     sm: &gtk::SortListModel,
-    selected: &gtk::Bitset,
+    selection: &SelectionSnapshot,
     rt_handle: &tokio::runtime::Handle,
     track_store: &gtk::gio::ListStore,
     source_tracks: &std::rc::Rc<
@@ -152,7 +304,7 @@ fn build_remove_from_playlist_action(
     let active_key = active_key.to_string();
 
     // Collect URIs of selected tracks.
-    let selected_uris = collect_selected_uris(sm, selected);
+    let selected_uris = collect_selected_uris(sm, selection);
 
     let remove_action = gtk::gio::SimpleAction::new("remove-from-playlist", None);
     let uris = selected_uris;
@@ -284,7 +436,7 @@ fn build_add_to_playlist_actions(
     action_group: &gtk::gio::SimpleActionGroup,
     sidebar_store: &gtk::gio::ListStore,
     sm: &gtk::SortListModel,
-    selected: &gtk::Bitset,
+    selection: &SelectionSnapshot,
     rt_handle: &tokio::runtime::Handle,
 ) {
     let mut has_playlists = false;
@@ -312,7 +464,7 @@ fn build_add_to_playlist_actions(
                 let action_name = format!("add-to-{}", pl_id.replace('-', "_"));
 
                 // Collect selected URIs.
-                let selected_uris = collect_selected_uris(sm, selected);
+                let selected_uris = collect_selected_uris(sm, selection);
 
                 let rt = rt_handle.clone();
                 let add_action = gtk::gio::SimpleAction::new(&action_name, None);
@@ -386,60 +538,57 @@ fn build_add_to_playlist_actions(
 fn build_properties_action(
     menu: &gtk::gio::Menu,
     action_group: &gtk::gio::SimpleActionGroup,
-    gesture: &gtk::GestureClick,
+    column_view: &gtk::ColumnView,
     sm: &gtk::SortListModel,
-    selected: &gtk::Bitset,
+    selection: &SelectionSnapshot,
     automatic_device: bool,
 ) {
     // Snapshot the exact selection while building the menu. Properties is an
     // all-or-none local-file operation: silently dropping a malformed or
     // remote row would let a batch edit only an unexpected subset.
     let mut track_infos = Vec::new();
-    let mut pos = 0u32;
-    while pos < sm.n_items() {
-        if selected.contains(pos) {
-            let Some(item) = sm.item(pos) else { return };
-            let Some(track) = item.downcast_ref::<TrackObject>() else {
-                return;
-            };
-            let Some(path) = local_file_path(&track.uri()) else {
-                return;
-            };
-            track_infos.push(super::properties_dialog::TrackInfo {
-                path,
-                title: track.title(),
-                artist: track.artist(),
-                album: track.album(),
-                genre: track.genre(),
-                composer: track.composer(),
-                year: track.year_display(),
-                track_number: if track.track_number() > 0 {
-                    track.track_number().to_string()
-                } else {
-                    String::new()
-                },
-                disc_number: if track.disc_number() > 0 {
-                    track.disc_number().to_string()
-                } else {
-                    String::new()
-                },
-                format: track.format(),
-                bitrate: track.bitrate_display(),
-                sample_rate: track.sample_rate_display(),
-                duration: track.duration_display(),
-            });
-        }
-        pos += 1;
+    for &position in &selection.positions {
+        let Some(item) = sm.item(position) else {
+            return;
+        };
+        let Some(track) = item.downcast_ref::<TrackObject>() else {
+            return;
+        };
+        let Some(path) = local_file_path(&track.uri()) else {
+            return;
+        };
+        track_infos.push(super::properties_dialog::TrackInfo {
+            path,
+            title: track.title(),
+            artist: track.artist(),
+            album: track.album(),
+            genre: track.genre(),
+            composer: track.composer(),
+            year: track.year_display(),
+            track_number: if track.track_number() > 0 {
+                track.track_number().to_string()
+            } else {
+                String::new()
+            },
+            disc_number: if track.disc_number() > 0 {
+                track.disc_number().to_string()
+            } else {
+                String::new()
+            },
+            format: track.format(),
+            bitrate: track.bitrate_display(),
+            sample_rate: track.sample_rate_display(),
+            duration: track.duration_display(),
+        });
     }
     if track_infos.is_empty() {
         return;
     }
 
     let props_action = gtk::gio::SimpleAction::new("properties", None);
-    let win_for_props = gesture.widget().and_then(|w| {
-        w.root()
-            .and_then(|r| r.downcast::<adw::ApplicationWindow>().ok())
-    });
+    let win_for_props = column_view
+        .root()
+        .and_then(|root| root.downcast::<adw::ApplicationWindow>().ok());
 
     props_action.connect_activate(move |_, _| {
         let Some(ref win) = win_for_props else { return };
@@ -492,18 +641,14 @@ fn selection_counts(uris: &[String]) -> std::collections::HashMap<&str, usize> {
 }
 
 /// Collect URIs of selected tracks from the sort model.
-fn collect_selected_uris(sm: &gtk::SortListModel, selected: &gtk::Bitset) -> Vec<String> {
+fn collect_selected_uris(sm: &gtk::SortListModel, selection: &SelectionSnapshot) -> Vec<String> {
     let mut uris = Vec::new();
-    let mut pos = 0u32;
-    while pos < sm.n_items() {
-        if selected.contains(pos) {
-            if let Some(item) = sm.item(pos) {
-                if let Some(track) = item.downcast_ref::<TrackObject>() {
-                    uris.push(track.uri());
-                }
+    for &position in &selection.positions {
+        if let Some(item) = sm.item(position) {
+            if let Some(track) = item.downcast_ref::<TrackObject>() {
+                uris.push(track.uri());
             }
         }
-        pos += 1;
     }
     uris
 }
@@ -567,5 +712,92 @@ mod tests {
         assert!(!active_source_is_automatic_device(&store, "/media/player"));
         assert!(!active_source_is_automatic_device(&store, "device:opaque"));
         assert!(!active_source_is_automatic_device(&store, "local"));
+    }
+
+    #[test]
+    fn keyboard_context_menu_plan_pins_wiring_snapshot_and_propagation() {
+        use gtk::gdk::{Key, ModifierType};
+
+        assert!(is_keyboard_context_menu_trigger(
+            Key::Menu,
+            ModifierType::empty()
+        ));
+        assert!(is_keyboard_context_menu_trigger(
+            Key::Menu,
+            ModifierType::LOCK_MASK
+        ));
+        assert!(is_keyboard_context_menu_trigger(
+            Key::F10,
+            ModifierType::SHIFT_MASK
+        ));
+        assert!(is_keyboard_context_menu_trigger(
+            Key::F10,
+            ModifierType::SHIFT_MASK | ModifierType::LOCK_MASK
+        ));
+        // GDK4 no longer names the legacy X11 Mod2 mask, but key state can
+        // still carry its raw bit while NumLock is active.
+        let ambient_mod2 = ModifierType::from_bits_retain(1 << 4);
+        assert!(is_keyboard_context_menu_trigger(Key::Menu, ambient_mod2));
+        assert!(is_keyboard_context_menu_trigger(
+            Key::F10,
+            ModifierType::SHIFT_MASK | ambient_mod2
+        ));
+
+        assert!(!is_keyboard_context_menu_trigger(
+            Key::F10,
+            ModifierType::empty()
+        ));
+        assert!(!is_keyboard_context_menu_trigger(
+            Key::F10,
+            ModifierType::SHIFT_MASK | ModifierType::CONTROL_MASK
+        ));
+        assert!(!is_keyboard_context_menu_trigger(
+            Key::Menu,
+            ModifierType::SHIFT_MASK
+        ));
+        assert!(!is_keyboard_context_menu_trigger(
+            Key::Menu,
+            ModifierType::SHIFT_MASK | ModifierType::LOCK_MASK
+        ));
+        assert!(!is_keyboard_context_menu_trigger(
+            Key::Menu,
+            ModifierType::ALT_MASK
+        ));
+        assert!(!is_keyboard_context_menu_trigger(
+            Key::F9,
+            ModifierType::SHIFT_MASK
+        ));
+
+        assert_eq!(
+            CONTEXT_MENU_INTERACTION,
+            ContextMenuInteractionPlan {
+                keyboard_controller: ContextMenuControllerPlan::EventControllerKeyBubble,
+                has_popup: true,
+                accessible_key_shortcuts: "Shift+F10 ContextMenu",
+                action_owner: ContextMenuActionOwner::Popover,
+            }
+        );
+
+        assert_eq!(
+            keyboard_context_menu_propagation(false, false),
+            KeyboardContextMenuPropagation::Proceed
+        );
+        assert_eq!(
+            keyboard_context_menu_propagation(true, false),
+            KeyboardContextMenuPropagation::Proceed
+        );
+        assert_eq!(
+            keyboard_context_menu_propagation(true, true),
+            KeyboardContextMenuPropagation::Stop
+        );
+
+        assert!(ContextMenuPopupPlan::from_positions([]).is_none());
+        let mut live_selection = vec![1, 3];
+        let popup_plan = ContextMenuPopupPlan::from_positions(live_selection.iter().copied())
+            .expect("non-empty selection must produce a popup plan");
+        live_selection.clear();
+        live_selection.push(4);
+        assert_eq!(popup_plan.selection.positions, vec![1, 3]);
+        assert_eq!(popup_plan.action_owner, ContextMenuActionOwner::Popover);
     }
 }

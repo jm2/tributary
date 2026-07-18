@@ -289,12 +289,6 @@ impl DaapBackend {
         Ok(())
     }
 
-    /// Return all tracks from the cache as Tributary `Track` models.
-    /// Used by the integration layer to send a generation-scoped sync to the UI.
-    pub async fn all_tracks(&self) -> Vec<Track> {
-        self.cache.read().await.tracks.clone()
-    }
-
     /// Send one best-effort logout request to the DAAP server.
     ///
     /// Returns `true` only for the owner that initiated shutdown. Repeated
@@ -469,6 +463,10 @@ impl crate::architecture::MediaBackend for DaapBackend {
             albums,
             artists,
         })
+    }
+
+    async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
+        Ok(self.cache.read().await.tracks.clone())
     }
 
     async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {

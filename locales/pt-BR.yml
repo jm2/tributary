@@ -17,6 +17,8 @@ header:
   output: "Saída de áudio"
   add_output: "Adicionar saída"
   main_menu: "Menu principal"
+  playback_position: "Posição da reprodução"
+  volume: "Volume"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:

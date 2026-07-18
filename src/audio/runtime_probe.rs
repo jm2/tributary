@@ -165,10 +165,15 @@ pub(crate) fn run_packaged_windows_runtime_probe(plugin_dir: &Path) -> anyhow::R
         .ok_or_else(|| anyhow!("packaged audio probe playbin3 has no bus"))?;
 
     let playback_result = run_playback_to_eos(&playbin, &bus);
+    // Publish media-read cancellation before NULL closes an accepted source,
+    // but keep both listeners accepting until the transition is complete so
+    // the poisoned-proxy observation covers teardown as well as playback.
+    media_server.begin_teardown();
+    poison_server.begin_teardown();
     let teardown_result = teardown_to_null(&playbin);
 
-    let media_shutdown = media_server.shutdown();
-    let poison_shutdown = poison_server.shutdown();
+    let media_shutdown = media_server.finish_teardown();
+    let poison_shutdown = poison_server.finish_teardown();
 
     // A successful set_state(NULL) alone is not enough: wait for the bounded
     // transition and prove the pipeline is actually NULL before using the
@@ -415,12 +420,17 @@ enum ServerKind {
 
 struct ProbeServer {
     address: SocketAddr,
-    stop: Arc<AtomicBool>,
+    lifecycle: Arc<ProbeServerLifecycle>,
     connections: Arc<AtomicUsize>,
     valid_gets: Arc<AtomicUsize>,
     failed: Arc<AtomicBool>,
     armed_at: Arc<OnceLock<Instant>>,
     thread: Option<JoinHandle<()>>,
+}
+
+struct ProbeServerLifecycle {
+    cancellation_requested: AtomicBool,
+    stop_requested: AtomicBool,
 }
 
 impl ProbeServer {
@@ -433,13 +443,16 @@ impl ProbeServer {
         let address = listener
             .local_addr()
             .map_err(|_| anyhow!("packaged audio probe could not inspect a loopback server"))?;
-        let stop = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(ProbeServerLifecycle {
+            cancellation_requested: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+        });
         let connections = Arc::new(AtomicUsize::new(0));
         let valid_gets = Arc::new(AtomicUsize::new(0));
         let failed = Arc::new(AtomicBool::new(false));
         let armed_at = Arc::new(OnceLock::new());
         let thread = {
-            let stop = Arc::clone(&stop);
+            let lifecycle = Arc::clone(&lifecycle);
             let connections = Arc::clone(&connections);
             let valid_gets = Arc::clone(&valid_gets);
             let failed = Arc::clone(&failed);
@@ -450,7 +463,7 @@ impl ProbeServer {
                     serve_probe_listener(
                         listener,
                         kind,
-                        &stop,
+                        &lifecycle,
                         &connections,
                         &valid_gets,
                         &failed,
@@ -461,7 +474,7 @@ impl ProbeServer {
         };
         Ok(Self {
             address,
-            stop,
+            lifecycle,
             connections,
             valid_gets,
             failed,
@@ -476,8 +489,17 @@ impl ProbeServer {
             .map_err(|_| anyhow!("packaged audio probe loopback server was armed twice"))
     }
 
-    fn shutdown(&mut self) -> anyhow::Result<()> {
-        self.stop.store(true, Ordering::SeqCst);
+    fn begin_teardown(&self) {
+        self.lifecycle
+            .cancellation_requested
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn finish_teardown(&mut self) -> anyhow::Result<()> {
+        if !self.lifecycle.cancellation_requested.load(Ordering::SeqCst) {
+            bail!("packaged audio probe loopback server teardown was not requested");
+        }
+        self.lifecycle.stop_requested.store(true, Ordering::SeqCst);
         if self
             .thread
             .take()
@@ -494,7 +516,8 @@ impl ProbeServer {
 
 impl Drop for ProbeServer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        self.begin_teardown();
+        self.lifecycle.stop_requested.store(true, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -504,13 +527,13 @@ impl Drop for ProbeServer {
 fn serve_probe_listener(
     listener: TcpListener,
     kind: ServerKind,
-    stop: &AtomicBool,
+    lifecycle: &ProbeServerLifecycle,
     connections: &AtomicUsize,
     valid_gets: &AtomicUsize,
     failed: &AtomicBool,
     armed_at: &OnceLock<Instant>,
 ) {
-    while !stop.load(Ordering::SeqCst) {
+    loop {
         if armed_at
             .get()
             .is_some_and(|started| started.elapsed() >= SERVER_DEADLINE)
@@ -520,18 +543,37 @@ fn serve_probe_listener(
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if stop.load(Ordering::SeqCst) {
+                // Count every socket returned by accept, including one that
+                // was already queued when final stop became visible.
+                connections.fetch_add(1, Ordering::SeqCst);
+                // Winsock can inherit the listener's nonblocking mode onto
+                // accepted sockets. Restore blocking I/O before installing
+                // the bounded deadlines so a fragmented request waits for
+                // its next bytes instead of spuriously failing WouldBlock.
+                if stream.set_nonblocking(false).is_err()
+                    || stream.set_read_timeout(Some(CONNECTION_DEADLINE)).is_err()
+                    || stream.set_write_timeout(Some(CONNECTION_DEADLINE)).is_err()
+                {
+                    failed.store(true, Ordering::SeqCst);
                     return;
                 }
-                connections.fetch_add(1, Ordering::SeqCst);
-                let _ = stream.set_read_timeout(Some(CONNECTION_DEADLINE));
-                let _ = stream.set_write_timeout(Some(CONNECTION_DEADLINE));
                 if matches!(kind, ServerKind::Media) {
                     match serve_media(&mut stream) {
                         MediaRequestOutcome::ValidGet => {
                             valid_gets.fetch_add(1, Ordering::SeqCst);
                         }
                         MediaRequestOutcome::ValidHead => {}
+                        MediaRequestOutcome::IncompleteHeaders => {
+                            // NULL teardown can close a connection that was
+                            // accepted before the cancellation phase became
+                            // visible. Only its incomplete-header
+                            // EOF/reset/abort is expected; semantic request
+                            // and response failures remain fatal below.
+                            if !lifecycle.cancellation_requested.load(Ordering::SeqCst) {
+                                failed.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                        }
                         MediaRequestOutcome::Invalid => {
                             failed.store(true, Ordering::SeqCst);
                             return;
@@ -540,6 +582,12 @@ fn serve_probe_listener(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                // Final stop is complete only after accept proves the
+                // platform queue is empty. This keeps the poison observer
+                // live through NULL teardown and counts racing connections.
+                if lifecycle.stop_requested.load(Ordering::SeqCst) {
+                    return;
+                }
                 thread::sleep(Duration::from_millis(5));
             }
             Err(_) => {
@@ -554,12 +602,24 @@ fn serve_probe_listener(
 enum MediaRequestOutcome {
     ValidGet,
     ValidHead,
+    IncompleteHeaders,
     Invalid,
 }
 
 fn serve_media(stream: &mut TcpStream) -> MediaRequestOutcome {
-    let Ok(request) = read_request_headers(stream) else {
-        return MediaRequestOutcome::Invalid;
+    let request = match read_request_headers(stream) {
+        Ok(request) => request,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return MediaRequestOutcome::IncompleteHeaders;
+        }
+        Err(_) => return MediaRequestOutcome::Invalid,
     };
     let Ok(request) = std::str::from_utf8(&request) else {
         return MediaRequestOutcome::Invalid;
@@ -836,6 +896,95 @@ mod tests {
         (outcome, response)
     }
 
+    fn wait_for_probe_condition(mut condition: impl FnMut() -> bool, label: &str) {
+        let deadline = Instant::now() + CONNECTION_DEADLINE;
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {label}");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn two_phase_teardown_cancels_an_accepted_connection_blocked_on_headers() {
+        let mut server = ProbeServer::start(ServerKind::Media).expect("start media probe server");
+        server.arm().expect("arm media probe server");
+        let client = TcpStream::connect(server.address).expect("connect without sending headers");
+        wait_for_probe_condition(
+            || server.connections.load(Ordering::SeqCst) == 1,
+            "the media server to accept the blocked client",
+        );
+
+        // Match production: publish cancellation before NULL teardown closes
+        // the source, then publish final stop, drain, join, and inspect.
+        server.begin_teardown();
+        client
+            .shutdown(Shutdown::Write)
+            .expect("half-close the abandoned request");
+
+        server
+            .finish_teardown()
+            .expect("teardown owns an abandoned in-flight connection");
+        assert!(!server.failed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn poison_observer_stays_live_and_drains_queued_accepts_through_teardown() {
+        let mut server = ProbeServer::start(ServerKind::Poison).expect("start poison observer");
+        server.arm().expect("arm poison observer");
+        server.begin_teardown();
+
+        let _accepted = TcpStream::connect(server.address).expect("connect during NULL phase");
+        wait_for_probe_condition(
+            || server.connections.load(Ordering::SeqCst) == 1,
+            "the poison observer to accept during the NULL phase",
+        );
+
+        // Do not wait for this connection to be accepted. finish_teardown
+        // must set final stop, drain any queued accept, and count it before
+        // the listener observes WouldBlock and exits.
+        let _queued =
+            TcpStream::connect(server.address).expect("queue connection before final stop");
+        server
+            .finish_teardown()
+            .expect("drain poison observer after NULL phase");
+
+        assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn malformed_request_completed_during_teardown_still_fails_the_server() {
+        let mut server = ProbeServer::start(ServerKind::Media).expect("start media probe server");
+        server.arm().expect("arm media probe server");
+        let mut client = TcpStream::connect(server.address).expect("connect malformed request");
+        client
+            .set_read_timeout(Some(CONNECTION_DEADLINE))
+            .expect("bound malformed response read");
+        wait_for_probe_condition(
+            || server.connections.load(Ordering::SeqCst) == 1,
+            "the media server to accept the malformed client",
+        );
+
+        server.begin_teardown();
+        let malformed = format!("GET {TICKET_ROUTE} HTTP/1.1\r\nBad Header: value\r\n\r\n");
+        client
+            .write_all(malformed.as_bytes())
+            .expect("send malformed request");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("finish malformed request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .expect("read malformed request response");
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        wait_for_probe_condition(
+            || server.failed.load(Ordering::SeqCst),
+            "the media server to reject semantic request drift during teardown",
+        );
+
+        assert!(server.finish_teardown().is_err());
+    }
+
     #[test]
     fn media_fixture_classifies_valid_get_and_head() {
         let get =
@@ -853,6 +1002,18 @@ mod tests {
             .position(|window| window == b"\r\n\r\n")
             .expect("HEAD response terminator");
         assert_eq!(header_end + 4, response.len());
+    }
+
+    #[test]
+    fn media_fixture_distinguishes_incomplete_header_io_from_semantic_drift() {
+        let incomplete = format!("GET {TICKET_ROUTE} HTTP/1.1\r\nHost: localhost\r\n");
+        let (outcome, _) = classify(incomplete.as_bytes());
+        assert!(matches!(outcome, MediaRequestOutcome::IncompleteHeaders));
+
+        let mut invalid_utf8 = format!("GET {TICKET_ROUTE} HTTP/1.1\r\nHeader: ").into_bytes();
+        invalid_utf8.extend_from_slice(b"\xff\r\n\r\n");
+        let (outcome, _) = classify(&invalid_utf8);
+        assert!(matches!(outcome, MediaRequestOutcome::Invalid));
     }
 
     #[test]

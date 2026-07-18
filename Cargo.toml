@@ -170,6 +170,7 @@ dbus = "*"
 [dev-dependencies]
 http = "1"
 proptest = "1"
+serde_yaml = "0.9"
 toml = "0.8"
 
 [profile.release]
