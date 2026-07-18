@@ -77,7 +77,7 @@ length, so provider-controlled values do not enter diagnostics.
 | Source kind | `SourceId` rule | Stability boundary |
 |---|---|---|
 | Local library | UUIDv5 of `builtin:local` | Constant across launches and library-root changes |
-| Saved remote source | UUID stored with the saved source record | Constant across reconnects and an explicit endpoint rebind |
+| Saved remote source | Random UUIDv4, or the exact canonical UUIDv5 stored with a migrated/promoted row | Constant across reconnects; UUIDv4 may survive an explicit endpoint rebind, while UUIDv5 is valid only for its canonical endpoint |
 | Legacy saved remote source | UUIDv5 of `remote:<backend>:<canonical-base-url>`, persisted before use | Stable upgrade without depending on a partially completed rewrite |
 | Unsaved discovered or environment remote | UUIDv5 of the same backend plus canonical base URL | Stable while that logical endpoint is unchanged; an explicit save/rebind gives it a persisted record |
 | Radio-Browser | UUIDv5 of `builtin:radio-browser` | Constant across feed queries, refreshes, and launches |
@@ -114,16 +114,20 @@ ID above. Duplicate canonical `(backend, base URL)` rows collapse to their first
 its display name because they describe one logical source. A duplicate canonical endpoint with
 different pre-existing IDs, or one `source_id` assigned to different canonical endpoints, instead
 quarantines the complete file: no row is published or rewritten until the user explicitly removes
-or rebinds the conflicting record. Nil and the frozen local/Radio-Browser built-in IDs are reserved
-and likewise quarantine a version-1 file, so persisted remote input cannot impersonate an
-application-owned source. Quarantine is a loader state over the unchanged `servers.json`, not a
-second persistence store.
+or rebinds the conflicting record. Version-1 remotes may carry either an RFC UUIDv4 random identity
+minted for a manual source or the one exact UUIDv5 derived from that row's canonical `(backend,
+base URL)`. Nil, non-RFC UUIDs, every other UUID version, and a UUIDv5 owned by another endpoint,
+backend, built-in, or removable source quarantine the complete file. Persisted input therefore
+cannot impersonate any deterministic application-owned source, including another remote.
+Quarantine is a loader state over the unchanged `servers.json`, not a second persistence store.
 
 The complete version-1 envelope is written to a same-directory temporary file and atomically
 replaces the legacy file before any migrated row is published. A write or replacement failure
-publishes nothing and preserves the last complete file. Changing an endpoint through a future
-explicit rebind retains the stored ID. Merely discovering a different URL never migrates identity
-by name or library similarity.
+publishes nothing and preserves the last complete file. A future explicit endpoint rebind may
+retain a random UUIDv4 owner. A canonical UUIDv5 owner cannot be carried to a different endpoint in
+version 1; rebind must atomically assign a random owner (or introduce a later schema with explicit
+rebind provenance) and retire the old owner. Merely discovering a different URL never migrates
+identity by name or library similarity.
 
 The existing local `tracks.id` value is already the local backend's native `TrackId` and is kept
 byte-for-byte, including a legacy non-UUID string. The random fallback in `db_model_to_track` has
@@ -369,11 +373,14 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
 - Saved sources use the strict version-1 envelope. Loading a legacy array derives deterministic
   IDs, collapses canonical duplicates in file order, atomically replaces `servers.json` before
   publication, and publishes nothing when validation or replacement fails. Malformed or unknown
-  version-1 data, reserved nil/built-in identities, and endpoint/ID conflicts quarantine the
-  complete unchanged file. Repeated manual Add reuses the saved owner; discovered-to-saved
-  promotion persists the row's already-published ID before changing its presentation; and
-  saved-plus-env startup authenticates under the stored ID. Each path therefore keeps one
-  canonical `(backend, endpoint)` owner without transferring live ownership between IDs.
+  version-1 data, any identity other than random UUIDv4 or the row's exact canonical remote
+  UUIDv5, and endpoint/ID conflicts quarantine the complete unchanged file. Repeated manual Add
+  reuses the saved owner; discovered-to-saved promotion persists the row's already-published ID
+  before changing its presentation; and saved-plus-env startup authenticates under the stored ID.
+  Promotion also retains the live row's ephemeral advertised route and passes it into the
+  immediate route-aware authentication/connection attempt; persistence never stores that route.
+  Each path therefore keeps one canonical `(backend, endpoint)` owner without transferring live
+  ownership between IDs or discarding discovery-only reachability during Add.
 - Brand-new manually saved remote rows receive random persisted `SourceId` values. Legacy,
   discovered, environment, and unsaved remote endpoints use deterministic
   backend-plus-canonical-base-URL identity; promoting a discovered/environment row persists that

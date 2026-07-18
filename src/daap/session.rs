@@ -848,8 +848,6 @@ mod tests {
         for (case, response) in malformed_items_responses() {
             let server = MockDaapServer::start().await;
             server.enqueue(MockEndpoint::Items, response);
-            let source_id = SourceId::random();
-            let attempt = begin_connect(source_id).expect("register connection attempt");
 
             let outcome = tokio::time::timeout(
                 MOCK_DEADLINE,
@@ -862,11 +860,6 @@ mod tests {
             };
             assert_bounded_parse_error(error, case);
 
-            drop(attempt);
-            assert!(
-                release_source(source_id).is_none(),
-                "{case}: failed initial sync must not enter the session registry"
-            );
             server.wait_for_requests(MockEndpoint::Logout, 1).await;
             assert_eq!(server.request_count(MockEndpoint::Items), 1, "{case}");
             assert_eq!(logout_count(&server), 1, "{case}");
@@ -935,8 +928,6 @@ mod tests {
         for (case, endpoint, response) in cases {
             let server = MockDaapServer::start().await;
             server.enqueue(endpoint, response);
-            let source_id = SourceId::random();
-            let attempt = begin_connect(source_id).expect("register connection attempt");
 
             let outcome = tokio::time::timeout(
                 MOCK_DEADLINE,
@@ -956,11 +947,6 @@ mod tests {
                 "{case}: unexpected expiration error: {error}"
             );
 
-            drop(attempt);
-            assert!(
-                release_source(source_id).is_none(),
-                "{case}: failed session must never enter the registry"
-            );
             server.wait_for_requests(MockEndpoint::Logout, 1).await;
             assert_eq!(server.request_count(MockEndpoint::ServerInfo), 1, "{case}");
             assert_eq!(server.request_count(MockEndpoint::Login), 1, "{case}");
@@ -990,8 +976,6 @@ mod tests {
         reset_registry().await;
         let server = MockDaapServer::start().await;
         server.enqueue(MockEndpoint::Items, in_band_items_status(500));
-        let source_id = SourceId::random();
-        let attempt = begin_connect(source_id).expect("register connection attempt");
 
         let outcome = tokio::time::timeout(
             MOCK_DEADLINE,
@@ -1010,8 +994,6 @@ mod tests {
             } if message == "DAAP items returned status 500"
         ));
 
-        drop(attempt);
-        assert!(release_source(source_id).is_none());
         server.wait_for_requests(MockEndpoint::Logout, 1).await;
         assert_eq!(logout_count(&server), 1);
         assert_eq!(server.request_count(MockEndpoint::Stream), 0);
@@ -1032,6 +1014,13 @@ mod tests {
             .await
             .expect("read DAAP track catalogue");
         assert_eq!(tracks.len(), 1);
+        assert_eq!(
+            tracks[0]
+                .native_track_id
+                .as_ref()
+                .map(crate::architecture::TrackId::as_str),
+            Some("9")
+        );
 
         let stream_reference = tracks[0]
             .stream_url

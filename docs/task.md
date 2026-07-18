@@ -71,12 +71,14 @@ boxes. Independent review clarified deterministic overlapping-radio locator owne
 exact versioned saved-source migration/quarantine boundary before the complete exact-toolchain and
 native/package matrix passed in runs 29605029668 and 29605032344; runtime implementation remains
 open at that architecture-only milestone.
-The bounded P3.2 local-aggregate slice accepted in PR #114 closes its three
+The bounded P3.2 local-aggregate slice accepted in PR #114 closed its three
 identity/grouping/lookup boxes: local artist and album UUIDs are
 stable, same-titled albums are disambiguated by effective album artist, and both formerly
-unsupported by-ID track methods now resolve compact keys before narrowed SQL queries. The common
-local integration boundary, invalid persisted `TrackId` fallback, and final P3.2 implementation
-record remain open. Static analysis passed in run 29607279056 and the complete exact-toolchain,
+unsupported by-ID track methods now resolve compact keys before narrowed SQL queries. At that
+milestone the common local integration boundary, invalid persisted `TrackId` fallback, and final
+P3.2 implementation record remained open. PR #116 subsequently closed the shared-catalogue seam
+and P3.2 record; PR #120 preserves exact persisted local IDs and replaces the random fallback with
+a frozen deterministic compatibility projection under P3.1. Static analysis passed in run 29607279056 and the complete exact-toolchain,
 coverage, audit, native, Flatpak, and package matrix passed in run 29607280861. The review window
 produced no code findings; Gemini posted only its service-sunset notice.
 The first documentation-head rerun, 29608292265, then exposed a pre-existing MPD worker-enqueue
@@ -155,11 +157,14 @@ PR #120 closes only P3.1's stable source/backend-native identity box. Frozen typ
 saved-source schema migration replace URL ownership with persisted or deterministic `SourceId`
 values across the UI and registries; every remote adapter preserves its exact bounded native
 `TrackId`; and queues use `MediaKey` plus separate playlist/radio `ViewOrigin`. Removable rows use a
-lossless mount-relative ID, radio uses bounded station UUIDs, and external sessions mint random
-source and track IDs. Version-1 saved remotes cannot claim nil or built-in IDs; repeated Add,
-discovered-to-saved promotion, and saved-plus-environment startup coalesce one canonical
-`(backend, endpoint)` owner, and every accepted reconnect publication clears transient connecting
-state even if that canonical owner was already connected. Remote media references reversibly
+frozen lossless mount-relative ID, radio uses bounded station UUIDs, and external sessions mint
+random source and track IDs. Version-1 saved remotes accept only random RFC UUIDv4 identities or
+the exact UUIDv5 owner of the row's canonical `(backend, endpoint)`, so crafted input cannot claim
+another endpoint, backend, built-in, or removable source. Repeated Add,
+discovered-to-saved promotion, and saved-plus-environment startup coalesce one canonical owner;
+promotion retains its advertised route for the immediate route-aware connection, and every
+accepted reconnect publication clears transient connecting state even if that canonical owner was
+already connected. Remote media references reversibly
 prefix/hex-encode native IDs so valid `.` and `..` values cannot be normalized as URL path
 segments. The local-ID-at-use slice is included but its compound box remains open until current
 root acquisition, containment, exact file authority, and retention through output consumption
@@ -1457,13 +1462,17 @@ closed as a milestone.
   strict version-1 envelope. Legacy arrays migrate atomically before publication or quarantine the
   whole file on conflicts. Local rows retain exact SQLite IDs; Subsonic, Jellyfin, Plex, and DAAP retain exact
   bounded song ID, item `Id`, `ratingKey`, and decimal `miid`; radio retains a bounded
-  `stationuuid`; removable paths use a lossless mount-relative native encoding; and external
-  sessions receive independent random IDs. Queues use `MediaKey` plus a separate playlist/radio
-  `ViewOrigin`, and hostile track values are bounded and redacted from debug output. Version-1
-  saved input also rejects nil and built-in IDs, and every manual/discovered/environment path
-  coalesces the same canonical `(backend, endpoint)` under one persisted-or-deterministic owner.
-  Promotion persists the discovered row's existing ID before changing its presentation, so it
-  never requires a partial transfer of live navigation, cache, playback, or registry ownership.
+  `stationuuid`; removable paths use a frozen lossless mount-relative native encoding; and
+  external sessions receive independent random IDs. Queues use `MediaKey` plus a separate
+  playlist/radio `ViewOrigin`, and hostile track values are bounded and redacted from debug output.
+  Version-1 saved input accepts only random RFC UUIDv4 identities or the exact UUIDv5 owner of the row's
+  canonical `(backend, endpoint)`; other UUID versions and UUIDv5 values owned by another remote,
+  built-in, or removable source quarantine the complete file. Every
+  manual/discovered/environment path coalesces the same endpoint under one
+  persisted-or-deterministic owner. Promotion persists the discovered row's existing ID before
+  changing its presentation and retains its ephemeral advertised route for the immediate
+  route-aware authentication/connection attempt, so it neither requires a partial transfer of
+  live navigation, cache, playback, or registry ownership nor loses discovery-only reachability.
   Runtime implementation is traceable through `79b9d0c`, `9bf87db`, `8232d90`, `432b66b`, and
   `269eb93`, with the accepted-reconnect follow-up in `4bb27a3`; the combined milestone is prepared
   for PR #120.
@@ -1557,17 +1566,19 @@ closed as a milestone.
   disambiguation, and both formerly unsupported by-ID methods. This completion slice constructs
   `LocalBackend`, routes every complete local and remote catalogue through the shared trait-object
   adapter, removes the backend-specific `all_tracks` bypasses, and updates the public architecture
-  claims. Repairing or rejecting an invalid persisted local track UUID, instead of the existing
-  random conversion fallback, belongs with the typed `TrackId` migration in P3.1 and does not block
-  this bounded P3.2 completion. PR #116.
+  claims. At PR #116, repairing or rejecting an invalid persisted local track UUID instead of the
+  then-existing random conversion fallback remained assigned to typed `TrackId` work in P3.1 and
+  did not block this bounded P3.2 completion. PR #120 subsequently preserved the exact persisted
+  string and replaced that fallback with a frozen deterministic compatibility projection.
 
 Acceptance criteria for this bounded slice: unchanged exact local metadata yields identical
 artist/album identities across queries and restarts; concatenation or artist/album domain
 collisions cannot alias; a compilation and same-titled albums group by the documented effective
 album artist; listing IDs round-trip through both by-ID methods; unknown IDs return no tracks; and
 the lookup's full-model query is constrained to the resolved title or exact artist. Complete
-catalogue publication must additionally enter the shared trait-object adapter. Path-bearing queue
-values and invalid persisted `TrackId` fallback remain explicitly assigned to P3.1.
+catalogue publication must additionally enter the shared trait-object adapter. The path-bearing
+queue and invalid persisted-`TrackId` gaps recorded at P3.2 completion were subsequently addressed
+under P3.1; current-root authority, containment, and retention remain there.
 
 ### P3.3 Add network integration harnesses
 
@@ -1608,7 +1619,8 @@ values and invalid persisted `TrackId` fallback remain explicitly assigned to P3
     artist/album/track while independently failed artist and album requests are skipped; Plex
     publishes one complete healthy section while an unavailable section contributes nothing; and
     geolocation advances past HTTP-error, oversized, and timed-out providers without publishing
-    their data.
+    their data. The production catalogue fixtures assert the exact surviving native IDs:
+    Subsonic `healthy-track`, Jellyfin and Plex `track-0`, and DAAP decimal `9`.
   - Complete backend fixtures use configured prefixes ending in `/` and prove API, pagination,
     stream, and artwork paths. Existing Subsonic/DAAP exact-path regressions cover root, ordinary,
     trailing-slash, and already-escaped bases. New Jellyfin/Plex regressions cover the same four
@@ -1626,9 +1638,11 @@ values and invalid persisted `TrackId` fallback remain explicitly assigned to P3
   as Raw. Eight post-login expiration cases cover HTTP 401 and 403 independently on update,
   databases, and items plus in-band item `mstt` 401 and 403; an explicit `mstt` 500 proves
   non-authentication classification. Each case has a five-second test deadline and fixed typed
-  error. The tests drive `DaapBackend::connect` through a real connection attempt, prove the failed
-  backend never enters the session registry and issues no stream/artwork request, and observe
-  exactly one automatic bounded logout.
+  error. The tests drive `DaapBackend::connect` directly through a real connection attempt and
+  prove it returns no backend, issues no stream/artwork request, and performs exactly one automatic
+  bounded logout. Separate registry lifecycle tests prove that only an explicitly retained
+  successful attempt installs a source, replacement logs out the displaced session, and
+  shutdown/release races remain joined and exactly-once.
 - [x] Record implementation: source commits `b80e534` and `6f6c9ac` provide the shared service and
   DAAP foundations; this completion branch adds the representative behavior matrix and fixes the
   Subsonic peer-message, Radio-Browser/geolocation status, and Jellyfin/Plex reverse-proxy findings
@@ -1932,15 +1946,17 @@ CodeQL and all three static-analysis jobs passed; final Codex review of `91536ab
 issues after both earlier findings were fixed and resolved. P2.10 is complete at 198/223 overall
 and 76/79 P2; P3.5's exact-toolchain acceptance remains recorded by PR #111.
 
-Current merged-branch validation (2026-07-17, P3.1 stable identity before PR #120):
-`cargo check --all-targets --all-features --locked`, strict
+Current local branch validation (2026-07-17, P3.1 stable-identity independent-review follow-up):
+`cargo check --all-targets --all-features --locked`, strict debug-profile
 `cargo clippy --all-targets --all-features --locked -- -D warnings`, and
-`cargo test --all-targets --all-features --locked` pass in debug and release. Each complete profile
-runs 20 library, 793 application, and 10 repository-metadata tests (823 total). The 46-test identity filter
-passes together with focused production-queue capture, recycled-sidebar action, prefixed
-Jellyfin/Plex/Subsonic, native-ID artwork, DAAP adversarial/expiration, and already-connected
-reconnect-publication regressions. These post-merge tests exercise the P3.4 seams with typed media
-identity and exact-native-ID service fixtures; formatting and whitespace checks pass.
+`cargo test --all-targets --all-features --locked` pass. The complete debug profile runs 20
+library, 796 application, and 10 repository-metadata tests (826 total). The 48-test identity filter
+passes together with the production non-resolvable-origin/loopback-route promotion regression,
+exact native Subsonic/Jellyfin/Plex/DAAP assertions, saved-ID collision quarantine, production-queue
+capture, recycled-sidebar action, DAAP adversarial/expiration, and already-connected
+reconnect-publication regressions. `cargo fmt --all -- --check` and `git diff --check` pass. The
+accepted pre-follow-up head separately passed the complete 823-test release profile and strict
+release Clippy; the 826-test release rerun belongs to final integration-head validation.
 
 Pre-merge local branch validation (2026-07-17, P3.1 stable-identity runtime before PR #120):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature Clippy in debug
@@ -2223,8 +2239,10 @@ Record scope or design decisions here so deferred work is explicit.
   databases, and items share the same HTTP classifier, and one bounded logout is attempted for
   every failure after login has yielded a usable session ID—including before a complete client can
   be returned. Diagnostics are fixed and bounded rather than formatting peer-controlled remaining
-  bytes. The fixture proves the failed initial sync never enters the registry, issues no media
-  request, and sends exactly one logout. This closes the DAAP
+  bytes. The fixture proves the failed initial sync returns no backend, issues no media request,
+  and sends exactly one logout; separate registry tests pin explicit successful retention,
+  displaced-session replacement logout, and joined exactly-once shutdown/release races. This
+  closes the DAAP
   malformed-container/session-expiration box and, alongside the non-DAAP fixture, the named
   service-mock box; at that slice, the broader P3.3 behavior matrix and final implementation
   record remained open.
@@ -2306,9 +2324,11 @@ Record scope or design decisions here so deferred work is explicit.
   compact grouped keys and then load only rows under the resolved exact title or artist; album
   results reuse the same effective-artist predicate. At PR #114 this decision closed stable
   aggregate and lookup behavior only; it did not yet make `LocalBackend` the shipping integration
-  seam or change the invalid database track-UUID fallback. The current P3.2 completion slice now
-  closes the complete-catalogue seam, while typed/persisted `TrackId` migration, local/playlist
-  ID-at-use resolution, and broader source lifecycle integration remain P3.1 work.
+  seam or change the invalid database track-UUID fallback. PR #116 subsequently closed the
+  complete-catalogue seam, and PR #120 preserved exact persisted `TrackId` strings, removed the
+  random fallback, and added exact local/playlist ID-at-use resolution. Current-root authority,
+  containment, retention through output consumption, and broader source lifecycle integration
+  remain P3.1 work.
 
 - 2026-07-10 — Implemented P0.1, P0.3-P0.6, and P0.8 in PR #68. P0.7's
   workflow contract is implemented, but its live manual-dispatch acceptance test requires a
@@ -2869,7 +2889,7 @@ Add one line per completed task:
 | 2026-07-17 | P2.11 real-GStreamer fake-backend path (partial) | PR #109 | Process-isolated DAAP- and Subsonic-shaped typed requests traverse the production Player, protected loopback proxy, HTTP source, FLAC decoder, and fakesink to generation-owned EOS while preserving exact upstream request and direct-source-policy contracts. Packaged Windows source-policy and live playback remain open. |
 | 2026-07-17 | P2.11 packaged Windows runtime proof (partial) | PR #110 | The completed Windows distribution computes a bounded, non-executing PE-import closure over the app/scanner/all plugins and each copied runtime, with a singleton Soup direct-edge gate and batched absolute architecture-local `llvm-readobj` processes; this replaces an ARM64 `ldd` hang while retaining exact recursive copying and no broad runtime sweep. It co-locates and directly preflights its exact scanner without probe-only DLL search help, then runs its own hidden early-startup probe with sanitized runtime/proxy state and a fresh external registry before ZIP creation. Native x86_64 and ARM64 CI both prove bundle-only factory/decoder provenance, real protected-ticket FLAC decode/EOS, exact direct/zero-retry/30-second source policy, zero poisoned-proxy connections, and alternate-source fail-closed behavior under Rust and process-level deadlines. Live packaged DAAP/Subsonic playback remains open. |
 | 2026-07-17 | P3.1 source identity/lifecycle architecture | PR #113 | Records location-independent `(SourceId, TrackId)` media identity, an exact legacy-array-to-versioned-envelope saved-source migration with atomic replacement and fail-closed conflict quarantine, one registry-owned operation/session lifecycle, deterministic per-view radio locator ownership, playback-time locator resolution, exactly-once DAAP retirement, adapter-specific rules for every source kind, and staged completion tests. This closes only the two architecture decision boxes; runtime migration remains open. Independent review found and resolved two design ambiguities before the full exact-toolchain/native/package matrix passed in runs 29605029668 and 29605032344. |
-| 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the implementation-head exact-toolchain/native/package matrix passed. A documentation rerun exposed and fixed a pre-existing terminal MPD enqueue/wake race; replacement static run 29614521885 and complete matrix 29614525132 passed every job. At PR #114 the common `LocalBackend` catalogue seam and final P3.2 record remained open; the completion row below closes both, while invalid persisted `TrackId` repair remains P3.1 work. |
+| 2026-07-17 | P3.2 stable local aggregates (partial) | PR #114 | Local tracks, artist listings, and album listings share private versioned, domain-separated, length-framed UUIDv5 identities over exact metadata. Album grouping, counts, and stats use exact title plus effective album artist with Unicode-blank fallback and deterministic metadata minima. Both formerly unsupported by-ID methods resolve compact keys, narrow SQL to exact title/artist, reuse the grouping predicate, order deterministically, and return empty for unknown IDs. Four focused backend tests, all 243 local tests, the 759-test debug repository suite, static analysis, and the implementation-head exact-toolchain/native/package matrix passed. A documentation rerun exposed and fixed a pre-existing terminal MPD enqueue/wake race; replacement static run 29614521885 and complete matrix 29614525132 passed every job. At PR #114 the common `LocalBackend` catalogue seam, final P3.2 record, and invalid persisted `TrackId` repair remained open. PR #116 closed the first two; PR #120 later preserved the exact persisted string and removed the random fallback under P3.1. |
 | 2026-07-17 | P2.11 packaged-probe teardown hardening (follow-up) | PR #114 | Separates pre-NULL cancellation from final listener stop, keeps poison observation live through NULL, and drains/counts queued accepts before join. Only narrowly classified incomplete-header EOF/reset/abort outcomes may cancel; semantic request, accept, and response-write failures remain fatal even during teardown. Four Windows tests pin classification, synchronized clean-versus-malformed behavior, and the accepted/queued poison window. x86_64 runs the unit tests, while ARM64 compiles the code and executes the production probe during packaging. This hardens the already-complete packaged proof and leaves checklist arithmetic unchanged. |
 | 2026-07-17 | P2.11 Windows distribution-path repair (follow-up) | PR #115 | Resolves the caller-relative bundle immediately after creation through PowerShell's FileSystem provider and retains its physical `ProviderPath`, preventing `.NET` PE inspection from using a stale process working directory and preventing custom PSDrive names from escaping into native tools. Static ordering and live PowerShell regressions cover a changed `$PWD`, repository spaces, and custom FileSystem PSDrives. Full debug/release suites pass 761 tests per profile, all 30 focused platform-runtime tests pass in both profiles, and strict Clippy is clean. CI run 29615869107 passed every job, including both native finished bundles; the live packaged DAAP/Subsonic playback box remains open, so checklist arithmetic is unchanged. |
 | 2026-07-17 | P3.2 shared catalogue backend completion | PR #116 | Adds object-safe complete-track catalogue access and removes every backend-specific `all_tracks` bypass. Scanner snapshots construct `LocalBackend`; local, environment, manual, discovery, Subsonic, Jellyfin, Plex, and DAAP publication all enter one explicit `&dyn MediaBackend` adapter. Concrete authentication and protected-media/session retention intentionally remain under P3.1. The production passwordless DAAP catalogue-error branch logs out and invokes the paired user-error/GTK-cleanup helper; focused coverage pins that helper's paired emissions without claiming to synthesize a catalogue failure. Together with PR #114's aggregate work, this closes P3.2's final two boxes. Its base-branch validation is recorded above. |
@@ -2878,4 +2898,4 @@ Add one line per completed task:
 | 2026-07-17 | P3.4 recycled-row and UI-generation harnesses (partial) | PR #119 | Closes the GTK recycling/stale-callback and stale artwork/source-result boxes within the combined P3.4 completion. Sidebar setup installs one parameterized production `GAction`; factory bind replaces its typed current-source target and unbind revokes it. Its headless repeated-recycle harness proves no historical delete/disconnect/menu callback survives. A synchronized loopback fixture drives the real persistent artwork worker across an in-flight generation replacement, and the production source cache/eviction boundary rejects reversed same-key loaded and missing callbacks while retaining cache-only publication for an inactive newest request. |
 | 2026-07-17 | P3.4 playback/output lifecycle completion | PR #119 | Completes the playback-session, output-transfer/reselect, and final implementation-record boxes. Production now shares exact `ListModel` queue capture, current-item direct load/retry, and clear-before-Stop ownership boundaries; the headless harness survives sort/filter/source-projection replacement while preserving local B→C→B identity and rejecting stale events. A validated output-slot transaction makes exact reselection inert, parks/restores only an exact Local output, clears before stopping/dropping remote outputs, preserves playback on invalid or wrong-parked-type replacement, and removes the throwaway MPD parking worker. Recording Local/MPD/Chromecast outputs prove rejection retry, remote replacement, exact Local restoration, and complete cleanup. The final rebased branch passes 797 tests per profile and strict Clippy in both profiles. |
 | 2026-07-17 | P3.1 exact local ID-at-use resolution (partial) | PR #120 (`81db425`) | Preserves each SQLite `tracks.id` byte-for-byte in local and playlist UI/queue identity, replaces random malformed-UUID fallback with a frozen deterministic compatibility projection, removes file locators from local/playlist queue items, and resolves the exact current database row plus five-second regular-file evidence before initial, newly navigated, repeated, or receiver-targeted output loads. Exact-generation completion suppresses stale async results and missing, empty, dead, timed-out, or deleted IDs never use metadata/path fallback. Focused resolver, queue, GObject, and model-conversion tests plus strict full debug/release suites cover the slice. Acquisition of the current root, containment proof, exact file authority, and retention through full output consumption remain open, so that compound task remains unchecked. |
-| 2026-07-17 | P3.1 stable identity runtime | PR #120 (`79b9d0c`, `9bf87db`, `8232d90`, `432b66b`, `269eb93`, `4bb27a3`) | Freezes typed source/media/view identity and a strict atomic saved-source migration; replaces URL ownership with persisted or deterministic `SourceId` across standard and DAAP flows; preserves exact bounded native IDs for every remote adapter; and adopts source-scoped `MediaKey` plus playlist/radio `ViewOrigin` in playback. Reserved nil/local/radio IDs quarantine hostile saved input; repeated Add reuses the saved owner, discovered-to-saved promotion persists the already-published ID before changing presentation, and saved-plus-env startup authenticates under the stored ID; a prefixed reversible segment round-trips even native `.`/`..` IDs through stream and artwork references. Accepted reconnect publications clear the transient connecting state even when the canonical owner remains connected. Removable rows use lossless mount-relative native identity, malformed radio IDs fail closed, and external sessions mint independent random IDs. A row carrying both saved and discovery provenance still collapses those facts into `manually_added`, so Delete cannot yet demote it to a still-live discovered row and discovery loss can still retire the saved owner; that remains part of the open centralized-lifecycle task. Focused migration, registry, adapter, queue, removable, radio, and source-object regressions plus strict full debug/release validation cover the completed stable-ID compound box. Centralized lifecycle/provenance, nonlocal at-use locators, and acquisition/containment/retention of local root/file authority remain open. |
+| 2026-07-17 | P3.1 stable identity runtime | PR #120 (`79b9d0c`, `9bf87db`, `8232d90`, `432b66b`, `269eb93`, `4bb27a3`) | Freezes typed source/media/view identity and a strict atomic saved-source migration; replaces URL ownership with persisted or deterministic `SourceId` across standard and DAAP flows; preserves exact bounded native IDs for every remote adapter; and adopts source-scoped `MediaKey` plus playlist/radio `ViewOrigin` in playback. Version-1 rows accept only random RFC UUIDv4 IDs or their exact canonical remote UUIDv5 owner, preventing crafted values from claiming another endpoint, backend, built-in, or removable identity. Repeated Add reuses the saved owner, discovered-to-saved promotion persists the already-published ID and retains its ephemeral advertised route for the immediate route-aware connection, and saved-plus-env startup authenticates under the stored ID; a prefixed reversible segment round-trips even native `.`/`..` IDs through stream and artwork references. Accepted reconnect publications clear the transient connecting state even when the canonical owner remains connected. Removable rows use frozen lossless mount-relative native identity, malformed radio IDs fail closed, and external sessions mint independent random IDs. A row carrying both saved and discovery provenance still collapses those facts into `manually_added`, so Delete cannot yet demote it to a still-live discovered row and discovery loss can still retire the saved owner; that remains part of the open centralized-lifecycle task. Focused migration, route, registry, exact-native-ID adapter, queue, removable, radio, and source-object regressions cover the completed stable-ID compound box; the accepted head passed strict full debug/release validation, and the final three-test independent-review follow-up passes the complete debug gate pending its integration-head release rerun. Centralized lifecycle/provenance, nonlocal at-use locators, and acquisition/containment/retention of local root/file authority remain open. |

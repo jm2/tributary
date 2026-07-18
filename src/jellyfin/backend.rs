@@ -635,10 +635,14 @@ mod tests {
 
         let track = jellyfin_item_to_track(
             &item,
-            TrackId::remote("item-id").expect("track ID"),
+            TrackId::remote("track-id").expect("track ID"),
             Uuid::new_v4(),
             None,
             None,
+        );
+        assert_eq!(
+            track.native_track_id.as_ref().map(TrackId::as_str),
+            Some("track-id")
         );
         assert!(track.stream_url.is_none());
         assert!(track.cover_art_url.is_none());
@@ -831,6 +835,7 @@ mod tests {
             .native_track_id
             .clone()
             .expect("fixture track retains its native ID");
+        assert_eq!(first_id.as_str(), "track-0");
         drop(cache);
         assert_eq!(
             backend

@@ -948,6 +948,7 @@ mod tests {
             .native_track_id
             .clone()
             .expect("fixture track retains its native ID");
+        assert_eq!(first_id.as_str(), "track-0");
         drop(cache);
         assert_eq!(
             backend

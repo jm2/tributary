@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
-use uuid::Uuid;
+use uuid::{Uuid, Variant, Version};
 
 /// Frozen namespace for deterministic application source identifiers.
 pub const SOURCE_ID_NAMESPACE: Uuid = Uuid::from_u128(0xc931_938b_1524_4c8f_b63a_abfa_86ce_36f1);
@@ -95,6 +95,28 @@ impl SourceId {
     /// able to impersonate.
     pub fn is_reserved_remote(self) -> bool {
         self.0.is_nil() || self == Self::local() || self == Self::radio_browser()
+    }
+
+    /// Whether a saved remote may claim this identity for one exact endpoint.
+    ///
+    /// New manual sources persist random RFC UUIDv4 values. Legacy,
+    /// environment, and discovered sources use the one deterministic UUIDv5
+    /// derived from their canonical backend/endpoint pair. No other UUID
+    /// version or deterministic owner may enter saved configuration, which
+    /// prevents a crafted file from impersonating another remote, a built-in
+    /// source, or a removable filesystem.
+    pub fn is_valid_persisted_remote_for(self, backend: &str, base_url: &Url) -> bool {
+        let Ok(deterministic) = Self::remote(backend, base_url) else {
+            return false;
+        };
+        if self.0.get_variant() != Variant::RFC4122 {
+            return false;
+        }
+        match self.0.get_version() {
+            Some(Version::Random) => true,
+            Some(Version::Sha1) => self == deterministic,
+            _ => false,
+        }
     }
 
     fn deterministic(input: &[u8]) -> Self {
@@ -361,6 +383,12 @@ mod tests {
                 .to_string(),
             "86e16344-b0ec-5aeb-a798-2d5f401538d2"
         );
+        assert_eq!(
+            SourceId::removable("device:uuid:01234567-89ab-cdef-0123-456789abcdef")
+                .expect("removable source ID")
+                .to_string(),
+            "e50231dc-08f9-567a-9564-c73a2deb12f4"
+        );
     }
 
     #[test]
@@ -375,6 +403,31 @@ mod tests {
         )
         .expect("remote ID")
         .is_reserved_remote());
+    }
+
+    #[test]
+    fn persisted_remote_identity_accepts_only_random_or_its_exact_endpoint_owner() {
+        let endpoint = Url::parse("https://music.example.test/base").expect("endpoint");
+        let exact = SourceId::remote("subsonic", &endpoint).expect("endpoint owner");
+        assert!(SourceId::random().is_valid_persisted_remote_for("subsonic", &endpoint));
+        assert!(exact.is_valid_persisted_remote_for("subsonic", &endpoint));
+
+        let other_endpoint = SourceId::remote(
+            "subsonic",
+            &Url::parse("https://other.example.test/base").expect("other endpoint"),
+        )
+        .expect("other endpoint owner");
+        assert!(!other_endpoint.is_valid_persisted_remote_for("subsonic", &endpoint));
+        assert!(!exact.is_valid_persisted_remote_for("plex", &endpoint));
+        assert!(!SourceId::local().is_valid_persisted_remote_for("subsonic", &endpoint));
+        assert!(!SourceId::radio_browser().is_valid_persisted_remote_for("subsonic", &endpoint));
+        assert!(!SourceId::removable("device:fixture")
+            .expect("removable owner")
+            .is_valid_persisted_remote_for("subsonic", &endpoint));
+        assert!(
+            !SourceId::from_uuid(Uuid::from_u128(0x0000_0000_0000_1000_8000_0000_0000_0001))
+                .is_valid_persisted_remote_for("subsonic", &endpoint)
+        );
     }
 
     #[test]
@@ -469,6 +522,18 @@ mod tests {
         let path = root.join(std::ffi::OsString::from_vec(vec![b'a', 0xff, b'.', b'f']));
         let identity = TrackId::removable_relative(root, &path).expect("native identity");
         assert_eq!(identity.as_str(), "unix:61ff2e66");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removable_track_identity_preserves_unpaired_utf16_code_units() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let root = Path::new(r"C:\media\device");
+        let native_name = std::ffi::OsString::from_wide(&[0x0061, 0xd800, 0x002e, 0x0066]);
+        let identity =
+            TrackId::removable_relative(root, &root.join(native_name)).expect("native identity");
+        assert_eq!(identity.as_str(), "windows-utf16le:610000d82e006600");
     }
 
     #[test]
