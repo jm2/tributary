@@ -22,6 +22,9 @@ mod imp {
         /// Distinguishes an explicitly supplied (even malformed/empty) native
         /// identifier from UI-only rows that deliberately use their URI.
         pub has_explicit_track_id: Cell<bool>,
+        /// Non-secret lifecycle epoch that published an authenticated remote
+        /// row. Zero means the row is not owned by a remote session.
+        pub remote_session_epoch: Cell<u64>,
         /// Identity of this concrete UI row instance. Duplicate playlist
         /// entries share `track_id` but receive distinct row IDs.
         pub row_instance_id: Cell<u64>,
@@ -195,6 +198,16 @@ impl TrackObject {
         let imp = self.imp();
         imp.track_id.replace(id.to_string());
         imp.has_explicit_track_id.set(true);
+    }
+
+    pub(crate) fn remote_session_epoch(&self) -> Option<u64> {
+        let epoch = self.imp().remote_session_epoch.get();
+        (epoch != 0).then_some(epoch)
+    }
+
+    pub(crate) fn set_remote_session_epoch(&self, epoch: u64) {
+        debug_assert_ne!(epoch, 0, "lifecycle session epochs are non-zero");
+        self.imp().remote_session_epoch.set(epoch);
     }
 
     pub fn set_album_artist(&self, name: &str) {

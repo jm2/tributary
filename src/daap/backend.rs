@@ -1,27 +1,28 @@
 //! `MediaBackend` implementation for DAAP (iTunes Sharing) servers.
 //!
 //! All metadata is held in memory — nothing touches the local SQLite DB.
-//! The full library is fetched during [`DaapBackend::connect`] and
-//! cached for fast browsing. Cached tracks contain credential-free
-//! `daap://` references; the live retained session resolves those to typed,
-//! credential-isolated HTTP requests immediately before media is consumed.
+//! Login and catalogue loading are separate lifecycle stages. Cached tracks
+//! retain only stable native identities; the central registry resolves those
+//! against the exact adopted session immediately before media is consumed.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 use tracing::info;
-use url::Url;
 use uuid::Uuid;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::architecture::media::{MediaLease, ResolvedHttpRequest};
+use crate::architecture::media::{RemoteMediaResolver, ResolvedHttpRequest};
 use crate::architecture::models::*;
-use crate::architecture::AdvertisedHttpRoute;
+use crate::architecture::{AdvertisedHttpRoute, TrackId};
+use crate::source_lifecycle::{
+    AdapterCloseFuture, CloseAuthority, FailureCategory, LifecycleAdapter,
+};
 
-use super::client::DaapClient;
+use super::client::{DaapCatalogueScope, DaapClient};
 use super::dmap;
 
 // ---------------------------------------------------------------------------
@@ -30,6 +31,7 @@ use super::dmap;
 
 /// In-memory library cache populated from the DAAP server.
 struct LibraryCache {
+    scope: Option<DaapCatalogueScope>,
     tracks: Vec<Track>,
     albums: Vec<Album>,
     artists: Vec<Artist>,
@@ -37,16 +39,20 @@ struct LibraryCache {
     track_by_uuid: HashMap<Uuid, usize>,
     /// Tributary UUID → DAAP item ID.
     track_to_daap_id: HashMap<Uuid, u32>,
+    /// DAAP item ID → validated stream format for exact at-use resolution.
+    format_by_daap_id: HashMap<u32, String>,
 }
 
 impl LibraryCache {
     fn empty() -> Self {
         Self {
+            scope: None,
             tracks: Vec::new(),
             albums: Vec::new(),
             artists: Vec::new(),
             track_by_uuid: HashMap::new(),
             track_to_daap_id: HashMap::new(),
+            format_by_daap_id: HashMap::new(),
         }
     }
 }
@@ -57,88 +63,57 @@ impl LibraryCache {
 
 /// A DAAP backend that implements [`MediaBackend`].
 ///
-/// Create one with [`DaapBackend::connect`], which performs the DAAP
-/// handshake and fetches the full library into memory.
+/// Login and catalogue loading are deliberately separate so a server-side
+/// session enters the central lifecycle registry immediately after `mlid` is
+/// parsed and before update/database/items work begins.
 pub struct DaapBackend {
     display_name: String,
     client: DaapClient,
     cache: RwLock<LibraryCache>,
-    /// Opaque identifier embedded in UI-facing `daap://` media references.
-    /// It identifies this live session without exposing the bearer session ID.
-    session_key: Uuid,
-    /// Shared exactly-once state for explicit disconnect and controlled shutdown.
-    disconnect: std::sync::Arc<DisconnectLifecycle>,
-    /// Revokes every already-issued stream/artwork request as soon as this
-    /// stateful DAAP session loses ownership.
-    media_lease: MediaLease,
-}
-
-const SESSION_CONNECTED: u8 = 0;
-const SESSION_DISCONNECTING: u8 = 1;
-const SESSION_DISCONNECTED: u8 = 2;
-
-struct DisconnectLifecycle {
-    state: AtomicU8,
-    complete: Notify,
 }
 
 impl DaapBackend {
-    /// Connect to a DAAP server, perform the handshake, and fetch the
-    /// full library into memory.
+    /// Login to a DAAP server and return the first close-capable adapter.
     ///
     /// # Arguments
     /// * `name` — display name for the sidebar (e.g. "Living Room DAAP")
     /// * `server_url` — base URL including scheme (e.g. `http://192.168.1.50:3689`)
     /// * `password` — optional share password
-    pub async fn connect(
+    pub async fn login(
         name: &str,
         server_url: &str,
         password: Option<&str>,
     ) -> BackendResult<Self> {
-        Self::connect_with_route(name, server_url, password, None).await
+        Self::login_with_route(name, server_url, password, None).await
     }
 
     /// Connect through a retained mDNS route without replacing the advertised
     /// hostname in the DAAP origin.
-    pub(crate) async fn connect_with_route(
+    pub(crate) async fn login_with_route(
         name: &str,
         server_url: &str,
         password: Option<&str>,
         advertised_route: Option<AdvertisedHttpRoute>,
     ) -> BackendResult<Self> {
-        let client = DaapClient::connect_with_route(server_url, password, advertised_route).await?;
-
-        let backend = Self {
+        let client = DaapClient::login_with_route(server_url, password, advertised_route).await?;
+        Ok(Self {
             display_name: name.to_string(),
             client,
             cache: RwLock::new(LibraryCache::empty()),
-            session_key: Uuid::new_v4(),
-            disconnect: std::sync::Arc::new(DisconnectLifecycle {
-                state: AtomicU8::new(SESSION_CONNECTED),
-                complete: Notify::new(),
-            }),
-            media_lease: MediaLease::new(),
-        };
-
-        if let Err(error) = backend.refresh_library().await {
-            // The handshake already created a server-side session. A failed
-            // initial sync has no owner to close it later, so do that here.
-            backend.disconnect().await;
-            return Err(error);
-        }
-
-        Ok(backend)
+        })
     }
 
-    /// Fetch the entire library from the server into the in-memory cache.
-    async fn refresh_library(&self) -> BackendResult<()> {
+    /// Discover and fetch the entire catalogue after lifecycle staging.
+    pub(crate) async fn load_catalogue(&self) -> BackendResult<Vec<Track>> {
         info!("Fetching DAAP library...");
 
-        let mlit_items = self.client.fetch_tracks().await?;
+        let scope = self.client.discover_catalogue_scope().await?;
+        let mlit_items = self.client.fetch_tracks(scope).await?;
 
         let mut all_tracks = Vec::new();
         let mut track_by_uuid = HashMap::new();
         let mut track_to_daap_id = HashMap::new();
+        let mut format_by_daap_id = HashMap::new();
 
         // Aggregation maps for artists and albums.
         // Key: name (lowercased for dedup), Value: (display_name, metadata).
@@ -160,6 +135,7 @@ impl DaapBackend {
             let genre = dmap::find_string(nodes, b"asgn");
             let year = dmap::find_u16(nodes, b"asyr");
             let format = dmap::find_string(nodes, b"asfm").unwrap_or_else(|| "mp3".to_string());
+            remember_track_format(&mut format_by_daap_id, daap_id, format.clone())?;
             let bitrate = dmap::find_u16(nodes, b"asbr");
             let sample_rate = dmap::find_u32(nodes, b"assr");
 
@@ -173,12 +149,6 @@ impl DaapBackend {
             let track_uuid = deterministic_uuid(daap_id);
             let artist_uuid = deterministic_uuid_from_name(&artist_name);
             let album_uuid = deterministic_uuid_from_name(&album_title);
-
-            // Keep the session bearer credential out of long-lived UI model
-            // values. These opaque references are resolved through the live
-            // retained backend immediately before playback/artwork fetch.
-            let stream_url = self.media_reference_url("stream", daap_id, Some(&format));
-            let cover_art_url = self.media_reference_url("artwork", daap_id, None);
 
             let duration_secs = duration_ms.map(|ms| u64::from(ms) / 1000);
 
@@ -198,13 +168,13 @@ impl DaapBackend {
                 genre: genre.clone(),
                 year: year.map(i32::from),
                 file_path: None,
-                stream_url: Some(stream_url),
-                cover_art_url: Some(cover_art_url),
+                stream_url: None,
+                cover_art_url: None,
                 date_added: None,
                 date_modified,
                 bitrate_kbps: bitrate.map(u32::from),
                 sample_rate_hz: sample_rate,
-                format: Some(format),
+                format: Some(format.clone()),
                 play_count: None,
             };
 
@@ -279,92 +249,48 @@ impl DaapBackend {
 
         let mut cache = self.cache.write().await;
         *cache = LibraryCache {
+            scope: Some(scope),
             tracks: all_tracks,
             albums: all_albums,
             artists: all_artists,
             track_by_uuid,
             track_to_daap_id,
+            format_by_daap_id,
         };
 
-        Ok(())
+        Ok(cache.tracks.clone())
     }
 
-    /// Send one best-effort logout request to the DAAP server.
-    ///
-    /// Returns `true` only for the owner that initiated shutdown. Repeated
-    /// explicit disconnects and shutdown races wait for that owner and then
-    /// return `false` without issuing another request.
-    pub async fn disconnect(&self) -> bool {
-        self.media_lease.revoke();
-        let owns_logout = self
-            .disconnect
-            .state
-            .compare_exchange(
-                SESSION_CONNECTED,
-                SESSION_DISCONNECTING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok();
-
-        if owns_logout {
-            // Detach the request from this caller so cancellation cannot leave
-            // the session permanently stuck in DISCONNECTING. The shared
-            // lifecycle remains owned by the task and all waiters.
-            let client = self.client.clone();
-            let disconnect = std::sync::Arc::clone(&self.disconnect);
-            tokio::spawn(async move {
-                client.logout().await;
-                disconnect
-                    .state
-                    .store(SESSION_DISCONNECTED, Ordering::Release);
-                disconnect.complete.notify_waiters();
-            });
-        }
-
-        loop {
-            let completion = self.disconnect.complete.notified();
-            tokio::pin!(completion);
-            completion.as_mut().enable();
-            if self.disconnect.state.load(Ordering::Acquire) == SESSION_DISCONNECTED {
-                return owns_logout;
-            }
-            completion.await;
-        }
-    }
-
-    /// Opaque key identifying this particular live session.
-    pub(super) fn session_key(&self) -> Uuid {
-        self.session_key
-    }
-
-    /// Resolve one stream request from the current live session.
-    pub(super) fn stream_request_for_item(
+    async fn stream_request_for_native_id(
         &self,
-        song_id: u32,
-        format: &str,
+        track_id: &TrackId,
     ) -> BackendResult<ResolvedHttpRequest> {
-        self.ensure_connected()?;
-        self.client
-            .stream_request(song_id, format)
-            .map(|request| request.with_lease(self.media_lease.clone()))
+        let song_id = parse_daap_track_id(track_id)?;
+        let cache = self.cache.read().await;
+        let scope = cache.scope.ok_or_else(unavailable_catalogue)?;
+        let format = cache
+            .format_by_daap_id
+            .get(&song_id)
+            .ok_or_else(unavailable_catalogue)?;
+        self.client.stream_request(scope, song_id, format)
     }
 
-    /// Resolve one artwork request from the current live session.
-    pub(super) fn artwork_request_for_item(
+    async fn artwork_request_for_native_id(
         &self,
-        song_id: u32,
+        track_id: &TrackId,
     ) -> BackendResult<ResolvedHttpRequest> {
-        self.ensure_connected()?;
-        self.client
-            .cover_art_request(song_id)
-            .map(|request| request.with_lease(self.media_lease.clone()))
+        let song_id = parse_daap_track_id(track_id)?;
+        let cache = self.cache.read().await;
+        let scope = cache.scope.ok_or_else(unavailable_catalogue)?;
+        if !cache.format_by_daap_id.contains_key(&song_id) {
+            return Err(unavailable_catalogue());
+        }
+        self.client.cover_art_request(scope, song_id)
     }
 
     /// Resolve a cached application track ID for DAAP lifecycle tests.
-    ///
-    /// Production playback resolves the opaque `daap://` reference through
-    /// the retained session registry instead of exposing bearer query state.
+    /// Production playback instead carries pathless `(SourceId, TrackId,
+    /// session epoch)` identity through the central lifecycle registry.
     #[cfg(test)]
     pub(super) async fn stream_request_for_track(
         &self,
@@ -381,30 +307,67 @@ impl DaapBackend {
                 })?;
         let idx = cache.track_by_uuid[track_id];
         let format = cache.tracks[idx].format.as_deref().unwrap_or("mp3");
-        self.stream_request_for_item(*song_id, format)
+        let scope = cache.scope.ok_or_else(unavailable_catalogue)?;
+        self.client.stream_request(scope, *song_id, format)
+    }
+}
+
+fn parse_daap_track_id(track_id: &TrackId) -> BackendResult<u32> {
+    let song_id = track_id
+        .as_str()
+        .parse::<u32>()
+        .map_err(|_| unavailable_catalogue())?;
+    if song_id.to_string() != track_id.as_str() {
+        return Err(unavailable_catalogue());
+    }
+    Ok(song_id)
+}
+
+fn unavailable_catalogue() -> BackendError {
+    BackendError::ConnectionFailed {
+        message: "DAAP track is unavailable in the active catalogue".to_string(),
+        source: None,
+    }
+}
+
+/// Admit one canonical DAAP item identity. A duplicate `miid` is ambiguous:
+/// silently overwriting it could bind catalogue metadata to another row's
+/// stream, so reject the complete candidate catalogue before publication.
+fn remember_track_format(
+    formats: &mut HashMap<u32, String>,
+    daap_id: u32,
+    format: String,
+) -> BackendResult<()> {
+    if formats.contains_key(&daap_id) {
+        return Err(BackendError::ParseError {
+            message: "DAAP catalogue contains duplicate item identity".to_string(),
+            source: None,
+        });
+    }
+    formats.insert(daap_id, format);
+    Ok(())
+}
+
+#[async_trait]
+impl RemoteMediaResolver for DaapBackend {
+    async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
+        self.stream_request_for_native_id(track_id).await
     }
 
-    pub(super) fn revoke_media(&self) {
-        self.media_lease.revoke();
+    async fn resolve_artwork(
+        &self,
+        track_id: &TrackId,
+    ) -> BackendResult<Option<ResolvedHttpRequest>> {
+        self.artwork_request_for_native_id(track_id).await.map(Some)
     }
+}
 
-    fn ensure_connected(&self) -> BackendResult<()> {
-        if self.disconnect.state.load(Ordering::Acquire) != SESSION_CONNECTED {
-            return Err(BackendError::ConnectionFailed {
-                message: "DAAP source is disconnected".to_string(),
-                source: None,
-            });
-        }
-        Ok(())
-    }
-
-    fn media_reference_url(&self, kind: &str, song_id: u32, format: Option<&str>) -> Url {
-        let mut url = Url::parse(&format!("daap://{}/{kind}/{song_id}", self.session_key))
-            .expect("DAAP media reference components are always valid");
-        if let Some(format) = format {
-            url.query_pairs_mut().append_pair("format", format);
-        }
-        url
+impl LifecycleAdapter for DaapBackend {
+    fn close(self: Arc<Self>, _authority: CloseAuthority) -> AdapterCloseFuture {
+        Box::pin(async move {
+            self.client.logout().await;
+            Ok::<(), FailureCategory>(())
+        })
     }
 }
 
@@ -564,4 +527,27 @@ fn deterministic_uuid(daap_id: u32) -> Uuid {
 /// Generate a deterministic UUID from a name string (for artists/albums).
 fn deterministic_uuid_from_name(name: &str) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_URL, format!("daap:name:{name}").as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_daap_item_identity_fails_closed_without_overwriting_first_row() {
+        let mut formats = HashMap::new();
+        remember_track_format(&mut formats, 7, "flac".to_string()).expect("first identity");
+
+        let error = remember_track_format(&mut formats, 7, "mp3".to_string())
+            .expect_err("duplicate identity must reject the candidate catalogue");
+
+        assert!(matches!(
+            error,
+            BackendError::ParseError {
+                ref message,
+                source: None
+            } if message == "DAAP catalogue contains duplicate item identity"
+        ));
+        assert_eq!(formats.get(&7).map(String::as_str), Some("flac"));
+    }
 }

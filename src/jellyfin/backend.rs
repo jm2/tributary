@@ -5,9 +5,10 @@
 //! exposes it through the unified `MediaBackend` trait.
 
 use std::collections::HashMap;
+use std::sync::RwLock as SyncRwLock;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 use uuid::Uuid;
 
@@ -69,12 +70,14 @@ impl LibraryCache {
 
 /// A Jellyfin backend that implements [`MediaBackend`].
 ///
-/// Create one with [`JellyfinBackend::connect`] (API key) or
-/// [`JellyfinBackend::from_client`] (pre-authenticated client).
+/// Create one with [`JellyfinBackend::connect`] for a durable API key. An
+/// interactive AuthenticateByName client enters through the crate-private,
+/// synchronous lifecycle staging constructor.
 pub struct JellyfinBackend {
     display_name: String,
     client: JellyfinClient,
-    music_libraries: Vec<MusicLibrary>,
+    music_libraries: SyncRwLock<Vec<MusicLibrary>>,
+    initialized: Mutex<bool>,
     cache: RwLock<LibraryCache>,
 }
 
@@ -107,28 +110,48 @@ impl JellyfinBackend {
         Self::init(name, client).await
     }
 
-    /// Build from a pre-authenticated `JellyfinClient` (e.g. after
-    /// interactive login via `JellyfinClient::authenticate`).
-    pub async fn from_client(name: &str, client: JellyfinClient) -> BackendResult<Self> {
-        Self::init(name, client).await
+    /// Synchronously transfer an AuthenticateByName client into an adapter.
+    /// No network work may occur between token minting and lifecycle staging;
+    /// ping/discovery/catalogue loading runs later under the staged owner.
+    pub(crate) fn stage_authenticated(name: &str, client: JellyfinClient) -> Self {
+        Self::staged(name, client)
     }
 
     /// Shared initialisation: ping, discover, fetch library.
     async fn init(name: &str, client: JellyfinClient) -> BackendResult<Self> {
-        client.get_text("System/Ping").await?;
-        info!(server = %client.base_url(), "Jellyfin ping OK");
+        let backend = Self::staged(name, client);
+        backend.ensure_initialized().await?;
+        Ok(backend)
+    }
 
-        let mut backend = Self {
+    fn staged(name: &str, client: JellyfinClient) -> Self {
+        Self {
             display_name: name.to_string(),
             client,
-            music_libraries: Vec::new(),
+            music_libraries: SyncRwLock::new(Vec::new()),
+            initialized: Mutex::new(false),
             cache: RwLock::new(LibraryCache::empty()),
-        };
+        }
+    }
 
-        backend.music_libraries = backend.discover_music_libraries().await?;
-        backend.refresh_library().await?;
+    /// Complete all post-construction work once, after the lifecycle registry
+    /// has staged the adapter behind mandatory retirement.
+    pub(crate) async fn ensure_initialized(&self) -> BackendResult<()> {
+        let mut initialized = self.initialized.lock().await;
+        if *initialized {
+            return Ok(());
+        }
+        self.client.get_text("System/Ping").await?;
+        info!(server = %self.client.base_url(), "Jellyfin ping OK");
 
-        Ok(backend)
+        let libraries = self.discover_music_libraries().await?;
+        self.refresh_library(&libraries).await?;
+        *self
+            .music_libraries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = libraries;
+        *initialized = true;
+        Ok(())
     }
 
     /// Discover music-only libraries.
@@ -166,7 +189,7 @@ impl JellyfinBackend {
     }
 
     /// Fetch the entire music library into the in-memory cache.
-    async fn refresh_library(&self) -> BackendResult<()> {
+    async fn refresh_library(&self, music_libraries: &[MusicLibrary]) -> BackendResult<()> {
         info!("Fetching Jellyfin library...");
 
         let user_id = self.client.user_id().to_string();
@@ -179,7 +202,7 @@ impl JellyfinBackend {
         let mut track_artwork_locator_by_track_id = HashMap::new();
         let mut skipped_invalid_track_ids = 0usize;
 
-        for lib in &self.music_libraries {
+        for lib in music_libraries {
             let items_ep = items_endpoint.clone();
             let lib_id = lib.id.clone();
 
@@ -341,8 +364,15 @@ impl JellyfinBackend {
     }
 
     /// Return the music libraries discovered during init.
-    pub fn music_libraries(&self) -> &[MusicLibrary] {
-        &self.music_libraries
+    pub fn music_libraries(&self) -> Vec<MusicLibrary> {
+        self.music_libraries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) async fn logout_owned_session(&self) -> BackendResult<()> {
+        self.client.logout_owned_session().await
     }
 }
 

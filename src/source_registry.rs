@@ -1,878 +1,975 @@
-//! Ownership registry for standard remote media sources.
+//! Production lifecycle service for authenticated remote sources.
 //!
-//! Remote library rows carry only opaque, credential-free references. The
-//! backend that can turn those references into authenticated requests stays in
-//! this process-owned registry and is consulted only when media is consumed.
+//! This is the single owner for Subsonic, Jellyfin, Plex, and DAAP adapters.
+//! Catalogue rows and playback queues retain `(SourceId, TrackId)` plus the
+//! non-secret session epoch that published them; URLs, credentials, resolver
+//! maps, random lease keys, and DAAP session keys stay out of UI state.
 
-use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
 
-use url::Url;
-use uuid::Uuid;
-
-use crate::architecture::media::{MediaLease, RemoteMediaResolver, ResolvedHttpRequest};
+use crate::architecture::backend::{BackendResult, MediaBackend};
+use crate::architecture::error::BackendError;
+use crate::architecture::media::{RemoteMediaResolver, ResolvedHttpRequest};
+use crate::architecture::models::Track;
 use crate::architecture::{SourceId, TrackId};
+use crate::source_lifecycle::{
+    AdapterCloseFuture, AdapterTaskResult, CloseAuthority, ConstructionCancellationPolicy,
+    FailureCategory, LifecycleAdapter, LifecycleBaseline, LifecycleSnapshot, ProvenanceClaimId,
+    RefreshTaskResult, RetirementWaiter, ShutdownBarrier, SourceLifecycleRegistry,
+    SourceProvenance,
+};
 
-const MEDIA_REFERENCE_SCHEME: &str = "tributary-remote";
-const MEDIA_TRACK_SEGMENT_PREFIX: &str = "id-";
+type CatalogueFuture = Pin<Box<dyn Future<Output = BackendResult<Vec<Track>>> + Send + 'static>>;
 
-#[derive(Clone, Copy, Default, Eq, PartialEq)]
-enum RegistryGate {
-    #[default]
-    Running,
-    ShuttingDown,
+/// Heterogeneous operational contract stored by one lifecycle registry.
+pub trait ManagedRemoteAdapter:
+    MediaBackend + RemoteMediaResolver + LifecycleAdapter + Send + Sync
+{
+    /// Load the first complete catalogue after construction is staged.
+    fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture;
 }
 
-struct ActiveSource {
-    generation: u64,
-    lease_key: Uuid,
-    media_lease: MediaLease,
-}
-
-struct LeaseOwner {
-    source_id: SourceId,
-    generation: u64,
-    media_lease: MediaLease,
-    resolver: Arc<dyn RemoteMediaResolver>,
-}
-
-#[derive(Default)]
-struct SourceRegistry {
-    gate: RegistryGate,
-    next_generation: u64,
-    latest_generation: HashMap<SourceId, u64>,
-    pending_attempts: HashSet<(SourceId, u64)>,
-    by_source: HashMap<SourceId, ActiveSource>,
-    by_lease: HashMap<Uuid, LeaseOwner>,
-}
-
-fn registry() -> &'static Mutex<SourceRegistry> {
-    static REGISTRY: OnceLock<Mutex<SourceRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(SourceRegistry::default()))
-}
-
-fn lock_registry() -> MutexGuard<'static, SourceRegistry> {
-    registry()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// A generation registered before remote authentication/network I/O starts.
-/// Dropping an unfinished attempt removes it and restores any still-active
-/// predecessor as the current owner.
-pub struct ConnectionAttempt {
-    source_id: SourceId,
-    generation: u64,
-    completed: bool,
-}
-
-impl ConnectionAttempt {
-    /// Whether this attempt is still the newest allowed owner for its source.
-    pub fn is_latest(&self) -> bool {
-        let sources = lock_registry();
-        sources.gate == RegistryGate::Running
-            && sources.latest_generation.get(&self.source_id) == Some(&self.generation)
-    }
-
-    /// Retain a resolver if this connection attempt still owns the source.
-    /// A replacement immediately revokes requests and references issued by the
-    /// old lease, even when the source key is reused for a new login.
-    pub fn retain(mut self, resolver: Arc<dyn RemoteMediaResolver>) -> Option<RetainedSource> {
-        let mut sources = lock_registry();
-        sources
-            .pending_attempts
-            .remove(&(self.source_id, self.generation));
-        self.completed = true;
-
-        let accepted = sources.gate == RegistryGate::Running
-            && sources.latest_generation.get(&self.source_id) == Some(&self.generation);
-        if !accepted {
-            return None;
-        }
-
-        if let Some(previous) = sources.by_source.remove(&self.source_id) {
-            previous.media_lease.revoke();
-            sources.by_lease.remove(&previous.lease_key);
-        }
-
-        // UUID v4 collisions are vanishingly unlikely, but a registry key is
-        // still selected under the lock and checked rather than overwriting a
-        // live lease if one ever occurs.
-        let lease_key = loop {
-            let candidate = Uuid::new_v4();
-            if !sources.by_lease.contains_key(&candidate) {
-                break candidate;
+macro_rules! standard_remote_adapter {
+    ($adapter:ty) => {
+        impl LifecycleAdapter for $adapter {
+            fn close(self: Arc<Self>, _authority: CloseAuthority) -> AdapterCloseFuture {
+                Box::pin(async { Ok(()) })
             }
-        };
-        let media_lease = MediaLease::new();
+        }
 
-        sources.by_source.insert(
-            self.source_id,
-            ActiveSource {
-                generation: self.generation,
-                lease_key,
-                media_lease: media_lease.clone(),
-            },
-        );
-        sources.by_lease.insert(
-            lease_key,
-            LeaseOwner {
-                source_id: self.source_id,
-                generation: self.generation,
-                media_lease,
-                resolver,
-            },
-        );
+        impl ManagedRemoteAdapter for $adapter {
+            fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
+                Box::pin(
+                    async move { crate::architecture::load_track_catalog(self.as_ref()).await },
+                )
+            }
+        }
+    };
+}
 
-        Some(RetainedSource {
-            source_id: self.source_id,
-            generation: self.generation,
-            lease_key,
+standard_remote_adapter!(crate::subsonic::SubsonicBackend);
+// Plex's legacy auth token is a durable credential, not a revocable server
+// session: its documented revocation mechanisms are account/device-wide, so
+// Tributary has no safe per-adapter close authority. Constructors may therefore
+// be aborted, while disconnect only revokes local media/session authority.
+standard_remote_adapter!(crate::plex::PlexBackend);
+
+impl LifecycleAdapter for crate::jellyfin::JellyfinBackend {
+    fn close(self: Arc<Self>, _authority: CloseAuthority) -> AdapterCloseFuture {
+        Box::pin(async move {
+            self.logout_owned_session()
+                .await
+                .map_err(|error| failure_category(&error))
         })
     }
 }
 
-impl Drop for ConnectionAttempt {
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-
-        let mut sources = lock_registry();
-        sources
-            .pending_attempts
-            .remove(&(self.source_id, self.generation));
-        if sources.gate == RegistryGate::Running
-            && sources.latest_generation.get(&self.source_id) == Some(&self.generation)
-        {
-            if let Some(active_generation) = sources
-                .by_source
-                .get(&self.source_id)
-                .map(|source| source.generation)
-            {
-                sources
-                    .latest_generation
-                    .insert(self.source_id, active_generation);
-            } else {
-                sources.latest_generation.remove(&self.source_id);
-            }
-        }
+impl ManagedRemoteAdapter for crate::jellyfin::JellyfinBackend {
+    fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
+        Box::pin(async move {
+            self.ensure_initialized().await?;
+            crate::architecture::load_track_catalog(self.as_ref()).await
+        })
     }
 }
 
-/// Proof that one standard remote source owns a generation and opaque lease.
+mod sealed {
+    pub trait AbortableRemoteAdapter {}
+}
+
+/// Marker for constructors whose cancellation cannot strand lifecycle-owned,
+/// individually closeable server state. DAAP and interactive Jellyfin login
+/// deliberately cannot satisfy it. Plex's legacy durable credential has no
+/// safe per-token close operation and is documented separately above.
+pub trait AbortableRemoteAdapter: ManagedRemoteAdapter + sealed::AbortableRemoteAdapter {}
+
+macro_rules! abortable_remote_adapter {
+    ($adapter:ty) => {
+        impl sealed::AbortableRemoteAdapter for $adapter {}
+        impl AbortableRemoteAdapter for $adapter {}
+    };
+}
+
+abortable_remote_adapter!(crate::subsonic::SubsonicBackend);
+abortable_remote_adapter!(crate::plex::PlexBackend);
+
+impl ManagedRemoteAdapter for crate::daap::DaapBackend {
+    fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
+        Box::pin(async move { self.load_catalogue().await })
+    }
+}
+
+/// Cloneable application service around the centralized lifecycle authority.
 #[derive(Clone)]
-pub struct RetainedSource {
-    source_id: SourceId,
-    generation: u64,
-    lease_key: Uuid,
+pub struct RemoteSourceRegistry {
+    lifecycle: SourceLifecycleRegistry<dyn ManagedRemoteAdapter, Vec<Track>>,
 }
 
-impl RetainedSource {
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub fn lease_key(&self) -> Uuid {
-        self.lease_key
-    }
-
-    pub fn is_current(&self) -> bool {
-        is_current_source(self.source_id, self.generation, self.lease_key)
-    }
-}
-
-/// Register source ownership before starting authentication or other network
-/// I/O. Returns `None` after controlled shutdown closes the registry gate.
-pub fn begin_connect(source_id: SourceId) -> Option<ConnectionAttempt> {
-    let mut sources = lock_registry();
-    if sources.gate != RegistryGate::Running {
-        return None;
-    }
-
-    sources.next_generation = sources.next_generation.wrapping_add(1).max(1);
-    let generation = sources.next_generation;
-    sources.latest_generation.insert(source_id, generation);
-    sources.pending_attempts.insert((source_id, generation));
-
-    Some(ConnectionAttempt {
-        source_id,
-        generation,
-        completed: false,
-    })
-}
-
-/// Revoke the active lease and invalidate pending attempts for one source.
-pub fn release_source(source_id: SourceId) -> bool {
-    let mut sources = lock_registry();
-    sources.latest_generation.remove(&source_id);
-    let Some(source) = sources.by_source.remove(&source_id) else {
-        return false;
-    };
-    source.media_lease.revoke();
-    sources.by_lease.remove(&source.lease_key);
-    true
-}
-
-/// Verify ownership carried by a queued remote-library publication.
-pub fn is_current_source(source_id: SourceId, generation: u64, lease_key: Uuid) -> bool {
-    let sources = lock_registry();
-    sources.gate == RegistryGate::Running
-        && sources
-            .by_source
-            .get(&source_id)
-            .is_some_and(|source| source.generation == generation && source.lease_key == lease_key)
-}
-
-/// Close the registry and revoke every standard remote media lease.
-pub fn begin_shutdown() {
-    let mut sources = lock_registry();
-    if sources.gate != RegistryGate::Running {
-        return;
-    }
-    sources.gate = RegistryGate::ShuttingDown;
-    sources.latest_generation.clear();
-    sources.pending_attempts.clear();
-    for source in sources.by_source.values() {
-        source.media_lease.revoke();
-    }
-    sources.by_source.clear();
-    sources.by_lease.clear();
-}
-
-/// Build an opaque playable reference. It contains no source address or
-/// credentials and is useful only while its exact registry lease is active.
-pub fn stream_reference(lease_key: Uuid, track_id: &TrackId) -> String {
-    media_reference(lease_key, MediaKind::Stream, track_id)
-}
-
-/// Build an opaque artwork reference with the same lease isolation as streams.
-pub fn artwork_reference(lease_key: Uuid, track_id: &TrackId) -> String {
-    media_reference(lease_key, MediaKind::Artwork, track_id)
-}
-
-fn media_reference(lease_key: Uuid, kind: MediaKind, track_id: &TrackId) -> String {
-    format!(
-        "{MEDIA_REFERENCE_SCHEME}://{lease_key}/{}/{}",
-        kind.path_component(),
-        encode_track_segment(track_id)
-    )
-}
-
-/// Encode an exact UTF-8 native identifier into one URL segment that cannot
-/// be interpreted as `.` or `..` by an RFC 3986 parser.
-///
-/// The fixed non-dot prefix and lowercase hex alphabet make the representation
-/// canonical, reversible, and independent of percent-decoder behavior.
-fn encode_track_segment(track_id: &TrackId) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let bytes = track_id.as_str().as_bytes();
-    let mut encoded = String::with_capacity(
-        MEDIA_TRACK_SEGMENT_PREFIX
-            .len()
-            .saturating_add(bytes.len().saturating_mul(2)),
-    );
-    encoded.push_str(MEDIA_TRACK_SEGMENT_PREFIX);
-    for &byte in bytes {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
-fn decode_track_segment(segment: &str) -> Result<TrackId, MediaReferenceError> {
-    let encoded = segment
-        .strip_prefix(MEDIA_TRACK_SEGMENT_PREFIX)
-        .ok_or(MediaReferenceError::Malformed)?;
-    if encoded.is_empty() || !encoded.len().is_multiple_of(2) {
-        return Err(MediaReferenceError::Malformed);
-    }
-
-    let mut decoded = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.as_bytes().chunks_exact(2) {
-        let high = decode_hex_nibble(pair[0]).ok_or(MediaReferenceError::Malformed)?;
-        let low = decode_hex_nibble(pair[1]).ok_or(MediaReferenceError::Malformed)?;
-        decoded.push((high << 4) | low);
-    }
-    let value = String::from_utf8(decoded).map_err(|_| MediaReferenceError::Malformed)?;
-    TrackId::remote(value).map_err(|_| MediaReferenceError::Malformed)
-}
-
-const fn decode_hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    }
-}
-
-/// Return true for references owned by this registry, including malformed
-/// ones that must fail closed instead of being passed to a media backend.
-pub fn is_media_reference(reference: &str) -> bool {
-    crate::daap::is_media_reference(reference)
-        || reference
-            .split_once(':')
-            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(MEDIA_REFERENCE_SCHEME))
-}
-
-/// Whether a playable reference is owned by one exact retained lease.
-///
-/// GTK uses this at remote-library publication time to distinguish a duplicate
-/// snapshot from a same-source replacement. A malformed or wrong-kind value
-/// fails closed and therefore cannot preserve a queue across replacement.
-pub fn stream_reference_uses_lease(reference: &str, lease_key: Uuid) -> bool {
-    parse_reference(reference, MediaKind::Stream).is_ok_and(|parsed| parsed.lease_key == lease_key)
-}
-
-/// Resolve one exact stream reference without exposing backend failures.
-pub async fn resolve_stream_reference(
-    reference: &str,
-) -> Result<ResolvedHttpRequest, MediaReferenceError> {
-    if crate::daap::is_media_reference(reference) {
-        return crate::daap::resolve_stream_reference(reference)
-            .map_err(|_| MediaReferenceError::Unavailable);
-    }
-    let parsed = parse_reference(reference, MediaKind::Stream)?;
-    let (resolver, media_lease) = resolver_for(&parsed)?;
-    let request = resolver
-        .resolve_stream(&parsed.track_id)
-        .await
-        .map_err(|_| MediaReferenceError::Unavailable)?;
-    ensure_current(&parsed)?;
-    Ok(request.with_lease(media_lease))
-}
-
-/// Resolve one exact artwork reference without exposing backend failures.
-pub async fn resolve_artwork_reference(
-    reference: &str,
-) -> Result<Option<ResolvedHttpRequest>, MediaReferenceError> {
-    if crate::daap::is_media_reference(reference) {
-        return crate::daap::resolve_artwork_reference(reference)
-            .map(Some)
-            .map_err(|_| MediaReferenceError::Unavailable);
-    }
-    let parsed = parse_reference(reference, MediaKind::Artwork)?;
-    let (resolver, media_lease) = resolver_for(&parsed)?;
-    let request = resolver
-        .resolve_artwork(&parsed.track_id)
-        .await
-        .map_err(|_| MediaReferenceError::Unavailable)?;
-    ensure_current(&parsed)?;
-    Ok(request.map(|request| request.with_lease(media_lease)))
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum MediaKind {
-    Stream,
-    Artwork,
-}
-
-impl MediaKind {
-    const fn path_component(self) -> &'static str {
-        match self {
-            Self::Stream => "stream",
-            Self::Artwork => "artwork",
+impl RemoteSourceRegistry {
+    pub fn new(runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            lifecycle: SourceLifecycleRegistry::new(runtime),
         }
     }
-}
 
-struct ParsedReference {
-    lease_key: Uuid,
-    track_id: TrackId,
-}
+    pub fn subscribe_invalidations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.lifecycle.subscribe_invalidations()
+    }
 
-fn parse_reference(
-    reference: &str,
-    expected_kind: MediaKind,
-) -> Result<ParsedReference, MediaReferenceError> {
-    let parsed = Url::parse(reference).map_err(|_| MediaReferenceError::Malformed)?;
-    if parsed.scheme() != MEDIA_REFERENCE_SCHEME
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.port().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
+    pub fn claim_provenance(
+        &self,
+        source_id: SourceId,
+        provenance: SourceProvenance,
+    ) -> Option<ProvenanceClaimId> {
+        self.lifecycle.claim_provenance(source_id, provenance)
+    }
+
+    pub fn release_provenance(&self, source_id: SourceId, claim_id: ProvenanceClaimId) -> bool {
+        if !self.lifecycle.release_provenance(source_id, claim_id) {
+            return false;
+        }
+        self.lifecycle
+            .schedule_prune_after_current_retirement(source_id);
+        true
+    }
+
+    pub fn snapshot(&self, source_id: SourceId) -> Option<LifecycleSnapshot<Vec<Track>>> {
+        self.lifecycle.snapshot(source_id)
+    }
+
+    /// Spawn one standard remote constructor under the only permitted
+    /// abortable policy. The generation is minted synchronously before any
+    /// network future can be queued.
+    pub fn connect_standard<A, OnGeneration, Authenticate, AuthenticateFuture>(
+        &self,
+        source_id: SourceId,
+        on_generation: OnGeneration,
+        authenticate: Authenticate,
+    ) -> Option<u64>
+    where
+        A: AbortableRemoteAdapter + 'static,
+        OnGeneration: FnOnce(u64),
+        Authenticate: FnOnce() -> AuthenticateFuture + Send + 'static,
+        AuthenticateFuture: Future<Output = BackendResult<A>> + Send + 'static,
     {
-        return Err(MediaReferenceError::Malformed);
+        self.spawn_connect(
+            source_id,
+            ConstructionCancellationPolicy::Abortable,
+            on_generation,
+            authenticate,
+        )
     }
 
-    let lease_key = parsed
-        .host_str()
-        .ok_or(MediaReferenceError::Malformed)?
-        .parse::<Uuid>()
-        .map_err(|_| MediaReferenceError::Malformed)?;
-    let mut segments = parsed
-        .path_segments()
-        .ok_or(MediaReferenceError::Malformed)?;
-    let kind = match segments.next() {
-        Some("stream") => MediaKind::Stream,
-        Some("artwork") => MediaKind::Artwork,
-        _ => return Err(MediaReferenceError::Malformed),
-    };
-    if kind != expected_kind {
-        return Err(MediaReferenceError::WrongKind);
-    }
-    let encoded_track_id = segments.next().ok_or(MediaReferenceError::Malformed)?;
-    let track_id = decode_track_segment(encoded_track_id)?;
-    if segments.next().is_some() {
-        return Err(MediaReferenceError::Malformed);
+    /// Connect with a pre-existing Jellyfin API key. No server-side session
+    /// is minted during construction, so cancellation may abort the future.
+    pub fn connect_jellyfin_api_key<OnGeneration, Authenticate, AuthenticateFuture>(
+        &self,
+        source_id: SourceId,
+        on_generation: OnGeneration,
+        authenticate: Authenticate,
+    ) -> Option<u64>
+    where
+        OnGeneration: FnOnce(u64),
+        Authenticate: FnOnce() -> AuthenticateFuture + Send + 'static,
+        AuthenticateFuture:
+            Future<Output = BackendResult<crate::jellyfin::JellyfinBackend>> + Send + 'static,
+    {
+        self.spawn_connect(
+            source_id,
+            ConstructionCancellationPolicy::Abortable,
+            on_generation,
+            authenticate,
+        )
     }
 
-    Ok(ParsedReference {
-        lease_key,
-        track_id,
-    })
+    /// Connect through AuthenticateByName. The constructor may mint a
+    /// revocable Jellyfin session token, so cancellation must let it finish
+    /// and transfer the synchronously staged adapter into exact logout.
+    pub fn connect_jellyfin_session<OnGeneration, Authenticate, AuthenticateFuture>(
+        &self,
+        source_id: SourceId,
+        on_generation: OnGeneration,
+        authenticate: Authenticate,
+    ) -> Option<u64>
+    where
+        OnGeneration: FnOnce(u64),
+        Authenticate: FnOnce() -> AuthenticateFuture + Send + 'static,
+        AuthenticateFuture:
+            Future<Output = BackendResult<crate::jellyfin::JellyfinBackend>> + Send + 'static,
+    {
+        self.spawn_connect(
+            source_id,
+            ConstructionCancellationPolicy::FinishConstruction,
+            on_generation,
+            authenticate,
+        )
+    }
+
+    /// Spawn a DAAP login under protected FinishConstruction. The login
+    /// future returns immediately after `mlid`; update/database/items begin
+    /// only in the registry-staged catalogue closure.
+    pub fn connect_daap<OnGeneration, Authenticate, AuthenticateFuture>(
+        &self,
+        source_id: SourceId,
+        on_generation: OnGeneration,
+        authenticate: Authenticate,
+    ) -> Option<u64>
+    where
+        OnGeneration: FnOnce(u64),
+        Authenticate: FnOnce() -> AuthenticateFuture + Send + 'static,
+        AuthenticateFuture:
+            Future<Output = BackendResult<crate::daap::DaapBackend>> + Send + 'static,
+    {
+        self.spawn_connect(
+            source_id,
+            ConstructionCancellationPolicy::FinishConstruction,
+            on_generation,
+            authenticate,
+        )
+    }
+
+    fn spawn_connect<A, OnGeneration, Authenticate, AuthenticateFuture>(
+        &self,
+        source_id: SourceId,
+        policy: ConstructionCancellationPolicy,
+        on_generation: OnGeneration,
+        authenticate: Authenticate,
+    ) -> Option<u64>
+    where
+        A: ManagedRemoteAdapter + 'static,
+        OnGeneration: FnOnce(u64),
+        Authenticate: FnOnce() -> AuthenticateFuture + Send + 'static,
+        AuthenticateFuture: Future<Output = BackendResult<A>> + Send + 'static,
+    {
+        let owner = self.lifecycle.begin_connect(source_id)?;
+        let generation = owner.generation();
+        on_generation(generation);
+        owner.spawn_staged(
+            policy,
+            move |cancellation| async move {
+                if cancellation.is_cancelled() {
+                    return AdapterTaskResult::Cancelled;
+                }
+                match authenticate().await {
+                    Ok(adapter) => constructed_adapter(adapter),
+                    Err(error) => AdapterTaskResult::Failed(failure_category(&error)),
+                }
+            },
+            move |adapter, cancellation| async move {
+                if cancellation.is_cancelled() {
+                    return RefreshTaskResult::Cancelled;
+                }
+                match adapter.load_initial_catalogue().await {
+                    Ok(tracks) => RefreshTaskResult::Refreshed(tracks),
+                    Err(error) => RefreshTaskResult::Failed(failure_category(&error)),
+                }
+            },
+        );
+        Some(generation)
+    }
+
+    pub fn disconnect(&self, source_id: SourceId) -> Option<RetirementWaiter> {
+        self.lifecycle.disconnect(source_id)
+    }
+
+    pub fn shutdown(&self) -> ShutdownBarrier {
+        self.lifecycle.shutdown()
+    }
+
+    #[cfg(test)]
+    pub fn is_shutting_down(&self) -> bool {
+        self.lifecycle.is_shutting_down()
+    }
+
+    /// Validate the exact accepted catalogue at the GTK publication boundary.
+    #[cfg(test)]
+    pub fn is_current_catalogue(
+        &self,
+        source_id: SourceId,
+        generation: u64,
+        session_epoch: u64,
+    ) -> bool {
+        self.lifecycle
+            .is_current_catalogue(source_id, generation, session_epoch)
+    }
+
+    #[cfg(test)]
+    pub fn has_session_epoch(&self, source_id: SourceId, session_epoch: u64) -> bool {
+        self.lifecycle.active_session_epoch(source_id) == Some(session_epoch)
+    }
+
+    pub fn snapshot_all(&self) -> LifecycleBaseline<Vec<Track>> {
+        self.lifecycle.snapshot_all()
+    }
+
+    pub async fn resolve_stream(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        track_id: TrackId,
+    ) -> BackendResult<ResolvedHttpRequest> {
+        self.lifecycle
+            .resolve_http(
+                source_id,
+                expected_session_epoch,
+                move |adapter| async move { adapter.resolve_stream(&track_id).await },
+            )
+            .await
+    }
+
+    pub async fn resolve_artwork(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        track_id: TrackId,
+    ) -> BackendResult<Option<ResolvedHttpRequest>> {
+        self.lifecycle
+            .resolve_optional_http(
+                source_id,
+                expected_session_epoch,
+                move |adapter| async move { adapter.resolve_artwork(&track_id).await },
+            )
+            .await
+    }
 }
 
-fn resolver_for(
-    reference: &ParsedReference,
-) -> Result<(Arc<dyn RemoteMediaResolver>, MediaLease), MediaReferenceError> {
-    let sources = lock_registry();
-    if sources.gate != RegistryGate::Running {
-        return Err(MediaReferenceError::Unavailable);
-    }
-    let owner = sources
-        .by_lease
-        .get(&reference.lease_key)
-        .ok_or(MediaReferenceError::Unavailable)?;
-    let current = sources
-        .by_source
-        .get(&owner.source_id)
-        .is_some_and(|source| {
-            source.generation == owner.generation && source.lease_key == reference.lease_key
-        });
-    if !current {
-        return Err(MediaReferenceError::Unavailable);
-    }
-    Ok((Arc::clone(&owner.resolver), owner.media_lease.clone()))
+/// Convert one concrete backend into the task result accepted by the
+/// heterogeneous lifecycle registry.
+fn constructed_adapter<A>(adapter: A) -> AdapterTaskResult<dyn ManagedRemoteAdapter>
+where
+    A: ManagedRemoteAdapter + 'static,
+{
+    AdapterTaskResult::Constructed(Box::new(adapter))
 }
 
-fn ensure_current(reference: &ParsedReference) -> Result<(), MediaReferenceError> {
-    let sources = lock_registry();
-    let Some(owner) = sources.by_lease.get(&reference.lease_key) else {
-        return Err(MediaReferenceError::Unavailable);
-    };
-    let current = sources.gate == RegistryGate::Running
-        && sources
-            .by_source
-            .get(&owner.source_id)
-            .is_some_and(|source| {
-                source.generation == owner.generation && source.lease_key == reference.lease_key
-            });
-    if current {
-        Ok(())
-    } else {
-        Err(MediaReferenceError::Unavailable)
+/// Reduce backend-specific errors to the closed categories retained by the
+/// lifecycle registry. No backend error chain crosses this boundary.
+pub fn failure_category(error: &BackendError) -> FailureCategory {
+    match error {
+        BackendError::AuthenticationFailed { .. } => FailureCategory::AuthenticationRejected,
+        BackendError::ConnectionFailed { .. } | BackendError::Io(_) => FailureCategory::Connection,
+        BackendError::Timeout { .. } => FailureCategory::Timeout,
+        BackendError::ParseError { .. } => FailureCategory::InvalidResponse,
+        BackendError::TokenAuthNotSupported { .. } => FailureCategory::UnsupportedAuthentication,
+        BackendError::NotFound { .. } => FailureCategory::UnavailableOrPermission,
+        BackendError::Unsupported { .. } | BackendError::Internal(_) => FailureCategory::Backend,
     }
 }
 
-/// Deliberately opaque: neither its display text nor its source chain contains
-/// a backend URL, credential, response body, or request reference.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MediaReferenceError {
-    Malformed,
-    WrongKind,
-    Unavailable,
+/// GTK-owned bookkeeping for the exact provenance claims minted by real
+/// Saved, Environment, and Discovery publishers.
+///
+/// This map owns only opaque claim tokens. Session, cancellation, media, and
+/// retirement authority remain exclusively in [`RemoteSourceRegistry`].
+#[derive(Clone, Default)]
+pub struct ProvenanceClaims {
+    claims: Rc<RefCell<ProvenanceClaimMap>>,
 }
 
-impl fmt::Display for MediaReferenceError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self {
-            Self::Malformed => "invalid remote media reference",
-            Self::WrongKind => "remote media reference has the wrong kind",
-            Self::Unavailable => "remote media is unavailable",
+type ProvenanceClaimKey = (SourceId, SourceProvenance, String);
+type ProvenanceClaimMap = HashMap<ProvenanceClaimKey, ProvenanceClaimId>;
+
+impl ProvenanceClaims {
+    pub fn ensure(
+        &self,
+        registry: &RemoteSourceRegistry,
+        source_id: SourceId,
+        provenance: SourceProvenance,
+        publisher: impl Into<String>,
+    ) -> bool {
+        let key = (source_id, provenance, publisher.into());
+        if self.claims.borrow().contains_key(&key) {
+            return true;
+        }
+        let Some(claim) = registry.claim_provenance(source_id, provenance) else {
+            return false;
         };
-        formatter.write_str(message)
+        self.claims.borrow_mut().insert(key, claim);
+        true
+    }
+
+    pub fn release(
+        &self,
+        registry: &RemoteSourceRegistry,
+        source_id: SourceId,
+        provenance: SourceProvenance,
+        publisher: &str,
+    ) -> bool {
+        let key = (source_id, provenance, publisher.to_string());
+        let Some(claim) = self.claims.borrow().get(&key).copied() else {
+            return false;
+        };
+        if !registry.release_provenance(source_id, claim) {
+            return false;
+        }
+        self.claims.borrow_mut().remove(&key);
+        true
+    }
+
+    #[cfg(test)]
+    pub fn contains(
+        &self,
+        source_id: SourceId,
+        provenance: SourceProvenance,
+        publisher: &str,
+    ) -> bool {
+        self.claims
+            .borrow()
+            .contains_key(&(source_id, provenance, publisher.to_string()))
     }
 }
-
-impl std::error::Error for MediaReferenceError {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use async_trait::async_trait;
+    use axum::http::{Method, StatusCode};
+    use tokio::runtime::Handle;
+    use tokio::sync::watch;
+    use tokio::time::{timeout, Duration};
+    use url::Url;
+    use uuid::Uuid;
 
-    use crate::architecture::backend::BackendResult;
-    use crate::architecture::media::{RemoteMediaResolver, ResolvedHttpRequest};
+    use crate::architecture::models::{
+        Album, Artist, LibraryStats, SearchResults, SortField, SortOrder,
+    };
+    use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
 
     use super::*;
 
-    static REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    struct MockResolver {
-        endpoint: Url,
+    struct FakeProbe {
+        close_calls: AtomicUsize,
+        stream_calls: AtomicUsize,
+        close_release: watch::Sender<bool>,
     }
 
-    struct CapturingResolver {
-        seen_streams: Arc<Mutex<Vec<TrackId>>>,
-        seen_artwork: Arc<Mutex<Vec<TrackId>>>,
-    }
+    impl FakeProbe {
+        fn new(close_released: bool) -> Arc<Self> {
+            let (close_release, _receiver) = watch::channel(close_released);
+            Arc::new(Self {
+                close_calls: AtomicUsize::new(0),
+                stream_calls: AtomicUsize::new(0),
+                close_release,
+            })
+        }
 
-    impl MockResolver {
-        fn new(marker: &str) -> Self {
-            Self {
-                endpoint: Url::parse(&format!("https://media.invalid/{marker}"))
-                    .expect("mock endpoint"),
+        fn adapter(self: &Arc<Self>, label: &'static str) -> FakeAdapter {
+            FakeAdapter {
+                label,
+                probe: Arc::clone(self),
+                close_release: self.close_release.subscribe(),
             }
         }
+
+        async fn wait_for_close_calls(&self, expected: usize) {
+            timeout(Duration::from_secs(2), async {
+                while self.close_calls.load(Ordering::Acquire) < expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("adapter close started");
+        }
+    }
+
+    struct FakeAdapter {
+        label: &'static str,
+        probe: Arc<FakeProbe>,
+        close_release: watch::Receiver<bool>,
     }
 
     #[async_trait]
-    impl RemoteMediaResolver for MockResolver {
-        async fn resolve_stream(&self, _track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
-            ResolvedHttpRequest::new(self.endpoint.clone())
+    impl MediaBackend for FakeAdapter {
+        fn name(&self) -> &str {
+            self.label
         }
 
-        async fn resolve_artwork(
+        fn backend_type(&self) -> &str {
+            "test"
+        }
+
+        async fn ping(&self) -> BackendResult<()> {
+            Ok(())
+        }
+
+        async fn search(&self, _query: &str, _limit: usize) -> BackendResult<SearchResults> {
+            Ok(SearchResults::default())
+        }
+
+        async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_albums(
             &self,
-            _media_id: &TrackId,
-        ) -> BackendResult<Option<ResolvedHttpRequest>> {
-            ResolvedHttpRequest::new(self.endpoint.clone()).map(Some)
+            _sort: SortField,
+            _order: SortOrder,
+        ) -> BackendResult<Vec<Album>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_artists(&self) -> BackendResult<Vec<Artist>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_album_tracks(&self, _album_id: &Uuid) -> BackendResult<Vec<Track>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_artist_tracks(&self, _artist_id: &Uuid) -> BackendResult<Vec<Track>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_stats(&self) -> BackendResult<LibraryStats> {
+            Ok(LibraryStats::default())
         }
     }
 
     #[async_trait]
-    impl RemoteMediaResolver for CapturingResolver {
+    impl RemoteMediaResolver for FakeAdapter {
         async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
-            self.seen_streams
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(track_id.clone());
-            ResolvedHttpRequest::new(Url::parse("https://media.invalid/exact").expect("URL"))
+            self.probe.stream_calls.fetch_add(1, Ordering::AcqRel);
+            ResolvedHttpRequest::new(
+                Url::parse(&format!(
+                    "https://media.invalid/{}/{}",
+                    self.label,
+                    track_id.as_str()
+                ))
+                .expect("fixture URL"),
+            )
         }
 
         async fn resolve_artwork(
             &self,
-            track_id: &TrackId,
+            _track_id: &TrackId,
         ) -> BackendResult<Option<ResolvedHttpRequest>> {
-            self.seen_artwork
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(track_id.clone());
-            ResolvedHttpRequest::new(Url::parse("https://media.invalid/artwork").expect("URL"))
-                .map(Some)
+            Ok(None)
         }
     }
 
-    fn reset_registry() {
-        let mut sources = lock_registry();
-        for source in sources.by_source.values() {
-            source.media_lease.revoke();
+    impl LifecycleAdapter for FakeAdapter {
+        fn close(self: Arc<Self>, _authority: CloseAuthority) -> AdapterCloseFuture {
+            self.probe.close_calls.fetch_add(1, Ordering::AcqRel);
+            let mut release = self.close_release.clone();
+            Box::pin(async move {
+                while !*release.borrow_and_update() {
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            })
         }
-        *sources = SourceRegistry::default();
     }
 
-    fn retain(source_id: SourceId, marker: &str) -> RetainedSource {
-        begin_connect(source_id)
-            .expect("connection attempt")
-            .retain(Arc::new(MockResolver::new(marker)))
-            .expect("retained source")
-    }
-
-    fn track_id() -> TrackId {
-        TrackId::remote(Uuid::new_v4().to_string()).expect("test track ID")
-    }
-
-    #[tokio::test]
-    async fn same_key_replacement_revokes_old_lease_and_reference() {
-        let _guard = REGISTRY_TEST_LOCK.lock().await;
-        reset_registry();
-        let track_id = track_id();
-        let source_id = SourceId::random();
-        let first = retain(source_id, "first");
-        let old_reference = stream_reference(first.lease_key(), &track_id);
-        let old_request = resolve_stream_reference(&old_reference)
-            .await
-            .expect("first request");
-
-        let second = retain(source_id, "second");
-        assert!(!first.is_current());
-        assert!(second.is_current());
-        assert!(!stream_reference_uses_lease(
-            &old_reference,
-            second.lease_key()
-        ));
-        assert!(!old_request.is_active());
-        assert!(matches!(
-            resolve_stream_reference(&old_reference).await,
-            Err(MediaReferenceError::Unavailable)
-        ));
-        let new_reference = stream_reference(second.lease_key(), &track_id);
-        assert!(stream_reference_uses_lease(
-            &new_reference,
-            second.lease_key()
-        ));
-        assert!(resolve_stream_reference(&new_reference)
-            .await
-            .expect("replacement request")
-            .endpoint()
-            .path()
-            .ends_with("/second"));
-        reset_registry();
-    }
-
-    #[tokio::test]
-    async fn stale_retain_cannot_replace_a_newer_attempt() {
-        let _guard = REGISTRY_TEST_LOCK.lock().await;
-        reset_registry();
-        let source_id = SourceId::random();
-        let stale = begin_connect(source_id).expect("stale attempt");
-        let current = begin_connect(source_id).expect("current attempt");
-
-        assert!(stale.retain(Arc::new(MockResolver::new("stale"))).is_none());
-        let current = current
-            .retain(Arc::new(MockResolver::new("current")))
-            .expect("current retained");
-        assert!(current.is_current());
-        reset_registry();
-    }
-
-    #[tokio::test]
-    async fn discovery_loss_invalidates_an_attempt_before_network_start() {
-        let _guard = REGISTRY_TEST_LOCK.lock().await;
-        reset_registry();
-        let source_id = SourceId::random();
-        let attempt = begin_connect(source_id).expect("queued attempt");
-
-        // No backend is active yet, but release must still retire the minted
-        // generation so a task first polled afterward cannot resurrect it.
-        assert!(!release_source(source_id));
-        assert!(!attempt.is_latest());
-        assert!(attempt
-            .retain(Arc::new(MockResolver::new("withdrawn")))
-            .is_none());
-        assert!(!lock_registry()
-            .pending_attempts
-            .iter()
-            .any(|(key, _)| *key == source_id));
-        reset_registry();
-    }
-
-    #[tokio::test]
-    async fn release_invalidates_references_and_issued_requests() {
-        let _guard = REGISTRY_TEST_LOCK.lock().await;
-        reset_registry();
-        let source_id = SourceId::random();
-        let source = retain(source_id, "released");
-        let reference = stream_reference(source.lease_key(), &track_id());
-        let request = resolve_stream_reference(&reference)
-            .await
-            .expect("issued request");
-
-        assert!(release_source(source_id));
-        assert!(!source.is_current());
-        assert!(!request.is_active());
-        assert!(matches!(
-            resolve_stream_reference(&reference).await,
-            Err(MediaReferenceError::Unavailable)
-        ));
-        reset_registry();
-    }
-
-    #[tokio::test]
-    async fn source_leases_are_collision_isolated() {
-        let _guard = REGISTRY_TEST_LOCK.lock().await;
-        reset_registry();
-        let track_id = track_id();
-        let first_source_id = SourceId::random();
-        let second_source_id = SourceId::random();
-        let first = retain(first_source_id, "first");
-        let second = retain(second_source_id, "second");
-        let first_reference = stream_reference(first.lease_key(), &track_id);
-        let second_reference = stream_reference(second.lease_key(), &track_id);
-
-        assert_ne!(first.lease_key(), second.lease_key());
-        assert!(resolve_stream_reference(&first_reference)
-            .await
-            .expect("first request")
-            .endpoint()
-            .path()
-            .ends_with("/first"));
-        assert!(resolve_stream_reference(&second_reference)
-            .await
-            .expect("second request")
-            .endpoint()
-            .path()
-            .ends_with("/second"));
-        assert!(release_source(first_source_id));
-        assert!(resolve_stream_reference(&second_reference).await.is_ok());
-        reset_registry();
-    }
-
-    #[tokio::test]
-    async fn references_expose_only_lease_kind_and_track_identity() {
-        let _guard = REGISTRY_TEST_LOCK.lock().await;
-        reset_registry();
-        let source = retain(SourceId::random(), "artwork");
-        let track_id = TrackId::remote(" Case/Sensitive + Unicode ☃").expect("test track ID");
-        let stream = stream_reference(source.lease_key(), &track_id);
-        let artwork = artwork_reference(source.lease_key(), &track_id);
-        let encoded_track_id = encode_track_segment(&track_id);
-
-        assert_eq!(
-            stream,
-            format!(
-                "{MEDIA_REFERENCE_SCHEME}://{}/stream/{encoded_track_id}",
-                source.lease_key(),
-            )
-        );
-        assert_eq!(
-            artwork,
-            format!(
-                "{MEDIA_REFERENCE_SCHEME}://{}/artwork/{encoded_track_id}",
-                source.lease_key(),
-            )
-        );
-        for reference in [&stream, &artwork] {
-            assert!(!reference.contains("private.example"));
-            assert!(!reference.contains("user"));
-            assert!(!reference.contains("secret"));
+    impl ManagedRemoteAdapter for FakeAdapter {
+        fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
+            Box::pin(async { Ok(Vec::new()) })
         }
-        assert!(resolve_stream_reference(&stream).await.is_ok());
-        assert!(resolve_artwork_reference(&artwork)
-            .await
-            .expect("artwork resolution")
-            .is_some());
-        reset_registry();
     }
 
-    #[tokio::test]
-    async fn reference_round_trip_preserves_the_exact_backend_native_id() {
-        let _guard = REGISTRY_TEST_LOCK.lock().await;
-        reset_registry();
-        let seen_streams = Arc::new(Mutex::new(Vec::new()));
-        let seen_artwork = Arc::new(Mutex::new(Vec::new()));
-        let source = begin_connect(SourceId::random())
-            .expect("connection attempt")
-            .retain(Arc::new(CapturingResolver {
-                seen_streams: Arc::clone(&seen_streams),
-                seen_artwork: Arc::clone(&seen_artwork),
-            }))
-            .expect("retained source");
-        let track_ids = [
-            TrackId::remote(".").expect("dot track ID"),
-            TrackId::remote("..").expect("dot-dot track ID"),
+    impl sealed::AbortableRemoteAdapter for FakeAdapter {}
+    impl AbortableRemoteAdapter for FakeAdapter {}
+
+    fn registry() -> RemoteSourceRegistry {
+        RemoteSourceRegistry::new(Handle::current())
+    }
+
+    async fn wait_for_catalogue(
+        registry: &RemoteSourceRegistry,
+        source_id: SourceId,
+    ) -> (u64, u64) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(catalogue) = registry
+                    .snapshot(source_id)
+                    .and_then(|snapshot| snapshot.catalogue)
+                {
+                    return (catalogue.generation, catalogue.session_epoch);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("catalogue accepted")
+    }
+
+    async fn wait_until_pruned(registry: &RemoteSourceRegistry, source_id: SourceId) {
+        timeout(Duration::from_secs(2), async {
+            while registry.snapshot(source_id).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source pruned after final retirement");
+    }
+
+    async fn wait_for_request_count(service: &MockHttpService, expected: usize) {
+        timeout(Duration::from_secs(2), async {
+            while service.requests().len() < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture received request");
+    }
+
+    #[test]
+    fn every_backend_error_maps_to_a_closed_failure_category() {
+        let cases = [
+            (
+                BackendError::AuthenticationFailed {
+                    message: "secret-free".into(),
+                },
+                FailureCategory::AuthenticationRejected,
+            ),
+            (
+                BackendError::ConnectionFailed {
+                    message: "offline".into(),
+                    source: None,
+                },
+                FailureCategory::Connection,
+            ),
+            (
+                BackendError::Io(std::io::Error::other("offline")),
+                FailureCategory::Connection,
+            ),
+            (
+                BackendError::Timeout { duration_secs: 1 },
+                FailureCategory::Timeout,
+            ),
+            (
+                BackendError::ParseError {
+                    message: "invalid".into(),
+                    source: None,
+                },
+                FailureCategory::InvalidResponse,
+            ),
+            (
+                BackendError::TokenAuthNotSupported {
+                    message: "unsupported".into(),
+                },
+                FailureCategory::UnsupportedAuthentication,
+            ),
+            (
+                BackendError::NotFound {
+                    entity_type: "track".into(),
+                    id: Uuid::nil(),
+                },
+                FailureCategory::UnavailableOrPermission,
+            ),
+            (
+                BackendError::Unsupported {
+                    operation: "fixture".into(),
+                },
+                FailureCategory::Backend,
+            ),
+            (
+                BackendError::Internal(anyhow::anyhow!("fixture")),
+                FailureCategory::Backend,
+            ),
         ];
 
-        for track_id in &track_ids {
-            let stream = stream_reference(source.lease_key(), track_id);
-            let artwork = artwork_reference(source.lease_key(), track_id);
-            assert!(!stream.contains("/./"));
-            assert!(!stream.contains("/../"));
-            assert!(!artwork.contains("/./"));
-            assert!(!artwork.contains("/../"));
-
-            resolve_stream_reference(&stream)
-                .await
-                .expect("resolve exact stream ID");
-            assert!(resolve_artwork_reference(&artwork)
-                .await
-                .expect("resolve exact artwork ID")
-                .is_some());
+        for (error, expected) in cases {
+            assert_eq!(failure_category(&error), expected);
         }
-
-        assert_eq!(
-            seen_streams
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_slice(),
-            track_ids.as_slice()
-        );
-        assert_eq!(
-            seen_artwork
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_slice(),
-            track_ids.as_slice()
-        );
-        reset_registry();
     }
 
     #[tokio::test]
-    async fn malformed_and_wrong_kind_references_fail_closed() {
-        let _guard = REGISTRY_TEST_LOCK.lock().await;
-        reset_registry();
-        let source = retain(SourceId::random(), "media");
-        let track_id = track_id();
-        let stream = stream_reference(source.lease_key(), &track_id);
-        let artwork = artwork_reference(source.lease_key(), &track_id);
-
-        assert!(is_media_reference(&stream));
-        assert!(matches!(
-            resolve_artwork_reference(&stream).await,
-            Err(MediaReferenceError::WrongKind)
-        ));
-        assert!(matches!(
-            resolve_stream_reference(&artwork).await,
-            Err(MediaReferenceError::WrongKind)
-        ));
-        for malformed in [
-            "not-a-reference",
-            "tributary-remote://%",
-            "tributary-remote:///stream/track",
-            "tributary-remote://not-a-uuid/stream/track",
-            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/",
-            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/%FF",
-            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/id-",
-            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/id-0",
-            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/id-2E",
-            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/id-ff",
-            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/track/extra",
-            "tributary-remote://00000000-0000-4000-8000-000000000001/stream/track?secret=no",
-        ] {
-            if malformed.starts_with("tributary-remote:") {
-                assert!(is_media_reference(malformed));
-            }
-            assert!(resolve_stream_reference(malformed).await.is_err());
-        }
-        reset_registry();
-    }
-
-    #[tokio::test]
-    async fn failed_new_attempt_restores_existing_owner() {
-        let _guard = REGISTRY_TEST_LOCK.lock().await;
-        reset_registry();
-        let track_id = track_id();
+    async fn generation_callback_runs_before_constructor_future_is_polled() {
+        let registry = registry();
         let source_id = SourceId::random();
-        let existing = retain(source_id, "existing");
-        let reference = stream_reference(existing.lease_key(), &track_id);
-        let failed = begin_connect(source_id).expect("replacement attempt");
-        assert!(existing.is_current());
-        assert!(resolve_stream_reference(&reference).await.is_ok());
-        drop(failed);
+        registry
+            .claim_provenance(source_id, SourceProvenance::Saved)
+            .expect("saved claim");
+        let seen_generation = Arc::new(AtomicU64::new(0));
+        let future_observer = Arc::clone(&seen_generation);
+        let callback_observer = Arc::clone(&seen_generation);
+        let probe = FakeProbe::new(true);
 
-        assert!(lock_registry().pending_attempts.is_empty());
+        let returned_generation = registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                move |generation| callback_observer.store(generation, Ordering::Release),
+                move || async move {
+                    assert_ne!(
+                        future_observer.load(Ordering::Acquire),
+                        0,
+                        "constructor was polled before generation publication"
+                    );
+                    Ok(probe.adapter("ordered"))
+                },
+            )
+            .expect("connection admitted");
 
-        assert!(existing.is_current());
-        assert!(resolve_stream_reference(&reference).await.is_ok());
-        reset_registry();
+        assert_eq!(seen_generation.load(Ordering::Acquire), returned_generation);
+        let (generation, epoch) = wait_for_catalogue(&registry, source_id).await;
+        assert_eq!(generation, returned_generation);
+        assert!(registry.is_current_catalogue(source_id, generation, epoch));
+
+        registry.shutdown().wait().await;
     }
 
     #[tokio::test]
-    async fn shutdown_revokes_active_and_rejects_pending_ownership() {
-        let _guard = REGISTRY_TEST_LOCK.lock().await;
-        reset_registry();
-        let source = retain(SourceId::random(), "active");
-        let reference = stream_reference(source.lease_key(), &track_id());
-        let request = resolve_stream_reference(&reference)
-            .await
-            .expect("active request");
-        let pending = begin_connect(SourceId::random()).expect("pending attempt");
+    async fn exact_publishers_are_idempotent_and_release_independently() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let claims = ProvenanceClaims::default();
 
-        begin_shutdown();
-
-        assert!(!source.is_current());
-        assert!(!request.is_active());
-        assert!(!pending.is_latest());
-        assert!(begin_connect(SourceId::random()).is_none());
-        assert!(matches!(
-            resolve_stream_reference(&reference).await,
-            Err(MediaReferenceError::Unavailable)
+        assert!(claims.ensure(&registry, source_id, SourceProvenance::Saved, "saved:a"));
+        assert!(claims.ensure(&registry, source_id, SourceProvenance::Saved, "saved:a"));
+        assert!(claims.ensure(&registry, source_id, SourceProvenance::Saved, "saved:b"));
+        assert!(claims.ensure(
+            &registry,
+            source_id,
+            SourceProvenance::Discovery,
+            "discovery:one"
         ));
-        drop(pending);
-        reset_registry();
+        let snapshot = registry.snapshot(source_id).expect("claimed source");
+        assert_eq!(snapshot.provenance.claim_count(SourceProvenance::Saved), 2);
+        assert_eq!(
+            snapshot.provenance.claim_count(SourceProvenance::Discovery),
+            1
+        );
+
+        assert!(claims.release(&registry, source_id, SourceProvenance::Saved, "saved:a"));
+        assert!(!claims.contains(source_id, SourceProvenance::Saved, "saved:a"));
+        assert!(claims.contains(source_id, SourceProvenance::Saved, "saved:b"));
+        assert_eq!(
+            registry
+                .snapshot(source_id)
+                .expect("source retained")
+                .provenance
+                .claim_count(SourceProvenance::Saved),
+            1
+        );
+        assert!(!claims.release(&registry, source_id, SourceProvenance::Saved, "saved:a"));
+        assert!(claims.release(&registry, source_id, SourceProvenance::Saved, "saved:b"));
+        assert!(claims.release(
+            &registry,
+            source_id,
+            SourceProvenance::Discovery,
+            "discovery:one"
+        ));
+
+        wait_until_pruned(&registry, source_id).await;
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn replacement_revokes_old_media_and_final_claim_auto_prunes() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let claims = ProvenanceClaims::default();
+        assert!(claims.ensure(&registry, source_id, SourceProvenance::Saved, "saved"));
+        let predecessor = FakeProbe::new(true);
+        let predecessor_for_connect = Arc::clone(&predecessor);
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(predecessor_for_connect.adapter("predecessor")) },
+            )
+            .expect("predecessor admitted");
+        let (_, predecessor_epoch) = wait_for_catalogue(&registry, source_id).await;
+        let track_id = TrackId::remote("track").expect("track ID");
+        let predecessor_request = registry
+            .resolve_stream(source_id, predecessor_epoch, track_id.clone())
+            .await
+            .expect("predecessor media");
+        assert!(predecessor_request.is_active());
+
+        let successor = FakeProbe::new(true);
+        let successor_for_connect = Arc::clone(&successor);
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(successor_for_connect.adapter("successor")) },
+            )
+            .expect("replacement admitted");
+        let (successor_generation, successor_epoch) = timeout(Duration::from_secs(2), async {
+            loop {
+                let current = wait_for_catalogue(&registry, source_id).await;
+                if current.1 != predecessor_epoch {
+                    return current;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successor catalogue accepted");
+
+        assert!(!predecessor_request.is_active());
+        assert!(registry
+            .resolve_stream(source_id, predecessor_epoch, track_id.clone())
+            .await
+            .is_err());
+        assert_eq!(successor.stream_calls.load(Ordering::Acquire), 0);
+        let successor_request = registry
+            .resolve_stream(source_id, successor_epoch, track_id)
+            .await
+            .expect("successor media");
+        assert!(successor_request.is_active());
+        assert!(registry.has_session_epoch(source_id, successor_epoch));
+        assert!(registry.is_current_catalogue(source_id, successor_generation, successor_epoch));
+
+        assert!(claims.release(&registry, source_id, SourceProvenance::Saved, "saved"));
+        wait_until_pruned(&registry, source_id).await;
+        predecessor.wait_for_close_calls(1).await;
+        successor.wait_for_close_calls(1).await;
+        assert!(!successor_request.is_active());
+        assert_eq!(predecessor.close_calls.load(Ordering::Acquire), 1);
+        assert_eq!(successor.close_calls.load(Ordering::Acquire), 1);
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_the_gate_and_joins_held_retirement() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        registry
+            .claim_provenance(source_id, SourceProvenance::Saved)
+            .expect("saved claim");
+        let held = FakeProbe::new(false);
+        let held_for_connect = Arc::clone(&held);
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(held_for_connect.adapter("held")) },
+            )
+            .expect("connection admitted");
+        wait_for_catalogue(&registry, source_id).await;
+
+        let barrier = registry.shutdown();
+        held.wait_for_close_calls(1).await;
+        assert!(registry.is_shutting_down());
+        assert!(registry.snapshot_all().shutting_down);
+        assert!(!barrier.is_complete());
+        assert!(registry
+            .claim_provenance(SourceId::random(), SourceProvenance::Saved)
+            .is_none());
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_observer = Arc::clone(&callback_called);
+        let constructor_polled = Arc::new(AtomicBool::new(false));
+        let constructor_observer = Arc::clone(&constructor_polled);
+        assert!(registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                move |_| callback_observer.store(true, Ordering::Release),
+                move || async move {
+                    constructor_observer.store(true, Ordering::Release);
+                    Ok(FakeProbe::new(true).adapter("rejected"))
+                },
+            )
+            .is_none());
+        assert!(!callback_called.load(Ordering::Acquire));
+        assert!(!constructor_polled.load(Ordering::Acquire));
+
+        held.close_release.send_replace(true);
+        timeout(Duration::from_secs(2), barrier.wait())
+            .await
+            .expect("shutdown joined held close");
+        assert_eq!(held.close_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_interactive_jellyfin_login_finishes_then_logs_out_without_catalogue_io() {
+        let token = Uuid::new_v4().to_string();
+        let service = MockHttpService::start(vec![
+            MockRoute::new(Method::POST, "/Users/AuthenticateByName").reply(
+                MockResponse::json(serde_json::json!({
+                    "User": { "Id": "user-id", "Name": "Fixture" },
+                    "AccessToken": token,
+                }))
+                .with_delay(Duration::from_millis(150)),
+            ),
+            MockRoute::new(Method::POST, "/Sessions/Logout")
+                .reply(MockResponse::status(StatusCode::NO_CONTENT)),
+        ])
+        .await;
+        let registry = registry();
+        let source_id = SourceId::random();
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Saved)
+            .expect("saved claim");
+        let server_url = service.base_url();
+        registry
+            .connect_jellyfin_session(
+                source_id,
+                |_| {},
+                move || async move {
+                    let client = crate::jellyfin::client::JellyfinClient::authenticate(
+                        &server_url,
+                        "fixture-user",
+                        "fixture-password",
+                    )
+                    .await?;
+                    Ok(crate::jellyfin::JellyfinBackend::stage_authenticated(
+                        "fixture", client,
+                    ))
+                },
+            )
+            .expect("interactive login admitted");
+
+        wait_for_request_count(&service, 1).await;
+        assert!(registry.release_provenance(source_id, claim));
+        wait_for_request_count(&service, 2).await;
+        wait_until_pruned(&registry, source_id).await;
+        registry.shutdown().wait().await;
+
+        let requests = service.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].uri.path(), "/Users/AuthenticateByName");
+        assert_eq!(requests[1].uri.path(), "/Sessions/Logout");
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_jellyfin_api_key_staging_never_logs_out_durable_credential() {
+        let service = MockHttpService::start(vec![MockRoute::get("/System/Ping")
+            .reply(MockResponse::text("Jellyfin Server").with_delay(Duration::from_millis(150)))])
+        .await;
+        let registry = registry();
+        let source_id = SourceId::random();
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Saved)
+            .expect("saved claim");
+        let server_url = service.base_url();
+        registry
+            .connect_jellyfin_api_key(
+                source_id,
+                |_| {},
+                move || async move {
+                    let client = crate::jellyfin::client::JellyfinClient::new(
+                        &server_url,
+                        "durable-api-key",
+                        "user-id",
+                    )?;
+                    Ok(crate::jellyfin::JellyfinBackend::stage_authenticated(
+                        "fixture", client,
+                    ))
+                },
+            )
+            .expect("API-key staging admitted");
+
+        wait_for_request_count(&service, 1).await;
+        assert!(registry.release_provenance(source_id, claim));
+        wait_until_pruned(&registry, source_id).await;
+        registry.shutdown().wait().await;
+
+        let requests = service.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].uri.path(), "/System/Ping");
+        service.finish().await;
     }
 }

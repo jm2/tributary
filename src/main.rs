@@ -86,6 +86,29 @@ use tracing::info;
 /// Reverse-DNS application identifier.
 const APP_ID: &str = "io.github.tributary.Tributary";
 
+/// Route an application-level quit request through the active window so its
+/// `close-request` handler can finish lifecycle-owned remote teardown first.
+/// With no window there is no such barrier to join, so quitting the
+/// application directly is the only remaining action.
+fn dispatch_application_quit<W, CloseWindow, QuitApplication>(
+    active_window: Option<W>,
+    close_window: CloseWindow,
+    quit_application: QuitApplication,
+) where
+    CloseWindow: FnOnce(W),
+    QuitApplication: FnOnce(),
+{
+    if let Some(window) = active_window {
+        close_window(window);
+    } else {
+        quit_application();
+    }
+}
+
+fn request_application_quit(app: &adw::Application) {
+    dispatch_application_quit(app.active_window(), |window| window.close(), || app.quit());
+}
+
 fn main() {
     // ── Windows: attach to parent console ────────────────────────────
     // The `windows_subsystem = "windows"` attribute prevents a console
@@ -213,7 +236,7 @@ fn main() {
 
     // ── Application actions ─────────────────────────────────────────
     let quit_action = gio::ActionEntry::builder("quit")
-        .activate(|app: &adw::Application, _, _| app.quit())
+        .activate(|app: &adw::Application, _, _| request_application_quit(app))
         .build();
 
     // Register the app icon search path inside connect_activate,
@@ -347,4 +370,41 @@ fn main() {
     // Run the GTK main loop.  This blocks until the last window closes.
     let exit_code = app.run();
     std::process::exit(exit_code.into());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::dispatch_application_quit;
+
+    #[test]
+    fn application_quit_closes_active_window_instead_of_bypassing_it() {
+        let window_closed = Cell::new(false);
+        let application_quit = Cell::new(false);
+
+        dispatch_application_quit(
+            Some(()),
+            |()| window_closed.set(true),
+            || application_quit.set(true),
+        );
+
+        assert!(window_closed.get());
+        assert!(!application_quit.get());
+    }
+
+    #[test]
+    fn application_quit_falls_back_when_no_window_exists() {
+        let window_closed = Cell::new(false);
+        let application_quit = Cell::new(false);
+
+        dispatch_application_quit(
+            None::<()>,
+            |()| window_closed.set(true),
+            || application_quit.set(true),
+        );
+
+        assert!(!window_closed.get());
+        assert!(application_quit.get());
+    }
 }

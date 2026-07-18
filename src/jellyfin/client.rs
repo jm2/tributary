@@ -54,6 +54,10 @@ pub struct JellyfinClient {
     /// The raw access token, kept for building stream/image URLs.
     api_key: String,
     http: Client,
+    /// True only for a token minted by AuthenticateByName in this process.
+    /// Pre-existing API keys are durable credentials and must not be revoked
+    /// by source disconnect.
+    owns_session_token: bool,
 }
 
 impl JellyfinClient {
@@ -101,6 +105,7 @@ impl JellyfinClient {
             user_id: user_id.to_string(),
             api_key: api_key.to_string(),
             http,
+            owns_session_token: false,
         })
     }
 
@@ -109,7 +114,7 @@ impl JellyfinClient {
     /// Posts to `/Users/AuthenticateByName`, extracts the `AccessToken`
     /// and `User.Id` from the response, and returns a fully authenticated
     /// client.
-    pub async fn authenticate(
+    pub(crate) async fn authenticate(
         server_url: &str,
         username: &str,
         password: &str,
@@ -118,7 +123,7 @@ impl JellyfinClient {
     }
 
     /// Authenticate with an immutable address route supplied by discovery.
-    pub async fn authenticate_with_route(
+    pub(crate) async fn authenticate_with_route(
         server_url: &str,
         username: &str,
         password: &str,
@@ -222,23 +227,71 @@ impl JellyfinClient {
 
         let api_key = auth_resp.access_token;
         let user_id = auth_resp.user.id;
+        let user_name = auth_resp.user.name;
 
-        info!(
-            server = %redact_url_secrets(base_url.as_str()),
-            user = %auth_resp.user.name,
-            user_id = %user_id,
-            "Jellyfin authentication successful"
+        // Validate the server-supplied token before it can enter any request.
+        // A token containing control bytes cannot be represented as an HTTP
+        // header, including on a cleanup request, so that narrow hostile-peer
+        // case must fail closed without echoing the value. Once the token has
+        // a safe header representation, retain a copy for exact best-effort
+        // logout if the final authenticated client cannot be constructed.
+        let auth_header = jellyfin_auth_header(&api_key)?;
+        let http = build_http_client_with_auth_header(
+            auth_header.clone(),
+            &base_url,
+            advertised_route.as_ref(),
         );
 
-        // Build the real client with the acquired token.
-        let http = build_http_client(&api_key, &base_url, advertised_route.as_ref())?;
-
-        Ok(Self {
+        let client = finish_interactive_authentication(
+            &pre_auth_http,
             base_url,
             advertised_route,
             user_id,
             api_key,
+            auth_header,
             http,
+        )
+        .await?;
+
+        info!(
+            server = %redact_url_secrets(client.base_url.as_str()),
+            user = %user_name,
+            user_id = %client.user_id,
+            "Jellyfin authentication successful"
+        );
+        Ok(client)
+    }
+
+    /// Revoke the exact interactive session token owned by this client.
+    /// Durable API keys are intentionally a no-op: Tributary did not mint
+    /// them and has no authority to revoke them on source disconnect.
+    pub(crate) async fn logout_owned_session(&self) -> BackendResult<()> {
+        if !self.owns_session_token {
+            return Ok(());
+        }
+
+        let url = self.api_url("Sessions/Logout");
+        debug!(url = %redact_url_secrets(url.as_str()), "Jellyfin session logout");
+        let response = self
+            .http
+            .post(url.as_str())
+            .timeout(AUTH_RESPONSE_DEADLINE)
+            .send()
+            .await
+            .map_err(|error| {
+                let error = strip_request_url(error);
+                BackendError::ConnectionFailed {
+                    message: format!("Session logout failed: {error}"),
+                    source: Some(Box::new(error)),
+                }
+            })?;
+        let status = response.status();
+        if status.is_success() || status == reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(());
+        }
+        Err(BackendError::ConnectionFailed {
+            message: format!("Session logout returned HTTP {status}"),
+            source: None,
         })
     }
 
@@ -422,8 +475,16 @@ fn build_http_client(
     base_url: &Url,
     advertised_route: Option<&AdvertisedHttpRoute>,
 ) -> BackendResult<Client> {
+    build_http_client_with_auth_header(jellyfin_auth_header(api_key)?, base_url, advertised_route)
+}
+
+fn build_http_client_with_auth_header(
+    auth_header: HeaderValue,
+    base_url: &Url,
+    advertised_route: Option<&AdvertisedHttpRoute>,
+) -> BackendResult<Client> {
     let mut default_headers = HeaderMap::new();
-    default_headers.insert("X-Emby-Authorization", jellyfin_auth_header(api_key)?);
+    default_headers.insert("X-Emby-Authorization", auth_header);
     default_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
     let builder = authenticated_client_builder()
@@ -441,6 +502,60 @@ fn build_http_client(
             message: format!("Failed to build HTTP client: {e}"),
             source: Some(Box::new(e)),
         })
+}
+
+/// Complete ownership transfer for a syntactically valid token minted by
+/// `AuthenticateByName`.
+///
+/// The authentication client already carries the exact advertised route and
+/// is therefore the only safe fallback transport if constructing the normal
+/// token-bearing client fails. The original construction error remains the
+/// caller-visible result; logout is bounded and best-effort because there is
+/// no close-capable `JellyfinClient` to hand to the lifecycle registry yet.
+async fn finish_interactive_authentication(
+    pre_auth_http: &Client,
+    base_url: Url,
+    advertised_route: Option<AdvertisedHttpRoute>,
+    user_id: String,
+    api_key: String,
+    auth_header: HeaderValue,
+    http: BackendResult<Client>,
+) -> BackendResult<JellyfinClient> {
+    let http = match http {
+        Ok(http) => http,
+        Err(error) => {
+            best_effort_logout_minted_session(pre_auth_http, &base_url, auth_header).await;
+            return Err(error);
+        }
+    };
+
+    Ok(JellyfinClient {
+        base_url,
+        advertised_route,
+        user_id,
+        api_key,
+        http,
+        owns_session_token: true,
+    })
+}
+
+/// Attempt to retire one exact, safely representable token before lifecycle
+/// staging is possible. No response or transport error is exposed or logged:
+/// the original client-construction failure is authoritative and must remain
+/// free of the server-supplied token.
+async fn best_effort_logout_minted_session(
+    pre_auth_http: &Client,
+    base_url: &Url,
+    auth_header: HeaderValue,
+) {
+    let mut url = base_url.clone();
+    append_base_path_segments(&mut url, ["Sessions", "Logout"]);
+    let _ = pre_auth_http
+        .post(url.as_str())
+        .header("X-Emby-Authorization", auth_header)
+        .timeout(AUTH_RESPONSE_DEADLINE)
+        .send()
+        .await;
 }
 
 fn jellyfin_auth_header(api_key: &str) -> BackendResult<HeaderValue> {
@@ -604,6 +719,152 @@ mod tests {
         let requests = service.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].uri.path(), "/gateway/Users/AuthenticateByName");
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn interactive_token_is_logged_out_once_with_authenticated_post() {
+        let token = uuid::Uuid::new_v4().to_string();
+        let service = MockHttpService::start(vec![
+            MockRoute::new(Method::POST, "/Users/AuthenticateByName").reply(MockResponse::json(
+                serde_json::json!({
+                    "User": { "Id": "user-id", "Name": "Fixture" },
+                    "AccessToken": token
+                }),
+            )),
+            MockRoute::new(Method::POST, "/Sessions/Logout")
+                .reply(MockResponse::status(StatusCode::NO_CONTENT)),
+        ])
+        .await;
+
+        let client =
+            JellyfinClient::authenticate(&service.base_url(), "fixture-user", "fixture-password")
+                .await
+                .expect("interactive client");
+        client
+            .logout_owned_session()
+            .await
+            .expect("owned session logout");
+
+        let requests = service.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].uri.path(), "/Users/AuthenticateByName");
+        assert_eq!(requests[1].uri.path(), "/Sessions/Logout");
+        assert_eq!(requests[1].method, Method::POST);
+        let authorization = requests[1]
+            .headers
+            .get("x-emby-authorization")
+            .and_then(|value| value.to_str().ok())
+            .expect("logout authorization");
+        assert!(authorization.contains(&format!(r#"Token="{token}""#)));
+        assert!(!requests[1].uri.to_string().contains(&token));
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn valid_minted_token_is_logged_out_when_final_client_construction_fails() {
+        let token = uuid::Uuid::new_v4().to_string();
+        let service = MockHttpService::start(vec![MockRoute::new(
+            Method::POST,
+            "/gateway/Sessions/Logout",
+        )
+        .reply(MockResponse::status(StatusCode::NO_CONTENT))])
+        .await;
+
+        // Match the production pre-auth client closely enough to prove that
+        // the per-request minted-token header replaces its tokenless default.
+        let mut pre_auth_headers = HeaderMap::new();
+        pre_auth_headers.insert(
+            "X-Emby-Authorization",
+            HeaderValue::from_static("MediaBrowser Client=\"pre-auth\""),
+        );
+        let pre_auth_http = authenticated_client_builder()
+            .default_headers(pre_auth_headers)
+            .build()
+            .expect("pre-auth client");
+        let base_url =
+            Url::parse(&format!("{}/gateway/", service.base_url())).expect("fixture base URL");
+        let auth_header = jellyfin_auth_header(&token).expect("safe minted token");
+        let construction_error = BackendError::ConnectionFailed {
+            message: "synthetic final client construction failure".to_string(),
+            source: None,
+        };
+
+        let result = finish_interactive_authentication(
+            &pre_auth_http,
+            base_url,
+            None,
+            "fixture-user-id".to_string(),
+            token.clone(),
+            auth_header,
+            Err(construction_error),
+        )
+        .await;
+        let error = result.err().expect("construction must fail");
+        assert_eq!(
+            error.to_string(),
+            "Connection failed: synthetic final client construction failure"
+        );
+        assert!(!error.to_string().contains(&token));
+
+        let requests = service.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::POST);
+        assert_eq!(requests[0].uri.path(), "/gateway/Sessions/Logout");
+        let authorization = requests[0]
+            .headers
+            .get("x-emby-authorization")
+            .and_then(|value| value.to_str().ok())
+            .expect("cleanup authorization");
+        assert!(authorization.contains(&format!(r#"Token="{token}""#)));
+        assert!(!requests[0].uri.to_string().contains(&token));
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn header_invalid_minted_token_fails_closed_without_echo_or_unsafe_logout() {
+        let secret = uuid::Uuid::new_v4().to_string();
+        let invalid_token = format!("{secret}\r\nX-Injected: rejected");
+        let service = MockHttpService::start(vec![MockRoute::new(
+            Method::POST,
+            "/Users/AuthenticateByName",
+        )
+        .reply(MockResponse::json(serde_json::json!({
+            "User": { "Id": "user-id", "Name": "Fixture" },
+            "AccessToken": invalid_token
+        })))])
+        .await;
+
+        let result =
+            JellyfinClient::authenticate(&service.base_url(), "fixture-user", "fixture-password")
+                .await;
+        let error = result.err().expect("invalid token header must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("Invalid auth header value"));
+        assert!(!rendered.contains(&secret));
+        assert!(!rendered.contains("X-Injected"));
+
+        // The hostile value cannot safely be represented in the exact header
+        // required by Sessions/Logout. Sending a transformed or raw value
+        // would either target another session or permit header injection.
+        let requests = service.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].uri.path(), "/Users/AuthenticateByName");
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn durable_api_key_is_not_logged_out() {
+        let service = MockHttpService::start(Vec::new()).await;
+        let client = JellyfinClient::new(&service.base_url(), "durable-key", "user-id")
+            .expect("durable API-key client");
+
+        client
+            .logout_owned_session()
+            .await
+            .expect("durable credential close is local-only");
+
+        assert!(service.requests().is_empty());
         service.finish().await;
     }
 

@@ -1,7 +1,8 @@
 # Source identity and lifecycle ownership
 
-- Status: Accepted in PR #113; stable identity and the unwired lifecycle foundation are implemented,
-  adapter consolidation incomplete
+- Status: Accepted in PR #113; stable identity, retained local playback authority, and the
+  authenticated-remote lifecycle production cutover are implemented; non-remote adapter
+  consolidation and local embedded-art authority remain incomplete
 - Decision date: 2026-07-17
 - Tracker: [P3.1](../task.md#p31-introduce-a-sourcesession-registry)
 - Review finding: [Architectural assessment](../../CODE_REVIEW_2026-07-10.md#architectural-assessment)
@@ -21,23 +22,25 @@ was recorded, those sources did not share one identity or lifecycle boundary:
 - connection, refresh, cancellation, cached publication, failure, and disconnect behavior was
   split between the GTK window, source-selection callbacks, the local engine, and the registries.
 
-The stable-identity portion has since been implemented. Playback uses an immutable queue addressed
-by typed source and exact native track identity instead of a mutable GTK row index. Standard remote
-backends retain private native locators behind generation-owned, revocable leases, while DAAP
-retains its stateful session and performs explicit logout. Source navigation rejects stale
-asynchronous publications. Local renames preserve database track IDs, and removable scans are
+The stable-identity and authenticated-remote portions have since been implemented. Playback uses
+an immutable queue addressed by typed source and exact native track identity instead of a mutable
+GTK row index. For Subsonic, Jellyfin, Plex, and DAAP, GTK rows and queues retain only `SourceId`,
+`TrackId`, and the non-secret publishing session epoch; the single `RemoteSourceRegistry` owns
+adapters, private locators, revocable leases, catalogue/failure state, cancellation, and retirement.
+DAAP retains its protocol-specific state and exactly-once logout inside that common lifecycle.
+Source navigation rejects stale asynchronous publications. Local renames preserve database track
+IDs, local playback retains exact root/file authority through consumption, and removable scans are
 generation-owned and cancelled on relocation or removal.
 
-This decision defines how those foundations converge; it does **not** claim that its broader
-source/session lifecycle is implemented. PR #120 implements the stable-identity migration, and PR
-#121 adds retained local file authority through output consumption; the single lifecycle boundary
-remains open. When this decision was recorded, `MediaBackend` was not an integration seam at all.
-P3.2 has since completed its bounded
-backend-abstraction scope: scanner snapshots construct `LocalBackend`, and all five shipping
-backends publish complete track catalogues through one `&dyn MediaBackend` adapter.
-Authentication, registry/session lifecycle, refresh/failure ownership, and some browsing paths
-still use concrete backend-specific integration, so this decision does not claim the broader
-convergence complete. That remaining work stays tracked under
+This decision still describes the intended boundary for every source kind; it does **not** claim
+that all non-remote adapters have converged. PR #120 implements stable identity, PR #121 adds
+retained local file authority through output consumption, PR #122 introduces the generic lifecycle
+foundation, and the following production cutover moves all authenticated remotes onto it. P3.2 has
+also completed its bounded backend-abstraction scope: scanner snapshots construct `LocalBackend`,
+and all five shipping backends publish complete track catalogues through one `&dyn MediaBackend`
+adapter. Radio-Browser, removable media, and OS-opened external files still retain their current
+at-use locators outside registry adapters, and local embedded-art display still hands a path to its
+helper. That remaining work stays tracked under
 [P3.1](../task.md#p31-introduce-a-sourcesession-registry).
 
 ## Decision
@@ -315,6 +318,25 @@ Subsonic, Jellyfin, Plex, and DAAP all occupy ordinary registry entries and expo
 track IDs through their adapters. Their endpoint, advertised route, authentication, native media
 locator, and protocol metadata remain private to the ready session.
 
+Interactive Jellyfin `AuthenticateByName` can mint a server-side session token before an adapter
+exists. Its bounded constructor therefore uses `FinishConstruction`, synchronously stages the
+token-bearing adapter before ping, library discovery, or catalogue work, and gives the registry's
+close capability the only authority to POST `Sessions/Logout`. A pre-existing Jellyfin API key is
+not a session minted by Tributary, so its constructor is abortable and disconnect never revokes
+that durable credential. Plex's legacy token is likewise treated as a durable credential: the
+available revocation mechanisms are broader than one adapter session, so retirement revokes local
+media/adapter authority without attempting an account- or device-wide server-side revocation.
+
+There is one earlier Jellyfin cleanup boundary before registry staging is possible. Once
+`AuthenticateByName` returns a token that can be represented exactly as a sensitive
+`X-Emby-Authorization` value, failure to construct the final routed authenticated client triggers
+one bounded best-effort `Sessions/Logout` through the exact pre-authentication transport; the
+original redacted construction failure remains authoritative. A hostile server can instead return
+a token containing HTTP control bytes. Such a token cannot safely form the exact logout header, and
+sending it raw or transformed would permit header injection or target a different session. That
+narrow case therefore fails closed without echoing the token and intentionally cannot attempt
+server-side logout.
+
 DAAP's adapter additionally implements an asynchronous `close` that only the registry can
 authorize. Explicit disconnect,
 replacement, discovery loss, deletion, and shutdown transfer its session into registry-owned
@@ -323,22 +345,24 @@ callers receive clones of one exact retirement waiter and never send a second lo
 timed-out best-effort logout still ends in `Dormant`/`Retired`; it cannot resurrect the session.
 `Drop` performs only local revocation and memory cleanup and never starts network I/O.
 
-DAAP wiring must split its current constructor at the first close-capable boundary. The bounded
-`FinishConstruction` phase covers server-info and login only, and returns a logged-in adapter
-immediately after parsing the session ID. The registry synchronously installs its mandatory
-`StagedConnect` retirement guard before update, database discovery, items, or initial catalogue
-work begins. Once the unsafe login request has started, the constructor may observe cancellation
-but must not select/drop itself; it finishes and either performs its own ordinary-error cleanup or
-returns the adapter for registry retirement. Post-stage catalogue work may be aborted because
-dropping the staged guard starts the one tracked close. The current full
-`DaapBackend::connect_with_route`/`connect` path must therefore be split during production wiring;
-calling that full constructor as the protected authentication closure would stage too late.
+DAAP now implements that close-capable boundary explicitly. `DaapClient::login_with_route` covers
+server-info and login only and returns immediately after parsing `mlid`; `DaapBackend` then enters
+the registry's bounded `FinishConstruction` phase. The registry synchronously installs its
+mandatory staged-retirement guard before `load_catalogue` begins update, database discovery,
+items, or initial catalogue publication. Once login has started, cancellation is observed without
+dropping an unowned server session; login either fails before session ownership exists or returns
+the close-capable adapter for registry retirement. Post-stage catalogue work may be aborted because
+dropping the staged guard starts the one tracked close. A malformed or expired post-login update,
+database, or items response therefore publishes no catalogue or media and reaches that same exact
+logout owner.
 
 At application close the registry first closes its admission gate, cancels attempts and refreshes,
-and revokes every session lease. It then joins all bounded DAAP logout owners and other adapter
-teardown before allowing the window to close. A connection completion racing shutdown cannot
-escape registry ownership: it is immediately retired and, for DAAP, joined through the same close
-path.
+and revokes every session lease. It then joins all bounded DAAP and owned Jellyfin logout work plus
+other adapter teardown before allowing the window to close. A connection completion racing
+shutdown cannot escape registry ownership: it is immediately retired and joined through the same
+close path when it owns server-side session state. The menu and Ctrl+Q application actions request
+that window close rather than calling application quit directly, so the same `close-request`
+barrier runs; direct application quit is reserved for the no-window case.
 
 #### Internet radio
 
@@ -402,21 +426,23 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
   discovered, environment, and unsaved remote endpoints use deterministic
   backend-plus-canonical-base-URL identity; promoting a discovered/environment row persists that
   existing deterministic ID. The same typed ID is carried through sidebar objects, connect
-  generations, standard and DAAP registries, sync events, navigation, disconnect, discovery loss,
-  deletion, and shutdown.
+  generations, `RemoteSourceRegistry`, lifecycle baselines, navigation, disconnect, discovery
+  loss, deletion, and shutdown.
 - Subsonic, Jellyfin, Plex, and DAAP catalogue rows preserve their exact bounded native song ID,
-  item `Id`, `ratingKey`, and decimal `miid`, respectively. Standard opaque playback references
-  carry that exact native ID in a reversible, prefixed lowercase-hex segment (so `.` and `..`
-  cannot be path-normalized) and their resolvers look it up without a derived UUID compatibility
-  projection.
+  item `Id`, `ratingKey`, and decimal `miid`, respectively. Their GTK rows and playback queues
+  carry only pathless `SourceId`, exact `TrackId`, and the non-secret session epoch that published
+  the catalogue. Resolution uses the exact native ID without a derived UUID compatibility
+  projection or a generic authenticated/lease-bearing URI.
 - `PlaybackSession` captures immutable source/track identity, queue order, duplicate occurrence,
   and playback event generation independently of GTK sorting/filtering. Queue identity is a
   `MediaKey`; playlists and radio queries retain a separate `ViewOrigin`, so local invalidation
   retires every local projection while view-specific invalidation cannot retire a sibling view.
-- Standard remote sources have generation-owned resolvers, random media leases, playback-time
-  protected request resolution, and synchronous revocation on replacement/release/shutdown.
-- DAAP has generation-owned retained sessions, credential-free references, explicit exactly-once
-  logout, a synchronous shutdown gate, and joined retirement.
+- Authenticated remotes share one `RemoteSourceRegistry` with generation-owned adapters, random
+  media leases, exact session epochs, immutable catalogue/failure snapshots, playback-time
+  protected request resolution, and synchronous revocation on replacement, route loss, release,
+  or shutdown. DAAP and interactively authenticated Jellyfin add explicit exactly-once logout
+  through the same tracked/joined retirement path; pre-existing Jellyfin API keys and Plex legacy
+  tokens are retained as non-owned durable credentials rather than broadly revoked.
 - Source navigation rejects stale same-key and cross-source publications and preserves the newest
   cache independently of rendering.
 - Local database IDs and playlist foreign keys survive authoritative file/directory renames.
@@ -439,51 +465,76 @@ future multi-file queue can extend the same ephemeral-source rule explicitly.
   station UUIDs instead of falling back to a stream URL. Each OS-opened file queue receives fresh,
   independent random source and track identities.
 
-These are compatible foundations, not proof that the complete lifecycle decision is implemented.
-An initially unwired `SourceLifecycleRegistry` now defines the shared authority boundary without
-creating a second production owner. Its entry atomically owns the adopted adapter, production
-`MediaLease`, and session epoch. Non-cloneable connect/refresh authority carries exact global
-generations and wakeable cancel-before-wait observation. Only atomically admitted spawned tasks and
-adapter retirements participate in the persistent shutdown barrier; an unspawned owner is inert,
-cannot hold shutdown open, and cannot start work after the gate closes. Dropping the optional task
-cancellation capability is also inert. The registry routes explicit cancellation through the
-current phase policy, so a protected constructor finishes cooperatively while post-stage work may
-be aborted safely. The final external registry handle closes admission, cancels tasks, revokes
-leases, and starts fail-closed retirement even if normal shutdown was omitted.
+The initially unwired `SourceLifecycleRegistry` now backs the shipping `RemoteSourceRegistry`.
+For Subsonic, Jellyfin, Plex, and DAAP, each entry atomically owns the adopted adapter, production
+`MediaLease`, session epoch, connect/catalogue generations, immutable snapshot, keyed provenance,
+and sanitized failure state. Non-cloneable operation authority carries exact global generations
+and wakeable cancel-before-wait observation. Only atomically admitted tasks and adapter retirements
+participate in the persistent shutdown barrier; an unspawned owner is inert, cannot hold shutdown
+open, and cannot start work after the gate closes. The registry routes cancellation through the
+current phase policy, so DAAP's protected login finishes cooperatively while post-stage catalogue
+work may be aborted safely. The final external registry handle closes admission, cancels tasks,
+revokes leases, and starts fail-closed retirement even if normal shutdown was omitted.
 
-New adapters are wrapped by the framework and synchronously enter either the active session or a
-non-cloneable staged retirement guard; no operational handle has close authority. Stale, cancelled,
-panicking, rejected, or shutdown results, adopted replacement, explicit disconnect, and shutdown
-all use the same exactly-once close path. Repeated disconnect returns one exact reusable waiter;
-disconnect/reconnect races dissociate the predecessor close from successor state without losing
-its waiter, and a second successor disconnect receives a distinct waiter that the predecessor
-cannot complete. A waiter wakes only after locked bookkeeping, typed retirement publication, and
-the terminal snapshot transition; replacement and dissociated closes also publish their retired
-session epoch so removing a pending-retirement count always advances the observable revision.
-Media resolution snapshots the exact adapter/lease/epoch, performs the backend
-lookup, rechecks all three, and only then attaches that existing lease to the request.
+Adapters are wrapped by the framework and synchronously enter either the active session or a
+non-cloneable staged-retirement guard; no operational handle has close authority. Stale,
+cancelled, panicking, rejected, or shutdown results, adopted replacement, explicit disconnect,
+discovery route loss, and shutdown all use the same exactly-once close path. Repeated disconnect
+returns one exact reusable composite waiter. Each spawned connection generation owns a
+`ConnectSettlement` participant through construction, including superseded generations. If it
+constructs a late adapter that must be rejected, participant ownership transfers into that exact
+close job before the constructor participant drops; the waiter can never observe a false zero-count
+gap. A disconnect joins its adopted-adapter retirement, the latest dissociated predecessor close,
+and every still-active per-generation settlement in deterministic generation order. It completes
+only after all constructors and late closes settle, and reports a late rejected-adapter close
+failure as a sanitized disconnect failure. Disconnect/reconnect races dissociate the predecessor
+close from successor state without losing its waiter, while a second successor disconnect receives
+a distinct waiter that the predecessor cannot complete. Final provenance release records
+`Retired` even when the existing disconnect is settlement-only, then lifecycle-owned maintenance
+awaits that waiter and prunes the inert entry without a duplicate cancel or close. Media resolution
+rejects a mismatched expected epoch before invoking the adapter, snapshots the exact
+adapter/lease/epoch, performs the backend lookup, rechecks all three, and only then attaches that
+existing lease to the request.
 
-Source-wide and per-`ViewOrigin` refresh lanes retain their last complete snapshot and accepted
-generation. Their sanitized failures carry the exact operation generation and optional session
-epoch, so a stale event cannot clear a newer retry. Every provenance publisher owns an opaque keyed
-claim; duplicate `Discovery` or removable publishers are reference-counted independently, and a
-new claim during close reactivates the logical source while the old retirement remains joined but
-cannot mutate a successor. Typed state, snapshot, provenance, cancellation, and failure changes
-carry one monotonically increasing registry revision, and only inert, provenance-free retired
-entries can be pruned.
+One atomic `LifecycleBaseline` and monotonic invalidation watch are now the production GTK input.
+The reducer renders state, catalogue, failure, provenance, visibility, cancellation, and retirement
+without reconstructing authority from spinners, URLs, row existence, or channel closure. A
+same-epoch catalogue refresh preserves the current queue and navigation; a new epoch invalidates
+stale media before publishing its successor. Catalogue acceptance clears its exact pending guard
+before any connected-row rebind or programmatic selection. If the exact accepted row was already
+selected but the guarded rebind could not activate it, the reducer invalidates selection and
+reselects that same index after catalogue/cache state is authoritative. Only the exact accepted
+generation can plan this reactivation; stale or superseded catalogues remain cache-only or inactive.
+GTK helpers clone `RefCell`-backed active keys and release all navigation borrows before changing
+`GtkSingleSelection`, whose signals may synchronously re-enter those cells. Generation-correlated
+failure or cancellation clears only its exact pending intent, including a result observed only
+through a resnapshot. Hidden or absent lifecycle state authoritatively clears pending state, cache,
+playback, navigation, sidebar row, and empty category header. Lifecycle-owned pruning waits for the
+current retirement to finish without issuing another mutating disconnect.
 
-The new module is compiled and race-tested but deliberately has no shipping adapter call sites yet.
-The standard and DAAP registries therefore remain the production owners, and
-connect/refresh/cancellation/failure publication still crosses UI-owned paths. Radio, removable,
-and external queue entries have location-independent identity but retain their current locator
-until their registry adapters and at-use resolvers are implemented. Local and playlist GTK rows
-retain paths for non-playback UI operations; embedded-art display begins with the exact
-playback-time resolution but still hands its helper a path rather than retained file authority. A
-production row with both saved and discovered provenance still collapses them into one
-`manually_added` flag: Delete cannot yet demote it to a still-live discovery publication, and
-discovery loss retires live ownership even if the saved row remains. Wiring those production paths
-into the new authority, the nonlocal adapters, and the embedded-art authority boundary remain
-explicit P3.1 work.
+Saved, Environment, and Discovery publishers own independent opaque keyed claims. Duplicate
+publishers are reference-counted, and a new claim during close reactivates the logical source while
+the old retirement remains joined but cannot mutate a successor. Removing Saved demotes a row that
+still has Discovery instead of deleting it. Removing Discovery clears the advertised route and
+revokes the active adapter or pending constructor that may have captured that route, even when
+Saved or Environment keeps the logical row visible. Route withdrawal therefore retires live media,
+cache, and active projection without incorrectly deleting a still-claimed row. The reducer derives
+the presentation-only `manually_added` value from the live Saved claim rather than treating that row
+flag as provenance authority.
+
+Comprehensive deterministic lifecycle, registry-wrapper, reducer, playback-boundary, provenance,
+shutdown, and actual-wire DAAP regressions cover protected login cancellation, supersession,
+malformed post-login catalogue responses, exact logout, invalid Jellyfin token containment,
+stale-epoch stream/artwork rejection, accepted-catalogue reactivation, `RefCell` signal re-entry,
+failure correlation, route-withdrawal demotion/visibility, composite disconnect settlement, and
+retirement/pruning races. The focused lifecycle module passes all 53 tests.
+
+This production cutover completes authenticated-remote convergence, not the full decision. Radio,
+removable, and external queue entries have location-independent identity but retain their current
+locator until their registry adapters and at-use resolvers are implemented. Local and playlist GTK
+rows retain paths for non-playback UI operations; embedded-art display begins with exact
+playback-time resolution but still hands its helper a path rather than retained file authority.
+Those non-remote adapters and the embedded-art authority boundary remain explicit P3.1 work.
 
 ## Deliberately deferred implementation details
 
@@ -498,11 +549,11 @@ implementation details so long as one registry ultimately enforces this contract
 
 1. **Identity complete:** introduce `SourceId`, `TrackId`, `MediaKey`, `ViewOrigin`, and the saved
    remote-source schema migration.
-2. **Identity complete, lifecycle open:** preserve exact backend-native IDs in catalogue adapters;
-   moving the standard remote and DAAP resolver contracts behind one registry entry remains open.
+2. **Authenticated-remote lifecycle complete:** exact backend-native IDs and Subsonic, Jellyfin,
+   Plex, and DAAP adapter/resolver contracts now live behind `RemoteSourceRegistry` entries.
 3. **Identity complete, locator removal partial:** queues carry `MediaKey` and optional
-   `ViewOrigin`; remote protected references already resolve at use, while radio/removable/external
-   locators remain until their adapters land.
+   `ViewOrigin`; authenticated remotes carry a non-secret session epoch and resolve pathlessly at
+   use, while radio/removable/external locators remain until their adapters land.
 4. **Playback resolution complete, adapter convergence open:** local/playlist playback queries the
    exact ID at use, acquires the current authoritative root and exact file, and retains both
    through output consumption. The random invalid-local-ID fallback is gone. Local embedded art
@@ -510,12 +561,17 @@ implementation details so long as one registry ultimately enforces this contract
 5. **Identity complete, lifecycle open:** Radio-Browser, removable media, and external files have
    the specified source/track identity; moving their locator and retirement ownership into
    registry adapters remains open.
-6. **Lifecycle foundation complete, production wiring open:** the unwired registry now owns the
-   state-machine, generation, epoch, provenance, close-task, and persistent shutdown-barrier
-   contracts under deterministic race coverage. Move connection/refresh cancellation, sanitized
-   failure state, and snapshot publication out of GTK callbacks one adapter family at a time.
-   Remove URL-keyed lifecycle maps and the sibling DAAP registry only after standard remotes, DAAP,
-   radio, removable, local/playlist, and external-file adapters have entered the unified path.
+6. **Authenticated-remote production cutover complete; non-remote wiring open:** the lifecycle
+   registry owns the state machine, generation, epoch, provenance, close task, persistent shutdown
+   barrier, and coherent baseline/watch contracts under deterministic race coverage. Subsonic,
+   Jellyfin, Plex, and DAAP connection/catalogue cancellation, sanitized failure state, media
+   resolution, disconnect, and shutdown use that production path; the URL-keyed standard owner and
+   sibling DAAP registry are removed. Move Radio-Browser, removable, external-file, and the local
+   embedded-art authority boundary into their specified adapters to complete P3.1.
+
+Locked debug and release suites each pass 20 library, 865 application, and 10 repository-metadata
+tests (895 total), with locked all-target/all-feature compile, strict warning-free Clippy,
+formatting, and diff checks green.
 
 Each step must keep existing credential-isolation, exact-origin, root-authority, receiver-ticket,
 and generation-supersession tests green. Compatibility code is removed in the same milestone; two

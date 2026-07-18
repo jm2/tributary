@@ -22,10 +22,8 @@
 pub mod backend;
 pub mod client;
 pub mod dmap;
-pub mod session;
+
+#[cfg(test)]
+mod lifecycle_tests;
 
 pub use backend::DaapBackend;
-pub use session::{
-    begin_connect, begin_shutdown, is_current_session, is_media_reference, release_source,
-    resolve_artwork_reference, resolve_stream_reference, shutdown_all,
-};

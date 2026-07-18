@@ -12,7 +12,6 @@ use std::path::PathBuf;
 
 use gtk::glib;
 use gtk::subclass::prelude::*;
-use uuid::Uuid;
 
 use crate::architecture::{AdvertisedHttpRoute, SourceId};
 
@@ -45,10 +44,8 @@ mod imp {
         pub connected: Cell<bool>,
         /// Whether an authentication attempt is in progress.
         pub connecting: Cell<bool>,
-        /// Opaque owner of an environment-configured attempt's transient
-        /// spinner. A generic/manual transition clears this token so a queued
-        /// older environment failure cannot retire a newer attempt's UI.
-        pub connecting_attempt: Cell<Option<Uuid>>,
+        /// Exact centralized lifecycle generation that owns the spinner.
+        pub connecting_generation: Cell<Option<u64>>,
         /// Whether this server requires a password to connect.
         /// `true` = password required (default), `false` = open/passwordless.
         pub requires_password: Cell<bool>,
@@ -219,24 +216,24 @@ impl SourceObject {
     }
 
     pub fn set_connecting(&self, val: bool) {
-        self.imp().connecting_attempt.set(None);
+        self.imp().connecting_generation.set(None);
         self.imp().connecting.set(val);
     }
 
-    /// Begin one token-owned connecting transition.
-    pub(crate) fn begin_connecting_attempt(&self) -> Uuid {
-        let attempt = Uuid::new_v4();
-        self.imp().connecting_attempt.set(Some(attempt));
+    pub(crate) fn set_connecting_generation(&self, generation: u64) {
+        self.imp().connecting_generation.set(Some(generation));
         self.imp().connecting.set(true);
-        attempt
     }
 
-    /// Clear the spinner only while this exact attempt still owns it.
-    pub(crate) fn clear_connecting_attempt(&self, attempt: Uuid) -> bool {
-        if self.imp().connecting_attempt.get() != Some(attempt) {
+    pub(crate) fn connecting_generation(&self) -> Option<u64> {
+        self.imp().connecting_generation.get()
+    }
+
+    pub(crate) fn clear_connecting_generation(&self, generation: u64) -> bool {
+        if self.imp().connecting_generation.get() != Some(generation) {
             return false;
         }
-        self.imp().connecting_attempt.set(None);
+        self.imp().connecting_generation.set(None);
         self.imp().connecting.set(false);
         true
     }
