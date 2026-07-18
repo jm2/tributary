@@ -70,6 +70,8 @@ mod platform_runtime;
 #[allow(dead_code)]
 mod plex;
 mod radio;
+#[allow(dead_code)]
+mod source_lifecycle;
 mod source_registry;
 mod subsonic;
 mod ui;

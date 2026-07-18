@@ -48,6 +48,15 @@ document already labels its diagram as intended and names the shipping abstracti
 P3.5 now reports every Linux-host source area in one pinned aggregate, keeps different native
 source sets as informational reports, and enforces the baseline accepted by two exact pinned PR
 executions in PR #111.
+
+The current P3.1 partial slice deliberately leaves both centralized production wiring and the final
+implementation-record boxes unchecked, so the literal arithmetic remains **218/223 (97.8%)** and
+P3 remains **28/30**. It compiles an unwired lifecycle authority and fixes its migration contract
+without replacing the shipping standard or DAAP registries. Final local validation after rebasing
+onto merged PR #121 passes all 38 focused lifecycle tests;
+`cargo check --all-targets --all-features --locked`; formatting and diff checks; strict
+all-target/all-feature Clippy in debug and release; and the complete debug and release suites at 20
+library, 842 application, and 10 repository-metadata tests (**872 total per profile**).
 P3.3 is complete after combining the independently reviewed non-DAAP service fixture from
 `b80e534`, the DAAP adversarial fixture from `6f6c9ac`, and this representative cross-service
 behavior matrix. The matrix exercises rejected authentication, credential-safe authenticated and
@@ -1551,6 +1560,40 @@ closed as a milestone.
   cannot yet demote it to a still-live discovery publication, while discovery loss retires live
   ownership even if the saved row remains. The ADR defines the target state machine, operation
   generations, session epochs, provenance, and ownership.
+  The current partial slice adds an intentionally unwired, production-shaped
+  `SourceLifecycleRegistry` foundation. Each entry atomically owns its adapter, the existing
+  production `MediaLease`, and its session epoch. Exact connect/refresh authority carries global
+  generations and cancel-before-wait-safe observation, while only atomically admitted spawned
+  tasks and retirement tasks participate in the persistent shutdown barrier. Unspawned owners and
+  dropped task-cancellation capabilities are inert; they cannot hold shutdown open or start work
+  after admission closes. The last external registry handle also closes the gate, cancels tasks,
+  revokes leases, and starts fail-closed close tasks if ordinary shutdown was omitted.
+
+  Framework-owned adapter wrapping and an unforgeable close capability make the registry the sole
+  teardown authority. A `FinishConstruction` phase lets a bounded sessionful login finish safely
+  after cancellation, stages the returned close-capable adapter synchronously, and only then makes
+  catalogue work abortable; staged drop, panic, cancellation, stale submission, replacement,
+  disconnect, and shutdown all enter one exactly-once retirement path. Repeated disconnect shares
+  one exact waiter, reconnect dissociates an old close from successor state without losing its
+  waiter, and a later successor disconnect has a distinct completion. The at-use HTTP bridge
+  snapshots adapter/lease/epoch, rechecks the exact epoch and active lease after resolution, and
+  attaches that lease only to a current result. DAAP production wiring must split the present full
+  constructor: protected server-info/login returns immediately after parsing the session ID and is
+  staged before update, database discovery, items, or initial catalogue work. Using the existing
+  whole `DaapBackend::connect` call as the protected login closure would stage too late.
+
+  Source-wide and exact `ViewOrigin` lanes retain independent accepted generations and snapshots.
+  Sanitized failure snapshots/events carry the exact generation and optional session epoch;
+  supersession publishes cancellation before the replacement start. Every Saved, Environment,
+  Discovery, BuiltIn, Removable, or External publisher owns an opaque keyed claim, so duplicate
+  publishers are reference-counted and a new claim during close reactivates the source without
+  allowing the old retirement to mutate a successor. Safe pruning admits only inert,
+  provenance-free retired entries. Thirty-eight deterministic tests cover construction-phase and
+  post-stage cancellation, panic, replacement, exact media/refresh ownership, correlated failures,
+  duplicate/reappearing provenance, reusable and successor retirement waiters, late task admission,
+  last-handle teardown, close, per-view, shutdown, and pruning races. No shipping adapter calls this
+  module yet: the standard and DAAP registries remain the sole production owners until follow-on
+  wiring lands, so this box correctly stays open.
 - [x] Decide how local, radio, and external-file sources fit the same lifecycle. Local is one
   always-registered source, playlists are local views, Radio-Browser is one stateless source whose
   feeds are views, removable filesystems are generation-owned sources keyed by their existing
@@ -1564,10 +1607,11 @@ closed as a milestone.
   #86 and PR #113 closed the architecture boxes. PR #120 completes frozen identity types,
   saved-source migration/quarantine, stable source ownership, exact native IDs,
   `MediaKey`/`ViewOrigin` queues, and radio/removable/external identity. PR #121 closes exact
-  local/playlist ID-at-use plus retained root/file authority through every output. One centralized
-  refresh/cancellation/failure/provenance lifecycle and at-use radio/removable/external locator
-  adapters—including the local embedded-art authority boundary—must land before P3.1 itself can
-  be recorded complete.
+  local/playlist ID-at-use plus retained root/file authority through every output. The unwired
+  registry foundation now fixes the central state/owner/task/provenance/shutdown API and race
+  contracts without creating split production authority. Standard remote and DAAP lifecycle
+  wiring, remaining source families, at-use radio/removable/external locators, and the local
+  embedded-art authority boundary must still land before P3.1 itself can be recorded complete.
 
 ### P3.2 Make the backend abstraction real and stable
 
@@ -2981,3 +3025,4 @@ Add one line per completed task:
 | 2026-07-17 | P3.1 stable identity runtime | PR #120 (`79b9d0c`, `9bf87db`, `8232d90`, `432b66b`, `269eb93`, `4bb27a3`, `208dbf4`, `3357765`, `3adf3ee`) | Freezes typed source/media/view identity and a strict atomic saved-source migration; replaces URL ownership with persisted or deterministic `SourceId` across standard and DAAP flows; preserves exact bounded native IDs for every remote adapter; and adopts source-scoped `MediaKey` plus playlist/radio `ViewOrigin` in playback. Version-1 rows accept only random RFC UUIDv4 IDs or their exact canonical remote UUIDv5 owner, preventing crafted values from claiming another endpoint, backend, built-in, or removable identity. Repeated Add reuses the saved owner, discovered-to-saved promotion persists the already-published ID and retains its ephemeral advertised route for the immediate route-aware connection, and saved-plus-env startup authenticates under the stored ID; a prefixed reversible segment round-trips even native `.`/`..` IDs through stream and artwork references. Accepted reconnect publications clear the transient connecting state even when the canonical owner remains connected; environment authentication/catalogue failures carry exact owner plus opaque UI-attempt identity, preserving a retained predecessor and rejecting a stale queued failure after a same-source retry. Removable rows use frozen lossless mount-relative native identity, malformed radio IDs fail closed, and external sessions mint independent random IDs. A row carrying both saved and discovery provenance still collapses those facts into `manually_added`, so Delete cannot yet demote it to a still-live discovered row and discovery loss can still retire the saved owner; that remains part of the open centralized-lifecycle task. Focused migration, route, registry, exact-native-ID adapter, queue, removable, radio, source-object, and reordered exact-attempt failure regressions cover the completed stable-ID compound box; the final independent-review head passes 827 tests and strict Clippy in both debug and release. Centralized lifecycle/provenance, nonlocal at-use locators, and acquisition/containment/retention of local root/file authority remain open. |
 | 2026-07-17 | P3.1 stable identity CI follow-up | PR #120 | Replaces the failed-atomic-migration fixture's Unix permission manipulation with an injected error at the loader's private save boundary. Privileged containers can bypass `chmod 0500`, but the new cross-platform fixture deterministically proves a failed replacement quarantines the configuration, publishes no migrated rows, and preserves the legacy bytes exactly. The focused regression passes in debug and release; it now also runs on Windows, changes no production migration behavior, and leaves checklist arithmetic unchanged. |
 | 2026-07-17 | P3.1 exact local/playlist ID-at-use and retained output authority | PR #121 | Preserves PR #120's exact SQLite IDs and typed local `MediaKey`/playlist `ViewOrigin`, keeps playback queues pathless, and resolves only the exact current row beneath the most-specific currently configured authoritative root. A typed `ResolvedLocalMedia` lease retains root, marker, ancestor, and exact file handles through local/AirPlay GStreamer, Chromecast, and MPD handle-backed tickets; path replacement cannot retarget admitted playback, explicit-offset full/Range reads cannot interfere through a shared cloned-handle cursor, and load replacement, Stop, error, terminal completion, ticket drop, and teardown revoke future lookup. Shared Chromecast cleanup revokes credential and retained-authority routes without changing the legacy explicit-file server-lifetime contract. Gemini's review follow-up replaced whole-row root equality with a semantic snapshot that ignores observational timestamp drift while binding every root-authority field. All 56 focused root/state recheck, no-fallback, symlink-escape, retained-file replacement, ticket/revocation, output-boundary, and playlist-ownership regressions pass alongside locked all-target check, formatting/diff checks, strict debug/release Clippy, and complete 834-test debug/release suites. Central lifecycle/provenance, nonlocal at-use locator adapters, and the path-based local embedded-art helper remain open. |
+| 2026-07-17 | P3.1 centralized lifecycle foundation (partial) | Pending PR | Adds an intentionally unwired `SourceLifecycleRegistry` with atomic adapter/production-lease/epoch ownership, framework-only construction and unforgeable close authority, phase-safe protected construction plus staged retirement, exact connect/refresh generations, correlated sanitized failures, keyed/refcounted provenance, exact reusable disconnect waiters, post-resolution lease/epoch rechecks, atomic task admission, a persistent shutdown barrier, and final-handle fail-closed teardown. Thirty-eight deterministic adversarial tests cover pre/post-stage cancellation and panic (including synchronous closure invocation), supersession ordering, stale media/refresh rejection, provenance reappearance, reconnect/disconnect close races and waiter/event finalization, late task admission, replacement, views, shutdown, and pruning. Standard/DAAP/GTK production owners remain unchanged, the DAAP login constructor still needs its required post-session-ID/pre-update split, and the centralization and final implementation boxes remain open. |
