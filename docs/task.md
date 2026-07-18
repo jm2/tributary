@@ -1955,6 +1955,10 @@ passes together with the production non-resolvable-origin/loopback-route promoti
 exact native Subsonic/Jellyfin/Plex/DAAP assertions, saved-ID collision quarantine, production-queue
 capture, recycled-sidebar action, DAAP adversarial/expiration, and already-connected
 reconnect-publication regressions. `cargo fmt --all -- --check` and `git diff --check` pass.
+The aggregate CodeQL gate then classified the promoted-route test's mock password literal as a new
+critical hard-coded credential. The regression now generates a disposable UUID secret at runtime;
+this is test-only scan hardening and does not change production authentication or the test's route
+assertions. The focused regression and strict validation were rerun after that correction.
 
 Pre-merge local branch validation (2026-07-17, P3.1 stable-identity runtime before PR #120):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature Clippy in debug

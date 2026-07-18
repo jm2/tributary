@@ -1319,11 +1319,12 @@ mod tests {
             .expect("promotion retains the discovery route");
         assert_eq!(captured_route, route);
 
+        let fixture_password = uuid::Uuid::new_v4().to_string();
         let connection = connect_manual_subsonic(
             "Saved",
             &server_url,
             "fixture-user",
-            "fixture-password",
+            &fixture_password,
             Some(captured_route),
         )
         .await;

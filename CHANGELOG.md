@@ -151,7 +151,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and strict all-target/all-feature Clippy in both profiles. The final identity review adds three
   regressions for the persisted-ID contract and promoted advertised route: the complete debug and
   release suites now pass 826 tests each, the 48-test identity filter is clean, and strict Clippy
-  passes in both profiles.
+  passes in both profiles. The promoted-route regression generates its disposable authentication
+  secret at runtime instead of embedding a credential-shaped literal, keeping the security scan
+  meaningful without changing production authentication behavior.
 - **Source identity and lifecycle now have a recorded architecture contract** — The P3.1 decision
   defines immutable `SourceId` plus backend-native `TrackId` identity, deterministic migration for
   legacy saved sources, one registry-owned connection/refresh/cancellation/failure state machine,
