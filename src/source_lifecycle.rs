@@ -6,8 +6,8 @@
 //! provenance, accepted snapshots, and generation-scoped operations. Every
 //! constructed adapter enters exactly-once retirement even when cancelled or
 //! stale, and shutdown joins all tracked construction/refresh/close work.
-//! Built-in local, removable, and external-file adapters remain outside this
-//! production cutover for now, while sharing the same typed `SourceId` model.
+//! The ephemeral external-file adapter also uses this authority; built-in
+//! local and removable adapters remain outside the production cutover for now.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -27,6 +27,25 @@ use crate::architecture::backend::BackendResult;
 use crate::architecture::media::MediaLease;
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::architecture::{SourceId, ViewOrigin};
+use crate::local::resolver::ResolvedFileMedia;
+
+/// Internal adapter result whose lifecycle lease is attached before it can
+/// leave the exact-session resolver.
+pub enum AdapterStream {
+    ProtectedHttp(Box<ResolvedHttpRequest>),
+    File(ResolvedFileMedia),
+}
+
+impl AdapterStream {
+    fn with_lease(self, lease: MediaLease) -> Self {
+        match self {
+            Self::ProtectedHttp(request) => {
+                Self::ProtectedHttp(Box::new((*request).with_lease(lease)))
+            }
+            Self::File(media) => Self::File(media.with_lease(lease)),
+        }
+    }
+}
 
 /// Result future for one bounded, best-effort adapter close.
 pub type AdapterCloseFuture =
@@ -1963,22 +1982,20 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         })
     }
 
-    /// Resolve one protected HTTP locator through the exact expected adapter
-    /// epoch, then recheck its epoch and lease before attaching the production
-    /// `MediaLease`. Requiring the caller's captured epoch prevents a queued
-    /// reference from being resolved against a later same-source session.
-    /// This is the migration seam that replaces the standard resolver map and
-    /// DAAP lease map without introducing a second lookup authority.
-    pub async fn resolve_http<F, Fut>(
+    /// Resolve an adapter-owned capability through one exact session and
+    /// return the lease captured by that same atomic adapter/epoch snapshot.
+    /// Typed boundary helpers attach the lease only after the post-resolution
+    /// current-session recheck succeeds.
+    async fn resolve_exact_session<R, F, Fut>(
         &self,
         source_id: SourceId,
         expected_session_epoch: u64,
         resolve: F,
-    ) -> BackendResult<ResolvedHttpRequest>
+    ) -> BackendResult<(R, MediaLease)>
     where
         S: Send + Sync,
         F: FnOnce(Arc<A>) -> Fut + Send,
-        Fut: Future<Output = BackendResult<ResolvedHttpRequest>> + Send,
+        Fut: Future<Output = BackendResult<R>> + Send,
     {
         let session = self.session(source_id).ok_or_else(|| {
             crate::architecture::error::BackendError::Internal(anyhow::anyhow!(
@@ -2005,7 +2022,70 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                 anyhow::anyhow!("source session changed during media resolution"),
             ));
         }
+        Ok((request, lease))
+    }
+
+    /// Resolve one protected HTTP locator through the exact expected adapter
+    /// epoch, then recheck its epoch and lease before attaching the production
+    /// `MediaLease`. Requiring the caller's captured epoch prevents a queued
+    /// reference from being resolved against a later same-source session.
+    /// This is the migration seam that replaces the standard resolver map and
+    /// DAAP lease map without introducing a second lookup authority.
+    pub async fn resolve_http<F, Fut>(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        resolve: F,
+    ) -> BackendResult<ResolvedHttpRequest>
+    where
+        S: Send + Sync,
+        F: FnOnce(Arc<A>) -> Fut + Send,
+        Fut: Future<Output = BackendResult<ResolvedHttpRequest>> + Send,
+    {
+        let (request, lease) = self
+            .resolve_exact_session(source_id, expected_session_epoch, resolve)
+            .await?;
         Ok(request.with_lease(lease))
+    }
+
+    /// Resolve one exact retained file through the same adapter, expected
+    /// epoch, and pre/post lease checks used for protected HTTP. The attached
+    /// lease is checked again immediately before and after every file-handle
+    /// clone, so retirement cannot retarget a queued external identity.
+    pub async fn resolve_file<F, Fut>(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        resolve: F,
+    ) -> BackendResult<ResolvedFileMedia>
+    where
+        S: Send + Sync,
+        F: FnOnce(Arc<A>) -> Fut + Send,
+        Fut: Future<Output = BackendResult<ResolvedFileMedia>> + Send,
+    {
+        let (media, lease) = self
+            .resolve_exact_session(source_id, expected_session_epoch, resolve)
+            .await?;
+        Ok(media.with_lease(lease))
+    }
+
+    /// Resolve one heterogeneous adapter stream without ever exposing its
+    /// source lease as a separable value.
+    pub(crate) async fn resolve_stream<F, Fut>(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        resolve: F,
+    ) -> BackendResult<AdapterStream>
+    where
+        S: Send + Sync,
+        F: FnOnce(Arc<A>) -> Fut + Send,
+        Fut: Future<Output = BackendResult<AdapterStream>> + Send,
+    {
+        let (stream, lease) = self
+            .resolve_exact_session(source_id, expected_session_epoch, resolve)
+            .await?;
+        Ok(stream.with_lease(lease))
     }
 
     /// Optional-artwork form of [`Self::resolve_http`] with the same exact
@@ -5114,6 +5194,64 @@ mod tests {
         assert!(delayed.await.expect("resolution task").is_err());
         predecessor.allow_close();
         predecessor.probe.wait_for_completions(1).await;
+        shutdown_immediate(&registry).await;
+    }
+
+    #[tokio::test]
+    async fn file_resolution_uses_exact_epoch_and_revokes_handle_clones_on_retirement() {
+        let registry = registry();
+        let source_id = SourceId::external();
+        claim(&registry, source_id, SourceProvenance::External);
+        let mut adapter = AdapterFixture::held();
+        let (session_epoch, _) = adopt(&registry, source_id, &mut adapter, Vec::new());
+        let directory = tempfile::tempdir().expect("retained file directory");
+        let path = directory.path().join("external.bin");
+        std::fs::write(&path, b"retained").expect("write retained file");
+        let file = std::fs::File::open(&path).expect("open retained file");
+
+        let invoked = Arc::new(AtomicBool::new(false));
+        let stale_invoked = Arc::clone(&invoked);
+        assert!(registry
+            .resolve_file(
+                source_id,
+                session_epoch.wrapping_add(1),
+                move |_adapter| async move {
+                    stale_invoked.store(true, Ordering::Release);
+                    ResolvedFileMedia::from_open_regular_file(file, None)
+                        .map_err(crate::architecture::error::BackendError::Io)
+                },
+            )
+            .await
+            .is_err());
+        assert!(!invoked.load(Ordering::Acquire));
+
+        let file = std::fs::File::open(&path).expect("reopen retained file");
+        let media = registry
+            .resolve_file(source_id, session_epoch, move |_adapter| async move {
+                ResolvedFileMedia::from_open_regular_file(file, None)
+                    .map_err(crate::architecture::error::BackendError::Io)
+            })
+            .await
+            .expect("resolve exact retained file");
+        assert!(media.is_active());
+        media
+            .try_clone_file()
+            .expect("current lease permits handle clone");
+
+        let waiter = registry
+            .disconnect(source_id)
+            .expect("disconnect external file");
+        assert!(!media.is_active());
+        assert_eq!(
+            media
+                .try_clone_file()
+                .expect_err("retired lease rejects handle clone")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        adapter.allow_close();
+        waiter.wait().await;
+        assert_eq!(adapter.probe.calls(), 1);
         shutdown_immediate(&registry).await;
     }
 
