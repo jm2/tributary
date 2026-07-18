@@ -154,6 +154,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes in both profiles. The promoted-route regression generates its disposable authentication
   secret at runtime instead of embedding a credential-shaped literal, keeping the security scan
   meaningful without changing production authentication behavior.
+  Automated review also removed a redundant copy of each accepted Radio-Browser native ID.
+  Remote-reference decoding deliberately continues to reject uppercase hex as noncanonical; an
+  existing malformed-reference regression pins that fail-closed boundary.
 - **Source identity and lifecycle now have a recorded architecture contract** — The P3.1 decision
   defines immutable `SourceId` plus backend-native `TrackId` identity, deterministic migration for
   legacy saved sources, one registry-owned connection/refresh/cancellation/failure state machine,

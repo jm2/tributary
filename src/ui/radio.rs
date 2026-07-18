@@ -90,12 +90,12 @@ pub fn radio_station_to_track_object(station: &crate::radio::RadioStation) -> Tr
         &station.codec,   // format = codec
         &station.url_resolved,
     );
-    let track_id = crate::architecture::TrackId::remote(station.stationuuid.clone())
-        .map(|id| id.as_str().to_string())
-        .unwrap_or_default();
     // Explicit empty identity makes malformed server rows unqueueable instead
     // of silently falling back to their stream URL as a different identity.
-    track.set_track_id(&track_id);
+    match crate::architecture::TrackId::remote(station.stationuuid.clone()) {
+        Ok(track_id) => track.set_track_id(track_id.as_str()),
+        Err(_) => track.set_track_id(""),
+    }
     track
 }
 

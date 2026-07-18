@@ -1959,6 +1959,11 @@ The aggregate CodeQL gate then classified the promoted-route test's mock passwor
 critical hard-coded credential. The regression now generates a disposable UUID secret at runtime;
 this is test-only scan hardening and does not change production authentication or the test's route
 assertions. The focused regression and strict validation were rerun after that correction.
+Gemini's follow-up review found one valid avoidable Radio-Browser ID copy, now removed without
+changing accepted or quarantined rows. Its suggestion to accept uppercase reference hex was not
+applied: the frozen encoder emits lowercase only, canonical spelling is part of the opaque-ticket
+contract, and `malformed_and_wrong_kind_references_fail_closed` already asserts uppercase `id-2E`
+is rejected. Both review threads were resolved after recording that distinction.
 
 Pre-merge local branch validation (2026-07-17, P3.1 stable-identity runtime before PR #120):
 `cargo check --all-targets --all-features --locked`, strict all-target/all-feature Clippy in debug
