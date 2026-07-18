@@ -605,14 +605,22 @@ implementation details so long as one registry ultimately enforces this contract
    file capability through bounded, cursor-safe parsing without reopening a pathname. Removable
    and external direct-file art move with their source adapters in the remaining steps.
 
-Locked debug and release suites each pass 20 library, 865 application, and 10 repository-metadata
-tests (895 total), with locked all-target/all-feature compile, strict warning-free Clippy,
-formatting, and diff checks green.
+The authenticated-remote cutover's locked debug and release suites each passed 20 library, 865
+application, and 10 repository-metadata tests (895 total), with locked all-target/all-feature
+compile, strict warning-free Clippy, formatting, and diff checks green.
 
 PR #125 validation for the retained embedded-art slice passes all 9 focused album-art
 tests, the locked all-target/all-feature check, strict Clippy in debug and release, formatting, and
 the whitespace check. Locked debug and release suites each pass 20 library, 872 application, and
 10 repository-metadata tests (902 total).
+
+The Radio-Browser cutover passes the locked all-target/all-feature check, strict Clippy in debug and
+release, formatting, and whitespace checks. Complete locked debug and release suites each pass 20
+library, 895 application, and 10 repository-metadata tests (925 total). Focused lifecycle,
+source-registry, media, radio-client/adapter, reducer, consent, queue, and playback tests cover
+cancellation, empty/failure distinction, cross-view winner ordering, final-use revocation,
+last-registry-drop, partial Near Me tiers, deduplication/distance ordering, pathless capture,
+pre-publication source loss, exact failure ownership, and the generation-owned consent prerequisite.
 
 Each step must keep existing credential-isolation, exact-origin, root-authority, receiver-ticket,
 and generation-supersession tests green. Compatibility code is removed in the same milestone; two
