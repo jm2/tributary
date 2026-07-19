@@ -12,6 +12,7 @@ mod m20260714_000007_add_composer;
 mod m20260715_000008_playlist_entry_match_path;
 mod m20260715_000009_create_root_reauthorization_receipts;
 mod m20260718_000010_add_playback_history;
+mod m20260718_000011_migrate_default_history_playlists;
 
 pub struct Migrator;
 
@@ -29,6 +30,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260715_000008_playlist_entry_match_path::Migration),
             Box::new(m20260715_000009_create_root_reauthorization_receipts::Migration),
             Box::new(m20260718_000010_add_playback_history::Migration),
+            Box::new(m20260718_000011_migrate_default_history_playlists::Migration),
         ]
     }
 }
