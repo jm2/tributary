@@ -92,10 +92,23 @@ async fn migrate_defaults(
     match result {
         Ok(()) => transaction.commit().await,
         Err(error) => {
-            transaction.rollback().await?;
-            Err(error)
+            let rollback_result = transaction.rollback().await;
+            Err(preserve_original_error(error, rollback_result))
         }
     }
+}
+
+/// Preserve the failure that caused rollback while retaining evidence if the
+/// rollback itself also fails. Returning the rollback error would hide the
+/// operation that made the migration unsafe to commit in the first place.
+fn preserve_original_error(original: DbErr, rollback_result: Result<(), DbErr>) -> DbErr {
+    if let Err(rollback_error) = rollback_result {
+        tracing::warn!(
+            error = %rollback_error,
+            "Failed to roll back history-playlist migration; preserving the original error"
+        );
+    }
+    original
 }
 
 async fn update_recently_played<C: ConnectionTrait>(
@@ -532,6 +545,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(migrated, expected);
+    }
+
+    #[test]
+    fn rollback_failure_does_not_mask_the_original_migration_error() {
+        let original = DbErr::Migration("forced update failure".to_string());
+        let expected = original.to_string();
+        let rollback = DbErr::Migration("forced rollback failure".to_string());
+
+        let returned = preserve_original_error(original, Err(rollback));
+
+        assert_eq!(returned.to_string(), expected);
     }
 
     #[tokio::test]
