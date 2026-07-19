@@ -90,13 +90,16 @@ async fn validate_rating_column(manager: &SchemaManager<'_>) -> Result<(), DbErr
         })
         .flat_map(char::to_lowercase)
         .collect();
-    // SQLite appends an ADD COLUMN definition immediately before the table's
-    // final `)`. Requiring that exact normalized suffix rejects compatible-
-    // looking columns with additional restrictions (for example <= 50),
-    // which would otherwise be ledgered despite rejecting canonical values.
-    const REQUIRED_COLUMN_SUFFIX: &str =
-        ",ratingintegernullcheck(ratingisnullor(typeof(rating)='integer'andratingbetween1and100)))";
-    if !normalized.ends_with(REQUIRED_COLUMN_SUFFIX) {
+    // Require the exact normalized definition between real column boundaries.
+    // The comma case keeps retry validation valid after a later migration has
+    // appended another column; the closing-parenthesis case covers rating as
+    // the current final column. An extra same-column restriction (for example
+    // `CHECK (rating <= 50)`) has neither boundary and is still rejected.
+    const REQUIRED_COLUMN_DEFINITION: &str =
+        "ratingintegernullcheck(ratingisnullor(typeof(rating)='integer'andratingbetween1and100))";
+    let followed_by_column = format!(",{REQUIRED_COLUMN_DEFINITION},");
+    let final_column = format!(",{REQUIRED_COLUMN_DEFINITION})");
+    if !normalized.contains(&followed_by_column) && !normalized.ends_with(&final_column) {
         return Err(DbErr::Migration(
             "tracks.rating does not have the exact canonical whole-integer 1..=100 CHECK constraint"
                 .to_string(),
@@ -243,6 +246,20 @@ mod tests {
             .await
             .expect("accept compatible interrupted migration");
         assert!(migration_is_applied(&compatible).await);
+
+        let followed_by_later_column = database_before_rating_migration().await;
+        followed_by_later_column
+            .execute_unprepared(ADD_RATING_SQL)
+            .await
+            .expect("install compatible interrupted column");
+        followed_by_later_column
+            .execute_unprepared("ALTER TABLE tracks ADD COLUMN later_marker TEXT NULL")
+            .await
+            .expect("simulate a later appended schema column");
+        Migrator::up(&followed_by_later_column, Some(1))
+            .await
+            .expect("accept the exact rating definition before a later column");
+        assert!(migration_is_applied(&followed_by_later_column).await);
 
         let incompatible = database_before_rating_migration().await;
         incompatible

@@ -36,7 +36,8 @@ Migration 12 adds `tracks.rating` as a nullable SQLite `INTEGER` with a constrai
 `NULL` or integer storage in the inclusive 1–100 range. It has no default: every legacy row becomes
 `NULL`/unrated without inference from tags, play counts, dates, or playlists. Interrupted upgrades
 accept only the exact compatible nullable and constrained shape; a lookalike unconstrained column
-is rejected. Down/up retry removes any rating with the column and recreates legacy rows as unrated.
+is rejected, while the exact definition remains recognizable after later columns are appended.
+Down/up retry removes any rating with the column and recreates legacy rows as unrated.
 
 `LocalBackend::set_track_rating` sets or clears one exact source-native `TrackId` in a transaction,
 selects the replacement row before commit, and returns only committed state. A missing row is a

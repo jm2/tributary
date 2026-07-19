@@ -171,8 +171,9 @@ the 35-record feature backlog.
   through 100, with `None` as unrated, and one coherent Writable, ReadOnly, or Unsupported state per
   track. Tributary owns and transactionally writes ratings only for exact local-library IDs in
   SQLite; migration 12 leaves every legacy row `NULL`, enforces integer/range storage, validates
-  interrupted upgrades, and supports down/up retry. Existing-row metadata refreshes and recognized
-  paired watcher file/directory renames preserve ratings; an offline or otherwise unrecognized
+  interrupted upgrades even after later columns are appended, and supports down/up retry.
+  Existing-row metadata refreshes and recognized paired watcher file/directory renames preserve
+  ratings; an offline or otherwise unrecognized
   remove-plus-add becomes a new unrated row. Embedded tags are neither read nor written for this
   field.
 

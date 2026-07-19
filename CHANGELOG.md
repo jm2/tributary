@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Tracks carry one coherent Writable, ReadOnly, or Unsupported state, and the catalogue seam rejects
   any per-track capability that disagrees with its backend. Migration 12 adds a nullable local
   SQLite integer with independent storage-type/range enforcement, leaves every legacy row unrated,
-  rejects interrupted lookalike schemas without the canonical constraint, and supports down/up
-  retry. Tributary owns ratings only for local-library tracks: `LocalBackend` transactionally sets
+  rejects interrupted lookalike schemas without the canonical constraint, recognizes the exact
+  definition even after later columns are appended, and supports down/up retry. Tributary owns
+  ratings only for local-library tracks: `LocalBackend` transactionally sets
   or clears one exact native ID, returns only committed state, treats deletion as a clean no-op,
   and existing-row metadata refresh or a recognized paired watcher rename preserves the value
   without reading or writing embedded tags. An unrecognized remove-plus-add remains a new unrated
