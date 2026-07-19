@@ -4,8 +4,11 @@
 //! time and left `Top 25 Most Played` without a deterministic presentation
 //! order.  There is no persisted "seeded by Tributary" marker, so this
 //! migration deliberately recognizes only the complete byte-exact historical
-//! signatures.  Any user-visible or redundant-field difference is treated as
-//! evidence that the playlist is user-owned and must remain untouched.
+//! signatures. This includes both the v0.5.0 JSON representation, whose rule
+//! object contained `live_updating: true`, and its immediate successor after
+//! that redundant JSON field was removed. Any user-visible or redundant-field
+//! difference is treated as evidence that the playlist is user-owned and must
+//! remain untouched.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::{ConnectionTrait, Statement, TransactionTrait};
@@ -15,6 +18,10 @@ const TOP_25_NAME: &str = "Top 25 Most Played";
 
 const LEGACY_RECENTLY_PLAYED_RULES: &str = r#"{"match_mode":"All","rules":[{"field":"DateModified","operator":{"IsInTheLast":{"amount":14,"unit":"Days"}},"value":{"Number":14}},{"field":"PlayCount","operator":"GreaterThan","value":{"Number":0}}],"limit":null,"sort_order":[{"field":"DateModified","direction":"Descending"}]}"#;
 const LEGACY_TOP_25_RULES: &str = r#"{"match_mode":"All","rules":[{"field":"PlayCount","operator":"GreaterThan","value":{"Number":0}}],"limit":{"value":25,"unit":"Items","selected_by":"MostPlayed"},"sort_order":[]}"#;
+// v0.5.0 serialized the database's always-live compatibility flag inside the
+// rule object. Its position is part of the exact released signature.
+const V0_5_0_RECENTLY_PLAYED_RULES: &str = r#"{"match_mode":"All","rules":[{"field":"DateModified","operator":{"IsInTheLast":{"amount":14,"unit":"Days"}},"value":{"Number":14}},{"field":"PlayCount","operator":"GreaterThan","value":{"Number":0}}],"limit":null,"live_updating":true,"sort_order":[{"field":"DateModified","direction":"Descending"}]}"#;
+const V0_5_0_TOP_25_RULES: &str = r#"{"match_mode":"All","rules":[{"field":"PlayCount","operator":"GreaterThan","value":{"Number":0}}],"limit":{"value":25,"unit":"Items","selected_by":"MostPlayed"},"live_updating":true,"sort_order":[]}"#;
 
 // These literals intentionally mirror `serde_json::to_string` for the fresh
 // defaults. Keep them independent of the current Rust rule types: a migration
@@ -31,9 +38,9 @@ impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         migrate_defaults(
             manager,
-            LEGACY_RECENTLY_PLAYED_RULES,
+            &[LEGACY_RECENTLY_PLAYED_RULES, V0_5_0_RECENTLY_PLAYED_RULES],
             CURRENT_RECENTLY_PLAYED_RULES,
-            LEGACY_TOP_25_RULES,
+            &[LEGACY_TOP_25_RULES, V0_5_0_TOP_25_RULES],
             CURRENT_TOP_25_RULES,
         )
         .await
@@ -42,9 +49,9 @@ impl MigrationTrait for Migration {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         migrate_defaults(
             manager,
-            CURRENT_RECENTLY_PLAYED_RULES,
+            &[CURRENT_RECENTLY_PLAYED_RULES],
             LEGACY_RECENTLY_PLAYED_RULES,
-            CURRENT_TOP_25_RULES,
+            &[CURRENT_TOP_25_RULES],
             LEGACY_TOP_25_RULES,
         )
         .await
@@ -59,9 +66,9 @@ impl MigrationTrait for Migration {
 /// after commit but before the ledger write is safe to retry.
 async fn migrate_defaults(
     manager: &SchemaManager<'_>,
-    recently_played_from: &str,
+    recently_played_sources: &[&str],
     recently_played_to: &str,
-    top_25_from: &str,
+    top_25_sources: &[&str],
     top_25_to: &str,
 ) -> Result<(), DbErr> {
     if !manager.has_table("playlists").await? {
@@ -72,8 +79,12 @@ async fn migrate_defaults(
 
     let transaction = manager.get_connection().begin().await?;
     let result = async {
-        update_recently_played(&transaction, recently_played_from, recently_played_to).await?;
-        update_top_25(&transaction, top_25_from, top_25_to).await?;
+        for from_rules in recently_played_sources {
+            update_recently_played(&transaction, from_rules, recently_played_to).await?;
+        }
+        for from_rules in top_25_sources {
+            update_top_25(&transaction, from_rules, top_25_to).await?;
+        }
         Ok::<(), DbErr>(())
     }
     .await;
@@ -166,12 +177,15 @@ mod tests {
         db
     }
 
-    fn recently_played(id: impl Into<String>) -> playlist::Model {
+    fn recently_played_with_rules(
+        id: impl Into<String>,
+        smart_rules_json: &str,
+    ) -> playlist::Model {
         playlist::Model {
             id: id.into(),
             name: RECENTLY_PLAYED_NAME.to_string(),
             is_smart: true,
-            smart_rules_json: Some(LEGACY_RECENTLY_PLAYED_RULES.to_string()),
+            smart_rules_json: Some(smart_rules_json.to_string()),
             limit_enabled: false,
             limit_value: None,
             limit_unit: None,
@@ -183,12 +197,20 @@ mod tests {
         }
     }
 
-    fn top_25(id: impl Into<String>) -> playlist::Model {
+    fn recently_played(id: impl Into<String>) -> playlist::Model {
+        recently_played_with_rules(id, LEGACY_RECENTLY_PLAYED_RULES)
+    }
+
+    fn v0_5_0_recently_played(id: impl Into<String>) -> playlist::Model {
+        recently_played_with_rules(id, V0_5_0_RECENTLY_PLAYED_RULES)
+    }
+
+    fn top_25_with_rules(id: impl Into<String>, smart_rules_json: &str) -> playlist::Model {
         playlist::Model {
             id: id.into(),
             name: TOP_25_NAME.to_string(),
             is_smart: true,
-            smart_rules_json: Some(LEGACY_TOP_25_RULES.to_string()),
+            smart_rules_json: Some(smart_rules_json.to_string()),
             limit_enabled: true,
             limit_value: Some(25),
             limit_unit: Some("\"Items\"".to_string()),
@@ -198,6 +220,14 @@ mod tests {
             created_at: "2025-11-12T13:14:15.000Z".to_string(),
             updated_at: "2026-01-02T03:04:05.000Z".to_string(),
         }
+    }
+
+    fn top_25(id: impl Into<String>) -> playlist::Model {
+        top_25_with_rules(id, LEGACY_TOP_25_RULES)
+    }
+
+    fn v0_5_0_top_25(id: impl Into<String>) -> playlist::Model {
+        top_25_with_rules(id, V0_5_0_TOP_25_RULES)
     }
 
     async fn insert_playlists(db: &DatabaseConnection, playlists: &[playlist::Model]) {
@@ -260,6 +290,23 @@ mod tests {
         });
         add_recent("match-mode", |model| model.match_mode = "any".to_string());
         add_recent("not-live", |model| model.live_updating = false);
+        let mut v0_5_0_recent_false = v0_5_0_recently_played("v050-recent-false");
+        v0_5_0_recent_false.smart_rules_json = Some(V0_5_0_RECENTLY_PLAYED_RULES.replacen(
+            "\"live_updating\":true",
+            "\"live_updating\":false",
+            1,
+        ));
+        v0_5_0_recent_false.live_updating = false;
+        models.push(v0_5_0_recent_false);
+        let mut v0_5_0_recent_reformatted = v0_5_0_recently_played("v050-recent-reformatted");
+        v0_5_0_recent_reformatted.smart_rules_json = Some(
+            serde_json::to_string_pretty(
+                &serde_json::from_str::<serde_json::Value>(V0_5_0_RECENTLY_PLAYED_RULES)
+                    .expect("parse v0.5.0 Recently Played rules"),
+            )
+            .expect("reformat v0.5.0 Recently Played rules"),
+        );
+        models.push(v0_5_0_recent_reformatted);
 
         let mut add_top = |suffix: &str, change: fn(&mut playlist::Model)| {
             let mut model = top_25(format!("top-{suffix}"));
@@ -291,11 +338,37 @@ mod tests {
         });
         add_top("match-mode", |model| model.match_mode = "any".to_string());
         add_top("not-live", |model| model.live_updating = false);
+        let mut v0_5_0_top_false = v0_5_0_top_25("v050-top-false");
+        v0_5_0_top_false.smart_rules_json = Some(V0_5_0_TOP_25_RULES.replacen(
+            "\"live_updating\":true",
+            "\"live_updating\":false",
+            1,
+        ));
+        v0_5_0_top_false.live_updating = false;
+        models.push(v0_5_0_top_false);
+        let mut v0_5_0_top_reformatted = v0_5_0_top_25("v050-top-reformatted");
+        v0_5_0_top_reformatted.smart_rules_json = Some(
+            serde_json::to_string_pretty(
+                &serde_json::from_str::<serde_json::Value>(V0_5_0_TOP_25_RULES)
+                    .expect("parse v0.5.0 Top 25 rules"),
+            )
+            .expect("reformat v0.5.0 Top 25 rules"),
+        );
+        models.push(v0_5_0_top_reformatted);
         models
     }
 
+    #[derive(serde::Serialize)]
+    struct V0_5_0SmartRules {
+        match_mode: MatchMode,
+        rules: Vec<SmartRule>,
+        limit: Option<SmartLimit>,
+        live_updating: bool,
+        sort_order: Vec<SortCriterion>,
+    }
+
     #[test]
-    fn legacy_rule_literals_match_the_historical_seed_serializer() {
+    fn legacy_rule_literals_match_both_historical_seed_serializers() {
         let recently_played_rules = SmartRules {
             match_mode: MatchMode::All,
             rules: vec![
@@ -333,6 +406,20 @@ mod tests {
             }),
             sort_order: vec![],
         };
+        let v0_5_0_recently_played_rules = V0_5_0SmartRules {
+            match_mode: recently_played_rules.match_mode.clone(),
+            rules: recently_played_rules.rules.clone(),
+            limit: recently_played_rules.limit.clone(),
+            live_updating: true,
+            sort_order: recently_played_rules.sort_order.clone(),
+        };
+        let v0_5_0_top_25_rules = V0_5_0SmartRules {
+            match_mode: top_25_rules.match_mode.clone(),
+            rules: top_25_rules.rules.clone(),
+            limit: top_25_rules.limit.clone(),
+            live_updating: true,
+            sort_order: top_25_rules.sort_order.clone(),
+        };
 
         assert_eq!(
             serde_json::to_string(&recently_played_rules).expect("serialize historical rules"),
@@ -342,15 +429,28 @@ mod tests {
             serde_json::to_string(&top_25_rules).expect("serialize historical rules"),
             LEGACY_TOP_25_RULES
         );
+        assert_eq!(
+            serde_json::to_string(&v0_5_0_recently_played_rules)
+                .expect("serialize v0.5.0 Recently Played rules"),
+            V0_5_0_RECENTLY_PLAYED_RULES
+        );
+        assert_eq!(
+            serde_json::to_string(&v0_5_0_top_25_rules).expect("serialize v0.5.0 Top 25 rules"),
+            V0_5_0_TOP_25_RULES
+        );
     }
 
     #[tokio::test]
     async fn up_updates_only_complete_byte_exact_historical_signatures() {
         let db = database_before_migration().await;
-        let exact_recent = recently_played("exact-recent");
-        let exact_top = top_25("exact-top");
+        let exact = vec![
+            recently_played("exact-recent"),
+            top_25("exact-top"),
+            v0_5_0_recently_played("exact-v050-recent"),
+            v0_5_0_top_25("exact-v050-top"),
+        ];
         let near_misses = signature_near_misses();
-        let mut fixtures = vec![exact_recent.clone(), exact_top.clone()];
+        let mut fixtures = exact.clone();
         fixtures.extend(near_misses.clone());
         insert_playlists(&db, &fixtures).await;
 
@@ -359,12 +459,17 @@ mod tests {
             .expect("migrate untouched history defaults");
 
         let mut expected = near_misses;
-        let mut migrated_recent = exact_recent;
-        migrated_recent.smart_rules_json = Some(CURRENT_RECENTLY_PLAYED_RULES.to_string());
-        expected.push(migrated_recent);
-        let mut migrated_top = exact_top;
-        migrated_top.smart_rules_json = Some(CURRENT_TOP_25_RULES.to_string());
-        expected.push(migrated_top);
+        expected.extend(exact.into_iter().map(|mut model| {
+            model.smart_rules_json = Some(
+                if model.name == RECENTLY_PLAYED_NAME {
+                    CURRENT_RECENTLY_PLAYED_RULES
+                } else {
+                    CURRENT_TOP_25_RULES
+                }
+                .to_string(),
+            );
+            model
+        }));
         expected.sort_by(|left, right| left.id.cmp(&right.id));
 
         assert_eq!(all_playlists(&db).await, expected);
@@ -374,12 +479,17 @@ mod tests {
     #[tokio::test]
     async fn failure_rolls_back_both_updates_and_the_retry_is_safe() {
         let db = database_before_migration().await;
-        let original = vec![recently_played("recent"), top_25("top")];
+        let original = vec![
+            recently_played("recent-no-field"),
+            v0_5_0_recently_played("recent-v050"),
+            top_25("top-no-field"),
+            v0_5_0_top_25("top-v050"),
+        ];
         insert_playlists(&db, &original).await;
         db.execute_unprepared(
             "CREATE TRIGGER fail_top_25_migration
              BEFORE UPDATE OF smart_rules_json ON playlists
-             WHEN OLD.name = 'Top 25 Most Played'
+             WHEN OLD.id = 'top-v050'
              BEGIN
                  SELECT RAISE(ABORT, 'forced Top 25 migration failure');
              END",
@@ -407,20 +517,27 @@ mod tests {
             .await
             .expect("repeat committed migration body");
         let migrated = all_playlists(&db).await;
-        assert_eq!(
-            migrated[0].smart_rules_json.as_deref(),
-            Some(CURRENT_RECENTLY_PLAYED_RULES)
-        );
-        assert_eq!(
-            migrated[1].smart_rules_json.as_deref(),
-            Some(CURRENT_TOP_25_RULES)
-        );
+        let expected = original
+            .into_iter()
+            .map(|mut model| {
+                model.smart_rules_json = Some(
+                    if model.name == RECENTLY_PLAYED_NAME {
+                        CURRENT_RECENTLY_PLAYED_RULES
+                    } else {
+                        CURRENT_TOP_25_RULES
+                    }
+                    .to_string(),
+                );
+                model
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(migrated, expected);
     }
 
     #[tokio::test]
     async fn down_reverts_only_still_untouched_current_signatures() {
         let db = database_before_migration().await;
-        let original = vec![recently_played("recent"), top_25("top")];
+        let original = vec![v0_5_0_recently_played("recent"), v0_5_0_top_25("top")];
         insert_playlists(&db, &original).await;
         Migrator::up(&db, Some(1))
             .await
@@ -449,7 +566,9 @@ mod tests {
             Some(CURRENT_RECENTLY_PLAYED_RULES),
             "a user-modified current signature must not be rewritten"
         );
-        assert_eq!(rows[1], original[1]);
+        let mut canonical_predecessor_top = original[1].clone();
+        canonical_predecessor_top.smart_rules_json = Some(LEGACY_TOP_25_RULES.to_string());
+        assert_eq!(rows[1], canonical_predecessor_top);
         assert!(!migration_is_applied(&db).await);
     }
 }
