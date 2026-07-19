@@ -487,6 +487,8 @@ fn add_rating_column(column_view: &gtk::ColumnView, library_commands: LibraryCom
         }
     });
 
+    let rating_title = rust_i18n::t!("columns.rating").into_owned();
+    let sort_rating_title = rating_title.clone();
     let column_view_weak = column_view.downgrade();
     let sorter = gtk::CustomSorter::new(move |a, b| {
         let first = a
@@ -499,17 +501,20 @@ fn add_rating_column(column_view: &gtk::ColumnView, library_commands: LibraryCom
             view.sorter()
                 .and_downcast::<gtk::ColumnViewSorter>()
                 .is_some_and(|sorter| {
-                    rating_sort_is_descending((0..sorter.n_sort_columns()).filter_map(|index| {
-                        let (column, order) = sorter.nth_sort_column(index);
-                        Some((column?.title()?, order))
-                    }))
+                    rating_sort_is_descending(
+                        (0..sorter.n_sort_columns()).filter_map(|index| {
+                            let (column, order) = sorter.nth_sort_column(index);
+                            Some((column?.title()?, order))
+                        }),
+                        &sort_rating_title,
+                    )
                 })
         });
         compare_rating_rows(first, second, descending).into()
     });
 
     let column = gtk::ColumnViewColumn::builder()
-        .title("Rating")
+        .title(&rating_title)
         .factory(&factory)
         .sorter(&sorter)
         .resizable(true)
@@ -632,14 +637,14 @@ fn rating_sort_category(rating: TrackRating) -> u8 {
 
 /// Return the direction assigned specifically to Rating, including when GTK
 /// uses it as a secondary compound-sort key.
-fn rating_sort_is_descending<I, S>(columns: I) -> bool
+fn rating_sort_is_descending<I, S>(columns: I, rating_title: &str) -> bool
 where
     I: IntoIterator<Item = (S, gtk::SortType)>,
     S: AsRef<str>,
 {
     columns
         .into_iter()
-        .any(|(title, order)| title.as_ref() == "Rating" && order == gtk::SortType::Descending)
+        .any(|(title, order)| title.as_ref() == rating_title && order == gtk::SortType::Descending)
 }
 
 #[cfg(test)]
@@ -802,13 +807,19 @@ mod tests {
 
     #[test]
     fn secondary_rating_sort_uses_its_own_direction() {
-        assert!(rating_sort_is_descending([
-            ("Artist", gtk::SortType::Ascending),
-            ("Rating", gtk::SortType::Descending),
-        ]));
-        assert!(!rating_sort_is_descending([
-            ("Artist", gtk::SortType::Descending),
-            ("Rating", gtk::SortType::Ascending),
-        ]));
+        assert!(rating_sort_is_descending(
+            [
+                ("Artiste", gtk::SortType::Ascending),
+                ("Note", gtk::SortType::Descending),
+            ],
+            "Note",
+        ));
+        assert!(!rating_sort_is_descending(
+            [
+                ("Artiste", gtk::SortType::Descending),
+                ("Note", gtk::SortType::Ascending),
+            ],
+            "Note",
+        ));
     }
 }

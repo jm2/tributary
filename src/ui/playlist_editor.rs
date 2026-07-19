@@ -286,7 +286,10 @@ fn validate_rating_row(row: &gtk::Box) -> bool {
     error.set_label(message.as_deref().unwrap_or_default());
     error.set_visible(message.is_some());
 
-    let is_range = operator.selected() == 4;
+    let is_range = matches!(
+        index_to_rating_operator(operator.selected()),
+        RuleOperator::InRange
+    );
     set_rating_entry_error(&value, message.as_deref());
     set_rating_entry_error(&high, if is_range { message.as_deref() } else { None });
     validation.is_ok()
@@ -890,12 +893,19 @@ fn build_rule_row(
             let field = index_to_field(field_dd.selected());
             let field_type = field_type(&field);
             let is_range = match field_type {
-                FieldType::Number | FieldType::Rating => dd.selected() == 4, // "in range"
+                FieldType::Number => dd.selected() == 4, // "in range"
+                FieldType::Rating => matches!(
+                    index_to_rating_operator(dd.selected()),
+                    RuleOperator::InRange
+                ),
                 _ => false,
             };
             value2.set_visible(is_range);
-            let is_rating_presence =
-                matches!(field_type, FieldType::Rating) && matches!(dd.selected(), 5 | 6);
+            let is_rating_presence = matches!(field_type, FieldType::Rating)
+                && matches!(
+                    index_to_rating_operator(dd.selected()),
+                    RuleOperator::IsRated | RuleOperator::IsUnrated
+                );
             value.set_visible(!is_rating_presence);
             let is_relative_date =
                 matches!(field_type, FieldType::Date) && matches!(dd.selected(), 4 | 5);
