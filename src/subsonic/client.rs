@@ -13,8 +13,8 @@ use crate::architecture::error::BackendError;
 use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
-    apply_advertised_http_route, authenticated_client_builder, redact_url_secrets,
-    strip_request_url, validate_base_url,
+    append_base_path_segments, apply_advertised_http_route, authenticated_client_builder,
+    redact_url_secrets, strip_request_url, validate_base_url,
 };
 
 use super::api::SubsonicEnvelope;
@@ -203,11 +203,7 @@ impl SubsonicClient {
         let mut url = self.base_url.clone();
         url.set_query(None);
         url.set_fragment(None);
-        {
-            let mut segments = url.path_segments_mut().expect("base URL cannot-be-a-base");
-            segments.push("rest");
-            segments.push(endpoint);
-        }
+        append_base_path_segments(&mut url, ["rest", endpoint]);
         {
             let mut q = url.query_pairs_mut();
             q.append_pair("u", &self.username);
@@ -305,29 +301,28 @@ impl SubsonicClient {
             })?;
 
         if envelope.response.status != "ok" {
-            let msg = envelope
-                .response
-                .error
-                .as_ref()
-                .map(|e| format!("Subsonic error {}: {}", e.code, e.message))
-                .unwrap_or_else(|| "Unknown Subsonic error".into());
-
             if let Some(err) = &envelope.response.error {
+                let message = format!("Subsonic API error {}", err.code);
                 match err.code {
                     // Code 40 = wrong credentials
                     40 => {
-                        return Err(BackendError::AuthenticationFailed { message: msg });
+                        return Err(BackendError::AuthenticationFailed { message });
                     }
                     // Code 41 = token auth not supported
                     41 => {
-                        return Err(BackendError::TokenAuthNotSupported { message: msg });
+                        return Err(BackendError::TokenAuthNotSupported { message });
                     }
                     _ => {}
                 }
+
+                return Err(BackendError::ConnectionFailed {
+                    message,
+                    source: None,
+                });
             }
 
             return Err(BackendError::ConnectionFailed {
-                message: msg,
+                message: "Subsonic API returned a failed response".into(),
                 source: None,
             });
         }
@@ -359,11 +354,7 @@ impl SubsonicClient {
         media_id: &str,
     ) -> BackendResult<ResolvedHttpRequest> {
         let mut url = self.base_url.clone();
-        {
-            let mut segments = url.path_segments_mut().expect("base URL cannot-be-a-base");
-            segments.push("rest");
-            segments.push(endpoint);
-        }
+        append_base_path_segments(&mut url, ["rest", endpoint]);
         {
             let mut query = url.query_pairs_mut();
             query
@@ -410,7 +401,9 @@ fn response_body_error(context: &str, error: ResponseBodyError) -> BackendError 
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+    use std::thread;
 
     use super::*;
 
@@ -418,6 +411,55 @@ mod tests {
         let origin = Url::parse(origin).expect("route origin");
         AdvertisedHttpRoute::new(&origin, [SocketAddr::from((Ipv4Addr::LOCALHOST, 45_321))])
             .expect("domain route")
+    }
+
+    fn spawn_failed_envelope(code: i32) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind fixture server");
+        listener
+            .set_nonblocking(true)
+            .expect("set fixture listener nonblocking");
+        let address = listener.local_addr().expect("fixture address");
+        let body = format!(
+            r#"{{"subsonic-response":{{"status":"failed","version":"1.16.1","error":{{"code":{code},"message":"fixture failure"}}}}}}"#
+        );
+        let server = thread::spawn(move || {
+            let accept_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < accept_deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept fixture request: {error}"),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("set fixture stream blocking");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set fixture read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).expect("read fixture request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write fixture response");
+        });
+        (format!("http://{address}"), server)
     }
 
     #[test]
@@ -447,6 +489,88 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains("embedded-user"));
         assert!(!rendered.contains(&secret));
+    }
+
+    #[test]
+    fn api_and_media_paths_preserve_reverse_proxy_prefixes_exactly() {
+        let password = uuid::Uuid::new_v4().to_string();
+        for (base, prefix) in [
+            ("https://music.example.test", ""),
+            ("https://music.example.test/share", "/share"),
+            ("https://music.example.test/share/", "/share"),
+            (
+                "https://music.example.test/tenant%2Fmusic/",
+                "/tenant%2Fmusic",
+            ),
+        ] {
+            let mut client = SubsonicClient::new(base, "user", &password).expect("client");
+            client.auth = AuthMode::Token {
+                token: "fixed-token".to_string(),
+                salt: "fixed-salt".to_string(),
+            };
+            assert_eq!(
+                client.api_url("ping.view").as_str(),
+                format!(
+                    "https://music.example.test{prefix}/rest/ping.view?u=user&t=fixed-token&s=fixed-salt&v=1.16.1&c=Tributary&f=json"
+                ),
+                "API base URL: {base}"
+            );
+            assert_eq!(
+                client
+                    .resolved_stream_request("song-id")
+                    .expect("stream request")
+                    .endpoint()
+                    .as_str(),
+                format!(
+                    "https://music.example.test{prefix}/rest/stream.view?id=song-id&v=1.16.1&c=Tributary&f=json"
+                ),
+                "stream base URL: {base}"
+            );
+            assert_eq!(
+                client
+                    .resolved_artwork_request("cover-id")
+                    .expect("artwork request")
+                    .endpoint()
+                    .as_str(),
+                format!(
+                    "https://music.example.test{prefix}/rest/getCoverArt.view?id=cover-id&v=1.16.1&c=Tributary&f=json"
+                ),
+                "artwork base URL: {base}"
+            );
+            assert!(!client.api_url("ping.view").as_str().contains("%252F"));
+        }
+    }
+
+    #[tokio::test]
+    async fn maps_http_200_failed_envelopes_to_typed_subsonic_errors() {
+        let password = uuid::Uuid::new_v4().to_string();
+        for code in [40, 41, 70] {
+            let (base_url, server) = spawn_failed_envelope(code);
+            let client = SubsonicClient::new(&base_url, "user", &password).expect("client");
+            let error = client
+                .get("ping.view")
+                .await
+                .expect_err("failed envelope must not be accepted");
+            server.join().expect("join fixture server");
+
+            let expected = format!("Subsonic API error {code}");
+            match (code, error) {
+                (40, BackendError::AuthenticationFailed { message }) => {
+                    assert_eq!(message, expected);
+                }
+                (41, BackendError::TokenAuthNotSupported { message }) => {
+                    assert_eq!(message, expected);
+                }
+                (
+                    70,
+                    BackendError::ConnectionFailed {
+                        message,
+                        source: None,
+                    },
+                ) => assert_eq!(message, expected),
+                (_, other) => panic!("unexpected Subsonic error mapping: {other}"),
+            }
+        }
     }
 
     #[test]

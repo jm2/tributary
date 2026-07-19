@@ -14,6 +14,8 @@ use adw::prelude::*;
 
 use crate::local::engine::{LibraryCommand, RootTrustOutcome, RootTrustReason, RootTrustRequest};
 
+use super::library_commands::LibraryCommandAdmission;
+
 const CONFIRM_RESPONSE: &str = "confirm";
 const DEFER_RESPONSE: &str = "defer";
 
@@ -105,7 +107,7 @@ enum ResponseAction {
 struct ControllerInner {
     window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
-    command_tx: async_channel::Sender<LibraryCommand>,
+    command_admission: LibraryCommandAdmission,
     queue: RefCell<PromptQueue<RootTrustRequest>>,
     finished_ids: RefCell<HashSet<String>>,
 }
@@ -117,16 +119,16 @@ pub struct RootTrustPromptController {
 }
 
 impl RootTrustPromptController {
-    pub fn new(
+    pub(super) fn new(
         window: &adw::ApplicationWindow,
         toast_overlay: &adw::ToastOverlay,
-        command_tx: async_channel::Sender<LibraryCommand>,
+        command_admission: LibraryCommandAdmission,
     ) -> Self {
         Self {
             inner: Rc::new(ControllerInner {
                 window: window.clone(),
                 toast_overlay: toast_overlay.clone(),
-                command_tx,
+                command_admission,
                 queue: RefCell::new(PromptQueue::new()),
                 finished_ids: RefCell::new(HashSet::new()),
             }),
@@ -135,6 +137,9 @@ impl RootTrustPromptController {
 
     /// Queue all newly reported roots and present the first one, if idle.
     pub fn enqueue(&self, requests: Vec<RootTrustRequest>) {
+        if !self.inner.command_admission.is_open() {
+            return;
+        }
         let mut added = false;
         {
             let mut queue = self.inner.queue.borrow_mut();
@@ -201,6 +206,9 @@ impl RootTrustPromptController {
     }
 
     fn present_next(&self) {
+        if !self.inner.command_admission.is_open() {
+            return;
+        }
         let Some(prompt) = self.inner.queue.borrow_mut().take_next() else {
             return;
         };
@@ -232,6 +240,9 @@ impl RootTrustPromptController {
     }
 
     fn present_empty_final(&self, prompt_id: String, request: RootTrustRequest) {
+        if !self.inner.command_admission.is_open() {
+            return;
+        }
         let path = request.path().display().to_string();
         let remembered = request.remembered_track_count();
         let fresh_empty = request.reason() == RootTrustReason::EmptyRoot && remembered == 0;
@@ -320,23 +331,19 @@ impl RootTrustPromptController {
                 }
 
                 if action == ResponseAction::Confirm {
-                    match self
+                    if self
                         .inner
-                        .command_tx
+                        .command_admission
                         .try_send(LibraryCommand::ConfirmRootTrust(request))
                     {
-                        Ok(()) => self
-                            .add_toast(rust_i18n::t!("library_root_trust.pending_toast").as_ref()),
-                        Err(_) => {
-                            // The request was not delivered, so do not turn
-                            // lifetime deduplication into a permanent denial
-                            // of the user's ability to retry.
-                            self.inner.queue.borrow_mut().allow_retry(&prompt_id);
-                            tracing::warn!("Library root trust command queue is unavailable");
-                            self.add_toast(
-                                rust_i18n::t!("library_root_trust.failed_toast").as_ref(),
-                            );
-                        }
+                        self.add_toast(rust_i18n::t!("library_root_trust.pending_toast").as_ref());
+                    } else {
+                        // The request was not delivered, so do not turn
+                        // lifetime deduplication into a permanent denial
+                        // of the user's ability to retry.
+                        self.inner.queue.borrow_mut().allow_retry(&prompt_id);
+                        tracing::warn!("Library root trust command admission is closed");
+                        self.add_toast(rust_i18n::t!("library_root_trust.failed_toast").as_ref());
                     }
                 }
 

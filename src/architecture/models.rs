@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
+use super::identity::TrackId;
+
 // ---------------------------------------------------------------------------
 // Primary Entities
 // ---------------------------------------------------------------------------
@@ -17,7 +19,20 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
     /// Unique identifier (assigned by the originating backend).
+    ///
+    /// This UUID remains a compatibility key for album/search APIs. Playback
+    /// and queue ownership use the exact `native_track_id` below.
     pub id: Uuid,
+
+    /// Exact backend-native track identifier, when the adapter can preserve
+    /// it independently from the compatibility UUID above.
+    ///
+    /// Local-library rows use their SQLite `tracks.id` value byte-for-byte so
+    /// legacy non-UUID keys remain stable across reads. The value is typed and
+    /// bounded before an adapter publishes the row; remote resolvers consume
+    /// it directly without round-tripping through a derived UUID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_track_id: Option<TrackId>,
 
     /// Track title.
     pub title: String,
@@ -85,6 +100,12 @@ pub struct Track {
 
     /// Number of times this track has been played.
     pub play_count: Option<u32>,
+
+    /// UTC instant when this track most recently crossed Tributary's
+    /// counted-play threshold. Legacy and unplayed tracks leave this unset;
+    /// file metadata timestamps are never substituted for listening history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_played: Option<DateTime<Utc>>,
 }
 
 /// An album — a logical grouping of tracks.

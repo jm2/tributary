@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 
+use crate::architecture::SourceId;
+
 /// Immutable identity of one accepted source-selection request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceRequest {
@@ -158,10 +160,24 @@ impl SourceNavigation {
 /// One in-flight remote connection paired with the navigation intent that
 /// started it. Backend generations prove session ownership; this token proves
 /// that the user still wants successful completion to change selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionIntentKind {
+    Interactive,
+    PasswordlessDaap,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConnectionLifecycleIntent {
+    source_id: SourceId,
+    generation: u64,
+    kind: ConnectionIntentKind,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingConnection {
     source_key: String,
     request: SourceRequest,
+    lifecycle: Option<ConnectionLifecycleIntent>,
 }
 
 impl PendingConnection {
@@ -169,6 +185,7 @@ impl PendingConnection {
         Self {
             source_key: source_key.into(),
             request,
+            lifecycle: None,
         }
     }
 
@@ -180,6 +197,50 @@ impl PendingConnection {
         &self.request
     }
 
+    /// Bind the user intent to the exact lifecycle generation before its
+    /// constructor task can begin. A pending dialog owns no lifecycle
+    /// generation until authentication is actually submitted.
+    pub fn bind_lifecycle(
+        &mut self,
+        source_id: SourceId,
+        generation: u64,
+        kind: ConnectionIntentKind,
+    ) -> bool {
+        if self.lifecycle.is_some() {
+            return false;
+        }
+        self.lifecycle = Some(ConnectionLifecycleIntent {
+            source_id,
+            generation,
+            kind,
+        });
+        true
+    }
+
+    pub fn matches_lifecycle(&self, source_id: SourceId, generation: u64) -> bool {
+        self.lifecycle
+            .is_some_and(|intent| intent.source_id == source_id && intent.generation == generation)
+    }
+
+    /// Return the exact backend generation currently owned by this intent.
+    /// Reducers use this to retire an intent when a cancellation invalidation
+    /// leaves no pending operation, accepted catalogue, or correlated failure.
+    pub fn lifecycle_generation_for(&self, source_id: SourceId) -> Option<u64> {
+        self.lifecycle
+            .filter(|intent| intent.source_id == source_id)
+            .map(|intent| intent.generation)
+    }
+
+    pub fn intent_kind_for(
+        &self,
+        source_id: SourceId,
+        generation: u64,
+    ) -> Option<ConnectionIntentKind> {
+        self.lifecycle
+            .filter(|intent| intent.source_id == source_id && intent.generation == generation)
+            .map(|intent| intent.kind)
+    }
+
     pub fn may_auto_select(&self, source_key: &str, navigation: &SourceNavigation) -> bool {
         self.source_key == source_key && navigation.is_current(&self.request)
     }
@@ -189,7 +250,7 @@ impl PendingConnection {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{CompletionDisposition, PendingConnection, SourceNavigation};
+    use super::{CompletionDisposition, ConnectionIntentKind, PendingConnection, SourceNavigation};
 
     fn complete(
         navigation: &SourceNavigation,
@@ -366,5 +427,26 @@ mod tests {
         navigation.select("playlist:a");
 
         assert!(!navigation.may_refresh_visible("local", &visible_local, Some(&remote)));
+    }
+
+    #[test]
+    fn pending_connection_binds_one_exact_lifecycle_generation_and_intent_kind() {
+        let mut navigation = SourceNavigation::new("local");
+        let request = navigation.select("remote");
+        let mut pending = PendingConnection::new("remote", request);
+        let source_id = crate::architecture::SourceId::random();
+        let other_source_id = crate::architecture::SourceId::random();
+
+        assert_eq!(pending.intent_kind_for(source_id, 41), None);
+        assert!(pending.bind_lifecycle(source_id, 41, ConnectionIntentKind::PasswordlessDaap,));
+        assert_eq!(
+            pending.intent_kind_for(source_id, 41),
+            Some(ConnectionIntentKind::PasswordlessDaap)
+        );
+        assert!(pending.matches_lifecycle(source_id, 41));
+        assert!(!pending.matches_lifecycle(source_id, 42));
+        assert!(!pending.matches_lifecycle(other_source_id, 41));
+        assert!(!pending.bind_lifecycle(source_id, 42, ConnectionIntentKind::Interactive,));
+        assert!(pending.matches_lifecycle(source_id, 41));
     }
 }

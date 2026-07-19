@@ -15,6 +15,12 @@ use anyhow::bail;
 use anyhow::{anyhow, Context};
 
 const CACHE_NAMESPACE: &str = "tributary/runtime";
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
+const PLATFORM_RUNTIME_PROBE_FLAG: &str = "--tributary-platform-runtime-probe";
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_PROBE_SENTINEL_NAME: &str = "tributary-platform-runtime-probe.ok";
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_PROBE_SENTINEL: &[u8] = b"tributary-windows-runtime-probe-v1\n";
 
 #[cfg(any(test, target_os = "macos"))]
 const PIXBUF_CACHE_LIMIT: usize = 1024 * 1024;
@@ -30,22 +36,27 @@ struct RuntimeCachePaths {
 
 /// Configure bundled runtime paths before GTK or GStreamer initialize.
 ///
-/// Returns `true` only when the hidden macOS packaging probe ran successfully
-/// and the process should exit without starting the normal application.
+/// Returns `true` only when a hidden packaging probe ran successfully and the
+/// process should exit without starting the normal application.
 #[cfg_attr(
     not(any(target_os = "windows", target_os = "macos")),
     allow(clippy::unnecessary_wraps)
 )]
 pub fn configure_before_toolkit() -> anyhow::Result<bool> {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let probe_root = parse_platform_runtime_probe_request(env::args_os())?;
+
     #[cfg(target_os = "windows")]
-    configure_windows_bundle()?;
+    {
+        configure_windows_bundle(probe_root.as_deref())
+    }
 
     #[cfg(target_os = "macos")]
     {
-        configure_macos_bundle()
+        configure_macos_bundle(probe_root.as_deref())
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         Ok(false)
     }
@@ -136,20 +147,39 @@ fn cache_base() -> anyhow::Result<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn configure_windows_bundle() -> anyhow::Result<()> {
-    let exe = env::current_exe().context("could not determine executable path")?;
-    let Some(layout) = detect_windows_bundle(&exe) else {
-        return Ok(());
+fn configure_windows_bundle(probe_root: Option<&Path>) -> anyhow::Result<bool> {
+    let exe = env::current_exe()
+        .context("could not determine executable path")?
+        .canonicalize()
+        .context("could not resolve executable path")?;
+    let layout = detect_windows_bundle(&exe);
+    if probe_root.is_some() && layout.is_none() {
+        bail!("platform runtime probe requires a valid Windows bundle");
+    }
+    let Some(layout) = layout else {
+        return Ok(false);
     };
+
+    if let Some(root) = probe_root {
+        run_windows_runtime_probe(&layout, root)?;
+        return Ok(true);
+    }
 
     set_gstreamer_if_unset("GST_PLUGIN_PATH", "GST_PLUGIN_PATH_1_0", &layout.plugin_dir);
     set_gstreamer_if_unset("GST_PLUGIN_SYSTEM_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0", "");
+    if layout.scanner.is_file() {
+        set_gstreamer_if_unset(
+            "GST_PLUGIN_SCANNER",
+            "GST_PLUGIN_SCANNER_1_0",
+            &layout.scanner,
+        );
+    }
 
     if !should_set_gstreamer_env(
         env::var_os("GST_REGISTRY").as_deref(),
         env::var_os("GST_REGISTRY_1_0").as_deref(),
     ) {
-        return Ok(());
+        return Ok(false);
     }
 
     // If the OS has no usable user cache directory, leave this unset and
@@ -159,7 +189,7 @@ fn configure_windows_bundle() -> anyhow::Result<()> {
         env::set_var("GST_REGISTRY", registry);
     }
 
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(target_os = "windows")]
@@ -177,6 +207,7 @@ fn prepare_windows_registry(layout: &WindowsBundleLayout) -> Option<PathBuf> {
 struct WindowsBundleLayout {
     install_root: PathBuf,
     plugin_dir: PathBuf,
+    scanner: PathBuf,
 }
 
 #[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
@@ -187,9 +218,144 @@ fn detect_windows_bundle(exe: &Path) -> Option<WindowsBundleLayout> {
         return None;
     }
     Some(WindowsBundleLayout {
+        // Keep the scanner beside the application and its bundled DLLs. Windows
+        // searches an executable's own directory for its dependencies, so this
+        // works for both the isolated package probe and an ordinary user launch
+        // without adding the bundle to PATH.
+        scanner: install_root.join("gst-plugin-scanner.exe"),
         install_root,
         plugin_dir,
     })
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_runtime_probe(
+    layout: &WindowsBundleLayout,
+    requested_cache_root: &Path,
+) -> anyhow::Result<()> {
+    reject_inherited_windows_probe_environment()?;
+    if !layout.scanner.is_file() {
+        bail!("platform runtime probe requires the bundled gst-plugin-scanner.exe");
+    }
+
+    let cache_base = validate_probe_cache_root(requested_cache_root, &layout.install_root)?;
+    let caches = runtime_cache_paths(
+        &cache_base,
+        "windows",
+        env::consts::ARCH,
+        &layout.install_root,
+    )?;
+    ensure_cache_outside_install(&caches.root, &layout.install_root)?;
+    create_cache_parent(&caches.gst_registry)?;
+
+    set_exact_windows_probe_environment(layout, &caches.gst_registry);
+    preflight_windows_plugin_scanner(&layout.scanner)?;
+    crate::audio::run_packaged_windows_runtime_probe(&layout.plugin_dir)?;
+
+    let registry = std::fs::metadata(&caches.gst_registry).with_context(|| {
+        format!(
+            "platform runtime probe registry was not created: {}",
+            caches.gst_registry.display()
+        )
+    })?;
+    if !registry.is_file() || registry.len() == 0 {
+        bail!("platform runtime probe registry is empty");
+    }
+    if caches.gst_registry.starts_with(&layout.install_root) {
+        bail!("platform runtime probe registry resolves inside the Windows bundle");
+    }
+
+    atomic_replace(
+        &cache_base.join(WINDOWS_PROBE_SENTINEL_NAME),
+        WINDOWS_PROBE_SENTINEL,
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn reject_inherited_windows_probe_environment() -> anyhow::Result<()> {
+    let forbidden = env::vars_os().find_map(|(key, _)| {
+        forbidden_windows_probe_environment_key(&key)
+            .then_some(key.to_string_lossy().to_ascii_uppercase())
+    });
+    if let Some(key) = forbidden {
+        bail!("platform runtime probe requires inherited {key} to be unset");
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn forbidden_windows_probe_environment_key(key: &OsStr) -> bool {
+    let normalized = key.to_string_lossy().to_ascii_uppercase();
+    normalized.starts_with("GST_")
+        || normalized == "GIO_EXTRA_MODULES"
+        || normalized == "GIO_USE_PROXY_RESOLVER"
+}
+
+#[cfg(target_os = "windows")]
+fn set_exact_windows_probe_environment(layout: &WindowsBundleLayout, registry: &Path) {
+    for key in ["GST_PLUGIN_PATH", "GST_PLUGIN_PATH_1_0"] {
+        env::set_var(key, &layout.plugin_dir);
+    }
+    for key in ["GST_PLUGIN_SYSTEM_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0"] {
+        env::set_var(key, "");
+    }
+    for key in ["GST_PLUGIN_SCANNER", "GST_PLUGIN_SCANNER_1_0"] {
+        env::set_var(key, &layout.scanner);
+    }
+    for key in ["GST_REGISTRY", "GST_REGISTRY_1_0"] {
+        env::set_var(key, registry);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn preflight_windows_plugin_scanner(scanner: &Path) -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(scanner)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| anyhow!("bundled GStreamer plugin scanner could not start"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if scanner_no_args_exit_code_is_expected(status.code()) {
+                    return Ok(());
+                }
+                bail!("bundled GStreamer plugin scanner returned an unexpected status");
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                terminate_windows_scanner(&mut child)?;
+                bail!("bundled GStreamer plugin scanner exceeded its 5-second deadline");
+            }
+            Err(_) => {
+                terminate_windows_scanner(&mut child)?;
+                bail!("bundled GStreamer plugin scanner status could not be inspected");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_windows_scanner(child: &mut std::process::Child) -> anyhow::Result<()> {
+    let killed = child.kill().is_ok();
+    let waited = child.wait().is_ok();
+    if !killed || !waited {
+        bail!("bundled GStreamer plugin scanner could not be terminated");
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn scanner_no_args_exit_code_is_expected(code: Option<i32>) -> bool {
+    code == Some(1)
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -237,8 +403,7 @@ fn detect_macos_bundle(exe: &Path) -> Option<MacBundleLayout> {
 }
 
 #[cfg(target_os = "macos")]
-fn configure_macos_bundle() -> anyhow::Result<bool> {
-    let probe_root = parse_macos_probe_request(env::args_os())?;
+fn configure_macos_bundle(probe_root: Option<&Path>) -> anyhow::Result<bool> {
     let exe = env::current_exe()
         .context("could not determine executable path")?
         .canonicalize()
@@ -258,7 +423,7 @@ fn configure_macos_bundle() -> anyhow::Result<bool> {
         env::var_os("GDK_PIXBUF_MODULE_FILE").as_deref(),
     );
     let caches = if needs_cache {
-        let cache_base = if let Some(root) = probe_root.as_deref() {
+        let cache_base = if let Some(root) = probe_root {
             validate_probe_cache_root(root, &layout.app_root)?
         } else {
             cache_base()?
@@ -333,27 +498,30 @@ fn configure_macos_environment(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn parse_macos_probe_request(
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
+fn parse_platform_runtime_probe_request(
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> anyhow::Result<Option<PathBuf>> {
     let mut args = args.into_iter().skip(1);
     let mut probe_root = None;
     while let Some(arg) = args.next() {
-        if arg == "--tributary-platform-runtime-probe" {
+        if arg == PLATFORM_RUNTIME_PROBE_FLAG {
             if probe_root.is_some() {
                 bail!("platform runtime probe flag may only be supplied once");
             }
             let root = args
                 .next()
                 .ok_or_else(|| anyhow!("platform runtime probe requires an explicit cache root"))?;
+            if root == PLATFORM_RUNTIME_PROBE_FLAG {
+                bail!("platform runtime probe flag may only be supplied once");
+            }
             probe_root = Some(PathBuf::from(root));
         }
     }
     Ok(probe_root)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 fn validate_probe_cache_root(root: &Path, app_root: &Path) -> anyhow::Result<PathBuf> {
     if !root.is_absolute() {
         bail!("platform runtime probe cache root must be absolute");
@@ -373,6 +541,23 @@ fn validate_probe_cache_root(root: &Path, app_root: &Path) -> anyhow::Result<Pat
     if projected_root.starts_with(&resolved_app) {
         bail!("platform runtime probe cache root must be outside the app bundle");
     }
+    if root.exists() {
+        if !root.is_dir() {
+            bail!("platform runtime probe cache root must be a directory");
+        }
+        if std::fs::read_dir(root)
+            .with_context(|| {
+                format!(
+                    "could not inspect platform runtime probe cache root {}",
+                    root.display()
+                )
+            })?
+            .next()
+            .is_some()
+        {
+            bail!("platform runtime probe cache root must be fresh and empty");
+        }
+    }
     std::fs::create_dir_all(root).with_context(|| {
         format!(
             "could not create platform runtime probe cache root {}",
@@ -384,6 +569,18 @@ fn validate_probe_cache_root(root: &Path, app_root: &Path) -> anyhow::Result<Pat
         .context("could not resolve platform runtime probe cache root")?;
     if resolved_root.starts_with(&resolved_app) {
         bail!("platform runtime probe cache root must be outside the app bundle");
+    }
+    if std::fs::read_dir(&resolved_root)
+        .with_context(|| {
+            format!(
+                "could not inspect platform runtime probe cache root {}",
+                resolved_root.display()
+            )
+        })?
+        .next()
+        .is_some()
+    {
+        bail!("platform runtime probe cache root must be fresh and empty");
     }
     Ok(resolved_root)
 }
@@ -763,7 +960,7 @@ fn resolve_existing_prefix(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(resolved.join(suffix))
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 fn atomic_replace(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -850,7 +1047,7 @@ fn bundle_contains_mutable_cache(layout: &MacBundleLayout) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
 
     fn write_fake_app(root: &Path) -> PathBuf {
@@ -932,6 +1129,143 @@ mod tests {
     }
 
     #[test]
+    fn platform_probe_parser_accepts_one_explicit_cache_root() {
+        let args = [
+            OsString::from("tributary"),
+            OsString::from("--unrelated"),
+            OsString::from(PLATFORM_RUNTIME_PROBE_FLAG),
+            OsString::from("/fresh cache"),
+        ];
+        assert_eq!(
+            parse_platform_runtime_probe_request(args).unwrap(),
+            Some(PathBuf::from("/fresh cache"))
+        );
+        assert_eq!(
+            parse_platform_runtime_probe_request([OsString::from("tributary")]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn platform_probe_parser_rejects_missing_or_duplicate_roots() {
+        for args in [
+            vec![
+                OsString::from("tributary"),
+                OsString::from(PLATFORM_RUNTIME_PROBE_FLAG),
+            ],
+            vec![
+                OsString::from("tributary"),
+                OsString::from(PLATFORM_RUNTIME_PROBE_FLAG),
+                OsString::from(PLATFORM_RUNTIME_PROBE_FLAG),
+            ],
+            vec![
+                OsString::from("tributary"),
+                OsString::from(PLATFORM_RUNTIME_PROBE_FLAG),
+                OsString::from("/first"),
+                OsString::from(PLATFORM_RUNTIME_PROBE_FLAG),
+                OsString::from("/second"),
+            ],
+        ] {
+            assert!(parse_platform_runtime_probe_request(args).is_err());
+        }
+    }
+
+    #[test]
+    fn platform_probe_cache_root_must_be_fresh_empty_and_external() {
+        let temp = tempfile::tempdir().unwrap();
+        let install = temp.path().join("Tributary.app");
+        fs::create_dir(&install).unwrap();
+        let cache = temp.path().join("Fresh Cache With Spaces");
+
+        let resolved = validate_probe_cache_root(&cache, &install).unwrap();
+        assert!(resolved.is_absolute());
+        assert!(resolved.is_dir());
+        fs::write(cache.join("stale-registry.bin"), b"stale").unwrap();
+        assert!(validate_probe_cache_root(&cache, &install).is_err());
+
+        let inside = install.join("probe-cache");
+        assert!(validate_probe_cache_root(&inside, &install).is_err());
+        assert!(!inside.exists());
+        assert!(validate_probe_cache_root(Path::new("relative-cache"), &install).is_err());
+    }
+
+    #[test]
+    fn windows_probe_rejects_all_gstreamer_and_gio_policy_keys() {
+        for key in [
+            "GST_REGISTRY",
+            "gst_debug",
+            "GST_PLUGIN_LOADING_WHITELIST",
+            "GIO_EXTRA_MODULES",
+            "gio_use_proxy_resolver",
+        ] {
+            assert!(forbidden_windows_probe_environment_key(OsStr::new(key)));
+        }
+        for key in [
+            "PATH",
+            "HTTP_PROXY",
+            "GIO_MODULE_DIR",
+            "GDK_PIXBUF_MODULE_FILE",
+        ] {
+            assert!(!forbidden_windows_probe_environment_key(OsStr::new(key)));
+        }
+    }
+
+    #[test]
+    fn windows_scanner_preflight_accepts_only_documented_no_args_status() {
+        assert!(scanner_no_args_exit_code_is_expected(Some(1)));
+        for code in [None, Some(0), Some(2), Some(i32::MAX)] {
+            assert!(!scanner_no_args_exit_code_is_expected(code));
+        }
+    }
+
+    #[test]
+    fn windows_scanner_preflight_is_bounded_silent_and_precedes_gstreamer() {
+        let source = include_str!("platform_runtime.rs");
+        let configure = source
+            .find("set_exact_windows_probe_environment(layout, &caches.gst_registry);")
+            .expect("exact probe environment");
+        let preflight_call = source[configure..]
+            .find("preflight_windows_plugin_scanner(&layout.scanner)?;")
+            .expect("scanner preflight call")
+            + configure;
+        let gstreamer_probe = source[preflight_call..]
+            .find("crate::audio::run_packaged_windows_runtime_probe(&layout.plugin_dir)?;")
+            .expect("GStreamer probe call")
+            + preflight_call;
+        assert!(configure < preflight_call);
+        assert!(preflight_call < gstreamer_probe);
+
+        let preflight = source
+            .split_once("fn preflight_windows_plugin_scanner")
+            .expect("scanner preflight implementation")
+            .1
+            .split_once("fn terminate_windows_scanner")
+            .expect("scanner preflight boundary")
+            .0;
+        for fragment in [
+            ".stdin(Stdio::null())",
+            ".stdout(Stdio::null())",
+            ".stderr(Stdio::null())",
+            "Duration::from_secs(5)",
+            "child.try_wait()",
+            "terminate_windows_scanner(&mut child)?",
+        ] {
+            assert!(preflight.contains(fragment));
+        }
+        assert!(!preflight.contains(".arg("));
+
+        let termination = source
+            .split_once("fn terminate_windows_scanner")
+            .expect("scanner termination implementation")
+            .1
+            .split_once("fn scanner_no_args_exit_code_is_expected")
+            .expect("scanner termination boundary")
+            .0;
+        assert!(termination.contains("child.kill()"));
+        assert!(termination.contains("child.wait()"));
+    }
+
+    #[test]
     fn mac_bundle_detection_requires_complete_exact_shape() {
         let temp = tempfile::tempdir().unwrap();
         let exe = write_fake_app(temp.path());
@@ -966,7 +1300,8 @@ mod tests {
         fs::write(&exe, b"binary").unwrap();
         assert!(detect_windows_bundle(&exe).is_none());
         fs::create_dir_all(temp.path().join("lib/gstreamer-1.0")).unwrap();
-        assert!(detect_windows_bundle(&exe).is_some());
+        let layout = detect_windows_bundle(&exe).unwrap();
+        assert_eq!(layout.scanner, temp.path().join("gst-plugin-scanner.exe"));
     }
 
     fn cache_record(module_record: &str) -> String {
@@ -1168,5 +1503,661 @@ mod tests {
         }
         assert!(!script.contains("export GST_REGISTRY="));
         assert!(!script.contains("export GDK_PIXBUF_MODULE_FILE="));
+    }
+
+    #[test]
+    fn windows_script_overwrites_and_dependency_scans_bundled_scanner() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        assert!(script.contains("$gstScannerDest = Join-Path $DIST \"gst-plugin-scanner.exe\""));
+        assert!(!script.contains(
+            "$gstScannerDest = Join-Path $DIST \"libexec\\gstreamer-1.0\\gst-plugin-scanner.exe\""
+        ));
+        let scanner_copy = script
+            .find("Copy-Item -LiteralPath $gstScannerSrc -Destination $gstScannerDest -Force")
+            .expect("unconditional scanner copy");
+        let scanner_scan = script
+            .find("$initialDllScanTargets += $gstScannerDest")
+            .expect("scanner dependency scan");
+        let runtime_probe = script
+            .find("Write-Info \"Running packaged Windows runtime probe...\"")
+            .expect("packaged runtime probe");
+        let archive = script
+            .find("Write-Info \"Creating zip archive...\"")
+            .expect("zip creation");
+        assert!(scanner_copy < scanner_scan);
+        assert!(scanner_scan < runtime_probe);
+        assert!(runtime_probe < archive);
+        assert!(!script.contains("Copy-IfNewer $gstScannerSrc"));
+        assert!(script.contains(
+            "Remove-Item -LiteralPath $legacyGstScannerDest -Force -ErrorAction SilentlyContinue"
+        ));
+    }
+
+    #[test]
+    fn windows_script_computes_a_bounded_nonexecuting_pe_import_closure() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        for fragment in [
+            "$requiredSoupPluginName = \"libgstsoup.dll\"",
+            "$requiredSoupRuntimeName = \"libsoup-3.0-0.dll\"",
+            "Required souphttpsrc runtime is incomplete",
+            "$PkgPrefix-libsoup3 packages",
+            "function Get-PeImportDependencyName",
+            "Name: libfoo.dll",
+            "--coff-imports includes ordinary and delay-load imports",
+            "if ($Line -notmatch '^\\s*Name:\\s*([^\\\\/:*?\"<>|\\x00-\\x1F]+\\.dll)\\s*$')",
+            "$peImportInspector = [System.IO.Path]::GetFullPath((Join-Path $MsysPath \"bin\\llvm-readobj.exe\"))",
+            "[System.IO.Path]::IsPathRooted($peImportInspector)",
+            "Required PE import inspector not found",
+            "$PkgPrefix-llvm package",
+            "function Format-PeImportTargetForDiagnostic",
+            "...[truncated]",
+            "function ConvertTo-BoundedPeImportArgumentBatch",
+            "[System.Collections.Generic.List[string]]$TargetBatch",
+            "function Invoke-BoundedPeImportBatch",
+            "PE import-inspection target #$targetNumber is not absolute",
+            "PE import-inspection target #$targetNumber is not a DLL or EXE",
+            "PE import-inspection target #$targetNumber is not an existing file",
+            "[System.IO.File]::Exists($normalizedTarget)",
+            "Start-Process -FilePath $Inspector -ArgumentList $arguments",
+            "-RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath",
+            "while (-not $process.WaitForExit(50))",
+            "[System.IO.File]::ReadAllLines($stdoutPath)",
+            "Stop-BoundedProcessTree $process \"PE import inspector\"",
+            "$maxDllScanTargets = 4096",
+            "$maxPeInspectorOutputLines = 131072",
+            "$maxPeInspectorBatchTargets = 28",
+            "$maxPeInspectorArgumentCharacters = 24000",
+            "$maxPeInspectorBatchOutputBytes = 8388608",
+            "$peInspectorBatchDeadlineMs = 45000",
+            "$peInspectorClosureDeadlineMs = 300000",
+            "$dllScanQueue = [System.Collections.Queue]::new()",
+            "$knownDllScanTargets = @{}",
+            "Invoke-BoundedPeImportBatch `",
+            "$soupInspectorTargets = [System.Collections.Generic.List[string]]::new()",
+            "$soupInspectorTargets.Add($requiredSoupPluginFull)",
+            "-TargetBatch $soupInspectorTargets",
+            "$scannedDllTargets[$requiredSoupPluginFull] = $true",
+            "while ($dllScanQueue.Count -gt 0)",
+            "$roundTargets = [System.Collections.Generic.List[string]]::new()",
+            "$roundTargets.Add($bin)",
+            "$batchTargets = [System.Collections.Generic.List[string]]::new()",
+            "$batchTargets.Add($candidate)",
+            "-TargetBatch $batchTargets",
+            "Add-PeImportDependencies $batchLines $batchNames",
+            "Add-DllScanTarget $Queue $Known $destPath $TargetLimit",
+            "if ($ClosureClock.ElapsedMilliseconds -ge $ClosureDeadlineMs)",
+            "Unresolved DLL import $dllName reported for $SourceLabel",
+            "$systemPath = Join-Path ([System.Environment]::SystemDirectory) $dllName",
+            "$isApiSet = $dllName -match '^(?i:api-ms-win-|ext-ms-win-)'",
+            "$soupRuntimeDependencyObserved = $true",
+            "if (-not $soupPluginScanned)",
+            "if (-not $soupRuntimeDependencyObserved)",
+            "$scannedDllTargets.ContainsKey($requiredSoupRuntimeFull)",
+        ] {
+            assert!(
+                script.contains(fragment),
+                "missing bounded Windows PE-import closure contract: {fragment}"
+            );
+        }
+
+        let copy = script
+            .find("if (Copy-IfNewer $srcPath $destPath)")
+            .expect("dependency copy");
+        let enqueue = script[copy..]
+            .find("Add-DllScanTarget $Queue $Known $destPath")
+            .expect("copied dependency enqueue")
+            + copy;
+        let probe = script
+            .find("Write-Info \"Running packaged Windows runtime probe...\"")
+            .expect("packaged runtime probe");
+        assert!(copy < enqueue);
+        assert!(enqueue < probe);
+        assert!(!script.contains("foreach ($bin in $binariesToScan)"));
+        assert!(!script.contains("Get-ChildItem -Path \"$MsysPath\\bin\""));
+        assert!(!script.contains("Get-LddDependencyName"));
+        assert!(!script.contains("$ldd"));
+        assert!(!script.contains("ReadToEnd"));
+        assert!(!script.contains("DataReceived"));
+    }
+
+    #[test]
+    fn windows_pe_import_batches_use_explicit_typed_list_binding() {
+        fn compact_parameter_contract(script: &str) -> String {
+            let function = script
+                .split_once("function Invoke-BoundedPeImportBatch")
+                .expect("PE-import batch function declaration")
+                .1;
+            let parameter_start = function
+                .find("param")
+                .expect("PE-import batch parameter declaration");
+            let parameters = &function[parameter_start..];
+            let open = parameters
+                .find('(')
+                .expect("PE-import batch parameter-list opening delimiter");
+            let mut depth = 0usize;
+            let mut close = None;
+            for (offset, character) in parameters[open..].char_indices() {
+                match character {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth = depth
+                            .checked_sub(1)
+                            .expect("balanced PE-import batch parameter delimiters");
+                        if depth == 0 {
+                            close = Some(open + offset + character.len_utf8());
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            parameters[..close.expect("PE-import batch parameter-list closing delimiter")]
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect()
+        }
+
+        fn production_invocations(script: &str) -> Vec<String> {
+            const COMMAND: &str = "Invoke-BoundedPeImportBatch";
+
+            let lines: Vec<_> = script.lines().collect();
+            let mut invocations = Vec::new();
+            let mut index = 0usize;
+            while index < lines.len() {
+                let line = lines[index];
+                let trimmed = line.trim_start();
+                let Some(command_offset) = line.find(COMMAND) else {
+                    index += 1;
+                    continue;
+                };
+                if trimmed.starts_with('#') || trimmed.starts_with("function ") {
+                    index += 1;
+                    continue;
+                }
+
+                let mut invocation = String::new();
+                let mut fragment = &line[command_offset..];
+                loop {
+                    let trimmed_fragment = fragment.trim();
+                    let continued = trimmed_fragment.ends_with('`');
+                    let content = trimmed_fragment
+                        .strip_suffix('`')
+                        .unwrap_or(trimmed_fragment)
+                        .trim_end();
+                    invocation.push_str(content);
+                    invocation.push(' ');
+                    index += 1;
+                    if !continued || index == lines.len() {
+                        break;
+                    }
+                    fragment = lines[index];
+                }
+
+                let invocation = invocation.trim();
+                invocations.push(
+                    invocation
+                        .strip_suffix(')')
+                        .unwrap_or(invocation)
+                        .trim_end()
+                        .to_string(),
+                );
+            }
+            invocations
+        }
+
+        let script = include_str!("../scripts/build-windows.ps1");
+        assert_eq!(
+            compact_parameter_contract(script),
+            "param([string]$Inspector,[AllowNull()][System.Collections.Generic.List[string]]$TargetBatch,[System.Diagnostics.Stopwatch]$ClosureClock,[int]$ClosureDeadlineMs,[int]$ProcessDeadlineMs,[int64]$OutputByteLimit,[int]$ArgumentCharacterLimit)",
+            "named calls and the PowerShell parameter declaration must preserve one exact typed-list contract"
+        );
+
+        let invocations = production_invocations(script);
+        assert_eq!(
+            invocations.len(),
+            2,
+            "every production PE-import batch call must be covered"
+        );
+
+        let expected_shared_bindings = [
+            ("-Inspector", "$peImportInspector"),
+            ("-ClosureClock", "$peInspectorClosureClock"),
+            ("-ClosureDeadlineMs", "$peInspectorClosureDeadlineMs"),
+            ("-ProcessDeadlineMs", "$peInspectorBatchDeadlineMs"),
+            ("-OutputByteLimit", "$maxPeInspectorBatchOutputBytes"),
+            (
+                "-ArgumentCharacterLimit",
+                "$maxPeInspectorArgumentCharacters",
+            ),
+        ];
+        let mut target_bindings = std::collections::BTreeSet::new();
+        for (invocation_index, invocation) in invocations.iter().enumerate() {
+            let tokens: Vec<_> = invocation.split_whitespace().collect();
+            assert_eq!(tokens.first(), Some(&"Invoke-BoundedPeImportBatch"));
+            assert_eq!(
+                (tokens.len() - 1) % 2,
+                0,
+                "invocation {invocation_index} must contain only named parameter/value pairs: {invocation}"
+            );
+
+            let mut bindings = std::collections::BTreeMap::new();
+            for pair in tokens[1..].chunks_exact(2) {
+                assert!(
+                    pair[0].starts_with('-'),
+                    "invocation {invocation_index} contains a positional argument: {invocation}"
+                );
+                assert!(
+                    bindings.insert(pair[0], pair[1]).is_none(),
+                    "invocation {invocation_index} binds {} more than once",
+                    pair[0]
+                );
+            }
+            assert_eq!(
+                bindings.len(),
+                expected_shared_bindings.len() + 1,
+                "invocation {invocation_index} has an unknown or missing binding: {invocation}"
+            );
+            for (parameter, value) in expected_shared_bindings {
+                assert_eq!(
+                    bindings.get(parameter),
+                    Some(&value),
+                    "invocation {invocation_index} must bind {parameter} explicitly"
+                );
+            }
+            target_bindings.insert(
+                *bindings.get("-TargetBatch").unwrap_or_else(|| {
+                    panic!("invocation {invocation_index} must bind -TargetBatch")
+                }),
+            );
+        }
+        assert_eq!(
+            target_bindings,
+            std::collections::BTreeSet::from(["$batchTargets", "$soupInspectorTargets"]),
+            "the singleton Soup proof and closure batches must each bind their own exact typed list"
+        );
+        assert!(!script.contains("[string[]]$Paths"));
+        assert!(!script.contains("-Paths @($requiredSoupPluginFull)"));
+    }
+
+    #[test]
+    fn powershell_pe_import_target_batch_preserves_lists_and_bounds_diagnostics() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        let helpers_start = script
+            .find("function Format-PeImportTargetForDiagnostic")
+            .expect("bounded PE target formatter");
+        let helpers_end = script[helpers_start..]
+            .find("function Add-PeImportDependencies")
+            .expect("PE target helper boundary")
+            + helpers_start;
+        let helpers = &script[helpers_start..helpers_end];
+
+        let temp = tempfile::tempdir().unwrap();
+        let valid_dll = temp.path().join("valid target with spaces.dll");
+        let valid_exe = temp.path().join("valid-target.exe");
+        let wrong_extension = temp.path().join("wrong-extension.txt");
+        let missing_dll = temp.path().join("missing-target.dll");
+        fs::write(&valid_dll, b"not executed").unwrap();
+        fs::write(&valid_exe, b"not executed").unwrap();
+        fs::write(&wrong_extension, b"not executed").unwrap();
+
+        let command = [
+            "$ErrorActionPreference = \"Stop\"\n",
+            helpers,
+            r#"
+if ($env:TRIBUTARY_REQUIRE_DESKTOP_POWERSHELL -eq "1" -and
+    ($PSVersionTable.PSEdition -ne "Desktop" -or
+     $PSVersionTable.PSVersion.Major -ne 5 -or
+     $PSVersionTable.PSVersion.Minor -ne 1)) {
+    throw "target regression did not run under Windows PowerShell 5.1"
+}
+
+function Assert-TargetFailure {
+    param(
+        [System.Collections.Generic.List[string]]$Targets,
+        [string]$Expected
+    )
+    $failure = $null
+    try {
+        $null = ConvertTo-BoundedPeImportArgumentBatch `
+            -TargetBatch $Targets -ArgumentCharacterLimit 4096
+    }
+    catch {
+        $failure = $_.Exception.Message
+    }
+    if ($null -eq $failure) { throw "expected target validation failure: $Expected" }
+    if (-not $failure.Contains($Expected)) {
+        throw "target validation failure did not contain '$Expected': $failure"
+    }
+    if ($failure.Length -gt 384) {
+        throw "target validation diagnostic was not bounded: $($failure.Length) characters"
+    }
+    if ($failure.Contains([string][char]10) -or $failure.Contains([string][char]13)) {
+        throw "target validation diagnostic was not single-line"
+    }
+}
+
+function Assert-InvokeTargetFailure {
+    param(
+        [System.Collections.Generic.List[string]]$Targets,
+        [string]$Expected
+    )
+    $failure = $null
+    try {
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $null = Invoke-BoundedPeImportBatch `
+            -Inspector "not-started" -TargetBatch $Targets -ClosureClock $clock `
+            -ClosureDeadlineMs 1000 -ProcessDeadlineMs 1000 `
+            -OutputByteLimit 4096 -ArgumentCharacterLimit 4096
+    }
+    catch {
+        $failure = $_.Exception.Message
+    }
+    if ($null -eq $failure -or -not $failure.Contains($Expected)) {
+        throw "Invoke target boundary did not preserve '$Expected': $failure"
+    }
+    if ($failure.Length -gt 384 -or $failure.Contains([string][char]10) -or
+        $failure.Contains([string][char]13)) {
+        throw "Invoke target boundary emitted an unbounded diagnostic"
+    }
+}
+
+$validTargets = [System.Collections.Generic.List[string]]::new()
+$validTargets.Add($env:TRIBUTARY_VALID_DLL)
+$validTargets.Add($env:TRIBUTARY_VALID_EXE)
+$batch = ConvertTo-BoundedPeImportArgumentBatch `
+    -TargetBatch $validTargets -ArgumentCharacterLimit 4096
+if ($batch.Label -ne "valid target with spaces.dll, valid-target.exe") {
+    throw "typed target list changed shape: $($batch.Label)"
+}
+foreach ($target in $validTargets) {
+    $quoted = '"' + [System.IO.Path]::GetFullPath($target) + '"'
+    if (-not $batch.Arguments.Contains($quoted)) {
+        throw "validated target was absent from inspector arguments: $target"
+    }
+}
+
+$emptyTarget = [System.Collections.Generic.List[string]]::new()
+$emptyTarget.Add("")
+Assert-TargetFailure $emptyTarget "target #1 was empty"
+
+$relativeTarget = [System.Collections.Generic.List[string]]::new()
+$relativeTarget.Add(("x" * 1024) + ".dll")
+Assert-InvokeTargetFailure $relativeTarget "target #1 is not absolute"
+
+$wrongExtension = [System.Collections.Generic.List[string]]::new()
+$wrongExtension.Add($env:TRIBUTARY_WRONG_EXTENSION)
+Assert-TargetFailure $wrongExtension "target #1 is not a DLL or EXE"
+
+$missingTarget = [System.Collections.Generic.List[string]]::new()
+$missingTarget.Add($env:TRIBUTARY_MISSING_DLL)
+Assert-TargetFailure $missingTarget "target #1 is not an existing file"
+
+$newlineTarget = [System.Collections.Generic.List[string]]::new()
+$newlineTarget.Add($env:TRIBUTARY_VALID_DLL + [char]10 + "forged diagnostic.dll")
+Assert-TargetFailure $newlineTarget "target #1 contains an unsupported quote or control character"
+"#,
+        ]
+        .concat();
+
+        let run = |program: &str| {
+            std::process::Command::new(program)
+                .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+                .env("TRIBUTARY_VALID_DLL", &valid_dll)
+                .env("TRIBUTARY_VALID_EXE", &valid_exe)
+                .env("TRIBUTARY_WRONG_EXTENSION", &wrong_extension)
+                .env("TRIBUTARY_MISSING_DLL", &missing_dll)
+                .env(
+                    "TRIBUTARY_REQUIRE_DESKTOP_POWERSHELL",
+                    if cfg!(target_os = "windows") {
+                        "1"
+                    } else {
+                        "0"
+                    },
+                )
+                .output()
+        };
+        let program = if cfg!(target_os = "windows") {
+            "powershell.exe"
+        } else {
+            "pwsh"
+        };
+        let output = match run(program) {
+            Ok(output) => output,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && !cfg!(target_os = "windows") =>
+            {
+                return;
+            }
+            Err(error) => panic!("could not run {program} PE target regression: {error}"),
+        };
+
+        assert!(
+            output.status.success(),
+            "PowerShell PE target regression failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn windows_script_resolves_the_relative_distribution_before_import_inspection() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        let create = script
+            .find("New-Item -ItemType Directory -Force $DIST | Out-Null")
+            .expect("relative distribution creation");
+        let resolve = script
+            .find("$DIST = (Resolve-Path -LiteralPath $DIST).ProviderPath")
+            .expect("physical provider distribution resolution");
+        let soup_inspection = script
+            .find("Write-Host \"  inspecting required Soup plugin imports...\"")
+            .expect("required Soup inspection");
+
+        assert!(script.contains("$DIST = \"dist\\tributary-windows\""));
+        assert!(create < resolve);
+        assert!(resolve < soup_inspection);
+        assert!(!script[resolve..soup_inspection].contains("$DIST = \"dist\\tributary-windows\""));
+        for fragment in [
+            "$gstScannerDest = Join-Path $DIST \"gst-plugin-scanner.exe\"",
+            "$requiredSoupPluginDest = Join-Path $DIST",
+            "$initialDllScanTargets = @(Join-Path $DIST",
+            "$initialDllScanTargets += Get-ChildItem -Path \"$DIST\\lib\"",
+            "$requiredSoupRuntimeDest = Join-Path $DIST",
+        ] {
+            let target = script
+                .find(fragment)
+                .unwrap_or_else(|| panic!("missing distribution-rooted PE target: {fragment}"));
+            assert!(
+                resolve < target,
+                "PE target was constructed before distribution resolution: {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_provider_resolution_handles_changed_pwd_spaces_and_psdrives() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("Tributary Repository With Spaces");
+        fs::create_dir(&repository).unwrap();
+        let command = r#"
+$ErrorActionPreference = "Stop"
+Set-Location -LiteralPath $env:TRIBUTARY_PATH_TEST_REPOSITORY
+$DIST = "dist\tributary-windows"
+$legacyFullPath = [System.IO.Path]::GetFullPath($DIST)
+New-Item -ItemType Directory -Force $DIST | Out-Null
+$DIST = (Resolve-Path -LiteralPath $DIST).ProviderPath
+$expected = Join-Path (Get-Location).Path "dist\tributary-windows"
+if ($DIST -ne $expected) { throw "distribution did not resolve against PowerShell PWD" }
+if (-not [System.IO.Path]::IsPathRooted($DIST)) { throw "distribution is not absolute" }
+if (-not (Test-Path -LiteralPath $DIST -PathType Container)) { throw "distribution does not exist" }
+if ($DIST -eq $legacyFullPath) { throw "test did not separate process cwd from PowerShell PWD" }
+
+$driveName = "TributaryPathTest"
+New-PSDrive -Name $driveName -PSProvider FileSystem -Root $env:TRIBUTARY_PATH_TEST_REPOSITORY | Out-Null
+try {
+    Set-Location -LiteralPath "${driveName}:\"
+    $DIST = "dist\tributary-windows"
+    New-Item -ItemType Directory -Force $DIST | Out-Null
+    $resolved = Resolve-Path -LiteralPath $DIST
+    $providerPath = $resolved.ProviderPath
+    $drivePath = $resolved.Path
+    $expected = Join-Path $env:TRIBUTARY_PATH_TEST_REPOSITORY "dist\tributary-windows"
+    if ($providerPath -ne $expected) { throw "provider path did not resolve to the physical repository" }
+    if (-not [System.IO.Path]::IsPathRooted($providerPath)) { throw "provider path is not absolute" }
+    if (-not (Test-Path -LiteralPath $providerPath -PathType Container)) { throw "provider path does not exist" }
+    if ($drivePath -eq $providerPath) { throw "test did not exercise a custom FileSystem PSDrive" }
+}
+finally {
+    Set-Location -LiteralPath $env:TRIBUTARY_PATH_TEST_REPOSITORY
+    Remove-PSDrive -Name $driveName
+}
+"#;
+
+        let run = |program: &str| {
+            std::process::Command::new(program)
+                .args(["-NoProfile", "-NonInteractive", "-Command", command])
+                .current_dir(temp.path())
+                .env("TRIBUTARY_PATH_TEST_REPOSITORY", &repository)
+                .output()
+        };
+        let output = match run("pwsh") {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match run("powershell") {
+                Ok(output) => output,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) => panic!("could not run Windows PowerShell path regression: {error}"),
+            },
+            Err(error) => panic!("could not run PowerShell path regression: {error}"),
+        };
+
+        assert!(
+            output.status.success(),
+            "PowerShell path regression failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn windows_script_runs_a_sanitized_deadline_bounded_exact_probe() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        for fragment in [
+            "$startInfo.ArgumentList.Add(\"--tributary-platform-runtime-probe\")",
+            "$startInfo.ArgumentList.Add($probeCache)",
+            "$startInfo.PSObject.Properties.Name -contains \"ArgumentList\"",
+            "$probeCache.IndexOf([char]34)",
+            "$startInfo.Arguments = \"--tributary-platform-runtime-probe `\"$probeCache`\"\"",
+            "Fresh Cache With Spaces",
+            "$startInfo.EnvironmentVariables.Keys",
+            "$startInfo.EnvironmentVariables.Remove($key)",
+            "$normalized.StartsWith(\"GST_\")",
+            "$normalized -eq \"GIO_EXTRA_MODULES\"",
+            "$normalized -eq \"GIO_USE_PROXY_RESOLVER\"",
+            "'^(HTTP|HTTPS|ALL|NO)_PROXY$'",
+            "$system32 = [System.Environment]::SystemDirectory",
+            "$startInfo.EnvironmentVariables[\"PATH\"] = $system32",
+            "$probeOutputLimit = 1MB",
+            "$probeProcess.WaitForExit(50)",
+            "$probeClock.ElapsedMilliseconds -ge 90000",
+            "($stdoutLength + $stderrLength) -gt $probeOutputLimit",
+            "$useTaskkill = $null -eq $killTreeMethod",
+            "$killTreeMethod.Invoke($Process, [object[]]@($true))",
+            "$taskkillPath = Join-Path $system32 \"taskkill.exe\"",
+            "[System.IO.Path]::IsPathRooted($taskkillPath)",
+            "$taskkillInfo.Arguments = \"/PID $($Process.Id) /T /F\"",
+            "$taskkillProcess.WaitForExit(10000)",
+            "try { $Process.Kill() } catch { }",
+            "$Process.WaitForExit(10000)",
+            "Get-BoundedProbeDiagnostic",
+            "Remove-Item -LiteralPath $probeWorkspace -Recurse -Force",
+        ] {
+            assert!(
+                script.contains(fragment),
+                "missing Windows probe policy: {fragment}"
+            );
+        }
+        assert!(!script.contains(
+            "$startInfo.EnvironmentVariables[\"PATH\"] = \"$distFull$([System.IO.Path]::PathSeparator)$system32\""
+        ));
+        assert!(!script.contains("$startInfo.Environment["));
+        assert!(!script.contains("$Process.Kill($true)"));
+        assert!(script.contains(WINDOWS_PROBE_SENTINEL_NAME));
+        assert!(script.contains(
+            std::str::from_utf8(WINDOWS_PROBE_SENTINEL)
+                .unwrap()
+                .trim_end()
+        ));
+    }
+
+    #[test]
+    fn windows_script_supports_windows_powershell_5_1_process_apis() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        for fragment in [
+            "$startInfo.PSObject.Properties.Name -contains \"ArgumentList\"",
+            "$probeCache.IndexOf([char]34)",
+            "$startInfo.Arguments = \"--tributary-platform-runtime-probe `\"$probeCache`\"\"",
+            "$startInfo.EnvironmentVariables.Keys",
+            "$startInfo.EnvironmentVariables.Remove($key)",
+            "$killTreeMethod.Invoke($Process, [object[]]@($true))",
+            "$taskkillPath = Join-Path $system32 \"taskkill.exe\"",
+            "[System.IO.Path]::IsPathRooted($taskkillPath)",
+            "$taskkillInfo.Arguments = \"/PID $($Process.Id) /T /F\"",
+            "$taskkillProcess.WaitForExit(10000)",
+            "$Process.WaitForExit(10000)",
+        ] {
+            assert!(
+                script.contains(fragment),
+                "missing Windows PowerShell 5.1 compatibility contract: {fragment}"
+            );
+        }
+        assert!(!script.contains("$startInfo.Environment["));
+        assert!(!script.contains("$Process.Kill($true)"));
+    }
+
+    #[test]
+    fn windows_script_documents_skip_bundle_installer_probe_boundary() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        assert!(script.contains("existing, already-probed"));
+        assert!(script.contains("bundle/runtime probe skipped"));
+        let installer_only = script
+            .find("if ($InnoSetup -and $SkipBundle)")
+            .expect("installer-only mode");
+        let dependency_checks = script
+            .find("Write-Info \"Checking build dependencies...\"")
+            .expect("dependency checks");
+        assert!(installer_only < dependency_checks);
+    }
+
+    #[test]
+    fn native_windows_workflows_probe_before_publishing_each_bundle() {
+        let ci = include_str!("../.github/workflows/ci.yml");
+        let ci_bundle = ci
+            .find("pwsh -File scripts/build-windows.ps1 -Msys2Root \"$MSYS_ROOT\" -NoCargoBuild")
+            .expect("CI native Windows bundle invocation");
+        let ci_upload = ci[ci_bundle..]
+            .find("name: Upload Windows zip")
+            .expect("CI Windows upload")
+            + ci_bundle;
+        assert!(ci_bundle < ci_upload);
+        assert!(!ci[ci_bundle..ci_upload].contains("-SkipBundle"));
+
+        let release = include_str!("../.github/workflows/release.yml");
+        let release_bundle = release
+            .find("pwsh -File scripts/build-windows.ps1 -Msys2Root \"$MSYS_ROOT\" -NoCargoBuild")
+            .expect("release native Windows bundle invocation");
+        let release_rename = release[release_bundle..]
+            .find("name: Rename zip for release")
+            .expect("release zip rename")
+            + release_bundle;
+        let installer_only = release[release_rename..]
+            .find("-NoCargoBuild -SkipBundle -InnoSetup")
+            .expect("downstream release installer-only invocation")
+            + release_rename;
+        let release_upload = release[installer_only..]
+            .find("name: Upload Windows artifacts")
+            .expect("release Windows upload")
+            + installer_only;
+        assert!(release_bundle < release_rename);
+        assert!(!release[release_bundle..release_rename].contains("-SkipBundle"));
+        assert!(release_rename < installer_only);
+        assert!(installer_only < release_upload);
     }
 }

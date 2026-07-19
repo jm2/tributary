@@ -17,6 +17,8 @@ header:
   output: "Audio Output"
   add_output: "Add output"
   main_menu: "Main Menu"
+  playback_position: "Playback position"
+  volume: "Volume"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -128,6 +130,8 @@ dialogs:
   output_name_placeholder: "Living Room MPD"
   output_host: "Host"
   output_port: "Port"
+  output_exclusive_control_warning: "MPD pause, stop, repeat, random, single, and consume commands affect the entire playback partition. Do not share it with another controller or Tributary instance."
+  output_exclusive_control_confirmation: "I confirm Tributary has exclusive control of this MPD playback partition."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -201,6 +205,8 @@ context:
   properties: "Properties…"
   add_to_playlist: "Add to Playlist"
   remove_from_playlist: "Remove from Playlist"
+  playlist_add_unsupported_heading: "Tracks Weren’t Added"
+  playlist_add_unsupported_body: "Only tracks in Tributary’s local library can be added to playlists right now. Nothing from this source was added."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:
@@ -256,6 +262,7 @@ errors:
     audio_output_failed: "Audio output failed"
     playback_failed: "Audio playback failed"
     airplay_raopsink_missing: "AirPlay requires GStreamer's raopsink element — install the gst-plugins-bad package and restart Tributary"
+    mpd_exclusive_control_required: "Re-add this MPD output, confirm exclusive partition control, then select it again before playback"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

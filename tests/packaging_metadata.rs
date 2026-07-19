@@ -5,6 +5,11 @@ const RPM_SPEC: &str = include_str!("../build-aux/rpm/tributary.spec");
 const ARCH_PKGBUILD: &str = include_str!("../build-aux/arch/PKGBUILD");
 const DESKTOP_ENTRY: &str = include_str!("../data/io.github.tributary.Tributary.desktop");
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
+const COVERAGE_BASELINE: &str = include_str!("../coverage-baseline.txt");
+const README: &str = include_str!("../README.md");
+const BUILD_LINUX: &str = include_str!("../scripts/build-linux.sh");
+const BUILD_MACOS: &str = include_str!("../scripts/build-macos.sh");
+const BUILD_WINDOWS: &str = include_str!("../scripts/build-windows.ps1");
 
 fn manifest() -> Value {
     toml::from_str(MANIFEST).expect("Cargo.toml must parse")
@@ -245,5 +250,114 @@ fn ci_compile_proves_the_exact_declared_msrv() {
     assert!(
         msrv_job.contains("run: cargo check --all-targets --locked"),
         "CI must compile-check every target against the committed lockfile"
+    );
+}
+
+#[test]
+fn ci_coverage_is_pinned_comprehensive_and_threshold_gated() {
+    let manifest = manifest();
+    let rust_version = manifest["package"]["rust-version"]
+        .as_str()
+        .expect("package.rust-version must be a string");
+    let coverage_job = workflow_job(CI_WORKFLOW, "coverage");
+    let minimum: f64 = COVERAGE_BASELINE
+        .trim()
+        .parse()
+        .expect("coverage-baseline.txt must contain one numeric percentage");
+
+    assert!(
+        (0.0..=100.0).contains(&minimum) && minimum > 0.0,
+        "the line-coverage baseline must be a meaningful percentage"
+    );
+    assert!(
+        coverage_job.contains("name: Coverage (Linux x86_64)"),
+        "CI must expose one comparable aggregate coverage gate"
+    );
+    assert!(
+        coverage_job.contains(&format!("uses: dtolnay/rust-toolchain@{rust_version}.0")),
+        "coverage must use the exact declared Rust release"
+    );
+    assert!(
+        coverage_job.contains("components: llvm-tools-preview"),
+        "coverage must install the matching LLVM coverage tools"
+    );
+    assert!(
+        coverage_job.contains("cargo install cargo-llvm-cov --version 0.8.7 --locked"),
+        "coverage must pin cargo-llvm-cov and its dependency resolution"
+    );
+    assert!(
+        coverage_job.contains(
+            "cargo llvm-cov --all-targets --all-features --locked --html --output-dir coverage --fail-under-lines \"$minimum\""
+        ),
+        "coverage must execute every host target and feature before enforcing the line floor"
+    );
+    assert!(
+        coverage_job.contains("coverage_status=0")
+            && coverage_job.contains("|| coverage_status=$?")
+            && coverage_job.contains("cargo llvm-cov report --summary-only")
+            && coverage_job.contains("exit \"$coverage_status\""),
+        "coverage must print the exact measured summary without masking the test or threshold status"
+    );
+    assert!(
+        coverage_job.contains("coverage-baseline.txt"),
+        "the CI threshold must come from the reviewed baseline file"
+    );
+    assert!(
+        coverage_job.contains("if: always()")
+            && coverage_job.contains("path: coverage/")
+            && coverage_job.contains("if-no-files-found: error"),
+        "the HTML upload must run after failure and reject a missing report"
+    );
+    assert!(
+        !CI_WORKFLOW.contains("--ignore-filename-regex"),
+        "the only CI coverage report must not hide source areas"
+    );
+}
+
+#[test]
+fn developer_coverage_commands_do_not_hide_source_areas() {
+    for (platform, script) in [
+        ("Linux", BUILD_LINUX),
+        ("macOS", BUILD_MACOS),
+        ("Windows", BUILD_WINDOWS),
+    ] {
+        assert!(
+            script.contains("cargo install cargo-llvm-cov --version 0.8.7 --locked"),
+            "{platform} must install the reviewed cargo-llvm-cov release"
+        );
+        assert!(
+            script.contains("cargo-llvm-cov 0.8.7") && script.contains("--locked --force"),
+            "{platform} must detect and replace a mismatched coverage frontend"
+        );
+        assert!(
+            script.contains("cargo llvm-cov --all-targets --all-features --locked"),
+            "{platform} coverage must include every host target and feature"
+        );
+        assert!(
+            !script.contains("--ignore-filename-regex"),
+            "{platform} coverage must not hide source areas"
+        );
+    }
+
+    assert!(
+        BUILD_LINUX.contains("informational coverage")
+            && BUILD_LINUX.contains("active Rust toolchain")
+            && !BUILD_LINUX.contains("--fail-under-lines"),
+        "the ambient-toolchain Linux helper must not impersonate the pinned CI gate"
+    );
+    assert!(
+        BUILD_WINDOWS.contains("-or $Coverage")
+            && BUILD_WINDOWS.contains("rustup component add llvm-tools-preview")
+            && BUILD_WINDOWS.contains("--target $RustTarget --summary-only"),
+        "Windows coverage must retain its native target and matching LLVM tools"
+    );
+    assert!(
+        README.contains("coverage-baseline.txt")
+            && README.contains("does not compare it with the base branch")
+            && README.contains("repository review policy treats the floor as a")
+            && README.contains("ratchet: ordinary changes keep or raise it")
+            && README.contains("lowering it requires a dedicated")
+            && README.contains("measurement-definition change"),
+        "the threshold enforcement and separate review ratchet must be documented accurately"
     );
 }

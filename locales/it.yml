@@ -17,6 +17,8 @@ header:
   output: "Uscita audio"
   add_output: "Aggiungi uscita"
   main_menu: "Menu principale"
+  playback_position: "Posizione di riproduzione"
+  volume: "Volume"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -123,6 +125,8 @@ dialogs:
   output_name_placeholder: "MPD soggiorno"
   output_host: "Host"
   output_port: "Porta"
+  output_exclusive_control_warning: "I comandi MPD pausa, arresto, ripetizione, casuale, singolo e consumo influiscono sull'intera partizione di riproduzione. Non condividerla con un altro controller o un'altra istanza di Tributary."
+  output_exclusive_control_confirmation: "Confermo che Tributary ha il controllo esclusivo di questa partizione di riproduzione MPD."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -168,6 +172,8 @@ context:
   properties: "Proprietà…"
   add_to_playlist: "Aggiungi alla playlist"
   remove_from_playlist: "Rimuovi dalla playlist"
+  playlist_add_unsupported_heading: "I brani non sono stati aggiunti"
+  playlist_add_unsupported_body: "Al momento, è possibile aggiungere alle playlist solo i brani della libreria locale di Tributary. Non è stato aggiunto nulla da questa sorgente."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:
@@ -223,6 +229,7 @@ errors:
     audio_output_failed: "Si è verificato un errore nell’uscita audio"
     playback_failed: "La riproduzione audio non è riuscita"
     airplay_raopsink_missing: "AirPlay richiede l'elemento raopsink di GStreamer: installa il pacchetto gst-plugins-bad e riavvia Tributary"
+    mpd_exclusive_control_required: "Aggiungi di nuovo questa uscita MPD, conferma il controllo esclusivo della partizione, quindi selezionala di nuovo prima della riproduzione"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

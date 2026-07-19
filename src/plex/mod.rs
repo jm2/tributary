@@ -1,13 +1,14 @@
 //! Plex media server backend.
 //!
 //! Connects to a Plex instance via its REST API, auto-discovers
-//! music libraries, and (in later phases) syncs track metadata into
-//! the unified Tributary data model.
+//! music libraries, and publishes their track metadata through the
+//! unified Tributary data model. Stream and artwork requests are resolved
+//! from backend-native rating keys only when the live source is used.
 
 pub mod api;
 pub mod backend;
 pub mod client;
 
-// Re-export will be used once the UI wires up Plex connections.
+// Public backend type used by the source lifecycle and connection flows.
 #[allow(unused_imports)]
 pub use backend::PlexBackend;

@@ -5,9 +5,91 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.1] — Unreleased
+## [Unreleased]
 
 ### Added
+- **Local playback history now has a durable contract, schema, and production pipeline** — Local
+  track rows gain a nullable UTC epoch-millisecond `last_played` value, while the architecture
+  model safely rejects out-of-range stored timestamps. Migration 10 preserves every nonnegative legacy play
+  count, repairs negative corruption to zero, never invents a timestamp from file or library dates,
+  validates interrupted SQLite upgrades (including SQLite's equivalent nullable `INTEGER`
+  spelling while rejecting incompatible shapes), and supports down/up retry. A pure per-occurrence
+  state counts observed forward playback at half of a positive duration rounded up and capped at
+  four minutes; missing or zero duration uses the four-minute fallback or an unskipped authoritative
+  natural end. Duration freezes on the first positive value; seeks, neutral retry/resume anchors,
+  and restarts earn no jump credit; only a forward user seek suppresses the early unknown-duration
+  end rule; backward replay preserves accumulated listening; and the count signal latches once.
+  `PlaybackSession` now owns that latch per exact local queue occurrence, separately from replaceable
+  output-event generations. Only a successfully accepted local delivery—including one reached
+  through a local regular or smart playlist—can earn credit. Rejected/stale events earn none;
+  pause, buffering, retry, resume, seek, and the three-second Previous restart re-anchor without
+  jump credit, while explicit Paused/Stopped state keeps later position polls inert until Playing
+  and successful navigation or Repeat One creates a fresh occurrence. Repeat One snapshots only
+  the prior history occurrence: a failure before output-generation handoff restores that occurrence
+  without cloning or rewinding the queue, shuffle, resolution, or event state, while a generation
+  change can never be rolled back. Current output replacement ends playback. The latch closes
+  before synchronous FIFO enqueue, preventing duplicate ticks from
+  enqueueing another write. Normal shutdown synchronously closes one shared GTK-thread admission
+  gate before appending its FIFO marker, disables playback, media-key, seek, open-file, history,
+  and root-trust producers, revokes event ownership, stops the output, and waits for every earlier
+  admitted history/root-trust command; no callback can queue work behind the marker. That durable
+  drain may keep the disabled window visible while an earlier serialized initial or root-trust scan
+  finishes. The library engine then atomically updates only that stable `TrackId`, repairs a
+  legacy-negative count to one, saturates `play_count` at `i32::MAX`, keeps
+  `max(existing, event_timestamp)`, and treats a
+  concurrently deleted row as a clean no-op. Only a committed update publishes its replacement
+  row; the live Plays value refreshes by stable identity and active/cached playlist projections are
+  invalidated without URI matching or phantom rows. AirPlay 1's dedicated RAOP pipeline now samples
+  position and duration on a 500 ms timer while Playing and emits generation-scoped evidence when
+  available, bringing it under the same accounting boundary as the other outputs. Deterministic
+  Recently Played and Top 25 filtering, ordering, empty-state, untouched-default migration, and
+  live smart-playlist refresh
+  remain the final P1.3 slice and are not claimed here.
+
+### Fixed
+- **Unsupported playlist additions now fail visibly and atomically** — Choosing Add to Playlist
+  from an authenticated remote, internet-radio, removable-media, or unknown/pathless source now
+  shows a localized explanation before any runtime task, database connection, or playlist write.
+  Tributary therefore adds nothing instead of silently skipping unsupported rows or modifying only
+  an unexpected subset. The existing Add to Playlist, Remove from Playlist, and Properties context
+  labels now use their shipped translations as well, and the refusal copy is covered across all 13
+  locale catalogs. Local-library playlist behavior is unchanged; durable source-scoped remote
+  playlist entries remain planned separately.
+- **Shuffled Previous and Next now follow a bounded real playback timeline** — Tributary retains
+  the current queue occurrence plus ten actual predecessors, walks backward without fabricating a
+  random track at the oldest boundary, and replays fixed forward history before drawing again.
+  Duplicate tracks remain distinct queue occurrences; one- and two-item queues, repeat Off/All/One,
+  navigation rollback, and queue/output/source lifecycle boundaries are explicitly regressed.
+  Repeat All now starts complete queue-occurrence cycles and avoids immediately repeating the
+  rollover track instead of omitting that occurrence from the new cycle. Either shuffle toggle
+  starts a fresh traversal without changing the current item. The header button and operating-system
+  media controls also share one Previous dispatcher: positions above three seconds restart, exactly
+  three seconds still navigates, and a retained-boundary Previous restarts the current item.
+
+## [0.5.1] — 2026-07-18
+
+### Added
+- **An audited implementation roadmap and clean active backlog** — `docs/roadmap.md` now separates
+  product work from the completed holistic-review remediation and classifies all 11 open GitHub
+  issues, their current implementation state, dependencies, and likely delivery shape. The active
+  `docs/task.md` is reset to 35 countable feature records ordered by correctness foundations,
+  bounded user-facing enhancements, and larger data-movement epics. Its first record captures
+  hardening for the existing occurrence-aware shuffled Previous/Next history—including bounded
+  Repeat All growth, retained-boundary behavior, real UI/media-control path regressions, forward
+  traversal after Previous, duplicates, repeat modes, and queue/session resets—rather than
+  claiming the feature is absent. The former 220/223 remediation tracker remains intact as
+  `docs/task-remediation-2026-07.md`, with its three hardware/installed/live validation records
+  explicitly excluded from the new feature percentage.
+- **Remote-service tests share bounded protocol-appropriate fixtures and a completed behavior matrix** — Subsonic's ad hoc server is replaced with a reusable loopback service whose method, exact path, and decoded query-subset routes are independent of arrival order. It records bounded request bodies and headers, queues exact response counts, can delay a response body under test-owned deadlines, rejects unexpected or ambiguous requests, verifies every expectation at explicit bounded shutdown, and aborts safely if a test unwinds. Complete production paths cover Subsonic token-query derivation and partial artist/album failure, Jellyfin and Plex authenticated multi-page catalogue loading, Plex atomic per-section failure, Radio-Browser filtering and public redirects, and the geolocation provider cascade; DAAP retains its separately appropriate endpoint-scripted raw-socket fixture for malformed containers and session expiration. The representative matrix covers rejected authentication, credential-safe redirect behavior, finite deadlines, streaming body caps, pagination, partial failure, and root/trailing-slash/escaped reverse-proxy bases without claiming every redundant Cartesian pairing. Twelve additional regressions bring the completion branch to 787 debug and 787 release tests plus strict Clippy in both profiles.
+- **Track actions and playback sliders are now accessible without a pointer** — With focus in the
+  track list, either the unmodified platform Context Menu key or Shift+F10 opens the same
+  selection-snapshotted Add to Playlist, Remove from Playlist, and Properties actions as
+  right-click. When no row is selected, the keyboard invocation propagates instead of swallowing
+  the key. The list advertises its popup and standard `Shift+F10 ContextMenu` shortcuts to assistive
+  technology, and playback position and volume now have distinct localized accessible names in all
+  13 catalogs while retaining GTK's native slider role, range, current-value, and keyboard
+  behavior. Each one-shot popover owns its action group, so closing it releases the captured
+  selection instead of leaving stale menu actions attached to the long-lived track list.
 - **Explicit library-root trust and re-enrollment** — Tributary now asks before a legacy or replaced library root can become authoritative, and applies stronger confirmation when a trust request's complete observation has no supported audio files, instead of inferring identity from similar content. A brand-new writable root auto-enrolls only when its first complete observation contains supported audio and it has no remembered metadata. If Tributary has already recorded an empty observation, later content still requires consent because it may be a removable or network volume newly appearing at the mountpoint.
   - The main window automatically queues one prompt at a time for exact configured roots inherited from a pre-identity database, confirmed roots whose identity could no longer be verified, and trust requests whose complete observation has no supported audio files. No Preferences detour is required.
   - Replacement confirmation is presented as destructive. Every prompted no-supported-audio observation, including an empty replacement, requires a separate second acknowledgement because an empty mountpoint is indistinguishable from an intentionally empty library by content alone.
@@ -20,19 +102,373 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - **Authenticated requests are pinned to an exact origin** — Every HTTP client that carries a credential (Subsonic, Jellyfin, Plex, DAAP, authentication, artwork, and protected local/AirPlay media fetching) now refuses to follow a redirect to a different scheme, host, or port, and never sends a `Referer`. Previously a redirect could walk a credential to an attacker-controlled host or downgrade it to plaintext HTTP.
 - **Credentials are stripped from errors and logs** — Request URLs are removed before an HTTP error is retained or displayed, URL user-info and backend query credentials are rejected or redacted, DAAP session IDs are no longer logged, and MPD command arguments are no longer written to the log. Failures involving MPD server replies or authenticated media URLs, including local and AirPlay pipeline setup/playback, are reduced to opaque categories before they can reach player events or diagnostics. MPD ACK handling validates the single-command index and expected command echo, then retains only a closed typed numeric error category; the daemon-controlled index, echo, and free-form trailing message never enter retained failures, UI text, or logs.
-- **Backend credentials no longer enter track or UI state** — Subsonic, Jellyfin, and Plex catalogue models now retain only stable app track identity; backend-native stream locators, track-only artwork locators, and authentication remain inside a process-owned resolver for the live source. Keeping artwork locators track-only also prevents a Subsonic album or artist with the same type-local native ID from overwriting a song's cover. GTK and the playback queue receive only `tributary-remote://<lease>/{stream,artwork}/<track-id>` references containing a random session lease and track UUID — never the server address, native media ID, token, salt, username, or password. Playback and artwork resolve the exact current lease only when consumed, and same-source replacement, disconnect, discovery removal, deletion, or shutdown invalidates old references and already-issued requests. Queued source publications and asynchronous playback/artwork completions are generation-checked so a stale connection or selection cannot retarget through a newer login. Retiring a source stops and clears playback only when that source owns the queue; Pause during a pending resolution cancels the completion but leaves Play retryable, and a protected-output error forces the next Play through fresh lease resolution. Manual, saved, environment-configured, and discovered remote-server URLs are now validated before persistence, auth-dialog display, logs, discovery state/UI publication, or connection ownership; raw Jellyfin UDP response bodies are never logged, and malformed input, userinfo, query, and fragment state produce one fixed error that cannot echo a rejected secret.
-- **Playback-time requests isolate protocol credentials** — Resolved requests are typed, non-serializable, and deliberately omit `Debug`. Their inspectable HTTP(S) endpoint rejects embedded credentials; Plex's token is held as a sensitive `X-Plex-Token` header and Jellyfin's as a sensitive `X-Emby-Authorization` header. Subsonic's `u` plus `t`/`s` or HTTPS-only legacy `p` values and DAAP's bearer `session-id` remain separate private query material and are appended only inside Tributary's app-owned proxy immediately before the exact-origin upstream fetch. A DAAP request also carries a revocable live-session lease, so replacement, release, discovery loss, disconnect, or shutdown invalidates an already-issued request. The proxy accepts only allowlisted authentication fields, forwards only the receiver's `Range`, and every output's typed load path fails closed instead of falling through to the clean endpoint.
+- **Backend credentials no longer enter track or UI state** — Subsonic, Jellyfin, Plex, and DAAP
+  catalogue models retain only stable application identity and non-secret metadata;
+  backend-native stream/artwork locators,
+  authentication, routes, random media leases, and DAAP session keys remain inside the live
+  registry-owned adapter. Keeping artwork locators track-only also prevents a Subsonic album or
+  artist with the same type-local native ID from overwriting a song's cover. GTK rows and playback
+  queues now carry only pathless `SourceId`, exact bounded `TrackId`, and the non-secret session
+  epoch that published the catalogue—never a server address, token, salt, username, password,
+  authenticated URI, or random lease key. Playback and artwork require that exact epoch before the
+  adapter is invoked and recheck the current adapter, lease, and epoch after asynchronous lookup,
+  so replacement, disconnect, discovery-route loss, deletion, or shutdown cannot retarget an old
+  row through a newer login. Retiring a source stops and clears playback only when that source owns
+  the queue; Pause during a pending resolution cancels the completion but leaves Play retryable,
+  and a protected-output error forces the next Play through fresh registry resolution. Manual,
+  saved, environment-configured, and discovered remote-server URLs are validated before
+  persistence, auth-dialog display, logs, discovery/UI publication, or connection ownership; raw
+  Jellyfin UDP response bodies are never logged, and malformed input, userinfo, query, and fragment
+  state produce one fixed error that cannot echo a rejected secret.
+- **Removable-media rows and queues no longer retain mount paths or `file://` locators** — An
+  eligible mount's logical GIO key now claims its deterministic `SourceId` into `SourceRegistry`,
+  while the current native mount path remains private construction input. The accepted catalogue,
+  GTK rows, caches, playback queue, and artwork requests retain only that source ID, a frozen
+  lossless native mount-relative `TrackId`, and the exact non-secret publishing epoch. The adapter
+  acquires retained mounted-root authority on the blocking runtime, walks deterministically without
+  following links or crossing filesystems, and parses bounded metadata through exact already-open
+  file handles. Playback and embedded art resolve only IDs present in the exact accepted catalogue,
+  recheck the live epoch and revocable media lease, revalidate the root, ancestor chain, and final
+  file, and receive one inseparable retained file capability. Only the private filesystem authority
+  decodes the relative identity; UI and output consumers never receive or reconstruct a host path
+  or direct URI. Pre-unmount, relocation, confirmed removal, replacement, and shutdown disconnect that
+  authority before invalidating cache, navigation, playback, or rows. A failed unmount may reconnect
+  only from fresh inventory under a new epoch, and confirmed removal releases the provenance claim.
+  Pathless removable rows deliberately omit Properties until a separate typed mutation capability
+  exists. Unix authority strips only semantically redundant trailing slash and `/.` spellings before
+  its no-follow root open, closing a symlink-root bypass. On Windows, traversal temporarily pins the
+  exact root and ancestor namespace without delete sharing until the final no-follow file has been
+  retained, rejects directory symlinks, and follows a final reparse root only after Windows verifies
+  it as a volume mount point; short-lived guards are then released so ordinary device eject is not
+  held open unnecessarily.
+- **Radio stream locators no longer enter GTK rows or playback queues** — Radio-Browser is one
+  stateless built-in `SourceRegistry` session whose Top Clicked, Top Voted, and Near Me feeds are
+  independently cancellable views. Accepted snapshots expose only pathless tracks and retain the
+  validated station-ID-to-public-URL map privately. If multiple views contribute the same station,
+  playback selects the greatest accepted source-wide generation. The resolved request remains
+  provisional until the output handoff: weak registry authority plus source and per-view leases
+  recheck that exact winner, so view replacement/removal, a newer overlapping view, source
+  disconnect/replacement, or dropping the last registry handle fails closed instead of replaying or
+  retargeting an obsolete locator. A pending request cannot itself keep that authority alive.
+- **Playback-time requests isolate protocol credentials** — Resolved requests are typed, non-serializable, and deliberately omit `Debug`. Their inspectable HTTP(S) endpoint rejects embedded credentials; Plex's token is held as a sensitive `X-Plex-Token` header and Jellyfin's as a sensitive `X-Emby-Authorization` header. Subsonic's `u` plus `t`/`s` or HTTPS-only legacy `p` values and DAAP's bearer `session-id` remain separate private query material and are appended only inside Tributary's app-owned proxy immediately before the exact-origin upstream fetch. DAAP's non-secret `Accept`, `User-Agent`, client-version, and access-index requirements now cross the same typed boundary through a separate exact-name allowlist shared by stream and artwork fetching; receiver, authentication, routing, proxy, framing, and arbitrary headers cannot enter that channel. A DAAP request also carries a revocable live-session lease, so replacement, release, discovery loss, disconnect, or shutdown invalidates an already-issued request. The proxy accepts only allowlisted trusted and authentication fields, installs request-owned values before the receiver's `Range`, forwards no other receiver header, and every output's typed load path fails closed instead of falling through to the clean endpoint.
 - **HTTP responses are bounded while streaming** — API, authentication, DAAP, radio, artwork, and metadata reads now count bytes as they arrive and stop at an endpoint-specific cap, with an end-to-end deadline in addition to the idle timeout. A hostile or broken server previously could exhaust memory by lying about `Content-Length` or by never ending a chunked body.
+- **Chromecast frame lengths are bounded before allocation** — `rust_cast 0.21` otherwise reads a peer's unsigned 32-bit Cast length and immediately reserves that many bytes. Tributary now wraps the decrypted worker-local stream with a framing guard that buffers the complete big-endian header and rejects control-message payloads above a deliberately generous 1 MiB before the upstream message manager sees the header or allocates. Accepted headers and payloads remain byte-for-byte unchanged, writes pass through unchanged, and an early EOF inside either the header or advertised payload fails closed and retires the poisoned session. Regressions through the real upstream manager cover oversized rejection without a payload read, an exactly-at-limit protobuf message, fragmented/truncated input, and consecutive frame reset.
 - **Third-party requests refuse plaintext downgrades** — Radio-Browser, IP geolocation, and MusicBrainz requests still follow the cross-host redirects those services depend on, but no longer follow one from HTTPS down to HTTP, and no longer send a `Referer`.
 - **Flatpak filesystem access is consent-based and narrowly scoped** — The sandbox no longer exposes the user's entire home directory, even read-only. XDG Music remains read/write; automatic Devices entries receive read-only file access only under the standard host mount roots `/media`, `/run/media`, and `/mnt`. The reviewed `org.gtk.vfs.*` session-bus namespace exposes host GVfs service methods for GIO's native mount inventory, which can still list an eligible inaccessible root elsewhere, while Tributary omits raw USB/all-device, UDisks, whole-host, and non-native GVfs filesystem grants. Selecting a custom library through Preferences requests a persistent read/write file-chooser portal grant, subject to ordinary host filesystem permissions. A fail-closed CI allowlist and adversarial fixtures reject every unreviewed Flatpak finish argument.
 - **Dependency-audit findings are resolved or explicitly time-bounded** — The yanked `spin 0.9.8` transitive dependency is updated to compatible `0.9.9`. The two remaining warnings (`paste` and `proc-macro-error2`, both unmaintained) have documented dependency paths, follow-ups, and review deadlines. The sole ignored vulnerability, `RUSTSEC-2023-0071` for `rsa`, exists only in `Cargo.lock` through inactive MySQL support: Tributary enables SQLite, but `cargo-audit` checks locked optional packages. Because no fixed release exists, the ignore remains until 2026-10-10 or the next release, whichever comes first, with immediate review if MySQL support is enabled.
-- **Chromecast no longer receives your server credentials** — Casting a track from Subsonic, Jellyfin, or Plex used to hand the Chromecast the stream URL with your credential still in it: your Plex token, your Jellyfin API key, or — with Subsonic's plaintext auth mode — your **actual password**, hex-encoded and trivially reversible. That credential went to a device Tributary does not control, over a LAN it does not control, and was retained in the device's media session. Tributary now resolves the live source inside the app, fetches the stream itself, and gives the device an opaque, revocable, single-media ticket; even a clean-looking resolved endpoint must take the typed proxy path. A new load (including direct or invalid media), user Stop, source-lease revocation, or output/server teardown retires the old route; pause and seek keep it available for byte-range refetches only within its hard lifetime. Internet radio and other unauthenticated streams are unaffected and still play directly.
+- **Chromecast no longer receives your server credentials** — Casting a track from Subsonic, Jellyfin, or Plex used to hand the Chromecast the stream URL with your credential still in it: your Plex token, your Jellyfin API key, or — with Subsonic's plaintext auth mode — your **actual password**, hex-encoded and trivially reversible. That credential went to a device Tributary does not control, over a LAN it does not control, and was retained in the device's media session. Tributary now resolves the live source inside the app, fetches the stream itself, and gives the device an opaque, revocable, single-media ticket; even a clean-looking resolved endpoint must take the typed proxy path. A new load (including direct or invalid media), user Stop, source-lease revocation, or output/server teardown retires the old route; pause and seek keep it available for byte-range refetches only within its hard lifetime. Internet radio still plays directly after its credential-free locator is resolved and revalidated at use, but that locator no longer lives in GTK or the queue.
 - **MPD no longer receives or stores backend credentials** — Remote playback is resolved from an opaque live-source reference into an app-private typed request before MPD is invoked; the legacy/direct URI classifier remains a fail-closed defense for DAAP and other supported protected inputs. After connecting, Tributary binds a dedicated proxy to the successful socket's local IPv4/IPv6 address and gives plaintext `addid` only a bracket-correct opaque ticket, so neither the endpoint nor credential crosses the MPD connection or lands in daemon queue state and logs. The protected upstream is fixed at registration, fetched by Tributary's no-`Referer` exact-origin client, and accepts only the receiver's `Range` header. Missing runtime or connection-address state, unusable scoped/link-local IPv6, bind/registration failure, malformed HTTP(S), unsupported credential schemes, an inactive source lease, and invalid generated arguments all fail closed. Tickets survive pause, seek, and a restartable remote Stop within their hard lifetime, but are revoked sooner on any replacement load, user Stop, source replacement/release, output drop, natural end, ownership loss, operation failure, worker shutdown, or stale generation; stale cleanup cannot revoke a newer ticket. Upstream body failures are reduced to URL-free diagnostics.
 - **Local and AirPlay GStreamer no longer receive backend credentials** — Before `playbin3` or AirPlay's `uridecodebin` can consume protected media, Tributary exchanges the playback-time typed request for an opaque ticket on a dedicated loopback-only server. The app-owned proxy fixes the upstream target, applies the exact-origin/no-`Referer` policy, and forwards only `Range`; credential-free radio, files, and library paths remain byte-for-byte direct. Malformed or unsupported protected media and missing runtime, bind, client, ticket, or active source-lease state fail closed with fixed URL-free events. Replacement by any direct, protected, or rejected load, Stop, source replacement/release, EOS/error, setup/preroll/start failure, output teardown, and proxy teardown revoke the route; pause, play, and seek retain it only within its hard 24-hour lifetime. Each load owns its server and cleanup is identity-checked, so a stale pipeline callback cannot revoke a newer ticket. Server binding and revocation run outside the short-held proxy-state mutex; generation ownership lets a newer load, Stop, or runtime replacement supersede an in-flight startup without waiting and prevents that older startup from installing afterward.
 - **Protected loopback tickets cannot escape through an ambient HTTP proxy** — GStreamer's `souphttpsrc` may consult process or operating-system proxy settings even for `127.0.0.1`; an empty proxy property still restores the default resolver under libsoup3. Local and AirPlay source-setup now recognizes only Tributary's exact HTTP loopback `/cast/<UUID[.extension]>` shape with an explicit port and no user-info, query, or fragment, installs the `direct://` resolver, disables retries, verifies its timeout/policy round trip, and posts a fixed error while locking the source in NULL if any property cannot be enforced. Ordinary files and internet radio retain their existing proxy behavior, while the app-owned upstream request may still use a legitimate configured proxy. An isolated child-process regression receives poisoned proxy variables before process creation, keeps the parent-owned proxy listener live through child completion, and starts the child-owned media listener's bounded window only after cold GStreamer plugin discovery, then proves the media fixture receives the ticket and the ambient proxy receives nothing.
+- **Protected DAAP and Subsonic playback now has a real-GStreamer regression** — One bounded child process constructs production backend-shaped requests and sends both sequentially through the real local `Player`, per-load app-owned proxy, `souphttpsrc`, FLAC decoder, and `fakesink` to a decoded-buffer handoff and generation-owned end-of-stream. The fixture proves exact upstream paths, private queries, DAAP protocol headers, absence of `Authorization`, `Proxy-Authorization`, `Cookie`, and `Referer` at the upstream fixture, opaque ticket containment, and source-setup's direct/zero-retry/30-second policy. Missing plugins, request drift, player errors, absent decoded audio/EOS, and native hangs fail rather than silently skipping. This regression runs against each build host's GStreamer installation; the packaged-Windows proof below independently covers the bundled plugin and DLL set.
+- **Windows packages prove protected playback uses only their bundled GStreamer runtime** — Before the portable ZIP is created, the finished distribution now runs its own hidden, headless probe from a fresh external registry with ambient GStreamer paths, proxy-resolver overrides, HTTP proxy variables, and MSYS2 DLL search paths removed. A bounded, deduplicated closure seeded by the app, scanner, and every plugin uses the selected architecture's absolute `llvm-readobj.exe` to inspect PE imports as data rather than executing arbitrary plugins through `ldd`; newly copied MSYS2 runtimes form the next exact closure round, with no broad `bin` sweep. The Soup plugin is inspected alone first so its direct `libsoup` edge must be observed, copied, and inspected. Remaining targets run in batches of at most 28 under command-line, output, per-process, process-tree, and five-minute whole-closure limits, with fixed-size failure diagnostics and Windows PowerShell 5.1-compatible process handling. This replaces an ARM64 `ldd` path that first missed path-only records and then hung for more than 33 minutes while executing `libgstencoding.dll`. The package places its exact-architecture `gst-plugin-scanner.exe` beside Tributary's root-level DLLs and executes that exact helper under a five-second deadline before GStreamer can fall back to in-process discovery; the probe's PATH contains only System32, so it receives no DLL-search assistance unavailable to an ordinary user launch. Every required factory and the selected FLAC decoder must resolve beneath the distribution's plugin directory. The probe sends an embedded FLAC through the production protected-loopback callback to a decoded buffer and EOS, verifies `souphttpsrc` retained direct routing, zero retries, and the 30-second timeout, proves a poisoned proxy received no connection, and proves an alternate source is locked in NULL with the fixed fail-closed error. Listener deadlines arm after cold factory discovery. Before transitioning GStreamer to NULL, the probe publishes a listener cancellation phase while both listeners remain accepting; afterward it publishes a separate final stop, drains and counts queued accepts until the nonblocking listener reports an empty queue, then joins and inspects. Only an already-accepted media request that ends with incomplete-header EOF, connection-aborted, or connection-reset I/O in the cancellation phase is cancellation. Malformed UTF-8, request-line, route, method, header, range, timeout, other I/O, accept, and response-write failures remain fatal even when teardown overlaps, while the poison observer covers the complete NULL transition. Deterministic server tests pin the production ordering, poison observation window, queued-accept drain, and semantic-failure boundary. A missing required DLL, plugin, or scanner, external provenance, a stale cache, request/policy drift, absent decode/EOS, crossing the 1 MiB output-flood threshold, native hangs, or a missing exact success sentinel fails packaging under independent Rust and 90-second process deadlines; captured diagnostics are fixed-size tails. Process-tree termination and exact argument passing feature-detect newer .NET APIs with bounded Windows PowerShell 5.1 fallbacks. CI and release workflows invoke the same pre-archive script on native x86_64 and ARM64 runners. After PR #124's named arguments passed both jobs but the affected host reproduced the same singleton-target failure, PR #127 replaces the function-boundary array with explicit `List[string]` singleton, round, and batch values and reports the exact failed target predicate with bounded single-line diagnostics. Native x86_64 and ARM64 package CI, including the Desktop PowerShell 5.1 path, passed in run `29648906031`; the exact affected-host rerun and live packaged-Windows DAAP/Subsonic playback remain separate manual checks.
 - **Credential-bearing media tickets now expire** — Every upstream proxy ticket has a hard, absolute, non-sliding 24-hour lifetime from registration in addition to earlier playback-lifecycle revocation. It is usable only before its monotonic deadline; a lookup at or after that boundary atomically removes it and returns the same 404 as an unknown or revoked route. GET and byte-range requests, pause, seek, and receiver status do not renew the deadline, so a compromised receiver cannot perpetuate the bearer. A response admitted before expiry may finish afterward, but every later lookup fails. Local-file routes retain their existing server-lifetime behavior because they front no backend credential.
 
 ### Changed
+- **Project documentation now describes the shipping source architecture and remaining work** — The
+  README no longer presents the implemented P3.1 lifecycle as a future URL-keyed design or labels
+  AirPlay 1 as scaffolding. Its architecture diagram, project tree, removable-media lifecycle,
+  pathless retained authority, smart-playlist limitations, ratings status, playlist scope, and
+  shuffle-history status now match the code. The source-lifecycle ADR links its archived tracker;
+  Subsonic, Jellyfin, Plex, and device module docs now describe current protected at-use resolution,
+  catalogue publication, and the still-unimplemented transfer/MTP scope without referencing closed
+  issue #1.
+- **Managed network sources now share one production lifecycle authority** —
+  `SourceRegistry` is the sole adapter/session owner for Subsonic, Jellyfin, Plex, DAAP, and the
+  built-in Radio-Browser source
+  across environment startup, manual and interactive authentication, discovery, initial catalogue
+  publication, at-use stream/artwork resolution, disconnect, route loss, deletion, and shutdown.
+  The separate standard and DAAP registries and their URL/lease-key UI ownership have been removed.
+  GTK consumes one atomic lifecycle baseline through a monotonic invalidation watch and reduces
+  exact connection generation, non-secret session epoch, catalogue, closed failure category,
+  provenance, visibility, cancellation, and retirement state into the sidebar and browser. An
+  accepted catalogue clears its exact pending guard before any row rebind or selection signal. If
+  its exact row was already selected but the guarded rebind could not activate it, GTK invalidates
+  and reselects that same row once the catalogue is authoritative; stale or superseded catalogues
+  cannot activate themselves. Programmatic selection and fallback paths snapshot `RefCell`-backed
+  navigation keys and release every borrow before GTK can synchronously re-enter a signal handler.
+  A stale failure clears only its own intent; same-epoch catalogue publication preserves playback
+  and navigation, while a replacement epoch invalidates old media before rendering the successor.
+  Saved, Environment, and Discovery publishers own independent keyed/refcounted claims, so deleting
+  Saved demotes a still-discovered row. Withdrawing Discovery revokes active or pending work that
+  captured that advertised route and clears the route even when Saved or Environment keeps the
+  logical row visible; the reducer still retires its cache, playback, and active projection. Hidden
+  or absent lifecycle snapshots synchronously clear pending state, cache, queue, navigation, row,
+  and empty category presentation rather than waiting for retirement pruning.
+  DAAP server-info/login now returns immediately after parsing `mlid`; the framework stages exact
+  close authority before update, database discovery, items, or initial catalogue loading begins.
+  Cancellation after session acquisition, malformed post-login catalogue failure, replacement,
+  disconnect, discovery loss, and shutdown therefore revoke media and elect one bounded logout
+  owner. Interactive Jellyfin `AuthenticateByName` similarly finishes under protected
+  construction, synchronously stages its newly minted session token before ping or catalogue work,
+  and sends exactly one `Sessions/Logout` from registry-owned retirement. Pre-existing Jellyfin API
+  keys and Plex legacy tokens remain explicitly non-owned durable credentials: disconnect revokes
+  all local adapter/media authority without attempting broader server-side credential revocation.
+  If normal client construction fails after a safely representable interactive token was minted,
+  the exact pre-authentication route attempts one bounded best-effort logout. A hostile token with
+  control bytes cannot be represented in the exact authorization header; that narrow case fails
+  closed without echoing, transforming, or sending the token, so an unsafe logout is deliberately
+  impossible. Application shutdown joins admitted retirement work. Menu and Ctrl+Q quit requests
+  close the active window instead of bypassing its `close-request` barrier; only an application with
+  no window quits directly. The focused lifecycle module passes all 53 tests. Locked debug and
+  release suites each pass 20 library, 865 application, and 10 repository-metadata tests (895
+  total), with locked all-target/all-feature compile, strict warning-free Clippy, formatting, and
+  diff checks green. The CodeQL review follow-up generates all three password-bearing test inputs
+  at runtime instead of embedding credential-shaped literals, preserving the exact authentication
+  and logout coverage without suppressing hard-coded-secret analysis. Lifecycle, registry,
+  reducer, playback-boundary, provenance, shutdown,
+  interactive-Jellyfin, and actual-wire DAAP regressions cover the authenticated cutover.
+  Radio-Browser now uses three exact independently cancellable views, preserves a predecessor on
+  failed refresh, publishes accepted empty results authoritatively, and resolves public streams
+  from private locator contributions only at use. Near Me performs translated consent in GTK; an
+  exact generation-owned prerequisite marker prevents unrelated lifecycle invalidations from
+  treating the deliberate pre-construction dialog interval as source loss, while a stale or
+  superseded dialog cannot suppress ordinary fallback. Automatic construction failure or later
+  source loss now returns a selected radio lane to Local with the user's music-column names,
+  column visibility, and browser visibility restored. The adapter tolerates partial successful
+  tiers, deduplicates by tier precedence, computes each retained station's distance once, and then
+  applies one stable global distance sort.
+  Locked all-target/all-feature check, strict debug/release Clippy, formatting, and diff checks
+  pass; complete locked debug and release suites each pass 20 library, 895 application, and 10
+  repository-metadata tests (925 total). Independent integrated review found the consent race and
+  the automatic-fallback presentation leak; both are fixed.
+  The OS-opened external-file adapter described below closed one remaining boundary. The removable
+  adapter now closes the last one with registry-owned mounted-root authority, pathless epoch-bound
+  catalogues, and retained-file resolution, completing P3.1's implementation record.
+- **OS-opened files now use an ephemeral registry-owned lifecycle instead of direct path queues** —
+  A delivery is processed sequentially on a blocking worker, preserving candidate order, skipping
+  files that cannot be opened, parsed as audio, or accepted by the metadata bounds, and stopping
+  after the first accepted candidate. A native non-UTF-8 leaf name becomes bounded lossy Unicode
+  only as a parser/presentation hint; the already-open handle remains the sole authority. Before
+  identity or adapter publication,
+  the worker must still own the delivery's exact admission generation under the shared
+  shutdown/publication gate. A newer delivery, every explicit Play/Pause/Next/Previous/scrub action,
+  Stop, a real output change, or shutdown supersedes older admission; selecting the already-active
+  output remains inert. Only a successfully parsed already-open regular file receives fresh random
+  source and track IDs. Its one-item queue carries those pathless IDs and the exact registry epoch,
+  while the hidden adapter retains the original handle behind a `MediaLease` checked both before and
+  after every file-handle clone. The closed stream resolver now returns either `Http` or a retained
+  `File` capability, so remote/radio behavior is unchanged and external playback never reconstructs
+  a URI. Cursor-based tag and artwork parsers serialize per retained capability, while every output
+  continues to consume the app-owned proxy's position-independent reads.
+  Embedded art receives a cloned capability only after the selected output accepts the load.
+  Replacement by another external or ordinary queue, Stop, unrepeated EOS, playback/load failure,
+  real output change, stale post-adoption admission, and shutdown explicitly retire the ephemeral
+  source idempotently. Registry shutdown and adoption serialize under the same gate; lifecycle
+  baselines clear hidden state only for real UI owners, so the intentionally hidden source cannot
+  invalidate its own playback. The OS-open callback now logs only a count and fixed status, never a
+  delivered path. Focused regressions cover ordering, exact admission and shutdown races, random
+  identity and epoch isolation, retained-handle path replacement, lease revocation,
+  hidden-baseline ownership, and exactly-once retirement; independent review covers the complete
+  intent/terminal wiring and post-accept artwork handoff. Locked debug and release suites each pass
+  940 tests, strict Clippy is clean in both profiles, and final independent integrated review is
+  clean.
+- **Removable mounts now use the shared source lifecycle from discovery through playback** — The
+  window-owned GIO controller still performs only cached inventory work on GTK's main thread, but
+  it now owns keyed provenance claims and delegates scanning, catalogue publication, media
+  resolution, cancellation, disconnect, and shutdown to `SourceRegistry`. Stable `SourceId` text,
+  rather than the transient logical inventory key or current mount path, keys navigation and cache
+  state. Selecting an accepted row renders its pathless catalogue; relocation or pre-unmount
+  disconnects the exact source before invalidating cache and source-owned playback, a cancelled
+  unmount reconnects only through a fresh inventory observation and new epoch, and confirmed removal
+  releases the claim after retirement. Deterministic lifecycle tests cover accepted publication,
+  unlisted-track rejection, stale lease and epoch rejection, reconnect, queued-scan cancellation,
+  shutdown joining, and replay of a retained background scan failure when its inactive row is later
+  selected. Together with mounted-authority, identity, adapter, and GTK coverage, the complete
+  serial locked debug suite passes 20 library, 926 application, and 10 metadata tests (956 total).
+  Locked all-target/all-feature check, strict debug Clippy, formatting, and diff checks are
+  green. A release-suite attempt was interrupted when partial artifacts exhausted temporary
+  workspace disk quota; no release validation result is claimed from that environmental failure.
+  This completes P3 at 30/30 and advances the remediation tracker to 220/223 (98.7%); only three
+  manual P2 field validations remain, while the release-workflow run remains deliberately deferred.
+- **The centralized source-lifecycle foundation now backs the production source registry** —
+  `SourceLifecycleRegistry` provides the atomic adapter, revocable media lease, session epoch,
+  accepted catalogue/view snapshots, keyed/refcounted provenance, and generation-correlated
+  sanitized failures used by `SourceRegistry`. Framework-owned adapter wrapping and an
+  unforgeable close capability send rejected, stale, cancelled, panicking, replaced, disconnected,
+  and shutdown sessions through one exactly-once tracked retirement path. Each spawned connection
+  generation retains a settlement participant through construction and any late rejected-adapter
+  close. One composite disconnect waiter joins the adopted retirement, a dissociated predecessor,
+  and every still-unsettled generation—including superseded generations—and returns a sanitized
+  late close failure only after all joined work settles. Participant ownership transfers before the
+  constructor task can drop, so there is no false zero-count completion window. Final provenance
+  release also retires and prunes a settlement-only disconnect without starting another close.
+  Reconnect can adopt a successor while its predecessor closes, and at-use HTTP resolution checks
+  the expected epoch before adapter access, then rechecks the adapter, lease, and epoch after
+  asynchronous lookup. Protected construction, atomic task admission, persistent shutdown,
+  last-handle fail-closed cleanup, lifecycle-owned pruning, and coherent baseline/watch observation
+  retain their deterministic adversarial coverage. This was introduced as an unwired foundation
+  earlier in the release cycle; the production cutover above now consumes it instead of maintaining
+  a second lifecycle owner.
+- **Playback queues and output selection now share tested lifecycle boundaries** — Starting from
+  the track list captures its current sorted/filtered `ListModel` projection exactly once. Initial
+  direct playback, Next, Previous, EOS replay, and a retry after synchronous refusal now all hand the
+  session's current immutable item to the active output under a fresh event generation, while Stop
+  invalidates that ownership before it invokes the backend. Sorting, filtering, or navigating the
+  visible projection therefore cannot retarget the playing identity or make a stale output event
+  current. Output changes use one validated transaction: selecting the exact active endpoint is a
+  complete no-op; a real change clears generation ownership before stopping the displaced output,
+  parks and later restores the exact Local instance, and stops/drops replaced remote outputs. A
+  wrong-type replacement or inconsistent parking state leaves the current target, queue, and
+  output unchanged. The old switch path constructed a throwaway MPD worker solely to move Local
+  into its parked slot; that worker is no longer created. Headless recording-output regressions
+  exercise reorder/filter/source-navigation, B→C→B queue identity, stale events, rejected remote
+  load retry, Local→MPD→Chromecast→Local replacement/restoration, invalid replacement, Stop/drop
+  cleanup, and exact reselection through the production seams. Keyboard context-menu matching
+  now ignores ambient lock/legacy modifier state such as NumLock while continuing to reject real
+  Control, Alt, Super, and extra-Shift chords; owned local and remote artwork buffers also cross
+  into GLib without a redundant full-buffer copy. Together with the accessibility,
+  Cast-frame, recycled-row, artwork, and source-generation harnesses, this completes all P3.4
+  integration items; the final rebased branch passes 797 tests in each profile plus strict Clippy
+  in debug and release.
+- **Local and remote track catalogues now share the backend abstraction** — `MediaBackend` now
+  exposes one complete-track catalogue operation, and the only production publication adapter
+  accepts `&dyn MediaBackend`. Scanner snapshots construct `LocalBackend` instead of querying the
+  track table directly, while Subsonic, Jellyfin, Plex, DAAP, environment, discovery, and manual
+  connection paths use that same adapter rather than backend-specific `all_tracks` methods.
+  Authentication and protected-media/session retention remain concrete because those lifecycles
+  are intentionally backend-specific; this slice makes catalogue publication the real seam without
+  claiming that every source-lifecycle or browsing path has already converged. If a passwordless
+  DAAP catalogue read fails after login, Tributary now logs out and emits the same one-shot UI
+  failure signal as a connection error, so the sidebar spinner, pending guard, and prior selection
+  are restored instead of remaining stuck. Together with the stable local aggregate identity,
+  grouping, and by-ID work accepted in PR #114, this completes P3.2's bounded backend-abstraction
+  scope; broader source/session lifecycle convergence remains tracked under P3.1.
+- **MPD playback now requires explicit exclusive partition control** — MPD exposes pause, stop,
+  and its `repeat`, `random`, `single`, and `consume` settings as partition-wide mutations, with no
+  atomic command that can prove Tributary still owns the current song. The Add Output dialog now
+  explains that scope in every supported locale and requires confirmation that no other controller
+  or Tributary instance shares the playback partition. The confirmation is persisted as an
+  explicit mode and participates in output identity, so reselecting an upgraded active endpoint
+  rebuilds it instead of being mistaken for a no-op. Legacy entries deserialize unconfirmed and
+  every load intent fails with localized re-add/confirm/reselect guidance before optimistic
+  Buffering state, output-epoch advancement, worker enqueue/cleanup, MPD connection, MPD state or
+  option commands, protected-media tickets, or queue mutation—even when media was already rejected
+  as malformed, unsupported, or inactive. The synchronous refusal leaves the exact queue item
+  retryable, so another Play re-shows the guidance instead of toggling an empty MPD session; an
+  independent worker gate retains the same fail-closed contract for internal callers.
+  Re-adding the exact host and port with the checkbox upgrades that entry in place without renaming
+  it, dropping siblings, or creating a duplicate. Existing song-ID ownership checks remain in
+  force: observing a foreign current song violates the exclusive-control promise but still causes
+  conservative relinquishment/retention rather than a racy stop or delete.
+- **Coverage is now representative and threshold-gated** — The sole comparable report moves to
+  a dedicated Linux x86_64 job pinned to Rust 1.92.0, matching LLVM tools, cargo-llvm-cov 0.8.7,
+  the committed dependency graph, every host target, and every feature. UI, Jellyfin, Plex,
+  Subsonic, radio, migrations, desktop integration, and `main.rs` are no longer excluded from CI
+  or any developer helper. A reviewed `coverage-baseline.txt` enforces a 66.9% line floor and the
+  HTML report uploads even when the threshold fails, and a missing artifact is itself an error.
+  Two exact pinned reports measured 67.03% and 67.02% lines, correcting the provisional local
+  estimate and confirming the floor under the documented two-run policy; CI prints that measured
+  summary even on a threshold failure. Two repository contract tests prevent the toolchain,
+  source set, threshold wiring, artifact policy, summary, and local commands from silently
+  drifting. CI enforces the checked-in floor but does not compare it with the base branch; README
+  records the repository's non-decrease review policy and explains why developer-helper and
+  native-platform summaries remain informational rather than directly comparable to the canonical
+  denominator.
+- **Sources and playback queues now use stable, location-independent media identity** — The
+  accepted P3.1 contract is now backed by frozen `SourceId`, exact bounded backend-native
+  `TrackId`, composite `MediaKey`, and separate playlist/radio `ViewOrigin` types. Saved remotes
+  added without an existing live row receive random persisted source IDs; legacy, discovered,
+  environment, and unsaved endpoints use deterministic backend-plus-canonical-base-URL IDs, and
+  promotion persists that already-live deterministic ID. Local, Radio-Browser, and removable
+  logical sources use pinned deterministic identities. Those typed IDs now travel through sidebar
+  rows, standard and DAAP connection ownership, sync events, navigation, disconnect, discovery
+  loss, deletion, and playback instead of using a configured URL as generic ownership. Subsonic song
+  IDs, Jellyfin item IDs, Plex rating keys, and decimal DAAP item IDs remain exact and
+  source-scoped rather than being irreversibly projected into global UUIDs. Empty or oversized
+  provider IDs fail closed and debug output retains only their byte length. Production catalogue
+  fixtures pin exact surviving values (`healthy-track`, `track-0`, and DAAP `9`), while frozen
+  removable-source and native-path goldens cover mount relocation and unpaired Windows UTF-16 code
+  units.
+  The saved-source file is now a strict version-1 envelope containing `source_id`. A legacy bare
+  array is validated, canonical duplicates collapse deterministically to the first row, and the
+  complete migrated file atomically replaces `servers.json` before any row is published. Unknown
+  versions, malformed identities, endpoint/ID conflicts, and failed replacement publish nothing
+  and leave the original complete file unchanged for explicit recovery. A version-1 remote accepts
+  only a random RFC UUIDv4 identity or the exact UUIDv5 owner of its canonical backend and endpoint;
+  other UUID versions and UUIDv5 values owned by another remote, built-in, or removable source
+  quarantine the complete file. Repeated manual Add reuses the saved owner,
+  discovered-to-saved promotion first persists the row's already-published ID and retains its
+  ephemeral advertised route for the immediate route-aware authentication/connection attempt, and
+  saved-plus-environment startup uses the stored ID for authentication; all three paths therefore
+  keep one canonical `(backend, endpoint)` owner without trying to transfer live UI, cache,
+  playback, or registry state or discarding discovery-only reachability. An accepted
+  reconnect publication always clears the canonical row's transient connecting state—even when a
+  prior session still marks it connected—so repeated Add, promotion, and environment reconnects
+  cannot leave the sidebar spinner stuck. A newest environment authentication or catalogue
+  failure now carries its exact `SourceId` and opaque UI-attempt token back to GTK and clears only
+  that attempt's transient spinner while preserving any prior connected session. An attempt
+  already superseded at the registry publishes no failure transition; if a retry starts after an
+  older failure is queued, its new token prevents that stale event from clearing the retry.
+  Playlist queues now carry local media identity plus their
+  playlist origin, overlapping radio feeds share station media identity without sharing view
+  ownership, removable tracks use a lossless native mount-relative ID that survives a mount-point
+  change, and each OS-opened file session mints independent random source and track IDs. The
+  later authenticated-remote lifecycle cutover consolidates the standard and DAAP owners behind
+  `SourceRegistry`; the Radio-Browser follow-up makes its queues pathless as well. At that
+  identity-only cutover, removable and external queues still retained their current locators. After
+  merging the completed P3.4 seams, the accepted
+  pre-follow-up head passed 823 tests
+  and strict all-target/all-feature Clippy in both profiles. The final identity review adds three
+  regressions for the persisted-ID contract and promoted advertised route: the complete debug and
+  release suites now pass 827 tests each, the 49-test identity filter is clean, and strict Clippy
+  passes in both profiles. The promoted-route regression generates its disposable authentication
+  secret at runtime instead of embedding a credential-shaped literal, keeping the security scan
+  meaningful without changing production authentication behavior.
+  Automated review also removed a redundant copy of each accepted Radio-Browser native ID.
+  Remote-reference decoding deliberately continues to reject uppercase hex as noncanonical; an
+  existing malformed-reference regression pins that fail-closed boundary. Codex review found the
+  failed saved-plus-environment spinner path; its reordered same-source and exact-owner regression
+  proves cleanup neither clears a newer retry, disconnects the retained predecessor, nor mutates
+  another source row. The failed-migration regression now injects the atomic-replacement error at
+  the loader's private persistence boundary instead of relying on directory permissions, which a
+  privileged Linux CI container can bypass. Linux, Windows, and unprivileged test runs therefore
+  exercise the same fail-closed no-publication/original-bytes contract without changing production
+  migration behavior.
+- **Source identity and lifecycle now have a recorded architecture contract** — The P3.1 decision
+  defines immutable `SourceId` plus backend-native `TrackId` identity, deterministic migration for
+  legacy saved sources, one registry-owned connection/refresh/cancellation/failure state machine,
+  explicit exactly-once DAAP retirement, and ID-at-use resolution for local, playlist, radio,
+  removable, remote, and OS-opened media. It separates playlist and radio-feed view identity from
+  underlying media identity and documents the evidence limits of discovered endpoints and
+  removable-device keys. The migration contract pins the legacy-array reader, versioned envelope,
+  atomic replacement, deterministic duplicate collapse, and fail-closed whole-file conflict
+  quarantine. Overlapping radio views retain separate locator contributions and choose the newest
+  initiated accepted refresh deterministically rather than completion order.
+  PR #113 recorded this decision only. PR #120 implements its stable source/media identity and
+  saved-source migration; PR #121 adds exact local/playlist resolution plus retained root/file
+  authority through output consumption; and the authenticated-remote production cutover unifies
+  Subsonic, Jellyfin, Plex, and DAAP session, refresh/failure, provenance, and GTK projection
+  ownership. At that cutover, embedded-art authority and the radio/removable/external at-use
+  locator adapters remained implementation work tracked under P3.1. The retained-art and
+  Radio-Browser follow-ups close the local/playlist and public-radio boundaries. The subsequent
+  external-file adapter closes OS-opened-file admission, retained capability, and retirement. The
+  final removable adapter adds the same pathless registry ownership with mounted-root authority and
+  closes P3.1's implementation record.
+- **Local album and artist aggregates now have stable identities** — `LocalBackend` replaces its
+  per-call random album/artist UUIDs with UUIDv5 values under a private versioned namespace. Artist
+  and album domains are separate, every component is length-framed to prevent concatenation
+  ambiguity, and metadata bytes are intentionally neither case-folded nor Unicode-normalized. A
+  local track now carries the same performing-artist and album IDs returned by aggregate listings,
+  so an unchanged database produces the same identities across queries and restarts.
+  - Albums are keyed by exact title plus effective album artist, rather than title alone. A missing
+    or Unicode-whitespace-only album-artist tag falls back to the exact performing artist; nonblank
+    tags retain their original case, normalization, and surrounding whitespace. Same-titled albums
+    by different artists therefore stay separate, while compilation tracks with one album artist
+    group together. Aggregate year and genre use deterministic minima instead of SQLite's arbitrary
+    bare-column value; counts, durations, per-artist album totals, and library album statistics use
+    the same disambiguated key. `Album.artist_id` remains empty because a compilation credit does
+    not necessarily identify a performing-artist entity.
+  - `get_album_tracks` and `get_artist_tracks` are no longer unsupported. They first map a UUID to
+    its compact deterministic metadata key, return an empty list for an unknown UUID, and then
+    issue a deterministically ordered SQLite query narrowed to the exact album title or performing
+    artist. Album results retain an exact effective-artist filter so blank-tag fallback cannot
+    merge another same-titled album. Identity-bearing metadata edits intentionally create a new
+    aggregate identity. The common complete-catalogue backend seam was completed later in this
+    development cycle. The P3.1 stable-identity milestone subsequently preserved exact persisted
+    local track-ID strings and replaced the random malformed-UUID fallback with a frozen
+    deterministic compatibility projection. PR #121 subsequently adds current root/file authority
+    and retains it through the complete playback-output lifetime.
 - **Minimum supported Rust version raised to 1.92** — Originally raised to 1.85 in this cycle, but the gtk-rs 0.11 release series (gtk4, glib, gstreamer) requires rustc 1.92, so 1.85 had been unbuildable fiction since that upgrade. The declaration now matches reality and a dedicated CI job compile-proves the MSRV against the committed lockfile on every push, so it cannot silently drift again.
 - **The local validation gate is now enforced by CI** — Debug-profile `cargo test --all-targets` (release-only testing compiled out `debug_assert!` bodies and overflow checks), fuzz-workspace `fmt`/`clippy` against its committed lockfile (which had already drifted past the supported toolchain unnoticed), strict no-diagnostics `desktop-file-validate`, and `appstreamcli validate` all run on every push and pull request. Repository-level tests also pin the Rust/API floor, native package requirements, desktop launch field, and main category together so those declarations cannot silently diverge again. Their workflow inspection is line-ending agnostic and explicitly exercises a synthesized CRLF checkout, so Windows cannot report a missing job merely because Git converted the YAML file. Windows architecture jobs now finish independently instead of matrix fail-fast cancelling the surviving diagnostic signal, and the ARM runner skips setup-msys2's optional package cache after its `paccache` cleanup intermittently failed even though package installation had succeeded; Cargo retains its separate architecture-specific cache.
 - **Flatpak source generation is consistent across local and CI builds** — The exact checksum-pinned `flatpak-cargo-generator` revision is now vendored with provenance, an MIT license notice, and update instructions. One repository-root-independent helper verifies those bytes, Python 3.9+, and the exact direct dependency versions before always generating `build-aux/flatpak/cargo-sources.json`; the Linux build helper and CI both call it instead of downloading the generator or writing the manifest to the wrong directory. The Python transitive dependency graph is not hash-locked. Local instructions keep those packages in an XDG cache virtual environment and configure Flathub. Flatpak-only mode now bypasses native Rust/GTK prerequisite checks, the directory source excludes known VCS/agent/generated state (including host `target/`), the builder installs the runtime, SDK, and Rust extension from Flathub, and the single-file bundle records that runtime repository. The release workflow remains deliberately unchanged for now and continues to download and verify the identical immutable generator revision before use.
@@ -41,6 +477,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Playlist import matching is deterministic, ambiguity-safe, and indexed** — An exact path decoded from a valid local `file:` URI—including Windows drive-letter form—wins first; non-file and malformed locations are not treated as filesystem paths. Otherwise title and artist, plus album when supplied, must match exactly after trimming and case normalization; matching is deliberately not fuzzy. A supplied duration is a hard inclusive ±5-second gate and only the unique nearest candidate wins, while an equal-nearest tie or duplicate metadata without duration remains unmatched. Import and later orphan reconciliation use the same resolver and build its path/normalized-metadata index once per library snapshot, so the result cannot change merely because two call paths ranked candidates differently and large playlists do not repeatedly scan and normalize the entire library. Path authority is retained only from imported location evidence; metadata-only imports and manually added entries remain fingerprint-only across repeated relinks, preventing a different song at a reused library path from silently taking over the entry. Corrupt negative or out-of-schema library durations are omitted from match evidence instead of wrapping or blocking reconciliation, and already-corrupt negative entry evidence is treated as absent.
 
 ### Fixed
+- **Local and playlist playback now resolves exact identity into retained file authority at use** —
+  PR #120 preserves the exact SQLite `tracks.id` string—including legacy non-UUID values—uses a
+  frozen deterministic malformed-ID compatibility projection, and gives playlist rows the local
+  `MediaKey` plus a separate `ViewOrigin`. Queue snapshots retain that identity, order, duplicate
+  occurrence, and display metadata but deliberately omit the playback path. Initial Play, newly
+  selected Next/Previous, repeat/replay, and output retries asynchronously re-read only the exact
+  row, choose the most-specific root that is both currently configured and backed by complete,
+  available, identity-confirmed state, and reject missing, empty, dead, timed-out, stale, or
+  displaced authority without metadata, fingerprint, saved-path, or alternate-track fallback.
+  Resolution retains the exact root, marker, ancestor chain, and regular-file handle under a
+  five-second outer budget and rechecks the exact track path plus the root key, marker identity,
+  confirmation, availability, and complete-scan authority state before publication. The
+  observational `last_checked_at` scan timestamp is deliberately excluded from that authority
+  snapshot, so a concurrent successful scan cannot reject playback merely by refreshing metadata;
+  any authority-relevant drift still fails closed. The GTK
+  handoff rechecks that the retained root is still the most-specific configured match without
+  touching the filesystem, and the bounded ticket worker revalidates physical authority before
+  every retained-handle clone. Local and AirPlay GStreamer, Chromecast, and MPD receive a typed
+  lease and consume it through an opaque handle-backed app ticket, never by reopening the database
+  path. The bounded two-chunk stream uses explicit-offset reads, so sequential or concurrent full
+  and Range requests cannot corrupt one another through an OS-cloned shared cursor. Replacing a
+  pathname cannot retarget an admitted load, while root or marker loss blocks later handle clones.
+  Replacement, Stop, load or playback failure, terminal queue completion, ticket drop, and
+  output/server teardown revoke future lookup; a failed item remains retryable through a fresh
+  exact-ID resolution. Shared Chromecast cleanup revokes credential and retained-authority routes
+  while preserving the documented server-lifetime contract of legacy explicit-file routes. At PR
+  #121, GTK rows could still retain current paths for non-playback display and file management, and
+  embedded-art display still gave its helper the exact playback-time path; the follow-up below
+  closes that retained-authority boundary.
+  Fifty-six focused exact-ID, root-authority, queue/view-ownership,
+  handle-streaming, GStreamer-ticket, and MPD-ticket regressions pass with the locked all-target
+  compile, formatting/diff gates, and strict warning-free Clippy in both profiles. The complete
+  debug and release suites each pass 20 library, 804 application, and 10 repository-metadata tests
+  (834 total), including every socket-bearing regression. Gemini's review follow-up is covered by
+  a deterministic regression that accepts timestamp-only drift while independently rejecting
+  changes to every retained root-authority field.
+- **Local and playlist embedded art now stays inside retained file authority** — Artwork begins
+  only after the exact local/playlist ID resolves beneath the still-current configured root, its
+  resolution generation remains current, and the selected output accepts the load. The background
+  worker receives a clone of that `ResolvedLocalMedia`, not a path or file URI. Cloning revalidates
+  the root marker, ancestor chain, and exact regular file, and the worker owns the capability
+  through parsing; replacement at the pathname therefore cannot retarget artwork and authority
+  drift fails closed. Because cloned operating-system file handles may share a cursor, every parse
+  attempt rewinds the retained file and leaves it rewound. Lofty uses the safe extension only as a
+  format hint, content-probes an unknown suffix, and disables unrelated property reads. The
+  explicit MP4 reread and raw `covr` fallback consume the same handle. The raw fallback reads at
+  most 256 MiB, every parser path returns at most 32 MiB of artwork, and atom offsets, extended
+  sizes, conversions, and additions are checked before slicing or allocation. Exact album-art
+  generations also reject a result superseded during parsing. At that retained-art slice, the
+  direct file-URI helper remained a transitional boundary for removable and OS-opened external
+  files. All 9 focused album-art tests pass, including real tagged FLAC, path replacement,
+  authority drift, cursor restoration, delayed generation, and malformed MP4 bounds. Locked all-target/all-feature
+  check, strict debug/release Clippy, formatting, and diff checks pass; locked debug and release
+  suites each pass 20 library, 872 application, and 10 repository-metadata tests (902 total). This
+  closes one part of P3.1's compound final record without changing **219/223 (98.2%)** overall or
+  **29/30 P3**. The Radio-Browser and external-file follow-ups close two more parts; the final
+  removable adapter now closes the record and advances P3 to **30/30**.
+- **Subsonic failed envelopes no longer retain a server-controlled error message** — HTTP-200 API failures keep only the numeric Subsonic code in a fixed typed error; code 40 remains authentication rejection and code 41 remains the HTTPS-only legacy-auth negotiation signal. A malicious or broken peer can no longer echo a submitted password or arbitrary text into retained errors, logs, or UI-facing classification.
+- **Radio-Browser and geolocation no longer trust successful-looking JSON on an HTTP error** — Station and all three IP-geolocation provider paths now require a success status before their bounded response reader or deserializer can publish data. A `503` carrying a syntactically valid station or location is rejected, the geolocation cascade advances to its next provider, and late or oversized bodies remain bounded. Public same-origin/cross-origin redirects retain the existing no-`Referer`, no-HTTPS-downgrade policy.
+- **Jellyfin and Plex now preserve reverse-proxy base paths for every API and media request** — Both clients remove only one trailing empty base segment before appending API paths, so root, `/share`, `/share/`, and already-escaped prefixes do not gain a doubled slash or lose their prefix. Plex stream-part and thumbnail paths now append below that same configured base instead of replacing it; escaped bytes are preserved and normalized dot segments cannot escape the prefix. Root `//` and prefixed `/share//` regressions pin the same one-empty-segment rule across catalogue and protected-media construction. The rejection uses a fixed peer-path-free error. Complete prefixed backend fixtures prove authenticated ping/identity, discovery, pagination, stream, and artwork construction.
+- **Recycled sidebar rows and asynchronous UI results have production-boundary stale-authority coverage** —
+  The existing one-handler sidebar invariant is strengthened with one parameterized `GAction`
+  installed during factory setup; each bind replaces its immutable delete, disconnect, or menu
+  target and unbind revokes that target before GTK recycles the widget. The display-independent
+  regression activates that exact production
+  action across repeated manual, unbound, connecting, DAAP, and playlist-header bindings, so it
+  runs on every headless native CI host rather than depending on a display server. A synchronized
+  loopback fixture also pauses a real request inside the persistent artwork worker, installs a
+  newer generation, and proves the stale response is discarded before publication while only the
+  newer bytes cross the completion channel. The production source cache and eviction boundary is
+  exercised with reversed same-key results: an old loaded or missing callback cannot overwrite or
+  remove the newer projection, and the newest inactive-source result remains cache-only.
+- **Packaged-probe accepted sockets honor their bounded deadlines on Windows** — Winsock can retain a nonblocking listener's mode on an accepted socket, so a fragmented protected-media request could return `WouldBlock` immediately instead of waiting for its next bytes or the configured deadline. The probe now explicitly restores blocking I/O before installing read/write deadlines and treats any socket-configuration failure as fatal; timeout, malformed-request, and response failures remain distinct from the narrow teardown cancellation case.
+- **Local Windows packaging could reject the Soup plugin it had just copied** — The bundle path
+  remained relative until PE import inspection. PowerShell resolved the successful copy check
+  against its current location, while `.NET` resolved `Path.GetFullPath` against the process
+  working directory, which does not follow an interactive PowerShell `cd`. The inspector therefore
+  received an absolute path to a different, nonexistent `libgstsoup.dll` and stopped with
+  `PE import-inspection target must be an absolute existing DLL or EXE`. The bundler now resolves
+  the created distribution through PowerShell's filesystem provider and retains its physical
+  `ProviderPath` before constructing any PE target. Regression coverage reproduces a
+  process/current-location split inside a repository path containing spaces, proves a custom
+  FileSystem PSDrive does not leak its provider-only drive name to `.NET` or external tools, and
+  retains the caller-relative `dist\tributary-windows` workflow.
+- **Windows PE-import targets cross an explicit typed batch boundary with predicate-specific
+  diagnostics** — PR #124 named every argument to `Invoke-BoundedPeImportBatch` and passed native
+  x86_64 and ARM64 package/probe jobs, but the 2026-07-18 affected-host rerun rejected the same Soup
+  singleton. That reproduction disproves positional array binding as the cause. The current repair
+  candidate removes the non-terminal `[string[]]` function boundary: callers construct explicit
+  `List[string]` instances for the singleton, every dependency-closure round, and each bounded
+  process batch. Each target must be nonempty, quote/control-free, rooted,
+  `GetFullPath`-valid, a DLL or EXE, and an existing file before process launch. Failure identifies
+  the violated predicate in a bounded single-line report that retains at most 192 sanitized target
+  characters plus a fixed truncation marker. The architecture-local `llvm-readobj` still inspects
+  PE data without executing the target, and the established batch, argument, output, process,
+  process-tree, and whole-closure
+  limits remain intact. The current focused filters pass 14 `windows_*` and three `powershell_*`
+  tests; the target-batch behavior regression uses `pwsh` away from Windows and is designed to
+  require Desktop PowerShell 5.1 on native Windows. AST parsing, formatting/diff, locked check,
+  strict debug/release Clippy, and complete 926-test debug/release profiles pass. Native package
+  CI/Desktop PowerShell 5.1 execution and the exact affected-host rerun remain required, so this is
+  not yet a claim that the reported packaging failure is fixed.
+- **Malformed or expired DAAP catalogue responses now fail closed** — Tributary's DMAP parser no longer accepts a valid item prefix while silently discarding a malformed or truncated remainder in a known nested container, and every known integer field must use its exact protocol width. Wrong or missing containers, truncated framing, excessive nesting, short or overlong `mstt`, and duplicate response statuses now produce fixed-size typed parse failures before a catalogue can be published or any media request can begin. HTTP 401/403 share one authentication/session-expiration classification across the post-login update, databases, and items routes; in-band `mstt` 401/403 has the same typed result, any other explicit non-200 `mstt` is a typed connection failure, and a missing status on login or later session responses remains compatible with older peers. Once login yields a usable session ID, any later failure performs one bounded best-effort logout even when update or database discovery prevents construction of a client. The socket fixture reads complete request headers in deterministic fragments under a 16 KiB cap and five-second deadline and owns its handlers; lifecycle regressions cover nine malformed catalogue forms, eight expiration route/status combinations, and a non-authentication status, proving direct failed initial sync returns no backend, begins no stream/artwork request, and issues exactly one logout. Separate registry tests prove only explicit successful retention installs a source, replacement logs out the displaced session, and shutdown/release races remain joined and exactly-once.
 - **Bundled runtime caches no longer modify the application install** — Windows and macOS now select GStreamer's writable registry before toolkit initialization under the operating system's per-user cache directory, separated by platform, architecture, and install path. Explicit unversioned or GStreamer 1.0-specific registry/plugin overrides—including an intentionally empty value—remain authoritative, and failure to establish the preferred Windows cache leaves GStreamer to its normal user-scoped default rather than falling back beside the executable in Program Files. Cache destinations are resolved through existing ancestors before creation and rejected if a normal or symlinked path would enter the application install. Portable regression fixtures derive native absolute paths on each host, so Windows CI exercises drive-qualified cache, install, and loader paths rather than Unix-shaped stand-ins.
   - The macOS launcher no longer exports a bundle-local GStreamer registry or copied `loaders.cache`. Instead, the signed app bundles and signs `gdk-pixbuf-query-loaders`; early startup invokes that exact helper with the exact absolute relocated loader modules and drains its output under a deadline and fixed memory bounds. Validation parses the cache's module/info/MIME/extension/signature record structure, including standalone quoted empty MIME or extension lists, instead of mistaking every standalone quoted line for a module. Exact absolute module records are retained; a safe helper-relative record is accepted only when resolving it against the signed helper's top level produces the exact expected loader set. Every accepted module is rewritten to its C-escaped absolute installed path, while malformed, incomplete, duplicate, traversal, or out-of-directory records fail closed before the user cache is atomically replaced. The old cache survives helper, validation, write, sync, or rename failure.
   - macOS packaging removes both mutable caches before signing and makes every signing and strict deep verification failure fatal. It launches a read-only signed copy from a path containing spaces with a fresh explicit probe cache, decodes the bundled app PNG through GDK-Pixbuf, initializes GStreamer and finds the bundled `playbin3` factory, proves both caches reference the relocated bundle and none appeared inside it, then strictly verifies the launched copy and untouched packaged app again before DMG creation.
@@ -48,7 +587,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Linux file association now actually works** — The desktop entry advertised audio MIME types since 0.5.0, but its `Exec` line lacked a field code, so activating Tributary for a file never passed the URI to the process. `Exec=tributary %U` fixes it, and the required `AudioVideo` main category accompanies the existing `Audio`/`Music`/`Player` additional categories, so the entry passes `desktop-file-validate` (now enforced in CI).
 - **Linux packages no longer install onto systems that cannot run the binary** — The `.deb` and `.rpm` declared GTK ≥ 4.14 and libadwaita ≥ 1.5 while the binary hard-requires GTK 4.16 and libadwaita 1.6, and the Arch manifest declared no version floors at all, so package managers could install a binary that could not start. Debian, both RPM paths, and Arch now state the real runtime minimums; the handwritten RPM build requirements carry the same floors.
 - **Selecting an AirPlay receiver no longer falls back to a subprocess that cannot reach it** — When GStreamer's `raopsink` element was missing (the default on most Linux installations, because it ships in `gst-plugins-bad`), Tributary silently piped decoded audio into a spawned `shairport-sync` process. `shairport-sync` is an AirPlay *receiver*, not a sender: it ignored the device the user selected, so the click looked successful while nothing could ever play on that device — and the subprocess probe, spawn, and teardown all ran synchronously on the GTK main thread. The fallback is removed. A missing `raopsink` now fails the load immediately with a localized error naming the `gst-plugins-bad` package, translated in all 13 supported catalogs. Playback errors are also now surfaced as in-app toasts instead of being visible only in logs; every message an output emits was already reduced to a fixed, credential- and URL-free category, so displaying it verbatim is safe.
-- **mDNS-discovered HTTP servers no longer depend on a second `.local` lookup for API and protected-media connections** — Tributary now retains a bounded, canonical snapshot of the socket addresses advertised for Subsonic, Plex, and DAAP services and applies it only when opening a direct connection. The advertised hostname remains in the URL, HTTP `Host`, TLS SNI/certificate identity, and exact-origin redirect checks; system and explicit proxies retain their normal behavior. Discovery preserves the authoritative SRV hostname, treats Avahi conflict-suffix cleanup as display-only, applies scheme-correct default ports, aggregates duplicate instances through a bounded origin index, publishes address updates, rejects same-origin cross-backend aliases, and removes an origin only after its final retained exact service instance disappears within those bounds. Unauthenticated state is capped at 512 publications, 32 instances per origin, and 16 route addresses. Routes remain ephemeral and are snapshotted per connection into the applicable API/auth client and protected stream/artwork pools; connection ownership is minted before async work is queued, so a final service loss clears the route and revokes pending or active ownership even when a manually saved row remains available. Jellyfin's client accepts the same route contract, but its UDP discovery currently supplies only a URL. Automated tests preserve the hostname and HTTP `Host`; they do not perform a real TLS certificate/SNI handshake. This removes an identified resolver dependency but is not yet proof that DNS caused the reported live Windows failures.
+- **mDNS-discovered HTTP servers no longer depend on a second `.local` lookup for API and protected-media connections** — Tributary now retains a bounded, canonical snapshot of the socket addresses advertised for Subsonic, Plex, and DAAP services and applies it only when opening a direct connection. The advertised hostname remains in the URL, HTTP `Host`, TLS SNI/certificate identity, and exact-origin redirect checks; system and explicit proxies retain their normal behavior. Discovery preserves the authoritative SRV hostname, treats Avahi conflict-suffix cleanup as display-only, applies scheme-correct default ports, aggregates duplicate instances through a bounded origin index, publishes address updates, namespaces same-origin rows by backend protocol, and removes an origin only after its final retained exact service instance disappears within those bounds. Unauthenticated state is capped at 512 publications, 32 instances per origin, and 16 route addresses. Routes remain ephemeral and are snapshotted per connection into the applicable API/auth client and protected stream/artwork pools; connection ownership is minted before async work is queued, so a final service loss clears the route and revokes pending or active ownership even when a manually saved row remains available. Jellyfin's client accepts the same route contract, but its UDP discovery currently supplies only a URL. Automated tests preserve the hostname and HTTP `Host`; they do not perform a real TLS certificate/SNI handshake. This removes an identified resolver dependency but is not yet proof that DNS caused the reported live Windows failures.
+- **Protected DAAP and Subsonic requests now survive reverse-proxy base paths** — DAAP stream and artwork construction previously erased a configured prefix such as `/share`, even though control and catalog requests preserved it; Subsonic preserved the prefix but produced `/share//rest/...` when the configured URL ended in `/`. Both now append beneath the exact existing path after removing only its optional trailing empty segment, preserving already-escaped bytes without double encoding. Protected DAAP stream and artwork requests also retain the same four fixed protocol headers as the control session instead of losing them at the typed media boundary. The app-owned proxy and artwork worker install those request-owned values and authentication separately, and a playback receiver cannot override them or forward anything except `Range`. Deterministic fixtures additionally prove Subsonic's HTTP-200 failed envelopes remain typed errors and an explicitly selected upstream proxy receives the exact protected request.
 - **Protected DAAP and Subsonic playback could repeatedly fail after exactly 15 seconds** — Both backends converge on the same loopback proxy before local GStreamer playback; each protected load previously built a fresh upstream HTTP client, waited without distinct startup/body-idle deadlines, and could be abandoned by `souphttpsrc` at its 15-second default with only “Audio pipeline error.” Each GStreamer output now reuses credential-free default and immutable route-keyed upstream connection pools across track tickets. Connect establishment is bounded at 5 seconds, dispatch through response headers at 10 seconds, and silence between body chunks at 10 seconds, while an active stream has no total lifetime; the downstream loopback source uses a 30-second budget so the app-owned proxy returns a deterministic empty 502/504 first. Exact-origin redirects, Range-only forwarding, ticket revocation, and credential isolation are unchanged. Proxy failures now include only closed phase/category, numeric HTTP status when applicable, and bounded elapsed time; GStreamer reports only a closed domain, numeric code, protected flag, elapsed time, and normalized network/decoder/output/pipeline category, and stops its watch after the first terminal error.
 - **Connection timeouts were mislabeled as authentication failures** — Sidebar, manual-dialog, passwordless DAAP, and environment-configured remote connection flows used authentication wording for every backend failure and retained raw backend/server text in logs and UI. They now classify authentication rejection, connection failure, timeout, invalid response, unsupported authentication method, and other backend failure from the typed `BackendError`, and expose only a fixed category and fixed user message. A transient connect timeout can no longer look like rejected credentials, and a server-supplied string, URL, or local I/O path cannot enter those diagnostics. The new remote and playback failure messages are translated in all 13 supported catalogs, with automated no-fallback and interpolation checks.
 - **Failed preference writes no longer risk truncating `config.json`** — Configuration is serialized before touching the destination, written and synchronized through an exclusively created same-directory temporary file, then atomically installed. A serialization, write, sync, or rename failure preserves the previous file, and correctness-dependent library-folder actions update in-memory UI state only after the new configuration is safely persisted.
@@ -65,29 +605,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Pressing Play on a newly loaded library could abort the application** — Idle Play selected its `StartAt` action through a `RefCell` read embedded directly in a `match` scrutinee. Rust retained that immutable borrow through the selected arm, where queue installation immediately requested a mutable borrow and panicked; on Windows the panic crossed the GTK callback boundary and aborted the process. Request selection now completes behind a function boundary before dispatch, guaranteeing that the read is gone before a fresh queue is installed. The Stop-then-Play regression now exercises the real `RefCell` boundary and verifies that immediate mutable replacement succeeds.
 - **Chromecast commands could race each other** — Load, play, pause, seek, volume, and stop are now serialized through one ordered worker, so a stale load can no longer replace newer media, and a failure can no longer report Error and then Buffering.
 - **A silent Chromecast can no longer pin playback control forever** — Cast control previously used `rust_cast`'s socket-hiding high-level client, so a receiver that accepted a connection but stopped replying could block the sole ordered worker indefinitely; Stop, a replacement Load, and even output shutdown remained queued behind it. Tributary now uses `rust_cast`'s public generic message manager and channel constructors over its own deadline-aware TLS transport, without a fork or new dependency. mDNS discovery carries a deterministic usable numeric IPv4 socket address into playback instead of doing a later unbounded `.local` lookup. TCP connect is bounded to 5 seconds; every high-level TLS/Cast operation has one absolute 8-second budget across every write and read plus a 2-second idle-I/O cap, so trickled bytes cannot renew the deadline. The `Rc` session remains entirely on its dedicated worker. Transport, TLS, framing, decoding, and deadline failures discard the desynchronized session immediately—including when superseded—while complete semantic rejections retain only enough synchronization for bounded best-effort cleanup, and all receiver-controlled text remains out of diagnostics. Real silent-peer regressions prove Stop, replacement Load, and Shutdown make bounded progress.
-- **MPD playback could race commands and report guessed state** — MPD output now owns one ordered worker and persistent connection per load, tracks the exact `addid`/`playid` song identity, and publishes state, position, duration, and completion from authoritative receiver status; command and transport failures become opaque errors. Pause resumes the same song, an explicit remote Stop remains restartable, and natural queue exhaustion emits end-of-track. New loads no longer clear the shared queue, queue removal targets only Tributary's stable song ID, and controls revalidate the current ID before acting; when polling observes another client's replacement, Tributary relinquishes ownership without clearing that client's queue. Each owned load disables MPD's global `repeat`, `random`, `single`, and `consume` modes so Tributary can identify queue exhaustion itself. Protocol input, resolved-address counts, media-URI sizes, idle I/O, and post-resolution operations are bounded; desynchronized connections are discarded instead of reused. Standard-library DNS lookup, the unbounded nonblocking worker ingress, load-time global option side effects, and the unavoidable shared-partition race between status revalidation and MPD's global pause or stop commands remain tracked follow-ups.
+- **MPD playback could race commands and report guessed state** — MPD output now owns one ordered worker and persistent connection per load, tracks the exact `addid`/`playid` song identity, and publishes state, position, duration, and completion from authoritative receiver status; command and transport failures become opaque errors. Pause resumes the same song, an explicit remote Stop remains restartable, and natural queue exhaustion emits end-of-track. New loads no longer clear the shared queue, queue removal targets only Tributary's stable song ID, and controls revalidate the current ID before acting; when polling observes another client's replacement, Tributary relinquishes ownership without clearing that client's queue. Each owned load disables MPD's global `repeat`, `random`, `single`, and `consume` modes so Tributary can identify queue exhaustion itself. Name resolution, protocol input, resolved-address counts, media-URI sizes, idle I/O, post-resolution operations, and worker ingress are bounded; desynchronized connections are discarded instead of reused. Load-time global option side effects and the unavoidable shared-partition race between status revalidation and MPD's global pause or stop commands remain tracked follow-ups.
 - **MPD cleanup no longer mistakes every ACK for a missing song** — A complete ACK previously retained no code, and targeted cleanup treated every synchronized rejection—including permission and bad-argument failures—as though the queue ID were already absent. Tributary now validates the single-command index and echoed command, parses the protocol's numeric ACK category into a closed redacted type, and recognizes only code 50 (`NoExist`) as absence evidence; permission, argument, password, system, valid-but-unknown, and all other correlated rejections remain real failures without retaining daemon-controlled text, while malformed or mismatched ACK-like input poisons the connection. Stopped/no-current after an owned item was observed active produces end-of-track only when targeted `deleteid` succeeds, proving the queued ID still existed and was atomically removed. MPD cannot distinguish natural exhaustion from an external Next past the final item, so both intentionally share that completion result. A `NoExist` response proves only that the ID was already absent and is reported as ownership loss without a false completion event. If a foreign-song status response becomes stale while a replacement Load is queued, the old session is now discarded before replacement cleanup can target the deliberately retained ID.
+- **MPD command bursts no longer grow an unbounded worker queue** — Commands now enter a capacity-64 epoch-aware deque signaled by a capacity-one wake token, so the GTK-facing path uses only a short-held in-memory lock and never waits for MPD I/O or channel capacity. FIFO is exact below the cap. A newer Load, Stop, or Shutdown epoch atomically purges obsolete backlog and rejects late stale commands. Only a saturated same-epoch transient burst is reduced: consecutive seeks and playback transformations are folded without crossing non-transient command boundaries, then the oldest remaining transient is evicted if necessary so the newest intent survives. Stale wake tokens retain one absolute receive deadline instead of postponing status polling, and receiver loss clears pending work. Queue insertion now retains the same short-held mutex through nonblocking wake publication, so a worker cannot consume terminal Shutdown and drop the wake receiver between those two steps, making an accepted command spuriously report `Disconnected`. A real TCP regression withholds Pause's ACK while later Seek and Play commands enqueue, proves they are not pipelined, then verifies exact ordered execution after release; all terminal/ownership-loss variants also pass in both profiles.
+- **MPD name resolution can no longer pin the ordered worker** — Blocking `ToSocketAddrs` lookup has been replaced by one process-lifetime resolver thread that owns a private GLib main context and every asynchronous GIO enumerator, callback, and callback-owned resource. Requests use a capacity-64 nonblocking channel and accept at most a 1-KiB host; empty, NUL-bearing, oversized, or overloaded work fails closed without retaining resolver text. Each context tick admits at most 16 requests, no more than eight GIO operations may remain active, and callbacks are dispatched between intake batches so queued work cannot starve completions. Numeric IPv4 and raw or bracketed IPv6 bypass DNS after deadline and lifecycle validation. Enumerated results preserve resolver order and IPv6 flowinfo/scope while deduplicating to a 32-address cap. The load or probe's one absolute budget now spans resolution, connection attempts, and greeting; deadline expiry, a newer Load/Stop/Shutdown epoch, or result-channel loss cancels GIO, and late callback sends and resource drops remain safely confined to the resolver thread. Nine net-new resolver regressions plus an expanded raw/bracketed IPv6 case cover validation, bounds, overload recovery, cancellation, callback progress and ownership, and address fidelity. Two additional real-socket regressions use channel synchronization without sleeps or fragile elapsed bounds: an accepted first peer that never greets proves a later address retains its fair share of the absolute deadline, and a real `::1` listener proves numeric IPv6 resolution, connection, greeting, and client/peer address families whenever the host supports the initial IPv6 bind.
 - **Sidebar buttons acted on the wrong row** — Action handlers were reconnected on every list-item rebind, so one click could fire several actions, or act on a recycled row's previous source.
 - **Smart playlists could not match a specific date** — A track's timestamp was compared against a rule's date as raw text, and a timestamp is never text-equal to a bare date, so a "Date Added **is** \<date\>" rule matched nothing at all. "Is after \<date\>" had the mirror-image bug and included the boundary day itself, which also skewed every "in the last N days" rule.
 - **Smart-playlist limits could discard the requested final order** — The compound display sort ran before the limit's independent “selected by” order. The limit still chose the correct subset, but its internal selection sort ran last and replaced the requested presentation—for example, “top 25 most played, displayed by artist” stayed in play-count order. Rules now filter candidates first, the limit order selects and truncates the intended subset, and the compound sort orders only that retained subset. Item, duration, random-subset, multi-key, legacy-JSON, and end-to-end dynamic reevaluation tests cover the combined contract.
 - **Properties now checks effective tag-write capability before enabling edits** — The dialog previously treated a supported filename extension as proof of writability, so Flatpak's read-only automatic Devices roots and ordinary permission failures surfaced only after Save. It now starts fail-closed, validates every exact selected path as a supported, readable, non-symlink regular file on a worker, independently proves every Windows file's installed DACL permits the later read/write/delete access, and rehearses exclusive creation, flush, replacement, and explicit cleanup with empty writer-owned siblings once per distinct containing directory, stopping at the first failed target or directory instead of performing needless later probes. A visible localized status enables the fields, MusicBrainz fill, and Save only after the complete selection passes; automatic-device failures explain the Flatpak custom-library route. Malformed or mixed local/remote selections can no longer silently edit only their valid subset, duplicate playlist rows are exact-deduplicated, and Save repeats the whole preflight before the first file write, so a member already read-only or unavailable at that check prevents any write. Save temporarily owns the dialog—Cancel and header close are disabled—and invalidates any in-flight MusicBrainz completion, including delayed label resets from an earlier lookup, until the write result restores a coherent state. Unix writer siblings start at mode `0600`, preventing a full source copy from being briefly exposed through a permissive umask before final permissions are applied. On Windows the source DACL is installed through an exclusive no-sharing handle before any audio byte is copied, preventing a permissive parent-directory ACL from creating the same exposure window. The real atomic writer still handles every operation as fallible because the check cannot eliminate unplug, permission, space, sharing, cleanup, or target-specific races.
 - **Editing tags could silently discard changes, fail on valid audio, leave temporary files behind, or replace the wrong library identity** — Typing a non-number into Year, Track #, or Disc # rewrote the file, dropped that field, and reported success; invalid numeric edits are now rejected before the original is opened. Album-artist edits, which previously triggered a rewrite but were never applied, are now written too. Each save copies the original to an exclusively created randomized sibling, preserves its Unix mode on a best-effort basis or its snapshotted Windows DACL before copying content, `fsync`s the tagged copy, atomically replaces the original, and uses an RAII guard that attempts cleanup on every failure path, so concurrent saves cannot collide at a predictable temp name and failed renames take the same cleanup path. Cleanup I/O and process termination remain inherently fallible; any residual exact writer-owned name is excluded from scans and watcher admission. The initial randomized name ended in `.tmp`, which prevented Lofty from determining the copied audio format; the first extension-preserving correction then retained the complete source basename, which could exceed a filesystem component limit for an otherwise valid long name. The final bounded spelling is `.tributary-tag-<canonical UUID>.<case-normalized format extension>`. An audio-looking copy can also live beyond the watcher debounce while a large or remote file is being tagged; if indexed, its final rename could displace the original track row and lose stable identity, history, and playlist links. Full scans now reject only that exact writer-owned filename shape, standalone watcher events for it are ignored, and every supported temp-to-original rename form becomes a metadata upsert at the public path rather than an identity transfer. A committed generated-silence FLAC regression exercises the public write path and verifies all ten declared fields round-trip while the audio remains readable and no temporary sibling remains.
-- **Browsing a USB device could index files that were not on it** — The device scan followed symbolic links, so a stick containing a link like `music -> /home/you` caused Tributary to walk that directory and list its contents as being on the device. Device scans no longer leave the device.
-- **Removable media now follows the live native mount lifecycle without blocking discovery** — The one-shot platform-directory and drive-letter heuristics have been replaced by GIO's native `VolumeMonitor`. The monitor and every GIO object stay on GTK's main thread, where Tributary reads cached metadata only—discovery performs no path canonicalization, metadata probe, or filesystem traversal. Shadowed roots and roots without native-path access are excluded, as are mounts the backend explicitly classifies as network or loop; removable, ejectable, device-class, or otherwise user-unmountable native-path mounts are retained. Mount UUID, volume UUID, Unix device identifier, then root URI supply the best available logical key kept separately from the current native `PathBuf`, and aliases with the same key deterministically retain the lexically first path. Mount-added, changed, pre-unmount, and removed notifications reconcile rows for the window's lifetime. Confirmed removal synchronously retires the exact tracked path before the coalesced snapshot, so a rapid same-key/path reattach cannot inherit its scan, cache, or playback; pre-unmount performs that retirement but retains the row until removal is confirmed because the operation can fail. An active source falls back to Local, and an immediate same-identity reappearance is reselected only while that exact automatic fallback remains current. Renames replace the row atomically at the same position, the Devices header tracks an empty/non-empty inventory, and window teardown invalidates device scan generations before disconnecting every global signal handler. The bounded scan consumer also selects directly on its receive future, avoiding one heap allocation per discovered track while retaining the 50 ms cancellation poll.
-- **Removable-device scans are bounded and cooperatively cancellable** — Selecting an uncached device immediately clears the previous source projection, then starts one named `usb-scan` thread and lazily streams parsed tracks through a capacity-64 channel instead of retaining an unbounded cross-thread result. GTK rechecks the exact source generation at 50 ms intervals and after each received row. Same-device re-selection, relocation, or unplug invalidates the old generation and closes its receiver, which wakes a blocked producer and prevents a stale scan from filling the cache or rendering. Navigating to another source deliberately lets the newest generation finish as a cache-only result. The walker does not follow directory or file symlinks, so a link cannot escape the selected volume; GTK objects are still constructed only on the main thread.
-- **Slow source work could replace newer navigation or stale playlists** — Playlist and smart-playlist loads, USB scans, radio searches and consent, local-library debounces, and pending remote connections now carry an exact source key plus navigation generation. A completion may update the cache only when it is the newest request for that source, and may render only when it is the exact current request, so switching away or re-selecting the same source cannot let older work render last. The newest result for an inactive source is still cached for a fast return. Pending remote authentication remains the current navigation intent while the prior source is visible; that visible source keeps its own exact projection generation so browser and status updates continue during authentication, while older away-and-back callbacks remain rejected. Background publication and playlist/sidebar refreshes cannot unexpectedly select another source, and a rejected second connection restores the pending server's selection. After a committed library mutation and playlist reconciliation, Tributary invalidates outstanding playlist generations and cached projections, then reloads the active playlist only if it still owns navigation, preventing reminted, relinked, or orphaned track IDs from leaving stale actionable rows. Transient playlist database failures preserve the last valid cache and display instead of replacing them with an empty result.
+- **Browsing a USB device could index files that were not on it** — The old device scan followed
+  symbolic links, so a stick containing `music -> /home/you` could list the home directory as part
+  of the device. The registry-owned walker now retains exact mounted-root, ancestor, and final-file
+  authority; it follows neither directory nor file links, rejects a descendant on another
+  filesystem, and parses only through the exact opened file. At-use resolution repeats those
+  boundary checks and rejects any relative ID absent from the accepted catalogue.
+- **Removable media now follows the live native mount lifecycle without blocking discovery** — The
+  one-shot platform-directory and drive-letter heuristics have been replaced by GIO's native
+  `VolumeMonitor`. The monitor and every GIO object stay on GTK's main thread, where Tributary reads
+  cached metadata only—discovery performs no path canonicalization, metadata probe, or filesystem
+  traversal. Shadowed roots and roots without native-path access are excluded, as are mounts the
+  backend explicitly classifies as network or loop; removable, ejectable, device-class, or
+  otherwise user-unmountable native-path mounts are retained. Mount UUID, volume UUID, Unix device
+  identifier, then root URI supply the best available logical key kept separately from the current
+  native `PathBuf`, and aliases with the same key deterministically retain the lexically first path.
+  Mount-added, changed, pre-unmount, and removed notifications reconcile keyed provenance claims for
+  the window's lifetime. Pre-unmount and relocation disconnect the exact registry source before UI
+  and playback invalidation; confirmed removal then releases the claim, while a failed unmount can
+  reconnect from the fresh inventory only under a new epoch. An active source falls back to Local,
+  and an immediate same-identity reappearance is reselected only while that exact automatic
+  fallback remains current. Renames replace the row atomically at the same position, the Devices
+  header tracks an empty/non-empty inventory, and window teardown disconnects every source before
+  removing its global signal handlers.
+- **Removable-device scans are lifecycle-owned and cooperatively cancellable** — Mount arrival asks
+  `SourceRegistry` to construct the device adapter on Tokio's blocking runtime; selecting its row
+  only displays the latest accepted catalogue or an empty projection while construction continues.
+  The exact connect generation owns cancellation through deterministic traversal and bounded tag
+  parsing; a stale, disconnected, replaced, or shutdown result cannot publish a catalogue. An
+  accepted snapshot is pathless and exact-epoch-bound. Registry tests deliberately queue a scan
+  behind a blocked worker, then prove disconnect cancels it without publishing a failure and
+  shutdown joins it before rejecting later construction. Cancellation cannot interrupt the single
+  filesystem or parser call currently executing, but it is rechecked throughout traversal and at
+  lifecycle publication; GTK performs no scan polling or per-track filesystem work.
+- **Slow source work could replace newer navigation or stale playlists** — Playlist and
+  smart-playlist loads, radio searches and consent, local-library debounces, and pending remote
+  connections carry exact source/view plus navigation generations. Removable construction and
+  scanning now use the stronger registry contract: the exact connect generation, source epoch,
+  media lease, and accepted catalogue must all remain current before publication or resolution. A
+  completion may update a cache only when it is newest for that owner and may render only for the
+  exact current navigation, so switching away or reselecting cannot let older work render last.
+  The newest accepted result for an inactive source may still remain cached for a fast return.
+  Pending remote authentication remains the current navigation intent while the prior source is
+  visible; that visible source keeps its own exact projection generation so browser and status
+  updates continue during authentication, while older away-and-back callbacks remain rejected.
+  Background publication and playlist/sidebar refreshes cannot unexpectedly select another source,
+  and a rejected second connection restores the pending server's selection. After a committed
+  library mutation and playlist reconciliation, Tributary invalidates outstanding playlist
+  generations and cached projections, then reloads the active playlist only if it still owns
+  navigation, preventing reminted, relinked, or orphaned track IDs from leaving stale actionable
+  rows. Transient playlist database failures preserve the last valid cache and display instead of
+  replacing them with an empty result.
 - **Plex tracks without media parts no longer appear playable** — The playback-time resolver initially issued every cached Plex track an opaque playback reference even when Plex supplied no `Media`/`Part.key`, turning a previously disabled row into an asynchronous resolution failure. Tributary now omits tracks with no non-empty media part from the playable catalogue, searches every returned media/part entry for the first usable locator instead of assuming the first entry is valid, and takes bitrate/format metadata from that same selected media entry.
 
 ### Known limitations
-- **Chromecast control still trusts an upstream peer-advertised frame length** — `rust_cast 0.21` reads the unsigned 32-bit Cast frame length and allocates for that payload before reading or bounding it. The new deadlines prevent a silent or byte-trickling receiver from hanging the worker, but a malicious or broken receiver can still provoke an allocation attempt approaching 4 GiB. A pre-allocation frame cap requires an upstream change or narrowly audited framing layer and remains tracked under the adversarial Chromecast integration work. Chromecast publication is also currently IPv4-only because Tributary's receiver-facing media-ticket listener is IPv4-only; an IPv6-only control endpoint would connect but could not fetch the advertised media and is therefore omitted.
-- **MPD still has unbounded work before and ahead of its bounded socket operations** — Standard-library `ToSocketAddrs` resolution can block before Tributary obtains the bounded address set, and the nonblocking command ingress feeding the ordered worker has no capacity limit or coalescing policy. The post-resolution connection, protocol, and idle-I/O paths remain bounded, but a stalled resolver or a producer that outruns the worker can still delay progress or grow queued memory. Resolver isolation and bounded/coalesced ingress remain open P2.10 work.
+- **Chromecast publication is currently IPv4-only** — Tributary's receiver-facing media-ticket listener is IPv4-only. An IPv6-only control endpoint would connect but could not fetch the advertised media and is therefore omitted.
 - **A shared MPD queue may retain Tributary's old entry after another client takes over** — Once status reports a foreign current song, Tributary deliberately relinquishes ownership without issuing `deleteid` for its former stable ID. MPD offers no conditional “delete this ID only if it is still not current” operation, so another client could select that entry between status revalidation and deletion; removing it then would disrupt playback Tributary no longer owns. A direct-media entry may remain playable; a protected entry may remain selectable but its revoked opaque ticket will fail. No retained entry contains the backend credential, but it can remain until manually removed. Automatic orphan cleanup requires the still-open detectable exclusive-control mode, which must also address MPD's global pause/stop and load-option side effects.
-- **Native removable-media identity and cancellation have deliberate limits** — GIO does not expose a uniformly reliable physical-USB flag. Tributary's broad `can_unmount` fallback may include a non-removable or natively mounted network filesystem when backend class metadata is absent, while a platform backend can omit a device it cannot classify. UUIDs identify a logical filesystem rather than unique hardware, so a clone may collide; Unix-device and root-URI fallbacks can change with device or path assignment. The app does not automount unmounted volumes, eject devices, or browse pathless/MTP-only media. Scan cancellation closes the bounded channel but cannot interrupt the filesystem or tag-parser operation already executing, and a real nested filesystem below the selected root is still traversed. Cross-platform add/change/pre-unmount/remove behavior has automated policy and reconciliation coverage but has not yet been manually validated with physical hardware. In Flatpak, the inventory can still list an eligible native mount outside `/media`, `/run/media`, and `/mnt`, but the sandbox grants automatic Devices file access only beneath those roots and only read-only; an inaccessible listed root fails its scan. Properties now probes current capability before enabling edits, but that point-in-time rehearsal cannot prove future mount state, full-copy space, target-specific immutable/delete rules, or sharing locks, so the final atomic write can still fail safely. Pathless/MTP-only media remains unavailable, and interactive portal/custom-library behavior still needs a local sandbox smoke test. Legacy direct roots must use **Reauthorize**, not ordinary remove-and-add, to preserve identity; the guarded flow intentionally rejects a confirmed legacy root without a supported durable marker or a markerless destination on which it cannot create one.
+- **Native removable-media identity and cancellation have deliberate limits** — GIO does not expose
+  a uniformly reliable physical-USB flag. Tributary's broad `can_unmount` fallback may include a
+  non-removable or natively mounted network filesystem when backend class metadata is absent, while
+  a platform backend can omit a device it cannot classify. UUIDs identify a logical filesystem
+  rather than unique hardware, so a clone may collide; Unix-device and root-URI fallbacks can change
+  with device or path assignment. The app does not automount unmounted volumes, eject devices, or
+  browse pathless/MTP-only media. Adapter cancellation cannot interrupt the one filesystem or
+  tag-parser call already executing, although it is checked during traversal and before lifecycle
+  publication; nested filesystems are now rejected rather than traversed. Cross-platform
+  add/change/pre-unmount/failed-unmount/reconnect/remove behavior has deterministic policy,
+  authority, registry, and UI coverage but has not yet been manually validated with physical
+  hardware. In Flatpak, inventory can still list an eligible native mount outside `/media`,
+  `/run/media`, and `/mnt`, but the sandbox grants automatic Devices file access only beneath those
+  roots and only read-only; an inaccessible listed root fails construction. Because removable rows
+  no longer retain a host path, Properties is deliberately unavailable until a typed mutation
+  authority exists. Pathless/MTP-only media remains unavailable, and interactive
+  portal/custom-library behavior still needs a local installed-sandbox smoke test. Legacy direct
+  roots must use **Reauthorize**, not ordinary remove-and-add, to preserve identity; the guarded flow
+  intentionally rejects a confirmed legacy root without a supported durable marker or a markerless
+  destination on which it cannot create one.
 - **A markerless read-only library root cannot be enrolled** — Trust may adopt an existing valid root marker on read-only storage, but it cannot safely create a marker there. Such a root remains unavailable and its remembered metadata remains protected until the marker can be created on the intended storage.
 - **A library-root marker identifies a logical library, not a unique physical device** — A clone that already carries the same valid marker before authority-lease acquisition is treated as the same logical bearer, preserving backup and restore semantics; marker identity is not proof of physical-device uniqueness. Once an eligible root's initial scan or watcher batch acquires its lease, retained root, marker, and descendant evidence reject later substitution. Filesystem changes and a SQLite commit cannot form one atomic transaction, so authorization linearizes at the final retained-handle validation inside the database transaction, after its SQL changes and immediately before commit. Positive object handles remain live through commit; a missing name is instead a point-in-time absence proof bracketed by validation of its retained parent. A filesystem change after that boundary is a subsequent transition for the watcher or reconciliation to process. On Windows, retained authority handles intentionally omit delete sharing: attempts to rename or delete the retained root, marker, or a briefly bound descendant can receive a sharing violation until the scan, watcher batch, or transaction releases the relevant handle. A final probe of slow or hung network storage can keep the SQLite writer transaction open while the blocking worker finishes, although it does not block Tokio's async worker threads. These controls provide consistency against ordinary edits, replacement, remount, and hotplug races; they are not a sandbox against a malicious same-user process with equivalent filesystem or mount privileges.
-- **Remote source lifecycle is not yet unified across every source kind** — Standard remote resolvers and DAAP sessions now have exact generation/lease ownership, but stable source IDs have not replaced URL keys, their registries remain separate, and environment, interactive, and manual connection/refresh/failure paths are still duplicated. Local and playlist rows also still copy a resolved file URI instead of resolving their stable track ID at playback/navigation/receiver-load time, while radio and external files have no shared source lifecycle. These are the remaining P3.1 items; they do not reintroduce backend credentials into generic values.
-- **Credential-bearing media tickets remain replayable within their hard lifetime** — Each opaque output ticket is a bearer for one fixed media item and arbitrary byte ranges until the earlier of source-lease/lifecycle revocation or its absolute 24-hour expiry; it is not a one-shot token. Neither event cancels a response the proxy already admitted. Protected local/AirPlay tickets are reachable only through a dedicated loopback listener; a protected MPD load from an unspecified address, or a scoped/link-local IPv6 route, fails closed rather than exposing the upstream request. Local-file routes are separate session-lifetime capabilities because they front no backend credential.
-- **Packaged end-to-end protected-playback validation remains outstanding** — Retained mDNS routing is implemented, but full fake Subsonic and DAAP streams still need to run through GStreamer, the packaged Windows source plugin must prove the same direct-loopback enforcement or a verified fail-closed alternative, and live packaged-Windows playback remains to be recorded. Until that work is complete, the retained-route change should not be treated as proof that `.local` resolution caused or fixes the reported live failures.
+- **Source lifecycle is unified where a retained session or locator authority exists** — Stable typed source/media
+  identity spans authenticated remotes, local/playlist views, Radio-Browser, removable media, and
+  external files, and complete local and remote track-catalogue publication shares one
+  `MediaBackend` trait-object seam. Subsonic, Jellyfin, Plex, DAAP, Radio-Browser, external files,
+  and removable mounts now share one
+  production `SourceRegistry` for connection/catalogue/view generations, session epochs, cancellation,
+  sanitized failures, provenance, media revocation, disconnect, and shutdown. GTK renders its
+  atomic baseline rather than owning a sibling registry or rebuilding state from row flags.
+  Saved and Discovery claims remain independent, so removing Saved demotes a still-discovered row;
+  discovery loss still revokes route-bound work while another claim may keep the logical row
+  visible. Local/playlist playback resolves exact stable IDs into retained root/file authority at
+  use, and local/playlist embedded art now clones that same authority only after output acceptance
+  and retains its exact handle through parsing. Radio queues are pathless and resolve the exact
+  current accepted-view locator at use. External-file queues are likewise pathless and resolve a
+  registry-owned retained open-file capability at use; post-accept embedded art clones that same
+  authority, and replacement/terminal transitions retire it explicitly. Removable queues are also
+  pathless: their registry adapter resolves accepted lossless relative IDs under exact mounted-root,
+  file, epoch, and lease authority for playback and embedded art. Hotplug transitions disconnect
+  before UI/playback invalidation. Always-present Local remains a deliberately specialized engine,
+  and playlist/radio browsing remains view state rather than a separate connection; these are
+  intentional source shapes rather than a second locator/session owner. Typed tag-mutation
+  authority for pathless removable rows remains a future capability, so their Properties action is
+  omitted instead of crossing the lifecycle boundary with a path.
+- **Credential-bearing media tickets remain replayable within their hard lifetime** — Each opaque output ticket is a bearer for one fixed media item and arbitrary byte ranges until the earlier of source-lease/lifecycle revocation or its absolute 24-hour expiry; it is not a one-shot token. Neither event cancels a response the proxy already admitted. Protected local/AirPlay tickets are reachable only through a dedicated loopback listener; a protected MPD load from an unspecified address, or a scoped/link-local IPv6 route, fails closed rather than exposing the upstream request. Playback-time local-authority tickets follow their owning load lifecycle; only legacy explicit-file routes retain the older server-lifetime capability contract.
+- **Live packaged-Windows protected-playback validation remains outstanding** — Fake DAAP and Subsonic streams traverse the complete production protected-player path through real GStreamer, and native x86_64 and ARM64 package jobs both prove their finished distribution supplies the selected HTTP source, scanner, decoder, required DLL closure, direct-loopback policy, alternate-source fail-closed path, and real FLAC decode to end-of-stream without borrowing the build host's runtime. That deterministic probe cannot establish compatibility with the reported live DAAP/Subsonic servers, `.local`/mDNS routing, TLS, physical audio output, firewall or endpoint-security policy, or the user's legitimate upstream proxy. Audible live playback from the packaged application remains to be recorded, and no automated result proves that DNS caused the original failures.
+  The exact affected Windows host previously reached the copied Soup plugin and then rejected its
+  singleton PE-inspection target as non-absolute or nonexistent. PR #124's explicit argument
+  binding passed both native CI package jobs but did not change that host result, disproving the
+  positional-binding hypothesis. PR #127 now uses explicit `List[string]` values at
+  every singleton/round/batch boundary and emits predicate-specific, bounded single-line target
+  diagnostics while preserving nonexecuting inspection and every resource limit. Native x86_64
+  and ARM64 package CI, including Desktop PowerShell 5.1 execution, passed in run `29648906031`.
+  The exact affected-host rerun remains pending and must precede the audible playback check.
 
 ---
 
@@ -390,6 +1027,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
+[Unreleased]: https://github.com/jm2/tributary/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/jm2/tributary/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/jm2/tributary/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/jm2/tributary/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/jm2/tributary/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/jm2/tributary/compare/v0.3.0...v0.3.1

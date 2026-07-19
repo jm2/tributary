@@ -7,15 +7,17 @@
 //! - [`format_ms`] — format milliseconds as `m:ss` or `h:mm:ss`
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
 use tracing::warn;
 
+use crate::architecture::{MediaKey, SourceId, TrackId, ViewOrigin};
 use crate::audio::output::AudioOutput;
-use crate::audio::PlayerEventGeneration;
+use crate::audio::{PlayerEvent, PlayerEventGeneration, PlayerState};
+use crate::local::playback_history::PlaybackHistoryProgress;
 use crate::ui::header_bar::RepeatMode;
 use crate::ui::objects::TrackObject;
 
@@ -28,14 +30,91 @@ pub const LOCAL_SOURCE_KEY: &str = "local";
 /// the local library, so their queue items carry library track IDs too.
 pub const PLAYLIST_SOURCE_PREFIX: &str = "playlist:";
 
+/// Previous restarts the current item only after this position. At exactly
+/// three seconds it still walks the queue or retained shuffle history.
+const PREVIOUS_RESTART_THRESHOLD_MS: u64 = 3_000;
+
 /// Whether a queue source is backed by the local library database, and its
 /// track IDs are therefore library track IDs.
 ///
-/// Remote backends key tracks by their own native IDs, and external files and
-/// USB items fall back to their URI as an ID ([`TrackObject::track_id`]). A
+/// Remote backends key tracks by their own native IDs, removable tracks use a
+/// lossless mount-relative ID, and external sessions mint ephemeral IDs. A
 /// library update must never reinterpret one of those as one of its own.
-fn is_library_source(source_id: &str) -> bool {
-    source_id == LOCAL_SOURCE_KEY || source_id.starts_with(PLAYLIST_SOURCE_PREFIX)
+fn is_library_source(source_id: SourceId) -> bool {
+    source_id == SourceId::local()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueueView {
+    source_id: SourceId,
+    origin: Option<ViewOrigin>,
+}
+
+fn queue_view(source_key: &str) -> Option<QueueView> {
+    if source_key == LOCAL_SOURCE_KEY {
+        return Some(QueueView {
+            source_id: SourceId::local(),
+            origin: None,
+        });
+    }
+    if let Some(playlist_id) = source_key.strip_prefix(PLAYLIST_SOURCE_PREFIX) {
+        return Some(QueueView {
+            source_id: SourceId::local(),
+            origin: Some(ViewOrigin::playlist(playlist_id).ok()?),
+        });
+    }
+    if source_key.starts_with("radio-") {
+        return Some(QueueView {
+            source_id: SourceId::radio_browser(),
+            origin: Some(super::radio::radio_view_origin(source_key)?),
+        });
+    }
+    if let Ok(source_id) = source_key.parse::<SourceId>() {
+        return Some(QueueView {
+            source_id,
+            origin: None,
+        });
+    }
+    Some(QueueView {
+        source_id: SourceId::removable(source_key).ok()?,
+        origin: None,
+    })
+}
+
+fn identity_belongs_to_source(identity: &PlaybackIdentity, source_key: &str) -> bool {
+    if source_key == LOCAL_SOURCE_KEY {
+        return identity.media_key.source_id == SourceId::local();
+    }
+    if let Some(playlist_id) = source_key.strip_prefix(PLAYLIST_SOURCE_PREFIX) {
+        return identity.view_origin == Some(ViewOrigin::Playlist(playlist_id.to_string()));
+    }
+    if super::radio::is_radio_backend(source_key) {
+        return super::radio::radio_view_origin(source_key).as_ref()
+            == identity.view_origin.as_ref();
+    }
+    identity.view_origin.is_none()
+        && queue_view(source_key).is_some_and(|view| view.source_id == identity.media_key.source_id)
+}
+
+/// Whether `source_key` names the media-source session that owns this item.
+///
+/// Playlist and radio-feed keys are view origins, not source owners. They are
+/// intentionally accepted by `identity_belongs_to_source` for GTK visibility,
+/// but retiring one view must not revoke media owned by the local library or
+/// shared Radio-Browser source.
+fn identity_is_owned_by_source(identity: &PlaybackIdentity, source_key: &str) -> bool {
+    let source_id = if source_key == LOCAL_SOURCE_KEY {
+        Some(SourceId::local())
+    } else if source_key.starts_with(PLAYLIST_SOURCE_PREFIX)
+        || super::radio::is_radio_backend(source_key)
+    {
+        None
+    } else if let Ok(source_id) = source_key.parse::<SourceId>() {
+        Some(source_id)
+    } else {
+        SourceId::removable(source_key).ok()
+    };
+    source_id == Some(identity.media_key.source_id)
 }
 
 /// Overlay committed local-library URIs onto an existing playlist projection.
@@ -79,11 +158,20 @@ pub(super) fn refresh_projected_library_uris(
     refreshed
 }
 
-/// Stable identity of a track inside the source that supplied its queue.
+/// Stable media identity plus the view that supplied this queue occurrence.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PlaybackIdentity {
-    pub source_id: String,
-    pub track_id: String,
+    pub media_key: MediaKey,
+    pub view_origin: Option<ViewOrigin>,
+}
+
+impl PlaybackIdentity {
+    fn new(view: &QueueView, track_id: TrackId) -> Self {
+        Self {
+            media_key: MediaKey::new(view.source_id, track_id),
+            view_origin: view.origin.clone(),
+        }
+    }
 }
 
 /// A committed library change, addressed to the queue by stable track ID.
@@ -93,7 +181,6 @@ pub struct PlaybackIdentity {
 /// history it captured.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueueTrackRefresh {
-    pub uri: String,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -103,7 +190,6 @@ pub struct QueueTrackRefresh {
 impl QueueTrackRefresh {
     pub fn from_track(track: &TrackObject) -> Self {
         Self {
-            uri: track.uri(),
             title: track.title(),
             artist: track.artist(),
             album: track.album(),
@@ -128,6 +214,17 @@ pub struct QueueItem {
     /// playlist entries while that source model is alive; `occurrence` remains
     /// a fallback if the view is rebuilt with fresh row objects.
     row_instance_id: Option<u64>,
+    /// Exact source session epoch that published this row.
+    /// Stable media identity remains `(SourceId, TrackId)`; the epoch prevents
+    /// a captured queue from being retargeted to a replacement login.
+    source_session_epoch: Option<u64>,
+    /// This exact queue item owns a hidden ephemeral external-file source.
+    /// Random SourceIds are also valid persisted remote identities, so source
+    /// shape alone cannot safely recover this lifecycle distinction later.
+    external_session: bool,
+    /// Positive metadata duration captured with this queue occurrence.
+    /// Zero remains unknown so an output may supply its first real duration.
+    duration_ms: Option<u64>,
     uri: String,
     title: String,
     artist: String,
@@ -136,15 +233,27 @@ pub struct QueueItem {
 }
 
 impl QueueItem {
-    fn from_track(source_id: &str, track: &TrackObject, occurrence: usize) -> Self {
+    fn from_track(identity: PlaybackIdentity, track: &TrackObject, occurrence: usize) -> Self {
+        let is_library = is_library_source(identity.media_key.source_id);
+        let duration_ms = match track.duration_secs() {
+            0 => None,
+            duration_secs => Some(duration_secs.saturating_mul(1_000)),
+        };
         Self {
-            identity: PlaybackIdentity {
-                source_id: source_id.to_string(),
-                track_id: track.track_id(),
-            },
+            identity,
             occurrence,
             row_instance_id: Some(track.row_instance_id()),
-            uri: track.uri(),
+            source_session_epoch: track.source_session_epoch(),
+            external_session: false,
+            duration_ms,
+            // Local, playlist, and lifecycle-owned queues retain identity,
+            // ordering, and metadata but never a locator. Every output load
+            // resolves the exact source/track/epoch at the point of use.
+            uri: if is_library || track.source_session_epoch().is_some() {
+                String::new()
+            } else {
+                track.uri()
+            },
             title: track.title(),
             artist: track.artist(),
             album: track.album(),
@@ -152,14 +261,46 @@ impl QueueItem {
         }
     }
 
-    pub(crate) fn external(uri: String, title: String, artist: String, album: String) -> Self {
+    pub(crate) fn external(session: &crate::source_registry::ExternalFileSession) -> Self {
+        let track = session.track();
         Self {
             identity: PlaybackIdentity {
-                source_id: "external".to_string(),
-                track_id: uri.clone(),
+                media_key: MediaKey::new(session.source_id(), session.track_id().clone()),
+                view_origin: None,
             },
             occurrence: 0,
             row_instance_id: None,
+            source_session_epoch: Some(session.session_epoch()),
+            external_session: true,
+            duration_ms: track
+                .duration_secs
+                .filter(|duration_secs| *duration_secs > 0)
+                .map(|duration_secs| duration_secs.saturating_mul(1_000)),
+            uri: String::new(),
+            title: track.title.clone(),
+            artist: track.artist_name.clone(),
+            album: track.album_title.clone(),
+            cover_art_url: String::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_for_test(
+        uri: String,
+        title: String,
+        artist: String,
+        album: String,
+    ) -> Self {
+        Self {
+            identity: PlaybackIdentity {
+                media_key: MediaKey::new(SourceId::random(), TrackId::external()),
+                view_origin: None,
+            },
+            occurrence: 0,
+            row_instance_id: None,
+            source_session_epoch: None,
+            external_session: false,
+            duration_ms: None,
             uri,
             title,
             artist,
@@ -168,17 +309,120 @@ impl QueueItem {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn external_for_test(source_id: SourceId, session_epoch: u64) -> Self {
+        Self {
+            identity: PlaybackIdentity {
+                media_key: MediaKey::new(source_id, TrackId::external()),
+                view_origin: None,
+            },
+            occurrence: 0,
+            row_instance_id: None,
+            source_session_epoch: Some(session_epoch),
+            external_session: true,
+            duration_ms: None,
+            uri: String::new(),
+            title: "External".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            cover_art_url: String::new(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn uri(&self) -> &str {
         &self.uri
     }
+
+    #[cfg(test)]
+    pub(crate) const fn source_session_epoch(&self) -> Option<u64> {
+        self.source_session_epoch
+    }
 }
 
-#[derive(Clone, Debug)]
+/// History state owned by one genuine playback occurrence.
+///
+/// Output generations are deliberately only delivery proofs. A retry can
+/// replace `accepted_generation` while retaining `progress`; queue navigation
+/// and repeat-one instead install a brand-new value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlaybackHistoryOccurrence {
+    track_id: TrackId,
+    progress: PlaybackHistoryProgress,
+    accepted_generation: Option<PlayerEventGeneration>,
+    playing: bool,
+    needs_reanchor: bool,
+    /// Initial accepted loads, retries, and Buffering may lack a clean
+    /// Playing transition, so their first position is authoritative playback
+    /// proof. Explicit Paused/Stopped states revoke that permission: remote
+    /// status polls may keep advancing even though no audio is playing.
+    position_may_prove_playing: bool,
+}
+
+impl PlaybackHistoryOccurrence {
+    fn from_item(item: &QueueItem) -> Option<Self> {
+        is_library_source(item.identity.media_key.source_id).then(|| Self {
+            track_id: item.identity.media_key.track_id.clone(),
+            progress: PlaybackHistoryProgress::new(item.duration_ms),
+            accepted_generation: None,
+            playing: false,
+            needs_reanchor: true,
+            position_may_prove_playing: false,
+        })
+    }
+
+    fn retire_delivery(&mut self) {
+        self.accepted_generation = None;
+        self.playing = false;
+        self.needs_reanchor = true;
+        self.position_may_prove_playing = false;
+    }
+}
+
+/// Maximum number of real queue occurrences retained before the current one.
+const SHUFFLE_PRIOR_LIMIT: usize = 10;
+const SHUFFLE_TIMELINE_CAPACITY: usize = SHUFFLE_PRIOR_LIMIT + 1;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ShuffleState {
-    /// Items visited in this shuffle cycle, ending with the current item.
-    history: Vec<usize>,
-    /// Items not yet visited in this cycle.
+    /// Bounded chronological playback timeline. `cursor` identifies the
+    /// current occurrence; entries after it are fixed forward history created
+    /// by Previous and must be replayed before another random draw.
+    history: VecDeque<usize>,
+    cursor: usize,
+    /// Queue occurrences not yet drawn from the active shuffle cycle.
     remaining: Vec<usize>,
+}
+
+impl ShuffleState {
+    fn current(&self) -> Option<usize> {
+        self.history.get(self.cursor).copied()
+    }
+
+    fn step_forward(&mut self) -> Option<usize> {
+        let next = self.cursor.checked_add(1)?;
+        let selected = self.history.get(next).copied()?;
+        self.cursor = next;
+        Some(selected)
+    }
+
+    fn step_back(&mut self) -> Option<usize> {
+        self.cursor = self.cursor.checked_sub(1)?;
+        self.current()
+    }
+
+    fn record_selection(&mut self, selected: usize) {
+        debug_assert_eq!(self.cursor.checked_add(1), Some(self.history.len()));
+        self.history.push_back(selected);
+        if self.history.len() > SHUFFLE_TIMELINE_CAPACITY {
+            let removed = self.history.pop_front();
+            debug_assert!(removed.is_some());
+        }
+        // A recorded selection is always the timeline frontier. Deriving the
+        // cursor from the retained deque avoids arithmetic underflow while
+        // restoring that invariant even if a caller arrived with stale state.
+        self.cursor = self.history.len() - 1;
+    }
 }
 
 /// Playback-owned queue and cursor.
@@ -187,9 +431,11 @@ struct ShuffleState {
 /// external file), reaches the unrepeated end, stops playback, or changes the
 /// output target. Sorting, filtering, and sidebar navigation never mutate it.
 /// Sequential Next/Previous follow snapshot order; repeat-all wraps that
-/// snapshot. Shuffle visits every snapshot item once per cycle, Previous walks
-/// shuffle history, and repeat-all starts a new shuffled cycle. Repeat-one is
-/// an EOS policy implemented by [`replay_current`], so manual Next still moves.
+/// snapshot. Shuffle visits every snapshot occurrence once per cycle, retains
+/// the current occurrence plus ten real predecessors, and replays fixed
+/// forward history after Previous before drawing again. Reaching the retained
+/// boundary never invents a predecessor. Repeat-one is an EOS policy
+/// implemented by [`replay_current`], so manual Next still moves.
 #[derive(Clone, Debug, Default)]
 pub struct PlaybackSession {
     queue: Vec<QueueItem>,
@@ -200,10 +446,15 @@ pub struct PlaybackSession {
     /// Play/toggle requests are accepted as no-ops until the exact request is
     /// handed to the output, so they cannot revive a superseded track.
     pending_resolution: Option<PlayerEventGeneration>,
-    /// The current protected reference failed before reaching an output. A
-    /// later Play/Toggle retries resolution instead of issuing `play()` to an
-    /// output that has no loaded media.
+    /// The current item failed before reaching an output or was synchronously
+    /// rejected by it. A later Play/Toggle retries the load (and protected
+    /// resolution when applicable) instead of issuing `play()` to an output
+    /// that has no loaded media.
     resolution_failed: bool,
+    /// Durable-history accounting for the current local queue occurrence.
+    /// Remote, removable, radio, and external items deliberately leave this
+    /// empty even when their backend-native track ID resembles a local ID.
+    history_occurrence: Option<PlaybackHistoryOccurrence>,
 }
 
 impl PlaybackSession {
@@ -216,6 +467,7 @@ impl PlaybackSession {
         self.shuffle = None;
         self.pending_resolution = None;
         self.resolution_failed = false;
+        self.begin_history_occurrence_for_current();
         true
     }
 
@@ -226,6 +478,14 @@ impl PlaybackSession {
         self.event_generation = self.event_generation.next();
         self.pending_resolution = None;
         self.resolution_failed = false;
+        self.history_occurrence = None;
+    }
+
+    /// Start a fresh shuffle traversal without changing the queue or current
+    /// item. The UI calls this for either direction of a shuffle toggle, so an
+    /// old randomized path cannot unexpectedly reappear after a mode change.
+    pub(crate) fn reset_shuffle_navigation(&mut self) {
+        self.shuffle = None;
     }
 
     /// Clear playback only when the current queue belongs to `source_id`.
@@ -237,7 +497,7 @@ impl PlaybackSession {
     pub(crate) fn clear_if_source(&mut self, source_id: &str) -> bool {
         if self
             .current_identity()
-            .is_none_or(|identity| identity.source_id != source_id)
+            .is_none_or(|identity| !identity_is_owned_by_source(identity, source_id))
         {
             return false;
         }
@@ -250,31 +510,27 @@ impl PlaybackSession {
     /// A full library snapshot can be very large. Publishing this small set
     /// lets the GTK receiver avoid cloning refresh metadata for tracks the
     /// queue does not own, while preserving source namespacing.
-    pub(crate) fn library_track_ids(&self) -> HashSet<&str> {
+    pub(crate) fn library_track_ids(&self) -> HashSet<&TrackId> {
         self.queue
             .iter()
-            .filter(|item| is_library_source(&item.identity.source_id))
-            .map(|item| item.identity.track_id.as_str())
+            .filter(|item| is_library_source(item.identity.media_key.source_id))
+            .map(|item| &item.identity.media_key.track_id)
             .collect()
     }
 
-    /// Re-resolve queued library items whose track the library just committed a
-    /// change to, and return how many items moved.
+    /// Refresh display metadata for queued library identities whose current
+    /// database row changed.
     ///
-    /// A rename preserves a track's identity but not its path, so a queue that
-    /// captured the old URI would hand a dead path to the output the next time
-    /// it loaded that item — on Next, on Previous, and at end of stream, where
-    /// repeat-one replays the current item from the queue rather than the view.
-    /// The item playing right now is refreshed too. The current output is not
-    /// retargeted here, but a subsequent load or replay resolves the path where
-    /// the track now lives.
+    /// File locations are deliberately absent from local/playlist queue items;
+    /// playback resolves the current row by ID at every load. This update can
+    /// therefore change only the metadata snapshot, never install a locator.
     ///
     /// Items are rewritten in place. Queue length, order, and the cursor are the
     /// coordinate system that `current_index` and the shuffle history index
     /// into, so identity — not position — is what an update may address.
     pub(crate) fn refresh_library_tracks(
         &mut self,
-        updates: &HashMap<String, QueueTrackRefresh>,
+        updates: &HashMap<TrackId, QueueTrackRefresh>,
     ) -> usize {
         if updates.is_empty() {
             return 0;
@@ -282,19 +538,13 @@ impl PlaybackSession {
 
         let mut refreshed = 0;
         for item in &mut self.queue {
-            if !is_library_source(&item.identity.source_id) {
+            if !is_library_source(item.identity.media_key.source_id) {
                 continue;
             }
-            let Some(update) = updates.get(&item.identity.track_id) else {
+            let Some(update) = updates.get(&item.identity.media_key.track_id) else {
                 continue;
             };
-            // A track with no playable URI is unplayable (see `play_current`).
-            // Keep the captured reference rather than strand the queue item.
-            if update.uri.is_empty() {
-                continue;
-            }
-            if item.uri == update.uri
-                && item.title == update.title
+            if item.title == update.title
                 && item.artist == update.artist
                 && item.album == update.album
                 && item.cover_art_url == update.cover_art_url
@@ -302,7 +552,6 @@ impl PlaybackSession {
                 continue;
             }
 
-            item.uri = update.uri.clone();
             item.title = update.title.clone();
             item.artist = update.artist.clone();
             item.album = update.album.clone();
@@ -325,11 +574,243 @@ impl PlaybackSession {
         self.current().map(|item| &item.identity)
     }
 
+    /// The generation currently authorized to publish player events.
+    ///
+    /// Seek callers capture this immediately before issuing the output seek,
+    /// then pass it back to [`Self::observe_history_seek`]. A simultaneous
+    /// queue transition therefore turns the observation into a no-op instead
+    /// of retargeting it to the replacement occurrence.
+    pub(crate) const fn current_event_generation(&self) -> PlayerEventGeneration {
+        self.event_generation
+    }
+
+    /// Observe one generation-owned player event for durable local history.
+    ///
+    /// Only a successfully accepted output load may earn credit. Playback
+    /// state and delivery generation are independent: pause, buffering,
+    /// retry, and resume re-anchor the next position without replacing the
+    /// occurrence, while stale and rejected deliveries cannot contribute.
+    /// The exact stable local [`TrackId`] is returned once, at the point the
+    /// occurrence first qualifies for persistence.
+    pub(crate) fn observe_history_event(&mut self, event: &PlayerEvent) -> Option<TrackId> {
+        let generation = event.generation();
+        if !self.accepts_event_generation(generation) {
+            return None;
+        }
+
+        let current_track_id = self.current().and_then(|item| {
+            is_library_source(item.identity.media_key.source_id)
+                .then(|| item.identity.media_key.track_id.clone())
+        })?;
+        let occurrence = self.history_occurrence.as_mut()?;
+        if occurrence.track_id != current_track_id
+            || occurrence.accepted_generation != Some(generation)
+        {
+            return None;
+        }
+
+        let counted = match event {
+            PlayerEvent::StateChanged { state, .. } => {
+                match state {
+                    PlayerState::Playing => {
+                        if !occurrence.playing {
+                            occurrence.needs_reanchor = true;
+                        }
+                        occurrence.playing = true;
+                        occurrence.position_may_prove_playing = false;
+                    }
+                    PlayerState::Buffering => {
+                        occurrence.playing = false;
+                        occurrence.needs_reanchor = true;
+                        occurrence.position_may_prove_playing = true;
+                    }
+                    PlayerState::Stopped | PlayerState::Paused => {
+                        occurrence.playing = false;
+                        occurrence.needs_reanchor = true;
+                        occurrence.position_may_prove_playing = false;
+                    }
+                }
+                false
+            }
+            PlayerEvent::PositionChanged {
+                position_ms,
+                duration_ms,
+                ..
+            } => {
+                let duration_counted = occurrence.progress.observe_duration(*duration_ms);
+                let position_counted = if !occurrence.playing || occurrence.needs_reanchor {
+                    occurrence.progress.observe_reanchor(*position_ms);
+                    if occurrence.playing {
+                        // Explicit Playing after a pause/resume re-anchors its
+                        // first sample before later positions earn credit.
+                        occurrence.needs_reanchor = false;
+                    } else if occurrence.position_may_prove_playing {
+                        // Some accepted remote loads and Buffering recoveries
+                        // never publish a clean Playing transition. Their
+                        // first position proves playback but earns no credit.
+                        occurrence.playing = true;
+                        occurrence.needs_reanchor = false;
+                        occurrence.position_may_prove_playing = false;
+                    }
+                    false
+                } else {
+                    occurrence.progress.observe_position(*position_ms)
+                };
+                duration_counted || position_counted
+            }
+            PlayerEvent::TrackEnded { .. } => {
+                occurrence.playing = false;
+                occurrence.needs_reanchor = true;
+                occurrence.position_may_prove_playing = false;
+                occurrence.progress.observe_natural_end()
+            }
+            PlayerEvent::Error { .. } => {
+                occurrence.retire_delivery();
+                false
+            }
+        };
+
+        counted.then_some(current_track_id)
+    }
+
+    /// Re-anchor one accepted local occurrence around an explicit user seek.
+    ///
+    /// `actual_position_ms` is sampled before the command and intentionally
+    /// earns no unsampled credit. Comparing `target_ms` with that real anchor
+    /// records only genuine forward-skip evidence. The next output position is
+    /// re-anchored again because a backend may land on a nearby keyframe.
+    pub(crate) fn observe_history_seek(
+        &mut self,
+        generation: PlayerEventGeneration,
+        actual_position_ms: u64,
+        target_ms: u64,
+    ) -> bool {
+        if !self.accepts_event_generation(generation) {
+            return false;
+        }
+        let Some(current_track_id) = self.current().and_then(|item| {
+            is_library_source(item.identity.media_key.source_id)
+                .then(|| item.identity.media_key.track_id.clone())
+        }) else {
+            return false;
+        };
+        let Some(occurrence) = self.history_occurrence.as_mut() else {
+            return false;
+        };
+        if occurrence.track_id != current_track_id
+            || occurrence.accepted_generation != Some(generation)
+        {
+            return false;
+        }
+
+        occurrence.progress.observe_reanchor(actual_position_ms);
+        occurrence.progress.observe_seek(target_ms);
+        occurrence.needs_reanchor = true;
+        true
+    }
+
+    fn begin_history_occurrence_for_current(&mut self) {
+        self.history_occurrence = self
+            .current()
+            .and_then(PlaybackHistoryOccurrence::from_item);
+    }
+
+    fn begin_repeat_one_occurrence(&mut self) {
+        self.begin_history_occurrence_for_current();
+    }
+
+    fn mark_history_load_accepted(&mut self, generation: PlayerEventGeneration) -> bool {
+        if self.pending_resolution.is_some()
+            || self.resolution_failed
+            || !self.accepts_event_generation(generation)
+        {
+            return false;
+        }
+        let Some(current_track_id) = self.current().and_then(|item| {
+            is_library_source(item.identity.media_key.source_id)
+                .then(|| item.identity.media_key.track_id.clone())
+        }) else {
+            return false;
+        };
+        let Some(occurrence) = self.history_occurrence.as_mut() else {
+            return false;
+        };
+        if occurrence.track_id != current_track_id {
+            return false;
+        }
+
+        occurrence.accepted_generation = Some(generation);
+        occurrence.playing = false;
+        occurrence.needs_reanchor = true;
+        occurrence.position_may_prove_playing = true;
+        true
+    }
+
+    /// Exact hidden external-file source currently owned by playback.
+    ///
+    /// This must be read before `clear`: baseline visibility is not terminal
+    /// ownership, and a random source identity is not by itself proof that a
+    /// queue item came from the OS-open adapter.
+    pub(crate) fn current_external_source_id(&self) -> Option<SourceId> {
+        self.current()
+            .filter(|item| item.external_session)
+            .map(|item| item.identity.media_key.source_id)
+    }
+
+    /// Decide terminal retirement from exact playback ownership.
+    ///
+    /// Repeat-one and repeat-all completion are not terminal. Delayed events
+    /// from an older output generation can never retire the current source.
+    pub(crate) fn external_source_for_terminal(
+        &self,
+        generation: PlayerEventGeneration,
+        repeated: bool,
+    ) -> Option<SourceId> {
+        (!repeated && self.accepts_event_generation(generation))
+            .then(|| self.current_external_source_id())
+            .flatten()
+    }
+
     fn begin_event_generation(&mut self) -> PlayerEventGeneration {
         self.event_generation = self.event_generation.next();
         self.pending_resolution = None;
         self.resolution_failed = false;
+        if let Some(occurrence) = self.history_occurrence.as_mut() {
+            occurrence.retire_delivery();
+        }
         self.event_generation
+    }
+
+    /// Hand the current direct item to an output under a fresh event owner.
+    ///
+    /// This is the production boundary shared by initial playback, queue
+    /// navigation, EOS replay, and a retry after synchronous rejection. The
+    /// queue cursor supplies the URI; callers cannot accidentally load a row
+    /// from the mutable GTK projection instead. A rejected load retains that
+    /// exact item and generation as retryable, while a later attempt advances
+    /// ownership before it calls the output again.
+    pub(super) fn load_current_direct(
+        &mut self,
+        output: &dyn AudioOutput,
+    ) -> Option<DirectLoadAttempt> {
+        let uri = self.current()?.uri.clone();
+        if uri.is_empty() || self.current()?.source_session_epoch.is_some() {
+            return None;
+        }
+
+        let generation = self.begin_event_generation();
+        output.set_event_generation(generation);
+        let accepted = output.load_uri(&uri);
+        if accepted {
+            let _ = self.mark_history_load_accepted(generation);
+        } else {
+            let marked = self.mark_load_rejected(generation);
+            debug_assert!(marked, "current direct load remains retryable");
+        }
+        Some(DirectLoadAttempt {
+            generation,
+            accepted,
+        })
     }
 
     fn begin_pending_resolution(&mut self) -> PlayerEventGeneration {
@@ -359,6 +840,9 @@ impl PlaybackSession {
         }
         self.pending_resolution = None;
         self.resolution_failed = true;
+        if let Some(occurrence) = self.history_occurrence.as_mut() {
+            occurrence.retire_delivery();
+        }
         true
     }
 
@@ -376,22 +860,48 @@ impl PlaybackSession {
         }
         self.pending_resolution = None;
         self.resolution_failed = true;
+        if let Some(occurrence) = self.history_occurrence.as_mut() {
+            occurrence.retire_delivery();
+        }
         true
     }
 
-    /// Turn a protected output failure into a fresh-resolution retry state.
+    /// Retain a synchronously rejected item as an explicit retryable load.
     ///
-    /// Resolution has already finished by the time `load_resolved` reaches an
-    /// output, so proxy startup, daemon, or receiver failures arrive through
+    /// The generation remains current so the output's required actionable
+    /// error is still displayed. A later Play begins a fresh generation and
+    /// attempts the load again instead of toggling an empty output session.
+    fn mark_load_rejected(&mut self, generation: PlayerEventGeneration) -> bool {
+        if self.pending_resolution.is_some() || !self.accepts_event_generation(generation) {
+            return false;
+        }
+        self.resolution_failed = true;
+        if let Some(occurrence) = self.history_occurrence.as_mut() {
+            occurrence.retire_delivery();
+        }
+        true
+    }
+
+    /// Turn an ID/session-resolved output failure into a fresh-resolution retry
+    /// state.
+    ///
+    /// Resolution has already finished by the time a protected request or
+    /// exact local file URI reaches an output, so proxy startup, daemon,
+    /// receiver, decoder, or filesystem failures arrive through
     /// `PlayerEvent::Error`. Without this transition, a later Play would call
-    /// `play()` on an output that never accepted media. Advancing the event
-    /// generation also rejects any delayed state emitted by the failed load.
-    pub(crate) fn mark_protected_load_failed(&mut self, generation: PlayerEventGeneration) -> bool {
+    /// `play()` on an output that may never have accepted media instead of
+    /// resolving the identity again. Advancing the event generation also
+    /// rejects delayed state emitted by the failed load.
+    pub(crate) fn mark_resolved_load_failed(&mut self, generation: PlayerEventGeneration) -> bool {
         if self.pending_resolution.is_some()
+            // A synchronously rejected load is already retryable and never
+            // created output state to stop. Keep its generation current so
+            // the queued guidance remains visible without issuing cleanup.
+            || self.resolution_failed
             || !self.accepts_event_generation(generation)
             || !self.current().is_some_and(|item| {
-                crate::source_registry::is_media_reference(item.uri())
-                    || item.uri().starts_with("daap:")
+                is_library_source(item.identity.media_key.source_id)
+                    || item.source_session_epoch.is_some()
             })
         {
             return false;
@@ -399,6 +909,9 @@ impl PlaybackSession {
 
         self.event_generation = self.event_generation.next();
         self.resolution_failed = true;
+        if let Some(occurrence) = self.history_occurrence.as_mut() {
+            occurrence.retire_delivery();
+        }
         true
     }
 
@@ -419,9 +932,26 @@ impl PlaybackSession {
             .collect();
         fastrand::shuffle(&mut remaining);
         self.shuffle = Some(ShuffleState {
-            history: vec![current],
+            history: VecDeque::from([current]),
+            cursor: 0,
             remaining,
         });
+    }
+
+    /// Start a complete Repeat All cycle while avoiding an immediate repeat at
+    /// the rollover boundary. Unlike the initial cycle (whose manually chosen
+    /// current item is already counted), every later cycle contains every
+    /// queue occurrence exactly once.
+    fn refill_shuffle_cycle(state: &mut ShuffleState, queue_len: usize, current: usize) {
+        state.remaining = (0..queue_len).collect();
+        fastrand::shuffle(&mut state.remaining);
+        if queue_len > 1 && state.remaining.last() == Some(&current) {
+            // Condition the uniform permutation on a different first draw by
+            // swapping the boundary item with a uniformly selected earlier
+            // slot. Choosing a fixed slot would bias otherwise valid cycles.
+            let replacement = fastrand::usize(0..(queue_len - 1));
+            state.remaining.swap(replacement, queue_len - 1);
+        }
     }
 
     fn advance(&mut self, repeat_mode: RepeatMode, shuffle: bool) -> Option<usize> {
@@ -440,6 +970,7 @@ impl PlaybackSession {
             self.current_index = Some(selected);
             self.pending_resolution = None;
             self.resolution_failed = false;
+            self.begin_history_occurrence_for_current();
             return Some(selected);
         }
 
@@ -448,28 +979,37 @@ impl PlaybackSession {
         }
 
         let state = self.shuffle.as_mut()?;
+        if let Some(selected) = state.step_forward() {
+            self.current_index = Some(selected);
+            self.pending_resolution = None;
+            self.resolution_failed = false;
+            self.begin_history_occurrence_for_current();
+            return Some(selected);
+        }
+
         if state.remaining.is_empty() {
             if repeat_mode != RepeatMode::All {
                 return None;
             }
-            state.remaining = (0..self.queue.len())
-                .filter(|&index| index != current)
-                .collect();
-            fastrand::shuffle(&mut state.remaining);
 
             // A one-item queue repeats itself under repeat-all.
-            if state.remaining.is_empty() {
+            if self.queue.len() == 1 {
+                state.record_selection(current);
                 self.pending_resolution = None;
                 self.resolution_failed = false;
+                self.begin_history_occurrence_for_current();
                 return Some(current);
             }
+
+            Self::refill_shuffle_cycle(state, self.queue.len(), current);
         }
 
         let selected = state.remaining.pop()?;
-        state.history.push(selected);
+        state.record_selection(selected);
         self.current_index = Some(selected);
         self.pending_resolution = None;
         self.resolution_failed = false;
+        self.begin_history_occurrence_for_current();
         Some(selected)
     }
 
@@ -488,6 +1028,7 @@ impl PlaybackSession {
             self.current_index = Some(selected);
             self.pending_resolution = None;
             self.resolution_failed = false;
+            self.begin_history_occurrence_for_current();
             return Some(selected);
         }
 
@@ -495,33 +1036,91 @@ impl PlaybackSession {
             self.initialize_shuffle();
         }
         let state = self.shuffle.as_mut()?;
-        if state.history.len() > 1 {
-            if let Some(departed) = state.history.pop() {
-                state.remaining.push(departed);
-            }
-            let selected = *state.history.last()?;
-            self.current_index = Some(selected);
-            self.pending_resolution = None;
-            self.resolution_failed = false;
-            return Some(selected);
-        }
-
-        if repeat_mode != RepeatMode::All {
-            return None;
-        }
-
-        let mut candidates: Vec<usize> = (0..self.queue.len())
-            .filter(|&index| index != current)
-            .collect();
-        fastrand::shuffle(&mut candidates);
-        let selected = candidates.pop().unwrap_or(current);
-        state.history = vec![selected];
-        state.remaining = candidates;
+        let selected = state.step_back()?;
         self.current_index = Some(selected);
         self.pending_resolution = None;
         self.resolution_failed = false;
+        self.begin_history_occurrence_for_current();
         Some(selected)
     }
+
+    #[cfg(test)]
+    pub(super) fn advance_for_test(
+        &mut self,
+        repeat_mode: RepeatMode,
+        shuffle: bool,
+    ) -> Option<usize> {
+        self.advance(repeat_mode, shuffle)
+    }
+
+    #[cfg(test)]
+    pub(super) fn previous_for_test(
+        &mut self,
+        repeat_mode: RepeatMode,
+        shuffle: bool,
+    ) -> Option<usize> {
+        self.previous(repeat_mode, shuffle)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DirectLoadAttempt {
+    pub(super) generation: PlayerEventGeneration,
+    pub(super) accepted: bool,
+}
+
+#[derive(Debug)]
+struct CapturedQueue {
+    items: Vec<QueueItem>,
+    selected_index: usize,
+}
+
+/// Capture the current sorted/filtered projection as a playback-owned queue.
+///
+/// All entry points that start playback from the track list go through this
+/// function. Once returned, the queue has no dependency on the mutable GTK
+/// model: sorting, filtering, rebuilding, or navigating to another source can
+/// no longer change the current identity or the meaning of Next/Previous.
+fn capture_visible_queue(
+    model: &impl IsA<gtk::gio::ListModel>,
+    source_key: &str,
+    selected_position: u32,
+) -> Option<CapturedQueue> {
+    let view = queue_view(source_key)?;
+    let mut selected_index = None;
+    let mut items = Vec::with_capacity(model.n_items() as usize);
+    let mut occurrences: HashMap<MediaKey, usize> = HashMap::new();
+
+    for model_index in 0..model.n_items() {
+        let Some(track) = model.item(model_index).and_downcast::<TrackObject>() else {
+            continue;
+        };
+        let Ok(track_id) = TrackId::new(track.track_id()) else {
+            continue;
+        };
+        if model_index == selected_position {
+            selected_index = Some(items.len());
+        }
+        let identity = PlaybackIdentity::new(&view, track_id);
+        let occurrence = occurrences.entry(identity.media_key.clone()).or_default();
+        items.push(QueueItem::from_track(identity, &track, *occurrence));
+        *occurrence += 1;
+    }
+
+    Some(CapturedQueue {
+        items,
+        selected_index: selected_index?,
+    })
+}
+
+/// Retire queue/event ownership before asking the active output to stop.
+///
+/// Both the explicit Stop control and output replacement use this ordering, so
+/// a backend that publishes `Stopped` synchronously cannot mutate the cleared
+/// or replacement session.
+pub(super) fn stop_owned_playback(session: &mut PlaybackSession, output: &dyn AudioOutput) {
+    session.clear();
+    output.stop();
 }
 
 /// Debounce state for the play-button buffering spinner.
@@ -571,6 +1170,14 @@ pub struct PlaybackContext {
     pub artist_label: gtk::Label,
     pub media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>>,
     pub session: Rc<RefCell<PlaybackSession>>,
+    /// Current in-process configuration. Local resolution snapshots its roots
+    /// before background work and rechecks them immediately before output.
+    pub app_config: Rc<RefCell<super::preferences::AppConfig>>,
+    /// Tokio runtime used for exact local-database resolution without
+    /// blocking GTK's main thread.
+    pub rt_handle: tokio::runtime::Handle,
+    /// Sole at-use resolver and lifecycle authority for source-owned media.
+    pub source_registry: crate::source_registry::SourceRegistry,
     /// The tracklist `ColumnView` — used to scroll the currently
     /// playing row into view on track change so the user doesn't lose
     /// their place when sequential / shuffled playback advances.
@@ -613,46 +1220,43 @@ fn resolve_session_play_request(
 /// Captures the visible sorted model as an immutable playback queue, then
 /// starts the selected item. Later view mutations do not alter that queue.
 pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
-    let source_id = ctx.active_source_key.borrow().clone();
-    let mut selected_index = None;
-    let mut queue = Vec::with_capacity(ctx.model.n_items() as usize);
-    let mut occurrences: HashMap<PlaybackIdentity, usize> = HashMap::new();
-
-    for model_index in 0..ctx.model.n_items() {
-        let Some(track) = ctx.model.item(model_index).and_downcast::<TrackObject>() else {
-            continue;
-        };
-        if model_index == position {
-            selected_index = Some(queue.len());
-        }
-        let identity = PlaybackIdentity {
-            source_id: source_id.clone(),
-            track_id: track.track_id(),
-        };
-        let occurrence = occurrences.entry(identity).or_default();
-        queue.push(QueueItem::from_track(&source_id, &track, *occurrence));
-        *occurrence += 1;
-    }
-
-    let Some(selected_index) = selected_index else {
+    let source_key = ctx.active_source_key.borrow().clone();
+    let Some(captured) = capture_visible_queue(&ctx.model, &source_key, position) else {
         return false;
     };
-    if queue[selected_index].uri.is_empty() {
+    let selected = &captured.items[captured.selected_index];
+    if selected.uri.is_empty()
+        && !is_library_source(selected.identity.media_key.source_id)
+        && selected.source_session_epoch.is_none()
+    {
         warn!("Track has no playable URI");
         return false;
     }
 
+    // A visible-track selection is a newer playback intent than any
+    // OS-open admission still parsing in the background.
+    super::open_files::invalidate_admission();
     let previous = ctx.session.borrow().clone();
+    let previous_external = previous.current_external_source_id();
     if !ctx
         .session
         .borrow_mut()
-        .replace_queue(queue, selected_index)
+        .replace_queue(captured.items, captured.selected_index)
     {
         return false;
     }
 
+    if let Some(source_id) = previous_external {
+        let _ = ctx.source_registry.retire_external(source_id);
+    }
+
     if play_current(ctx) {
         true
+    } else if previous_external.is_some() {
+        // The previous external capability was explicitly retired above and
+        // must never be restored as a retry target.
+        ctx.session.borrow_mut().clear();
+        false
     } else {
         *ctx.session.borrow_mut() = previous;
         false
@@ -662,6 +1266,9 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
 /// Resume the session's current item, or create a new queue from the visible
 /// model when playback is idle (including after an OS Stop action).
 pub fn play_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
+    // Play is a newer explicit playback intent than any OS-open delivery
+    // still parsing off the GTK thread.
+    super::open_files::invalidate_admission();
     if ctx.session.borrow().is_resolution_pending() {
         return true;
     }
@@ -683,6 +1290,8 @@ pub fn play_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
 
 /// Header/OS-toggle behavior: toggle a loaded item, otherwise start a queue.
 pub fn toggle_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
+    // Toggle covers both explicit Pause and Play requests.
+    super::open_files::invalidate_admission();
     if ctx.session.borrow().is_resolution_pending() {
         true
     } else if ctx.session.borrow().resolution_failed {
@@ -698,8 +1307,13 @@ pub fn toggle_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
 /// Invalidate the session before stopping the output so synchronously emitted
 /// Stopped events are already stale. The caller owns the widget reset.
 pub fn stop_playback(ctx: &PlaybackContext) {
-    ctx.session.borrow_mut().clear();
-    ctx.active_output.borrow().stop();
+    super::open_files::invalidate_admission();
+    let external_source = ctx.session.borrow().current_external_source_id();
+    let output = ctx.active_output.borrow();
+    stop_owned_playback(&mut ctx.session.borrow_mut(), output.as_ref());
+    if let Some(source_id) = external_source {
+        let _ = ctx.source_registry.retire_external(source_id);
+    }
 }
 
 /// Load the current immutable queue item and refresh now-playing UI.
@@ -710,12 +1324,99 @@ fn play_current(ctx: &PlaybackContext) -> bool {
     };
     let identity = session.current_identity().cloned();
     drop(session);
-    if item.uri.is_empty() {
-        warn!("Track has no playable URI");
-        return false;
+    if identity
+        .as_ref()
+        .is_some_and(|identity| is_library_source(identity.media_key.source_id))
+    {
+        // Stop and supersede the prior output before beginning the async DB
+        // lookup. Stop, Next, Previous, and replay all advance the generation,
+        // so a late result can never reach a receiver after ownership moves.
+        ctx.active_output.borrow().stop();
+        let generation = ctx.session.borrow_mut().begin_pending_resolution();
+        ctx.active_output.borrow().set_event_generation(generation);
+        update_now_playing_ui(ctx, &item, identity.as_ref(), None);
+
+        let track_id = identity
+            .as_ref()
+            .map(|identity| identity.media_key.track_id.clone())
+            .expect("local queue item has an identity");
+        let configured_roots = ctx.app_config.borrow().library_paths.clone();
+        let (resolved_tx, resolved_rx) = async_channel::bounded(1);
+        ctx.rt_handle.spawn(async move {
+            let resolved = match crate::db::connection::init_db().await {
+                Ok(db) => {
+                    crate::local::resolver::resolve_track(&db, track_id.as_str(), &configured_roots)
+                        .await
+                }
+                Err(source) => {
+                    Err(crate::local::resolver::LocalMediaResolutionError::Database { source })
+                }
+            };
+            let _ = resolved_tx.send(resolved).await;
+        });
+
+        let session = Rc::clone(&ctx.session);
+        let active_output = Rc::clone(&ctx.active_output);
+        let media_ctrl = Rc::clone(&ctx.media_ctrl);
+        let app_config = Rc::clone(&ctx.app_config);
+        let album_art = ctx.album_art.clone();
+        glib::MainContext::default().spawn_local(async move {
+            match resolved_rx.recv().await {
+                Ok(Ok(media))
+                    if media.matches_current_configuration(&app_config.borrow().library_paths) =>
+                {
+                    if session.borrow_mut().finish_pending_resolution(generation) {
+                        let artwork_media = media.clone();
+                        let accepted = active_output.borrow().load_local(media);
+                        if !accepted {
+                            let marked = session.borrow_mut().mark_load_rejected(generation);
+                            debug_assert!(marked, "current local load remains retryable");
+                            album_art::invalidate();
+                        } else {
+                            let marked = session
+                                .borrow_mut()
+                                .mark_history_load_accepted(generation);
+                            debug_assert!(marked, "accepted local load owns history delivery");
+                            album_art::update_resolved_file_album_art(
+                                &album_art,
+                                artwork_media,
+                            );
+                        }
+                    }
+                }
+                Ok(Ok(_)) => {
+                    if session.borrow_mut().fail_pending_resolution(generation) {
+                        warn!("Local media root changed before output handoff");
+                        active_output.borrow().stop();
+                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                            ctrl.update_playback(false);
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    if session.borrow_mut().fail_pending_resolution(generation) {
+                        warn!(error = %error, "Could not resolve local track by its library identity");
+                        active_output.borrow().stop();
+                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                            ctrl.update_playback(false);
+                        }
+                    }
+                }
+                Err(_) => {
+                    if session.borrow_mut().fail_pending_resolution(generation) {
+                        warn!("Local media resolver stopped before returning a result");
+                        active_output.borrow().stop();
+                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                            ctrl.update_playback(false);
+                        }
+                    }
+                }
+            }
+        });
+        return true;
     }
 
-    if crate::source_registry::is_media_reference(item.uri()) {
+    if let Some(expected_session_epoch) = item.source_session_epoch {
         // Retire the prior output/ticket before awaiting the source resolver.
         // The Stop captures the old event generation; the new generation below
         // therefore rejects any delayed terminal event it produces.
@@ -724,29 +1425,107 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         ctx.active_output.borrow().set_event_generation(generation);
         update_now_playing_ui(ctx, &item, identity.as_ref(), None);
 
-        let reference = item.uri.clone();
+        let identity = identity
+            .as_ref()
+            .expect("managed-source queue item has stable media identity");
+        let source_id = identity.media_key.source_id;
+        let track_id = identity.media_key.track_id.clone();
+        let source_registry = ctx.source_registry.clone();
         let session = Rc::clone(&ctx.session);
         let active_output = Rc::clone(&ctx.active_output);
         let media_ctrl = Rc::clone(&ctx.media_ctrl);
+        let album_art = ctx.album_art.clone();
+        let external_session = item.external_session;
         glib::MainContext::default().spawn_local(async move {
-            let resolved = crate::source_registry::resolve_stream_reference(&reference).await;
+            let resolved = source_registry
+                .resolve_stream(source_id, expected_session_epoch, track_id)
+                .await;
             match resolved {
-                Ok(request) if request.is_active() => {
-                    if session.borrow_mut().finish_pending_resolution(generation) {
-                        active_output.borrow().load_resolved(request);
+                Ok(request) => {
+                    if !session.borrow_mut().finish_pending_resolution(generation) {
+                        return;
                     }
-                }
-                Ok(_) => {
-                    if session.borrow_mut().fail_pending_resolution(generation) {
-                        warn!("Could not resolve track: source lease is inactive");
-                        active_output.borrow().stop();
+                    let accepted = match request {
+                        crate::source_registry::ResolvedSourceStream::Http(request) => {
+                            match request {
+                                crate::architecture::media::MediaRequest::ProtectedHttp(request) => {
+                                    active_output.borrow().load_resolved(*request)
+                                }
+                                crate::architecture::media::MediaRequest::PublicHttp(request) => {
+                                    match request.consume() {
+                                        Ok(url) => active_output.borrow().load_uri(url.as_str()),
+                                        Err(error) => {
+                                            warn!(error = %error, "Public stream authority expired before output handoff");
+                                            let marked = session
+                                                .borrow_mut()
+                                                .mark_load_rejected(generation);
+                                            debug_assert!(
+                                                marked,
+                                                "expired public load remains retryable"
+                                            );
+                                            if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                                                ctrl.update_playback(false);
+                                            }
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        crate::source_registry::ResolvedSourceStream::File(media) => {
+                            // AudioOutput consumes its retained capability. A
+                            // second clone is reserved for embedded art and is
+                            // used only after the output accepts the exact
+                            // object.
+                            let artwork_media = media.clone();
+                            let accepted = active_output.borrow().load_local(media);
+                            if accepted {
+                                album_art::update_resolved_file_album_art(
+                                    &album_art,
+                                    artwork_media,
+                                );
+                            }
+                            accepted
+                        }
+                    };
+                    if accepted {
+                        let _ = session
+                            .borrow_mut()
+                            .mark_history_load_accepted(generation);
+                    } else {
+                        if external_session
+                            && session.borrow().accepts_event_generation(generation)
+                            && session.borrow().current_external_source_id() == Some(source_id)
+                        {
+                            super::open_files::invalidate_admission();
+                            session.borrow_mut().clear();
+                            let _ = source_registry.retire_external(source_id);
+                            active_output.borrow().stop();
+                            album_art::invalidate();
+                        } else {
+                            let marked = session.borrow_mut().mark_load_rejected(generation);
+                            debug_assert!(marked, "current resolved load remains retryable");
+                        }
                         if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
                             ctrl.update_playback(false);
                         }
                     }
                 }
                 Err(error) => {
-                    if session.borrow_mut().fail_pending_resolution(generation) {
+                    let owns_external = external_session
+                        && session.borrow().accepts_event_generation(generation)
+                        && session.borrow().current_external_source_id() == Some(source_id);
+                    if owns_external {
+                        super::open_files::invalidate_admission();
+                        session.borrow_mut().clear();
+                        let _ = source_registry.retire_external(source_id);
+                        warn!(error = %error, "Could not resolve external media through its live source session");
+                        active_output.borrow().stop();
+                        album_art::invalidate();
+                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
+                            ctrl.update_playback(false);
+                        }
+                    } else if session.borrow_mut().fail_pending_resolution(generation) {
                         warn!(error = %error, "Could not resolve track through its live source session");
                         active_output.borrow().stop();
                         if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
@@ -759,6 +1538,11 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         return true;
     }
 
+    if item.uri.is_empty() {
+        warn!("Track has no playable URI");
+        return false;
+    }
+
     let playback_uri = item.uri.clone();
 
     // Each output resolves the source at its own trust boundary. Chromecast
@@ -769,9 +1553,21 @@ fn play_current(ctx: &PlaybackContext) -> bool {
 
     tracing::debug!("Playing track");
 
-    let generation = ctx.session.borrow_mut().begin_event_generation();
-    ctx.active_output.borrow().set_event_generation(generation);
-    ctx.active_output.borrow().load_uri(&playback_uri);
+    let load = {
+        let output = ctx.active_output.borrow();
+        ctx.session
+            .borrow_mut()
+            .load_current_direct(output.as_ref())
+    };
+    let Some(load) = load else {
+        debug_assert!(false, "current direct queue item is loadable");
+        return false;
+    };
+    tracing::debug!(
+        generation = ?load.generation,
+        accepted = load.accepted,
+        "Direct queue item handed to output"
+    );
     update_now_playing_ui(ctx, &item, identity.as_ref(), Some(&playback_uri));
 
     true
@@ -792,10 +1588,12 @@ fn update_now_playing_ui(
     // Scroll only when the queue's source and item are present in the current
     // view. Navigation still works when the user is viewing another source or
     // has filtered the playing item out.
-    if identity.is_some_and(|identity| *ctx.active_source_key.borrow() == identity.source_id) {
+    if identity.is_some_and(|identity| {
+        identity_belongs_to_source(identity, &ctx.active_source_key.borrow())
+    }) {
         if let Some(position) = find_queue_item_position(
             ctx.model.n_items(),
-            identity.map_or("", |identity| &identity.track_id),
+            identity.map_or("", |identity| identity.media_key.track_id.as_str()),
             item.occurrence,
             item.row_instance_id,
             |index| {
@@ -815,28 +1613,32 @@ fn update_now_playing_ui(
     }
 
     // ── Update album art ─────────────────────────────────────────
-    if !item.cover_art_url.is_empty() {
-        if crate::source_registry::is_media_reference(&item.cover_art_url) {
-            let generation = album_art::begin_remote_album_art(&ctx.album_art);
-            let reference = item.cover_art_url.clone();
-            let album_art = ctx.album_art.clone();
-            glib::MainContext::default().spawn_local(async move {
-                match crate::source_registry::resolve_artwork_reference(&reference).await {
-                    Ok(Some(request)) => {
-                        album_art::fetch_resolved_album_art(&album_art, request, generation);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        warn!(error = %error, "Could not resolve artwork through its live source session");
-                    }
+    if let (Some(identity), Some(expected_session_epoch)) = (identity, item.source_session_epoch) {
+        let generation = album_art::begin_remote_album_art(&ctx.album_art);
+        let source_registry = ctx.source_registry.clone();
+        let source_id = identity.media_key.source_id;
+        let track_id = identity.media_key.track_id.clone();
+        let album_art = ctx.album_art.clone();
+        glib::MainContext::default().spawn_local(async move {
+            match source_registry
+                .resolve_artwork(source_id, expected_session_epoch, track_id)
+                .await
+            {
+                Ok(Some(request)) => {
+                    album_art::fetch_resolved_album_art(&album_art, request, generation);
                 }
-            });
-        } else {
-            album_art::fetch_remote_album_art(&ctx.album_art, &item.cover_art_url);
-        }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(error = %error, "Could not resolve artwork through its live source session");
+                }
+            }
+        });
+    } else if !item.cover_art_url.is_empty() {
+        album_art::fetch_remote_album_art(&ctx.album_art, &item.cover_art_url);
     } else if let Some(playback_uri) = direct_playback_uri {
-        // Local track — extract from embedded tags.
-        album_art::update_album_art(&ctx.album_art, playback_uri);
+        // Transitional direct file sources extract from their locator until
+        // their source adapters provide retained file authority.
+        album_art::update_direct_file_album_art(&ctx.album_art, playback_uri);
     } else {
         album_art::invalidate();
         ctx.album_art
@@ -886,21 +1688,22 @@ fn find_queue_item_position(
 /// Returns `true` if a new track was loaded, `false` if we've reached
 /// the end (caller should reset to idle).
 pub fn advance_track(ctx: &PlaybackContext, repeat_mode: RepeatMode, shuffle: bool) -> bool {
-    let previous = ctx.session.borrow().clone();
-    if ctx
-        .session
-        .borrow_mut()
-        .advance(repeat_mode, shuffle)
-        .is_none()
-    {
-        return false;
-    }
-    if play_current(ctx) {
-        true
-    } else {
-        *ctx.session.borrow_mut() = previous;
-        false
-    }
+    navigate_and_play(
+        ctx.session.as_ref(),
+        |session| session.advance(repeat_mode, shuffle),
+        || play_current(ctx),
+    )
+}
+
+/// Explicit Next behavior. Natural EOS uses [`advance_track`] directly so an
+/// automatic transition cannot supersede a newer OS-open delivery.
+pub fn advance_track_from_user(
+    ctx: &PlaybackContext,
+    repeat_mode: RepeatMode,
+    shuffle: bool,
+) -> bool {
+    super::open_files::invalidate_admission();
+    advance_track(ctx, repeat_mode, shuffle)
 }
 
 /// Step back to the previous track, respecting repeat-all wrap-around.
@@ -910,68 +1713,150 @@ pub fn advance_track(ctx: &PlaybackContext, repeat_mode: RepeatMode, shuffle: bo
 /// heuristic belongs to the UI/key callers, which know what threshold
 /// they want to use. Returns `true` if a new track was loaded.
 pub fn previous_track(ctx: &PlaybackContext, repeat_mode: RepeatMode, shuffle: bool) -> bool {
-    let previous = ctx.session.borrow().clone();
-    if ctx
-        .session
-        .borrow_mut()
-        .previous(repeat_mode, shuffle)
-        .is_none()
-    {
+    navigate_and_play(
+        ctx.session.as_ref(),
+        |session| session.previous(repeat_mode, shuffle),
+        || play_current(ctx),
+    )
+}
+
+fn navigate_and_play(
+    session: &RefCell<PlaybackSession>,
+    navigate: impl FnOnce(&mut PlaybackSession) -> Option<usize>,
+    play: impl FnOnce() -> bool,
+) -> bool {
+    let previous = session.borrow().clone();
+    let selected = {
+        let mut session = session.borrow_mut();
+        navigate(&mut session)
+    };
+    if selected.is_none() {
         return false;
     }
-    if play_current(ctx) {
+    if play() {
         true
     } else {
-        *ctx.session.borrow_mut() = previous;
+        *session.borrow_mut() = previous;
         false
     }
 }
 
-/// Replay the current queue item without consulting the mutable view.
-pub fn replay_current(ctx: &PlaybackContext) -> bool {
-    play_current(ctx)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviousDispatch {
+    Stepped,
+    Restarted,
 }
 
-/// Play a local file directly, bypassing the library tracklist.
-///
-/// Used by the OS "Open With" / `xdg-open` handler.  Reads tags via
-/// lofty, updates the now-playing UI (labels, album art, OS media
-/// overlay), and asks the active output to play the file. The file becomes a
-/// one-item external playback queue, so Next/Previous cannot jump into an
-/// unrelated visible source after it ends.
-///
-/// Returns `true` if playback was initiated, `false` if the file could
-/// not be parsed or has no playable URI representation.
-pub fn play_local_file(path: &std::path::Path, ctx: &PlaybackContext) -> bool {
-    let parsed = match crate::local::tag_parser::parse_audio_file(path) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "Open With: failed to parse audio file");
-            return false;
-        }
-    };
+fn dispatch_previous(
+    position_ms: u64,
+    step: impl FnOnce() -> bool,
+    restart: impl FnOnce(),
+) -> PreviousDispatch {
+    if position_ms > PREVIOUS_RESTART_THRESHOLD_MS {
+        restart();
+        return PreviousDispatch::Restarted;
+    }
 
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let Ok(uri) = url::Url::from_file_path(&canonical) else {
-        warn!(path = %path.display(), "Open With: path cannot be represented as a file URI");
-        return false;
+    if step() {
+        PreviousDispatch::Stepped
+    } else {
+        restart();
+        PreviousDispatch::Restarted
+    }
+}
+
+/// Shared header-button and OS-media-control Previous behavior.
+///
+/// The output position borrow is deliberately released before navigation can
+/// load another item. This keeps both entry points on one exact threshold and
+/// avoids carrying a `RefCell` borrow into output callbacks.
+pub fn previous_or_restart_from_user(
+    ctx: &PlaybackContext,
+    repeat_mode: RepeatMode,
+    shuffle: bool,
+) {
+    super::open_files::invalidate_admission();
+    let position_ms = {
+        let output = ctx.active_output.borrow();
+        output.position_ms().unwrap_or(0)
     };
-    let item = QueueItem::external(
-        uri.to_string(),
-        parsed.title,
-        parsed.artist_name,
-        parsed.album_title,
+    let event_generation = ctx.session.borrow().current_event_generation();
+    let _ = dispatch_previous(
+        position_ms,
+        || previous_track(ctx, repeat_mode, shuffle),
+        || {
+            let _ = ctx
+                .session
+                .borrow_mut()
+                .observe_history_seek(event_generation, position_ms, 0);
+            ctx.active_output.borrow().seek_to(0);
+        },
     );
-    let previous = ctx.session.borrow().clone();
+}
+
+/// Replay the current queue item without consulting the mutable view.
+pub fn replay_current(ctx: &PlaybackContext) -> bool {
+    replay_current_occurrence(ctx.session.as_ref(), || play_current(ctx))
+}
+
+fn replay_current_occurrence(
+    session: &RefCell<PlaybackSession>,
+    play: impl FnOnce() -> bool,
+) -> bool {
+    // `play_current` returns false only before it begins a new output/event
+    // generation. Snapshot just the tentative occurrence so a pre-handoff
+    // failure can restore its predecessor without cloning or rolling back the
+    // queue, shuffle traversal, resolution state, or event ownership.
+    let (previous_occurrence, previous_generation) = {
+        let mut session = session.borrow_mut();
+        let previous = session.history_occurrence.clone();
+        let generation = session.event_generation;
+        session.begin_repeat_one_occurrence();
+        (previous, generation)
+    };
+    if play() {
+        true
+    } else {
+        let mut session = session.borrow_mut();
+        if session.event_generation == previous_generation {
+            session.history_occurrence = previous_occurrence;
+        } else {
+            debug_assert!(
+                false,
+                "a failed repeat-one handoff must not advance output ownership"
+            );
+        }
+        false
+    }
+}
+
+/// Install one already-admitted, pathless external-file session as the exact
+/// one-item playback queue.
+///
+/// Opening, validation, and tag parsing happen before this GTK boundary. The
+/// queue retains only source/track identity and the publishing epoch; every
+/// output resolves the retained file capability at use time.
+pub fn play_external_session(
+    external: &crate::source_registry::ExternalFileSession,
+    ctx: &PlaybackContext,
+) -> bool {
+    // Consume the delivery generation before replacing terminal ownership.
+    // Any duplicate/late completion from the same delivery is now stale.
+    super::open_files::invalidate_admission();
+    let item = QueueItem::external(external);
+    let previous_external = ctx.session.borrow().current_external_source_id();
     if !ctx.session.borrow_mut().replace_queue(vec![item], 0) {
         return false;
     }
+    if let Some(source_id) = previous_external {
+        let _ = ctx.source_registry.retire_external(source_id);
+    }
     if !play_current(ctx) {
-        *ctx.session.borrow_mut() = previous;
+        ctx.session.borrow_mut().clear();
+        let _ = ctx.source_registry.retire_external(external.source_id());
         return false;
     }
-
-    tracing::info!(path = %path.display(), "Open With: playback started");
+    tracing::info!("OS-opened external playback started");
     true
 }
 
@@ -990,19 +1875,121 @@ pub fn format_ms(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashSet;
 
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct RecordingOutputState {
+        generations: Vec<PlayerEventGeneration>,
+        loads: Vec<String>,
+        stops: usize,
+    }
+
+    struct RecordingOutput {
+        state: Rc<RefCell<RecordingOutputState>>,
+        reject_loads: Cell<usize>,
+        volume: f64,
+    }
+
+    impl RecordingOutput {
+        fn new(reject_loads: usize) -> (Self, Rc<RefCell<RecordingOutputState>>) {
+            let state = Rc::new(RefCell::new(RecordingOutputState::default()));
+            (
+                Self {
+                    state: Rc::clone(&state),
+                    reject_loads: Cell::new(reject_loads),
+                    volume: 0.5,
+                },
+                state,
+            )
+        }
+    }
+
+    impl AudioOutput for RecordingOutput {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn output_type(&self) -> crate::audio::output::OutputType {
+            crate::audio::output::OutputType::Local
+        }
+
+        fn supports_volume(&self) -> bool {
+            true
+        }
+
+        fn load_uri(&self, uri: &str) -> bool {
+            self.state.borrow_mut().loads.push(uri.to_string());
+            let remaining = self.reject_loads.get();
+            if remaining == 0 {
+                true
+            } else {
+                self.reject_loads.set(remaining - 1);
+                false
+            }
+        }
+
+        fn load_resolved(&self, _request: crate::architecture::media::ResolvedHttpRequest) -> bool {
+            false
+        }
+
+        fn load_local(&self, _media: crate::local::resolver::ResolvedLocalMedia) -> bool {
+            false
+        }
+
+        fn set_event_generation(&self, generation: PlayerEventGeneration) {
+            self.state.borrow_mut().generations.push(generation);
+        }
+
+        fn play(&self) {}
+
+        fn pause(&self) {}
+
+        fn stop(&self) {
+            self.state.borrow_mut().stops += 1;
+        }
+
+        fn toggle_play_pause(&self) {}
+
+        fn seek_to(&self, _position_ms: u64) {}
+
+        fn set_volume(&mut self, level: f64) {
+            self.volume = level;
+        }
+
+        fn volume(&self) -> f64 {
+            self.volume
+        }
+
+        fn state(&self) -> crate::audio::PlayerState {
+            crate::audio::PlayerState::Stopped
+        }
+
+        fn position_ms(&self) -> Option<u64> {
+            None
+        }
+    }
+
     fn item(source: &str, id: &str) -> QueueItem {
+        let view = queue_view(source).expect("test source identity");
+        let identity = PlaybackIdentity::new(
+            &view,
+            TrackId::new(id.to_string()).expect("test track identity"),
+        );
         QueueItem {
-            identity: PlaybackIdentity {
-                source_id: source.to_string(),
-                track_id: id.to_string(),
-            },
+            identity,
             occurrence: 0,
             row_instance_id: None,
-            uri: format!("https://media.invalid/{id}"),
+            source_session_epoch: None,
+            external_session: false,
+            duration_ms: None,
+            uri: if is_library_source(view.source_id) {
+                String::new()
+            } else {
+                format!("https://media.invalid/{id}")
+            },
             title: id.to_string(),
             artist: "Artist".to_string(),
             album: "Album".to_string(),
@@ -1010,9 +1997,38 @@ mod tests {
         }
     }
 
+    fn history_item(source: &str, id: &str, duration_ms: Option<u64>) -> QueueItem {
+        let mut item = item(source, id);
+        item.duration_ms = duration_ms.filter(|duration_ms| *duration_ms > 0);
+        item
+    }
+
+    fn accept_history_load(session: &mut PlaybackSession) -> PlayerEventGeneration {
+        let generation = session.begin_event_generation();
+        assert!(session.mark_history_load_accepted(generation));
+        generation
+    }
+
+    fn observe_playing(session: &mut PlaybackSession, generation: PlayerEventGeneration) {
+        assert_eq!(
+            session.observe_history_event(&PlayerEvent::state(generation, PlayerState::Playing,)),
+            None
+        );
+    }
+
+    fn observe_position(
+        session: &mut PlaybackSession,
+        generation: PlayerEventGeneration,
+        position_ms: u64,
+        duration_ms: u64,
+    ) -> Option<TrackId> {
+        session.observe_history_event(&PlayerEvent::position(generation, position_ms, duration_ms))
+    }
+
     fn protected_item(source: &str, id: &str) -> QueueItem {
         let mut item = item(source, id);
-        item.uri = "tributary-remote://00000000-0000-4000-8000-000000000001/stream/00000000-0000-4000-8000-000000000002".to_string();
+        item.uri.clear();
+        item.source_session_epoch = Some(7);
         item
     }
 
@@ -1024,17 +2040,54 @@ mod tests {
         row
     }
 
+    fn playback_row(id: &str) -> TrackObject {
+        projected_row(id, &format!("file:///music/{id}.flac"))
+    }
+
     fn ids(session: &PlaybackSession) -> Vec<String> {
         session
             .queue
             .iter()
-            .map(|entry| entry.identity.track_id.clone())
+            .map(|entry| entry.identity.media_key.track_id.as_str().to_string())
             .collect()
     }
 
-    fn renamed(uri: &str) -> QueueTrackRefresh {
+    fn library_ids(session: &PlaybackSession) -> HashSet<&str> {
+        session
+            .library_track_ids()
+            .into_iter()
+            .map(TrackId::as_str)
+            .collect()
+    }
+
+    fn current_id(session: &PlaybackSession) -> &str {
+        session
+            .current_identity()
+            .expect("current identity")
+            .media_key
+            .track_id
+            .as_str()
+    }
+
+    fn current_source(session: &PlaybackSession) -> SourceId {
+        session
+            .current_identity()
+            .expect("current identity")
+            .media_key
+            .source_id
+    }
+
+    fn item_from_row(source: &str, row: &TrackObject, occurrence: usize) -> QueueItem {
+        let view = queue_view(source).expect("test source identity");
+        let identity = PlaybackIdentity::new(
+            &view,
+            TrackId::new(row.track_id()).expect("test track identity"),
+        );
+        QueueItem::from_track(identity, row, occurrence)
+    }
+
+    fn refreshed_metadata() -> QueueTrackRefresh {
         QueueTrackRefresh {
-            uri: uri.to_string(),
             title: "Title".to_string(),
             artist: "Artist".to_string(),
             album: "Album".to_string(),
@@ -1043,11 +2096,14 @@ mod tests {
     }
 
     fn refresh(session: &mut PlaybackSession, track_id: &str, update: QueueTrackRefresh) -> usize {
-        session.refresh_library_tracks(&HashMap::from([(track_id.to_string(), update)]))
+        session.refresh_library_tracks(&HashMap::from([(
+            TrackId::new(track_id.to_string()).expect("test track identity"),
+            update,
+        )]))
     }
 
     #[test]
-    fn a_renamed_track_is_re_resolved_in_place_for_next_and_eos() {
+    fn a_library_metadata_refresh_preserves_pathless_queue_identity_and_shuffle() {
         let mut session = PlaybackSession::default();
         assert!(session.replace_queue(
             vec![item("local", "a"), item("local", "b"), item("local", "c")],
@@ -1058,13 +2114,10 @@ mod tests {
         let cursor = session.current_index;
         let shuffle = session.shuffle.clone().expect("shuffle state exists");
 
-        assert_eq!(
-            refresh(&mut session, "b", renamed("file:///music/renamed/b.flac")),
-            1
-        );
+        assert_eq!(refresh(&mut session, "b", refreshed_metadata()), 1);
 
-        assert_eq!(session.queue[1].uri, "file:///music/renamed/b.flac");
-        assert_eq!(session.queue[0].uri, "https://media.invalid/a");
+        assert!(session.queue.iter().all(|item| item.uri.is_empty()));
+        assert_eq!(session.queue[1].title, "Title");
         assert_eq!(
             ids(&session),
             ["a", "b", "c"],
@@ -1078,20 +2131,15 @@ mod tests {
     }
 
     #[test]
-    fn a_refresh_reaches_the_item_playing_right_now() {
+    fn a_metadata_refresh_reaches_the_item_playing_right_now_without_a_locator() {
         let mut session = PlaybackSession::default();
         assert!(session.replace_queue(vec![item("local", "a"), item("local", "b")], 1));
 
-        assert_eq!(
-            refresh(&mut session, "b", renamed("file:///music/renamed/b.flac")),
-            1
-        );
+        assert_eq!(refresh(&mut session, "b", refreshed_metadata()), 1);
 
-        // Repeat-one replays the current item from the queue, not from the view.
-        assert_eq!(
-            session.current().expect("current item").uri(),
-            "file:///music/renamed/b.flac"
-        );
+        let current = session.current().expect("current item");
+        assert_eq!(current.title, "Title");
+        assert!(current.uri().is_empty());
     }
 
     #[test]
@@ -1102,13 +2150,13 @@ mod tests {
             0,
         ));
         assert_eq!(
-            session.library_track_ids(),
+            library_ids(&session),
             HashSet::from(["a"]),
             "duplicate playlist/local occurrences need one snapshot lookup"
         );
 
         assert_eq!(
-            refresh(&mut session, "a", renamed("file:///music/renamed/a.flac")),
+            refresh(&mut session, "a", refreshed_metadata()),
             2,
             "a playlist is a projection of the library, so it holds library track IDs"
         );
@@ -1117,7 +2165,7 @@ mod tests {
     #[test]
     fn a_library_refresh_never_reinterprets_another_source_s_track_id() {
         let mut session = PlaybackSession::default();
-        let external = QueueItem::external(
+        let external = QueueItem::direct_for_test(
             "file:///downloads/a.flac".to_string(),
             "External".to_string(),
             "Artist".to_string(),
@@ -1132,32 +2180,104 @@ mod tests {
             0,
         ));
         assert_eq!(
-            session.library_track_ids(),
+            library_ids(&session),
             HashSet::from(["a"]),
             "only local-library sources participate in snapshot filtering"
         );
 
         // "a" is a library UUID here, but a remote backend's native ID — and an
         // external file's URI — are namespaced by their own source.
-        assert_eq!(
-            refresh(&mut session, "a", renamed("file:///music/renamed/a.flac")),
-            1
-        );
+        assert_eq!(refresh(&mut session, "a", refreshed_metadata()), 1);
         assert_eq!(session.queue[0].uri, "file:///downloads/a.flac");
         assert_eq!(session.queue[1].uri, "https://media.invalid/a");
-        assert_eq!(session.queue[2].uri, "file:///music/renamed/a.flac");
+        assert!(session.queue[2].uri.is_empty());
     }
 
     #[test]
-    fn an_unplayable_update_never_strands_a_queued_track() {
-        let mut session = PlaybackSession::default();
-        assert!(session.replace_queue(vec![item("local", "a")], 0));
+    fn local_and_playlist_queue_capture_discards_the_row_locator() {
+        let local = projected_row("legacy:local-id", "file:///music/captured.flac");
+        let playlist = projected_row("legacy:local-id", "file:///music/captured.flac");
+        let remote = projected_row("remote-id", "https://media.invalid/stream");
 
-        assert_eq!(refresh(&mut session, "a", renamed("")), 0);
+        let local_item = item_from_row("local", &local, 0);
+        let playlist_item = item_from_row("playlist:favourites", &playlist, 0);
+        let remote_item = item_from_row("https://server.invalid", &remote, 0);
+
         assert_eq!(
-            session.queue[0].uri, "https://media.invalid/a",
-            "a track with no playable URI keeps the reference the queue captured"
+            local_item.identity.media_key.track_id.as_str(),
+            "legacy:local-id"
         );
+        assert_eq!(
+            playlist_item.identity.media_key.track_id.as_str(),
+            "legacy:local-id"
+        );
+        assert_eq!(
+            local_item.identity.media_key,
+            playlist_item.identity.media_key
+        );
+        assert_eq!(
+            playlist_item.identity.view_origin,
+            Some(ViewOrigin::Playlist("favourites".to_string()))
+        );
+        assert!(local_item.uri.is_empty());
+        assert!(playlist_item.uri.is_empty());
+        assert_eq!(remote_item.uri, "https://media.invalid/stream");
+    }
+
+    #[test]
+    fn managed_source_queue_capture_preserves_epoch_and_stays_pathless() {
+        let remote = projected_row("native/remote.id", "");
+        remote.set_source_session_epoch(77);
+
+        let captured = item_from_row("https://server.invalid", &remote, 0);
+
+        assert_eq!(
+            captured.identity.media_key.track_id.as_str(),
+            "native/remote.id"
+        );
+        assert_eq!(captured.source_session_epoch(), Some(77));
+        assert!(captured.uri().is_empty());
+        assert!(captured.cover_art_url.is_empty());
+
+        let direct = item_from_row(
+            "https://another.invalid",
+            &projected_row("direct", "https://media.invalid/direct"),
+            0,
+        );
+        assert_eq!(direct.source_session_epoch(), None);
+        assert_eq!(direct.uri(), "https://media.invalid/direct");
+    }
+
+    #[test]
+    fn radio_queue_capture_discards_a_projected_locator_and_retains_view_identity() {
+        let radio = projected_row("Case/Sensitive Station ID", "https://radio.invalid/live");
+        radio.set_source_session_epoch(88);
+
+        let captured = item_from_row(super::super::radio::TOP_VOTE_SOURCE_KEY, &radio, 0);
+
+        assert_eq!(
+            captured.identity.media_key.source_id,
+            SourceId::radio_browser()
+        );
+        assert_eq!(
+            captured.identity.view_origin,
+            Some(ViewOrigin::Radio("top-voted".to_string()))
+        );
+        assert_eq!(captured.source_session_epoch(), Some(88));
+        assert!(captured.uri().is_empty());
+    }
+
+    #[test]
+    fn managed_source_item_cannot_bypass_resolution_with_a_cached_uri() {
+        let mut session = PlaybackSession::default();
+        let mut remote = protected_item("https://server.invalid", "native/remote.id");
+        remote.uri = "https://media.invalid/should-not-load".to_string();
+        assert!(session.replace_queue(vec![remote], 0));
+
+        let (output, output_state) = RecordingOutput::new(0);
+        assert!(session.load_current_direct(&output).is_none());
+        assert!(output_state.borrow().loads.is_empty());
+        assert!(output_state.borrow().generations.is_empty());
     }
 
     #[test]
@@ -1198,7 +2318,106 @@ mod tests {
         assert_eq!(ids(&session), ["a", "b", "c"]);
 
         assert_eq!(session.advance(RepeatMode::Off, false), Some(2));
-        assert_eq!(session.current_identity().unwrap().track_id, "c");
+        assert_eq!(current_id(&session), "c");
+    }
+
+    #[test]
+    fn production_snapshot_survives_sort_filter_navigation_and_owns_output_events() {
+        let source_key = "fixture-device-a";
+        let store = gtk::gio::ListStore::new::<TrackObject>();
+        for id in ["a", "b", "c"] {
+            store.append(&playback_row(id));
+        }
+        let captured = capture_visible_queue(&store, source_key, 1).expect("visible B is captured");
+        assert_eq!(
+            captured
+                .items
+                .iter()
+                .map(|entry| entry.identity.media_key.track_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(captured.items, captured.selected_index));
+        let (output, output_state) = RecordingOutput::new(0);
+        let first = session
+            .load_current_direct(&output)
+            .expect("captured B reaches the output");
+        assert!(first.accepted);
+        let stale_b_event = crate::audio::PlayerEvent::ended(first.generation);
+        assert_eq!(
+            current_source(&session),
+            SourceId::removable(source_key).expect("fixture source ID")
+        );
+        assert_eq!(current_id(&session), "b");
+
+        // Exercise the same ListModel projection boundary consumed from
+        // production's SortListModel, without constructing a display-bound
+        // GTK widget/model in headless CI.
+        store.remove_all();
+        for id in ["c", "b", "a"] {
+            store.append(&playback_row(id));
+        }
+        assert_eq!(
+            (0..store.n_items())
+                .map(|index| {
+                    store
+                        .item(index)
+                        .and_downcast::<TrackObject>()
+                        .expect("sorted TrackObject")
+                        .track_id()
+                })
+                .collect::<Vec<_>>(),
+            ["c", "b", "a"]
+        );
+
+        // Browser filtering rebuilds the underlying projection. Remove B and
+        // prove Next still follows the playback-owned A/B/C snapshot.
+        store.remove(1);
+        assert_eq!(store.n_items(), 2);
+        assert_eq!(session.advance(RepeatMode::Off, false), Some(2));
+        let c_load = session
+            .load_current_direct(&output)
+            .expect("filtered-out queue neighbor does not retarget Next");
+        assert!(c_load.accepted);
+        assert_eq!(current_id(&session), "c");
+        assert!(!session.accepts_event_generation(stale_b_event.generation()));
+        assert!(session.accepts_event_generation(c_load.generation));
+
+        // Sidebar navigation replaces the projection and source key, but does
+        // not install a queue until the user explicitly starts one there.
+        store.remove_all();
+        store.append(&playback_row("remote-x"));
+        let remote_projection =
+            capture_visible_queue(&store, "remote-server", 0).expect("remote view captures");
+        assert_eq!(
+            remote_projection.items[0].identity.media_key.source_id,
+            SourceId::removable("remote-server").expect("replacement source ID")
+        );
+        assert_eq!(session.previous(RepeatMode::Off, false), Some(1));
+        let b_again = session
+            .load_current_direct(&output)
+            .expect("Previous loads B from the local snapshot, not remote view");
+        assert_eq!(
+            current_source(&session),
+            SourceId::removable(source_key).expect("fixture source ID")
+        );
+        assert_eq!(current_id(&session), "b");
+        assert!(session.accepts_event_generation(b_again.generation));
+        assert_eq!(
+            output_state.borrow().loads,
+            [
+                "file:///music/b.flac",
+                "file:///music/c.flac",
+                "file:///music/b.flac"
+            ]
+        );
+
+        stop_owned_playback(&mut session, &output);
+        assert!(!session.has_current());
+        assert!(!session.accepts_event_generation(b_again.generation));
+        assert_eq!(output_state.borrow().stops, 1);
     }
 
     #[test]
@@ -1213,7 +2432,7 @@ mod tests {
         let filtered_view = ["a", "c"];
         assert!(!filtered_view.contains(&"b"));
         assert_eq!(session.advance(RepeatMode::Off, false), Some(1));
-        assert_eq!(session.current_identity().unwrap().track_id, "b");
+        assert_eq!(current_id(&session), "b");
     }
 
     #[test]
@@ -1223,11 +2442,11 @@ mod tests {
 
         let active_view_source = "remote-server";
         assert_ne!(
-            session.current_identity().unwrap().source_id,
-            active_view_source
+            current_source(&session),
+            SourceId::removable(active_view_source).expect("source ID")
         );
-        assert_eq!(session.current_identity().unwrap().source_id, "local");
-        assert_eq!(session.current_identity().unwrap().track_id, "track-a");
+        assert_eq!(current_source(&session), SourceId::local());
+        assert_eq!(current_id(&session), "track-a");
     }
 
     #[test]
@@ -1243,11 +2462,11 @@ mod tests {
         ));
 
         assert_eq!(session.advance(RepeatMode::Off, false), None);
-        assert_eq!(session.current_identity().unwrap().track_id, "c");
+        assert_eq!(current_id(&session), "c");
         assert_eq!(session.advance(RepeatMode::All, false), Some(0));
-        assert_eq!(session.current_identity().unwrap().track_id, "a");
+        assert_eq!(current_id(&session), "a");
         assert_eq!(session.previous(RepeatMode::All, false), Some(2));
-        assert_eq!(session.current_identity().unwrap().track_id, "c");
+        assert_eq!(current_id(&session), "c");
     }
 
     #[test]
@@ -1257,8 +2476,7 @@ mod tests {
         let mut repeat_one = PlaybackSession::default();
         assert!(repeat_one.replace_queue(queue.clone(), 1));
         // EOS repeat-one calls replay_current and does not move the cursor.
-        let replayed = repeat_one.current_identity().cloned();
-        assert_eq!(replayed.unwrap().track_id, "b");
+        assert_eq!(current_id(&repeat_one), "b");
 
         let mut repeat_off = PlaybackSession::default();
         assert!(repeat_off.replace_queue(queue.clone(), 1));
@@ -1267,7 +2485,7 @@ mod tests {
         let mut repeat_all = PlaybackSession::default();
         assert!(repeat_all.replace_queue(queue, 1));
         assert_eq!(repeat_all.advance(RepeatMode::All, false), Some(0));
-        assert_eq!(repeat_all.current_identity().unwrap().track_id, "a");
+        assert_eq!(current_id(&repeat_all), "a");
     }
 
     #[test]
@@ -1285,17 +2503,194 @@ mod tests {
         let mut visited = HashSet::from(["a".to_string()]);
         for _ in 0..2 {
             assert!(session.advance(RepeatMode::Off, true).is_some());
-            visited.insert(session.current_identity().unwrap().track_id.clone());
+            visited.insert(current_id(&session).to_string());
         }
         assert_eq!(visited, HashSet::from(["a".into(), "b".into(), "c".into()]));
         assert_eq!(session.advance(RepeatMode::Off, true), None);
 
-        // Repeat-all starts another shuffle cycle instead of ending.
-        assert!(session.advance(RepeatMode::All, true).is_some());
+        // Repeat-all starts a complete new cycle and does not immediately
+        // repeat the item at the rollover boundary.
+        let rollover_from = session.current_index.expect("current index");
+        let first = session
+            .advance(RepeatMode::All, true)
+            .expect("repeat-all begins another cycle");
+        assert_ne!(first, rollover_from);
+        let state = session.shuffle.as_ref().expect("shuffle state");
+        assert_eq!(state.remaining.len(), 2);
+        assert!(state.remaining.contains(&rollover_from));
+
+        let mut second_cycle = HashSet::from([first]);
+        for _ in 0..2 {
+            second_cycle.insert(
+                session
+                    .advance(RepeatMode::All, true)
+                    .expect("the complete repeat cycle remains available"),
+            );
+        }
+        assert_eq!(second_cycle, HashSet::from([0, 1, 2]));
     }
 
     #[test]
-    fn shuffled_previous_follows_play_history() {
+    fn shuffled_previous_and_next_walk_exact_occurrence_history() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![
+                item("source", "a"),
+                item("source", "b"),
+                item("source", "c"),
+                item("source", "d"),
+                item("source", "e"),
+                item("source", "f"),
+                item("source", "g"),
+                item("source", "h"),
+            ],
+            0,
+        ));
+
+        let mut actual = vec![0];
+        for _ in 0..4 {
+            actual.push(
+                session
+                    .advance(RepeatMode::Off, true)
+                    .expect("unvisited shuffle occurrence"),
+            );
+        }
+
+        for expected in actual[1..4].iter().rev() {
+            assert_eq!(session.previous(RepeatMode::All, true), Some(*expected));
+        }
+        for expected in &actual[2..=4] {
+            assert_eq!(
+                session.advance(RepeatMode::Off, true),
+                Some(*expected),
+                "fixed forward history precedes another random draw"
+            );
+        }
+
+        let drawn = session
+            .advance(RepeatMode::Off, true)
+            .expect("an unvisited random occurrence follows forward history");
+        assert!(!actual.contains(&drawn));
+    }
+
+    #[test]
+    fn shuffle_history_is_bounded_and_never_fabricates_a_predecessor() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![
+                item("source", "a"),
+                item("source", "b"),
+                item("source", "c"),
+                item("source", "d"),
+            ],
+            0,
+        ));
+
+        let mut actual = vec![0];
+        for _ in 0..40 {
+            actual.push(
+                session
+                    .advance(RepeatMode::All, true)
+                    .expect("repeat-all keeps selecting occurrences"),
+            );
+            let state = session.shuffle.as_ref().expect("shuffle state");
+            assert!(state.history.len() <= SHUFFLE_TIMELINE_CAPACITY);
+            assert!(state.cursor < state.history.len());
+        }
+
+        let retained = actual[actual.len() - SHUFFLE_TIMELINE_CAPACITY..].to_vec();
+        assert_eq!(
+            session
+                .shuffle
+                .as_ref()
+                .expect("shuffle state")
+                .history
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            retained
+        );
+
+        for expected in retained[..SHUFFLE_PRIOR_LIMIT].iter().rev() {
+            assert_eq!(session.previous(RepeatMode::All, true), Some(*expected));
+        }
+        let boundary = session.shuffle.clone();
+        assert_eq!(session.previous(RepeatMode::All, true), None);
+        assert_eq!(
+            session.shuffle, boundary,
+            "the retained boundary is a no-op"
+        );
+
+        for expected in &retained[1..] {
+            assert_eq!(session.advance(RepeatMode::Off, true), Some(*expected));
+        }
+    }
+
+    #[test]
+    fn duplicate_tracks_remain_distinct_shuffle_occurrences() {
+        let mut first = item("source", "duplicate");
+        first.occurrence = 0;
+        let other = item("source", "other");
+        let mut duplicate = item("source", "duplicate");
+        duplicate.occurrence = 1;
+
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![first, other, duplicate], 0));
+        let mut visited = vec![(0, 0)];
+        for _ in 0..2 {
+            let index = session
+                .advance(RepeatMode::Off, true)
+                .expect("distinct queue occurrence");
+            visited.push((index, session.current().expect("current").occurrence));
+        }
+        assert_eq!(
+            visited
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<HashSet<_>>(),
+            HashSet::from([0, 1, 2])
+        );
+        assert!(visited.contains(&(0, 0)));
+        assert!(visited.contains(&(2, 1)));
+
+        let previous = visited[1];
+        assert_eq!(session.previous(RepeatMode::Off, true), Some(previous.0));
+        assert_eq!(session.current().expect("current").occurrence, previous.1);
+        assert_eq!(session.advance(RepeatMode::Off, true), Some(visited[2].0));
+        assert_eq!(session.current().expect("current").occurrence, visited[2].1);
+    }
+
+    #[test]
+    fn one_and_two_item_shuffle_repeat_semantics_are_explicit() {
+        let mut one = PlaybackSession::default();
+        assert!(one.replace_queue(vec![item("source", "only")], 0));
+        assert_eq!(one.advance(RepeatMode::Off, true), None);
+        assert_eq!(one.advance(RepeatMode::One, true), None);
+        for _ in 0..20 {
+            assert_eq!(one.advance(RepeatMode::All, true), Some(0));
+        }
+        assert_eq!(
+            one.shuffle.as_ref().expect("shuffle state").history.len(),
+            SHUFFLE_TIMELINE_CAPACITY
+        );
+        for _ in 0..SHUFFLE_PRIOR_LIMIT {
+            assert_eq!(one.previous(RepeatMode::All, true), Some(0));
+        }
+        assert_eq!(one.previous(RepeatMode::All, true), None);
+
+        let mut two = PlaybackSession::default();
+        assert!(two.replace_queue(vec![item("source", "left"), item("source", "right")], 0,));
+        assert_eq!(two.advance(RepeatMode::Off, true), Some(1));
+        assert_eq!(two.advance(RepeatMode::One, true), None);
+        assert_eq!(two.previous(RepeatMode::All, true), Some(0));
+        assert_eq!(two.advance(RepeatMode::Off, true), Some(1));
+        for expected in [0, 1, 0, 1, 0, 1] {
+            assert_eq!(two.advance(RepeatMode::All, true), Some(expected));
+        }
+    }
+
+    #[test]
+    fn shuffle_toggle_resets_navigation_but_preserves_the_current_item() {
         let mut session = PlaybackSession::default();
         assert!(session.replace_queue(
             vec![
@@ -1306,25 +2701,251 @@ mod tests {
             0,
         ));
         assert!(session.advance(RepeatMode::Off, true).is_some());
-        let previous_id = session.current_identity().unwrap().track_id.clone();
+        let current = session.current_index;
+        assert!(session.shuffle.is_some());
+
+        // Either button transition deliberately starts a fresh traversal.
+        session.reset_shuffle_navigation();
+        assert_eq!(session.current_index, current);
+        assert!(session.shuffle.is_none());
+        assert_eq!(session.previous(RepeatMode::All, true), None);
+        assert_eq!(session.current_index, current);
+
+        session.reset_shuffle_navigation();
+        let current = session.current_index.expect("current");
+        let expected = if current + 1 < session.queue.len() {
+            current + 1
+        } else {
+            0
+        };
+        assert_eq!(session.advance(RepeatMode::All, false), Some(expected));
+        assert!(session.shuffle.is_none());
+    }
+
+    #[test]
+    fn rejected_navigation_before_output_handoff_restores_all_shuffle_state() {
+        let mut original = PlaybackSession::default();
+        assert!(original.replace_queue(
+            vec![
+                item("source", "a"),
+                item("source", "b"),
+                item("source", "c"),
+                item("source", "d"),
+            ],
+            0,
+        ));
+        assert!(original.advance(RepeatMode::Off, true).is_some());
+        assert!(original.advance(RepeatMode::Off, true).is_some());
+        let expected_index = original.current_index;
+        let expected_shuffle = original.shuffle.clone();
+        let session = RefCell::new(original);
+
+        assert!(!navigate_and_play(
+            &session,
+            |session| session.advance(RepeatMode::Off, true),
+            || false,
+        ));
+        assert_eq!(session.borrow().current_index, expected_index);
+        assert_eq!(session.borrow().shuffle, expected_shuffle);
+
+        assert!(!navigate_and_play(
+            &session,
+            |session| session.previous(RepeatMode::All, true),
+            || false,
+        ));
+        assert_eq!(session.borrow().current_index, expected_index);
+        assert_eq!(session.borrow().shuffle, expected_shuffle);
+
+        // Once an output handoff is initiated, the selected occurrence is a
+        // committed retry target; synchronous output rejection is handled by
+        // the existing retry state rather than rolling navigation back.
+        assert!(navigate_and_play(
+            &session,
+            |session| session.advance(RepeatMode::Off, true),
+            || true,
+        ));
+        assert_ne!(session.borrow().current_index, expected_index);
+    }
+
+    #[test]
+    fn queue_lifecycle_resets_and_non_navigation_updates_preserve_shuffle_history() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![item("local", "a"), item("local", "b"), item("local", "c")],
+            0,
+        ));
         assert!(session.advance(RepeatMode::Off, true).is_some());
-        assert!(session.previous(RepeatMode::Off, true).is_some());
-        assert_eq!(session.current_identity().unwrap().track_id, previous_id);
+        let history = session.shuffle.clone();
+
+        assert_eq!(refresh(&mut session, "a", refreshed_metadata()), 1);
+        assert_eq!(session.shuffle, history);
+        let pending = session.begin_pending_resolution();
+        assert!(session.accepts_event_generation(pending));
+        assert!(session.cancel_pending_resolution_for_retry());
+        assert_eq!(
+            session.shuffle, history,
+            "pending-resolution Pause preserves navigation"
+        );
+        assert!(!session.clear_if_source("another-source"));
+        assert_eq!(session.shuffle, history);
+
+        assert!(session.replace_queue(vec![item("source", "replacement")], 0));
+        assert!(session.shuffle.is_none(), "a new queue resets history");
+
+        assert!(session.replace_queue(vec![item("source", "a"), item("source", "b")], 0,));
+        assert!(session.advance(RepeatMode::Off, true).is_some());
+        assert!(session.clear_if_source("source"));
+        assert!(
+            session.shuffle.is_none(),
+            "source retirement resets history"
+        );
+
+        assert!(session.replace_queue(vec![item("source", "a"), item("source", "b")], 0,));
+        assert!(session.advance(RepeatMode::Off, true).is_some());
+        let (output, output_state) = RecordingOutput::new(0);
+        stop_owned_playback(&mut session, &output);
+        assert!(session.shuffle.is_none(), "Stop resets history");
+        assert_eq!(output_state.borrow().stops, 1);
+    }
+
+    #[test]
+    fn shared_previous_dispatch_pins_threshold_step_and_boundary_restart() {
+        let steps = Cell::new(0);
+        let restarts = Cell::new(0);
+        assert_eq!(
+            dispatch_previous(
+                PREVIOUS_RESTART_THRESHOLD_MS + 1,
+                || {
+                    steps.set(steps.get() + 1);
+                    true
+                },
+                || restarts.set(restarts.get() + 1),
+            ),
+            PreviousDispatch::Restarted
+        );
+        assert_eq!(steps.get(), 0);
+        assert_eq!(restarts.get(), 1);
+
+        assert_eq!(
+            dispatch_previous(
+                PREVIOUS_RESTART_THRESHOLD_MS,
+                || {
+                    steps.set(steps.get() + 1);
+                    true
+                },
+                || restarts.set(restarts.get() + 1),
+            ),
+            PreviousDispatch::Stepped
+        );
+        assert_eq!(steps.get(), 1);
+        assert_eq!(restarts.get(), 1);
+
+        assert_eq!(
+            dispatch_previous(
+                0,
+                || {
+                    steps.set(steps.get() + 1);
+                    false
+                },
+                || restarts.set(restarts.get() + 1),
+            ),
+            PreviousDispatch::Restarted
+        );
+        assert_eq!(steps.get(), 2);
+        assert_eq!(restarts.get(), 2);
+    }
+
+    #[test]
+    fn a_restart_then_early_previous_walks_the_real_shuffle_timeline() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![
+                item("source", "a"),
+                item("source", "b"),
+                item("source", "c")
+            ],
+            0,
+        ));
+        assert!(session.advance(RepeatMode::Off, true).is_some());
+        let state = session.shuffle.as_ref().expect("shuffle state");
+        let expected_previous = state.history[state.cursor - 1];
+        let current = session.current_index;
+        let restarts = Cell::new(0);
+
+        assert_eq!(
+            dispatch_previous(
+                PREVIOUS_RESTART_THRESHOLD_MS + 1,
+                || session.previous(RepeatMode::All, true).is_some(),
+                || restarts.set(restarts.get() + 1),
+            ),
+            PreviousDispatch::Restarted
+        );
+        assert_eq!(session.current_index, current);
+
+        assert_eq!(
+            dispatch_previous(
+                0,
+                || session.previous(RepeatMode::All, true).is_some(),
+                || restarts.set(restarts.get() + 1),
+            ),
+            PreviousDispatch::Stepped
+        );
+        assert_eq!(session.current_index, Some(expected_previous));
+        assert_eq!(restarts.get(), 1);
     }
 
     #[test]
     fn external_file_is_a_one_item_queue() {
         let mut session = PlaybackSession::default();
-        let external = QueueItem::external(
+        let external = QueueItem::direct_for_test(
             "file:///tmp/example.flac".to_string(),
             "Example".to_string(),
             "Artist".to_string(),
             "Album".to_string(),
         );
+        let first_source = external.identity.media_key.source_id;
+        let first_track = external.identity.media_key.track_id.clone();
+        let another = QueueItem::direct_for_test(
+            "file:///tmp/example.flac".to_string(),
+            "Example".to_string(),
+            "Artist".to_string(),
+            "Album".to_string(),
+        );
+        assert_ne!(first_source, another.identity.media_key.source_id);
+        assert_ne!(first_track, another.identity.media_key.track_id);
+        assert_ne!(first_track.as_str(), first_source.to_string());
         assert!(session.replace_queue(vec![external], 0));
-        assert_eq!(session.current_identity().unwrap().source_id, "external");
+        assert_eq!(current_source(&session), first_source);
+        assert_ne!(current_source(&session), SourceId::local());
         assert_eq!(session.advance(RepeatMode::Off, false), None);
         assert_eq!(session.advance(RepeatMode::All, false), Some(0));
+    }
+
+    #[test]
+    fn managed_external_queue_is_pathless_epoch_bound_and_terminally_owned() {
+        let source_id = SourceId::external();
+        let external = QueueItem::external_for_test(source_id, 73);
+        assert!(external.uri().is_empty());
+        assert_eq!(external.source_session_epoch(), Some(73));
+
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![external], 0));
+        assert_eq!(session.current_external_source_id(), Some(source_id));
+        let generation = session.begin_pending_resolution();
+        assert!(session.accepts_event_generation(generation));
+        assert_eq!(
+            session.external_source_for_terminal(generation, false),
+            Some(source_id)
+        );
+        assert_eq!(session.external_source_for_terminal(generation, true), None);
+
+        session.clear();
+        assert_eq!(session.current_external_source_id(), None);
+        assert!(!session.accepts_event_generation(generation));
+        assert_eq!(
+            session.external_source_for_terminal(generation, false),
+            None
+        );
     }
 
     #[test]
@@ -1350,6 +2971,64 @@ mod tests {
         assert!(!session.accepts_event_generation(retired_generation));
         assert!(!session.has_current());
         assert!(session.queue.is_empty());
+    }
+
+    #[test]
+    fn playlist_view_origin_is_separate_from_local_media_identity() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item("playlist:favourites", "local-track")], 0));
+        let generation = session.begin_pending_resolution();
+        let identity = session.current_identity().expect("identity");
+        assert_eq!(identity.media_key.source_id, SourceId::local());
+        assert_eq!(
+            identity.view_origin,
+            Some(ViewOrigin::Playlist("favourites".to_string()))
+        );
+
+        assert!(!session.clear_if_source("playlist:other"));
+        assert!(!session.clear_if_source("playlist:favourites"));
+        assert!(session.accepts_event_generation(generation));
+        assert!(session.clear_if_source(LOCAL_SOURCE_KEY));
+        assert!(!session.has_current());
+
+        assert!(session.replace_queue(vec![item(LOCAL_SOURCE_KEY, "local-track")], 0));
+        assert!(!session.clear_if_source("playlist:favourites"));
+        assert!(session.has_current());
+    }
+
+    #[test]
+    fn radio_queries_share_media_namespace_but_not_view_ownership() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item("radio-topvote", "station-uuid")], 0));
+        let identity = session.current_identity().expect("identity");
+        assert_eq!(identity.media_key.source_id, SourceId::radio_browser());
+        assert_eq!(
+            identity.view_origin,
+            Some(ViewOrigin::Radio("top-voted".to_string()))
+        );
+        assert!(!session.clear_if_source("radio-nearme"));
+        assert!(!session.clear_if_source("radio-topvote"));
+        assert!(session.clear_if_source(&SourceId::radio_browser().to_string()));
+        assert!(queue_view("radio-attacker-defined").is_none());
+    }
+
+    #[test]
+    fn removable_queue_identity_is_namespaced_by_logical_device() {
+        let device = "device:uuid:01234567-89ab-cdef-0123-456789abcdef";
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![item(device, "unix:4172746973742f547261636b2e666c6163")],
+            0
+        ));
+        let identity = session.current_identity().expect("identity");
+        assert_eq!(
+            identity.media_key.source_id,
+            SourceId::removable(device).expect("device source ID")
+        );
+        assert_eq!(
+            identity.media_key.track_id.as_str(),
+            "unix:4172746973742f547261636b2e666c6163"
+        );
     }
 
     #[test]
@@ -1421,13 +3100,13 @@ mod tests {
     }
 
     #[test]
-    fn protected_output_error_retries_resolution_but_direct_error_does_not() {
+    fn accepted_resolved_output_error_retries_identity_but_plain_direct_error_does_not() {
         let mut protected = PlaybackSession::default();
         assert!(protected.replace_queue(vec![protected_item("remote", "a")], 0));
         let failed_load = protected.begin_pending_resolution();
         assert!(protected.finish_pending_resolution(failed_load));
 
-        assert!(protected.mark_protected_load_failed(failed_load));
+        assert!(protected.mark_resolved_load_failed(failed_load));
         assert!(protected.resolution_failed);
         assert!(!protected.accepts_event_generation(failed_load));
         let retry = protected.begin_pending_resolution();
@@ -1435,19 +3114,47 @@ mod tests {
 
         let mut daap = PlaybackSession::default();
         let mut daap_item = item("daap-source", "a");
-        daap_item.uri =
-            "daap://00000000-0000-4000-8000-000000000001/stream/1?format=mp3".to_string();
+        daap_item.uri.clear();
+        daap_item.source_session_epoch = Some(9);
         assert!(daap.replace_queue(vec![daap_item], 0));
         let daap_load = daap.begin_event_generation();
-        assert!(daap.mark_protected_load_failed(daap_load));
+        assert!(daap.mark_resolved_load_failed(daap_load));
         assert!(daap.resolution_failed);
 
+        let mut local = PlaybackSession::default();
+        assert!(local.replace_queue(vec![item("local", "a")], 0));
+        let local_load = local.begin_pending_resolution();
+        assert!(local.finish_pending_resolution(local_load));
+        assert!(local.mark_resolved_load_failed(local_load));
+        assert!(local.resolution_failed);
+
         let mut direct = PlaybackSession::default();
-        assert!(direct.replace_queue(vec![item("local", "a")], 0));
+        assert!(direct.replace_queue(vec![item("radio", "a")], 0));
         let direct_load = direct.begin_event_generation();
-        assert!(!direct.mark_protected_load_failed(direct_load));
+        assert!(!direct.mark_resolved_load_failed(direct_load));
         assert!(!direct.resolution_failed);
         assert!(direct.accepts_event_generation(direct_load));
+    }
+
+    #[test]
+    fn synchronous_load_rejection_keeps_exact_direct_generation_retryable() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item("local", "a")], 0));
+        let rejected = session.begin_event_generation();
+
+        assert!(session.mark_load_rejected(rejected));
+        assert!(session.resolution_failed);
+        assert!(session.accepts_event_generation(rejected));
+        assert!(
+            !session.mark_resolved_load_failed(rejected),
+            "synchronous refusal has no output state to stop"
+        );
+
+        let retry = session.begin_event_generation();
+        assert_ne!(retry, rejected);
+        assert!(!session.resolution_failed);
+        assert!(!session.mark_load_rejected(rejected));
+        assert!(session.mark_load_rejected(retry));
     }
 
     #[test]
@@ -1490,6 +3197,494 @@ mod tests {
     }
 
     #[test]
+    fn history_is_local_only_and_playlist_rows_keep_exact_library_identity() {
+        let mut local = PlaybackSession::default();
+        assert!(local.replace_queue(
+            vec![history_item("local", "library-track", Some(20_000))],
+            0,
+        ));
+        let local_history = local.history_occurrence.as_ref().expect("local history");
+        assert_eq!(local_history.track_id.as_str(), "library-track");
+        assert_eq!(local_history.progress.threshold_ms(), 10_000);
+
+        let mut playlist = PlaybackSession::default();
+        assert!(playlist.replace_queue(
+            vec![history_item(
+                "playlist:favourites",
+                "projected-library-track",
+                Some(9_001),
+            )],
+            0,
+        ));
+        let playlist_history = playlist
+            .history_occurrence
+            .as_ref()
+            .expect("playlist projection is local");
+        assert_eq!(
+            playlist_history.track_id.as_str(),
+            "projected-library-track"
+        );
+        assert_eq!(playlist_history.progress.threshold_ms(), 4_501);
+
+        for remote in [
+            item("subsonic-source", "library-track"),
+            item("removable-drive", "library-track"),
+            QueueItem::external_for_test(SourceId::random(), 9),
+        ] {
+            let mut session = PlaybackSession::default();
+            assert!(session.replace_queue(vec![remote], 0));
+            assert!(session.history_occurrence.is_none());
+            let generation = session.begin_event_generation();
+            assert!(!session.mark_history_load_accepted(generation));
+        }
+    }
+
+    #[test]
+    fn history_requires_a_current_successfully_accepted_delivery() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![history_item("local", "pending", Some(20_000))], 0,));
+
+        let pending = session.begin_pending_resolution();
+        assert!(!session.mark_history_load_accepted(pending));
+        assert_eq!(
+            session.observe_history_event(&PlayerEvent::state(pending, PlayerState::Playing)),
+            None
+        );
+        assert_eq!(
+            observe_position(&mut session, pending, 20_000, 20_000),
+            None
+        );
+
+        assert!(session.finish_pending_resolution(pending));
+        assert_eq!(
+            observe_position(&mut session, pending, 20_000, 20_000),
+            None
+        );
+        assert!(session.mark_history_load_accepted(pending));
+        observe_playing(&mut session, pending);
+        assert_eq!(observe_position(&mut session, pending, 0, 20_000), None);
+        assert_eq!(
+            observe_position(&mut session, pending, 10_000, 20_000)
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("pending")
+        );
+
+        let stale = pending;
+        let retry = session.begin_event_generation();
+        assert_ne!(retry, stale);
+        assert_eq!(observe_position(&mut session, stale, 20_000, 20_000), None);
+
+        assert!(session.mark_load_rejected(retry));
+        assert_eq!(
+            session.observe_history_event(&PlayerEvent::state(retry, PlayerState::Playing)),
+            None
+        );
+        assert_eq!(observe_position(&mut session, retry, 20_000, 20_000), None);
+    }
+
+    #[test]
+    fn direct_load_acceptance_is_wired_but_rejection_cannot_earn_credit() {
+        let mut accepted_item = history_item("local", "accepted", Some(2));
+        accepted_item.uri = "file:///music/accepted.flac".to_string();
+        let mut accepted = PlaybackSession::default();
+        assert!(accepted.replace_queue(vec![accepted_item], 0));
+        let (output, _) = RecordingOutput::new(0);
+        let load = accepted
+            .load_current_direct(&output)
+            .expect("direct test load");
+        assert!(load.accepted);
+        observe_playing(&mut accepted, load.generation);
+        assert_eq!(observe_position(&mut accepted, load.generation, 0, 2), None);
+        assert_eq!(
+            observe_position(&mut accepted, load.generation, 1, 2)
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("accepted")
+        );
+
+        let mut rejected_item = history_item("local", "rejected", Some(2));
+        rejected_item.uri = "file:///music/rejected.flac".to_string();
+        let mut rejected = PlaybackSession::default();
+        assert!(rejected.replace_queue(vec![rejected_item], 0));
+        let (output, _) = RecordingOutput::new(1);
+        let load = rejected
+            .load_current_direct(&output)
+            .expect("rejected direct test load");
+        assert!(!load.accepted);
+        assert_eq!(
+            rejected
+                .observe_history_event(&PlayerEvent::state(load.generation, PlayerState::Playing,)),
+            None
+        );
+        assert_eq!(observe_position(&mut rejected, load.generation, 2, 2), None);
+        assert_eq!(
+            rejected
+                .history_occurrence
+                .as_ref()
+                .map(|history| history.progress.credited_ms()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn queue_duration_is_frozen_and_first_output_duration_can_complete_unknown_media() {
+        let mut known = PlaybackSession::default();
+        assert!(known.replace_queue(vec![history_item("local", "known", Some(20_000))], 0,));
+        let generation = accept_history_load(&mut known);
+        observe_playing(&mut known, generation);
+        assert_eq!(observe_position(&mut known, generation, 0, 1_000), None);
+        assert_eq!(observe_position(&mut known, generation, 9_999, 1_000), None);
+        assert_eq!(
+            observe_position(&mut known, generation, 10_000, 1_000)
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("known"),
+            "output duration cannot replace positive queue metadata"
+        );
+
+        let mut unknown = PlaybackSession::default();
+        assert!(unknown.replace_queue(vec![history_item("local", "unknown", None)], 0));
+        let generation = accept_history_load(&mut unknown);
+        assert_eq!(observe_position(&mut unknown, generation, 0, 10_000), None);
+        assert_eq!(
+            observe_position(&mut unknown, generation, 5_000, 10_000)
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("unknown"),
+            "first position proves playback and supplies the first positive duration"
+        );
+    }
+
+    #[test]
+    fn pause_buffer_and_missing_playing_state_reanchor_without_jump_credit() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![history_item("local", "remote-like", Some(20_000))], 0,));
+        let generation = accept_history_load(&mut session);
+
+        assert_eq!(
+            session.observe_history_event(&PlayerEvent::state(generation, PlayerState::Buffering,)),
+            None
+        );
+        assert_eq!(
+            observe_position(&mut session, generation, 2_000, 20_000),
+            None
+        );
+        assert_eq!(
+            session
+                .history_occurrence
+                .as_ref()
+                .map(|history| history.progress.credited_ms()),
+            Some(0),
+            "the first tick proves playback but only re-anchors"
+        );
+        assert_eq!(
+            observe_position(&mut session, generation, 6_000, 20_000),
+            None
+        );
+
+        assert_eq!(
+            session.observe_history_event(&PlayerEvent::state(generation, PlayerState::Paused,)),
+            None
+        );
+        assert_eq!(
+            observe_position(&mut session, generation, 9_000, 20_000),
+            None
+        );
+        assert_eq!(
+            observe_position(&mut session, generation, 10_000, 20_000),
+            None
+        );
+        assert_eq!(
+            observe_position(&mut session, generation, 11_000, 20_000),
+            None
+        );
+        assert_eq!(
+            session
+                .history_occurrence
+                .as_ref()
+                .map(|history| history.progress.credited_ms()),
+            Some(4_000),
+            "multiple advancing remote polls while paused earn no credit"
+        );
+
+        assert_eq!(
+            session.observe_history_event(&PlayerEvent::state(generation, PlayerState::Stopped,)),
+            None
+        );
+        assert_eq!(
+            observe_position(&mut session, generation, 12_000, 20_000),
+            None
+        );
+        assert_eq!(
+            observe_position(&mut session, generation, 13_000, 20_000),
+            None
+        );
+        assert_eq!(
+            session
+                .history_occurrence
+                .as_ref()
+                .map(|history| history.progress.credited_ms()),
+            Some(4_000),
+            "Stopped also suppresses advancing remote polls"
+        );
+
+        assert_eq!(
+            session.observe_history_event(&PlayerEvent::state(generation, PlayerState::Playing,)),
+            None
+        );
+        assert_eq!(
+            observe_position(&mut session, generation, 14_000, 20_000),
+            None,
+            "explicit Playing re-anchors before restoring credit"
+        );
+        assert_eq!(
+            observe_position(&mut session, generation, 20_000, 20_000)
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("remote-like")
+        );
+    }
+
+    #[test]
+    fn failed_delivery_retry_retains_credit_but_reanchors_new_generation() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![history_item("local", "retry", Some(20_000))], 0,));
+        let first = accept_history_load(&mut session);
+        observe_playing(&mut session, first);
+        assert_eq!(observe_position(&mut session, first, 0, 20_000), None);
+        assert_eq!(observe_position(&mut session, first, 4_000, 20_000), None);
+        assert_eq!(
+            session.observe_history_event(&PlayerEvent::error(first, "failed")),
+            None
+        );
+        assert_eq!(observe_position(&mut session, first, 20_000, 20_000), None);
+
+        let retry = accept_history_load(&mut session);
+        assert_ne!(retry, first);
+        assert_eq!(observe_position(&mut session, retry, 9_000, 20_000), None);
+        assert_eq!(observe_position(&mut session, retry, 14_999, 20_000), None);
+        assert_eq!(
+            observe_position(&mut session, retry, 15_000, 20_000)
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("retry"),
+            "retry keeps four seconds of credit but not the delivery jump"
+        );
+    }
+
+    #[test]
+    fn explicit_seek_uses_actual_anchor_and_forward_seek_suppresses_unknown_eos() {
+        let mut skipped = PlaybackSession::default();
+        assert!(skipped.replace_queue(vec![history_item("local", "skipped", None)], 0));
+        let generation = accept_history_load(&mut skipped);
+        observe_playing(&mut skipped, generation);
+        assert_eq!(observe_position(&mut skipped, generation, 0, 0), None);
+        assert_eq!(observe_position(&mut skipped, generation, 1_000, 0), None);
+        assert!(skipped.observe_history_seek(generation, 1_500, 10_000));
+        assert!(skipped
+            .history_occurrence
+            .as_ref()
+            .is_some_and(|history| history.progress.observed_forward_skip()));
+        assert_eq!(
+            skipped.observe_history_event(&PlayerEvent::ended(generation)),
+            None
+        );
+
+        let mut restarted = PlaybackSession::default();
+        assert!(restarted.replace_queue(vec![history_item("local", "restarted", None)], 0));
+        let generation = accept_history_load(&mut restarted);
+        assert!(restarted.observe_history_seek(generation, 2_000, 0));
+        assert_eq!(
+            restarted
+                .observe_history_event(&PlayerEvent::ended(generation))
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("restarted"),
+            "a backward Previous restart is not skip evidence"
+        );
+        assert!(!restarted.observe_history_seek(generation.next(), 0, 1_000));
+    }
+
+    #[test]
+    fn repeat_one_failure_rolls_back_only_its_tentative_history_occurrence() {
+        let mut playback = PlaybackSession::default();
+        assert!(playback.replace_queue(
+            vec![history_item("local", "repeat-rollback", Some(20_000))],
+            0,
+        ));
+        let generation = accept_history_load(&mut playback);
+        observe_playing(&mut playback, generation);
+        assert_eq!(observe_position(&mut playback, generation, 0, 20_000), None);
+        assert_eq!(
+            observe_position(&mut playback, generation, 4_000, 20_000),
+            None
+        );
+        let previous_occurrence = playback
+            .history_occurrence
+            .clone()
+            .expect("current local occurrence");
+        let session = RefCell::new(playback);
+
+        assert!(!replay_current_occurrence(&session, || {
+            let session = session.borrow();
+            let tentative = session
+                .history_occurrence
+                .as_ref()
+                .expect("tentative repeat occurrence");
+            assert_ne!(tentative, &previous_occurrence);
+            assert_eq!(session.event_generation, generation);
+            false
+        }));
+
+        let session = session.borrow();
+        assert_eq!(session.event_generation, generation);
+        assert_eq!(
+            session
+                .current()
+                .map(|item| item.identity.media_key.track_id.as_str()),
+            Some("repeat-rollback")
+        );
+        assert_eq!(
+            session.history_occurrence.as_ref(),
+            Some(&previous_occurrence)
+        );
+    }
+
+    #[test]
+    fn next_previous_repeat_all_and_repeat_one_create_fresh_occurrences() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![
+                history_item("local", "a", Some(2)),
+                history_item("local", "b", Some(2)),
+            ],
+            0,
+        ));
+        let first_a = accept_history_load(&mut session);
+        assert_eq!(observe_position(&mut session, first_a, 0, 2), None);
+        assert_eq!(
+            observe_position(&mut session, first_a, 1, 2)
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("a")
+        );
+
+        assert_eq!(session.advance(RepeatMode::Off, false), Some(1));
+        assert_eq!(
+            session
+                .history_occurrence
+                .as_ref()
+                .map(|h| h.track_id.as_str()),
+            Some("b")
+        );
+        assert_eq!(
+            session.observe_history_event(&PlayerEvent::ended(first_a)),
+            None
+        );
+        let first_b = accept_history_load(&mut session);
+        assert_eq!(observe_position(&mut session, first_b, 0, 2), None);
+        assert_eq!(
+            observe_position(&mut session, first_b, 1, 2)
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("b")
+        );
+
+        assert_eq!(session.previous(RepeatMode::Off, false), Some(0));
+        let second_a = accept_history_load(&mut session);
+        assert_eq!(observe_position(&mut session, second_a, 0, 2), None);
+        assert_eq!(
+            observe_position(&mut session, second_a, 1, 2)
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("a")
+        );
+
+        assert_eq!(session.previous(RepeatMode::All, false), Some(1));
+        let wrapped_b = accept_history_load(&mut session);
+        assert_eq!(observe_position(&mut session, wrapped_b, 0, 2), None);
+        assert_eq!(
+            observe_position(&mut session, wrapped_b, 1, 2)
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("b")
+        );
+
+        session.begin_repeat_one_occurrence();
+        assert_eq!(
+            session.observe_history_event(&PlayerEvent::ended(wrapped_b)),
+            None
+        );
+        let repeated_b = accept_history_load(&mut session);
+        assert_eq!(observe_position(&mut session, repeated_b, 0, 2), None);
+        assert_eq!(
+            observe_position(&mut session, repeated_b, 1, 2)
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("b")
+        );
+
+        let mut one = PlaybackSession::default();
+        assert!(one.replace_queue(vec![history_item("local", "one", Some(2))], 0));
+        let first = accept_history_load(&mut one);
+        assert_eq!(observe_position(&mut one, first, 0, 2), None);
+        assert!(observe_position(&mut one, first, 1, 2).is_some());
+        assert_eq!(one.advance(RepeatMode::All, false), Some(0));
+        let repeated = accept_history_load(&mut one);
+        assert_eq!(observe_position(&mut one, repeated, 0, 2), None);
+        assert_eq!(
+            observe_position(&mut one, repeated, 1, 2)
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("one")
+        );
+    }
+
+    #[test]
+    fn known_and_unknown_eos_follow_contract_and_count_only_once() {
+        let mut known = PlaybackSession::default();
+        assert!(known.replace_queue(vec![history_item("local", "known-eos", Some(20_000))], 0,));
+        let known_generation = accept_history_load(&mut known);
+        assert_eq!(
+            known.observe_history_event(&PlayerEvent::ended(known_generation)),
+            None,
+            "known EOS never invents tail credit"
+        );
+
+        let mut unknown = PlaybackSession::default();
+        assert!(unknown.replace_queue(vec![history_item("local", "unknown-eos", None)], 0));
+        let unknown_generation = accept_history_load(&mut unknown);
+        assert_eq!(
+            unknown
+                .observe_history_event(&PlayerEvent::ended(unknown_generation))
+                .as_ref()
+                .map(TrackId::as_str),
+            Some("unknown-eos")
+        );
+        assert_eq!(
+            unknown.observe_history_event(&PlayerEvent::ended(unknown_generation)),
+            None,
+            "duplicate EOS cannot count one occurrence twice"
+        );
+    }
+
+    #[test]
+    fn clear_retires_history_and_rejects_late_events_and_seeks() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![history_item("local", "cleared", Some(2))], 0,));
+        let generation = accept_history_load(&mut session);
+        session.clear();
+
+        assert!(session.history_occurrence.is_none());
+        assert_eq!(
+            session.observe_history_event(&PlayerEvent::position(generation, 2, 2)),
+            None
+        );
+        assert!(!session.observe_history_seek(generation, 0, 1));
+    }
+
+    #[test]
     fn duplicate_track_occurrences_keep_stable_identity_but_select_distinct_rows() {
         let mut first = item("playlist:one", "same-track");
         first.row_instance_id = Some(11);
@@ -1499,7 +3694,7 @@ mod tests {
         let mut session = PlaybackSession::default();
         assert!(session.replace_queue(vec![first, second], 1));
 
-        assert_eq!(session.current_identity().unwrap().track_id, "same-track");
+        assert_eq!(current_id(&session), "same-track");
         assert_eq!(session.current().map(|item| item.occurrence), Some(1));
         assert_eq!(
             find_queue_item_position(4, "same-track", 1, Some(22), |index| {

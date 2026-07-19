@@ -44,6 +44,19 @@
   </screenshots>
 
   <releases>
+    <release version="0.5.1" date="2026-07-18">
+      <description>
+        <p>Security and reliability release:</p>
+        <ul>
+          <li>Unify remote, radio, removable, and external-file source identity and lifecycle handling</li>
+          <li>Keep backend credentials and local file paths behind retained playback-time authority</li>
+          <li>Harden library-root reconciliation, metadata writes, and transactional playlist import</li>
+          <li>Correct smart-playlist, playback, MPD, AirPlay, and Chromecast lifecycle behavior</li>
+          <li>Improve DAAP, Subsonic, Jellyfin, Plex, Radio-Browser, and removable-media reliability</li>
+          <li>Expand accessibility, native packaging verification, CI coverage, and adversarial tests</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-05-08">
       <description>
         <p>Feature release:</p>

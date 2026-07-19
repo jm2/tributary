@@ -17,6 +17,8 @@ header:
   output: "Audio-uitvoer"
   add_output: "Uitvoer toevoegen"
   main_menu: "Hoofdmenu"
+  playback_position: "Afspeelpositie"
+  volume: "Volume"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -123,6 +125,8 @@ dialogs:
   output_name_placeholder: "Woonkamer MPD"
   output_host: "Host"
   output_port: "Poort"
+  output_exclusive_control_warning: "MPD-opdrachten voor pauzeren, stoppen, herhalen, willekeurig, enkel en verbruiken beïnvloeden de hele afspeelpartitie. Deel deze niet met een andere controller of Tributary-instantie."
+  output_exclusive_control_confirmation: "Ik bevestig dat Tributary exclusieve controle over deze MPD-afspeelpartitie heeft."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -168,6 +172,8 @@ context:
   properties: "Eigenschappen…"
   add_to_playlist: "Toevoegen aan afspeellijst"
   remove_from_playlist: "Verwijderen uit afspeellijst"
+  playlist_add_unsupported_heading: "Nummers zijn niet toegevoegd"
+  playlist_add_unsupported_body: "Op dit moment kunnen alleen nummers uit de lokale bibliotheek van Tributary aan afspeellijsten worden toegevoegd. Er is niets uit deze bron toegevoegd."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:
@@ -223,6 +229,7 @@ errors:
     audio_output_failed: "De audio-uitvoer is mislukt"
     playback_failed: "Het afspelen van audio is mislukt"
     airplay_raopsink_missing: "AirPlay vereist het GStreamer-element raopsink – installeer het pakket gst-plugins-bad en start Tributary opnieuw"
+    mpd_exclusive_control_required: "Voeg deze MPD-uitvoer opnieuw toe, bevestig exclusieve partitiecontrole en selecteer deze opnieuw vóór het afspelen"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

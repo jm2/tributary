@@ -26,6 +26,7 @@ pub struct Model {
     pub sample_rate_hz: Option<i32>,
     pub format: Option<String>,
     pub play_count: i32,
+    pub last_played_at_ms: Option<i64>,
     pub date_added: String,
     pub date_modified: String,
     pub file_size_bytes: Option<i64>,

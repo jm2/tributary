@@ -22,7 +22,9 @@ Quick-exit modes (run one task and exit):
   --clippy          Run cargo clippy in --all-targets (debug, with tests) and
                     --release modes; pedantic + nursery groups are configured
                     via [lints.clippy] in Cargo.toml.
-  --coverage        Run `cargo llvm-cov` summary (installs cargo-llvm-cov if needed).
+  --coverage        Run a comprehensive informational summary with the active
+                    Rust toolchain. The authoritative pinned line gate runs in
+                    CI (installs the pinned cargo-llvm-cov release if needed).
 
 Packaging:
   --flatpak         Build a Flatpak bundle (requires flatpak, flatpak-builder,
@@ -149,13 +151,18 @@ if $CLIPPY; then
 fi
 
 if $COVERAGE; then
-  command -v cargo-llvm-cov &>/dev/null || {
-    info "Installing cargo-llvm-cov..."
-    cargo install cargo-llvm-cov --locked
-  }
-  info "Running code coverage..."
-  cargo llvm-cov --summary-only \
-    --ignore-filename-regex '(ui/|jellyfin/|plex/|subsonic/|radio/|db/migration|desktop_integration/|main\.rs)'
+  required_coverage_version="cargo-llvm-cov 0.8.7"
+  installed_coverage_version="$(cargo llvm-cov --version 2>/dev/null || true)"
+  if [[ "${installed_coverage_version}" != "${required_coverage_version}" ]]; then
+    info "Installing cargo-llvm-cov 0.8.7..."
+    cargo install cargo-llvm-cov --version 0.8.7 --locked --force
+  fi
+  [[ "$(cargo llvm-cov --version)" == "${required_coverage_version}" ]] || \
+    error "cargo-llvm-cov 0.8.7 is required for reproducible coverage"
+
+  rust_host="$(rustc -vV | sed -n 's/^host: //p')"
+  info "Running comprehensive informational coverage for ${rust_host} with the active Rust toolchain..."
+  cargo llvm-cov --all-targets --all-features --locked --summary-only
   exit 0
 fi
 

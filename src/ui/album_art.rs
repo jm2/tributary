@@ -14,6 +14,12 @@ use gtk::glib;
 const REMOTE_ART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_REMOTE_ART_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_ROUTED_ART_CLIENTS: usize = 64;
+/// Raw MP4 fallback is intentionally bounded: unlike Lofty's tag parser it
+/// scans a complete file image. Ordinary parsing remains available above this
+/// limit, but a malformed or unusually large file cannot force an unbounded
+/// allocation merely because the format-specific fallback was reached.
+const MAX_RAW_MP4_FALLBACK_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_LOCAL_EMBEDDED_ART_BYTES: usize = 32 * 1024 * 1024;
 
 /// Global generation counter for album art requests.  Incremented on
 /// every track change; the worker checks this before sending results
@@ -125,16 +131,7 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
                                     }
                                 },
                             };
-                            let mut endpoint = resolved.endpoint().clone();
-                            {
-                                let mut query = endpoint.query_pairs_mut();
-                                for (key, value) in resolved.private_query_pairs() {
-                                    query.append_pair(key, value);
-                                }
-                            }
-                            client
-                                .get(endpoint)
-                                .headers(resolved.sensitive_headers().clone())
+                            build_resolved_art_request(&client, resolved)
                         }
                     };
 
@@ -184,15 +181,15 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
     .as_ref()
 }
 
-/// Extract embedded album art from a track's file and display it on the
-/// header bar image widget.  Falls back to the generic placeholder icon
-/// if no art is found or the URI is not a local file.
+/// Extract embedded album art from a direct file URI and display it on the
+/// header bar image widget.
 ///
-/// Tag reading is performed on a background thread to avoid blocking
-/// the GTK main loop — large FLAC files can take hundreds of ms to parse.
-pub fn update_album_art(image: &gtk::Image, uri: &str) {
+/// This transitional path is retained for removable-media rows until their
+/// at-use adapter provides retained file authority. Local-library, playlist,
+/// and OS-opened external playback use [`update_resolved_file_album_art`]
+/// instead.
+pub fn update_direct_file_album_art(image: &gtk::Image, uri: &str) {
     let generation = next_generation();
-    // Only attempt extraction for local file:// URIs.
     let path = match url::Url::parse(uri) {
         Ok(u) if u.scheme() == "file" => match u.to_file_path() {
             Ok(p) => p,
@@ -207,235 +204,344 @@ pub fn update_album_art(image: &gtk::Image, uri: &str) {
         }
     };
 
-    // Set placeholder immediately while extracting on background thread.
     image.set_icon_name(Some("audio-x-generic-symbolic"));
-    let image = image.clone();
-
-    let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
-
-    // Extract album art bytes on a background thread to avoid blocking GTK.
-    std::thread::spawn(move || {
-        if let Some(bytes) = extract_album_art_bytes(&path) {
-            if generation_is_current(generation) {
-                let _ = tx.send_blocking(bytes);
-            }
-        }
+    let reply_rx = enqueue_local_art_job(generation, move || {
+        extract_direct_file_album_art_bytes(&path)
     });
+    display_local_album_art_reply(image, reply_rx, generation);
+}
 
-    // Receive on the GTK main thread and create the texture.
-    glib::MainContext::default().spawn_local(async move {
-        if let Ok(data) = rx.recv().await {
+/// Extract embedded art through an exact retained local-file capability.
+///
+/// The background reader clones the already-authorized file handle; it never
+/// receives or reopens the database pathname. Keeping `media` owned by the job
+/// also retains its root, marker, ancestor, and exact-file authority through
+/// the complete parse.
+pub fn update_resolved_file_album_art(
+    image: &gtk::Image,
+    media: crate::local::resolver::ResolvedLocalMedia,
+) {
+    let generation = next_generation();
+    image.set_icon_name(Some("audio-x-generic-symbolic"));
+    let reply_rx = enqueue_local_art_job(generation, move || {
+        extract_resolved_file_album_art_bytes(&media)
+    });
+    display_local_album_art_reply(image, reply_rx, generation);
+}
+
+fn enqueue_local_art_job<F>(generation: u64, extract: F) -> async_channel::Receiver<Vec<u8>>
+where
+    F: FnOnce() -> Option<Vec<u8>> + Send + 'static,
+{
+    let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
+    let spawn_result = std::thread::Builder::new()
+        .name("local-art-worker".into())
+        .spawn(move || {
             if !generation_is_current(generation) {
                 return;
             }
-            let bytes = glib::Bytes::from(&data);
-            if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
-                image.set_paintable(Some(&texture));
+            if let Some(bytes) = extract() {
+                if generation_is_current(generation) {
+                    let _ = tx.send_blocking(bytes);
+                }
+            }
+        });
+    if let Err(error) = spawn_result {
+        tracing::warn!(%error, "Failed to spawn local album-art worker");
+    }
+    rx
+}
+
+fn display_local_album_art_reply(
+    image: &gtk::Image,
+    reply_rx: async_channel::Receiver<Vec<u8>>,
+    generation: u64,
+) {
+    let image = image.clone();
+    glib::MainContext::default().spawn_local(async move {
+        if let Ok(data) = reply_rx.recv().await {
+            if generation_is_current(generation) {
+                let bytes = glib::Bytes::from_owned(data);
+                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
+                    image.set_paintable(Some(&texture));
+                }
             }
         }
     });
+}
+
+fn extract_direct_file_album_art_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    let mut file = std::fs::File::open(path).ok()?;
+    extract_album_art_bytes(&mut file, extension)
+}
+
+fn extract_resolved_file_album_art_bytes(
+    media: &crate::local::resolver::ResolvedLocalMedia,
+) -> Option<Vec<u8>> {
+    let extension = media.extension().map(str::to_owned);
+    media
+        .with_serialized_seekable_file(|mut file| {
+            extract_album_art_bytes(&mut file, extension.as_deref())
+        })
+        .ok()
+        .flatten()
+}
+
+fn bounded_local_art_bytes(data: &[u8], max_bytes: usize) -> Option<Vec<u8>> {
+    if data.is_empty() || data.len() > max_bytes {
+        return None;
+    }
+    Some(data.to_vec())
 }
 
 /// Extract the first embedded picture from an audio file as raw bytes.
 ///
 /// This is a blocking operation — call from a background thread only.
-fn extract_album_art_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+fn extract_album_art_bytes(file: &mut std::fs::File, extension: Option<&str>) -> Option<Vec<u8>> {
     use lofty::file::TaggedFileExt;
+    use std::io::{BufReader, Seek, SeekFrom};
 
-    let tagged_file = lofty::read_from_path(path).ok()?;
-
-    // ── Attempt 1: unified pictures() API ───────────────────────
-    for tag in tagged_file.tags() {
-        if let Some(picture) = tag.pictures().first() {
-            return Some(picture.data().to_vec());
-        }
+    fn rewind(file: &mut std::fs::File) -> Option<()> {
+        file.seek(SeekFrom::Start(0)).ok()?;
+        Some(())
     }
 
-    // ── Attempt 2: MP4/M4A-specific fallback ────────────────────
-    // lofty's unified `pictures()` API may not expose MP4 atom-based
-    // cover art on all platforms.  Re-read with an explicit MP4 file
-    // type hint and also try the Ilst (iTunes metadata) tag directly.
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if matches!(
-        ext.to_lowercase().as_str(),
-        "m4a" | "m4b" | "m4p" | "mp4" | "aac"
-    ) {
+    fn read_tagged(
+        file: &mut std::fs::File,
+        extension: Option<&str>,
+    ) -> Option<lofty::file::TaggedFile> {
+        use lofty::config::ParseOptions;
         use lofty::file::FileType;
         use lofty::probe::Probe;
 
-        if let Ok(probe) = Probe::open(path) {
-            let probe = probe.set_file_type(FileType::Mp4);
-            if let Ok(tagged) = probe.read() {
-                // Try unified pictures() on the re-read file.
-                for tag in tagged.tags() {
-                    if let Some(picture) = tag.pictures().first() {
-                        return Some(picture.data().to_vec());
-                    }
+        rewind(file)?;
+        let reader = BufReader::new(file);
+        let options = ParseOptions::new().read_properties(false);
+        match extension.and_then(FileType::from_ext) {
+            Some(file_type) => Probe::with_file_type(reader, file_type)
+                .options(options)
+                .read()
+                .ok(),
+            None => Probe::new(reader)
+                .options(options)
+                .guess_file_type()
+                .ok()?
+                .read()
+                .ok(),
+        }
+    }
+
+    fn extract(file: &mut std::fs::File, extension: Option<&str>) -> Option<Vec<u8>> {
+        use lofty::config::ParseOptions;
+        use lofty::file::FileType;
+        use lofty::probe::Probe;
+
+        // ── Attempt 1: unified pictures() API ───────────────────
+        if let Some(tagged_file) = read_tagged(file, extension) {
+            for tag in tagged_file.tags() {
+                if let Some(picture) = tag.pictures().first() {
+                    return bounded_local_art_bytes(picture.data(), MAX_LOCAL_EMBEDDED_ART_BYTES);
                 }
             }
         }
 
-        // Attempt 3: Read the raw MP4 file and look for the `covr` atom
-        // directly.  Some M4A files (especially Apple-encoded) store art
-        // in a way that lofty's tag abstraction doesn't surface.
-        if let Ok(data) = std::fs::read(path) {
-            if let Some(art) = extract_mp4_covr_atom(&data) {
-                return Some(art);
-            }
-        }
-    }
-
-    None
-}
-
-/// Brute-force search for the `covr` atom in raw MP4 data.
-///
-/// The iTunes `covr` atom stores cover art as:
-///   [4-byte size][4-byte "data"][8-byte flags][image bytes]
-/// nested inside `moov.udta.meta.ilst.covr`.
-///
-/// This is a last-resort fallback when lofty's tag parser doesn't
-/// expose the picture through its unified API.
-fn extract_mp4_covr_atom(data: &[u8]) -> Option<Vec<u8>> {
-    // Walk the MP4 atom tree following the standard iTunes metadata
-    // path: moov → udta → meta → ilst → covr → data.
-    //
-    // This structured approach handles Apple-encoded files where:
-    //  - The `meta` atom has a 4-byte version/flags prefix (full-box)
-    //  - Atoms use extended 64-bit sizes
-    //  - The `covr` atom is deeply nested
-    //
-    // Falls back to a brute-force scan if the structured walk fails.
-
-    /// Read the size and 4-byte tag of an atom at `offset`.
-    /// Returns `(total_size, tag_bytes, header_len)` or `None`.
-    fn read_atom_header(data: &[u8], offset: usize) -> Option<(usize, [u8; 4], usize)> {
-        if offset + 8 > data.len() {
+        // ── Attempt 2: MP4/M4A-specific fallback ────────────────
+        // Preserve the existing extension-gated behavior without recovering
+        // a path. Every attempt rewinds the exact retained handle because OS
+        // clones may share their file cursor.
+        let extension = extension.unwrap_or_default();
+        if !matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "m4a" | "m4b" | "m4p" | "mp4" | "aac"
+        ) {
             return None;
         }
-        let size32 = u32::from_be_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]) as usize;
-        let mut tag = [0u8; 4];
-        tag.copy_from_slice(&data[offset + 4..offset + 8]);
 
-        if size32 == 1 {
-            // Extended 64-bit size.
-            if offset + 16 > data.len() {
-                return None;
+        rewind(file)?;
+        let probe = Probe::with_file_type(BufReader::new(&mut *file), FileType::Mp4)
+            .options(ParseOptions::new().read_properties(false));
+        if let Ok(tagged) = probe.read() {
+            for tag in tagged.tags() {
+                if let Some(picture) = tag.pictures().first() {
+                    return bounded_local_art_bytes(picture.data(), MAX_LOCAL_EMBEDDED_ART_BYTES);
+                }
             }
-            let size64 = u64::from_be_bytes([
-                data[offset + 8],
-                data[offset + 9],
-                data[offset + 10],
-                data[offset + 11],
-                data[offset + 12],
-                data[offset + 13],
-                data[offset + 14],
-                data[offset + 15],
-            ]) as usize;
-            Some((size64, tag, 16))
-        } else if size32 == 0 {
-            // Atom extends to end of file.
-            Some((data.len() - offset, tag, 8))
-        } else {
-            Some((size32, tag, 8))
         }
+
+        // Attempt 3 scans the same retained file object for a raw `covr`
+        // atom. A pathname replacement cannot retarget this fallback.
+        rewind(file)?;
+        extract_raw_mp4_fallback(
+            file,
+            MAX_RAW_MP4_FALLBACK_BYTES,
+            MAX_LOCAL_EMBEDDED_ART_BYTES,
+        )
     }
 
-    /// Find a child atom with the given tag inside `data[start..end]`.
-    /// `meta_adjust` adds extra bytes after the header for the `meta`
-    /// full-box version/flags field.
-    fn find_atom(
+    let result = extract(file, extension);
+    // Leave the shared OS cursor in a deterministic state for any later clone.
+    let _ = file.seek(SeekFrom::Start(0));
+    result
+}
+
+fn extract_raw_mp4_fallback(
+    file: &mut std::fs::File,
+    max_file_bytes: u64,
+    max_art_bytes: usize,
+) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let file_size = file.metadata().ok()?.len();
+    if file_size > max_file_bytes {
+        return None;
+    }
+    let capacity = usize::try_from(file_size).ok()?;
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut data = Vec::with_capacity(capacity);
+    let read_limit = max_file_bytes.checked_add(1)?;
+    (&mut *file).take(read_limit).read_to_end(&mut data).ok()?;
+    if u64::try_from(data.len()).ok()? > max_file_bytes {
+        return None;
+    }
+    extract_mp4_covr_atom(&data, max_art_bytes)
+}
+
+/// Checked raw search for the first bounded iTunes `covr` picture.
+///
+/// The structured walk covers `moov.udta.meta.ilst.covr.data`; a checked tag
+/// search retains the historical non-standard nesting fallback. Every offset,
+/// atom size, extended-size conversion, and image allocation is bounded.
+fn extract_mp4_covr_atom(data: &[u8], max_art_bytes: usize) -> Option<Vec<u8>> {
+    #[derive(Clone, Copy)]
+    struct AtomBounds {
+        tag: [u8; 4],
+        body_start: usize,
+        end: usize,
+    }
+
+    fn atom_header(data: &[u8], offset: usize, parent_end: usize) -> Option<AtomBounds> {
+        let base_header_end = offset.checked_add(8)?;
+        if base_header_end > parent_end || base_header_end > data.len() {
+            return None;
+        }
+        let size32 = u32::from_be_bytes(data.get(offset..offset.checked_add(4)?)?.try_into().ok()?);
+        let tag = data
+            .get(offset.checked_add(4)?..base_header_end)?
+            .try_into()
+            .ok()?;
+        let (size, header_len) = match size32 {
+            0 => (parent_end.checked_sub(offset)?, 8_usize),
+            1 => {
+                let extended_end = offset.checked_add(16)?;
+                if extended_end > parent_end || extended_end > data.len() {
+                    return None;
+                }
+                let raw =
+                    u64::from_be_bytes(data.get(base_header_end..extended_end)?.try_into().ok()?);
+                (usize::try_from(raw).ok()?, 16_usize)
+            }
+            size => (usize::try_from(size).ok()?, 8_usize),
+        };
+        if size < header_len {
+            return None;
+        }
+        let end = offset.checked_add(size)?;
+        if end > parent_end || end > data.len() {
+            return None;
+        }
+        Some(AtomBounds {
+            tag,
+            body_start: offset.checked_add(header_len)?,
+            end,
+        })
+    }
+
+    fn child_atom(
         data: &[u8],
         start: usize,
         end: usize,
         target: &[u8; 4],
-        meta_adjust: bool,
-    ) -> Option<(usize, usize)> {
-        let mut pos = start;
-        while pos < end {
-            let (size, tag, hdr) = read_atom_header(data, pos)?;
-            if size == 0 || pos + size > end {
-                break;
+        body_prefix: usize,
+    ) -> Option<AtomBounds> {
+        if start > end || end > data.len() {
+            return None;
+        }
+        let mut offset = start;
+        while offset < end {
+            let mut atom = atom_header(data, offset, end)?;
+            if &atom.tag == target {
+                atom.body_start = atom.body_start.checked_add(body_prefix)?;
+                if atom.body_start > atom.end {
+                    return None;
+                }
+                return Some(atom);
             }
-            if &tag == target {
-                let body_start = if meta_adjust {
-                    pos + hdr + 4
-                } else {
-                    pos + hdr
-                };
-                return Some((body_start, pos + size));
+            if atom.end <= offset {
+                return None;
             }
-            pos += size;
+            offset = atom.end;
         }
         None
     }
 
-    // Structured walk: moov → udta → meta → ilst → covr → data
-    if let Some((moov_body, moov_end)) = find_atom(data, 0, data.len(), b"moov", false) {
-        if let Some((udta_body, udta_end)) = find_atom(data, moov_body, moov_end, b"udta", false) {
-            // `meta` is a full-box: 4 extra bytes (version + flags) after the header.
-            if let Some((meta_body, meta_end)) = find_atom(data, udta_body, udta_end, b"meta", true)
-            {
-                if let Some((ilst_body, ilst_end)) =
-                    find_atom(data, meta_body, meta_end, b"ilst", false)
-                {
-                    if let Some((covr_body, covr_end)) =
-                        find_atom(data, ilst_body, ilst_end, b"covr", false)
-                    {
-                        // Inside `covr`, find the `data` atom.
-                        if let Some((data_body, data_end)) =
-                            find_atom(data, covr_body, covr_end, b"data", false)
-                        {
-                            // The `data` atom body starts with 8 bytes of
-                            // type indicator + locale (flags/reserved).
-                            let img_start = data_body + 8;
-                            if img_start < data_end {
-                                return Some(data[img_start..data_end].to_vec());
+    fn picture_bytes(data: &[u8], atom: AtomBounds, max_art_bytes: usize) -> Option<Vec<u8>> {
+        let start = atom.body_start.checked_add(8)?;
+        let length = atom.end.checked_sub(start)?;
+        if length == 0 || length > max_art_bytes {
+            return None;
+        }
+        bounded_local_art_bytes(data.get(start..atom.end)?, max_art_bytes)
+    }
+
+    fn next_tag(data: &[u8], start: usize, end: usize, target: &[u8; 4]) -> Option<usize> {
+        data.get(start..end)?
+            .windows(target.len())
+            .position(|candidate| candidate == target)
+            .and_then(|relative| start.checked_add(relative))
+    }
+
+    let structured = (|| {
+        let moov = child_atom(data, 0, data.len(), b"moov", 0)?;
+        let udta = child_atom(data, moov.body_start, moov.end, b"udta", 0)?;
+        let meta = child_atom(data, udta.body_start, udta.end, b"meta", 4)?;
+        let ilst = child_atom(data, meta.body_start, meta.end, b"ilst", 0)?;
+        let covr = child_atom(data, ilst.body_start, ilst.end, b"covr", 0)?;
+        let picture = child_atom(data, covr.body_start, covr.end, b"data", 0)?;
+        picture_bytes(data, picture, max_art_bytes)
+    })();
+    if structured.is_some() {
+        return structured;
+    }
+
+    let mut covr_search = 4_usize;
+    while let Some(covr_tag) = next_tag(data, covr_search, data.len(), b"covr") {
+        let covr_start = covr_tag.checked_sub(4)?;
+        if let Some(covr) = atom_header(data, covr_start, data.len()) {
+            if &covr.tag == b"covr" {
+                let mut data_search = covr.body_start.checked_add(4)?;
+                while data_search < covr.end {
+                    let Some(data_tag) = next_tag(data, data_search, covr.end, b"data") else {
+                        break;
+                    };
+                    let Some(data_start) = data_tag.checked_sub(4) else {
+                        break;
+                    };
+                    if let Some(picture) = atom_header(data, data_start, covr.end) {
+                        if &picture.tag == b"data" {
+                            if let Some(bytes) = picture_bytes(data, picture, max_art_bytes) {
+                                return Some(bytes);
                             }
                         }
                     }
+                    let Some(next_search) = data_tag.checked_add(4) else {
+                        break;
+                    };
+                    data_search = next_search;
                 }
             }
         }
-    }
-
-    // Fallback: brute-force scan for any `covr` atom in the raw data.
-    // This catches files with non-standard atom nesting.
-    let covr_tag = b"covr";
-    let data_tag = b"data";
-
-    for i in 4..data.len().saturating_sub(8) {
-        if &data[i..i + 4] == covr_tag {
-            let covr_size =
-                u32::from_be_bytes([data[i - 4], data[i - 3], data[i - 2], data[i - 1]]) as usize;
-            if covr_size < 16 || i - 4 + covr_size > data.len() {
-                continue;
-            }
-
-            let covr_end = i - 4 + covr_size;
-            let inner = &data[i + 4..covr_end];
-
-            for j in 0..inner.len().saturating_sub(8) {
-                if &inner[j + 4..j + 8] == data_tag {
-                    let ds =
-                        u32::from_be_bytes([inner[j], inner[j + 1], inner[j + 2], inner[j + 3]])
-                            as usize;
-                    if ds < 16 || j + ds > inner.len() {
-                        continue;
-                    }
-                    let img_start = j + 16;
-                    let img_end = j + ds;
-                    if img_end <= inner.len() && img_start < img_end {
-                        return Some(inner[img_start..img_end].to_vec());
-                    }
-                }
-            }
-        }
+        covr_search = covr_tag.checked_add(4)?;
     }
     None
 }
@@ -492,9 +598,55 @@ fn build_routed_art_client(
     }
 }
 
+/// Build the exact protected artwork request at the last responsible moment.
+///
+/// Authentication query state and headers stay isolated on the resolved
+/// request until the worker has selected the exact-origin HTTP client. Fixed
+/// protocol headers are installed before sensitive authentication headers so
+/// the ordering matches protected stream requests.
+fn build_resolved_art_request(
+    client: &reqwest::blocking::Client,
+    resolved: &crate::architecture::media::ResolvedHttpRequest,
+) -> reqwest::blocking::RequestBuilder {
+    let mut endpoint = resolved.endpoint().clone();
+    {
+        let mut query = endpoint.query_pairs_mut();
+        for (key, value) in resolved.private_query_pairs() {
+            query.append_pair(key, value);
+        }
+    }
+
+    client
+        .get(endpoint)
+        .headers(resolved.required_headers().clone())
+        .headers(resolved.sensitive_headers().clone())
+}
+
 fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, generation: u64) {
     let image = image.clone();
 
+    let reply_rx = enqueue_art_request(source, generation);
+
+    // Receive on the GTK main thread.
+    glib::MainContext::default().spawn_local(async move {
+        if let Ok(data) = reply_rx.recv().await {
+            // Double-check generation in case another track was selected
+            // while we were waiting for the channel.
+            if generation_is_current(generation) {
+                let bytes = glib::Bytes::from_owned(data);
+                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
+                    image.set_paintable(Some(&texture));
+                }
+            }
+        }
+    });
+}
+
+/// Submit one request through the production persistent worker and return its
+/// one-shot completion. Keeping this GTK-independent makes the full
+/// request/fetch/generation boundary deterministic under headless CI; the UI
+/// callback above adds the final generation check before mutating the widget.
+fn enqueue_art_request(source: ArtSource, generation: u64) -> async_channel::Receiver<Vec<u8>> {
     let (reply_tx, reply_rx) = async_channel::bounded::<Vec<u8>>(1);
 
     // Send the request to the persistent art worker thread.
@@ -511,32 +663,371 @@ fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, generation: u
         });
     }
 
-    // Receive on the GTK main thread.
-    glib::MainContext::default().spawn_local(async move {
-        if let Ok(data) = reply_rx.recv().await {
-            // Double-check generation in case another track was selected
-            // while we were waiting for the channel.
-            if generation_is_current(generation) {
-                let bytes = glib::Bytes::from(&data);
-                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
-                    image.set_paintable(Some(&texture));
-                }
-            }
-        }
-    });
+    reply_rx
 }
 
 #[cfg(test)]
-mod generation_tests {
+mod tests {
     use super::*;
+
+    use reqwest::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION};
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::sync::{mpsc, Mutex};
+    use std::time::Duration;
+
+    static GENERATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+    const MARKER: &str = "marker:v1:00000000-0000-4000-8000-000000000001";
+    const OTHER_MARKER: &str = "marker:v1:00000000-0000-4000-8000-000000000002";
+
+    fn mp4_atom(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let atom_size = 8_usize
+            .checked_add(body.len())
+            .expect("test MP4 atom size does not overflow");
+        let size = u32::try_from(atom_size).expect("test MP4 atom size fits u32");
+        let mut atom = Vec::with_capacity(atom_size);
+        atom.extend_from_slice(&size.to_be_bytes());
+        atom.extend_from_slice(tag);
+        atom.extend_from_slice(body);
+        atom
+    }
+
+    fn mp4_with_cover_art(art: &[u8]) -> Vec<u8> {
+        let mut data_body = vec![0_u8; 8];
+        data_body.extend_from_slice(art);
+        let data = mp4_atom(b"data", &data_body);
+        let covr = mp4_atom(b"covr", &data);
+        let ilst = mp4_atom(b"ilst", &covr);
+        let mut meta_body = vec![0_u8; 4];
+        meta_body.extend_from_slice(&ilst);
+        let meta = mp4_atom(b"meta", &meta_body);
+        let udta = mp4_atom(b"udta", &meta);
+        mp4_atom(b"moov", &udta)
+    }
+
+    fn authorized_media(
+        root: &std::path::Path,
+        filename: &str,
+        bytes: &[u8],
+    ) -> crate::local::resolver::ResolvedLocalMedia {
+        let path = root.join(filename);
+        std::fs::write(&path, bytes).expect("write media fixture");
+        authorize_existing_media(root, &path)
+    }
+
+    fn authorize_existing_media(
+        root: &std::path::Path,
+        path: &std::path::Path,
+    ) -> crate::local::resolver::ResolvedLocalMedia {
+        std::fs::write(root.join(".tributary-root-id"), format!("{MARKER}\n"))
+            .expect("write root marker");
+        crate::local::resolver::ResolvedLocalMedia::from_authorized_path_for_test(
+            root, MARKER, path,
+        )
+        .expect("authorize media fixture")
+    }
+
+    fn spawn_art_fixture(
+        body: &'static [u8],
+        before_response: impl FnOnce() + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind artwork fixture");
+        let address = listener.local_addr().expect("artwork fixture address");
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept artwork request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set artwork fixture read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("set artwork fixture write timeout");
+
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                assert_eq!(stream.read(&mut byte).expect("read artwork request"), 1);
+                request.push(byte[0]);
+                assert!(request.len() <= 16 * 1024, "artwork request header cap");
+            }
+            assert!(request.starts_with(b"GET /art HTTP/1.1\r\n"));
+
+            before_response();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .expect("write artwork response headers");
+            stream.write_all(body).expect("write artwork response body");
+        });
+        (format!("http://{address}/art"), thread)
+    }
 
     #[test]
     fn reset_invalidates_local_and_remote_artwork_results() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stale_generation = next_generation();
         assert!(generation_is_current(stale_generation));
 
         invalidate();
 
         assert!(!generation_is_current(stale_generation));
+    }
+
+    #[test]
+    fn delayed_local_art_result_cannot_cross_a_newer_generation() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (request_seen_tx, request_seen_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let stale_generation = next_generation();
+        let stale_reply = enqueue_local_art_job(stale_generation, move || {
+            request_seen_tx.send(()).expect("report delayed local read");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release delayed local read");
+            Some(b"stale-local-art".to_vec())
+        });
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("local artwork worker started");
+
+        let current_generation = next_generation();
+        let current_reply =
+            enqueue_local_art_job(current_generation, || Some(b"current-local-art".to_vec()));
+        release_tx.send(()).expect("release stale local read");
+
+        assert!(stale_reply.recv_blocking().is_err());
+        assert_eq!(
+            current_reply.recv_blocking().expect("current local art"),
+            b"current-local-art"
+        );
+    }
+
+    #[test]
+    fn resolved_handle_uses_lofty_for_extension_classified_flac_artwork() {
+        use lofty::config::WriteOptions;
+        use lofty::file::{FileType, TaggedFileExt};
+        use lofty::picture::{MimeType, Picture, PictureType};
+        use lofty::probe::Probe;
+        use lofty::tag::TagExt;
+        use std::io::BufReader;
+
+        let root = tempfile::tempdir().expect("temporary authority root");
+        let path = root.path().join("track.FLAC");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            ),
+            &path,
+        )
+        .expect("copy deterministic FLAC fixture");
+        let art = b"lofty-retained-handle-art";
+        let fixture_file = std::fs::File::open(&path).expect("open FLAC fixture");
+        let mut tagged = Probe::with_file_type(BufReader::new(fixture_file), FileType::Flac)
+            .read()
+            .expect("read FLAC fixture through handle");
+        if tagged.primary_tag_mut().is_none() {
+            let tag_type = tagged.primary_tag_type();
+            tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+        }
+        let tag = tagged.primary_tag_mut().expect("FLAC primary tag");
+        tag.push_picture(
+            Picture::unchecked(art.to_vec())
+                .pic_type(PictureType::CoverFront)
+                .mime_type(MimeType::Png)
+                .build(),
+        );
+        tag.save_to_path(&path, WriteOptions::default())
+            .expect("write FLAC picture");
+
+        let media = authorize_existing_media(root.path(), &path);
+        assert_eq!(
+            extract_resolved_file_album_art_bytes(&media).as_deref(),
+            Some(art.as_slice())
+        );
+    }
+
+    #[test]
+    fn raw_mp4_fallback_enforces_file_art_and_arithmetic_bounds() {
+        let art = b"bounded-art";
+        assert!(bounded_local_art_bytes(&[], art.len()).is_none());
+        assert!(bounded_local_art_bytes(art, art.len() - 1).is_none());
+        assert_eq!(
+            bounded_local_art_bytes(art, art.len()).as_deref(),
+            Some(art.as_slice())
+        );
+        let fixture = mp4_with_cover_art(art);
+        assert_eq!(
+            extract_mp4_covr_atom(&fixture, art.len()).as_deref(),
+            Some(art.as_slice())
+        );
+        assert!(extract_mp4_covr_atom(&fixture, art.len() - 1).is_none());
+
+        let root = tempfile::tempdir().expect("temporary fallback root");
+        let path = root.path().join("fallback.m4a");
+        std::fs::write(&path, &fixture).expect("write MP4 fallback fixture");
+        let mut file = std::fs::File::open(&path).expect("open MP4 fallback fixture");
+        let exact_file_limit = u64::try_from(fixture.len()).expect("fixture length fits u64");
+        assert!(extract_raw_mp4_fallback(&mut file, exact_file_limit - 1, art.len(),).is_none());
+        assert_eq!(
+            extract_raw_mp4_fallback(&mut file, exact_file_limit, art.len()).as_deref(),
+            Some(art.as_slice())
+        );
+
+        let mut extended_overflow = Vec::new();
+        extended_overflow.extend_from_slice(&1_u32.to_be_bytes());
+        extended_overflow.extend_from_slice(b"moov");
+        extended_overflow.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(extract_mp4_covr_atom(&extended_overflow, art.len()).is_none());
+    }
+
+    #[test]
+    fn local_art_extractor_rewinds_its_handle_before_and_after_parsing() {
+        use std::io::{Seek, SeekFrom};
+
+        let art = b"cursor-safe-art";
+        let fixture = mp4_with_cover_art(art);
+        let root = tempfile::tempdir().expect("temporary cursor root");
+        let path = root.path().join("cursor.m4a");
+        std::fs::write(&path, fixture).expect("write cursor fixture");
+        let mut file = std::fs::File::open(&path).expect("open cursor fixture");
+        file.seek(SeekFrom::Start(3)).expect("move fixture cursor");
+
+        assert_eq!(
+            extract_album_art_bytes(&mut file, Some("m4a")).as_deref(),
+            Some(art.as_slice())
+        );
+        assert_eq!(file.stream_position().expect("read restored cursor"), 0);
+    }
+
+    #[test]
+    fn resolved_artwork_fails_closed_after_root_authority_drift() {
+        let root = tempfile::tempdir().expect("temporary authority root");
+        let fixture = mp4_with_cover_art(b"authorized-art");
+        let media = authorized_media(root.path(), "track.m4a", &fixture);
+        assert_eq!(
+            extract_resolved_file_album_art_bytes(&media).as_deref(),
+            Some(b"authorized-art".as_slice())
+        );
+
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{OTHER_MARKER}\n"),
+        )
+        .expect("change retained marker");
+
+        assert!(extract_resolved_file_album_art_bytes(&media).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_artwork_reads_retained_file_after_path_replacement() {
+        let root = tempfile::tempdir().expect("temporary authority root");
+        let original = mp4_with_cover_art(b"original-authorized-art");
+        let replacement = mp4_with_cover_art(b"replacement-path-art");
+        let media = authorized_media(root.path(), "track.m4a", &original);
+        let path = root.path().join("track.m4a");
+        std::fs::rename(&path, root.path().join("displaced.m4a")).expect("move admitted file");
+        std::fs::write(&path, replacement).expect("install path replacement");
+
+        assert_eq!(
+            extract_resolved_file_album_art_bytes(&media).as_deref(),
+            Some(b"original-authorized-art".as_slice())
+        );
+        assert_eq!(
+            extract_direct_file_album_art_bytes(&path).as_deref(),
+            Some(b"replacement-path-art".as_slice())
+        );
+    }
+
+    #[test]
+    fn delayed_worker_result_cannot_cross_a_newer_artwork_generation() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (request_seen_tx, request_seen_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (stale_url, stale_server) = spawn_art_fixture(b"stale-art", move || {
+            request_seen_tx.send(()).expect("report delayed request");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release delayed response");
+        });
+        let (current_url, current_server) = spawn_art_fixture(b"current-art", || {});
+
+        let stale_generation = next_generation();
+        let stale_reply = enqueue_art_request(ArtSource::Url(stale_url), stale_generation);
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("production worker started delayed request");
+
+        let current_generation = next_generation();
+        let current_reply = enqueue_art_request(ArtSource::Url(current_url), current_generation);
+        release_tx.send(()).expect("release stale response");
+
+        assert!(
+            stale_reply.recv_blocking().is_err(),
+            "the worker must close a stale request without publishing its bytes"
+        );
+        assert_eq!(
+            current_reply
+                .recv_blocking()
+                .expect("current artwork bytes"),
+            b"current-art"
+        );
+        assert!(generation_is_current(current_generation));
+
+        stale_server.join().expect("join delayed artwork fixture");
+        current_server.join().expect("join current artwork fixture");
+    }
+
+    #[test]
+    fn resolved_art_request_preserves_endpoint_and_isolated_http_state() {
+        let required_name = HeaderName::from_static("client-daap-version");
+        let resolved = crate::architecture::media::ResolvedHttpRequest::new(
+            url::Url::parse("https://music.test/share/databases/1/items/42.mp3?format=original")
+                .unwrap(),
+        )
+        .unwrap()
+        .with_private_query_pair("session-id", "private-session")
+        .unwrap()
+        .with_required_header(
+            ACCEPT,
+            HeaderValue::from_static("application/x-dmap-tagged"),
+        )
+        .unwrap()
+        .with_required_header(required_name.clone(), HeaderValue::from_static("3.12"))
+        .unwrap()
+        .with_sensitive_header(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic private-authorization"),
+        )
+        .unwrap();
+
+        let request = build_resolved_art_request(&reqwest::blocking::Client::new(), &resolved)
+            .build()
+            .unwrap();
+
+        assert_eq!(request.url().path(), "/share/databases/1/items/42.mp3");
+        assert_eq!(
+            request.url().query(),
+            Some("format=original&session-id=private-session")
+        );
+        assert_eq!(
+            request.headers().get(ACCEPT).unwrap(),
+            "application/x-dmap-tagged"
+        );
+        assert_eq!(request.headers().get(&required_name).unwrap(), "3.12");
+        assert_eq!(
+            request.headers().get(AUTHORIZATION).unwrap(),
+            "Basic private-authorization"
+        );
+        assert_eq!(request.headers().len(), 3);
     }
 }

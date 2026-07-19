@@ -5,16 +5,17 @@
 //! exposes it through the unified `MediaBackend` trait.
 
 use std::collections::HashMap;
+use std::sync::RwLock as SyncRwLock;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
-use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest};
+use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest, TrackId};
 
 use super::api::{JellyfinItem, JellyfinItemsResponse, JellyfinViewsResponse};
 use super::client::JellyfinClient;
@@ -47,13 +48,10 @@ struct LibraryCache {
     tracks: Vec<Track>,
     albums: Vec<Album>,
     artists: Vec<Artist>,
-    /// Application track UUID → Jellyfin audio item ID.
-    stream_locator_by_uuid: HashMap<Uuid, String>,
-    /// Application track UUID → Jellyfin item ID with primary artwork.
-    track_artwork_locator_by_uuid: HashMap<Uuid, String>,
-    /// Jellyfin item ID → UUID we generated.
-    #[allow(dead_code)]
-    jellyfin_id_to_uuid: HashMap<String, Uuid>,
+    /// Exact Jellyfin audio item ID → stream locator.
+    stream_locator_by_track_id: HashMap<TrackId, String>,
+    /// Exact Jellyfin audio item ID → artwork item ID.
+    track_artwork_locator_by_track_id: HashMap<TrackId, String>,
 }
 
 impl LibraryCache {
@@ -62,9 +60,8 @@ impl LibraryCache {
             tracks: Vec::new(),
             albums: Vec::new(),
             artists: Vec::new(),
-            stream_locator_by_uuid: HashMap::new(),
-            track_artwork_locator_by_uuid: HashMap::new(),
-            jellyfin_id_to_uuid: HashMap::new(),
+            stream_locator_by_track_id: HashMap::new(),
+            track_artwork_locator_by_track_id: HashMap::new(),
         }
     }
 }
@@ -73,12 +70,14 @@ impl LibraryCache {
 
 /// A Jellyfin backend that implements [`MediaBackend`].
 ///
-/// Create one with [`JellyfinBackend::connect`] (API key) or
-/// [`JellyfinBackend::from_client`] (pre-authenticated client).
+/// Create one with [`JellyfinBackend::connect`] for a durable API key. An
+/// interactive AuthenticateByName client enters through the crate-private,
+/// synchronous lifecycle staging constructor.
 pub struct JellyfinBackend {
     display_name: String,
     client: JellyfinClient,
-    music_libraries: Vec<MusicLibrary>,
+    music_libraries: SyncRwLock<Vec<MusicLibrary>>,
+    initialized: Mutex<bool>,
     cache: RwLock<LibraryCache>,
 }
 
@@ -111,28 +110,48 @@ impl JellyfinBackend {
         Self::init(name, client).await
     }
 
-    /// Build from a pre-authenticated `JellyfinClient` (e.g. after
-    /// interactive login via `JellyfinClient::authenticate`).
-    pub async fn from_client(name: &str, client: JellyfinClient) -> BackendResult<Self> {
-        Self::init(name, client).await
+    /// Synchronously transfer an AuthenticateByName client into an adapter.
+    /// No network work may occur between token minting and lifecycle staging;
+    /// ping/discovery/catalogue loading runs later under the staged owner.
+    pub(crate) fn stage_authenticated(name: &str, client: JellyfinClient) -> Self {
+        Self::staged(name, client)
     }
 
     /// Shared initialisation: ping, discover, fetch library.
     async fn init(name: &str, client: JellyfinClient) -> BackendResult<Self> {
-        client.get_text("System/Ping").await?;
-        info!(server = %client.base_url(), "Jellyfin ping OK");
+        let backend = Self::staged(name, client);
+        backend.ensure_initialized().await?;
+        Ok(backend)
+    }
 
-        let mut backend = Self {
+    fn staged(name: &str, client: JellyfinClient) -> Self {
+        Self {
             display_name: name.to_string(),
             client,
-            music_libraries: Vec::new(),
+            music_libraries: SyncRwLock::new(Vec::new()),
+            initialized: Mutex::new(false),
             cache: RwLock::new(LibraryCache::empty()),
-        };
+        }
+    }
 
-        backend.music_libraries = backend.discover_music_libraries().await?;
-        backend.refresh_library().await?;
+    /// Complete all post-construction work once, after the lifecycle registry
+    /// has staged the adapter behind mandatory retirement.
+    pub(crate) async fn ensure_initialized(&self) -> BackendResult<()> {
+        let mut initialized = self.initialized.lock().await;
+        if *initialized {
+            return Ok(());
+        }
+        self.client.get_text("System/Ping").await?;
+        info!(server = %self.client.base_url(), "Jellyfin ping OK");
 
-        Ok(backend)
+        let libraries = self.discover_music_libraries().await?;
+        self.refresh_library(&libraries).await?;
+        *self
+            .music_libraries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = libraries;
+        *initialized = true;
+        Ok(())
     }
 
     /// Discover music-only libraries.
@@ -170,7 +189,7 @@ impl JellyfinBackend {
     }
 
     /// Fetch the entire music library into the in-memory cache.
-    async fn refresh_library(&self) -> BackendResult<()> {
+    async fn refresh_library(&self, music_libraries: &[MusicLibrary]) -> BackendResult<()> {
         info!("Fetching Jellyfin library...");
 
         let user_id = self.client.user_id().to_string();
@@ -179,11 +198,11 @@ impl JellyfinBackend {
         let mut all_tracks = Vec::new();
         let mut all_albums = Vec::new();
         let mut all_artists = Vec::new();
-        let mut stream_locator_by_uuid = HashMap::new();
-        let mut track_artwork_locator_by_uuid = HashMap::new();
-        let mut jellyfin_id_to_uuid = HashMap::new();
+        let mut stream_locator_by_track_id = HashMap::new();
+        let mut track_artwork_locator_by_track_id = HashMap::new();
+        let mut skipped_invalid_track_ids = 0usize;
 
-        for lib in &self.music_libraries {
+        for lib in music_libraries {
             let items_ep = items_endpoint.clone();
             let lib_id = lib.id.clone();
 
@@ -202,17 +221,21 @@ impl JellyfinBackend {
             )?;
 
             for item in &tracks {
+                let Ok(track_id) = TrackId::remote(item.id.clone()) else {
+                    skipped_invalid_track_ids += 1;
+                    continue;
+                };
                 let track_uuid = deterministic_uuid(&item.id);
                 let artist_id = item.artist_items.first().map(|a| deterministic_uuid(&a.id));
                 let album_id = item.album_id.as_deref().map(deterministic_uuid);
 
-                let track = jellyfin_item_to_track(item, track_uuid, artist_id, album_id);
+                let track =
+                    jellyfin_item_to_track(item, track_id.clone(), track_uuid, artist_id, album_id);
 
-                stream_locator_by_uuid.insert(track_uuid, item.id.clone());
+                stream_locator_by_track_id.insert(track_id.clone(), item.id.clone());
                 if let Some(album_id) = &item.album_id {
-                    track_artwork_locator_by_uuid.insert(track_uuid, album_id.clone());
+                    track_artwork_locator_by_track_id.insert(track_id, album_id.clone());
                 }
-                jellyfin_id_to_uuid.insert(item.id.clone(), track_uuid);
                 all_tracks.push(track);
             }
 
@@ -260,6 +283,7 @@ impl JellyfinBackend {
             artists = all_artists.len(),
             albums = all_albums.len(),
             tracks = all_tracks.len(),
+            skipped_invalid_track_ids,
             "Jellyfin library loaded"
         );
 
@@ -268,9 +292,8 @@ impl JellyfinBackend {
             tracks: all_tracks,
             albums: all_albums,
             artists: all_artists,
-            stream_locator_by_uuid,
-            track_artwork_locator_by_uuid,
-            jellyfin_id_to_uuid,
+            stream_locator_by_track_id,
+            track_artwork_locator_by_track_id,
         };
 
         Ok(())
@@ -340,14 +363,16 @@ impl JellyfinBackend {
         Ok(all_items)
     }
 
-    /// Return all tracks from the cache (for UI integration layer).
-    pub async fn all_tracks(&self) -> Vec<Track> {
-        self.cache.read().await.tracks.clone()
+    /// Return the music libraries discovered during init.
+    pub fn music_libraries(&self) -> Vec<MusicLibrary> {
+        self.music_libraries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
-    /// Return the music libraries discovered during init.
-    pub fn music_libraries(&self) -> &[MusicLibrary] {
-        &self.music_libraries
+    pub(crate) async fn logout_owned_session(&self) -> BackendResult<()> {
+        self.client.logout_owned_session().await
     }
 }
 
@@ -396,12 +421,17 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
         for item in &resp.items {
             match item.item_type.as_deref() {
                 Some("Audio") => {
+                    let Ok(track_id) = TrackId::remote(item.id.clone()) else {
+                        continue;
+                    };
                     let uuid = deterministic_uuid(&item.id);
                     let artist_id = item.artist_items.first().map(|a| deterministic_uuid(&a.id));
                     let album_id = item.album_id.as_deref().map(deterministic_uuid);
-                    stream_locators.push((uuid, item.id.clone()));
-                    track_artwork_locators.push((uuid, item.album_id.clone()));
-                    tracks.push(jellyfin_item_to_track(item, uuid, artist_id, album_id));
+                    stream_locators.push((track_id.clone(), item.id.clone()));
+                    track_artwork_locators.push((track_id.clone(), item.album_id.clone()));
+                    tracks.push(jellyfin_item_to_track(
+                        item, track_id, uuid, artist_id, album_id,
+                    ));
                 }
                 Some("MusicAlbum") => {
                     let uuid = deterministic_uuid(&item.id);
@@ -433,14 +463,14 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
         }
 
         let mut cache = self.cache.write().await;
-        cache.stream_locator_by_uuid.extend(stream_locators);
+        cache.stream_locator_by_track_id.extend(stream_locators);
         for (track_id, artwork_item_id) in track_artwork_locators {
             if let Some(artwork_item_id) = artwork_item_id {
                 cache
-                    .track_artwork_locator_by_uuid
+                    .track_artwork_locator_by_track_id
                     .insert(track_id, artwork_item_id);
             } else {
-                cache.track_artwork_locator_by_uuid.remove(&track_id);
+                cache.track_artwork_locator_by_track_id.remove(&track_id);
             }
         }
 
@@ -449,6 +479,10 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
             albums,
             artists,
         })
+    }
+
+    async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
+        Ok(self.cache.read().await.tracks.clone())
     }
 
     async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
@@ -513,27 +547,30 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
 
 #[async_trait]
 impl RemoteMediaResolver for JellyfinBackend {
-    async fn resolve_stream(&self, track_id: &Uuid) -> BackendResult<ResolvedHttpRequest> {
+    async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
         let item_id = self
             .cache
             .read()
             .await
-            .stream_locator_by_uuid
+            .stream_locator_by_track_id
             .get(track_id)
             .cloned()
             .ok_or_else(|| BackendError::NotFound {
                 entity_type: "track".into(),
-                id: *track_id,
+                id: deterministic_uuid(track_id.as_str()),
             })?;
         self.client.resolved_stream_request(&item_id)
     }
 
-    async fn resolve_artwork(&self, track_id: &Uuid) -> BackendResult<Option<ResolvedHttpRequest>> {
+    async fn resolve_artwork(
+        &self,
+        track_id: &TrackId,
+    ) -> BackendResult<Option<ResolvedHttpRequest>> {
         let item_id = self
             .cache
             .read()
             .await
-            .track_artwork_locator_by_uuid
+            .track_artwork_locator_by_track_id
             .get(track_id)
             .cloned();
         item_id
@@ -552,6 +589,7 @@ fn deterministic_uuid(jellyfin_id: &str) -> Uuid {
 
 fn jellyfin_item_to_track(
     item: &JellyfinItem,
+    track_id: TrackId,
     id: Uuid,
     artist_id: Option<Uuid>,
     album_id: Option<Uuid>,
@@ -573,6 +611,7 @@ fn jellyfin_item_to_track(
 
     Track {
         id,
+        native_track_id: Some(track_id),
         title: item.name.clone().unwrap_or_else(|| "Unknown".into()),
         artist_name: item
             .artist_items
@@ -603,11 +642,16 @@ fn jellyfin_item_to_track(
         sample_rate_hz,
         format: item.container.clone(),
         play_count: item.user_data.as_ref().and_then(|ud| ud.play_count),
+        last_played: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::http::{header::LOCATION, HeaderValue, StatusCode};
+
+    use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
+
     use super::*;
 
     #[test]
@@ -620,8 +664,241 @@ mod tests {
         }))
         .unwrap();
 
-        let track = jellyfin_item_to_track(&item, Uuid::new_v4(), None, None);
+        let track = jellyfin_item_to_track(
+            &item,
+            TrackId::remote("track-id").expect("track ID"),
+            Uuid::new_v4(),
+            None,
+            None,
+        );
+        assert_eq!(
+            track.native_track_id.as_ref().map(TrackId::as_str),
+            Some("track-id")
+        );
         assert!(track.stream_url.is_none());
         assert!(track.cover_art_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_fixture_connects_and_loads_one_music_library() {
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/System/Ping").reply(MockResponse::text("Jellyfin Server")),
+            MockRoute::get("/Users/fixture-user/Views").reply(MockResponse::json(
+                serde_json::json!({
+                    "Items": [
+                        {"Id": "music-library", "Name": "Music", "CollectionType": "music"},
+                        {"Id": "movie-library", "Name": "Movies", "CollectionType": "movies"}
+                    ],
+                    "TotalRecordCount": 2
+                }),
+            )),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "Audio")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [{
+                        "Id": "track-1",
+                        "Name": "Fixture Song",
+                        "Type": "Audio",
+                        "Album": "Fixture Album",
+                        "AlbumId": "album-1",
+                        "AlbumArtist": "Fixture Artist",
+                        "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}],
+                        "IndexNumber": 3,
+                        "ParentIndexNumber": 1,
+                        "RunTimeTicks": 1_230_000_000,
+                        "Genres": ["Test"],
+                        "ProductionYear": 2026,
+                        "Container": "flac",
+                        "MediaSources": [{
+                            "Bitrate": 1_411_000,
+                            "MediaStreams": [{"Type": "Audio", "SampleRate": 48_000}]
+                        }],
+                        "UserData": {"PlayCount": 4}
+                    }],
+                    "TotalRecordCount": 1
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicAlbum")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [{
+                        "Id": "album-1",
+                        "Name": "Fixture Album",
+                        "Type": "MusicAlbum",
+                        "AlbumArtist": "Fixture Artist",
+                        "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}],
+                        "ProductionYear": 2026,
+                        "Genres": ["Test"],
+                        "ChildCount": 1,
+                        "RunTimeTicks": 1_230_000_000
+                    }],
+                    "TotalRecordCount": 1
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicArtist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [{
+                        "Id": "artist-1",
+                        "Name": "Fixture Artist",
+                        "Type": "MusicArtist"
+                    }],
+                    "TotalRecordCount": 1
+                }))),
+        ])
+        .await;
+        let token = Uuid::new_v4().to_string();
+
+        let backend =
+            JellyfinBackend::connect("fixture", &service.base_url(), &token, "fixture-user")
+                .await
+                .expect("connect Jellyfin fixture");
+
+        assert_eq!(backend.music_libraries().len(), 1);
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), 1);
+        assert_eq!(cache.tracks[0].title, "Fixture Song");
+        assert_eq!(cache.albums.len(), 1);
+        assert_eq!(cache.artists.len(), 1);
+        drop(cache);
+
+        let requests = service.requests();
+        assert_eq!(requests.len(), 5);
+        for request in requests {
+            let authorization = request
+                .headers
+                .get("x-emby-authorization")
+                .and_then(|value| value.to_str().ok())
+                .expect("Jellyfin fixture request authorization");
+            assert!(authorization.contains(&format!(r#"Token="{token}""#)));
+            assert!(request.body.is_empty());
+        }
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn prefixed_backend_follows_same_origin_redirect_and_paginates() {
+        fn track(index: u32) -> serde_json::Value {
+            serde_json::json!({
+                "Id": format!("track-{index}"),
+                "Name": format!("Track {index}"),
+                "Type": "Audio",
+                "Album": "Fixture Album",
+                "AlbumId": "album-1",
+                "AlbumArtist": "Fixture Artist",
+                "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}]
+            })
+        }
+
+        let first_page = (0..PAGE_SIZE).map(track).collect::<Vec<_>>();
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/gateway/System/Ping").reply(
+                MockResponse::status(StatusCode::TEMPORARY_REDIRECT)
+                    .with_header(LOCATION, HeaderValue::from_static("/gateway/ping-result")),
+            ),
+            MockRoute::get("/gateway/ping-result").reply(MockResponse::text("Jellyfin Server")),
+            MockRoute::get("/gateway/Users/fixture-user/Views").reply(MockResponse::json(
+                serde_json::json!({
+                    "Items": [{
+                        "Id": "music-library",
+                        "Name": "Music",
+                        "CollectionType": "music"
+                    }],
+                    "TotalRecordCount": 1
+                }),
+            )),
+            MockRoute::get("/gateway/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "Audio")
+                .with_query("StartIndex", "0")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": first_page,
+                    "TotalRecordCount": PAGE_SIZE + 1
+                }))),
+            MockRoute::get("/gateway/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "Audio")
+                .with_query("StartIndex", PAGE_SIZE.to_string())
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [track(PAGE_SIZE)],
+                    "TotalRecordCount": PAGE_SIZE + 1
+                }))),
+            MockRoute::get("/gateway/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicAlbum")
+                .with_query("StartIndex", "0")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [{
+                        "Id": "album-1",
+                        "Name": "Fixture Album",
+                        "Type": "MusicAlbum",
+                        "AlbumArtist": "Fixture Artist",
+                        "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}]
+                    }],
+                    "TotalRecordCount": 1
+                }))),
+            MockRoute::get("/gateway/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicArtist")
+                .with_query("StartIndex", "0")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [{"Id": "artist-1", "Name": "Fixture Artist", "Type": "MusicArtist"}],
+                    "TotalRecordCount": 1
+                }))),
+        ])
+        .await;
+        let token = Uuid::new_v4().to_string();
+        let backend = JellyfinBackend::connect(
+            "fixture",
+            &format!("{}/gateway/", service.base_url()),
+            &token,
+            "fixture-user",
+        )
+        .await
+        .expect("prefixed paginated Jellyfin fixture");
+
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), (PAGE_SIZE + 1) as usize);
+        assert_eq!(cache.albums.len(), 1);
+        assert_eq!(cache.artists.len(), 1);
+        let first_id = cache.tracks[0]
+            .native_track_id
+            .clone()
+            .expect("fixture track retains its native ID");
+        assert_eq!(first_id.as_str(), "track-0");
+        drop(cache);
+        assert_eq!(
+            backend
+                .resolve_stream(&first_id)
+                .await
+                .expect("resolve prefixed stream")
+                .endpoint()
+                .path(),
+            "/gateway/Audio/track-0/stream"
+        );
+        assert_eq!(
+            backend
+                .resolve_artwork(&first_id)
+                .await
+                .expect("resolve prefixed artwork")
+                .expect("track artwork")
+                .endpoint()
+                .path(),
+            "/gateway/Items/album-1/Images/Primary"
+        );
+
+        let requests = service.requests();
+        assert_eq!(requests.len(), 7);
+        for request in requests {
+            let authorization = request
+                .headers
+                .get("x-emby-authorization")
+                .and_then(|value| value.to_str().ok())
+                .expect("Jellyfin fixture request authorization");
+            assert!(authorization.contains(&format!(r#"Token="{token}""#)));
+            assert!(request.headers.get(reqwest::header::REFERER).is_none());
+        }
+        service.finish().await;
     }
 }

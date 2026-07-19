@@ -4,8 +4,6 @@
 //! the network discovery service — adds/removes servers in the sidebar
 //! and AirPlay/Chromecast devices in the output selector.
 
-use std::rc::Rc;
-
 use adw::prelude::*;
 use gtk::glib;
 use tracing::info;
@@ -17,27 +15,21 @@ use super::objects::SourceObject;
 use super::window;
 use super::window_state::WindowState;
 
+fn discovery_publisher(backend_type: &str, server_url: &str) -> Option<String> {
+    let parsed = crate::http_security::parse_base_url(server_url).ok()?;
+    let canonical = crate::architecture::identity::canonical_remote_base_url(&parsed).ok()?;
+    Some(format!("discovery:{backend_type}:{canonical}"))
+}
+
 /// Wire mDNS/DNS-SD discovery: adds/removes servers in the sidebar
 /// and AirPlay/Chromecast devices in the output selector.
-pub fn setup_discovery(
-    state: &WindowState,
-    output_list: &gtk::ListBox,
-    invalidate_source_playback: Rc<dyn Fn(&str)>,
-) {
+pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
     let discovery_rx = crate::discovery::start_discovery();
     let store = state.sidebar_store.clone();
-    let rt_handle = state.rt_handle.clone();
-    let source_tracks = state.source_tracks.clone();
-    let active_source_key = state.active_source_key.clone();
-    let source_navigation = state.source_navigation.clone();
     let sidebar_selection = state.sidebar_selection.clone();
-    let track_store = state.track_store.clone();
-    let master_tracks = state.master_tracks.clone();
-    let browser_widget = state.browser_widget.clone();
-    let browser_state = state.browser_state.clone();
-    let status_label = state.status_label.clone();
-    let column_view = state.column_view.clone();
-    let pending_connection = state.pending_connection.clone();
+    let rt_handle = state.rt_handle.clone();
+    let source_registry = state.source_registry.clone();
+    let remote_provenance = state.remote_provenance.clone();
     let output_list = output_list.clone();
 
     glib::MainContext::default().spawn_local(async move {
@@ -93,22 +85,49 @@ pub fn setup_discovery(
                         }
                         None => None,
                     };
+                    let Some(publisher) =
+                        discovery_publisher(&server.service_type, &server.url)
+                    else {
+                        tracing::warn!("Ignoring discovered server without canonical publisher identity");
+                        continue;
+                    };
 
-                    // A URL remains the logical source key. An updated mDNS
-                    // publication refreshes only this row's ephemeral route;
-                    // an already-connected backend retains the immutable route
-                    // snapshot owned by its current generation.
-                    let existing = remote_source_for_url(&store, &server.url);
+                    // Stable SourceId owns the logical source. Canonical
+                    // `(backend, endpoint)` is only the discovery lookup key.
+                    // An updated publication refreshes this row's ephemeral
+                    // route; replacing or removing a prior advertised route
+                    // revokes work that captured the withdrawn address.
+                    let existing = remote_source_at(
+                        &store,
+                        &server.url,
+                        &server.service_type,
+                    )
+                    .map(|(_, source)| source);
                     if let Some(source) = existing {
-                        if source.backend_type() != server.service_type {
-                            tracing::warn!(
-                                backend = %server.service_type,
-                                "Ignoring discovered server whose URL is already owned by another backend"
-                            );
+                        let Some(source_id) = source.source_id() else {
+                            tracing::warn!("Ignoring discovered source without stable identity");
+                            continue;
+                        };
+                        if !remote_provenance.ensure(
+                            &source_registry,
+                            source_id,
+                            crate::source_lifecycle::SourceProvenance::Discovery,
+                            publisher,
+                        ) {
+                            tracing::debug!("Ignoring discovery publication during shutdown");
                             continue;
                         }
-                        let route_changed = source.advertised_route() != advertised_route;
-                        source.set_advertised_route(advertised_route.clone());
+                        let route_changed = reconcile_discovery_route(
+                            &source,
+                            advertised_route.clone(),
+                            |source_id| {
+                                // A pending constructor or active adapter may
+                                // have captured the withdrawn address. Claims
+                                // and the logical row remain; only exact
+                                // lifecycle/session authority is revoked.
+                                let _ = source_registry.disconnect(source_id);
+                            },
+                        );
                         if let Some(requires_password) = server.requires_password {
                             source.set_requires_password(requires_password);
                         }
@@ -120,6 +139,7 @@ pub fn setup_discovery(
                             probe_daap_password(
                                 &rt_handle,
                                 &store,
+                                &sidebar_selection,
                                 &server.url,
                                 advertised_route,
                             );
@@ -138,6 +158,19 @@ pub fn setup_discovery(
                         window::ensure_category_header_store(&store, &server.service_type);
                     let src =
                         SourceObject::discovered(&server.name, &server.service_type, &server.url);
+                    let Some(source_id) = src.source_id() else {
+                        tracing::warn!("Ignoring discovered source without stable identity");
+                        continue;
+                    };
+                    if !remote_provenance.ensure(
+                        &source_registry,
+                        source_id,
+                        crate::source_lifecycle::SourceProvenance::Discovery,
+                        publisher,
+                    ) {
+                        tracing::debug!("Ignoring discovery publication during shutdown");
+                        continue;
+                    }
                     src.set_advertised_route(advertised_route.clone());
 
                     // Apply requires_password if already known from discovery.
@@ -153,6 +186,7 @@ pub fn setup_discovery(
                         probe_daap_password(
                             &rt_handle,
                             &store,
+                            &sidebar_selection,
                             &server.url,
                             advertised_route,
                         );
@@ -178,11 +212,10 @@ pub fn setup_discovery(
                         continue;
                     }
 
-                    // URL keys cannot represent two backend protocols at the
-                    // same origin. A cross-backend mDNS alias is rejected on
-                    // Found above, and its Lost event must not retire the row,
-                    // registry, or credentials owned by the accepted backend.
-                    let Some((source_index, source)) =
+                    // Endpoint lookup includes the backend protocol. A Lost
+                    // event must retire only the exact row and stable owner
+                    // claimed by that `(backend, canonical endpoint)` pair.
+                    let Some((_, source)) =
                         remote_source_at(&store, &url, &service_type)
                     else {
                         tracing::debug!(
@@ -191,104 +224,49 @@ pub fn setup_discovery(
                         );
                         continue;
                     };
-                    let source_key = source.server_url();
-
-                    let lost_pending = pending_connection
-                        .borrow()
-                        .as_ref()
-                        .filter(|pending| pending.source_key() == source_key)
-                        .cloned();
-                    if let Some(pending) = lost_pending {
-                        *pending_connection.borrow_mut() = None;
-                        if source_navigation.borrow().is_current(pending.request()) {
-                            source_navigation
-                                .borrow_mut()
-                                .select(active_source_key.borrow().clone());
-                        }
+                    let Some(source_id) = source.source_id() else {
+                        tracing::warn!("Ignoring discovered source without stable identity");
+                        continue;
+                    };
+                    let Some(publisher) = discovery_publisher(&service_type, &url) else {
+                        tracing::warn!("Ignoring lost server without canonical publisher identity");
+                        continue;
+                    };
+                    if !remote_provenance.release(
+                        &source_registry,
+                        source_id,
+                        crate::source_lifecycle::SourceProvenance::Discovery,
+                        &publisher,
+                    ) {
+                        tracing::debug!(
+                            backend = %service_type,
+                            "Ignoring lost event without a matching discovery claim"
+                        );
+                        continue;
                     }
 
-                    // Final-instance disappearance invalidates pending and
-                    // active ownership even when a manually saved row remains
-                    // visible. A task that already captured the old route may
-                    // finish its network I/O, but its generation can no longer
-                    // publish a library or issue playable requests.
-                    invalidate_source_playback(&source_key);
-                    if service_type == "daap" {
-                        if let Some(session) = crate::daap::release_source(&source_key) {
-                            rt_handle.spawn(async move {
-                                session.disconnect().await;
-                            });
-                        }
-                    } else {
-                        crate::source_registry::release_source(&source_key);
-                    }
+                    let remaining_provenance = source_registry
+                        .snapshot(source_id)
+                        .map(|snapshot| snapshot.provenance)
+                        .unwrap_or_default();
 
                     info!(
                         backend = %service_type,
                         "Handling lost server discovery event"
                     );
-
                     source.set_advertised_route(None);
-                    let was_active = *active_source_key.borrow() == source_key;
-
-                    // Never auto-remove manually-added servers.
-                    if source.manually_added() {
-                        source_tracks.borrow_mut().remove(&source_key);
-                        source.set_connected(false);
-                        source.set_connecting(false);
-                        source.set_icon_name("network-server-symbolic");
-                        store.remove(source_index);
-                        store.insert(source_index, &source);
-
-                        if was_active {
-                            source_navigation.borrow_mut().select("local");
-                            *active_source_key.borrow_mut() = "local".to_string();
-                            sidebar_selection.set_selected(1);
-                            let st = source_tracks.borrow();
-                            let local_tracks = st.get("local").cloned().unwrap_or_default();
-                            window::display_tracks(
-                                &local_tracks,
-                                &track_store,
-                                &master_tracks,
-                                &browser_widget,
-                                &browser_state,
-                                &status_label,
-                                &column_view,
-                            );
-                        }
-                        continue;
-                    }
-
-                    if source.connected() {
-                        // Remove from source_tracks map.
-                        source_tracks.borrow_mut().remove(&source_key);
-                    }
-
-                    // Remove the sidebar entry.
-                    store.remove(source_index);
-
-                    // Clean up empty category header.
-                    let category = window::category_for_backend(&service_type);
-                    window::remove_empty_category_header(&store, category);
-
-                    // If this was the active source, switch to local.
-                    if was_active {
-                        source_navigation.borrow_mut().select("local");
-                        *active_source_key.borrow_mut() = "local".to_string();
-                        sidebar_selection.set_selected(1);
-
-                        let st = source_tracks.borrow();
-                        let local_tracks = st.get("local").cloned().unwrap_or_default();
-                        window::display_tracks(
-                            &local_tracks,
-                            &track_store,
-                            &master_tracks,
-                            &browser_widget,
-                            &browser_state,
-                            &status_label,
-                            &column_view,
-                        );
-                    }
+                    // Every constructor and resolver created from this row may
+                    // have captured the now-withdrawn advertised route. Revoke
+                    // that route-bound ownership even when Saved/Environment
+                    // keeps the logical row visible. The lifecycle reducer
+                    // owns pending/cache/playback/navigation cleanup and row
+                    // demotion/removal from the resulting baseline.
+                    let _ = source_registry.disconnect(source_id);
+                    tracing::debug!(
+                        backend = %service_type,
+                        retained = !remaining_provenance.is_empty(),
+                        "Withdrawn discovery route handed to lifecycle disconnect"
+                    );
                 }
             }
         }
@@ -428,15 +406,6 @@ fn handle_airplay_lost(output_list: &gtk::ListBox, url: &str) {
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-fn remote_source_for_url(store: &gtk::gio::ListStore, server_url: &str) -> Option<SourceObject> {
-    (0..store.n_items()).find_map(|index| {
-        store
-            .item(index)
-            .and_downcast::<SourceObject>()
-            .filter(|source| same_remote_server_url(&source.server_url(), server_url))
-    })
-}
-
 pub(super) fn remote_source_at(
     store: &gtk::gio::ListStore,
     server_url: &str,
@@ -458,6 +427,11 @@ fn same_remote_server_url(left: &str, right: &str) -> bool {
     crate::http_security::parse_base_url(left)
         .ok()
         .zip(crate::http_security::parse_base_url(right).ok())
+        .and_then(|(left, right)| {
+            crate::architecture::identity::canonical_remote_base_url(&left)
+                .ok()
+                .zip(crate::architecture::identity::canonical_remote_base_url(&right).ok())
+        })
         .is_some_and(|(left, right)| left == right)
 }
 
@@ -509,16 +483,39 @@ fn accepts_daap_probe_result(
         && !source.connected()
 }
 
+/// Replace the latest discovery route while revoking any operation or session
+/// that could still be bound to a withdrawn advertised address. Adding the
+/// first route does not withdraw the canonical endpoint used by existing
+/// work; replacing or removing an existing route does.
+fn reconcile_discovery_route(
+    source: &SourceObject,
+    advertised_route: Option<AdvertisedHttpRoute>,
+    mut disconnect: impl FnMut(crate::architecture::SourceId),
+) -> bool {
+    let previous = source.advertised_route();
+    let changed = previous != advertised_route;
+    let withdrew_route = previous.is_some() && changed;
+    source.set_advertised_route(advertised_route);
+    if withdrew_route {
+        if let Some(source_id) = source.source_id() {
+            disconnect(source_id);
+        }
+    }
+    changed
+}
+
 /// Probe whether a DAAP server requires a password, updating the sidebar item.
 fn probe_daap_password(
     rt_handle: &tokio::runtime::Handle,
     store: &gtk::gio::ListStore,
+    selection: &gtk::SingleSelection,
     server_url: &str,
     advertised_route: Option<AdvertisedHttpRoute>,
 ) {
     let probe_url = server_url.to_string();
     let route_for_probe = advertised_route.clone();
     let store = store.clone();
+    let selection = selection.clone();
     let (probe_tx, probe_rx) = async_channel::bounded::<Option<bool>>(1);
 
     rt_handle.spawn(async move {
@@ -538,10 +535,8 @@ fn probe_daap_password(
                 if let Some(src) = store.item(i).and_downcast_ref::<SourceObject>() {
                     if accepts_daap_probe_result(src, &probe_server_url, &advertised_route) {
                         src.set_requires_password(requires_pw);
-                        // Force rebind by remove + re-insert.
                         let src = src.clone();
-                        store.remove(i);
-                        store.insert(i, &src);
+                        super::window::rebind_sidebar_source(&store, &selection, i, &src, true);
                         break;
                     }
                 }
@@ -553,27 +548,48 @@ fn probe_daap_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    fn advertised_route(address: SocketAddr) -> AdvertisedHttpRoute {
+        AdvertisedHttpRoute::new(
+            &url::Url::parse("http://mini.local:3689").expect("origin"),
+            [address],
+        )
+        .expect("advertised route")
+    }
 
     #[test]
-    fn same_origin_cross_backend_alias_does_not_own_the_existing_row() {
+    fn same_origin_rows_are_namespaced_by_backend_protocol() {
         let store = gtk::gio::ListStore::new::<SourceObject>();
-        let source = SourceObject::manual("Subsonic", "subsonic", "http://mini.local:4533");
-        store.append(&source);
+        let subsonic = SourceObject::manual(
+            "Subsonic",
+            "subsonic",
+            "http://mini.local:4533",
+            crate::architecture::SourceId::random(),
+        );
+        let daap = SourceObject::manual(
+            "DAAP",
+            "daap",
+            "http://mini.local:4533",
+            crate::architecture::SourceId::random(),
+        );
+        store.append(&subsonic);
+        store.append(&daap);
 
         assert!(remote_source_at(&store, "http://mini.local:4533", "subsonic").is_some());
-        assert!(remote_source_at(&store, "http://mini.local:4533", "daap").is_none());
-        assert_eq!(
-            remote_source_for_url(&store, "http://mini.local:4533")
-                .expect("URL owner")
-                .backend_type(),
-            "subsonic"
-        );
+        assert!(remote_source_at(&store, "http://mini.local:4533", "daap").is_some());
+        assert_ne!(subsonic.source_id(), daap.source_id());
     }
 
     #[test]
     fn root_url_spelling_matches_discovery_without_changing_the_owned_key() {
         let store = gtk::gio::ListStore::new::<SourceObject>();
-        let source = SourceObject::manual("DAAP", "daap", "HTTP://MINI.LOCAL:80/");
+        let source = SourceObject::manual(
+            "DAAP",
+            "daap",
+            "HTTP://MINI.LOCAL:80/",
+            crate::architecture::SourceId::random(),
+        );
         store.append(&source);
 
         let (_, owner) = remote_source_at(&store, "http://mini.local", "daap")
@@ -592,5 +608,68 @@ mod tests {
             "http://mini.local/base",
             "http://mini.local/other"
         ));
+    }
+
+    #[test]
+    fn active_route_replacement_revokes_session_but_preserves_row_and_new_route() {
+        let source = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
+        source.set_connected(true);
+        let source_id = source.source_id().expect("stable source");
+        let old_route = advertised_route(SocketAddr::from((Ipv4Addr::LOCALHOST, 3_689)));
+        let new_route = advertised_route(SocketAddr::from(([127, 0, 0, 2], 3_689)));
+        source.set_advertised_route(Some(old_route));
+        let mut disconnected = Vec::new();
+
+        assert!(reconcile_discovery_route(
+            &source,
+            Some(new_route.clone()),
+            |id| disconnected.push(id),
+        ));
+
+        assert_eq!(disconnected, vec![source_id]);
+        assert_eq!(source.source_id(), Some(source_id));
+        assert!(
+            source.connected(),
+            "GTK demotion belongs to the baseline reducer"
+        );
+        assert_eq!(source.advertised_route(), Some(new_route));
+    }
+
+    #[test]
+    fn pending_route_reduction_cancels_captured_route_without_dropping_row() {
+        let source = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
+        source.set_connecting_generation(41);
+        let source_id = source.source_id().expect("stable source");
+        let old_route = advertised_route(SocketAddr::from((Ipv4Addr::LOCALHOST, 3_689)));
+        source.set_advertised_route(Some(old_route));
+        let mut disconnected = Vec::new();
+
+        assert!(reconcile_discovery_route(&source, None, |id| {
+            disconnected.push(id);
+        }));
+
+        assert_eq!(disconnected, vec![source_id]);
+        assert_eq!(source.source_id(), Some(source_id));
+        assert_eq!(source.connecting_generation(), Some(41));
+        assert_eq!(source.advertised_route(), None);
+    }
+
+    #[test]
+    fn first_discovery_route_does_not_revoke_canonical_endpoint_work() {
+        let source = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
+        source.set_connecting_generation(7);
+        let route = advertised_route(SocketAddr::from((Ipv4Addr::LOCALHOST, 3_689)));
+        let mut disconnects = 0;
+
+        assert!(reconcile_discovery_route(
+            &source,
+            Some(route.clone()),
+            |_| {
+                disconnects += 1;
+            }
+        ));
+
+        assert_eq!(disconnects, 0);
+        assert_eq!(source.advertised_route(), Some(route));
     }
 }

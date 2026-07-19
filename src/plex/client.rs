@@ -13,8 +13,8 @@ use crate::architecture::error::BackendError;
 use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
-    apply_advertised_http_route, authenticated_client_builder, redact_url_secrets,
-    strip_request_url, validate_base_url,
+    append_base_path_segments, apply_advertised_http_route, authenticated_client_builder,
+    redact_url_secrets, strip_request_url, validate_base_url,
 };
 
 use super::api::PlexSignInResponse;
@@ -277,14 +277,10 @@ impl PlexClient {
     /// `library/sections`. It will be appended to the base URL.
     pub fn api_url(&self, endpoint: &str) -> Url {
         let mut url = self.base_url.clone();
-        {
-            let mut segments = url.path_segments_mut().expect("base URL cannot-be-a-base");
-            for part in endpoint.split('/') {
-                if !part.is_empty() {
-                    segments.push(part);
-                }
-            }
-        }
+        append_base_path_segments(
+            &mut url,
+            endpoint.split('/').filter(|part| !part.is_empty()),
+        );
         url
     }
 
@@ -297,10 +293,7 @@ impl PlexClient {
         &self,
         part_key: &str,
     ) -> BackendResult<ResolvedHttpRequest> {
-        let mut url = self.base_url.clone();
-        url.set_path(part_key);
-        url.set_query(None);
-        url.set_fragment(None);
+        let url = self.media_url(part_key)?;
         let request = ResolvedHttpRequest::new(url)?.with_sensitive_header(
             HeaderName::from_static("x-plex-token"),
             plex_auth_header(&self.auth_token)?,
@@ -318,10 +311,7 @@ impl PlexClient {
         &self,
         thumb_path: &str,
     ) -> BackendResult<ResolvedHttpRequest> {
-        let mut url = self.base_url.clone();
-        url.set_path(thumb_path);
-        url.set_query(None);
-        url.set_fragment(None);
+        let url = self.media_url(thumb_path)?;
         let request = ResolvedHttpRequest::new(url)?.with_sensitive_header(
             HeaderName::from_static("x-plex-token"),
             plex_auth_header(&self.auth_token)?,
@@ -330,6 +320,49 @@ impl PlexClient {
             Some(route) => request.with_advertised_route(route.clone()),
             None => Ok(request),
         }
+    }
+
+    /// Append a server-issued root-relative path beneath the configured Plex
+    /// base path. Reverse proxies commonly expose Plex below `/plex`; replacing
+    /// the URL path here would silently bypass that prefix for playback and
+    /// artwork even though catalogue requests used it correctly.
+    fn media_url(&self, server_path: &str) -> BackendResult<Url> {
+        let suffix = server_path.trim_start_matches('/');
+        if suffix.is_empty() {
+            return Err(BackendError::ConnectionFailed {
+                message: "Plex returned an empty media path".into(),
+                source: None,
+            });
+        }
+
+        // Match `append_base_path_segments`: remove exactly one trailing
+        // empty segment. A deliberately configured `/share//` prefix must
+        // remain `/share//` for media just as it does for API requests.
+        let base_path = self
+            .base_url
+            .path()
+            .strip_suffix('/')
+            .unwrap_or_else(|| self.base_url.path());
+        let required_prefix = if base_path.is_empty() || base_path == "/" {
+            "/".to_string()
+        } else {
+            format!("{base_path}/")
+        };
+        let mut url = self.base_url.clone();
+        url.set_path(&format!("{required_prefix}{suffix}"));
+        url.set_query(None);
+        url.set_fragment(None);
+
+        // `Url::set_path` normalizes dot segments. A peer-supplied path must
+        // not use that normalization to escape a configured reverse-proxy
+        // prefix; keep the diagnostic fixed so the path cannot reach logs/UI.
+        if !url.path().starts_with(&required_prefix) {
+            return Err(BackendError::ConnectionFailed {
+                message: "Plex returned a media path outside the configured base path".into(),
+                source: None,
+            });
+        }
+        Ok(url)
     }
 
     /// Issue a GET request to a Plex endpoint and deserialize the
@@ -468,6 +501,10 @@ mod tests {
     use std::io::ErrorKind;
     use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 
+    use axum::http::{Method, StatusCode};
+
+    use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
+
     use super::*;
 
     fn advertised_route(origin: &str) -> AdvertisedHttpRoute {
@@ -526,6 +563,92 @@ mod tests {
                 .expect("auth header");
             assert!(value.is_sensitive());
         }
+    }
+
+    #[test]
+    fn api_and_media_paths_preserve_reverse_proxy_prefixes_exactly() {
+        for (base, prefix) in [
+            ("https://plex.example.test", ""),
+            ("https://plex.example.test//", ""),
+            ("https://plex.example.test/share", "/share"),
+            ("https://plex.example.test/share/", "/share"),
+            ("https://plex.example.test/share//", "/share/"),
+            (
+                "https://plex.example.test/tenant%2Fmusic/",
+                "/tenant%2Fmusic",
+            ),
+        ] {
+            let client = PlexClient::new(base, "token").expect("client");
+            assert_eq!(
+                client.api_url("library/sections").as_str(),
+                format!("https://plex.example.test{prefix}/library/sections"),
+                "base URL: {base}"
+            );
+            assert_eq!(
+                client
+                    .resolved_stream_request("/library/parts/file%2Fname.flac")
+                    .expect("stream request")
+                    .endpoint()
+                    .as_str(),
+                format!("https://plex.example.test{prefix}/library/parts/file%2Fname.flac"),
+                "base URL: {base}"
+            );
+            assert_eq!(
+                client
+                    .resolved_artwork_request("/library/metadata/1/thumb/2")
+                    .expect("artwork request")
+                    .endpoint()
+                    .as_str(),
+                format!("https://plex.example.test{prefix}/library/metadata/1/thumb/2"),
+                "base URL: {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_paths_cannot_escape_reverse_proxy_prefix() {
+        let client = PlexClient::new("https://plex.example.test/share/", "token").expect("client");
+        for path in [
+            "../outside-prefix",
+            "%2e%2e/outside-prefix",
+            ".%2e/outside-prefix",
+        ] {
+            let error = client
+                .resolved_stream_request(path)
+                .err()
+                .expect("plain or encoded dot segments must not escape the configured prefix");
+            assert!(matches!(error, BackendError::ConnectionFailed { .. }));
+            assert!(!error.to_string().contains("outside-prefix"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_auth_returns_typed_redacted_error() {
+        let service = MockHttpService::start(vec![MockRoute::new(
+            Method::POST,
+            "/account/users/sign_in.json",
+        )
+        .reply(MockResponse::status(StatusCode::UNAUTHORIZED))])
+        .await;
+        let username = uuid::Uuid::new_v4().to_string();
+        let password = uuid::Uuid::new_v4().to_string();
+        let sign_in_url = format!("{}/account/users/sign_in.json", service.base_url());
+        let result = PlexClient::authenticate_with_route_at(
+            "https://plex.example.test/gateway/",
+            &username,
+            &password,
+            None,
+            &sign_in_url,
+        )
+        .await;
+        let error = result.err().expect("fixture authentication must fail");
+
+        assert!(matches!(error, BackendError::AuthenticationFailed { .. }));
+        let rendered = error.to_string();
+        assert!(!rendered.contains(&username));
+        assert!(!rendered.contains(&password));
+        assert_eq!(service.requests().len(), 1);
+        service.finish().await;
     }
 
     #[test]

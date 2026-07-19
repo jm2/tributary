@@ -3,21 +3,22 @@
 //! media controls to the GTK main thread.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
+use chrono::Utc;
 use gtk::glib;
 use tracing::{info, warn};
 
 use crate::audio::local_output::LocalOutput;
 use crate::audio::output::AudioOutput;
-use crate::audio::{PlayerEvent, PlayerState};
+use crate::audio::{PlayerEvent, PlayerEventGeneration, PlayerState};
 use crate::desktop_integration::MediaAction;
 use crate::local::engine::{
-    LibraryEngine, LibraryEvent, RootReauthorizationOutcome, RootReauthorizationRequest,
+    LibraryCommand, LibraryEngine, LibraryEvent, RootReauthorizationOutcome,
+    RootReauthorizationRequest,
 };
 use crate::ui::header_bar::RepeatMode;
 
@@ -30,15 +31,18 @@ use super::persistence::{
     restore_sort_state, save_repeat_mode, save_shuffle, save_sort_state, save_window_geometry,
 };
 use super::playback::{
-    advance_track, format_ms, play_or_start, play_track_at, previous_track,
-    refresh_projected_library_uris, replay_current, stop_playback, toggle_or_start,
-    BufferingTracker, PlaybackContext, PlaybackSession, QueueTrackRefresh, PLAYLIST_SOURCE_PREFIX,
+    advance_track, advance_track_from_user, format_ms, play_or_start, play_track_at,
+    previous_or_restart_from_user, refresh_projected_library_uris, replay_current, stop_playback,
+    toggle_or_start, BufferingTracker, PlaybackContext, PlaybackSession, QueueTrackRefresh,
+    PLAYLIST_SOURCE_PREFIX,
 };
 use super::preferences;
 use super::root_trust;
 use super::server_dialogs::{load_saved_servers, remove_saved_server, show_add_server_dialog};
 use super::sidebar;
-use super::source_navigation::{PendingConnection, SourceNavigation};
+use super::source_navigation::{
+    ConnectionIntentKind, PendingConnection, SourceNavigation, SourceRequest,
+};
 use super::tracklist;
 use super::window_state::WindowState;
 
@@ -51,14 +55,6 @@ const SIDEBAR_POS: i32 = 200;
 
 /// Browser paned default position (px from top of right content area).
 const BROWSER_POS: i32 = 220;
-
-/// If the user presses Previous when more than this many ms into a track,
-/// restart the current track instead of going back.
-const PREV_RESTART_THRESHOLD_MS: u64 = 3000;
-
-/// User trust decisions are serialized by the engine; this bounded queue
-/// prevents a stalled engine from accumulating unbounded confirmations.
-const LIBRARY_COMMAND_CAPACITY: usize = 16;
 
 type SharedAudioOutput = Rc<RefCell<Box<dyn AudioOutput>>>;
 type PlaybackUiReset = Rc<dyn Fn()>;
@@ -75,6 +71,1043 @@ fn configured_server_url(variable: &'static str) -> Option<String> {
             None
         }
     }
+}
+
+fn remote_source_id(backend_type: &str, server_url: &str) -> crate::architecture::SourceId {
+    let parsed = crate::http_security::parse_base_url(server_url)
+        .expect("configured and discovered remote URLs are prevalidated");
+    crate::architecture::SourceId::remote(backend_type, &parsed)
+        .expect("supported remote backend produces a stable source ID")
+}
+
+#[derive(Clone, Copy)]
+struct EnvironmentConnectionAttempt {
+    source_id: crate::architecture::SourceId,
+}
+
+/// Add an environment-configured row or reuse the saved/discovered owner of
+/// the same canonical `(backend, endpoint)` pair.
+///
+/// Saved rows are loaded first, so their persisted identity wins over the
+/// deterministic environment identity. The returned ID must be used by the
+/// connection attempt; recomputing it from the URL would split one logical
+/// source across two registry owners.
+fn upsert_environment_source(
+    sources: &mut Vec<SourceObject>,
+    name: &str,
+    backend_type: &str,
+    server_url: &str,
+) -> EnvironmentConnectionAttempt {
+    if let Some(source) = sources.iter().find(|source| {
+        super::server_dialogs::same_remote_endpoint(
+            &source.backend_type(),
+            &source.server_url(),
+            backend_type,
+            server_url,
+        )
+    }) {
+        let source_id = source
+            .source_id()
+            .expect("validated remote source has a stable identity");
+        source.set_connecting(true);
+        return EnvironmentConnectionAttempt { source_id };
+    }
+
+    ensure_category_header_vec(sources, backend_type);
+    let source = SourceObject::discovered(name, backend_type, server_url);
+    let source_id = source
+        .source_id()
+        .unwrap_or_else(|| remote_source_id(backend_type, server_url));
+    source.set_connecting(true);
+    sources.push(source);
+    EnvironmentConnectionAttempt { source_id }
+}
+
+fn set_remote_connecting_generation(
+    store: &gtk::gio::ListStore,
+    selection: &gtk::SingleSelection,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
+) {
+    for index in 0..store.n_items() {
+        let Some(source) = store.item(index).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if source.source_id() != Some(source_id) {
+            continue;
+        }
+        source.set_connecting_generation(generation);
+        rebind_sidebar_source(store, selection, index, &source, true);
+        return;
+    }
+}
+
+#[derive(Clone)]
+struct SourceReducerContext {
+    source_registry: crate::source_registry::SourceRegistry,
+    sidebar_store: gtk::gio::ListStore,
+    sidebar_selection: gtk::SingleSelection,
+    source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    active_source_key: Rc<RefCell<String>>,
+    source_navigation: Rc<RefCell<SourceNavigation>>,
+    near_me_consent_request: Rc<RefCell<Option<SourceRequest>>>,
+    pending_connection: Rc<RefCell<Option<PendingConnection>>>,
+    track_store: gtk::gio::ListStore,
+    master_tracks: Rc<RefCell<Vec<TrackObject>>>,
+    browser_widget: gtk::Box,
+    browser_state: browser::BrowserState,
+    status_label: gtk::Label,
+    column_view: gtk::ColumnView,
+    app_config: Rc<RefCell<preferences::AppConfig>>,
+    invalidate_source_playback: SourcePlaybackInvalidator,
+}
+
+#[derive(Default)]
+struct SourceReducerState {
+    published_catalogues: HashMap<crate::architecture::SourceId, (u64, u64)>,
+    published_views: HashMap<
+        (
+            crate::architecture::SourceId,
+            crate::architecture::ViewOrigin,
+        ),
+        (u64, u64),
+    >,
+    radio_session_epoch: Option<u64>,
+    seen_failures:
+        HashMap<crate::architecture::SourceId, (u64, crate::source_lifecycle::FailureCategory)>,
+    seen_refresh_failures: HashMap<
+        (
+            crate::architecture::SourceId,
+            crate::architecture::ViewOrigin,
+        ),
+        (u64, crate::source_lifecycle::FailureCategory),
+    >,
+}
+
+struct SourceBaselinePlan {
+    present_sources: HashSet<crate::architecture::SourceId>,
+    hidden_sources: HashSet<crate::architecture::SourceId>,
+    clear_projections: Vec<crate::architecture::SourceId>,
+    clear_radio_projection: bool,
+    radio_session_epoch: Option<u64>,
+}
+
+impl SourceBaselinePlan {
+    fn new(
+        reducer: &SourceReducerState,
+        baseline: &crate::source_lifecycle::LifecycleBaseline<crate::source_registry::AcceptedView>,
+        active_source_key: &str,
+        radio_prerequisite_pending: bool,
+        ui_owned_sources: &HashSet<crate::architecture::SourceId>,
+    ) -> Self {
+        let mut present_sources = HashSet::new();
+        let mut catalogue_sources = HashSet::new();
+        let mut hidden_sources = HashSet::new();
+        for (source_id, snapshot) in &baseline.sources {
+            if snapshot.visibility == crate::source_lifecycle::SourceVisibility::Hidden {
+                hidden_sources.insert(*source_id);
+            } else {
+                present_sources.insert(*source_id);
+                if *source_id != crate::architecture::SourceId::radio_browser()
+                    && snapshot.catalogue.is_some()
+                {
+                    catalogue_sources.insert(*source_id);
+                }
+            }
+        }
+
+        let radio_id = crate::architecture::SourceId::radio_browser();
+        // Hidden external-file registrations never publish an ordinary GTK
+        // projection. A formerly visible source can still own a sidebar,
+        // navigation, or pending-connection projection before its first
+        // catalogue; clear only those explicit UI owners plus catalogues the
+        // reducer actually published. Terminal external retirement belongs to
+        // playback hooks, not observer visibility.
+        let mut clear_projections: HashSet<_> = hidden_sources
+            .intersection(ui_owned_sources)
+            .copied()
+            .collect();
+        clear_projections.extend(
+            reducer
+                .published_catalogues
+                .keys()
+                .filter(|source_id| !catalogue_sources.contains(source_id))
+                .copied(),
+        );
+
+        let mut clear_projections: Vec<_> = clear_projections.into_iter().collect();
+        clear_projections.sort_by_key(ToString::to_string);
+        let radio_snapshot = baseline
+            .sources
+            .iter()
+            .find(|(source_id, _)| *source_id == radio_id)
+            .map(|(_, snapshot)| snapshot);
+        let radio_session_epoch = radio_snapshot
+            .filter(|snapshot| {
+                snapshot.visibility != crate::source_lifecycle::SourceVisibility::Hidden
+            })
+            .and_then(|snapshot| snapshot.session_epoch);
+        let radio_connect_pending = radio_snapshot.is_some_and(|snapshot| {
+            snapshot.visibility != crate::source_lifecycle::SourceVisibility::Hidden
+                && snapshot.pending_connect.is_some()
+        });
+        let radio_was_projected = reducer
+            .published_views
+            .keys()
+            .any(|(source_id, _)| *source_id == radio_id);
+        let radio_is_selected = super::radio::is_radio_backend(active_source_key);
+        let radio_epoch_replaced = reducer
+            .radio_session_epoch
+            .zip(radio_session_epoch)
+            .is_some_and(|(previous, current)| previous != current);
+        let radio_source_lost = radio_session_epoch.is_none()
+            && !radio_connect_pending
+            && !radio_prerequisite_pending
+            && (reducer.radio_session_epoch.is_some() || radio_was_projected || radio_is_selected);
+
+        Self {
+            present_sources,
+            hidden_sources,
+            clear_projections,
+            clear_radio_projection: radio_epoch_replaced || radio_source_lost,
+            radio_session_epoch,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemotePublicationSelection {
+    Inactive,
+    AlreadyActivated,
+    Select(u32),
+    Reactivate(u32),
+}
+
+impl RemotePublicationSelection {
+    fn activates(self) -> bool {
+        self != Self::Inactive
+    }
+
+    fn apply(self, mut select: impl FnMut(u32)) {
+        match self {
+            Self::Inactive | Self::AlreadyActivated => {}
+            Self::Select(index) => select(index),
+            Self::Reactivate(index) => {
+                select(gtk::INVALID_LIST_POSITION);
+                select(index);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AcceptedRemotePublication {
+    index: u32,
+    rebound: bool,
+}
+
+impl SourceReducerContext {
+    fn from_window(
+        state: &WindowState,
+        invalidate_source_playback: SourcePlaybackInvalidator,
+    ) -> Self {
+        Self {
+            source_registry: state.source_registry.clone(),
+            sidebar_store: state.sidebar_store.clone(),
+            sidebar_selection: state.sidebar_selection.clone(),
+            source_tracks: state.source_tracks.clone(),
+            active_source_key: state.active_source_key.clone(),
+            source_navigation: state.source_navigation.clone(),
+            near_me_consent_request: state.near_me_consent_request.clone(),
+            pending_connection: state.pending_connection.clone(),
+            track_store: state.track_store.clone(),
+            master_tracks: state.master_tracks.clone(),
+            browser_widget: state.browser_widget.clone(),
+            browser_state: state.browser_state.clone(),
+            status_label: state.status_label.clone(),
+            column_view: state.column_view.clone(),
+            app_config: state.app_config.clone(),
+            invalidate_source_playback,
+        }
+    }
+}
+
+fn sidebar_source_by_id(
+    store: &gtk::gio::ListStore,
+    source_id: crate::architecture::SourceId,
+) -> Option<(u32, SourceObject)> {
+    (0..store.n_items()).find_map(|index| {
+        store
+            .item(index)
+            .and_downcast::<SourceObject>()
+            .filter(|source| source.source_id() == Some(source_id))
+            .map(|source| (index, source))
+    })
+}
+
+fn rebind_remote_source(
+    context: &SourceReducerContext,
+    index: u32,
+    source: &SourceObject,
+    keep_selected: bool,
+) {
+    let was_selected = context.sidebar_selection.selected() == index;
+    rebind_sidebar_source(
+        &context.sidebar_store,
+        &context.sidebar_selection,
+        index,
+        source,
+        keep_selected,
+    );
+    if was_selected && !keep_selected {
+        restore_visible_sidebar_selection(context);
+    }
+}
+
+/// Refresh plain GTK-side source fields without letting remove/insert
+/// transiently select an adjacent row and re-enter source navigation.
+pub(super) fn rebind_sidebar_source(
+    store: &gtk::gio::ListStore,
+    selection: &gtk::SingleSelection,
+    index: u32,
+    source: &SourceObject,
+    keep_selected: bool,
+) {
+    let was_selected = selection.selected() == index;
+    if was_selected {
+        // Prevent GtkSingleSelection from transiently selecting the adjacent
+        // row while remove/insert refreshes plain GTK-side state.
+        selection.set_selected(gtk::INVALID_LIST_POSITION);
+    }
+    store.remove(index);
+    store.insert(index, source);
+    if was_selected && keep_selected {
+        selection.set_selected(index);
+    }
+}
+
+fn source_matches_navigation_key(source: &SourceObject, key: &str) -> bool {
+    if source.source_id().is_some_and(|id| id.to_string() == key) || source.source_key() == key {
+        return true;
+    }
+    let backend = source.backend_type();
+    (backend == "local" && key == "local")
+        || (backend.starts_with("radio-") && backend == key)
+        || (matches!(backend.as_str(), "playlist" | "smart-playlist")
+            && format!(
+                "{}{}",
+                super::playback::PLAYLIST_SOURCE_PREFIX,
+                source.playlist_id()
+            ) == key)
+}
+
+/// Restore a selection by stable navigation identity rather than a list
+/// position that category insertion/removal may have shifted asynchronously.
+pub(super) fn select_sidebar_source_key(
+    store: &gtk::gio::ListStore,
+    selection: &gtk::SingleSelection,
+    key: &str,
+) -> bool {
+    let Some(index) = (0..store.n_items()).find(|index| {
+        store
+            .item(*index)
+            .and_downcast_ref::<SourceObject>()
+            .is_some_and(|source| source_matches_navigation_key(source, key))
+    }) else {
+        return false;
+    };
+    if selection.selected() != index {
+        selection.set_selected(index);
+    }
+    true
+}
+
+fn restore_visible_sidebar_selection(context: &SourceReducerContext) {
+    let key = context.active_source_key.borrow().clone();
+    if !select_sidebar_source_key(&context.sidebar_store, &context.sidebar_selection, &key) {
+        select_sidebar_source_key(&context.sidebar_store, &context.sidebar_selection, "local");
+    }
+}
+
+fn remote_backend_label(source: Option<&SourceObject>) -> &'static str {
+    match source.map(SourceObject::backend_type).as_deref() {
+        Some("subsonic") => "Subsonic",
+        Some("jellyfin") => "Jellyfin",
+        Some("plex") => "Plex",
+        Some("daap") => "DAAP",
+        Some("usb-device") => "Removable media",
+        _ => "Remote",
+    }
+}
+
+fn remote_failure_category(
+    category: crate::source_lifecycle::FailureCategory,
+) -> super::source_connect::RemoteFailureCategory {
+    super::source_connect::lifecycle_failure_category(category)
+}
+
+fn apply_local_navigation_fallback(
+    navigation: &mut SourceNavigation,
+    active_source_key: &mut String,
+    retired_key: &str,
+) -> bool {
+    if active_source_key != retired_key {
+        return false;
+    }
+    navigation.select("local");
+    *active_source_key = "local".to_string();
+    true
+}
+
+fn display_local_fallback(context: &SourceReducerContext, retired_key: &str) {
+    // Drop both RefCell guards before changing GtkSingleSelection: its signal
+    // handlers run synchronously and may update these same navigation cells.
+    let changed = {
+        let mut navigation = context.source_navigation.borrow_mut();
+        let mut active_source_key = context.active_source_key.borrow_mut();
+        apply_local_navigation_fallback(&mut navigation, &mut active_source_key, retired_key)
+    };
+    if !changed {
+        return;
+    }
+    select_sidebar_source_key(&context.sidebar_store, &context.sidebar_selection, "local");
+    if super::radio::is_radio_backend(retired_key) {
+        super::radio::apply_radio_columns(&context.column_view, false);
+        let config = context.app_config.borrow();
+        preferences::apply_column_visibility(&context.column_view, &config.visible_columns);
+        preferences::update_browser_visibility(&context.browser_widget, &config.browser_views);
+    }
+    let local_tracks = context
+        .source_tracks
+        .borrow()
+        .get("local")
+        .cloned()
+        .unwrap_or_default();
+    display_tracks(
+        &local_tracks,
+        &context.track_store,
+        &context.master_tracks,
+        &context.browser_widget,
+        &context.browser_state,
+        &context.status_label,
+        &context.column_view,
+    );
+}
+
+fn clear_remote_projection(
+    context: &SourceReducerContext,
+    source_id: crate::architecture::SourceId,
+) {
+    let source_key = source_id.to_string();
+    (context.invalidate_source_playback)(&source_key);
+    context
+        .source_navigation
+        .borrow_mut()
+        .invalidate_key(&source_key);
+    context.source_tracks.borrow_mut().remove(&source_key);
+    display_local_fallback(context, &source_key);
+}
+
+/// Revoke every Radio-Browser projection together because all three lanes
+/// share one source epoch and one playback authority.
+fn clear_radio_projections(context: &SourceReducerContext) {
+    let source_id = crate::architecture::SourceId::radio_browser();
+    (context.invalidate_source_playback)(&source_id.to_string());
+
+    let active_radio_key = {
+        let active = context.active_source_key.borrow();
+        super::radio::is_radio_backend(&active).then(|| active.clone())
+    };
+    for key in [
+        super::radio::TOP_CLICK_SOURCE_KEY,
+        super::radio::TOP_VOTE_SOURCE_KEY,
+        super::radio::NEARME_SOURCE_KEY,
+    ] {
+        context.source_navigation.borrow_mut().invalidate_key(key);
+        context.source_tracks.borrow_mut().remove(key);
+    }
+
+    // Include the selected exact view even before its first accepted refresh.
+    // Otherwise source-construction failure/loss would leave a blank radio
+    // projection selected indefinitely merely because no cache existed yet.
+    if let Some(active_radio_key) = active_radio_key {
+        display_local_fallback(context, &active_radio_key);
+    }
+}
+
+fn clear_remote_pending_intent(
+    context: &SourceReducerContext,
+    source_id: crate::architecture::SourceId,
+) {
+    let source_key = source_id.to_string();
+    let pending = {
+        let mut slot = context.pending_connection.borrow_mut();
+        if slot
+            .as_ref()
+            .is_some_and(|pending| pending.source_key() == source_key)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if pending.as_ref().is_some_and(|pending| {
+        context
+            .source_navigation
+            .borrow()
+            .is_current(pending.request())
+    }) {
+        // A remote intent can be current while the previous projection stays
+        // visible during authentication. Return navigation ownership to that
+        // visible projection without manufacturing a stale remote request.
+        context
+            .source_navigation
+            .borrow_mut()
+            .select(context.active_source_key.borrow().clone());
+    }
+}
+
+fn reconcile_cancelled_remote_intent(
+    context: &SourceReducerContext,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
+) {
+    let pending_was_current = context
+        .pending_connection
+        .borrow()
+        .as_ref()
+        .filter(|pending| pending.matches_lifecycle(source_id, generation))
+        .is_some_and(|pending| {
+            context
+                .source_navigation
+                .borrow()
+                .is_current(pending.request())
+        });
+    if !context
+        .pending_connection
+        .borrow()
+        .as_ref()
+        .is_some_and(|pending| pending.matches_lifecycle(source_id, generation))
+    {
+        return;
+    }
+    *context.pending_connection.borrow_mut() = None;
+
+    if let Some((index, source)) = sidebar_source_by_id(&context.sidebar_store, source_id) {
+        if source.clear_connecting_generation(generation) {
+            rebind_remote_source(context, index, &source, source.connected());
+        }
+    }
+    if pending_was_current {
+        restore_visible_sidebar_selection(context);
+    }
+    tracing::debug!(%source_id, generation, "Remote connection intent was cancelled");
+}
+
+fn reconcile_remote_failure(
+    context: &SourceReducerContext,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
+    category: crate::source_lifecycle::FailureCategory,
+    show_status: bool,
+) {
+    let row = sidebar_source_by_id(&context.sidebar_store, source_id);
+    let pending = context
+        .pending_connection
+        .borrow()
+        .as_ref()
+        .filter(|pending| pending.matches_lifecycle(source_id, generation))
+        .cloned();
+    let pending_was_current = pending.as_ref().is_some_and(|pending| {
+        context
+            .source_navigation
+            .borrow()
+            .is_current(pending.request())
+    });
+    let passwordless_reprompt = pending.as_ref().is_some_and(|pending| {
+        pending.intent_kind_for(source_id, generation)
+            == Some(ConnectionIntentKind::PasswordlessDaap)
+            && category == crate::source_lifecycle::FailureCategory::AuthenticationRejected
+    });
+
+    if pending.is_some() {
+        *context.pending_connection.borrow_mut() = None;
+    }
+
+    if let Some((index, source)) = row.as_ref() {
+        if source.clear_connecting_generation(generation) {
+            if passwordless_reprompt {
+                source.set_requires_password(true);
+            }
+            rebind_remote_source(context, *index, source, source.connected());
+        }
+    }
+
+    if pending_was_current {
+        if passwordless_reprompt {
+            if let Some((index, _)) = sidebar_source_by_id(&context.sidebar_store, source_id) {
+                // The exact passwordless intent was rejected. Re-fire selection
+                // only after requires_password=true is visible, so the normal
+                // credential dialog owns the retry.
+                context.sidebar_selection.set_selected(index);
+            }
+        } else {
+            restore_visible_sidebar_selection(context);
+        }
+    }
+
+    let ui_category = remote_failure_category(category);
+    let backend = if source_id == crate::architecture::SourceId::radio_browser() {
+        "Radio-Browser"
+    } else {
+        remote_backend_label(row.as_ref().map(|(_, source)| source))
+    };
+    tracing::error!(
+        %source_id,
+        generation,
+        category = ui_category.as_str(),
+        "Source connection failed"
+    );
+    if show_status {
+        context
+            .status_label
+            .set_text(&ui_category.user_message(backend));
+    }
+}
+
+fn reconcile_radio_refresh_failure(
+    context: &SourceReducerContext,
+    view: &crate::architecture::ViewOrigin,
+    generation: u64,
+    category: crate::source_lifecycle::FailureCategory,
+) {
+    let Some(source_key) = super::radio::radio_source_key(view) else {
+        return;
+    };
+    tracing::error!(
+        source = %crate::architecture::SourceId::radio_browser(),
+        ?view,
+        generation,
+        category = ?category,
+        "Radio-Browser view refresh failed"
+    );
+    if *context.active_source_key.borrow() == source_key
+        && context.source_navigation.borrow().is_key(source_key)
+    {
+        // A failed refresh is not an accepted empty feed. Preserve any last
+        // accepted rows in the cache/tracklist and expose a retryable error.
+        let category = remote_failure_category(category);
+        context
+            .status_label
+            .set_text(&category.user_message("Radio-Browser"));
+    }
+}
+
+fn selected_radio_projection_owns_status(
+    active_source_key: &str,
+    navigation: &SourceNavigation,
+) -> bool {
+    super::radio::is_radio_backend(active_source_key) && navigation.is_key(active_source_key)
+}
+
+fn source_connect_failure_owns_status(
+    source_id: crate::architecture::SourceId,
+    removable: bool,
+    active_source_key: &str,
+    navigation: &SourceNavigation,
+    radio_failure_was_selected: bool,
+) -> bool {
+    if removable {
+        let source_key = source_id.to_string();
+        return active_source_key == source_key && navigation.is_key(&source_key);
+    }
+
+    source_id != crate::architecture::SourceId::radio_browser() || radio_failure_was_selected
+}
+
+fn current_near_me_prerequisite(
+    active_source_key: &str,
+    navigation: &SourceNavigation,
+    pending: Option<&SourceRequest>,
+) -> bool {
+    active_source_key == super::radio::NEARME_SOURCE_KEY
+        && pending.is_some_and(|request| navigation.is_current(request))
+}
+
+fn publish_radio_view(
+    context: &SourceReducerContext,
+    view: &crate::architecture::ViewOrigin,
+    accepted: &crate::source_lifecycle::AcceptedSnapshot<crate::source_registry::AcceptedView>,
+) {
+    let Some(source_key) = super::radio::radio_source_key(view) else {
+        return;
+    };
+    let objects: Vec<TrackObject> = accepted
+        .value
+        .tracks()
+        .iter()
+        .map(|track| arch_remote_track_to_object(track, accepted.session_epoch))
+        .collect();
+    context
+        .source_tracks
+        .borrow_mut()
+        .insert(source_key.to_string(), objects.clone());
+
+    if *context.active_source_key.borrow() == source_key
+        && context.source_navigation.borrow().is_key(source_key)
+    {
+        // This deliberately publishes an accepted empty feed as an empty
+        // tracklist. Refresh failures take the separate stale-preserving path.
+        display_tracks(
+            &objects,
+            &context.track_store,
+            &context.master_tracks,
+            &context.browser_widget,
+            &context.browser_state,
+            &context.status_label,
+            &context.column_view,
+        );
+    }
+}
+
+fn reconcile_source_baseline(
+    context: &SourceReducerContext,
+    reducer: &mut SourceReducerState,
+    baseline: crate::source_lifecycle::LifecycleBaseline<crate::source_registry::AcceptedView>,
+) {
+    let mut ui_owned_sources = HashSet::new();
+    for index in 0..context.sidebar_store.n_items() {
+        if let Some(source_id) = context
+            .sidebar_store
+            .item(index)
+            .and_downcast::<SourceObject>()
+            .and_then(|source| source.source_id())
+        {
+            ui_owned_sources.insert(source_id);
+        }
+    }
+    if let Some(source_id) = context
+        .pending_connection
+        .borrow()
+        .as_ref()
+        .and_then(|pending| pending.source_key().parse().ok())
+    {
+        ui_owned_sources.insert(source_id);
+    }
+    if let Ok(source_id) = context.active_source_key.borrow().parse() {
+        ui_owned_sources.insert(source_id);
+    }
+
+    let radio_failure_was_selected = {
+        let active = context.active_source_key.borrow();
+        selected_radio_projection_owns_status(&active, &context.source_navigation.borrow())
+    };
+    let radio_prerequisite_pending = {
+        let active = context.active_source_key.borrow().clone();
+        let pending = context.near_me_consent_request.borrow().clone();
+        current_near_me_prerequisite(
+            &active,
+            &context.source_navigation.borrow(),
+            pending.as_ref(),
+        )
+    };
+    let SourceBaselinePlan {
+        present_sources,
+        hidden_sources,
+        clear_projections,
+        clear_radio_projection,
+        radio_session_epoch,
+    } = SourceBaselinePlan::new(
+        reducer,
+        &baseline,
+        &context.active_source_key.borrow(),
+        radio_prerequisite_pending,
+        &ui_owned_sources,
+    );
+
+    // Projection loss is authoritative before any plain row-state rebind.
+    // In particular, a selected retained passwordless DAAP row must already
+    // have fallen back to Local before connected=false causes remove/insert;
+    // otherwise stable-key restoration can reselect it and start a new login.
+    for source_id in clear_projections {
+        reducer.published_catalogues.remove(&source_id);
+        if hidden_sources.contains(&source_id) {
+            reducer.seen_failures.remove(&source_id);
+            clear_remote_pending_intent(context, source_id);
+        }
+        clear_remote_projection(context, source_id);
+    }
+    if clear_radio_projection {
+        clear_radio_projections(context);
+        reducer.published_views.retain(|(source_id, _), _| {
+            *source_id != crate::architecture::SourceId::radio_browser()
+        });
+        reducer.seen_refresh_failures.retain(|(source_id, _), _| {
+            *source_id != crate::architecture::SourceId::radio_browser()
+        });
+    }
+    reducer.radio_session_epoch = radio_session_epoch;
+
+    for (source_id, snapshot) in baseline.sources {
+        if hidden_sources.contains(&source_id) {
+            continue;
+        }
+
+        let connect_failure = snapshot.failure.filter(|failure| {
+            failure.failure.operation() == crate::source_lifecycle::FailureOperation::Connect
+        });
+        if let Some(failure) = connect_failure {
+            let identity = (failure.correlation.generation, failure.failure.category());
+            if reducer.seen_failures.get(&source_id) != Some(&identity) {
+                let removable = snapshot
+                    .provenance
+                    .contains(crate::source_lifecycle::SourceProvenance::Removable);
+                let show_status = source_connect_failure_owns_status(
+                    source_id,
+                    removable,
+                    &context.active_source_key.borrow(),
+                    &context.source_navigation.borrow(),
+                    radio_failure_was_selected,
+                );
+                reconcile_remote_failure(
+                    context,
+                    source_id,
+                    failure.correlation.generation,
+                    failure.failure.category(),
+                    show_status,
+                );
+                reducer.seen_failures.insert(source_id, identity);
+            }
+        } else {
+            reducer.seen_failures.remove(&source_id);
+        }
+
+        let pending_generation = {
+            context
+                .pending_connection
+                .borrow()
+                .as_ref()
+                .and_then(|pending| pending.lifecycle_generation_for(source_id))
+        };
+        if let Some(generation) = pending_generation {
+            let generation_still_owned = snapshot.pending_connect == Some(generation)
+                || snapshot
+                    .catalogue
+                    .as_ref()
+                    .is_some_and(|catalogue| catalogue.generation == generation)
+                || connect_failure
+                    .is_some_and(|failure| failure.correlation.generation == generation);
+            if !generation_still_owned {
+                reconcile_cancelled_remote_intent(context, source_id, generation);
+            }
+        }
+
+        if let Some((index, source)) = sidebar_source_by_id(&context.sidebar_store, source_id) {
+            let connected = snapshot.session_epoch.is_some();
+            let manually_added = snapshot
+                .provenance
+                .contains(crate::source_lifecycle::SourceProvenance::Saved);
+            let connected_changed = source.connected() != connected;
+            if connected_changed {
+                source.set_connected(connected);
+            }
+            let manually_added_changed = source.manually_added() != manually_added;
+            if manually_added_changed {
+                source.set_manually_added(manually_added);
+            }
+            let connecting_changed = if let Some(generation) = snapshot.pending_connect {
+                if source.connecting_generation() != Some(generation) {
+                    source.set_connecting_generation(generation);
+                    true
+                } else {
+                    false
+                }
+            } else if let Some(generation) = source.connecting_generation() {
+                source.clear_connecting_generation(generation);
+                true
+            } else {
+                false
+            };
+            let changed = connected_changed || manually_added_changed || connecting_changed;
+            if changed {
+                let ui_pending = context
+                    .pending_connection
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|pending| pending.source_key() == source_id.to_string());
+                rebind_remote_source(
+                    context,
+                    index,
+                    &source,
+                    connected || snapshot.pending_connect.is_some() || ui_pending,
+                );
+            }
+        }
+
+        if let Some(catalogue) = (source_id != crate::architecture::SourceId::radio_browser())
+            .then_some(snapshot.catalogue)
+            .flatten()
+        {
+            let identity = (catalogue.generation, catalogue.session_epoch);
+            if reducer.published_catalogues.get(&source_id) != Some(&identity) {
+                if reducer
+                    .published_catalogues
+                    .get(&source_id)
+                    .is_some_and(|(_, previous_epoch)| *previous_epoch != catalogue.session_epoch)
+                {
+                    let source_key = source_id.to_string();
+                    (context.invalidate_source_playback)(&source_key);
+                    context.source_tracks.borrow_mut().remove(&source_key);
+                }
+                let objects: Vec<TrackObject> = catalogue
+                    .value
+                    .tracks()
+                    .iter()
+                    .map(|track| arch_remote_track_to_object(track, catalogue.session_epoch))
+                    .collect();
+                publish_remote_library(
+                    source_id,
+                    catalogue.generation,
+                    objects,
+                    &context.source_tracks,
+                    &context.sidebar_store,
+                    &context.pending_connection,
+                    &context.sidebar_selection,
+                    &context.active_source_key,
+                    &context.source_navigation,
+                    &context.track_store,
+                    &context.master_tracks,
+                    &context.browser_widget,
+                    &context.browser_state,
+                    &context.status_label,
+                    &context.column_view,
+                );
+                reducer.published_catalogues.insert(source_id, identity);
+            }
+        }
+
+        if source_id == crate::architecture::SourceId::radio_browser() {
+            for (view, accepted) in &snapshot.views {
+                if super::radio::radio_source_key(view).is_none() {
+                    continue;
+                }
+                let key = (source_id, view.clone());
+                let identity = (accepted.generation, accepted.session_epoch);
+                if reducer.published_views.get(&key) == Some(&identity) {
+                    continue;
+                }
+                publish_radio_view(context, view, accepted);
+                reducer.published_views.insert(key, identity);
+            }
+
+            let mut live_failures = HashSet::new();
+            for (lane, failure) in &snapshot.refresh_failures {
+                let crate::source_lifecycle::RefreshLane::View(view) = lane else {
+                    continue;
+                };
+                if super::radio::radio_source_key(view).is_none() {
+                    continue;
+                }
+                let key = (source_id, view.clone());
+                live_failures.insert(key.clone());
+                let identity = (failure.correlation.generation, failure.failure.category());
+                if reducer.seen_refresh_failures.get(&key) == Some(&identity) {
+                    continue;
+                }
+                reconcile_radio_refresh_failure(
+                    context,
+                    view,
+                    failure.correlation.generation,
+                    failure.failure.category(),
+                );
+                reducer.seen_refresh_failures.insert(key, identity);
+            }
+            reducer
+                .seen_refresh_failures
+                .retain(|key, _| key.0 != source_id || live_failures.contains(key));
+        }
+    }
+    reducer
+        .seen_failures
+        .retain(|source_id, _| present_sources.contains(source_id));
+
+    // A missing baseline row is authoritative proof that all provenance and
+    // retirement work for that source was pruned. Remove any stale remote UI
+    // row; Found/Add/environment publishers claim before inserting a row, so a
+    // legitimate new row cannot fall into this branch.
+    let mut index = context.sidebar_store.n_items();
+    while index > 0 {
+        index -= 1;
+        let Some(source) = context
+            .sidebar_store
+            .item(index)
+            .and_downcast::<SourceObject>()
+        else {
+            continue;
+        };
+        let backend = source.backend_type();
+        if !matches!(backend.as_str(), "subsonic" | "jellyfin" | "plex" | "daap") {
+            continue;
+        }
+        let Some(source_id) = source.source_id() else {
+            continue;
+        };
+        if present_sources.contains(&source_id) {
+            continue;
+        }
+        clear_remote_pending_intent(context, source_id);
+        let backend = source.backend_type();
+        if context.sidebar_selection.selected() == index {
+            select_sidebar_source_key(&context.sidebar_store, &context.sidebar_selection, "local");
+        }
+        context.sidebar_store.remove(index);
+        clear_remote_projection(context, source_id);
+        remove_empty_category_header(&context.sidebar_store, category_for_backend(&backend));
+    }
+
+    if baseline.shutting_down {
+        tracing::debug!(
+            revision = baseline.revision,
+            "Source lifecycle reducer observed shutdown gate"
+        );
+    }
+}
+
+fn setup_source_lifecycle_reducer(
+    state: &WindowState,
+    mut invalidations: tokio::sync::watch::Receiver<u64>,
+    invalidate_source_playback: SourcePlaybackInvalidator,
+) {
+    let context = SourceReducerContext::from_window(state, invalidate_source_playback);
+    glib::MainContext::default().spawn_local(async move {
+        let mut reducer = SourceReducerState::default();
+        let baseline = context.source_registry.snapshot_all();
+        let mut revision = baseline.revision;
+        let shutting_down = baseline.shutting_down;
+        reconcile_source_baseline(&context, &mut reducer, baseline);
+        if shutting_down {
+            return;
+        }
+
+        loop {
+            // Mark the newest watch value seen only after comparing it with
+            // our atomic baseline. This closes the subscribe/baseline race:
+            // an invalidation arriving between those operations is either in
+            // the baseline or remains strictly newer here.
+            let observed = *invalidations.borrow_and_update();
+            if observed <= revision && invalidations.changed().await.is_err() {
+                return;
+            }
+
+            let baseline = context.source_registry.snapshot_all();
+            revision = baseline.revision;
+            let shutting_down = baseline.shutting_down;
+            reconcile_source_baseline(&context, &mut reducer, baseline);
+            if shutting_down {
+                return;
+            }
+        }
+    });
 }
 
 /// Build and present the main Tributary window.
@@ -116,6 +1149,13 @@ pub fn build_window(
     let daap_env =
         configured_server_url("DAAP_URL").map(|url| (url, std::env::var("DAAP_PASSWORD").ok()));
 
+    let source_registry = crate::source_registry::SourceRegistry::new(rt_handle.clone());
+    // Subscribe before the first provenance claim or constructor. The GTK
+    // reducer takes an atomic baseline later, then discards queued revisions
+    // already represented by that baseline.
+    let source_invalidations = source_registry.subscribe_invalidations();
+    let remote_provenance = crate::source_registry::ProvenanceClaims::default();
+
     // ── Load and apply persisted preferences ─────────────────────────
     let app_config: Rc<RefCell<preferences::AppConfig>> =
         Rc::new(RefCell::new(preferences::load_config()));
@@ -131,7 +1171,15 @@ pub fn build_window(
     let saved_servers = load_saved_servers();
     for entry in &saved_servers {
         ensure_category_header_vec(&mut sources, &entry.server_type);
-        let src = SourceObject::manual(&entry.name, &entry.server_type, &entry.url);
+        let src =
+            SourceObject::manual(&entry.name, &entry.server_type, &entry.url, entry.source_id);
+        let claimed = remote_provenance.ensure(
+            &source_registry,
+            entry.source_id,
+            crate::source_lifecycle::SourceProvenance::Saved,
+            "saved-config",
+        );
+        debug_assert!(claimed, "new lifecycle registry accepts saved provenance");
         sources.push(src);
         info!(
             name = %entry.name,
@@ -142,38 +1190,71 @@ pub fn build_window(
 
     // If env vars are set, add pre-configured remote server entries
     // under their respective category headers.
-    if let Some((url, _user, _pass)) = subsonic_env.as_ref() {
-        ensure_category_header_vec(&mut sources, "subsonic");
-        let src = SourceObject::discovered("Subsonic (env)", "subsonic", url);
-        src.set_connecting(true);
-        sources.push(src);
+    let subsonic_env_attempt = subsonic_env.as_ref().map(|(url, _user, _pass)| {
+        upsert_environment_source(&mut sources, "Subsonic (env)", "subsonic", url)
+    });
+    if let Some(attempt) = subsonic_env_attempt.as_ref() {
+        let claimed = remote_provenance.ensure(
+            &source_registry,
+            attempt.source_id,
+            crate::source_lifecycle::SourceProvenance::Environment,
+            "environment:SUBSONIC_URL",
+        );
+        debug_assert!(
+            claimed,
+            "new lifecycle registry accepts environment provenance"
+        );
         info!("Subsonic server configured via env vars");
     }
 
-    if let Some((url, _key, _uid)) = jellyfin_env.as_ref() {
-        ensure_category_header_vec(&mut sources, "jellyfin");
-        let src = SourceObject::discovered("Jellyfin (env)", "jellyfin", url);
-        src.set_connecting(true);
-        sources.push(src);
+    let jellyfin_env_attempt = jellyfin_env.as_ref().map(|(url, _key, _uid)| {
+        upsert_environment_source(&mut sources, "Jellyfin (env)", "jellyfin", url)
+    });
+    if let Some(attempt) = jellyfin_env_attempt.as_ref() {
+        let claimed = remote_provenance.ensure(
+            &source_registry,
+            attempt.source_id,
+            crate::source_lifecycle::SourceProvenance::Environment,
+            "environment:JELLYFIN_URL",
+        );
+        debug_assert!(
+            claimed,
+            "new lifecycle registry accepts environment provenance"
+        );
         info!("Jellyfin server configured via env vars");
     }
 
-    if let Some((url, _token)) = plex_env.as_ref() {
-        ensure_category_header_vec(&mut sources, "plex");
-        let src = SourceObject::discovered("Plex (env)", "plex", url);
-        src.set_connecting(true);
-        sources.push(src);
+    let plex_env_attempt = plex_env
+        .as_ref()
+        .map(|(url, _token)| upsert_environment_source(&mut sources, "Plex (env)", "plex", url));
+    if let Some(attempt) = plex_env_attempt.as_ref() {
+        let claimed = remote_provenance.ensure(
+            &source_registry,
+            attempt.source_id,
+            crate::source_lifecycle::SourceProvenance::Environment,
+            "environment:PLEX_URL",
+        );
+        debug_assert!(
+            claimed,
+            "new lifecycle registry accepts environment provenance"
+        );
         info!("Plex server configured via env vars");
     }
 
-    if let Some((url, _password)) = daap_env.as_ref() {
-        ensure_category_header_vec(&mut sources, "daap");
-        // Keep the configured URL as the source identity so the retained
-        // session, generation-scoped sync event, sidebar row, and disconnect action all
-        // address the same owner.
-        let src = SourceObject::discovered("DAAP (env)", "daap", url);
-        src.set_connecting(true);
-        sources.push(src);
+    let daap_env_attempt = daap_env
+        .as_ref()
+        .map(|(url, _password)| upsert_environment_source(&mut sources, "DAAP (env)", "daap", url));
+    if let Some(attempt) = daap_env_attempt.as_ref() {
+        let claimed = remote_provenance.ensure(
+            &source_registry,
+            attempt.source_id,
+            crate::source_lifecycle::SourceProvenance::Environment,
+            "environment:DAAP_URL",
+        );
+        debug_assert!(
+            claimed,
+            "new lifecycle registry accepts environment provenance"
+        );
         info!("DAAP server configured via env vars");
     }
 
@@ -268,19 +1349,21 @@ pub fn build_window(
     };
 
     // ── Connection guard ─────────────────────────────────────────────
-    // Tracks which server URL is currently being connected to, and the
-    // sidebar position that was active before the connection attempt.
+    // Tracks which stable source identity is currently being connected, and
+    // the sidebar position that was active before the connection attempt.
     // Used to (a) only auto-select on a remote sync if the source matches
     // the pending connection, and (b) revert the sidebar on failure.
     let pending_connection = Rc::new(RefCell::new(None));
     let pre_connect_selection: Rc<Cell<u32>> = Rc::new(Cell::new(1)); // default: local (index 1)
 
     // ── Per-source track storage ────────────────────────────────────
-    // Key: "local" for local filesystem, or server URL for remote.
+    // Key: "local" for the built-in local view, stable SourceId text for
+    // remotes, and the explicit view/device keys documented by WindowState.
     let source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>> =
         Rc::new(RefCell::new(HashMap::new()));
     let active_source_key: Rc<RefCell<String>> = Rc::new(RefCell::new("local".to_string()));
     let source_navigation = Rc::new(RefCell::new(SourceNavigation::new("local")));
+    let near_me_consent_request: Rc<RefCell<Option<SourceRequest>>> = Rc::new(RefCell::new(None));
 
     // ── Browser (starts empty, updated by FullSync) ──────────────────
     let track_store_for_filter = track_store.clone();
@@ -408,11 +1491,20 @@ pub fn build_window(
         window.maximize();
     }
 
-    // Save geometry, revoke standard remote leases, and explicitly close every
-    // retained DAAP session. Gate new connections synchronously, then let Tokio
-    // perform DAAP network I/O while GTK remains responsive. Once shutdown
-    // completes, close() re-enters this handler and is allowed to proceed.
-    let shutdown_handle = rt_handle.clone();
+    // Commands are queued synchronously on the GTK thread. Playback decisions
+    // are already rate-limited by real occurrences, and an unbounded FIFO
+    // avoids detached tasks silently waiting behind a busy initial scan. A
+    // terminal marker below makes normal shutdown wait for every earlier
+    // admitted history/root-trust command to finish.
+    let (library_commands, library_command_rx) =
+        super::library_commands::LibraryCommandAdmission::channel();
+
+    // Save geometry, retire playback, close the source lifecycle gate, and
+    // drain local-library mutations before allowing the window to disappear.
+    let shutdown_sources = source_registry.clone();
+    let shutdown_playback = playback_session.clone();
+    let shutdown_output_slot = active_output_slot.clone();
+    let shutdown_library_commands = library_commands.clone();
     let shutdown_started = Rc::new(Cell::new(false));
     let shutdown_complete = Rc::new(Cell::new(false));
     window.connect_close_request(move |w| {
@@ -422,20 +1514,38 @@ pub fn build_window(
         }
 
         if !shutdown_started.replace(true) {
-            crate::source_registry::begin_shutdown();
-            crate::daap::begin_shutdown();
-            let (done_tx, done_rx) = async_channel::bounded::<()>(1);
-            shutdown_handle.spawn(async move {
-                crate::daap::shutdown_all().await;
-                let _ = done_tx.send(()).await;
-            });
-
+            // Close every UI producer before any widget, output, or source
+            // teardown can synchronously re-enter GTK, then append the marker
+            // in that same non-interleavable main-thread operation.
+            let (flush_tx, flush_rx) = async_channel::bounded(1);
+            let flush_queued = shutdown_library_commands.close_and_flush(flush_tx);
+            if !flush_queued {
+                warn!("Library mutation receiver stopped before shutdown flush");
+            }
+            // The close drain can wait behind an initial scan. Make the still-
+            // visible window inert immediately; media-key and application
+            // actions also consult the shared command-admission gate below.
+            w.set_sensitive(false);
+            super::open_files::invalidate_admission();
+            let external_source = shutdown_playback.borrow().current_external_source_id();
+            // Revoke the event generation before stopping the output so no
+            // terminal callback can enqueue behind the FIFO flush marker.
+            shutdown_playback.borrow_mut().clear();
+            let shutdown_output = shutdown_output_slot.borrow().as_ref().cloned();
+            if let Some(shutdown_output) = shutdown_output {
+                shutdown_output.borrow().stop();
+            }
+            if let Some(source_id) = external_source {
+                let _ = shutdown_sources.retire_external(source_id);
+            }
+            let barrier = shutdown_sources.shutdown();
             let window = w.clone();
             let shutdown_complete = shutdown_complete.clone();
             glib::MainContext::default().spawn_local(async move {
-                // A closed channel also unblocks the window if the runtime
-                // task unexpectedly terminates.
-                let _ = done_rx.recv().await;
+                if flush_queued && flush_rx.recv().await.is_err() {
+                    warn!("Library mutation shutdown flush was not acknowledged");
+                }
+                barrier.wait().await;
                 shutdown_complete.set(true);
                 window.close();
             });
@@ -444,12 +1554,13 @@ pub fn build_window(
         glib::Propagation::Stop
     });
 
-    // Root trust is the only UI-to-library-engine command path. The engine
-    // validates every request against fresh filesystem evidence before it can
-    // change persisted trust; the GTK side only queues an affirmative intent.
-    let (library_command_tx, library_command_rx) = async_channel::bounded(LIBRARY_COMMAND_CAPACITY);
-    let root_trust_prompts =
-        root_trust::RootTrustPromptController::new(&window, &toast_overlay, library_command_tx);
+    // The engine validates every root-trust request against fresh filesystem
+    // evidence before it can change persisted trust.
+    let root_trust_prompts = root_trust::RootTrustPromptController::new(
+        &window,
+        &toast_overlay,
+        library_commands.clone(),
+    );
 
     // ── Start the library engine on tokio ────────────────────────────
     // Use the configured library paths from preferences, which default
@@ -500,188 +1611,87 @@ pub fn build_window(
 
     // ── Start Subsonic backend if configured via env vars ──────────
     if let Some((url, user, pass)) = subsonic_env {
-        let tx = engine_tx.clone();
-        rt_handle.spawn(async move {
-            info!("Connecting to Subsonic server...");
-            let Some(attempt) = crate::source_registry::begin_connect(url.clone()) else {
-                tracing::debug!("Skipping Subsonic connect during shutdown");
-                return;
-            };
-            match crate::subsonic::SubsonicBackend::connect("Subsonic", &url, &user, &pass).await {
-                Ok(backend) => {
-                    let tracks: Vec<crate::architecture::models::Track> =
-                        backend.all_tracks().await;
-                    let Some(source) = attempt.retain(Arc::new(backend)) else {
-                        tracing::debug!("Subsonic connect was superseded");
-                        return;
-                    };
-                    if !source.is_current() {
-                        tracing::debug!("Subsonic sync was superseded");
-                        return;
-                    }
-                    info!(count = tracks.len(), "Subsonic library fetched");
-                    let _ = tx
-                        .send(LibraryEvent::RemoteSync {
-                            source_key: url.clone(),
-                            generation: source.generation(),
-                            lease_key: source.lease_key(),
-                            tracks,
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    if !attempt.is_latest() {
-                        tracing::debug!("Ignoring superseded Subsonic connection failure");
-                        return;
-                    }
-                    let category = super::source_connect::remote_failure_category(&e);
-                    tracing::error!(category = category.as_str(), "Subsonic connection failed");
-                    let _ = tx
-                        .send(LibraryEvent::Error(category.user_message("Subsonic")))
-                        .await;
-                }
-            }
-        });
+        let EnvironmentConnectionAttempt { source_id } =
+            subsonic_env_attempt.expect("configured Subsonic source attempt");
+        source_registry.connect_standard(
+            source_id,
+            |generation| {
+                set_remote_connecting_generation(
+                    &sidebar_store,
+                    &sidebar_selection,
+                    source_id,
+                    generation,
+                );
+            },
+            move || async move {
+                info!("Connecting to Subsonic server...");
+                crate::subsonic::SubsonicBackend::connect("Subsonic", &url, &user, &pass).await
+            },
+        );
     }
 
     // ── Start Jellyfin backend if configured via env vars ──────────
     if let Some((url, api_key, user_id)) = jellyfin_env {
-        let tx = engine_tx.clone();
-        rt_handle.spawn(async move {
-            info!("Connecting to Jellyfin server...");
-            let Some(attempt) = crate::source_registry::begin_connect(url.clone()) else {
-                tracing::debug!("Skipping Jellyfin connect during shutdown");
-                return;
-            };
-            match crate::jellyfin::JellyfinBackend::connect("Jellyfin", &url, &api_key, &user_id)
-                .await
-            {
-                Ok(backend) => {
-                    let tracks: Vec<crate::architecture::models::Track> =
-                        backend.all_tracks().await;
-                    let Some(source) = attempt.retain(Arc::new(backend)) else {
-                        tracing::debug!("Jellyfin connect was superseded");
-                        return;
-                    };
-                    if !source.is_current() {
-                        tracing::debug!("Jellyfin sync was superseded");
-                        return;
-                    }
-                    info!(count = tracks.len(), "Jellyfin library fetched");
-                    let _ = tx
-                        .send(LibraryEvent::RemoteSync {
-                            source_key: url.clone(),
-                            generation: source.generation(),
-                            lease_key: source.lease_key(),
-                            tracks,
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    if !attempt.is_latest() {
-                        tracing::debug!("Ignoring superseded Jellyfin connection failure");
-                        return;
-                    }
-                    let category = super::source_connect::remote_failure_category(&e);
-                    tracing::error!(category = category.as_str(), "Jellyfin connection failed");
-                    let _ = tx
-                        .send(LibraryEvent::Error(category.user_message("Jellyfin")))
-                        .await;
-                }
-            }
-        });
+        let EnvironmentConnectionAttempt { source_id } =
+            jellyfin_env_attempt.expect("configured Jellyfin source attempt");
+        source_registry.connect_jellyfin_api_key(
+            source_id,
+            |generation| {
+                set_remote_connecting_generation(
+                    &sidebar_store,
+                    &sidebar_selection,
+                    source_id,
+                    generation,
+                );
+            },
+            move || async move {
+                info!("Connecting to Jellyfin server...");
+                crate::jellyfin::JellyfinBackend::connect("Jellyfin", &url, &api_key, &user_id)
+                    .await
+            },
+        );
     }
 
     // ── Start Plex backend if configured via env vars ──────────────
     if let Some((url, token)) = plex_env {
-        let tx = engine_tx.clone();
-        rt_handle.spawn(async move {
-            info!("Connecting to Plex server...");
-            let Some(attempt) = crate::source_registry::begin_connect(url.clone()) else {
-                tracing::debug!("Skipping Plex connect during shutdown");
-                return;
-            };
-            match crate::plex::PlexBackend::connect("Plex", &url, &token).await {
-                Ok(backend) => {
-                    let tracks: Vec<crate::architecture::models::Track> =
-                        backend.all_tracks().await;
-                    let Some(source) = attempt.retain(Arc::new(backend)) else {
-                        tracing::debug!("Plex connect was superseded");
-                        return;
-                    };
-                    if !source.is_current() {
-                        tracing::debug!("Plex sync was superseded");
-                        return;
-                    }
-                    info!(count = tracks.len(), "Plex library fetched");
-                    let _ = tx
-                        .send(LibraryEvent::RemoteSync {
-                            source_key: url.clone(),
-                            generation: source.generation(),
-                            lease_key: source.lease_key(),
-                            tracks,
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    if !attempt.is_latest() {
-                        tracing::debug!("Ignoring superseded Plex connection failure");
-                        return;
-                    }
-                    let category = super::source_connect::remote_failure_category(&e);
-                    tracing::error!(category = category.as_str(), "Plex connection failed");
-                    let _ = tx
-                        .send(LibraryEvent::Error(category.user_message("Plex")))
-                        .await;
-                }
-            }
-        });
+        let EnvironmentConnectionAttempt { source_id } =
+            plex_env_attempt.expect("configured Plex source attempt");
+        source_registry.connect_standard(
+            source_id,
+            |generation| {
+                set_remote_connecting_generation(
+                    &sidebar_store,
+                    &sidebar_selection,
+                    source_id,
+                    generation,
+                );
+            },
+            move || async move {
+                info!("Connecting to Plex server...");
+                crate::plex::PlexBackend::connect("Plex", &url, &token).await
+            },
+        );
     }
 
     // ── Start DAAP backend if configured via env vars ──────────────
     if let Some((url, password)) = daap_env {
-        let tx = engine_tx.clone();
-        rt_handle.spawn(async move {
-            info!("Connecting to DAAP server...");
-            let Some(attempt) = crate::daap::begin_connect(url.clone()) else {
-                tracing::debug!("Skipping DAAP connect during shutdown");
-                return;
-            };
-            match crate::daap::DaapBackend::connect("DAAP", &url, password.as_deref()).await {
-                Ok(backend) => {
-                    let Some(session) = attempt.retain(backend).await else {
-                        tracing::debug!("DAAP connect was superseded");
-                        return;
-                    };
-                    let tracks: Vec<crate::architecture::models::Track> =
-                        session.all_tracks().await;
-                    if !session.is_current() {
-                        tracing::debug!("DAAP sync was superseded");
-                        return;
-                    }
-                    info!(count = tracks.len(), "DAAP library fetched");
-                    let _ = tx
-                        .send(LibraryEvent::DaapSync {
-                            source_key: url.clone(),
-                            generation: session.generation(),
-                            session_key: session.session_key(),
-                            tracks,
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    if !attempt.is_latest() {
-                        tracing::debug!("Ignoring superseded DAAP connection failure");
-                        return;
-                    }
-                    let category = super::source_connect::remote_failure_category(&e);
-                    tracing::error!(category = category.as_str(), "DAAP connection failed");
-                    let _ = tx
-                        .send(LibraryEvent::Error(category.user_message("DAAP")))
-                        .await;
-                }
-            }
-        });
+        let EnvironmentConnectionAttempt { source_id } =
+            daap_env_attempt.expect("configured DAAP source attempt");
+        source_registry.connect_daap(
+            source_id,
+            |generation| {
+                set_remote_connecting_generation(
+                    &sidebar_store,
+                    &sidebar_selection,
+                    source_id,
+                    generation,
+                );
+            },
+            move || async move {
+                info!("Connecting to DAAP server...");
+                crate::daap::DaapBackend::login("DAAP", &url, password.as_deref()).await
+            },
+        );
     }
 
     // ── mDNS zero-config discovery ─────────────────────────────────
@@ -690,11 +1700,14 @@ pub fn build_window(
             window: window.clone(),
             rt_handle: rt_handle.clone(),
             engine_tx: engine_tx.clone(),
+            source_registry: source_registry.clone(),
+            remote_provenance: remote_provenance.clone(),
             track_store: track_store.clone(),
             master_tracks: master_tracks.clone(),
             source_tracks: source_tracks.clone(),
             active_source_key: active_source_key.clone(),
             source_navigation: source_navigation.clone(),
+            near_me_consent_request: near_me_consent_request.clone(),
             sidebar_store: sidebar_store.clone(),
             sidebar_selection: sidebar_selection.clone(),
             browser_widget: browser_widget.clone(),
@@ -707,17 +1720,25 @@ pub fn build_window(
             pre_connect_selection: pre_connect_selection.clone(),
         },
         &hb.output_list,
-        invalidate_source_playback.clone(),
     );
 
     // ── Wire "+" add-server button ──────────────────────────────────
     {
         let win = window.clone();
         let store = sidebar_store.clone();
+        let selection = sidebar_selection.clone();
         let engine_tx = engine_tx.clone();
-        let rt_handle = rt_handle.clone();
+        let source_registry = source_registry.clone();
+        let remote_provenance = remote_provenance.clone();
         add_button.connect_clicked(move |_| {
-            show_add_server_dialog(&win, &store, &engine_tx, &rt_handle);
+            show_add_server_dialog(
+                &win,
+                &store,
+                &selection,
+                &engine_tx,
+                &source_registry,
+                &remote_provenance,
+            );
         });
     }
 
@@ -741,148 +1762,50 @@ pub fn build_window(
 
     // ── Manual server delete (trash) handler ────────────────────────
     {
-        let sidebar_store = sidebar_store.clone();
-        let sidebar_selection = sidebar_selection.clone();
-        let source_tracks = source_tracks.clone();
-        let active_source_key = active_source_key.clone();
-        let source_navigation = source_navigation.clone();
-        let track_store = track_store.clone();
-        let master_tracks = master_tracks.clone();
-        let browser_widget = browser_widget.clone();
-        let browser_state = browser_state.clone();
-        let status_label = status_label.clone();
-        let column_view = column_view.clone();
-        let rt_handle = rt_handle.clone();
-        let invalidate_source_playback = invalidate_source_playback.clone();
+        let source_registry = source_registry.clone();
+        let remote_provenance = remote_provenance.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = delete_rx.recv().await {
                 info!("Manual server delete requested");
-                invalidate_source_playback(&source_key);
-
-                // A connected DAAP source normally uses the eject action,
-                // but deletion must still transfer and close ownership if a
-                // stale/rebound row emits delete instead.
-                if let Some(backend) = crate::daap::release_source(&source_key) {
-                    rt_handle.spawn(async move {
-                        backend.disconnect().await;
-                    });
+                let Ok(source_id) = source_key.parse::<crate::architecture::SourceId>() else {
+                    tracing::warn!("Ignoring delete for invalid source identity");
+                    continue;
+                };
+                // Persisted absence is the authority for releasing Saved.
+                // A failed write leaves both the row and claim untouched.
+                if !remove_saved_server(source_id) {
+                    tracing::warn!(%source_id, "Could not persist saved server removal");
+                    continue;
                 }
-                crate::source_registry::release_source(&source_key);
-
-                // Remove from servers.json.
-                remove_saved_server(&source_key);
-
-                // Remove from source_tracks map.
-                source_tracks.borrow_mut().remove(&source_key);
-
-                // Remove from sidebar.
-                for i in 0..sidebar_store.n_items() {
-                    if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-                        if src.server_url() == source_key {
-                            let backend = src.backend_type();
-                            sidebar_store.remove(i);
-                            let category = category_for_backend(&backend);
-                            remove_empty_category_header(&sidebar_store, category);
-                            break;
-                        }
-                    }
+                if !remote_provenance.release(
+                    &source_registry,
+                    source_id,
+                    crate::source_lifecycle::SourceProvenance::Saved,
+                    "saved-config",
+                ) {
+                    tracing::warn!(%source_id, "Saved source claim was unavailable after removal");
                 }
 
-                // If this was the active source, switch to "local".
-                if *active_source_key.borrow() == source_key {
-                    source_navigation.borrow_mut().select("local");
-                    *active_source_key.borrow_mut() = "local".to_string();
-                    sidebar_selection.set_selected(1);
-
-                    let st = source_tracks.borrow();
-                    let local_tracks = st.get("local").cloned().unwrap_or_default();
-                    display_tracks(
-                        &local_tracks,
-                        &track_store,
-                        &master_tracks,
-                        &browser_widget,
-                        &browser_state,
-                        &status_label,
-                        &column_view,
-                    );
-                }
+                // The lifecycle baseline reducer owns Saved demotion, final
+                // projection clearing, row removal, and active-source fallback.
             }
         });
     }
 
     // ── DAAP disconnect (eject) handler ─────────────────────────────
     {
-        let sidebar_store = sidebar_store.clone();
-        let sidebar_selection = sidebar_selection.clone();
-        let source_tracks = source_tracks.clone();
-        let active_source_key = active_source_key.clone();
-        let source_navigation = source_navigation.clone();
-        let track_store = track_store.clone();
-        let master_tracks = master_tracks.clone();
-        let browser_widget = browser_widget.clone();
-        let browser_state = browser_state.clone();
-        let status_label = status_label.clone();
-        let column_view = column_view.clone();
-        let rt_handle = rt_handle.clone();
-        let invalidate_source_playback = invalidate_source_playback.clone();
+        let source_registry = source_registry.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = disconnect_rx.recv().await {
                 info!("DAAP disconnect requested");
-                invalidate_source_playback(&source_key);
-
-                // Transfer ownership out of the live-session registry before
-                // updating the UI. This makes a subsequent fast reconnect
-                // independent of the old session's asynchronous logout.
-                if let Some(backend) = crate::daap::release_source(&source_key) {
-                    rt_handle.spawn(async move {
-                        backend.disconnect().await;
-                    });
-                } else {
-                    tracing::warn!("DAAP source had no retained session");
-                }
-
-                // 1. Remove from source_tracks map.
-                source_tracks.borrow_mut().remove(&source_key);
-
-                // 2. Reset the sidebar item back to discovered (unconnected)
-                //    state instead of removing it entirely.
-                for i in 0..sidebar_store.n_items() {
-                    if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-                        if src.server_url() == source_key {
-                            src.set_connected(false);
-                            src.set_connecting(false);
-                            src.set_icon_name("network-server-symbolic");
-                            // Force rebind by remove + re-insert.
-                            let src = src.clone();
-                            sidebar_store.remove(i);
-                            sidebar_store.insert(i, &src);
-                            break;
-                        }
-                    }
-                }
-
-                // 3. If this was the active source, switch to "local".
-                if *active_source_key.borrow() == source_key {
-                    source_navigation.borrow_mut().select("local");
-                    *active_source_key.borrow_mut() = "local".to_string();
-
-                    // Select the local source in the sidebar (index 1, after header).
-                    sidebar_selection.set_selected(1);
-
-                    // Display local tracks.
-                    let st = source_tracks.borrow();
-                    let local_tracks = st.get("local").cloned().unwrap_or_default();
-                    display_tracks(
-                        &local_tracks,
-                        &track_store,
-                        &master_tracks,
-                        &browser_widget,
-                        &browser_state,
-                        &status_label,
-                        &column_view,
-                    );
+                let Ok(source_id) = source_key.parse::<crate::architecture::SourceId>() else {
+                    tracing::warn!("Ignoring disconnect for invalid source identity");
+                    continue;
+                };
+                if source_registry.disconnect(source_id).is_none() {
+                    tracing::warn!("DAAP source lifecycle entry was unavailable");
                 }
             }
         });
@@ -897,11 +1820,14 @@ pub fn build_window(
         window: window.clone(),
         rt_handle: rt_handle.clone(),
         engine_tx: engine_tx.clone(),
+        source_registry: source_registry.clone(),
+        remote_provenance: remote_provenance.clone(),
         track_store: track_store.clone(),
         master_tracks: master_tracks.clone(),
         source_tracks: source_tracks.clone(),
         active_source_key: active_source_key.clone(),
         source_navigation: source_navigation.clone(),
+        near_me_consent_request: near_me_consent_request.clone(),
         sidebar_store: sidebar_store.clone(),
         sidebar_selection: sidebar_selection.clone(),
         browser_widget: browser_widget.clone(),
@@ -914,6 +1840,11 @@ pub fn build_window(
         pre_connect_selection: pre_connect_selection.clone(),
     };
     super::source_connect::setup_source_connect(&source_connection_state);
+    setup_source_lifecycle_reducer(
+        &source_connection_state,
+        source_invalidations,
+        invalidate_source_playback.clone(),
+    );
 
     // ═══════════════════════════════════════════════════════════════════
     // Phase 4: Audio Player + Desktop Integration
@@ -926,8 +1857,8 @@ pub fn build_window(
     info!("Main window presented");
 
     // GVolumeMonitor must stay on the GTK main thread. Its cached mount
-    // metadata drives an idempotent sidebar reconciliation, while selecting a
-    // device still performs filesystem walking/tag parsing on a bounded worker.
+    // metadata drives idempotent lifecycle reconciliation; each eligible mount
+    // starts its registry-owned walk/tag parse on a bounded blocking worker.
     super::removable_media::setup_removable_media(
         &source_connection_state,
         invalidate_source_playback.clone(),
@@ -956,7 +1887,6 @@ pub fn build_window(
                 pending_connection_for_events.clone(),
                 playback_session.clone(),
                 root_trust_prompts.clone(),
-                invalidate_source_playback.clone(),
                 app_config.clone(),
             );
             return;
@@ -1093,9 +2023,17 @@ pub fn build_window(
             let ctrl_for_ctx = media_ctrl.clone();
             let column_view_for_keys = column_view.clone();
             let clear_playback_ui = clear_playback_ui.clone();
+            let playback_rt = rt_handle.clone();
+            let playback_config = app_config.clone();
+            let playback_source_registry = source_registry.clone();
+            let media_playback_admission = library_commands.clone();
 
             glib::MainContext::default().spawn_local(async move {
                 while let Ok(action) = media_rx.recv().await {
+                    if !media_playback_admission.is_open() {
+                        tracing::debug!(?action, "Ignoring OS media action during shutdown");
+                        continue;
+                    }
                     info!(?action, "OS media key");
                     let ctx = PlaybackContext {
                         model: sm.clone(),
@@ -1106,7 +2044,10 @@ pub fn build_window(
                         artist_label: artist_label.clone(),
                         media_ctrl: ctrl_for_ctx.clone(),
                         session: playback_session.clone(),
+                        app_config: playback_config.clone(),
+                        rt_handle: playback_rt.clone(),
                         column_view: column_view_for_keys.clone(),
+                        source_registry: playback_source_registry.clone(),
                     };
                     match action {
                         MediaAction::Play => {
@@ -1117,6 +2058,7 @@ pub fn build_window(
                             }
                         }
                         MediaAction::Pause => {
+                            super::open_files::invalidate_admission();
                             if playback_session
                                 .borrow_mut()
                                 .cancel_pending_resolution_for_retry()
@@ -1144,21 +2086,14 @@ pub fn build_window(
                             clear_playback_ui();
                         }
                         MediaAction::Next => {
-                            advance_track(&ctx, repeat_mode.get(), shuffle.is_active());
+                            advance_track_from_user(&ctx, repeat_mode.get(), shuffle.is_active());
                         }
                         MediaAction::Previous => {
-                            // Mirror the header-bar heuristic: if we're past
-                            // the restart threshold, restart the current track.
-                            let position_ms = active_output.borrow().position_ms().unwrap_or(0);
-                            if position_ms > PREV_RESTART_THRESHOLD_MS {
-                                active_output.borrow().seek_to(0);
-                            } else {
-                                let stepped =
-                                    previous_track(&ctx, repeat_mode.get(), shuffle.is_active());
-                                if !stepped {
-                                    active_output.borrow().seek_to(0);
-                                }
-                            }
+                            previous_or_restart_from_user(
+                                &ctx,
+                                repeat_mode.get(),
+                                shuffle.is_active(),
+                            );
                         }
                     }
                 }
@@ -1182,8 +2117,15 @@ pub fn build_window(
         let playback_session = playback_session.clone();
         let shuffle = hb.shuffle_button.clone();
         let column_view_c = column_view.clone();
+        let playback_rt = rt_handle.clone();
+        let playback_config = app_config.clone();
+        let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         hb.play_button.connect_clicked(move |_| {
+            if !playback_admission.is_open() {
+                return;
+            }
             toggle_or_start(
                 &PlaybackContext {
                     model: sort_model.clone(),
@@ -1194,7 +2136,10 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    app_config: playback_config.clone(),
+                    rt_handle: playback_rt.clone(),
                     column_view: column_view_c.clone(),
+                    source_registry: playback_source_registry.clone(),
                 },
                 shuffle.is_active(),
             );
@@ -1208,9 +2153,13 @@ pub fn build_window(
             save_repeat_mode(mode.get());
         });
     }
-    hb.shuffle_button.connect_toggled(move |btn| {
-        save_shuffle(btn.is_active());
-    });
+    {
+        let playback_session = playback_session.clone();
+        hb.shuffle_button.connect_toggled(move |btn| {
+            playback_session.borrow_mut().reset_shuffle_navigation();
+            save_shuffle(btn.is_active());
+        });
+    }
 
     // ── Wire output selector row-click handler ──────────────────────
     {
@@ -1225,6 +2174,7 @@ pub fn build_window(
             &event_sender,
             &hb.volume_scale,
             &rt_handle,
+            &source_registry,
         );
     }
 
@@ -1235,18 +2185,28 @@ pub fn build_window(
     // window; the final value always lands within the window.
     {
         let active_output = active_output.clone();
+        let volume_admission = library_commands.clone();
         let pending: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
         let scheduled = Rc::new(Cell::new(false));
         hb.volume_adj.connect_value_changed(move |adj| {
+            if !volume_admission.is_open() {
+                pending.set(None);
+                return;
+            }
             pending.set(Some(adj.value()));
             if scheduled.replace(true) {
                 return;
             }
             let active_output = active_output.clone();
+            let volume_admission = volume_admission.clone();
             let pending = pending.clone();
             let scheduled = scheduled.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
                 scheduled.set(false);
+                if !volume_admission.is_open() {
+                    pending.set(None);
+                    return;
+                }
                 if let Some(v) = pending.take() {
                     active_output.borrow_mut().set_volume(v);
                 }
@@ -1259,30 +2219,57 @@ pub fn build_window(
     // position-poll updates (guarded by `seeking`) so they never seek.
     {
         let active_output = active_output.clone();
+        let playback_session = playback_session.clone();
         let seeking = seeking.clone();
-        let pending: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let playback_admission = library_commands.clone();
+        let pending: Rc<Cell<Option<(PlayerEventGeneration, u64)>>> = Rc::new(Cell::new(None));
         let scheduled = Rc::new(Cell::new(false));
         hb.progress_adj.connect_value_changed(move |adj| {
-            if seeking.get() {
+            if seeking.get() || !playback_admission.is_open() {
                 return;
             }
-            pending.set(Some(adj.value() as u64));
+            super::open_files::invalidate_admission();
+            pending.set(Some((
+                playback_session.borrow().current_event_generation(),
+                adj.value() as u64,
+            )));
             if scheduled.replace(true) {
                 return;
             }
             let active_output = active_output.clone();
+            let playback_session = playback_session.clone();
+            let playback_admission = playback_admission.clone();
             let pending = pending.clone();
             let seeking = seeking.clone();
             let scheduled = scheduled.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
                 scheduled.set(false);
+                let intent = pending.take();
                 // Re-check the guard: don't fire a stale seek if a
                 // programmatic update is in progress when the timer lands.
-                if !seeking.get() {
-                    if let Some(p) = pending.take() {
-                        active_output.borrow().seek_to(p);
-                    }
+                if seeking.get() {
+                    return;
                 }
+                if !playback_admission.is_open() {
+                    return;
+                }
+                let Some((generation, target_ms)) = intent else {
+                    return;
+                };
+                if !playback_session
+                    .borrow()
+                    .accepts_event_generation(generation)
+                {
+                    return;
+                }
+
+                let actual_position_ms = active_output.borrow().position_ms().unwrap_or(0);
+                let _ = playback_session.borrow_mut().observe_history_seek(
+                    generation,
+                    actual_position_ms,
+                    target_ms,
+                );
+                active_output.borrow().seek_to(target_ms);
             });
         });
     }
@@ -1316,8 +2303,15 @@ pub fn build_window(
         let active_source_key = active_source_key.clone();
         let playback_session = playback_session.clone();
         let cv = column_view.clone();
+        let playback_rt = rt_handle.clone();
+        let playback_config = app_config.clone();
+        let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         column_view.connect_activate(move |_view, position| {
+            if !playback_admission.is_open() {
+                return;
+            }
             play_track_at(
                 position,
                 &PlaybackContext {
@@ -1329,7 +2323,10 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    app_config: playback_config.clone(),
+                    rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
+                    source_registry: playback_source_registry.clone(),
                 },
             );
         });
@@ -1340,11 +2337,14 @@ pub fn build_window(
         window: window.clone(),
         rt_handle: rt_handle.clone(),
         engine_tx: engine_tx.clone(),
+        source_registry: source_registry.clone(),
+        remote_provenance: remote_provenance.clone(),
         track_store: track_store.clone(),
         master_tracks: master_tracks.clone(),
         source_tracks: source_tracks.clone(),
         active_source_key: active_source_key.clone(),
         source_navigation: source_navigation.clone(),
+        near_me_consent_request: near_me_consent_request.clone(),
         sidebar_store: sidebar_store_for_events.clone(),
         sidebar_selection: sidebar_sel_for_events.clone(),
         browser_widget: browser_widget.clone(),
@@ -1370,9 +2370,16 @@ pub fn build_window(
         let repeat_mode = hb.repeat_mode.clone();
         let shuffle = hb.shuffle_button.clone();
         let cv = column_view.clone();
+        let playback_rt = rt_handle.clone();
+        let playback_config = app_config.clone();
+        let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         hb.next_button.connect_clicked(move |_| {
-            advance_track(
+            if !playback_admission.is_open() {
+                return;
+            }
+            advance_track_from_user(
                 &PlaybackContext {
                     model: sm.clone(),
                     active_source_key: active_source_key.clone(),
@@ -1382,7 +2389,10 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    app_config: playback_config.clone(),
+                    rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
+                    source_registry: playback_source_registry.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
@@ -1403,16 +2413,16 @@ pub fn build_window(
         let repeat_mode = hb.repeat_mode.clone();
         let shuffle = hb.shuffle_button.clone();
         let cv = column_view.clone();
+        let playback_rt = rt_handle.clone();
+        let playback_config = app_config.clone();
+        let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         hb.prev_button.connect_clicked(move |_| {
-            // If more than 3 s into the track, restart it.
-            let position_ms = active_output.borrow().position_ms().unwrap_or(0);
-            if position_ms > PREV_RESTART_THRESHOLD_MS {
-                active_output.borrow().seek_to(0);
+            if !playback_admission.is_open() {
                 return;
             }
-
-            let stepped = previous_track(
+            previous_or_restart_from_user(
                 &PlaybackContext {
                     model: sm.clone(),
                     active_source_key: active_source_key.clone(),
@@ -1422,17 +2432,14 @@ pub fn build_window(
                     artist_label: artist_label.clone(),
                     media_ctrl: media_ctrl.clone(),
                     session: playback_session.clone(),
+                    app_config: playback_config.clone(),
+                    rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
+                    source_registry: playback_source_registry.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
             );
-
-            // If we couldn't step back (track 0 with repeat off, or no
-            // current track), restart whatever is playing instead.
-            if !stepped {
-                active_output.borrow().seek_to(0);
-            }
         });
     }
 
@@ -1457,6 +2464,10 @@ pub fn build_window(
         let buffering_tracker = buffering_tracker.clone();
         let clear_playback_ui = clear_playback_ui.clone();
         let toast_overlay = toast_overlay.clone();
+        let playback_rt = rt_handle.clone();
+        let playback_config = app_config.clone();
+        let playback_source_registry = source_registry.clone();
+        let playback_history_commands = library_commands.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -1478,6 +2489,21 @@ pub fn build_window(
                 {
                     tracing::debug!(?event_generation, "Ignoring stale player event");
                     continue;
+                }
+
+                // Account before EOS repeat/advance or error recovery mutates
+                // the occurrence. The session latches exactly once and the
+                // unbounded FIFO accepts synchronously, so no detached send
+                // task can outlive the normal-shutdown drain marker.
+                if let Some(track_id) = playback_session.borrow_mut().observe_history_event(&event)
+                {
+                    let counted_at_ms = Utc::now().timestamp_millis();
+                    if !playback_history_commands.try_send(LibraryCommand::RecordPlaybackHistory {
+                        track_id,
+                        counted_at_ms,
+                    }) {
+                        warn!("Playback history command admission is closed");
+                    }
                 }
                 match event {
                     PlayerEvent::StateChanged { state, .. } => {
@@ -1592,7 +2618,10 @@ pub fn build_window(
                                 artist_label: artist_label.clone(),
                                 media_ctrl: media_ctrl.clone(),
                                 session: playback_session.clone(),
+                                app_config: playback_config.clone(),
+                                rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
+                                source_registry: playback_source_registry.clone(),
                             })
                         {
                             continue;
@@ -1609,7 +2638,10 @@ pub fn build_window(
                                 artist_label: artist_label.clone(),
                                 media_ctrl: media_ctrl.clone(),
                                 session: playback_session.clone(),
+                                app_config: playback_config.clone(),
+                                rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
+                                source_registry: playback_source_registry.clone(),
                             },
                             mode,
                             shuffle.is_active(),
@@ -1617,8 +2649,21 @@ pub fn build_window(
 
                         if !advanced {
                             // End of playlist — invalidate the event generation
-                            // before resetting every async/visible UI surface.
+                            // before stopping the output. This also revokes a
+                            // receiver-facing local-file lease after natural
+                            // completion; any synchronous Stopped event is
+                            // already stale.
+                            let external_source = playback_session
+                                .borrow()
+                                .external_source_for_terminal(event_generation, false);
+                            if external_source.is_some() {
+                                super::open_files::invalidate_admission();
+                            }
                             playback_session.borrow_mut().clear();
+                            active_output.borrow().stop();
+                            if let Some(source_id) = external_source {
+                                let _ = playback_source_registry.retire_external(source_id);
+                            }
                             clear_playback_ui();
                         }
                     }
@@ -1632,14 +2677,26 @@ pub fn build_window(
                         // message is safe to display verbatim. Without this,
                         // a failed load is visible only in the logs.
                         toast_overlay.add_toast(adw::Toast::new(&message));
-                        // A protected resolver has already handed its request
-                        // to the output at this point. If that load fails, keep
-                        // the queue item but force the next Play through a new
-                        // resolution instead of calling `play()` on an output
-                        // that may never have accepted media.
+                        let external_source = playback_session
+                            .borrow()
+                            .external_source_for_terminal(event_generation, false);
+                        if let Some(source_id) = external_source {
+                            super::open_files::invalidate_admission();
+                            playback_session.borrow_mut().clear();
+                            active_output.borrow().stop();
+                            let _ = playback_source_registry.retire_external(source_id);
+                            clear_playback_ui();
+                            continue;
+                        }
+                        // A protected or exact-local resolver has already
+                        // handed media to the output at this point. If that
+                        // load fails, keep the queue item but force the next
+                        // Play through a new resolution instead of calling
+                        // `play()` on an output that may never have accepted
+                        // media.
                         if playback_session
                             .borrow_mut()
-                            .mark_protected_load_failed(event_generation)
+                            .mark_resolved_load_failed(event_generation)
                         {
                             active_output.borrow().stop();
                         }
@@ -1706,32 +2763,73 @@ pub fn build_window(
         let active_source_key = active_source_key.clone();
         let playback_session = playback_session.clone();
         let cv = column_view.clone();
+        let playback_rt = rt_handle.clone();
+        let playback_config = app_config.clone();
+        let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
         play_pending.connect_activate(move |_, _| {
-            let paths = super::open_files::drain();
-            if paths.is_empty() {
+            if !playback_admission.is_open() {
+                super::open_files::invalidate_admission();
+                let _ = super::open_files::drain();
                 return;
             }
-            // Play only the first file for now.  If multiple files were
-            // delivered, the rest are dropped — multi-file Open With with
-            // a temp playlist is a separate feature.
-            let ctx = super::playback::PlaybackContext {
-                model: sm.clone(),
-                active_source_key: active_source_key.clone(),
-                active_output: active_output.clone(),
-                album_art: album_art.clone(),
-                title_label: title_label.clone(),
-                artist_label: artist_label.clone(),
-                media_ctrl: media_ctrl.clone(),
-                session: playback_session.clone(),
-                column_view: cv.clone(),
-            };
-            for path in paths {
-                if super::playback::play_local_file(&path, &ctx) {
-                    break;
-                }
+            let delivery = super::open_files::drain();
+            if delivery.is_empty() {
+                return;
             }
+
+            let generation = delivery.generation();
+            let registry = playback_source_registry.clone();
+            let admission = playback_rt.spawn_blocking(move || {
+                super::open_files::admit_first_accepted_audio(delivery, registry)
+            });
+
+            let active_output = active_output.clone();
+            let media_ctrl = media_ctrl.clone();
+            let album_art = album_art.clone();
+            let title_label = title_label.clone();
+            let artist_label = artist_label.clone();
+            let sm = sm.clone();
+            let active_source_key = active_source_key.clone();
+            let playback_session = playback_session.clone();
+            let cv = cv.clone();
+            let playback_rt = playback_rt.clone();
+            let playback_config = playback_config.clone();
+            let playback_source_registry = playback_source_registry.clone();
+            let playback_admission = playback_admission.clone();
+            glib::MainContext::default().spawn_local(async move {
+                match admission.await {
+                    Ok(Some(pending))
+                        if playback_admission.is_open()
+                            && super::open_files::is_current(generation) =>
+                    {
+                        let ctx = super::playback::PlaybackContext {
+                            model: sm,
+                            active_source_key,
+                            active_output,
+                            album_art,
+                            title_label,
+                            artist_label,
+                            media_ctrl,
+                            session: playback_session,
+                            app_config: playback_config,
+                            rt_handle: playback_rt,
+                            column_view: cv,
+                            source_registry: playback_source_registry,
+                        };
+                        if super::playback::play_external_session(pending.session(), &ctx) {
+                            pending.commit();
+                        }
+                    }
+                    Ok(Some(_) | None) => {}
+                    Err(_) => {
+                        // The worker owns no log-safe path or backend detail.
+                        warn!("External media admission worker stopped unexpectedly");
+                    }
+                }
+            });
         });
         app.add_action(&play_pending);
 
@@ -1791,11 +2889,14 @@ pub fn build_window(
             window: window.clone(),
             rt_handle: rt_handle.clone(),
             engine_tx: engine_tx.clone(),
+            source_registry: source_registry.clone(),
+            remote_provenance: remote_provenance.clone(),
             track_store: track_store.clone(),
             master_tracks: master_tracks.clone(),
             source_tracks: source_tracks.clone(),
             active_source_key: active_source_key.clone(),
             source_navigation: source_navigation.clone(),
+            near_me_consent_request: near_me_consent_request.clone(),
             sidebar_store: sidebar_store_for_events.clone(),
             sidebar_selection: sidebar_sel_for_events.clone(),
             browser_widget: browser_widget.clone(),
@@ -1829,7 +2930,6 @@ pub fn build_window(
         pending_connection_for_events,
         playback_session,
         root_trust_prompts,
-        invalidate_source_playback,
         app_config,
     );
 }
@@ -1880,8 +2980,10 @@ fn refresh_playback_queue(session: &Rc<RefCell<PlaybackSession>>, objects: &[Tra
         // owns.
         let mut updates = HashMap::with_capacity(queue_ids.len());
         for track in objects {
-            let track_id = track.track_id();
-            if queue_ids.contains(track_id.as_str()) {
+            let Ok(track_id) = crate::architecture::TrackId::new(track.track_id()) else {
+                continue;
+            };
+            if queue_ids.contains(&track_id) {
                 updates.insert(track_id, QueueTrackRefresh::from_track(track));
             }
         }
@@ -1923,6 +3025,92 @@ fn refresh_active_playlist_uris(
     }
 }
 
+/// Replace one already-known local row by exact stable identity.
+///
+/// Playback-history events are updates, never discovery. Refusing to append a
+/// missing row prevents a delayed committed event from resurrecting a track
+/// that a newer library event already removed. URI equality is deliberately
+/// irrelevant: paths can move, and a remote source can expose the same URI.
+fn replace_existing_local_track(rows: &mut [TrackObject], replacement: &TrackObject) -> bool {
+    let track_id = replacement.track_id();
+    if track_id.is_empty() {
+        return false;
+    }
+    let Some(index) = rows.iter().position(|row| row.track_id() == track_id) else {
+        return false;
+    };
+    rows[index] = replacement.clone();
+    true
+}
+
+/// Retire every cached playlist projection and reload the active one.
+///
+/// A playback-history commit can change smart-playlist membership and order,
+/// while ordinary playlists still need their displayed Plays value refreshed.
+/// Invalidating the navigation generation before clearing rows prevents a late
+/// pre-commit query from publishing stale projections again.
+#[allow(clippy::too_many_arguments)]
+fn invalidate_playlist_projections(
+    rt_handle: &tokio::runtime::Handle,
+    source_navigation: &Rc<RefCell<SourceNavigation>>,
+    source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    active_source_key: &Rc<RefCell<String>>,
+    track_store: &gtk::gio::ListStore,
+    master_tracks: &Rc<RefCell<Vec<TrackObject>>>,
+    browser_widget: &gtk::Box,
+    browser_state: &browser::BrowserState,
+    status_label: &gtk::Label,
+    column_view: &gtk::ColumnView,
+) {
+    let active_key = active_source_key.borrow().clone();
+    source_navigation
+        .borrow_mut()
+        .invalidate_prefix(PLAYLIST_SOURCE_PREFIX);
+    source_tracks
+        .borrow_mut()
+        .retain(|key, _| !key.starts_with(PLAYLIST_SOURCE_PREFIX));
+
+    let Some(playlist_id) = active_key
+        .strip_prefix(PLAYLIST_SOURCE_PREFIX)
+        .map(str::to_string)
+    else {
+        return;
+    };
+
+    // Stale rows may already have changed membership or ordering. Leave no
+    // old projection actionable while its committed replacement is loading.
+    display_tracks(
+        &[],
+        track_store,
+        master_tracks,
+        browser_widget,
+        browser_state,
+        status_label,
+        column_view,
+    );
+
+    // During remote authentication, visible source and latest navigation
+    // intent intentionally differ. Background playlist maintenance must not
+    // supersede that newer intent.
+    if source_navigation.borrow().is_key(&active_key) {
+        let request = source_navigation.borrow_mut().select(active_key);
+        super::source_connect::load_playlist_source(
+            rt_handle.clone(),
+            playlist_id,
+            request,
+            source_navigation.clone(),
+            source_tracks.clone(),
+            active_source_key.clone(),
+            track_store.clone(),
+            master_tracks.clone(),
+            browser_widget.clone(),
+            browser_state.clone(),
+            status_label.clone(),
+            column_view.clone(),
+        );
+    }
+}
+
 /// Spawn the library event receiver loop on the GTK main thread.
 #[allow(clippy::too_many_arguments)]
 fn setup_library_events(
@@ -1943,7 +3131,6 @@ fn setup_library_events(
     pending_connection: Rc<RefCell<Option<PendingConnection>>>,
     playback_session: Rc<RefCell<PlaybackSession>>,
     root_trust_prompts: root_trust::RootTrustPromptController,
-    invalidate_source_playback: SourcePlaybackInvalidator,
     app_config: Rc<RefCell<preferences::AppConfig>>,
 ) {
     let browser_widget = browser_widget.clone();
@@ -1958,44 +3145,6 @@ fn setup_library_events(
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(event) = engine_rx.recv().await {
-            // A remote connection can be replaced while its track snapshot is
-            // queued for GTK. Validate exact ownership at the publication
-            // boundary so an older session cannot repopulate the source.
-            match &event {
-                LibraryEvent::RemoteSync {
-                    source_key,
-                    generation,
-                    lease_key,
-                    ..
-                } if !crate::source_registry::is_current_source(
-                    source_key,
-                    *generation,
-                    *lease_key,
-                ) =>
-                {
-                    tracing::debug!(
-                        generation,
-                        %lease_key,
-                        "Ignoring stale remote library sync"
-                    );
-                    continue;
-                }
-                LibraryEvent::DaapSync {
-                    source_key,
-                    generation,
-                    session_key,
-                    ..
-                } if !crate::daap::is_current_session(source_key, *generation, *session_key) => {
-                    tracing::debug!(
-                        generation,
-                        %session_key,
-                        "Ignoring stale DAAP library sync"
-                    );
-                    continue;
-                }
-                _ => {}
-            }
-
             match event {
                 LibraryEvent::FullSync(tracks) => {
                     info!(count = tracks.len(), "Received full library sync");
@@ -2028,55 +3177,6 @@ fn setup_library_events(
                             &column_view,
                         );
                     }
-                }
-
-                LibraryEvent::RemoteSync {
-                    source_key,
-                    generation: _,
-                    lease_key,
-                    tracks,
-                } => {
-                    let replaces_current_queue = {
-                        let session = playback_session.borrow();
-                        session.current_identity().is_some_and(|identity| {
-                            identity.source_id.as_str() == source_key.as_str()
-                                && session.current().is_some_and(|item| {
-                                    !crate::source_registry::stream_reference_uses_lease(
-                                        item.uri(),
-                                        lease_key,
-                                    )
-                                })
-                        })
-                    };
-                    if replaces_current_queue {
-                        // Retargeting old queue IDs could cross into a new
-                        // login or library on the same URL. Stop it instead;
-                        // the newly published rows carry the replacement lease.
-                        invalidate_source_playback(&source_key);
-                    }
-
-                    info!(count = tracks.len(), "Received remote library sync");
-
-                    let objects: Vec<TrackObject> = tracks
-                        .iter()
-                        .map(|track| arch_remote_track_to_object(track, lease_key))
-                        .collect();
-                    publish_remote_library(
-                        source_key,
-                        objects,
-                        &source_tracks,
-                        &sidebar_store,
-                        &pending_connection,
-                        &sidebar_selection,
-                        &active_source_key,
-                        &source_navigation,
-                        &track_store,
-                        &master_tracks,
-                        &browser_widget,
-                        &browser_state,
-                        &status_label,
-                        &column_view,
-                    );
                 }
 
                 LibraryEvent::TrackUpserted(track) => {
@@ -2267,60 +3367,65 @@ fn setup_library_events(
                     scan_spinner.set_visible(false);
                 }
 
-                LibraryEvent::PlaylistProjectionsInvalidated => {
-                    let active_key = active_source_key.borrow().clone();
+                LibraryEvent::PlaybackHistoryUpdated(track) => {
+                    let replacement = arch_track_to_object(&track);
+                    let track_id = replacement.track_id();
+                    let local_updated = {
+                        let mut sources = source_tracks.borrow_mut();
+                        sources
+                            .get_mut("local")
+                            .is_some_and(|rows| replace_existing_local_track(rows, &replacement))
+                    };
 
-                    // Any local mutation can change a live smart playlist, and
-                    // reconciliation can remint/relink regular-playlist track
-                    // IDs. Retire pre-settlement requests before clearing the
-                    // cache so a late query cannot put stale rows back.
-                    source_navigation
-                        .borrow_mut()
-                        .invalidate_prefix(PLAYLIST_SOURCE_PREFIX);
-                    source_tracks
-                        .borrow_mut()
-                        .retain(|key, _| !key.starts_with(PLAYLIST_SOURCE_PREFIX));
-
-                    if let Some(playlist_id) = active_key
-                        .strip_prefix(PLAYLIST_SOURCE_PREFIX)
-                        .map(str::to_string)
-                    {
-                        // The old rows may hold orphaned/reminted IDs. Do not
-                        // leave them actionable while the settled projection
-                        // is loading.
-                        display_tracks(
-                            &[],
-                            &track_store,
-                            &master_tracks,
-                            &browser_widget,
-                            &browser_state,
-                            &status_label,
-                            &column_view,
-                        );
-
-                        // `active_source_key` names the visible rows, while
-                        // SourceNavigation names the user's latest intent.
-                        // During remote authentication those intentionally
-                        // differ. Never let background playlist maintenance
-                        // supersede that newer remote intent.
-                        if source_navigation.borrow().is_key(&active_key) {
-                            let request = source_navigation.borrow_mut().select(active_key.clone());
-                            super::source_connect::load_playlist_source(
-                                rt_handle.clone(),
-                                playlist_id,
-                                request,
-                                source_navigation.clone(),
-                                source_tracks.clone(),
-                                active_source_key.clone(),
-                                track_store.clone(),
-                                master_tracks.clone(),
-                                browser_widget.clone(),
-                                browser_state.clone(),
-                                status_label.clone(),
-                                column_view.clone(),
-                            );
+                    if local_updated && *active_source_key.borrow() == "local" {
+                        // Reinsert at the same base-model position. Gtk's sort
+                        // model sees an item change and can immediately reorder
+                        // a Plays-sorted view without rebuilding unrelated rows.
+                        for index in 0..track_store.n_items() {
+                            let Some(existing) =
+                                track_store.item(index).and_downcast::<TrackObject>()
+                            else {
+                                continue;
+                            };
+                            if existing.track_id() == track_id {
+                                track_store.remove(index);
+                                track_store.insert(index, &replacement);
+                                break;
+                            }
                         }
+                        let _ = replace_existing_local_track(
+                            &mut master_tracks.borrow_mut(),
+                            &replacement,
+                        );
                     }
+
+                    invalidate_playlist_projections(
+                        &rt_handle,
+                        &source_navigation,
+                        &source_tracks,
+                        &active_source_key,
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
+                }
+
+                LibraryEvent::PlaylistProjectionsInvalidated => {
+                    invalidate_playlist_projections(
+                        &rt_handle,
+                        &source_navigation,
+                        &source_tracks,
+                        &active_source_key,
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
                 }
 
                 LibraryEvent::PlaylistsLoaded(playlists) => {
@@ -2482,41 +3587,55 @@ fn setup_library_events(
                     scan_spinner.set_visible(false);
                 }
 
-                LibraryEvent::DaapSync {
-                    source_key, tracks, ..
-                } => {
-                    // DAAP publishes one snapshot per retained session. A new
-                    // snapshot for the same source therefore replaces the
-                    // session embedded in any captured `daap://` queue refs.
-                    invalidate_source_playback(&source_key);
-                    info!(count = tracks.len(), "Received DAAP library sync");
-                    let objects: Vec<TrackObject> =
-                        tracks.iter().map(arch_track_to_object).collect();
-                    publish_remote_library(
-                        source_key,
-                        objects,
-                        &source_tracks,
-                        &sidebar_store,
-                        &pending_connection,
-                        &sidebar_selection,
-                        &active_source_key,
-                        &source_navigation,
-                        &track_store,
-                        &master_tracks,
-                        &browser_widget,
-                        &browser_state,
-                        &status_label,
-                        &column_view,
-                    );
-                }
             }
         }
     });
 }
 
 #[allow(clippy::too_many_arguments)]
+fn plan_remote_publication_selection(
+    pending: Option<&PendingConnection>,
+    navigation: &SourceNavigation,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
+    source_key: &str,
+    accepted: AcceptedRemotePublication,
+    selected_before_accept: u32,
+    projection_active_after_accept: bool,
+) -> RemotePublicationSelection {
+    let Some(pending) = pending.filter(|pending| {
+        pending.matches_lifecycle(source_id, generation) && pending.source_key() == source_key
+    }) else {
+        return RemotePublicationSelection::Inactive;
+    };
+
+    // A row rebind performed by acceptance can synchronously activate and
+    // render the source after the pending guard is cleared. Do not activate it
+    // a second time merely because the original request is no longer current.
+    if accepted.rebound
+        && selected_before_accept == accepted.index
+        && projection_active_after_accept
+    {
+        return RemotePublicationSelection::AlreadyActivated;
+    }
+    if !pending.may_auto_select(source_key, navigation) {
+        return RemotePublicationSelection::Inactive;
+    }
+    if selected_before_accept == accepted.index {
+        // The reducer may already have rebound connected/spinner state while
+        // the pending guard intentionally suppressed that selection signal.
+        // Force one post-publication signal now that catalogue and guard state
+        // are authoritative.
+        RemotePublicationSelection::Reactivate(accepted.index)
+    } else {
+        RemotePublicationSelection::Select(accepted.index)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn publish_remote_library(
-    source_key: String,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
     objects: Vec<TrackObject>,
     source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
     sidebar_store: &gtk::gio::ListStore,
@@ -2531,40 +3650,44 @@ fn publish_remote_library(
     status_label: &gtk::Label,
     column_view: &gtk::ColumnView,
 ) {
+    let source_key = source_id.to_string();
     source_tracks
         .borrow_mut()
         .insert(source_key.clone(), objects.clone());
 
     let pending_intent = pending_connection.borrow().clone();
-    let should_auto_select = pending_intent
-        .as_ref()
-        .is_some_and(|pending| pending.may_auto_select(&source_key, &source_navigation.borrow()));
     let should_clear_pending = pending_intent
         .as_ref()
-        .is_some_and(|pending| pending.source_key() == source_key);
+        .is_some_and(|pending| pending.matches_lifecycle(source_id, generation));
     if should_clear_pending {
         // Clear before any programmatic selection: the selection handler
         // otherwise treats this completed connection as still pending.
         *pending_connection.borrow_mut() = None;
     }
 
-    let mut auto_selected = false;
-    for i in 0..sidebar_store.n_items() {
-        if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-            if src.server_url() == source_key && !src.connected() {
-                src.set_connected(true);
-                src.set_connecting(false);
-                let src = src.clone();
-                sidebar_store.remove(i);
-                sidebar_store.insert(i, &src);
-                if should_auto_select {
-                    sidebar_selection.set_selected(i);
-                    auto_selected = true;
-                }
-                break;
-            }
-        }
-    }
+    let selected_before_accept = sidebar_selection.selected();
+    let accepted = accept_remote_publication(
+        sidebar_store,
+        Some(sidebar_selection),
+        source_id,
+        generation,
+    );
+    let projection_active_after_accept =
+        *active_source_key.borrow() == source_key && source_navigation.borrow().is_key(&source_key);
+    let selection_action = accepted.map_or(RemotePublicationSelection::Inactive, |accepted| {
+        plan_remote_publication_selection(
+            pending_intent.as_ref(),
+            &source_navigation.borrow(),
+            source_id,
+            generation,
+            &source_key,
+            accepted,
+            selected_before_accept,
+            projection_active_after_accept,
+        )
+    });
+    selection_action.apply(|index| sidebar_selection.set_selected(index));
+    let auto_selected = selection_action.activates();
 
     if !auto_selected
         && *active_source_key.borrow() == source_key
@@ -2580,6 +3703,86 @@ fn publish_remote_library(
             column_view,
         );
     }
+}
+
+/// Apply the sidebar state transition for an accepted remote publication.
+///
+/// A repeated Add, environment reconnect, or discovered-to-saved promotion
+/// can submit another connection for a row whose previous session is still
+/// marked connected. The accepted replacement publication still completes
+/// that operation, so it must always clear the transient spinner even though
+/// the durable connected state does not need to change.
+fn accept_remote_publication(
+    sidebar_store: &gtk::gio::ListStore,
+    sidebar_selection: Option<&gtk::SingleSelection>,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
+) -> Option<AcceptedRemotePublication> {
+    for index in 0..sidebar_store.n_items() {
+        let Some(source) = sidebar_store.item(index).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if source.source_id() != Some(source_id) {
+            continue;
+        }
+
+        let mut changed = if !source.connected() {
+            source.set_connected(true);
+            true
+        } else {
+            false
+        };
+        // A predecessor catalogue can remain authoritative while replacement
+        // generation G2 is pending. Publishing G1 must not clear G2's spinner.
+        changed |= source.clear_connecting_generation(generation);
+
+        if changed {
+            if let Some(selection) = sidebar_selection {
+                rebind_sidebar_source(sidebar_store, selection, index, &source, true);
+            } else {
+                // Headless model tests do not initialize a GTK selection model.
+                sidebar_store.remove(index);
+                sidebar_store.insert(index, &source);
+            }
+        }
+        return Some(AcceptedRemotePublication {
+            index,
+            rebound: changed,
+        });
+    }
+    None
+}
+
+/// Retire the transient spinner for the exact environment-configured owner
+/// whose newest connection attempt failed.
+///
+/// The background task emits this transition only after its registry attempt
+/// proves it is still latest. Keeping the lookup source-scoped prevents one
+/// failed endpoint from disturbing another row or its retained session.
+#[cfg(test)]
+fn clear_failed_remote_connection(
+    sidebar_store: &gtk::gio::ListStore,
+    source_id: crate::architecture::SourceId,
+    generation: u64,
+) -> Option<u32> {
+    for index in 0..sidebar_store.n_items() {
+        let Some(source) = sidebar_store.item(index).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if source.source_id() != Some(source_id)
+            || !source.connecting()
+            || !source.clear_connecting_generation(generation)
+        {
+            continue;
+        }
+
+        // SourceObject fields are plain GTK-side state. Reinsert the same
+        // object so a bound sidebar row immediately drops its spinner.
+        sidebar_store.remove(index);
+        sidebar_store.insert(index, &source);
+        return Some(index);
+    }
+    None
 }
 
 /// Convert an architecture `Track` to a UI `TrackObject`.
@@ -2599,14 +3802,14 @@ pub fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObje
     track_to_object(t, &uri, t.cover_art_url.as_ref().map(url::Url::as_str))
 }
 
-/// Convert a standard remote track using only opaque registry references.
+/// Convert a remote track into a pathless row bound to one adopted session.
 fn arch_remote_track_to_object(
     track: &crate::architecture::models::Track,
-    lease_key: uuid::Uuid,
+    session_epoch: u64,
 ) -> TrackObject {
-    let stream_reference = crate::source_registry::stream_reference(lease_key, track.id);
-    let artwork_reference = crate::source_registry::artwork_reference(lease_key, track.id);
-    track_to_object(track, &stream_reference, Some(&artwork_reference))
+    let object = track_to_object(track, "", None);
+    object.set_source_session_epoch(session_epoch);
+    object
 }
 
 fn track_to_object(
@@ -2633,7 +3836,14 @@ fn track_to_object(
         uri,
     );
 
-    obj.set_track_id(&t.id.to_string());
+    if let Some(native_track_id) = &t.native_track_id {
+        obj.set_track_id(native_track_id.as_str());
+    } else {
+        // A missing/invalid native identity is deliberately unplayable. Do
+        // not substitute the compatibility UUID: doing so silently routes a
+        // different identity through remote and playlist queues.
+        obj.set_track_id("");
+    }
 
     if let Some(artwork_reference) = artwork_reference {
         obj.set_cover_art_url(artwork_reference);
@@ -2766,3 +3976,577 @@ pub fn remove_empty_category_header(store: &gtk::gio::ListStore, category: &str)
 }
 
 // ── Popover scrollbar fix ───────────────────────────────────────────
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::architecture::SourceId;
+
+    fn local_history_row(track_id: &str, uri: &str, play_count: u32) -> TrackObject {
+        let row = TrackObject::new(
+            1,
+            "Title",
+            180,
+            "Artist",
+            "Album",
+            "Genre",
+            "",
+            2026,
+            "2026-07-18",
+            320,
+            48_000,
+            play_count,
+            "flac",
+            uri,
+        );
+        row.set_track_id(track_id);
+        row
+    }
+
+    #[test]
+    fn playback_history_replaces_only_the_exact_existing_local_identity() {
+        let original = local_history_row("track-a", "file:///old/a.flac", 2);
+        let unrelated = local_history_row("track-b", "file:///music/b.flac", 7);
+        let mut rows = vec![original, unrelated.clone()];
+        let replacement = local_history_row("track-a", "file:///new/a.flac", 3);
+
+        assert!(replace_existing_local_track(&mut rows, &replacement));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].track_id(), "track-a");
+        assert_eq!(rows[0].uri(), "file:///new/a.flac");
+        assert_eq!(rows[0].play_count(), 3);
+        assert_eq!(rows[1].track_id(), unrelated.track_id());
+        assert_eq!(rows[1].play_count(), 7);
+    }
+
+    #[test]
+    fn playback_history_never_uri_matches_or_appends_a_missing_row() {
+        let retained = local_history_row("track-a", "file:///music/shared.flac", 2);
+        let mut rows = vec![retained.clone()];
+
+        let same_uri_wrong_id =
+            local_history_row("remote-collision", "file:///music/shared.flac", 99);
+        assert!(!replace_existing_local_track(&mut rows, &same_uri_wrong_id));
+        let missing = local_history_row("track-missing", "file:///music/missing.flac", 1);
+        assert!(!replace_existing_local_track(&mut rows, &missing));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].track_id(), retained.track_id());
+        assert_eq!(rows[0].play_count(), 2);
+    }
+
+    fn disconnected_visible_snapshot(
+        revision: u64,
+    ) -> crate::source_lifecycle::LifecycleSnapshot<crate::source_registry::AcceptedView> {
+        crate::source_lifecycle::LifecycleSnapshot {
+            revision,
+            state: crate::source_lifecycle::SourceState::Dormant,
+            session_epoch: None,
+            provenance: crate::source_lifecycle::ProvenanceSet::default(),
+            visibility: crate::source_lifecycle::SourceVisibility::Visible,
+            retention: crate::source_lifecycle::Retention::Retained,
+            catalogue: None,
+            views: HashMap::new(),
+            failure: None,
+            refresh_failures: HashMap::new(),
+            pending_connect: None,
+            pending_refreshes: HashMap::new(),
+            pending_retirements: 0,
+        }
+    }
+
+    #[test]
+    fn saved_and_environment_startup_share_the_persisted_source_owner() {
+        let persisted = SourceId::random();
+        let mut sources = vec![
+            SourceObject::header("Subsonic"),
+            SourceObject::manual(
+                "Saved",
+                "subsonic",
+                "HTTPS://MUSIC.EXAMPLE.TEST:443/base/",
+                persisted,
+            ),
+        ];
+
+        let connection_attempt = upsert_environment_source(
+            &mut sources,
+            "Subsonic (env)",
+            "subsonic",
+            "https://music.example.test/base",
+        );
+
+        let owners: Vec<_> = sources
+            .iter()
+            .filter(|source| {
+                super::super::server_dialogs::same_remote_endpoint(
+                    &source.backend_type(),
+                    &source.server_url(),
+                    "subsonic",
+                    "https://music.example.test/base",
+                )
+            })
+            .collect();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(connection_attempt.source_id, persisted);
+        assert_eq!(owners[0].source_id(), Some(persisted));
+        assert!(owners[0].manually_added());
+        assert!(owners[0].connecting());
+    }
+
+    #[test]
+    fn accepted_reconnect_clears_connecting_on_an_already_connected_owner() {
+        let persisted = SourceId::random();
+        let saved = SourceObject::manual(
+            "Saved",
+            "subsonic",
+            "HTTPS://MUSIC.EXAMPLE.TEST:443/base/",
+            persisted,
+        );
+        saved.set_connected(true);
+        let mut sources = vec![SourceObject::header("Subsonic"), saved.clone()];
+
+        let connection_attempt = upsert_environment_source(
+            &mut sources,
+            "Subsonic (env)",
+            "subsonic",
+            "https://music.example.test/base",
+        );
+
+        assert_eq!(connection_attempt.source_id, persisted);
+        assert!(saved.connected());
+        assert!(saved.connecting());
+        saved.set_connecting_generation(42);
+
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        for source in sources {
+            store.append(&source);
+        }
+        let accepted_index = accept_remote_publication(&store, None, persisted, 42);
+
+        assert_eq!(
+            accepted_index,
+            Some(AcceptedRemotePublication {
+                index: 1,
+                rebound: true,
+            })
+        );
+        assert!(saved.connected());
+        assert!(!saved.connecting());
+    }
+
+    #[test]
+    fn failed_environment_reconnect_clears_only_the_exact_owner_spinner() {
+        let persisted = SourceId::random();
+        let other_id = SourceId::random();
+        let saved = SourceObject::manual(
+            "Saved",
+            "subsonic",
+            "https://music.example.test/base",
+            persisted,
+        );
+        saved.set_connected(true);
+        saved.set_connecting_generation(41);
+        let other =
+            SourceObject::manual("Other", "subsonic", "https://other.example.test", other_id);
+        other.set_connecting_generation(81);
+
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        store.append(&SourceObject::header("Subsonic"));
+        store.append(&saved);
+        store.append(&other);
+
+        // Retry B takes over the same row after failure A was queued but
+        // before GTK receives it. Failure A must not clear retry B's spinner.
+        saved.set_connecting_generation(42);
+        assert_eq!(clear_failed_remote_connection(&store, persisted, 41), None);
+        assert!(saved.connecting());
+        assert_eq!(
+            clear_failed_remote_connection(&store, persisted, 42),
+            Some(1)
+        );
+        assert!(
+            saved.connected(),
+            "a failed reconnect keeps the prior session"
+        );
+        assert!(!saved.connecting());
+        assert!(other.connecting());
+        assert_eq!(clear_failed_remote_connection(&store, persisted, 42), None);
+        saved.set_connecting(true);
+        assert_eq!(
+            clear_failed_remote_connection(&store, persisted, 42),
+            None,
+            "a generic/manual retry invalidates the environment token"
+        );
+        assert!(saved.connecting());
+        saved.set_connecting(false);
+        assert_eq!(clear_failed_remote_connection(&store, other_id, 82), None);
+        assert!(other.connecting());
+        assert_eq!(
+            clear_failed_remote_connection(&store, other_id, 81),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn predecessor_publication_does_not_clear_replacement_spinner() {
+        let source_id = SourceId::random();
+        let source =
+            SourceObject::manual("Saved", "subsonic", "https://music.example.test", source_id);
+        source.set_connected(true);
+        source.set_connecting_generation(2);
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        store.append(&source);
+
+        assert_eq!(
+            accept_remote_publication(&store, None, source_id, 1),
+            Some(AcceptedRemotePublication {
+                index: 0,
+                rebound: false,
+            })
+        );
+        assert!(source.connected());
+        assert!(source.connecting());
+        assert_eq!(source.connecting_generation(), Some(2));
+
+        assert_eq!(
+            accept_remote_publication(&store, None, source_id, 2),
+            Some(AcceptedRemotePublication {
+                index: 0,
+                rebound: true,
+            })
+        );
+        assert!(!source.connecting());
+    }
+
+    #[test]
+    fn fallback_matching_uses_stable_source_key_not_row_position() {
+        let local = SourceObject::source("Local", "local", "folder-music-symbolic");
+        let remote = SourceObject::manual(
+            "Remote",
+            "subsonic",
+            "https://music.example.test",
+            SourceId::random(),
+        );
+
+        assert!(source_matches_navigation_key(&local, "local"));
+        assert!(source_matches_navigation_key(
+            &remote,
+            &remote.source_id().expect("remote identity").to_string()
+        ));
+        assert!(!source_matches_navigation_key(&remote, "local"));
+    }
+
+    #[test]
+    fn retained_passwordless_disconnect_falls_back_before_row_rebind_can_reconnect() {
+        let source_id = SourceId::random();
+        let source_key = source_id.to_string();
+        let mut reducer = SourceReducerState::default();
+        reducer.published_catalogues.insert(source_id, (41, 7));
+        let baseline = crate::source_lifecycle::LifecycleBaseline {
+            revision: 9,
+            shutting_down: false,
+            sources: vec![(source_id, disconnected_visible_snapshot(9))],
+        };
+
+        let plan =
+            SourceBaselinePlan::new(&reducer, &baseline, &source_key, false, &HashSet::new());
+        assert_eq!(plan.clear_projections, vec![source_id]);
+
+        let mut navigation = SourceNavigation::new(source_key.clone());
+        let mut active_source_key = source_key.clone();
+        assert!(apply_local_navigation_fallback(
+            &mut navigation,
+            &mut active_source_key,
+            &source_key,
+        ));
+        assert_eq!(active_source_key, "local");
+        assert!(navigation.is_key("local"));
+
+        // Model the stable-key restoration that follows connected=false row
+        // rebind. Because fallback was part of the authoritative baseline
+        // phase, it chooses Local and never re-enters passwordless DAAP.
+        let local = SourceObject::source("Local", "local", "folder-music-symbolic");
+        let remote = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
+        remote.set_requires_password(false);
+        remote.set_connected(false);
+        let restored = [&local, &remote]
+            .into_iter()
+            .find(|source| source_matches_navigation_key(source, &active_source_key))
+            .expect("visible fallback row");
+        let passwordless_reconnects = usize::from(
+            restored.backend_type() == "daap"
+                && !restored.connected()
+                && !restored.requires_password(),
+        );
+        assert_eq!(restored.backend_type(), "local");
+        assert_eq!(passwordless_reconnects, 0);
+    }
+
+    #[test]
+    fn hidden_external_registration_is_not_a_published_projection_to_clear() {
+        let external_id = SourceId::external();
+        let mut external = disconnected_visible_snapshot(11);
+        external.visibility = crate::source_lifecycle::SourceVisibility::Hidden;
+        external.retention = crate::source_lifecycle::Retention::Ephemeral;
+        external.session_epoch = Some(29);
+        let baseline = crate::source_lifecycle::LifecycleBaseline {
+            revision: 11,
+            shutting_down: false,
+            sources: vec![(external_id, external)],
+        };
+
+        let plan = SourceBaselinePlan::new(
+            &SourceReducerState::default(),
+            &baseline,
+            "local",
+            false,
+            &HashSet::new(),
+        );
+
+        assert!(plan.hidden_sources.contains(&external_id));
+        assert!(plan.clear_projections.is_empty());
+        assert!(!plan.clear_radio_projection);
+    }
+
+    #[test]
+    fn hidden_pre_catalogue_source_clears_its_owned_sidebar_projection() {
+        let source_id = SourceId::random();
+        let mut hidden = disconnected_visible_snapshot(12);
+        hidden.visibility = crate::source_lifecycle::SourceVisibility::Hidden;
+        hidden.retention = crate::source_lifecycle::Retention::Ephemeral;
+        let baseline = crate::source_lifecycle::LifecycleBaseline {
+            revision: 12,
+            shutting_down: false,
+            sources: vec![(source_id, hidden)],
+        };
+        let ui_owned_sources = HashSet::from([source_id]);
+
+        let plan = SourceBaselinePlan::new(
+            &SourceReducerState::default(),
+            &baseline,
+            &source_id.to_string(),
+            false,
+            &ui_owned_sources,
+        );
+
+        assert_eq!(plan.clear_projections, vec![source_id]);
+    }
+
+    #[test]
+    fn selected_radio_view_without_a_publication_is_invalidated_when_its_source_is_lost() {
+        let radio_id = SourceId::radio_browser();
+        let reducer = SourceReducerState::default();
+        let baseline = crate::source_lifecycle::LifecycleBaseline {
+            revision: 3,
+            shutting_down: false,
+            sources: vec![(radio_id, disconnected_visible_snapshot(3))],
+        };
+
+        let plan = SourceBaselinePlan::new(
+            &reducer,
+            &baseline,
+            super::super::radio::TOP_VOTE_SOURCE_KEY,
+            false,
+            &HashSet::new(),
+        );
+
+        assert!(plan.clear_radio_projection);
+        assert!(reducer.published_views.is_empty());
+        assert_eq!(plan.radio_session_epoch, None);
+    }
+
+    #[test]
+    fn exact_current_near_me_consent_prerequisite_is_not_misclassified_as_source_loss() {
+        let radio_id = SourceId::radio_browser();
+        let reducer = SourceReducerState::default();
+        let baseline = crate::source_lifecycle::LifecycleBaseline {
+            revision: 3,
+            shutting_down: false,
+            sources: vec![(radio_id, disconnected_visible_snapshot(3))],
+        };
+        let mut navigation = SourceNavigation::new("local");
+        let stale = navigation.select(super::super::radio::NEARME_SOURCE_KEY);
+        let current = navigation.select(super::super::radio::NEARME_SOURCE_KEY);
+
+        assert!(!current_near_me_prerequisite(
+            super::super::radio::NEARME_SOURCE_KEY,
+            &navigation,
+            Some(&stale),
+        ));
+        assert!(current_near_me_prerequisite(
+            super::super::radio::NEARME_SOURCE_KEY,
+            &navigation,
+            Some(&current),
+        ));
+        let plan = SourceBaselinePlan::new(
+            &reducer,
+            &baseline,
+            super::super::radio::NEARME_SOURCE_KEY,
+            true,
+            &HashSet::new(),
+        );
+        assert!(!plan.clear_radio_projection);
+
+        navigation.select("local");
+        assert!(!current_near_me_prerequisite(
+            super::super::radio::NEARME_SOURCE_KEY,
+            &navigation,
+            Some(&current),
+        ));
+    }
+
+    #[test]
+    fn only_the_selected_exact_radio_intent_may_surface_a_setup_failure() {
+        let selected = SourceNavigation::new(super::super::radio::TOP_CLICK_SOURCE_KEY);
+        assert!(selected_radio_projection_owns_status(
+            super::super::radio::TOP_CLICK_SOURCE_KEY,
+            &selected,
+        ));
+        assert!(!selected_radio_projection_owns_status("local", &selected));
+
+        let superseded = SourceNavigation::new("local");
+        assert!(!selected_radio_projection_owns_status(
+            super::super::radio::TOP_CLICK_SOURCE_KEY,
+            &superseded,
+        ));
+    }
+
+    #[test]
+    fn only_the_selected_exact_removable_source_may_surface_a_scan_failure() {
+        let source_id = crate::architecture::SourceId::removable("test:failure-owner")
+            .expect("removable identity");
+        let source_key = source_id.to_string();
+
+        let local = SourceNavigation::new("local");
+        assert!(!source_connect_failure_owns_status(
+            source_id, true, "local", &local, false,
+        ));
+
+        let selected = SourceNavigation::new(source_key.clone());
+        assert!(source_connect_failure_owns_status(
+            source_id,
+            true,
+            &source_key,
+            &selected,
+            false,
+        ));
+
+        let superseded = SourceNavigation::new("local");
+        assert!(!source_connect_failure_owns_status(
+            source_id,
+            true,
+            &source_key,
+            &superseded,
+            false,
+        ));
+    }
+
+    #[test]
+    fn accepted_selected_passwordless_generation_reactivates_once_without_reconnect() {
+        let remote = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
+        let source_id = remote.source_id().expect("stable source");
+        let source_key = source_id.to_string();
+        remote.set_requires_password(false);
+        remote.set_connecting_generation(41);
+
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        store.append(&SourceObject::source(
+            "Local",
+            "local",
+            "folder-music-symbolic",
+        ));
+        store.append(&remote);
+
+        let mut navigation = SourceNavigation::new("local");
+        let request = navigation.select(source_key.clone());
+        let mut pending = PendingConnection::new(source_key.clone(), request);
+        assert!(pending.bind_lifecycle(source_id, 41, ConnectionIntentKind::PasswordlessDaap,));
+
+        // The baseline reducer updates the row before catalogue publication;
+        // its keep-selected rebind is suppressed by the still-live pending
+        // guard. Acceptance therefore observes no remaining row mutation.
+        remote.set_connected(true);
+        assert!(remote.clear_connecting_generation(41));
+        let accepted =
+            accept_remote_publication(&store, None, source_id, 41).expect("accepted source row");
+        assert_eq!(
+            accepted,
+            AcceptedRemotePublication {
+                index: 1,
+                rebound: false,
+            }
+        );
+        assert!(remote.connected());
+        assert!(!remote.connecting());
+
+        let action = plan_remote_publication_selection(
+            Some(&pending),
+            &navigation,
+            source_id,
+            41,
+            &source_key,
+            accepted,
+            1,
+            false,
+        );
+        assert_eq!(action, RemotePublicationSelection::Reactivate(1));
+
+        let mut active_source_key = "local".to_string();
+        let mut selected = 1;
+        let mut activations = 0;
+        let mut passwordless_connects = 1; // the admitted generation G41
+        action.apply(|position| {
+            selected = position;
+            if position == gtk::INVALID_LIST_POSITION {
+                return;
+            }
+            let selected_source = store
+                .item(position)
+                .and_downcast::<SourceObject>()
+                .expect("selected source");
+            if selected_source.connected() {
+                active_source_key = source_key.clone();
+                navigation.select(source_key.clone());
+                activations += 1;
+            } else if selected_source.backend_type() == "daap"
+                && !selected_source.requires_password()
+            {
+                passwordless_connects += 1;
+            }
+        });
+
+        assert_eq!(selected, 1);
+        assert_eq!(activations, 1);
+        assert_eq!(passwordless_connects, 1);
+        assert_eq!(active_source_key, source_key);
+
+        assert_eq!(
+            plan_remote_publication_selection(
+                Some(&pending),
+                &navigation,
+                source_id,
+                42,
+                &source_key,
+                accepted,
+                1,
+                false,
+            ),
+            RemotePublicationSelection::Inactive,
+            "a stale lifecycle generation cannot reactivate"
+        );
+        assert_eq!(
+            plan_remote_publication_selection(
+                Some(&pending),
+                &navigation,
+                source_id,
+                41,
+                &source_key,
+                accepted,
+                1,
+                false,
+            ),
+            RemotePublicationSelection::Inactive,
+            "the reactivation superseded the deferred request exactly once"
+        );
+    }
+}

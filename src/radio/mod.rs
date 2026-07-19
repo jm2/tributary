@@ -4,9 +4,7 @@
 //! community database of internet radio stations. Supports top-clicked,
 //! top-voted, and geo-located ("Stations Near Me") station lists.
 
-pub mod api;
-pub mod client;
-pub mod geo;
-
-pub use api::RadioStation;
-pub use client::RadioBrowserClient;
+pub mod adapter;
+mod api;
+mod client;
+mod geo;

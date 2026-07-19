@@ -9,13 +9,13 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Weak,
 };
 
+use super::identity::{SourceId, TrackId};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use url::Url;
-use uuid::Uuid;
 
 use super::backend::BackendResult;
 
@@ -186,6 +186,142 @@ pub struct MediaLease {
     active: Arc<AtomicBool>,
 }
 
+/// Credential-free HTTP(S) stream locator retained only by a live source view.
+///
+/// The URL is intentionally crate-private: generic models, GTK rows, and
+/// playback queues retain only typed source/media identity. Ordinary query
+/// data is allowed because public radio streams commonly require request
+/// shaping parameters; userinfo and fragments remain outside the locator
+/// boundary.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PublicHttpEndpoint {
+    endpoint: Url,
+}
+
+impl PublicHttpEndpoint {
+    pub(crate) fn new(endpoint: Url) -> BackendResult<Self> {
+        validate_public_endpoint(&endpoint)?;
+        Ok(Self { endpoint })
+    }
+
+    fn cloned_url(&self) -> Url {
+        self.endpoint.clone()
+    }
+}
+
+/// Weak final-consumption authority for a public request.
+///
+/// Implemented by the source registry without introducing an architecture-to-
+/// lifecycle dependency. A pending request holds only `Weak` authority, so it
+/// cannot keep the registry, source session, or accepted view alive.
+pub trait PublicHttpAuthority: Send + Sync {
+    fn is_current_public_stream(
+        &self,
+        source_id: SourceId,
+        session_epoch: u64,
+        winner_generation: u64,
+        track_id: &TrackId,
+    ) -> bool;
+}
+
+/// One-shot public stream request resolved from the newest accepted view.
+///
+/// Resolution alone is not authority to load the URL. [`Self::consume`]
+/// rechecks the exact winning generation through a weak registry handle and
+/// also checks the per-view lease. Replacing/removing the winning view,
+/// disconnecting its source, or dropping the final registry handle therefore
+/// fails closed even after resolution and before downstream consumption.
+pub struct ResolvedPublicHttpRequest {
+    endpoint: PublicHttpEndpoint,
+    lease: MediaLease,
+    authority: Weak<dyn PublicHttpAuthority>,
+    source_id: SourceId,
+    track_id: TrackId,
+    session_epoch: u64,
+    winner_generation: u64,
+}
+
+impl ResolvedPublicHttpRequest {
+    pub(crate) fn new(
+        endpoint: PublicHttpEndpoint,
+        lease: MediaLease,
+        authority: Weak<dyn PublicHttpAuthority>,
+        source_id: SourceId,
+        track_id: TrackId,
+        session_epoch: u64,
+        winner_generation: u64,
+    ) -> Self {
+        Self {
+            endpoint,
+            lease,
+            authority,
+            source_id,
+            track_id,
+            session_epoch,
+            winner_generation,
+        }
+    }
+
+    /// Consume this request immediately before passing its URL to an output.
+    pub fn consume(self) -> BackendResult<Url> {
+        if !self.lease.is_active() {
+            return Err(crate::architecture::error::BackendError::Internal(
+                anyhow::anyhow!("public media view is no longer active"),
+            ));
+        }
+        let authority = self.authority.upgrade().ok_or_else(|| {
+            crate::architecture::error::BackendError::Internal(anyhow::anyhow!(
+                "source registry is no longer active"
+            ))
+        })?;
+        if !authority.is_current_public_stream(
+            self.source_id,
+            self.session_epoch,
+            self.winner_generation,
+            &self.track_id,
+        ) || !self.lease.is_active()
+        {
+            return Err(crate::architecture::error::BackendError::Internal(
+                anyhow::anyhow!("public media view changed before consumption"),
+            ));
+        }
+        Ok(self.endpoint.cloned_url())
+    }
+
+    fn is_active(&self) -> bool {
+        self.lease.is_active()
+            && self.authority.upgrade().is_some_and(|authority| {
+                authority.is_current_public_stream(
+                    self.source_id,
+                    self.session_epoch,
+                    self.winner_generation,
+                    &self.track_id,
+                )
+            })
+            && self.lease.is_active()
+    }
+}
+
+/// At-use media request returned by a managed source adapter.
+pub enum MediaRequest {
+    /// Credential-isolated request consumed by the app-owned media proxy.
+    ProtectedHttp(Box<ResolvedHttpRequest>),
+    /// Credential-free public URL with exact accepted-view authority.
+    PublicHttp(ResolvedPublicHttpRequest),
+}
+
+impl MediaRequest {
+    pub(crate) fn is_active(&self) -> bool {
+        match self {
+            Self::ProtectedHttp(request) => request.is_active(),
+            Self::PublicHttp(request) => request.is_active(),
+        }
+    }
+}
+
+/// Compatibility-neutral name used at the playback boundary.
+pub type ResolvedStream = MediaRequest;
+
 impl MediaLease {
     pub(crate) fn new() -> Self {
         Self {
@@ -205,11 +341,13 @@ impl MediaLease {
 /// A resolved HTTP request whose credential material is isolated from its URL.
 ///
 /// This type is intentionally `Clone` but neither `Debug` nor serializable.
-/// Sensitive headers and private query pairs must only be applied by the
-/// app-owned media proxy immediately before its exact-origin upstream fetch.
+/// Required protocol headers, sensitive headers, and private query pairs must
+/// only be applied by the app-owned media proxy immediately before its
+/// exact-origin upstream fetch.
 #[derive(Clone)]
 pub struct ResolvedHttpRequest {
     endpoint: Url,
+    required_headers: HeaderMap,
     sensitive_headers: HeaderMap,
     private_query_pairs: Vec<(String, String)>,
     advertised_route: Option<AdvertisedHttpRoute>,
@@ -222,11 +360,29 @@ impl ResolvedHttpRequest {
         validate_endpoint(&endpoint)?;
         Ok(Self {
             endpoint,
+            required_headers: HeaderMap::new(),
             sensitive_headers: HeaderMap::new(),
             private_query_pairs: Vec::new(),
             advertised_route: None,
             lease: None,
         })
+    }
+
+    /// Add a fixed, non-secret header required by the remote media protocol.
+    ///
+    /// This deliberately narrow allowlist covers DAAP's content negotiation
+    /// and client-identification contract without admitting receiver-owned,
+    /// authentication, routing, proxy, framing, or hop-by-hop headers.
+    pub(crate) fn with_required_header(
+        mut self,
+        name: HeaderName,
+        value: HeaderValue,
+    ) -> BackendResult<Self> {
+        if !is_allowed_required_header(&name) {
+            return Err(anyhow::anyhow!("media request required header is not allowlisted").into());
+        }
+        self.required_headers.insert(name, value);
+        Ok(self)
     }
 
     /// Add an explicitly allowlisted authentication header.
@@ -287,6 +443,10 @@ impl ResolvedHttpRequest {
         &self.endpoint
     }
 
+    pub(crate) fn required_headers(&self) -> &HeaderMap {
+        &self.required_headers
+    }
+
     pub(crate) fn sensitive_headers(&self) -> &HeaderMap {
         &self.sensitive_headers
     }
@@ -308,11 +468,14 @@ impl ResolvedHttpRequest {
 /// Playback-time resolver retained by a live remote source session.
 #[async_trait]
 pub trait RemoteMediaResolver: Send + Sync {
-    /// Resolve an application track UUID into a credential-isolated request.
-    async fn resolve_stream(&self, track_id: &Uuid) -> BackendResult<ResolvedHttpRequest>;
+    /// Resolve an exact backend-native track ID into a credential-isolated request.
+    async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest>;
 
-    /// Resolve artwork for an application track UUID, when available.
-    async fn resolve_artwork(&self, track_id: &Uuid) -> BackendResult<Option<ResolvedHttpRequest>>;
+    /// Resolve artwork for an exact backend-native track ID, when available.
+    async fn resolve_artwork(
+        &self,
+        track_id: &TrackId,
+    ) -> BackendResult<Option<ResolvedHttpRequest>>;
 }
 
 fn validate_endpoint(endpoint: &Url) -> BackendResult<()> {
@@ -356,6 +519,22 @@ fn validate_endpoint(endpoint: &Url) -> BackendResult<()> {
     Ok(())
 }
 
+fn validate_public_endpoint(endpoint: &Url) -> BackendResult<()> {
+    let structurally_valid = !endpoint.cannot_be_a_base()
+        && matches!(endpoint.scheme(), "http" | "https")
+        && endpoint.host_str().is_some()
+        && endpoint.username().is_empty()
+        && endpoint.password().is_none()
+        && endpoint.fragment().is_none();
+    if !structurally_valid {
+        return Err(anyhow::anyhow!(
+            "public media endpoint must be an HTTP(S) URL without userinfo or a fragment"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn is_allowed_auth_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -363,9 +542,17 @@ fn is_allowed_auth_header(name: &HeaderName) -> bool {
     )
 }
 
+fn is_allowed_required_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept" | "user-agent" | "client-daap-version" | "client-daap-access-index"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn endpoint_rejects_embedded_credentials_and_unsafe_schemes() {
@@ -381,20 +568,87 @@ mod tests {
     }
 
     #[test]
-    fn request_builders_allow_only_auth_material() {
+    fn public_endpoint_accepts_queries_and_rejects_unsafe_url_shapes() {
+        for endpoint in [
+            "http://radio.example.test/live?codec=aac&mount=main",
+            "https://radio.example.test:8443/stream?token=public-station-value",
+        ] {
+            assert!(PublicHttpEndpoint::new(Url::parse(endpoint).unwrap()).is_ok());
+        }
+
+        for endpoint in [
+            "https://user:password@radio.example.test/live",
+            "https://radio.example.test/live#fragment",
+            "file:///tmp/station.m3u",
+            "data:audio/aac,fixture",
+        ] {
+            assert!(PublicHttpEndpoint::new(Url::parse(endpoint).unwrap()).is_err());
+        }
+        assert!(
+            Url::parse("http://").is_err(),
+            "URL parsing itself rejects a hostless HTTP locator"
+        );
+    }
+
+    #[test]
+    fn request_builders_keep_required_and_sensitive_header_allowlists_disjoint() {
         let request =
             ResolvedHttpRequest::new(Url::parse("https://example.test/audio?id=track-1").unwrap())
                 .unwrap();
+
+        let required = [
+            reqwest::header::ACCEPT,
+            reqwest::header::USER_AGENT,
+            HeaderName::from_static("client-daap-version"),
+            HeaderName::from_static("client-daap-access-index"),
+        ];
+        for name in required {
+            assert!(request
+                .clone()
+                .with_required_header(name.clone(), HeaderValue::from_static("accepted"))
+                .is_ok());
+            assert!(request
+                .clone()
+                .with_sensitive_header(name, HeaderValue::from_static("rejected"))
+                .is_err());
+        }
+
+        let sensitive = [
+            reqwest::header::AUTHORIZATION,
+            HeaderName::from_static("x-emby-authorization"),
+            HeaderName::from_static("x-plex-token"),
+        ];
+        for name in sensitive {
+            assert!(request
+                .clone()
+                .with_sensitive_header(name.clone(), HeaderValue::from_static("accepted"))
+                .is_ok());
+            assert!(request
+                .clone()
+                .with_required_header(name, HeaderValue::from_static("rejected"))
+                .is_err());
+        }
 
         for name in [
             reqwest::header::HOST,
             reqwest::header::REFERER,
             reqwest::header::COOKIE,
             reqwest::header::RANGE,
+            reqwest::header::CONTENT_LENGTH,
             reqwest::header::CONNECTION,
+            HeaderName::from_static("keep-alive"),
+            reqwest::header::TE,
+            reqwest::header::TRAILER,
             reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::UPGRADE,
             reqwest::header::PROXY_AUTHORIZATION,
+            HeaderName::from_static("proxy-connection"),
+            HeaderName::from_static("x-arbitrary-request-header"),
         ] {
+            assert!(request
+                .clone()
+                .with_required_header(name.clone(), HeaderValue::from_static("rejected"))
+                .is_err());
             assert!(request
                 .clone()
                 .with_sensitive_header(name, HeaderValue::from_static("rejected"))

@@ -14,7 +14,7 @@ use crate::local::engine::LibraryEvent;
 use super::browser::BrowserState;
 use super::objects::TrackObject;
 use super::preferences;
-use super::source_navigation::{PendingConnection, SourceNavigation};
+use super::source_navigation::{PendingConnection, SourceNavigation, SourceRequest};
 
 /// Shared UI state for the main window.
 ///
@@ -24,7 +24,7 @@ use super::source_navigation::{PendingConnection, SourceNavigation};
 pub struct WindowState {
     // ── Top-level GTK handles ───────────────────────────────────────
     /// The main application window.
-    /// Used by: source_connect (auth dialogs), playlist_actions (dialogs).
+    /// Used by: source_connect (auth dialogs), playlist_actions (dialogs), context_menu (results).
     pub window: adw::ApplicationWindow,
 
     /// Tokio runtime handle for spawning async background work.
@@ -34,6 +34,12 @@ pub struct WindowState {
     /// Channel to send events to the library engine.
     /// Used by: source_connect (RemoteSync after auth).
     pub engine_tx: async_channel::Sender<LibraryEvent>,
+
+    /// Sole lifecycle/media authority for source-owned media.
+    pub source_registry: crate::source_registry::SourceRegistry,
+
+    /// Exact Saved/Environment/Discovery claim-token owners on the GTK side.
+    pub remote_provenance: crate::source_registry::ProvenanceClaims,
 
     // ── Track data ──────────────────────────────────────────────────
     /// Backing store for the tracklist `ColumnView`.
@@ -45,9 +51,9 @@ pub struct WindowState {
     /// Used by: discovery_handler, source_connect, context_menu, window.
     pub master_tracks: Rc<RefCell<Vec<TrackObject>>>,
 
-    /// Per-source track cache.  Key: `"local"` for local filesystem,
-    /// server URL for remote, `"playlist:<id>"` for playlists,
-    /// backend type string for radio.
+    /// Per-source/view track cache. Key: `"local"` for the built-in local
+    /// view, stable `SourceId` text for authenticated and removable sources,
+    /// `"playlist:<id>"` for playlists, or the backend view key for radio.
     /// Used by: discovery_handler, source_connect, context_menu, window.
     pub source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
 
@@ -58,6 +64,12 @@ pub struct WindowState {
     /// Generation-owned navigation state for async source loads.
     /// Used by: source_connect, radio, discovery_handler, window.
     pub source_navigation: Rc<RefCell<SourceNavigation>>,
+
+    /// Exact current Near Me request waiting on the user's location-consent
+    /// prerequisite. It is not a network operation or source authority; the
+    /// lifecycle reducer uses it only to avoid treating the deliberate
+    /// pre-construction dialog interval as source loss.
+    pub near_me_consent_request: Rc<RefCell<Option<SourceRequest>>>,
 
     // ── Sidebar ─────────────────────────────────────────────────────
     /// Sidebar backing store (list of `SourceObject`s with headers).

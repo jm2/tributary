@@ -40,6 +40,42 @@ pub struct HeaderBarWidgets {
     pub output_list: gtk::ListBox,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SliderAccessibleOrientation {
+    Horizontal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SliderAccessibilityPlan {
+    playback_position_label: String,
+    volume_label: String,
+    orientation: SliderAccessibleOrientation,
+}
+
+fn slider_accessibility_plan(locale: &str) -> SliderAccessibilityPlan {
+    SliderAccessibilityPlan {
+        playback_position_label: rust_i18n::t!("header.playback_position", locale = locale)
+            .into_owned(),
+        volume_label: rust_i18n::t!("header.volume", locale = locale).into_owned(),
+        orientation: SliderAccessibleOrientation::Horizontal,
+    }
+}
+
+fn expose_slider_accessibility(progress: &gtk::Scale, volume: &gtk::Scale, locale: &str) {
+    let plan = slider_accessibility_plan(locale);
+    let orientation = match plan.orientation {
+        SliderAccessibleOrientation::Horizontal => gtk::Orientation::Horizontal,
+    };
+    progress.update_property(&[
+        gtk::accessible::Property::Label(&plan.playback_position_label),
+        gtk::accessible::Property::Orientation(orientation),
+    ]);
+    volume.update_property(&[
+        gtk::accessible::Property::Label(&plan.volume_label),
+        gtk::accessible::Property::Orientation(orientation),
+    ]);
+}
+
 /// Build the full header bar and return all interactive widgets.
 pub fn build_header_bar() -> HeaderBarWidgets {
     // ── Left: Playback Controls ──────────────────────────────────────
@@ -208,6 +244,11 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         .adjustment(&volume_adj)
         .build();
 
+    // GtkScale exposes its native value/range and keyboard controls. Give
+    // each otherwise-unlabelled scale a stable, localized accessible name so
+    // assistive technology can distinguish playback position from volume.
+    expose_slider_accessibility(&progress, &volume_scale, &rust_i18n::locale());
+
     let volume_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(2)
@@ -346,4 +387,58 @@ pub fn build_output_row(name: &str, icon_name: &str, active: bool) -> gtk::Box {
     row.append(&label);
     row.append(&check);
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use serde::Deserialize;
+
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct AccessibilityCatalog {
+        header: AccessibilityHeader,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct AccessibilityHeader {
+        playback_position: String,
+        volume: String,
+    }
+
+    #[test]
+    fn slider_accessibility_plan_is_backed_by_every_yaml_catalog() {
+        let locale_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+
+        for locale in rust_i18n::available_locales!() {
+            let path = locale_dir.join(format!("{locale}.yml"));
+            let yaml = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let catalog: AccessibilityCatalog = serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            let plan = slider_accessibility_plan(&locale);
+
+            assert_eq!(plan.orientation, SliderAccessibleOrientation::Horizontal);
+            assert!(!catalog.header.playback_position.trim().is_empty());
+            assert!(!catalog.header.volume.trim().is_empty());
+            assert_eq!(
+                plan.playback_position_label,
+                catalog.header.playback_position,
+                "header.playback_position fell back instead of using {}",
+                path.display()
+            );
+            assert_eq!(
+                plan.volume_label,
+                catalog.header.volume,
+                "header.volume fell back instead of using {}",
+                path.display()
+            );
+            assert_ne!(
+                plan.playback_position_label, plan.volume_label,
+                "the two sliders are indistinguishable for {locale}"
+            );
+        }
+    }
 }

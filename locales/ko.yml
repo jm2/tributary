@@ -17,6 +17,8 @@ header:
   output: "오디오 출력"
   add_output: "출력 추가"
   main_menu: "메인 메뉴"
+  playback_position: "재생 위치"
+  volume: "음량"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -123,6 +125,8 @@ dialogs:
   output_name_placeholder: "거실 MPD"
   output_host: "호스트"
   output_port: "포트"
+  output_exclusive_control_warning: "MPD의 일시 정지, 정지, 반복, 무작위, 단일 및 consume 명령은 전체 재생 파티션에 영향을 줍니다. 다른 컨트롤러나 Tributary 인스턴스와 공유하지 마세요."
+  output_exclusive_control_confirmation: "Tributary가 이 MPD 재생 파티션을 독점 제어함을 확인합니다."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -168,6 +172,8 @@ context:
   properties: "속성…"
   add_to_playlist: "재생목록에 추가"
   remove_from_playlist: "재생목록에서 제거"
+  playlist_add_unsupported_heading: "트랙이 추가되지 않았습니다"
+  playlist_add_unsupported_body: "현재는 Tributary의 로컬 라이브러리에 있는 트랙만 재생목록에 추가할 수 있습니다. 이 소스에서는 아무것도 추가되지 않았습니다."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:
@@ -223,6 +229,7 @@ errors:
     audio_output_failed: "오디오 출력에 실패했습니다"
     playback_failed: "오디오 재생에 실패했습니다"
     airplay_raopsink_missing: "AirPlay를 사용하려면 GStreamer의 raopsink 요소가 필요합니다. gst-plugins-bad 패키지를 설치한 후 Tributary를 다시 시작하세요"
+    mpd_exclusive_control_required: "이 MPD 출력을 다시 추가하고 파티션 독점 제어를 확인한 다음 재생 전에 다시 선택하세요"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:
