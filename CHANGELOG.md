@@ -49,11 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Linux library reads no longer feed a recursive rescan loop** — Filesystem notifications
   explicitly classified as access or access-time observations and produced by Tributary's own
-  metadata reads are discarded in the watcher callback,
-  before they can consume the bounded event queue and falsely request another full-library
-  reconciliation. Real create, write, rename, remove, and backend-error events remain queued across
-  the initial scan; queue-overflow evidence remains retained and still schedules an authoritative
-  reconciliation instead of being drained or cleared. The persistent unparseable-file cache from
+  metadata reads are discarded in the watcher callback, before they can consume the bounded event
+  queue and falsely request another full-library reconciliation. The filter does not discard real
+  create, write, rename, remove, or backend-error events; if accepted events fill the bounded queue,
+  overflow evidence remains retained and still schedules an authoritative reconciliation instead
+  of being drained or cleared. The persistent unparseable-file cache from
   the original proposal is intentionally excluded: a transient parser or I/O failure can be retried
   by a later scan rather than becoming a stale negative result.
   ([#103](https://github.com/jm2/tributary/pull/103))

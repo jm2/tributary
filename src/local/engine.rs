@@ -7129,10 +7129,11 @@ mod tests {
         let overflowed = AtomicBool::new(false);
 
         for index in 0..1_024 {
-            let kind = match index % 4 {
+            let kind = match index % 5 {
                 0 => EventKind::Access(AccessKind::Open(AccessMode::Read)),
-                1 => EventKind::Access(AccessKind::Read),
-                2 => EventKind::Access(AccessKind::Close(AccessMode::Read)),
+                1 => EventKind::Access(AccessKind::Open(AccessMode::Any)),
+                2 => EventKind::Access(AccessKind::Read),
+                3 => EventKind::Access(AccessKind::Close(AccessMode::Read)),
                 _ => EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)),
             };
             enqueue_watcher_result(
