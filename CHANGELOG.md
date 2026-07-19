@@ -60,6 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rollback- and retry-safe. The smart-playlist editor now exposes Last Played filtering/sorting and
   Most/Least Recently Played limit selection, and preserves authorable Days, Weeks, or Months when
   a relative date rule is reopened and saved.
+  ([#137](https://github.com/jm2/tributary/pull/137))
 
 ### Fixed
 - **Linux library reads no longer feed a recursive rescan loop** — Filesystem notifications
