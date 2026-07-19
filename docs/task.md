@@ -34,13 +34,13 @@ defaults, and live smart-playlist refresh. The rest of P1 builds on the source-s
 already present in the runtime, the now-bounded shuffle navigation semantics, an honest local-only
 playlist interaction boundary, and authoritative local playback events.
 
-An independent Linux watcher correctness fix is in review in
-[#103](https://github.com/jm2/tributary/pull/103) and does not change the **4/35** feature total.
+The independent Linux watcher correctness fix tracked in
+[#103](https://github.com/jm2/tributary/pull/103) does not change the **4/35** feature total.
 The salvaged scope rejects explicitly classified access/access-time noise before the bounded watcher
 queue while retaining real bootstrap mutations and backend errors in that queue, plus overflow
 evidence for authoritative reconciliation. It intentionally omits the original persistent
-unparseable-file cache so transient parser and I/O failures remain retryable. No backlog record is
-marked complete until that PR merges.
+unparseable-file cache so transient parser and I/O failures remain retryable. It is tracked outside
+the 35-record feature backlog.
 
 ## P1 — Correctness and shared feature foundations
 
@@ -268,4 +268,4 @@ marked complete until that PR merges.
 | 2026-07-18 | P1.2 honest unsupported playlist actions | [#133](https://github.com/jm2/tributary/pull/133) | Refused non-local Add to Playlist actions with an all-or-none localized dialog before database work, localized the existing context-menu labels, and regressed the fail-closed source policy plus every shipped catalog. |
 | 2026-07-18 | P1.3 playback-history contract and schema | [#134](https://github.com/jm2/tributary/pull/134) | Defined occurrence, threshold, duration, seek/retry/restart, clock, and legacy contracts; added migration 10 plus safe model conversion and a pure one-shot progress state. Production event writes and smart-playlist consumers remain the next two records. |
 | 2026-07-18 | P1.3 authoritative playback-history persistence | [#135](https://github.com/jm2/tributary/pull/135), [#136](https://github.com/jm2/tributary/pull/136) | Bound one progress latch to each exact local queue occurrence independently of output generations; rejected/stale/retry events cannot double count, paused polls stay inert, Repeat One rolls back only its tentative occurrence before generation handoff, and other discontinuities re-anchor. Added a shared shutdown admission gate plus FIFO drain, atomic stable-ID count/timestamp persistence with legacy-negative repair, post-commit Plays refresh and playlist-projection invalidation, plus generation-scoped AirPlay position evidence. Deterministic Recently Played and Top 25 behavior remains the final P1.3 record. |
-| 2026-07-18 | Linux watcher feedback-loop fix (in review) | [#103](https://github.com/jm2/tributary/pull/103) | Narrowed the external proposal to filter self-generated access events before queue admission while preserving genuine startup events, backend errors, and overflow-driven reconciliation. Persistent negative parse caching is deliberately excluded so failures remain retryable; this row records an open correctness fix and does not advance the feature numerator. |
+| 2026-07-18 | Linux watcher feedback-loop fix | [#103](https://github.com/jm2/tributary/pull/103) | Narrowed the external proposal to filter self-generated access events before queue admission while preserving genuine startup events, backend errors, and overflow-driven reconciliation. Persistent negative parse caching is deliberately excluded so failures remain retryable; this separate correctness fix does not advance the feature numerator. |
