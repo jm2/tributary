@@ -176,6 +176,7 @@ impl DaapBackend {
                 sample_rate_hz: sample_rate,
                 format: Some(format.clone()),
                 play_count: None,
+                rating: TrackRating::unsupported(),
                 last_played: None,
             };
 
@@ -431,6 +432,10 @@ impl crate::architecture::MediaBackend for DaapBackend {
 
     async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
         Ok(self.cache.read().await.tracks.clone())
+    }
+
+    fn rating_capability(&self) -> RatingCapability {
+        RatingCapability::Unsupported
     }
 
     async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {

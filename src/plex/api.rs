@@ -162,6 +162,14 @@ pub struct PlexTrack {
     #[serde(rename = "viewCount", default)]
     pub view_count: Option<u32>,
 
+    /// User rating on Plex's nullable decimal zero-through-ten scale.
+    #[serde(
+        rename = "userRating",
+        default,
+        deserialize_with = "crate::remote_rating_wire::optional_f64"
+    )]
+    pub user_rating: Option<f64>,
+
     /// Last updated timestamp (Unix seconds).
     #[serde(rename = "updatedAt", default)]
     pub updated_at: Option<i64>,
@@ -345,4 +353,33 @@ pub struct PlexIdentityContainer {
     /// The Plex server's version string.
     #[serde(default)]
     pub version: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_rating_wire_field_is_tolerant() {
+        let missing: PlexTrack =
+            serde_json::from_value(serde_json::json!({"ratingKey": "track"})).unwrap();
+        assert_eq!(missing.user_rating, None);
+
+        for (wire, expected) in [
+            (serde_json::Value::Null, None),
+            (serde_json::json!(8.25), Some(8.25)),
+            (serde_json::json!(8), Some(8.0)),
+            (serde_json::json!("8.25"), None),
+            (serde_json::json!(true), None),
+            (serde_json::json!([8.25]), None),
+            (serde_json::json!({"value": 8.25}), None),
+        ] {
+            let track: PlexTrack = serde_json::from_value(serde_json::json!({
+                "ratingKey": "track",
+                "userRating": wire,
+            }))
+            .expect("malformed optional rating must not reject the track");
+            assert_eq!(track.user_rating, expected);
+        }
+    }
 }

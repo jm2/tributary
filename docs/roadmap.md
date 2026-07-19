@@ -1,12 +1,12 @@
 # Tributary implementation roadmap
 
-Last audited: 2026-07-18
+Last audited: 2026-07-19
 
 This document explains the product and engineering work that remains **after** the holistic-review
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
 remediation record is preserved separately in
 [`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **220/223 (98.7%)**, with only three
-real-environment validation records left. The feature backlog is now **5/35 (14.3%)** complete. Neither
+real-environment validation records left. The feature backlog is now **6/35 (17.1%)** complete. Neither
 percentage estimates equal engineering effort, and the historical percentage is not a claim that
 Tributary has implemented every requested product feature.
 
@@ -30,7 +30,8 @@ starts. Historical holistic-review documents are point-in-time findings, not act
   work instead of silently skipping rows.
 - XSPF v1 import/export is implemented with exact path and deterministic normalized-metadata
   matching. Apple/iTunes XML, Google Takeout CSV, M3U, service URLs, and fuzzy matching are not
-  direct input modes.
+  direct input modes. Ratings are intentionally omitted on export and rating-like extension data
+  is inert on import because playlist interchange has no metadata-write consent or conflict flow.
 - Mounted removable filesystems can be browsed and played. Copy/sync, MTP-only devices, automount,
   eject, and pathless removable tag mutation are not implemented.
 - Shuffled playback retains the current queue occurrence plus ten real predecessors. Previous and
@@ -52,6 +53,14 @@ starts. Historical holistic-review documents are point-in-time findings, not act
   untouched v0.5.0 defaults and their immediate no-field successors; user-owned variants remain
   unchanged. Last Played editor fields, Most/Least Recently Played limits, and Days/Weeks/Months
   relative units round-trip losslessly.
+- The [rating foundation](ratings.md) defines one canonical whole integer from 1 through 100 with
+  `None` as unrated. Tributary owns nullable ratings only for local SQLite tracks; migration 12
+  leaves legacy rows unrated, local metadata refresh preserves values, and exact-ID set/clear is
+  transactional. Subsonic's valid 1–5 `userRating` and Jellyfin/Plex's valid finite 0–10 user
+  ratings propagate read-only through explicit capability states. DAAP, radio, removable, external,
+  and unknown sources remain unsupported, all remote writes fail closed, and catalogue admission
+  rejects source/track capability drift. The visible accessible editor, column, sorting, and smart
+  rules remain the next P1.4 record.
 
 ## Proposed implementation order
 
@@ -94,10 +103,11 @@ before starting large protocol or transfer subsystems.
    Renamed, edited, reformatted, or otherwise divergent playlists remain byte-for-byte user-owned.
    The editor exposes Last Played filtering/sorting and Most/Least Recently Played limits while
    preserving relative-rule amounts and Days/Weeks/Months units across reopen/save.
-4. **Next: add ratings ([#37]).** Decide whether ratings are app-local, written to tags,
-   synchronized to capable servers, or some explicit combination. Then add
-   schema/model/backend propagation, an editable and sortable column, smart-playlist rules, and
-   mixed-capability behavior.
+4. **In progress: add ratings ([#37]).** The [ownership and capability contract](ratings.md),
+   migration, model/backend propagation, transactional local persistence, validated read-only
+   Subsonic/Jellyfin/Plex conversion, and rating-neutral XSPF boundary are complete. Next add the
+   accessible editor and column, sorting, smart-playlist rules, live local refresh, and explicit
+   read-only/unsupported presentation.
 
 These foundations make Rhythmbox migration and Last.fm behavior much less ambiguous.
 
@@ -163,13 +173,13 @@ mistaken for work already underway.
 
 | Issue | Current implementation state | Likely implementation shape |
 |---|---|---|
-| [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus the complete playback-history schema, threshold, persistence, and deterministic-consumer contracts are foundations; ratings remain incomplete. | Complete ratings first; then transactional, idempotent migration with conflict reporting. |
+| [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus playback-history and local-rating storage are foundations; XSPF deliberately transfers neither history nor ratings. | Complete rating UI/rules, then build a separate transactional, idempotent migration with explicit metadata consent and conflict reporting. |
 | [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | No Last.fm client or scrobble pipeline. | Authorization, secret storage, authoritative thresholds, retry/offline queue, and privacy UX. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
 | [#47 — Remote/Subsonic tracks in playlists](https://github.com/jm2/tributary/issues/47) | Non-local Add to Playlist attempts are now refused visibly and atomically; durable remote entries and server-native playlist sync are not implemented. | Source-scoped playlist schema/resolution first; server playlist sync separately. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |
-| [#37 — Rating column](https://github.com/jm2/tributary/issues/37) | No rating field in the core track model, database, or track list. | Define ownership/sync semantics, then schema, editing, sorting, rules, and backend capabilities. |
+| [#37 — Rating column](https://github.com/jm2/tributary/issues/37) | Canonical model, local schema/persistence, source capabilities, validated read-only remote propagation, and interchange policy are complete; no visible column/editor or rating smart rules yet. | Add accessible local editing and display, sorting/rules, live refresh, and explicit read-only/unsupported states. |
 | [#29 — UI refinement](https://github.com/jm2/tributary/issues/29) | Requested separators/alignment changes are not implemented. | Split into independently reviewable visual changes after current-theme design review. |
 | [#14 — Browse by folder](https://github.com/jm2/tributary/issues/14) | Browser panes expose Genre, Artist, and Album only. | Root-relative folder model and lazy UI with multiple-root and unavailable-root semantics. |
 | [#11 — Offline cache/download](https://github.com/jm2/tributary/issues/11) | No remote download or offline catalogue subsystem. | Large persistent cache/download epic with quota, retry, reconciliation, and secure auth handling. |

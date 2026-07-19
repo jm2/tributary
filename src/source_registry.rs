@@ -16,15 +16,15 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::architecture::backend::BackendResult;
-#[cfg(test)]
-use crate::architecture::backend::MediaBackend;
+use crate::architecture::backend::{
+    validate_catalogue_rating_capability, BackendResult, MediaBackend,
+};
 use crate::architecture::error::BackendError;
 use crate::architecture::media::{
     MediaLease, MediaRequest, PublicHttpAuthority, PublicHttpEndpoint, RemoteMediaResolver,
     ResolvedHttpRequest, ResolvedPublicHttpRequest,
 };
-use crate::architecture::models::Track;
+use crate::architecture::models::{RatingCapability, Track};
 use crate::architecture::{SourceId, TrackId, ViewOrigin};
 use crate::external_file::{ExternalFileCandidate, ExternalFileHint};
 use crate::local::resolver::ResolvedFileMedia;
@@ -323,9 +323,22 @@ macro_rules! abortable_remote_adapter {
 abortable_remote_adapter!(crate::subsonic::SubsonicBackend);
 abortable_remote_adapter!(crate::plex::PlexBackend);
 
+/// Preserve DAAP's session-aware loader while applying the same catalogue
+/// rating invariant as the standard dynamic-dispatch publication path.
+fn validate_daap_initial_catalogue(
+    tracks: Vec<Track>,
+    capability: RatingCapability,
+) -> BackendResult<Vec<Track>> {
+    validate_catalogue_rating_capability(&tracks, capability)?;
+    Ok(tracks)
+}
+
 impl ManagedSourceAdapter for crate::daap::DaapBackend {
     fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
-        Box::pin(async move { self.load_catalogue().await })
+        Box::pin(async move {
+            let tracks = self.load_catalogue().await?;
+            validate_daap_initial_catalogue(tracks, self.rating_capability())
+        })
     }
 
     fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
@@ -1448,8 +1461,23 @@ mod tests {
             sample_rate_hz: None,
             format: None,
             play_count: None,
+            rating: crate::architecture::models::TrackRating::unsupported(),
             last_played: None,
         }
+    }
+
+    #[test]
+    fn daap_initial_catalogue_rejects_rating_capability_mismatch() {
+        let mut track = fixture_track(TrackId::remote("daap-track").unwrap());
+        track.rating = crate::architecture::models::TrackRating::read_only(None);
+
+        let error = validate_daap_initial_catalogue(
+            vec![track],
+            crate::architecture::models::RatingCapability::Unsupported,
+        )
+        .expect_err("DAAP publication must reject per-track rating capability drift");
+
+        assert!(matches!(error, BackendError::Internal(_)));
     }
 
     async fn wait_for_catalogue(registry: &SourceRegistry, source_id: SourceId) -> (u64, u64) {

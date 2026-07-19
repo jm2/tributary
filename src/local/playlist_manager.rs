@@ -740,6 +740,7 @@ mod tests {
             format: None,
             play_count: 0,
             last_played_at_ms: None,
+            rating: None,
             date_added: "2026-07-12T00:00:00Z".to_string(),
             date_modified: "2026-07-12T00:00:00Z".to_string(),
             file_size_bytes: None,
@@ -1005,6 +1006,45 @@ mod tests {
         assert_eq!(after[2].match_artist, "path wins");
         assert_eq!(after[2].match_album, "album");
         assert_eq!(after[2].match_duration_secs, Some(200));
+    }
+
+    #[tokio::test]
+    async fn playlist_import_never_mutates_app_owned_library_ratings() {
+        let db = in_memory_db().await;
+        let existing = insert_track(
+            &db,
+            "rated-existing",
+            "/music/rated.flac",
+            "Rated",
+            "Artist",
+            "Album",
+            Some(180),
+        )
+        .await;
+        let mut rated: track::ActiveModel = existing.clone().into();
+        rated.rating = Set(Some(87));
+        rated.update(&db).await.expect("seed app-owned rating");
+
+        let imported = [ImportedTrack {
+            title: "Conflicting external title".to_string(),
+            artist: "Conflicting external artist".to_string(),
+            album: String::new(),
+            file_path: existing.file_path,
+            duration_secs: None,
+        }];
+        let manager = PlaylistManager::new(db.clone());
+        let result = manager
+            .import_regular_playlist("Rating-neutral import", &imported)
+            .await
+            .expect("import playlist");
+        assert_eq!(result.counts.matched, 1);
+
+        let after = track::Entity::find_by_id("rated-existing")
+            .one(&db)
+            .await
+            .expect("query rated track")
+            .expect("rated track remains");
+        assert_eq!(after.rating, Some(87));
     }
 
     #[tokio::test]
