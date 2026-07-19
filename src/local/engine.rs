@@ -1023,7 +1023,13 @@ where
             active.update(&transaction).await?;
         }
 
-        let entries = playlist_entry::Entity::find().all(&transaction).await?;
+        let entries = playlist_entry::Entity::find()
+            .filter(
+                playlist_entry::Column::SourceId
+                    .eq(crate::architecture::SourceId::local().to_string()),
+            )
+            .all(&transaction)
+            .await?;
         for entry in entries {
             let Some(source_path) = entry.match_file_path.as_deref() else {
                 continue;
@@ -6536,6 +6542,10 @@ mod tests {
         expected_entry.match_file_path = Some(destination_path.to_string_lossy().into_owned());
         assert_eq!(moved_entry, expected_entry);
         assert_eq!(moved_entry.track_id.as_deref(), Some(original.id.as_str()));
+        assert_eq!(
+            moved_entry.local_track_id.as_deref(),
+            Some(original.id.as_str())
+        );
 
         assert!(
             library_root::Entity::find_by_id(old_root.to_string_lossy().as_ref())
@@ -6562,6 +6572,73 @@ mod tests {
         assert_eq!(receipt.old_path, old_root.to_string_lossy());
         assert_eq!(receipt.new_path, new_root.to_string_lossy());
         assert_eq!(receipt.marker_identity, marker);
+    }
+
+    #[tokio::test]
+    async fn root_reauthorization_ignores_non_local_playlist_match_paths_defensively() {
+        let db = rename_test_database().await;
+        let old_root = directory_fixture_path("/legacy/Music");
+        let new_root = directory_fixture_path("/portal/Music");
+        let marker = test_marker_identity();
+        let stored_root = insert_reauthorization_root(&db, &old_root, &marker, true).await;
+        let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Corrupt remote path evidence", false)
+            .await
+            .expect("create playlist");
+        let remote_match_path = old_root.join("Remote").join("song.flac");
+        let remote_entry_id = Uuid::new_v4().to_string();
+
+        // Migration 13 rejects this state. Insert it only to prove the
+        // relocation boundary remains safe if an older or externally modified
+        // database nevertheless contains remote path evidence.
+        db.execute_unprepared("PRAGMA ignore_check_constraints = ON")
+            .await
+            .expect("disable checks for corrupt fixture");
+        playlist_entry::ActiveModel {
+            id: Set(remote_entry_id.clone()),
+            playlist_id: Set(playlist.id),
+            position: Set(0),
+            source_id: Set(crate::architecture::SourceId::random().to_string()),
+            track_id: Set(Some("remote-track".to_string())),
+            local_track_id: Set(None),
+            match_title: Set("Remote song".to_string()),
+            match_artist: Set("Remote artist".to_string()),
+            match_album: Set(String::new()),
+            match_duration_secs: Set(None),
+            match_file_path: Set(Some(remote_match_path.to_string_lossy().into_owned())),
+        }
+        .insert(&db)
+        .await
+        .expect("insert corrupt remote playlist entry");
+        db.execute_unprepared("PRAGMA ignore_check_constraints = OFF")
+            .await
+            .expect("restore playlist checks");
+
+        let request = RootReauthorizationRequest::new(Uuid::new_v4(), old_root, new_root.clone());
+        relocate_library_root_rows(&db, &request, Some(&stored_root), &marker, || async {
+            true
+        })
+        .await
+        .expect("relocate local library root rows");
+
+        let remote_entry = playlist_entry::Entity::find_by_id(remote_entry_id)
+            .one(&db)
+            .await
+            .expect("load remote playlist entry")
+            .expect("remote playlist entry survives");
+        assert_eq!(
+            remote_entry.match_file_path.as_deref(),
+            Some(remote_match_path.to_string_lossy().as_ref()),
+            "root relocation must never rewrite non-local source evidence"
+        );
+        assert!(
+            library_root::Entity::find_by_id(new_root.to_string_lossy().as_ref())
+                .one(&db)
+                .await
+                .expect("query relocated root")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -7044,7 +7121,9 @@ mod tests {
             id: Set(Uuid::new_v4().to_string()),
             playlist_id: Set(playlist.id),
             position: Set(0),
+            source_id: Set(crate::architecture::SourceId::local().to_string()),
             track_id: Set(None),
+            local_track_id: Set(None),
             match_title: Set("Remembered".to_string()),
             match_artist: Set(String::new()),
             match_album: Set(String::new()),
@@ -8296,6 +8375,10 @@ mod tests {
             .expect("playlist entry remains");
         assert_eq!(entry_after, entry_before);
         assert_eq!(entry_after.track_id.as_deref(), Some("stable-track-id"));
+        assert_eq!(
+            entry_after.local_track_id.as_deref(),
+            Some("stable-track-id")
+        );
     }
 
     #[tokio::test]
@@ -8366,7 +8449,13 @@ mod tests {
             .await
             .expect("load overwrite playlist entries");
         assert_eq!(entries[0].track_id.as_deref(), Some("source-track"));
-        assert_eq!(entries[1].track_id, None);
+        assert_eq!(entries[0].local_track_id.as_deref(), Some("source-track"));
+        assert_eq!(
+            entries[1].track_id.as_deref(),
+            Some("destination-track"),
+            "local deletion preserves durable playlist identity"
+        );
+        assert_eq!(entries[1].local_track_id, None);
     }
 
     #[tokio::test]
@@ -8535,16 +8624,17 @@ mod tests {
         )
         .await
         .expect("insert watcher track");
-        db.execute_unprepared(
+        let local_source_id = crate::architecture::SourceId::local();
+        db.execute_unprepared(&format!(
             "INSERT INTO playlist_entries (
-                 id, playlist_id, position, track_id,
+                 id, playlist_id, position, source_id, track_id, local_track_id,
                  match_title, match_artist, match_album, match_duration_secs
              )
              VALUES (
-                 'watcher-entry', 'watcher-playlist', 0, NULL,
+                 'watcher-entry', 'watcher-playlist', 0, '{local_source_id}', NULL, NULL,
                  'watcher song', 'watcher artist', 'watcher album', 180
-             )",
-        )
+             )"
+        ))
         .await
         .expect("insert orphaned playlist entry");
         let (event_tx, event_rx) = async_channel::unbounded();
@@ -8565,6 +8655,7 @@ mod tests {
             .expect("query skipped reconciliation")
             .expect("playlist entry remains");
         assert_eq!(still_orphaned.track_id, None);
+        assert_eq!(still_orphaned.local_track_id, None);
 
         assert_eq!(
             settle_playlist_projections_after_watcher_batch(&db, &event_tx, false, true)
@@ -8582,6 +8673,7 @@ mod tests {
             .expect("query removal-only reconciliation")
             .expect("playlist entry remains");
         assert_eq!(still_orphaned.track_id, None);
+        assert_eq!(still_orphaned.local_track_id, None);
 
         db.execute_unprepared(
             "CREATE TRIGGER fail_watcher_playlist_reconciliation
@@ -8619,6 +8711,7 @@ mod tests {
             .expect("query watcher reconciliation")
             .expect("playlist entry remains");
         assert_eq!(relinked.track_id.as_deref(), Some("watcher-track"));
+        assert_eq!(relinked.local_track_id.as_deref(), Some("watcher-track"));
     }
 
     #[tokio::test]

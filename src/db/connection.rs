@@ -26,7 +26,7 @@ static SHARED_DB: OnceCell<DatabaseConnection> = OnceCell::const_new();
 ///
 /// All three are stated explicitly rather than inherited:
 ///
-/// - `foreign_keys` is what makes `playlist_entries.track_id`'s
+/// - `foreign_keys` is what makes `playlist_entries.local_track_id`'s
 ///   `ON DELETE SET NULL` fire when a track row is deleted. SQLite defaults
 ///   this to **off**; sqlx happens to enable it on every connection it opens,
 ///   and SeaORM never touches it either way. Leaving the library's whole
@@ -196,11 +196,11 @@ mod tests {
         }
     }
 
-    /// P1.1's guarantee, asserted end to end against a real pool: deleting a
-    /// track must null the referencing playlist entry rather than orphan it or
-    /// fail the delete.
+    /// P1.5's guarantee, asserted end to end against a real pool: deleting a
+    /// local track nulls only the current local binding. The entry and its
+    /// durable source-scoped identity survive for unavailable presentation.
     #[tokio::test]
-    async fn deleting_a_track_nulls_its_playlist_entry() {
+    async fn deleting_a_track_nulls_only_its_playlist_local_binding() {
         let file = TestDatabase::new("set-null");
         let db = connect_and_migrate(file.path())
             .await
@@ -230,7 +230,9 @@ mod tests {
             id: Set("entry-1".to_string()),
             playlist_id: Set("playlist-1".to_string()),
             position: Set(0),
+            source_id: Set(crate::architecture::SourceId::local().to_string()),
             track_id: Set(Some("track-1".to_string())),
+            local_track_id: Set(Some("track-1".to_string())),
             match_title: Set("Title".to_string()),
             match_artist: Set("Artist".to_string()),
             match_album: Set("Album".to_string()),
@@ -251,7 +253,12 @@ mod tests {
             .await
             .expect("load playlist entry")
             .expect("playlist entry survives the delete");
-        assert_eq!(entry.track_id, None);
+        assert_eq!(entry.track_id.as_deref(), Some("track-1"));
+        assert_eq!(entry.local_track_id, None);
+        assert_eq!(
+            entry.source_id,
+            crate::architecture::SourceId::local().to_string()
+        );
         assert_eq!(entry.position, 0);
         assert_eq!(entry.match_title, "Title");
     }
