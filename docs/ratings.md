@@ -30,6 +30,13 @@ entire result if any track's capability disagrees with its backend, preventing U
 silently drifting from adapter policy. The default backend capability and mutation implementation
 are `Unsupported`, so a new or incomplete remote adapter fails closed.
 
+Regular-playlist migration 13 does not change that ownership. Its durable `(source_id, track_id)`
+pair records membership only; neither the entry nor its safe match fingerprint stores a rating or
+grants mutation authority. Current local playlist projections continue to edit the exact linked
+local row. A later mixed-source projection must obtain a remote row's ReadOnly or Unsupported value
+from the current live source catalogue rather than treating persisted membership as metadata
+authority. See the [playlist storage contract](source-scoped-playlists.md).
+
 ## Local persistence
 
 Migration 12 adds `tracks.rating` as a nullable SQLite `INTEGER` with a constraint requiring either
@@ -171,6 +178,8 @@ or conflict-resolution step for modifying library metadata. Therefore:
 - XSPF export intentionally omits app-owned and read-only ratings.
 - Import ignores rating-like generic `<meta>` elements and extension content.
 - Matching an imported playlist row never changes the matched local track's rating.
+- Source-scoped playlist storage persists no rating snapshot; a disconnected remote occurrence
+  cannot manufacture a readable value from its membership fingerprint.
 
 This asymmetry is intentional: an XSPF file describes playlist membership, not catalogue
 authority. A future rating-transfer feature would need an explicitly versioned scalar plus a

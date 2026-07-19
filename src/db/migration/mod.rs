@@ -14,6 +14,7 @@ mod m20260715_000009_create_root_reauthorization_receipts;
 mod m20260718_000010_add_playback_history;
 mod m20260718_000011_migrate_default_history_playlists;
 mod m20260719_000012_add_track_rating;
+mod m20260719_000013_source_scoped_playlist_entries;
 
 pub struct Migrator;
 
@@ -33,6 +34,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260718_000010_add_playback_history::Migration),
             Box::new(m20260718_000011_migrate_default_history_playlists::Migration),
             Box::new(m20260719_000012_add_track_rating::Migration),
+            Box::new(m20260719_000013_source_scoped_playlist_entries::Migration),
         ]
     }
 }

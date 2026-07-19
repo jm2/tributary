@@ -3,7 +3,8 @@
 - Status: Accepted in PR #113 and fully implemented through the mounted removable-media adapter;
   P3.1 is complete. Physical removable-hardware, installed Flatpak portal/USB/custom-library, and
   packaged Windows DAAP/Subsonic playback validation remain tracked field work outside this
-  decision.
+  decision. P1.5 migration 13 extends the same identity boundary into regular-playlist storage;
+  mixed-source rendering/playback remains a follow-up and does not reopen P3.1.
 - Decision date: 2026-07-17
 - Historical tracker:
   [P3.1](../task-remediation-2026-07.md#p31-introduce-a-sourcesession-registry)
@@ -35,6 +36,14 @@ IDs; local playback and local/playlist embedded-art reads retain exact root/file
 consumption. Mounted removable sources now publish pathless registry catalogues and resolve only an
 accepted mount-relative identity through retained mount and exact-file authority. Their scans are
 generation-owned and cancelled on relocation, pre-unmount, removal, or shutdown.
+
+Regular-playlist storage now follows the same identity rule. Migration 13 assigns every existing
+entry to the built-in local source and stores its canonical `(source_id, track_id)` separately from
+the nullable local-track foreign-key cache. This foundation can represent another source without
+persisting its locator, credentials, lease, or session epoch. The shipping playlist projection is
+still deliberately local-only until the next P1.5 slice resolves those identities through the live
+registry. The full storage boundary is specified in
+[`source-scoped-playlists.md`](../source-scoped-playlists.md).
 
 The implementation has now converged on this boundary. PR #120 implements stable identity, PR #121
 adds retained local file authority through output consumption, and PR #122 introduces the generic
@@ -146,18 +155,24 @@ The existing local `tracks.id` value is already the local backend's native `Trac
 byte-for-byte, including a legacy non-UUID string. The random fallback in `db_model_to_track` has
 been removed: exact local identity uses the original string, while still-unmigrated UUID APIs see
 a frozen deterministic compatibility projection. New local tracks may continue to receive UUIDv4
-strings, and playlist foreign keys remain unchanged.
+strings. Migration 13 makes `(source_id, track_id)` the canonical regular-playlist identity and
+retains a separate nullable `local_track_id -> tracks(id) ON DELETE SET NULL` cache so existing
+local deletion and reconciliation integrity does not constrain a remote native ID to the local
+table.
 
-No remote catalogue or playback queue is persisted today. Therefore remote migration discards and
-refetches process-local catalogues; it never attempts to reverse the current one-way UUIDv5 mapping
-back into a server ID. If a future persisted format contains only that derived UUID and not the
-native locator, the row is invalidated and resynchronized rather than guessed.
+No complete remote catalogue or playback queue is persisted. A source-scoped regular-playlist row
+may retain only the exact `SourceId`, exact native `TrackId`, and safe non-secret match metadata;
+it stores no session epoch or media locator. Remote catalogue migration therefore still discards
+and refetches process-local catalogues, and never attempts to reverse a one-way UUIDv5 compatibility
+projection back into a server ID. If persisted state lacks the exact native identity, the row is
+unavailable rather than guessed.
 
 Backend-native `TrackId` values are represented as follows:
 
 | Adapter | Native track identity |
 |---|---|
-| Local and playlist projection | Exact SQLite `tracks.id` string |
+| Local library | Exact SQLite `tracks.id` string |
+| Regular-playlist occurrence | The exact `TrackId` of its owning source; currently rendered playlist rows remain local-only pending the mixed-source P1.5 slice |
 | Subsonic | Exact song `id` returned by the server |
 | Jellyfin | Exact audio item `Id` returned by the server |
 | Plex | Exact track `ratingKey`; the media-part key remains a locator |
@@ -310,19 +325,25 @@ The local playback adapter resolves the exact database `TrackId` at use, obtains
 path, proves it is contained by the most-specific currently configured authoritative root,
 acquires retained root/marker/ancestor/file authority, and keeps that authority until the output
 or file server has finished consuming it. It rechecks database bindings after acquisition and
-rechecks current root configuration before output handoff. Playlist navigation queries entries by
-playlist ID and resolves their linked local track IDs from the same current snapshot.
-Fingerprint/path fallback is only a reconciliation operation that updates
-`playlist_entries.track_id`; playback never performs fuzzy or path fallback on its own. An orphan
-remains visibly unavailable until reconciliation commits a unique match. Embedded-art display
+rechecks current root configuration before output handoff. The current playlist navigation path
+queries entries by playlist ID and resolves their nullable `local_track_id` cache from the same
+current snapshot. Stored non-local identities remain outside that projection until live-registry
+resolution is implemented.
+
+Fingerprint/path fallback is only a local reconciliation operation. It is restricted to the exact
+built-in local `source_id` and updates both canonical `track_id` and `local_track_id` only after a
+unique match commits; playback never performs fuzzy or path fallback on its own. An unmatched
+occurrence remains unavailable until reconciliation commits. Embedded-art display
 clones the exact accepted `ResolvedLocalMedia`, revalidates its physical authority when cloning the
 file, and owns that handle through generation-checked parsing. No local/playlist artwork helper
 receives or reopens the playback-time path.
 
-A playlist is a `ViewOrigin`, not a source session. Regular and smart playlist queue items carry
-the local `SourceId` and local `TrackId`, plus the playlist ID and occurrence for ordering. Deleting
-or rebuilding a playlist retires that view's pending navigation while local-source invalidation
-still retires its media.
+A playlist is a `ViewOrigin`, not a source session. Each durable regular-playlist occurrence now
+names its actual media owner with `(source_id, track_id)` while keeping the playlist ID, entry ID,
+and position as view/occurrence state. The current regular- and smart-playlist queue path still
+publishes only local rows; mixed-source GTK rows, current-epoch adoption, playback, and source-
+retirement behavior are the next P1.5 record. Deleting or rebuilding a playlist retires that view's
+pending navigation without pretending that the view owns any contributing source session.
 
 #### Remote libraries, including DAAP
 
@@ -505,6 +526,15 @@ queue can extend the same ephemeral-source rule explicitly.
   carry only pathless `SourceId`, exact `TrackId`, and the non-secret session epoch that published
   the catalogue. Resolution uses the exact native ID without a derived UUID compatibility
   projection or a generic authenticated/lease-bearing URI.
+- Regular-playlist migration 13 brings durable membership under the same identity namespace.
+  Existing entry IDs, order, duplicate occurrences, local links, and reconciliation evidence are
+  preserved while each row gains the exact built-in local `source_id`; canonical `track_id` is
+  separated from a nullable `local_track_id` foreign-key cache. New non-local storage accepts only
+  typed source/native identity plus optional non-secret normalized fingerprints and rejects file-
+  path evidence. Those fingerprints are neither display fields, identity, nor matching authority;
+  migration 13 adds no source-label snapshot. It persists no source epoch, locator, route, lease, or
+  credential. Mixed-source publication and playback remain deliberately unwired in this storage
+  slice.
 - `PlaybackSession` captures immutable source/track identity, queue order, duplicate occurrence,
   and playback event generation independently of GTK sorting/filtering. Queue identity is a
   `MediaKey`; playlists and radio queries retain a separate `ViewOrigin`, so local invalidation
@@ -527,7 +557,8 @@ queue can extend the same ephemeral-source rule explicitly.
   source loss restores Local's configured music-column and browser presentation.
 - Source navigation rejects stale same-key and cross-source publications and preserves the newest
   cache independently of rendering.
-- Local database IDs and playlist foreign keys survive authoritative file/directory renames.
+- Local database IDs and the playlist entry's canonical/local-cache pair survive authoritative
+  file/directory renames.
   Architecture rows preserve the exact SQLite ID—including a legacy non-UUID value—and local or
   playlist queues no longer retain a file locator. Every queue load resolves that ID against the
   current row and the most-specific currently configured authoritative root under a five-second
@@ -538,9 +569,10 @@ queue can extend the same ephemeral-source rule explicitly.
   full and Range requests independent even when cloned OS handles share a cursor. Every
   replacement, Stop, error, terminal queue completion, ticket drop, or output teardown retires
   future lookups. Shared Chromecast cleanup retains legacy explicit-file routes while revoking
-  credential and retained-authority routes. Playlist queue identity uses the local source plus a
-  separate `ViewOrigin`, so generic local retirement also retires a playlist-origin queue without
-  losing view navigation.
+  credential and retained-authority routes. The currently shipping playlist queue identity uses
+  the local source plus a separate `ViewOrigin`, so generic local retirement also retires a
+  playlist-origin queue without losing view navigation. A later P1.5 slice will select the source
+  per stored occurrence and retain that same separation between media owner and playlist view.
 - Removable sources derive `SourceId` from the best-available logical key and exact `TrackId` from
   the losslessly encoded mount-relative native path. Their registry-owned adapter publishes a
   pathless, epoch-bound accepted catalogue; retained mounted-root authority, an exact membership
@@ -661,7 +693,9 @@ conflict quarantine are also implemented; they do not introduce a second saved-s
 persist credentials. Exact lifecycle trait names and event-channel shapes remain internal
 implementation details so long as one registry enforces this contract. A typed retained mutation
 authority for pathless removable Properties editing is deliberately deferred; the UI omits that
-action instead of reconstructing a path or weakening playback authority.
+action instead of reconstructing a path or weakening playback authority. Source-scoped regular-
+playlist storage is specified separately, while mixed-source row resolution, playback, lifecycle
+refresh, and Subsonic-native playlist synchronization remain explicitly deferred P1.5 work.
 
 ## Implementation sequence
 
@@ -754,6 +788,9 @@ independent lifecycle systems must not become the permanent architecture.
 - Stable IDs do not claim more than their evidence supports. In particular, a removable logical
   key can collide for cloned filesystems, a relative file key does not survive rename, and an
   unsaved remote endpoint that changes URL is a new source until explicitly rebound.
+- Regular-playlist persistence can retain a source-scoped occurrence while its source is offline,
+  but storage alone does not make it playable. Only the same live source and exact native track can
+  restore authority; metadata and endpoint similarity are never substitutes.
 
 ## Rejected alternatives
 
@@ -761,8 +798,9 @@ independent lifecycle systems must not become the permanent architecture.
   material, and make relocation indistinguishable from replacement.
 - **Hash every native ID into a global UUID.** Hashing loses the backend value needed for lookup,
   hides namespace mistakes, and cannot migrate a stored hash back to the native ID.
-- **Make playlists independent sources.** They are ordered projections of local tracks; duplicating
-  source identity would weaken local invalidation and reconciliation.
+- **Make playlists independent sources.** They are ordered projections over media owned by their
+  contributing sources; duplicating source identity would weaken lifecycle invalidation and
+  reconciliation.
 - **Resolve a playlist fingerprint during playback.** Ambiguous matching belongs in transactional
   reconciliation, not an output path that must choose exactly one track.
 - **Perform DAAP logout from `Drop`.** Destructors cannot await, cannot establish exactly-once

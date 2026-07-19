@@ -4,15 +4,16 @@
 //! references with fingerprint data for rediscovery after library rebuilds.
 //! Smart playlists store rule configurations and evaluate dynamically.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sea_orm::prelude::*;
-use sea_orm::{ActiveValue::Set, QueryOrder, TransactionTrait};
+use sea_orm::{ActiveValue::Set, DatabaseTransaction, QueryOrder, TransactionTrait};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::playlist_io::{ImportedTrack, ImportedTrackMatchIndex};
 use super::smart_rules::{self, SmartRules};
+use crate::architecture::{MediaKey, SourceId, TrackId};
 use crate::db::entities::{playlist, playlist_entry, track};
 
 /// Per-entry outcome counts for one committed playlist import.
@@ -28,6 +29,177 @@ pub struct PlaylistImportCounts {
 pub struct PlaylistImportResult {
     pub playlist: playlist::Model,
     pub counts: PlaylistImportCounts,
+}
+
+/// One exact, source-scoped track to append to a regular playlist.
+///
+/// The identity is deliberately independent of any playable URI. Remote
+/// locators and credentials remain owned by the live source session and are
+/// never accepted by playlist persistence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaylistEntryInput {
+    pub media_key: MediaKey,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub duration_secs: Option<u64>,
+}
+
+impl PlaylistEntryInput {
+    pub fn new(
+        media_key: MediaKey,
+        title: impl Into<String>,
+        artist: impl Into<String>,
+        album: impl Into<String>,
+        duration_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            media_key,
+            title: title.into(),
+            artist: artist.into(),
+            album: album.into(),
+            duration_secs,
+        }
+    }
+
+    fn local(track: &track::Model) -> Result<Self, DbErr> {
+        let track_id = TrackId::new(track.id.clone())
+            .map_err(|error| DbErr::Custom(format!("Local track identity is invalid: {error}")))?;
+        Ok(Self::new(
+            MediaKey::new(SourceId::local(), track_id),
+            track.title.clone(),
+            track.artist_name.clone(),
+            track.album_title.clone(),
+            valid_track_match_duration(track).map(|duration| duration as u64),
+        ))
+    }
+}
+
+/// Durable regular-playlist occurrence returned by the storage boundary.
+///
+/// `track_id` is absent only for an unmatched local import. `local_track_id`
+/// is a resolution cache backed by the local-track foreign key; deleting a
+/// local library row can clear it without erasing the occurrence's canonical
+/// source-scoped identity or match evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredPlaylistEntry {
+    pub id: String,
+    pub playlist_id: String,
+    pub position: i32,
+    pub source_id: SourceId,
+    pub track_id: Option<TrackId>,
+    pub local_track_id: Option<TrackId>,
+    pub match_title: String,
+    pub match_artist: String,
+    pub match_album: String,
+    pub match_duration_secs: Option<i32>,
+    pub match_file_path: Option<String>,
+}
+
+impl StoredPlaylistEntry {
+    pub fn media_key(&self) -> Option<MediaKey> {
+        self.track_id
+            .clone()
+            .map(|track_id| MediaKey::new(self.source_id, track_id))
+    }
+
+    fn from_model(entry: playlist_entry::Model) -> Result<Self, DbErr> {
+        if entry.position < 0 {
+            return Err(DbErr::Custom(format!(
+                "Playlist entry {} has an invalid position",
+                entry.id
+            )));
+        }
+        let source_id = entry.source_id.parse::<SourceId>().map_err(|error| {
+            DbErr::Custom(format!(
+                "Playlist entry {} has an invalid source identity: {error}",
+                entry.id
+            ))
+        })?;
+        if source_id.to_string() != entry.source_id {
+            return Err(DbErr::Custom(format!(
+                "Playlist entry {} has a non-canonical source identity",
+                entry.id
+            )));
+        }
+        if source_id.as_uuid().is_nil() {
+            return Err(DbErr::Custom(format!(
+                "Playlist entry {} has an unavailable source identity",
+                entry.id
+            )));
+        }
+        let track_id = entry
+            .track_id
+            .as_deref()
+            .map(|track_id| {
+                if source_id == SourceId::local() {
+                    TrackId::new(track_id)
+                } else {
+                    TrackId::remote(track_id)
+                }
+            })
+            .transpose()
+            .map_err(|_| {
+                DbErr::Custom(format!(
+                    "Playlist entry {} has an invalid track identity",
+                    entry.id
+                ))
+            })?;
+        let local_track_id = entry
+            .local_track_id
+            .as_deref()
+            .map(TrackId::new)
+            .transpose()
+            .map_err(|_| {
+                DbErr::Custom(format!(
+                    "Playlist entry {} has an invalid local track identity",
+                    entry.id
+                ))
+            })?;
+
+        if source_id == SourceId::local() {
+            if let Some(local_track_id) = local_track_id.as_ref() {
+                if track_id.as_ref() != Some(local_track_id) {
+                    return Err(DbErr::Custom(format!(
+                        "Playlist entry {} has inconsistent local identities",
+                        entry.id
+                    )));
+                }
+            }
+            let has_path_evidence = entry
+                .match_file_path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty());
+            let has_fingerprint =
+                !entry.match_title.trim().is_empty() && !entry.match_artist.trim().is_empty();
+            if track_id.is_none() && !has_path_evidence && !has_fingerprint {
+                return Err(DbErr::Custom(format!(
+                    "Playlist entry {} has no usable local identity evidence",
+                    entry.id
+                )));
+            }
+        } else if track_id.is_none() || local_track_id.is_some() || entry.match_file_path.is_some()
+        {
+            return Err(DbErr::Custom(format!(
+                "Playlist entry {} has inconsistent remote identity",
+                entry.id
+            )));
+        }
+
+        Ok(Self {
+            id: entry.id,
+            playlist_id: entry.playlist_id,
+            position: entry.position,
+            source_id,
+            track_id,
+            local_track_id,
+            match_title: entry.match_title,
+            match_artist: entry.match_artist,
+            match_album: entry.match_album,
+            match_duration_secs: entry.match_duration_secs,
+            match_file_path: entry.match_file_path,
+        })
+    }
 }
 
 /// Manages playlist persistence and track reconciliation.
@@ -128,6 +300,10 @@ impl PlaylistManager {
             let matched = match_index.find(source);
             let (track_id, match_file_path, title, artist, album, match_duration) =
                 if let Some(track) = matched {
+                    if TrackId::new(track.id.as_str()).is_err() {
+                        counts.failed += 1;
+                        continue;
+                    }
                     counts.matched += 1;
                     (
                         Some(track.id.clone()),
@@ -153,7 +329,9 @@ impl PlaylistManager {
                 id: Set(Uuid::new_v4().to_string()),
                 playlist_id: Set(playlist.id.clone()),
                 position: Set(position),
-                track_id: Set(track_id),
+                source_id: Set(SourceId::local().to_string()),
+                track_id: Set(track_id.clone()),
+                local_track_id: Set(track_id),
                 match_file_path: Set(match_file_path),
                 match_title: Set(title),
                 match_artist: Set(artist),
@@ -226,117 +404,274 @@ impl PlaylistManager {
     /// Stores fingerprint data (title, artist, album, duration) for
     /// rediscovery after a library rebuild.
     pub async fn add_track(&self, playlist_id: &str, track: &track::Model) -> Result<(), DbErr> {
-        // Wrap the next-position read and the insert in a transaction so the
-        // two statements form a single atomic unit. (Fully preventing two
-        // concurrent adds from claiming the same position would additionally
-        // require a UNIQUE(playlist_id, position) index — see migrations.)
-        let txn = self.db.begin().await?;
-
-        // Get next position.
-        let max_pos = playlist_entry::Entity::find()
-            .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
-            .order_by_desc(playlist_entry::Column::Position)
-            .one(&txn)
-            .await?
-            .map(|e| e.position)
-            .unwrap_or(-1);
-
-        let entry = playlist_entry::ActiveModel {
-            id: Set(Uuid::new_v4().to_string()),
-            playlist_id: Set(playlist_id.to_string()),
-            position: Set(max_pos + 1),
-            track_id: Set(Some(track.id.clone())),
-            // A path is authoritative only when an imported playlist supplied
-            // it as durable location evidence. A manually added entry follows
-            // the song fingerprint after deletion/rename; otherwise a
-            // different file later scanned at the reused path could silently
-            // replace the user's original choice.
-            match_file_path: Set(None),
-            match_title: Set(track.title.to_lowercase().trim().to_string()),
-            match_artist: Set(track.artist_name.to_lowercase().trim().to_string()),
-            match_album: Set(track.album_title.to_lowercase().trim().to_string()),
-            match_duration_secs: Set(valid_track_match_duration(track)),
-        };
-        entry.insert(&txn).await?;
-        txn.commit().await?;
+        let input = PlaylistEntryInput::local(track)?;
+        self.add_entries(playlist_id, &[input]).await?;
         debug!(playlist = %playlist_id, track = %track.title, "Track added to playlist");
         Ok(())
     }
 
-    /// Remove an entry from a playlist.
-    pub async fn remove_entry(&self, entry_id: &str) -> Result<(), DbErr> {
-        playlist_entry::Entity::delete_by_id(entry_id.to_string())
-            .exec(&self.db)
+    /// Append exact source-scoped tracks to one regular playlist atomically.
+    ///
+    /// Duplicate identities are intentionally preserved as distinct
+    /// occurrences in input order. Local identities are resolved against the
+    /// current track table inside the same transaction and receive the local
+    /// foreign-key cache. Non-local identities are persisted without a URI or
+    /// local foreign key; the UI does not expose remote mutations until its
+    /// live-session projection is implemented.
+    pub async fn add_entries(
+        &self,
+        playlist_id: &str,
+        inputs: &[PlaylistEntryInput],
+    ) -> Result<Vec<StoredPlaylistEntry>, DbErr> {
+        let txn = self.db.begin().await?;
+        require_regular_playlist(&txn, playlist_id).await?;
+        if inputs.is_empty() {
+            txn.commit().await?;
+            return Ok(Vec::new());
+        }
+
+        for input in inputs {
+            if input.media_key.source_id.as_uuid().is_nil() {
+                return Err(DbErr::Custom(
+                    "Playlist source identity is unavailable".to_string(),
+                ));
+            }
+            if input.media_key.source_id != SourceId::local() {
+                TrackId::remote(input.media_key.track_id.as_str()).map_err(|_| {
+                    DbErr::Custom("Remote playlist track identity is invalid".to_string())
+                })?;
+            }
+        }
+
+        let max_position = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
+            .order_by_desc(playlist_entry::Column::Position)
+            .one(&txn)
+            .await?
+            .map(|entry| entry.position)
+            .unwrap_or(-1);
+        if max_position < -1 {
+            return Err(DbErr::Custom(format!(
+                "Playlist {playlist_id} has an invalid entry position"
+            )));
+        }
+        let first_position = max_position
+            .checked_add(1)
+            .ok_or_else(|| DbErr::Custom("Playlist has too many entries".to_string()))?;
+
+        let local_ids: HashSet<&str> = inputs
+            .iter()
+            .filter(|input| input.media_key.source_id == SourceId::local())
+            .map(|input| input.media_key.track_id.as_str())
+            .collect();
+        let local_tracks: HashMap<String, track::Model> = if local_ids.is_empty() {
+            HashMap::new()
+        } else {
+            track::Entity::find()
+                .filter(track::Column::Id.is_in(local_ids.iter().copied()))
+                .all(&txn)
+                .await?
+                .into_iter()
+                .map(|track| (track.id.clone(), track))
+                .collect()
+        };
+        if local_ids
+            .iter()
+            .any(|track_id| !local_tracks.contains_key(*track_id))
+        {
+            return Err(DbErr::RecordNotFound(
+                "Local playlist track not found".to_string(),
+            ));
+        }
+
+        let mut inserted = Vec::with_capacity(inputs.len());
+        for (offset, input) in inputs.iter().enumerate() {
+            let offset = i32::try_from(offset)
+                .map_err(|_| DbErr::Custom("Playlist has too many entries".to_string()))?;
+            let position = first_position
+                .checked_add(offset)
+                .ok_or_else(|| DbErr::Custom("Playlist has too many entries".to_string()))?;
+
+            let is_local = input.media_key.source_id == SourceId::local();
+            let local_track = is_local.then(|| {
+                local_tracks
+                    .get(input.media_key.track_id.as_str())
+                    .expect("all local playlist inputs were validated")
+            });
+            let duration = match local_track {
+                Some(track) => valid_track_match_duration(track),
+                None => input
+                    .duration_secs
+                    .map(i32::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        DbErr::Custom("Playlist entry duration is too large".to_string())
+                    })?,
+            };
+            let (title, artist, album) = match local_track {
+                Some(track) => (&track.title, &track.artist_name, &track.album_title),
+                None => (&input.title, &input.artist, &input.album),
+            };
+            let track_id = input.media_key.track_id.as_str().to_string();
+            let model = playlist_entry::ActiveModel {
+                id: Set(Uuid::new_v4().to_string()),
+                playlist_id: Set(playlist_id.to_string()),
+                position: Set(position),
+                source_id: Set(input.media_key.source_id.to_string()),
+                track_id: Set(Some(track_id.clone())),
+                local_track_id: Set(is_local.then_some(track_id)),
+                // A path is authoritative only when an imported local
+                // playlist supplied it as durable location evidence.
+                match_file_path: Set(None),
+                match_title: Set(normalize_fingerprint(title)),
+                match_artist: Set(normalize_fingerprint(artist)),
+                match_album: Set(normalize_fingerprint(album)),
+                match_duration_secs: Set(duration),
+            }
+            .insert(&txn)
             .await?;
+            inserted.push(StoredPlaylistEntry::from_model(model)?);
+        }
+
+        txn.commit().await?;
+        Ok(inserted)
+    }
+
+    /// Remove an entry from its owning regular playlist and close the gap.
+    pub async fn remove_entry(&self, entry_id: &str) -> Result<(), DbErr> {
+        let entry = playlist_entry::Entity::find_by_id(entry_id.to_string())
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| DbErr::RecordNotFound(format!("Entry {entry_id} not found")))?;
+        self.remove_entries(&entry.playlist_id, &[entry_id.to_string()])
+            .await
+    }
+
+    /// Remove exact durable occurrences atomically and restore contiguous
+    /// positions. Every ID must be unique and belong to `playlist_id`.
+    pub async fn remove_entries(
+        &self,
+        playlist_id: &str,
+        entry_ids: &[String],
+    ) -> Result<(), DbErr> {
+        let txn = self.db.begin().await?;
+        require_regular_playlist(&txn, playlist_id).await?;
+        if entry_ids.is_empty() {
+            txn.commit().await?;
+            return Ok(());
+        }
+        let current = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
+            .order_by_asc(playlist_entry::Column::Position)
+            .all(&txn)
+            .await?;
+        let requested: HashSet<&str> = entry_ids.iter().map(String::as_str).collect();
+        if requested.len() != entry_ids.len() {
+            return Err(DbErr::Custom(
+                "Playlist removal contains duplicate entry IDs".to_string(),
+            ));
+        }
+        let current_ids: HashSet<&str> = current.iter().map(|entry| entry.id.as_str()).collect();
+        if let Some(missing) = requested
+            .iter()
+            .find(|entry_id| !current_ids.contains(**entry_id))
+        {
+            return Err(DbErr::RecordNotFound(format!(
+                "Entry {missing} not found in playlist {playlist_id}"
+            )));
+        }
+
+        if !entry_ids.is_empty() {
+            let deleted = playlist_entry::Entity::delete_many()
+                .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
+                .filter(playlist_entry::Column::Id.is_in(entry_ids.iter().map(String::as_str)))
+                .exec(&txn)
+                .await?;
+            let expected = u64::try_from(entry_ids.len())
+                .map_err(|_| DbErr::Custom("Too many playlist entries selected".to_string()))?;
+            if deleted.rows_affected != expected {
+                return Err(DbErr::Custom(
+                    "Playlist changed while entries were being removed".to_string(),
+                ));
+            }
+        }
+
+        let remaining_ids: Vec<String> = current
+            .into_iter()
+            .filter(|entry| !requested.contains(entry.id.as_str()))
+            .map(|entry| entry.id)
+            .collect();
+        assign_contiguous_positions(&txn, playlist_id, &remaining_ids).await?;
+        txn.commit().await?;
         Ok(())
     }
 
-    /// Reorder entries in a playlist. `entry_ids` is the new order.
+    /// Reorder every occurrence in a playlist. `entry_ids` must be one exact,
+    /// duplicate-free permutation of the playlist's durable entry IDs.
     pub async fn reorder_entries(
         &self,
         playlist_id: &str,
         entry_ids: &[String],
     ) -> Result<(), DbErr> {
-        // The `UNIQUE(playlist_id, position)` index makes naive sequential
-        // updates collide: assigning an entry its final position while another
-        // entry still holds it is a transient duplicate the index rejects.
-        //
-        // Two phases inside one transaction avoid that. Phase 1 parks every
-        // affected entry in a high, non-overlapping range; phase 2 assigns the
-        // final `0..N` positions. Phase-1 values (>= `TEMP_OFFSET`) never
-        // overlap phase-2 targets, so no statement ever produces a duplicate.
-        // The whole thing is transactional, so a mid-way failure rolls back
-        // cleanly instead of leaving a mix of old and new positions.
-        const TEMP_OFFSET: i32 = 1_000_000;
-
         let txn = self.db.begin().await?;
-
-        // Phase 1: park each entry at `index + TEMP_OFFSET`.
-        for (pos, entry_id) in entry_ids.iter().enumerate() {
-            let mut entry: playlist_entry::ActiveModel =
-                playlist_entry::Entity::find_by_id(entry_id.clone())
-                    .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
-                    .one(&txn)
-                    .await?
-                    .ok_or(DbErr::RecordNotFound(format!("Entry {entry_id} not found")))?
-                    .into();
-
-            entry.position = Set(pos as i32 + TEMP_OFFSET);
-            entry.update(&txn).await?;
+        require_regular_playlist(&txn, playlist_id).await?;
+        let current = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
+            .all(&txn)
+            .await?;
+        let requested: HashSet<&str> = entry_ids.iter().map(String::as_str).collect();
+        let current_ids: HashSet<&str> = current.iter().map(|entry| entry.id.as_str()).collect();
+        if requested.len() != entry_ids.len()
+            || entry_ids.len() != current.len()
+            || requested != current_ids
+        {
+            return Err(DbErr::Custom(format!(
+                "Playlist {playlist_id} reorder must contain each entry exactly once"
+            )));
         }
 
-        // Phase 2: assign the final 0..N positions.
-        for (pos, entry_id) in entry_ids.iter().enumerate() {
-            let mut entry: playlist_entry::ActiveModel =
-                playlist_entry::Entity::find_by_id(entry_id.clone())
-                    .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
-                    .one(&txn)
-                    .await?
-                    .ok_or(DbErr::RecordNotFound(format!("Entry {entry_id} not found")))?
-                    .into();
-
-            entry.position = Set(pos as i32);
-            entry.update(&txn).await?;
-        }
-
+        assign_contiguous_positions(&txn, playlist_id, entry_ids).await?;
         txn.commit().await?;
         Ok(())
     }
 
+    /// Load every durable regular-playlist occurrence in stored order.
+    /// Unmatched and currently unavailable entries are retained.
+    pub async fn get_playlist_entries(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<StoredPlaylistEntry>, DbErr> {
+        require_regular_playlist(&self.db, playlist_id).await?;
+        let entries = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
+            .order_by_asc(playlist_entry::Column::Position)
+            .all(&self.db)
+            .await?;
+        entries
+            .into_iter()
+            .map(StoredPlaylistEntry::from_model)
+            .collect()
+    }
+
     /// Get all matched tracks for a regular playlist (ordered by position).
     ///
-    /// Returns only entries that have a valid `track_id` link. Unmatched
-    /// entries (orphans from a library rebuild) are excluded.
+    /// This compatibility projection is deliberately local-only. It returns
+    /// entries with a valid local foreign-key cache and excludes remote or
+    /// unresolved occurrences until mixed-source UI projection lands.
     pub async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<track::Model>, DbErr> {
         let entries = playlist_entry::Entity::find()
             .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
-            .filter(playlist_entry::Column::TrackId.is_not_null())
+            .filter(playlist_entry::Column::SourceId.eq(SourceId::local().to_string()))
+            .filter(playlist_entry::Column::LocalTrackId.is_not_null())
             .order_by_asc(playlist_entry::Column::Position)
             .all(&self.db)
             .await?;
 
         // Collect the linked track IDs in playlist order.
-        let track_ids: Vec<String> = entries.iter().filter_map(|e| e.track_id.clone()).collect();
+        let track_ids: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| entry.local_track_id.clone())
+            .collect();
         if track_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -460,14 +795,17 @@ impl PlaylistManager {
     /// Re-link orphaned playlist entries to newly-discovered tracks.
     ///
     /// Called after a library rebuild (FullSync). Finds entries with
-    /// `track_id IS NULL` and attempts to match them against current
-    /// tracks by exact retained path first, then by a normalized
+    /// the built-in local `source_id` and `local_track_id IS NULL`, then
+    /// attempts to match them against current tracks by exact retained path
+    /// first, then by a normalized
     /// `(title, artist, album)` fingerprint with optional duration tolerance.
+    /// Remote identities are never relinked by local metadata.
     ///
     /// Returns the number of entries re-linked.
     pub async fn reconcile_all(&self) -> Result<u32, DbErr> {
         let orphans = playlist_entry::Entity::find()
-            .filter(playlist_entry::Column::TrackId.is_null())
+            .filter(playlist_entry::Column::SourceId.eq(SourceId::local().to_string()))
+            .filter(playlist_entry::Column::LocalTrackId.is_null())
             .all(&self.db)
             .await?;
 
@@ -511,13 +849,21 @@ impl PlaylistManager {
             let best = match_index.find(&imported);
 
             if let Some(best) = best {
+                if TrackId::new(best.id.as_str()).is_err() {
+                    warn!(
+                        entry = %orphan.id,
+                        "Skipping playlist reconciliation with an invalid local track identity"
+                    );
+                    continue;
+                }
                 let track_id = best.id.clone();
                 let match_title = normalize_fingerprint(&best.title);
                 let match_artist = normalize_fingerprint(&best.artist_name);
                 let match_album = normalize_fingerprint(&best.album_title);
                 let match_duration_secs = valid_track_match_duration(best);
                 let mut entry: playlist_entry::ActiveModel = orphan.into();
-                entry.track_id = Set(Some(track_id));
+                entry.track_id = Set(Some(track_id.clone()));
+                entry.local_track_id = Set(Some(track_id));
                 entry.match_title = Set(match_title);
                 entry.match_artist = Set(match_artist);
                 entry.match_album = Set(match_album);
@@ -641,6 +987,110 @@ fn top_25_most_played_default_rules() -> smart_rules::SmartRules {
     }
 }
 
+async fn require_regular_playlist<C>(db: &C, playlist_id: &str) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let playlist = playlist::Entity::find_by_id(playlist_id.to_string())
+        .one(db)
+        .await?
+        .ok_or_else(|| DbErr::RecordNotFound(format!("Playlist {playlist_id} not found")))?;
+    if playlist.is_smart {
+        return Err(DbErr::Custom(format!(
+            "Playlist {playlist_id} is smart and cannot store regular entries"
+        )));
+    }
+    Ok(())
+}
+
+/// Assign one exact occurrence order without ever violating the unique
+/// `(playlist_id, position)` index. All arithmetic is checked before the
+/// first write, and the caller owns the surrounding transaction.
+async fn assign_contiguous_positions(
+    txn: &DatabaseTransaction,
+    playlist_id: &str,
+    entry_ids: &[String],
+) -> Result<(), DbErr> {
+    let current = playlist_entry::Entity::find()
+        .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
+        .order_by_asc(playlist_entry::Column::Position)
+        .all(txn)
+        .await?;
+    let requested: HashSet<&str> = entry_ids.iter().map(String::as_str).collect();
+    let current_ids: HashSet<&str> = current.iter().map(|entry| entry.id.as_str()).collect();
+    if requested.len() != entry_ids.len()
+        || entry_ids.len() != current.len()
+        || requested != current_ids
+    {
+        return Err(DbErr::Custom(format!(
+            "Playlist {playlist_id} changed while positions were being assigned"
+        )));
+    }
+
+    let already_contiguous = current.iter().enumerate().all(|(position, entry)| {
+        i32::try_from(position) == Ok(entry.position) && entry_ids.get(position) == Some(&entry.id)
+    });
+    if already_contiguous {
+        return Ok(());
+    }
+
+    let maximum_position = current
+        .iter()
+        .map(|entry| entry.position)
+        .max()
+        .unwrap_or(-1);
+    if maximum_position < -1 {
+        return Err(DbErr::Custom(format!(
+            "Playlist {playlist_id} has an invalid entry position"
+        )));
+    }
+    let parking_start = maximum_position.checked_add(1).ok_or_else(|| {
+        DbErr::Custom("Playlist positions cannot be reordered safely".to_string())
+    })?;
+    let final_offset = entry_ids
+        .len()
+        .checked_sub(1)
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| DbErr::Custom("Playlist has too many entries".to_string()))?
+        .unwrap_or(0);
+    parking_start.checked_add(final_offset).ok_or_else(|| {
+        DbErr::Custom("Playlist positions cannot be reordered safely".to_string())
+    })?;
+
+    // Park every row above the complete current range, then assign 0..N.
+    // The unique position index remains valid after every individual update.
+    // Reuse the snapshot already validated above: querying each entry again
+    // in both passes would add 2N database round trips while holding the
+    // write transaction.
+    let mut current_by_id: HashMap<String, playlist_entry::Model> = current
+        .into_iter()
+        .map(|entry| (entry.id.clone(), entry))
+        .collect();
+    let mut parked_entries = Vec::with_capacity(entry_ids.len());
+    for (offset, entry_id) in entry_ids.iter().enumerate() {
+        let offset = i32::try_from(offset)
+            .map_err(|_| DbErr::Custom("Playlist has too many entries".to_string()))?;
+        let mut entry: playlist_entry::ActiveModel = current_by_id
+            .remove(entry_id)
+            .ok_or_else(|| DbErr::RecordNotFound(format!("Entry {entry_id} not found")))?
+            .into();
+        entry.position = Set(parking_start + offset);
+        parked_entries.push(entry.update(txn).await?);
+    }
+    debug_assert!(current_by_id.is_empty());
+
+    for (position, entry) in parked_entries.into_iter().enumerate() {
+        let position = i32::try_from(position)
+            .map_err(|_| DbErr::Custom("Playlist has too many entries".to_string()))?;
+        let mut entry: playlist_entry::ActiveModel = entry.into();
+        entry.position = Set(position);
+        entry.update(txn).await?;
+    }
+
+    Ok(())
+}
+
 fn normalize_fingerprint(value: &str) -> String {
     value.trim().to_lowercase()
 }
@@ -679,7 +1129,11 @@ mod tests {
     };
     use sea_orm_migration::MigratorTrait;
 
-    use super::{recently_played_default_rules, top_25_most_played_default_rules, PlaylistManager};
+    use super::{
+        recently_played_default_rules, top_25_most_played_default_rules, PlaylistEntryInput,
+        PlaylistManager, StoredPlaylistEntry,
+    };
+    use crate::architecture::{MediaKey, SourceId, TrackId};
     use crate::db::entities::{playlist, playlist_entry, track};
     use crate::db::migration::Migrator;
     use crate::local::playlist_io::ImportedTrack;
@@ -702,10 +1156,12 @@ mod tests {
             id: Set(id.to_string()),
             playlist_id: Set(playlist_id.to_string()),
             position: Set(position),
+            source_id: Set(SourceId::local().to_string()),
             track_id: Set(None),
+            local_track_id: Set(None),
             match_file_path: Set(None),
-            match_title: Set(String::new()),
-            match_artist: Set(String::new()),
+            match_title: Set("placeholder".to_string()),
+            match_artist: Set("placeholder".to_string()),
             match_album: Set(String::new()),
             match_duration_secs: Set(None),
         }
@@ -777,6 +1233,70 @@ mod tests {
             top_25,
             r#"{"match_mode":"All","rules":[{"field":"PlayCount","operator":"GreaterThan","value":{"Number":0}}],"limit":{"value":25,"unit":"Items","selected_by":"MostPlayed"},"sort_order":[{"field":"PlayCount","direction":"Descending"},{"field":"LastPlayed","direction":"Descending"},{"field":"TrackId","direction":"Ascending"}]}"#
         );
+    }
+
+    #[test]
+    fn stored_entry_decode_enforces_remote_byte_bound_without_leaking_identity() {
+        // SQLite's length() reports characters, so the storage boundary still
+        // enforces the architecture's byte ceiling when decoding a row.
+        let oversized_secret = "é".repeat(3_000);
+        let model = playlist_entry::Model {
+            id: "remote-entry".to_string(),
+            playlist_id: "playlist".to_string(),
+            position: 0,
+            source_id: SourceId::random().to_string(),
+            track_id: Some(oversized_secret.clone()),
+            local_track_id: None,
+            match_title: "Title".to_string(),
+            match_artist: "Artist".to_string(),
+            match_album: "Album".to_string(),
+            match_duration_secs: None,
+            match_file_path: None,
+        };
+
+        let error = StoredPlaylistEntry::from_model(model)
+            .expect_err("remote IDs over 4096 bytes must fail closed");
+        assert!(!error.to_string().contains(&oversized_secret));
+    }
+
+    #[test]
+    fn stored_entry_decode_rejects_unidentified_local_orphan() {
+        let model = playlist_entry::Model {
+            id: "unidentified-local-entry".to_string(),
+            playlist_id: "playlist".to_string(),
+            position: 0,
+            source_id: SourceId::local().to_string(),
+            track_id: None,
+            local_track_id: None,
+            match_title: " ".to_string(),
+            match_artist: String::new(),
+            match_album: String::new(),
+            match_duration_secs: None,
+            match_file_path: Some("  ".to_string()),
+        };
+
+        StoredPlaylistEntry::from_model(model)
+            .expect_err("an unmatched local row needs path or title/artist evidence");
+    }
+
+    #[test]
+    fn stored_entry_decode_rejects_negative_position() {
+        let model = playlist_entry::Model {
+            id: "negative-position-entry".to_string(),
+            playlist_id: "playlist".to_string(),
+            position: -1,
+            source_id: SourceId::random().to_string(),
+            track_id: Some("remote-track".to_string()),
+            local_track_id: None,
+            match_title: String::new(),
+            match_artist: String::new(),
+            match_album: String::new(),
+            match_duration_secs: None,
+            match_file_path: None,
+        };
+
+        StoredPlaylistEntry::from_model(model)
+            .expect_err("typed storage must reject a negative occurrence position");
     }
 
     #[tokio::test]
@@ -1056,7 +1576,12 @@ mod tests {
         let before = playlist_entries(&db, &result.playlist.id).await;
         assert_eq!(before.len(), 3);
         assert_eq!(before[0].position, 0);
+        assert_eq!(before[0].source_id, SourceId::local().to_string());
         assert_eq!(before[0].track_id.as_deref(), Some(existing.id.as_str()));
+        assert_eq!(
+            before[0].local_track_id.as_deref(),
+            Some(existing.id.as_str())
+        );
         assert_eq!(
             before[0].match_file_path.as_deref(),
             Some(existing.file_path.as_str())
@@ -1064,9 +1589,14 @@ mod tests {
         assert_eq!(before[0].match_title, "canonical title");
         assert_eq!(before[1].position, 1);
         assert_eq!(before[1].track_id.as_deref(), Some(existing.id.as_str()));
+        assert_eq!(
+            before[1].local_track_id.as_deref(),
+            Some(existing.id.as_str())
+        );
         assert_eq!(before[1].match_file_path, None);
         assert_eq!(before[2].position, 2);
         assert_eq!(before[2].track_id, None);
+        assert_eq!(before[2].local_track_id, None);
         assert_eq!(
             before[2].match_file_path.as_deref(),
             Some("/music/available-later.flac")
@@ -1087,6 +1617,7 @@ mod tests {
         assert_eq!(after[2].id, before[2].id);
         assert_eq!(after[2].position, before[2].position);
         assert_eq!(after[2].track_id.as_deref(), Some(later.id.as_str()));
+        assert_eq!(after[2].local_track_id.as_deref(), Some(later.id.as_str()));
         assert_eq!(after[2].match_title, "metadata can differ");
         assert_eq!(after[2].match_artist, "path wins");
         assert_eq!(after[2].match_album, "album");
@@ -1292,6 +1823,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_scoped_batch_preserves_order_duplicates_and_local_projection() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Mixed storage fixture", false)
+            .await
+            .expect("create playlist");
+        let local = insert_track(
+            &db,
+            "shared-native-id",
+            "/music/local.flac",
+            "Local title",
+            "Local artist",
+            "Local album",
+            Some(180),
+        )
+        .await;
+        let remote_source = SourceId::random();
+        let other_source = SourceId::random();
+        let shared_remote_id = TrackId::remote("shared-native-id").expect("remote track ID");
+        let inputs = vec![
+            PlaylistEntryInput::new(
+                MediaKey::new(remote_source, shared_remote_id.clone()),
+                " Remote title ",
+                "REMOTE ARTIST",
+                "Remote album",
+                Some(200),
+            ),
+            PlaylistEntryInput::local(&local).expect("local playlist input"),
+            PlaylistEntryInput::new(
+                MediaKey::new(remote_source, shared_remote_id.clone()),
+                "Remote title",
+                "Remote artist",
+                "Remote album",
+                Some(200),
+            ),
+            PlaylistEntryInput::new(
+                MediaKey::new(other_source, shared_remote_id.clone()),
+                "Other source title",
+                "Other source artist",
+                "Other source album",
+                None,
+            ),
+        ];
+
+        let inserted = manager
+            .add_entries(&playlist.id, &inputs)
+            .await
+            .expect("append source-scoped entries");
+        assert_eq!(
+            inserted
+                .iter()
+                .map(|entry| entry.position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_ne!(inserted[0].id, inserted[2].id);
+        assert_eq!(inserted[0].media_key(), inserted[2].media_key());
+        assert_ne!(inserted[0].media_key(), inserted[3].media_key());
+        assert_eq!(inserted[0].source_id, remote_source);
+        assert_eq!(inserted[0].local_track_id, None);
+        assert_eq!(inserted[0].match_title, "remote title");
+        assert_eq!(inserted[1].source_id, SourceId::local());
+        assert_eq!(
+            inserted[1].local_track_id.as_ref().map(TrackId::as_str),
+            Some(local.id.as_str())
+        );
+
+        let stored = manager
+            .get_playlist_entries(&playlist.id)
+            .await
+            .expect("load typed entries");
+        assert_eq!(stored, inserted);
+        let projected = manager
+            .get_playlist_tracks(&playlist.id)
+            .await
+            .expect("load local compatibility projection");
+        assert_eq!(
+            projected
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![local.id.as_str()]
+        );
+
+        // A remote occurrence waiting for live-session projection must never
+        // be fingerprint-reconciled to a similarly named local row.
+        assert_eq!(
+            manager.reconcile_all().await.expect("reconcile local only"),
+            0
+        );
+        let after = manager
+            .get_playlist_entries(&playlist.id)
+            .await
+            .expect("reload source-scoped entries");
+        assert_eq!(after[0].source_id, remote_source);
+        assert_eq!(after[0].track_id.as_ref(), Some(&shared_remote_id));
+        assert_eq!(after[0].local_track_id, None);
+
+        manager
+            .remove_entries(&playlist.id, &[inserted[0].id.clone()])
+            .await
+            .expect("remove one duplicate occurrence");
+        let remaining = manager
+            .get_playlist_entries(&playlist.id)
+            .await
+            .expect("reload after exact removal");
+        assert_eq!(remaining.len(), 3);
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|entry| entry.media_key() == inserted[2].media_key())
+                .count(),
+            1
+        );
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|entry| entry.position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn source_scoped_batch_rejects_invalid_input_without_partial_writes_or_id_leaks() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Atomic batch", false)
+            .await
+            .expect("create playlist");
+        let oversized_secret = format!("private-track-id-{}", "x".repeat(4096));
+        let remote_input = PlaylistEntryInput::new(
+            MediaKey::new(
+                SourceId::random(),
+                TrackId::new(oversized_secret.clone()).expect("generic bounded track ID"),
+            ),
+            "Remote",
+            "Artist",
+            "Album",
+            None,
+        );
+        let error = manager
+            .add_entries(&playlist.id, &[remote_input])
+            .await
+            .expect_err("server-controlled ID ceiling must be enforced");
+        assert!(!error.to_string().contains(&oversized_secret));
+        assert!(playlist_entries(&db, &playlist.id).await.is_empty());
+
+        let source_id = SourceId::random();
+        let valid_first = PlaylistEntryInput::new(
+            MediaKey::new(
+                source_id,
+                TrackId::remote("first-valid").expect("remote ID"),
+            ),
+            "First",
+            "Artist",
+            "Album",
+            Some(180),
+        );
+        let invalid_second = PlaylistEntryInput::new(
+            MediaKey::new(
+                source_id,
+                TrackId::remote("second-invalid").expect("remote ID"),
+            ),
+            "Second",
+            "Artist",
+            "Album",
+            Some(u64::MAX),
+        );
+        assert!(manager
+            .add_entries(&playlist.id, &[valid_first, invalid_second])
+            .await
+            .is_err());
+        assert!(playlist_entries(&db, &playlist.id).await.is_empty());
+
+        let missing_local = PlaylistEntryInput::new(
+            MediaKey::new(
+                SourceId::local(),
+                TrackId::new("missing-private-local-id").expect("local track ID"),
+            ),
+            "Missing",
+            "Artist",
+            "Album",
+            None,
+        );
+        let error = manager
+            .add_entries(&playlist.id, &[missing_local])
+            .await
+            .expect_err("missing local FK target must reject the batch");
+        assert!(!error.to_string().contains("missing-private-local-id"));
+        assert!(playlist_entries(&db, &playlist.id).await.is_empty());
+
+        let smart = manager
+            .create_playlist("Smart", true)
+            .await
+            .expect("create smart playlist");
+        let valid_remote = PlaylistEntryInput::new(
+            MediaKey::new(
+                SourceId::random(),
+                TrackId::remote("valid-remote").expect("remote ID"),
+            ),
+            "Remote",
+            "Artist",
+            "Album",
+            None,
+        );
+        assert!(manager
+            .add_entries(&smart.id, &[valid_remote])
+            .await
+            .is_err());
+        assert!(playlist_entries(&db, &smart.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_uses_checked_positions_and_rolls_back_on_overflow() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Position overflow", false)
+            .await
+            .expect("create playlist");
+        insert_entry(&db, &playlist.id, "maximum-position", i32::MAX).await;
+        let track = insert_track(
+            &db,
+            "overflow-candidate",
+            "/music/overflow-candidate.flac",
+            "Candidate",
+            "Artist",
+            "Album",
+            Some(180),
+        )
+        .await;
+
+        assert!(manager.add_track(&playlist.id, &track).await.is_err());
+        let entries = playlist_entries(&db, &playlist.id).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "maximum-position");
+        assert_eq!(entries[0].position, i32::MAX);
+    }
+
+    #[tokio::test]
     async fn reorder_yields_unique_contiguous_positions() {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
@@ -1339,6 +2113,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reorder_and_remove_require_exact_occurrence_ids_and_rollback_invalid_requests() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Exact mutations", false)
+            .await
+            .expect("create playlist");
+        for (position, id) in ["first", "second", "third"].into_iter().enumerate() {
+            insert_entry(&db, &playlist.id, id, position as i32).await;
+        }
+        let original_ids = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
+
+        assert!(manager
+            .reorder_entries(
+                &playlist.id,
+                &[
+                    "first".to_string(),
+                    "first".to_string(),
+                    "third".to_string()
+                ],
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            playlist_entries(&db, &playlist.id)
+                .await
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            original_ids
+        );
+
+        assert!(manager
+            .remove_entries(&playlist.id, &["second".to_string(), "second".to_string()])
+            .await
+            .is_err());
+        assert!(manager
+            .remove_entries(&playlist.id, &["not-in-this-playlist".to_string()])
+            .await
+            .is_err());
+        assert_eq!(playlist_entries(&db, &playlist.id).await.len(), 3);
+
+        manager
+            .remove_entries(&playlist.id, &["second".to_string()])
+            .await
+            .expect("remove exact occurrence");
+        let remaining = playlist_entries(&db, &playlist.id).await;
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "third"]
+        );
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|entry| entry.position)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[tokio::test]
     async fn rename_fallback_relinks_without_changing_playlist_entry_identity() {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
@@ -1375,7 +2217,8 @@ mod tests {
             .await
             .pop()
             .expect("orphaned playlist entry");
-        assert_eq!(orphan.track_id, None);
+        assert_eq!(orphan.track_id.as_deref(), Some(original.id.as_str()));
+        assert_eq!(orphan.local_track_id, None);
 
         let replacement = insert_track(
             &db,
@@ -1401,6 +2244,10 @@ mod tests {
         assert_eq!(after.match_album, before.match_album);
         assert_eq!(after.match_duration_secs, before.match_duration_secs);
         assert_eq!(after.track_id.as_deref(), Some(replacement.id.as_str()));
+        assert_eq!(
+            after.local_track_id.as_deref(),
+            Some(replacement.id.as_str())
+        );
         assert_eq!(
             manager
                 .reconcile_all()
@@ -1475,6 +2322,10 @@ mod tests {
             .pop()
             .expect("relinked playlist entry");
         assert_eq!(relinked.track_id.as_deref(), Some(relocated.id.as_str()));
+        assert_eq!(
+            relinked.local_track_id.as_deref(),
+            Some(relocated.id.as_str())
+        );
         assert_eq!(relinked.match_file_path, None);
 
         track::Entity::delete_by_id(&relocated.id)
@@ -1502,7 +2353,8 @@ mod tests {
             .await
             .pop()
             .expect("preserved orphan");
-        assert_eq!(orphan.track_id, None);
+        assert_eq!(orphan.track_id.as_deref(), Some(relocated.id.as_str()));
+        assert_eq!(orphan.local_track_id, None);
         assert_eq!(orphan.match_title, "original song");
         assert_eq!(orphan.match_artist, "original artist");
         assert_eq!(orphan.match_album, "original album");
@@ -1570,13 +2422,16 @@ mod tests {
             .pop()
             .expect("preserved import with valid source duration");
         assert_eq!(imported_orphan.track_id, None);
+        assert_eq!(imported_orphan.local_track_id, None);
         assert_eq!(imported_orphan.match_duration_secs, Some(i32::MAX));
 
         playlist_entry::ActiveModel {
             id: Set("corrupt-duration-orphan".to_string()),
             playlist_id: Set(playlist.id.clone()),
             position: Set(2),
+            source_id: Set(SourceId::local().to_string()),
             track_id: Set(None),
+            local_track_id: Set(None),
             match_file_path: Set(Some(overflowing.file_path.clone())),
             match_title: Set(String::new()),
             match_artist: Set(String::new()),
@@ -1601,6 +2456,10 @@ mod tests {
             .expect("reconciled corrupt-duration entry");
         assert_eq!(
             reconciled.track_id.as_deref(),
+            Some(overflowing.id.as_str())
+        );
+        assert_eq!(
+            reconciled.local_track_id.as_deref(),
             Some(overflowing.id.as_str())
         );
         assert_eq!(
@@ -1655,7 +2514,7 @@ mod tests {
         assert!(playlist_entries(&db, &playlist.id)
             .await
             .iter()
-            .all(|entry| entry.track_id.is_none()));
+            .all(|entry| entry.local_track_id.is_none()));
 
         // Insert in reverse order to ensure matching is fingerprint-based,
         // not dependent on table or scan order.
@@ -1692,6 +2551,14 @@ mod tests {
         );
         assert_eq!(after[0].track_id.as_deref(), Some(first_new.id.as_str()));
         assert_eq!(after[1].track_id.as_deref(), Some(second_new.id.as_str()));
+        assert_eq!(
+            after[0].local_track_id.as_deref(),
+            Some(first_new.id.as_str())
+        );
+        assert_eq!(
+            after[1].local_track_id.as_deref(),
+            Some(second_new.id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -1748,7 +2615,9 @@ mod tests {
                 .expect("reconcile ambiguous entry"),
             0
         );
-        assert_eq!(playlist_entries(&db, &playlist.id).await[0].track_id, None);
+        let orphan = &playlist_entries(&db, &playlist.id).await[0];
+        assert_eq!(orphan.track_id.as_deref(), Some(original.id.as_str()));
+        assert_eq!(orphan.local_track_id, None);
     }
 
     #[tokio::test]
@@ -1807,7 +2676,7 @@ mod tests {
         );
         assert_eq!(
             playlist_entries(&db, &playlist.id).await[0]
-                .track_id
+                .local_track_id
                 .as_deref(),
             Some(expected.id.as_str())
         );

@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Regular playlists now have a source-scoped storage foundation**
+  ([#140](https://github.com/jm2/tributary/pull/140)) — Migration 13 makes the exact
+  `(source_id, track_id)` pair canonical for each durable regular-playlist occurrence while keeping
+  the playlist itself a view rather than a media source. Every valid existing row is
+  deterministically assigned to the built-in local `SourceId`; entry and playlist IDs, order,
+  duplicate occurrences, nullable track identity, normalized match metadata, and imported local
+  path evidence are preserved byte-for-byte. A separate nullable
+  `local_track_id -> tracks(id) ON DELETE SET NULL`
+  cache retains local deletion and reconciliation integrity without requiring a remote native ID
+  to reference the unrelated local table. `track_id` may be absent only for an unmatched local
+  import with usable path or normalized title-and-artist evidence, populated local caches must agree
+  with canonical identity, and non-local entries must have an exact bounded native ID with neither
+  a local cache nor file-path evidence.
+  The SQLite table rebuild, data copy, index/constraint restoration, and foreign-key validation are
+  one transaction; an interrupted or forced failure restores the complete predecessor definition
+  and remains retryable. The migrator distinguishes the exact predecessor and target definitions
+  instead of accepting a partial lookalike. Downgrade round-trips representable local rows but
+  transactionally refuses any non-local or otherwise inexpressible state rather than dropping it,
+  converting it to local, or guessing by metadata.
+  Typed source-generic storage accepts only stable source/native identity plus optional non-secret
+  normalized fingerprints, adds no display/source-label snapshots, rejects non-local path evidence,
+  preserves same-ID tracks from different sources as distinct media, and stores no server
+  URL, stream/artwork locator, credential, lease, route, or session epoch. Existing manual local
+  Add/load, XSPF import/export, duplicate ordering, local reconciliation, track deletion, rename,
+  and root-reauthorization paths retain their prior behavior through the new schema. The shipping UI
+  remains intentionally local-only in this slice: it still refuses non-local Add before database
+  work and does not render or play stored non-local
+  fixtures. Live `SourceRegistry` resolution, capability-gated authenticated-source Add/Remove/Play,
+  disconnected states, lifecycle/epoch handling, and mixed-source export follow separately;
+  Radio-Browser, removable, external, and unknown sources remain unsupported. Subsonic
+  server-native playlist import or synchronization is a third, separately designed capability.
+  The complete boundary and validation matrix are in
+  [`docs/source-scoped-playlists.md`](docs/source-scoped-playlists.md).
 - **Ratings now have a durable ownership, capability, and persistence foundation**
   ([#138](https://github.com/jm2/tributary/pull/138)) — A canonical
   rating is one validated whole integer from 1 through 100, while `None` alone means unrated.
@@ -128,8 +161,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Tributary therefore adds nothing instead of silently skipping unsupported rows or modifying only
   an unexpected subset. The existing Add to Playlist, Remove from Playlist, and Properties context
   labels now use their shipped translations as well, and the refusal copy is covered across all 13
-  locale catalogs. Local-library playlist behavior is unchanged; durable source-scoped remote
-  playlist entries remain planned separately.
+  locale catalogs. Local-library playlist behavior is unchanged. The source-scoped storage
+  foundation is now described above, while live non-local playlist interaction remains a later
+  P1.5 slice.
 - **Shuffled Previous and Next now follow a bounded real playback timeline** — Tributary retains
   the current queue occurrence plus ten actual predecessors, walks backward without fabricating a
   random track at the oldest boundary, and replays fixed forward history before drawing again.

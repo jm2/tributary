@@ -456,6 +456,17 @@ fn build_remove_from_playlist_action(
                                 &pid,
                             ),
                         )
+                        .filter(
+                            <crate::db::entities::playlist_entry::Column as sea_orm::ColumnTrait>::eq(
+                                &crate::db::entities::playlist_entry::Column::SourceId,
+                                crate::architecture::SourceId::local().to_string(),
+                            ),
+                        )
+                        .filter(
+                            <crate::db::entities::playlist_entry::Column as sea_orm::ColumnTrait>::is_not_null(
+                                &crate::db::entities::playlist_entry::Column::LocalTrackId,
+                            ),
+                        )
                         .all(&db)
                         .await
                     {
@@ -464,7 +475,7 @@ fn build_remove_from_playlist_action(
                         // rows rather than all at once.
                         let mut remaining = selection_counts(&uris);
                         for entry in entries {
-                            if let Some(ref track_id) = entry.track_id {
+                            if let Some(ref track_id) = entry.local_track_id {
                                 // Look up the track to get its file path / URI.
                                 if let Ok(Some(track)) = crate::db::entities::track::Entity::find_by_id(track_id.clone())
                                     .one(&db)

@@ -11,7 +11,16 @@ pub struct Model {
 
     pub playlist_id: String,
     pub position: i32,
+    /// Stable owner of `track_id`. Together these two columns are the
+    /// durable media identity; neither is a locator or session credential.
+    pub source_id: String,
+    /// Exact source-native track identity. This is nullable only for an
+    /// unmatched legacy local import that has fingerprint evidence instead.
     pub track_id: Option<String>,
+    /// Current local-table binding for a local entry. This is deliberately
+    /// separate from durable identity so deleting a local track can make the
+    /// occurrence unavailable without discarding its source-scoped key.
+    pub local_track_id: Option<String>,
 
     /// Fingerprint fields for track rediscovery after library rebuild.
     pub match_title: String,
@@ -33,7 +42,7 @@ pub enum Relation {
     Playlist,
     #[sea_orm(
         belongs_to = "super::track::Entity",
-        from = "Column::TrackId",
+        from = "Column::LocalTrackId",
         to = "super::track::Column::Id",
         on_delete = "SetNull"
     )]
