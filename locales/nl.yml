@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "De geselecteerde afspeellijst bestaat niet meer."
   smart_playlist_evaluation_failed: "De slimme afspeellijst kon niet worden geëvalueerd: %{error}"
   playlist_tracks_read_failed: "De nummers van de afspeellijst konden niet worden gelezen: %{error}"
+  export_local_only_unsupported_body: "Deze afspeellijst bevat externe of niet-beschikbare items. XSPF-export ondersteunt momenteel alleen afspeellijsten waarvan elk item beschikbaar is in de lokale bibliotheek."
   writer_worker_failed: "Het XSPF-schrijfproces is gestopt: %{error}"
   write_failed: "Het XSPF-bestand kon niet worden geschreven: %{error}"
   export_success_heading: "XSPF-afspeellijst geëxporteerd"

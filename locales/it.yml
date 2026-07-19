@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "La playlist selezionata non esiste più."
   smart_playlist_evaluation_failed: "Impossibile valutare la playlist intelligente: %{error}"
   playlist_tracks_read_failed: "Impossibile leggere i brani della playlist: %{error}"
+  export_local_only_unsupported_body: "Questa playlist contiene elementi remoti o non disponibili. Attualmente l’esportazione XSPF supporta solo playlist i cui elementi sono tutti disponibili nella libreria locale."
   writer_worker_failed: "Il processo di scrittura XSPF si è interrotto: %{error}"
   write_failed: "Impossibile scrivere il file XSPF: %{error}"
   export_success_heading: "Playlist XSPF esportata"

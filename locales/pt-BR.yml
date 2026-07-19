@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "A lista de reprodução selecionada não existe mais."
   smart_playlist_evaluation_failed: "Não foi possível avaliar a lista de reprodução inteligente: %{error}"
   playlist_tracks_read_failed: "Não foi possível ler as faixas da lista de reprodução: %{error}"
+  export_local_only_unsupported_body: "Esta lista de reprodução contém itens remotos ou indisponíveis. No momento, a exportação XSPF aceita apenas listas cujos itens estejam todos disponíveis na biblioteca local."
   writer_worker_failed: "O processo de gravação XSPF foi interrompido: %{error}"
   write_failed: "Não foi possível gravar o arquivo XSPF: %{error}"
   export_success_heading: "Lista de reprodução XSPF exportada"

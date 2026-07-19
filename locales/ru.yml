@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "Выбранный плейлист больше не существует."
   smart_playlist_evaluation_failed: "Не удалось вычислить смарт-плейлист: %{error}"
   playlist_tracks_read_failed: "Не удалось прочитать композиции плейлиста: %{error}"
+  export_local_only_unsupported_body: "Этот плейлист содержит удалённые или недоступные элементы. Сейчас экспорт XSPF поддерживает только плейлисты, все элементы которых доступны в локальной медиатеке."
   writer_worker_failed: "Процесс записи XSPF остановился: %{error}"
   write_failed: "Не удалось записать файл XSPF: %{error}"
   export_success_heading: "Плейлист XSPF экспортирован"

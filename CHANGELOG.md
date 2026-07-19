@@ -76,9 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tracks plus rows from current authenticated Subsonic, Jellyfin, Plex, and DAAP catalogues. One
   registry lookup validates every selected remote occurrence against its current source, session
   epoch, accepted catalogue generation, advertised capability, and native-track membership before
-  one atomic ordered write. If any current selected member is unsupported, disconnected, missing,
-  or in an invalid catalogue, a localized all-or-none result is shown and nothing is written. A
-  result made stale before commit is discarded and also writes nothing. Radio-Browser,
+  one atomic ordered write. After staging its SQL changes and immediately before commit, the
+  transaction revalidates the complete batch and acquires exact commit-scoped session/catalogue
+  authority permits. A result made stale during staging is rejected and the transaction rolls back;
+  once admitted, refresh, replacement, disconnect, or shutdown waits for commit or rollback. The
+  transaction and permits transfer to an independent completion worker, so caller cancellation or
+  a synchronous lifecycle revoker cannot strand authority or starve the commit. If
+  any current selected member is unsupported, disconnected, missing,
+  or in an invalid catalogue, a localized all-or-none result is shown and nothing is written.
+  Radio-Browser,
   removable-media, ephemeral external-file, and unknown sources remain unsupported.
   Regular-playlist projection now retains every durable entry in position order, including
   duplicates and unavailable occurrences. Available local rows use the exact current database
@@ -90,6 +96,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   displayed as stale metadata nor used to choose a similarly named remote track. Remove operates
   atomically on exact durable occurrence IDs, so repeated media can be removed independently and a
   failed mutation changes nothing.
+  XSPF remains a local-only interchange format: exporting a regular playlist with any remote or
+  unresolved occurrence now refuses the whole export with localized copy before touching the
+  destination instead of silently emitting only its local subset.
   Playlist queues keep the playlist as `ViewOrigin` while assigning each item to its actual source.
   Local rows retain exact root/file authority; remote stream and artwork resolution revalidate the
   row's transient closed guard before and after adapter work. Refresh, replacement, retirement,

@@ -424,6 +424,14 @@ fn show_playlist_alert(win: &adw::ApplicationWindow, heading: &str, body: &str) 
     alert.present(Some(win));
 }
 
+fn local_only_export_unsupported_body(locale: &str) -> String {
+    rust_i18n::t!(
+        "playlist_io.export_local_only_unsupported_body",
+        locale = locale
+    )
+    .into_owned()
+}
+
 /// Opens an XSPF v1 file, parses it off the async worker threads, imports the
 /// playlist transactionally, and publishes the committed playlist in the
 /// sidebar together with an explicit outcome summary.
@@ -671,10 +679,19 @@ fn handle_export_playlist(
                             .into_owned()
                         })?
                     } else {
-                        mgr.get_playlist_tracks(&pid).await.map_err(|error| {
+                        match mgr.local_playlist_export(&pid).await.map_err(|error| {
                             rust_i18n::t!("playlist_io.playlist_tracks_read_failed", error = error)
                                 .into_owned()
-                        })?
+                        })? {
+                            crate::local::playlist_manager::LocalPlaylistExport::Ready(tracks) => {
+                                tracks
+                            }
+                            crate::local::playlist_manager::LocalPlaylistExport::UnsupportedEntries => {
+                                return Err(local_only_export_unsupported_body(
+                                    rust_i18n::locale().as_ref(),
+                                ));
+                            }
+                        }
                     };
 
                     let export_path = path.clone();
@@ -727,4 +744,23 @@ fn handle_export_playlist(
             });
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_only_export_unsupported_body;
+
+    #[test]
+    fn local_only_export_refusal_is_localized_without_english_fallback() {
+        let english = local_only_export_unsupported_body("en");
+        assert!(!english.is_empty());
+
+        for locale in rust_i18n::available_locales!() {
+            let localized = local_only_export_unsupported_body(&locale);
+            assert!(!localized.is_empty(), "{locale}: empty refusal copy");
+            if locale != "en" {
+                assert_ne!(localized, english, "{locale} must not fall back to English");
+            }
+        }
+    }
 }

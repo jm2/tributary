@@ -1702,7 +1702,7 @@ fn update_now_playing_ui(
     let active_source_key = ctx.active_source_key.borrow().clone();
     if let Some((identity, view)) = identity
         .filter(|identity| identity_belongs_to_source(identity, &active_source_key))
-        .and_then(|identity| queue_view(&active_source_key).map(|view| (identity, view)))
+        .zip(queue_view(&active_source_key))
     {
         if let Some(position) = find_queue_item_position(
             ctx.model.n_items(),

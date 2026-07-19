@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "Die ausgewählte Wiedergabeliste ist nicht mehr vorhanden."
   smart_playlist_evaluation_failed: "Die intelligente Wiedergabeliste konnte nicht ausgewertet werden: %{error}"
   playlist_tracks_read_failed: "Die Titel der Wiedergabeliste konnten nicht gelesen werden: %{error}"
+  export_local_only_unsupported_body: "Diese Wiedergabeliste enthält entfernte oder nicht verfügbare Einträge. Der XSPF-Export unterstützt derzeit nur Wiedergabelisten, deren Einträge vollständig in der lokalen Mediathek verfügbar sind."
   writer_worker_failed: "Der XSPF-Schreibprozess wurde beendet: %{error}"
   write_failed: "Die XSPF-Datei konnte nicht geschrieben werden: %{error}"
   export_success_heading: "XSPF-Wiedergabeliste exportiert"

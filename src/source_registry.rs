@@ -29,10 +29,11 @@ use crate::architecture::{MediaKey, SourceId, TrackId, ViewOrigin};
 use crate::external_file::{ExternalFileCandidate, ExternalFileHint};
 use crate::local::resolver::ResolvedFileMedia;
 use crate::source_lifecycle::{
-    AdapterCloseFuture, AdapterStream, AdapterTaskResult, CloseAuthority,
-    ConstructionCancellationPolicy, FailureCategory, LifecycleAdapter, LifecycleBaseline,
-    LifecycleSnapshot, ProvenanceClaimId, RefreshLane, RefreshTaskResult, RetirementWaiter,
-    ShutdownBarrier, SourceLifecycleRegistry, SourceProvenance,
+    AdapterCloseFuture, AdapterStream, AdapterTaskResult, CatalogueCommitAuthority,
+    CatalogueCommitRequest, CloseAuthority, ConstructionCancellationPolicy, FailureCategory,
+    LifecycleAdapter, LifecycleBaseline, LifecycleSnapshot, ProvenanceClaimId, RefreshLane,
+    RefreshTaskResult, RetirementWaiter, ShutdownBarrier, SourceLifecycleRegistry,
+    SourceProvenance,
 };
 use url::Url;
 
@@ -733,6 +734,31 @@ impl PublicHttpAuthority for SourceRegistryInner {
 #[derive(Clone)]
 pub struct SourceRegistry {
     inner: Arc<SourceRegistryInner>,
+}
+
+/// Opaque authority retaining every remote session and catalogue selected for
+/// one regular-playlist database commit.
+///
+/// The lifecycle permit is declared before the registry owner so it is
+/// released first during drop. This prevents final-handle teardown from
+/// waiting on a permit owned by the value currently being destroyed.
+#[must_use = "regular-playlist commit authority must be retained through the database commit"]
+pub struct RegularPlaylistCommitAuthority {
+    #[allow(dead_code)] // Retention through Drop is the authority operation.
+    authority: CatalogueCommitAuthority,
+    _registry: Arc<SourceRegistryInner>,
+}
+
+impl RegularPlaylistCommitAuthority {
+    #[cfg(test)]
+    fn permit_count(&self) -> usize {
+        self.authority.permit_count()
+    }
+
+    #[cfg(test)]
+    fn revocation_started(&self) -> bool {
+        self.authority.revocation_started()
+    }
 }
 
 /// Pathless identity and catalogue projection for one admitted OS-opened
@@ -1442,6 +1468,46 @@ impl SourceRegistry {
             .all(|(observed, current)| regular_playlist_authority_eq(observed, current))
     }
 
+    /// Acquire commit-scoped authority for an ordered remote playlist plan.
+    ///
+    /// Every occurrence must be an available exact catalogue member. The
+    /// lifecycle registry deduplicates repeated tracks and guards, validates
+    /// the complete batch in one locked observation, and admits in-flight
+    /// session/catalogue permits before returning. The opaque result must be
+    /// retained until the database transaction has committed.
+    pub fn acquire_regular_playlist_commit_authority(
+        &self,
+        resolutions: &[RegularPlaylistTrackResolution],
+    ) -> Option<RegularPlaylistCommitAuthority> {
+        let mut requests = Vec::with_capacity(resolutions.len());
+        for resolution in resolutions {
+            let RegularPlaylistTrackResolution::Available(track) = resolution else {
+                return None;
+            };
+            let guard = track.guard();
+            if track.media_key.source_id != guard.source_id {
+                return None;
+            }
+            requests.push(CatalogueCommitRequest {
+                source_id: guard.source_id,
+                catalogue_generation: guard.catalogue_generation,
+                session_epoch: guard.session_epoch,
+                selected: track.media_key.track_id.clone(),
+            });
+        }
+
+        let authority = self
+            .inner
+            .lifecycle
+            .acquire_catalogue_commit_authority(&requests, |payload, track_id| {
+                payload.regular_playlist_track(track_id).is_some()
+            })?;
+        Some(RegularPlaylistCommitAuthority {
+            authority,
+            _registry: Arc::clone(&self.inner),
+        })
+    }
+
     /// Resolve one stream only through the exact catalogue guard that minted
     /// the playlist row. The returned protected request carries the accepted
     /// catalogue's revocable lease, so a same-session catalogue replacement
@@ -1746,6 +1812,8 @@ mod tests {
 
     use async_trait::async_trait;
     use axum::http::{Method, StatusCode};
+    use sea_orm::Database;
+    use sea_orm_migration::MigratorTrait;
     use tokio::runtime::Handle;
     use tokio::sync::{oneshot, watch};
     use tokio::time::{timeout, Duration};
@@ -1755,7 +1823,11 @@ mod tests {
     use crate::architecture::models::{
         Album, Artist, LibraryStats, SearchResults, SortField, SortOrder,
     };
+    use crate::db::migration::Migrator;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
+    use crate::local::playlist_manager::{
+        PlaylistEntryAddOutcome, PlaylistEntryInput, PlaylistManager,
+    };
 
     use super::*;
 
@@ -2013,6 +2085,19 @@ mod tests {
 
     fn registry() -> SourceRegistry {
         SourceRegistry::new(Handle::current())
+    }
+
+    async fn playlist_manager_fixture(name: &str) -> (PlaylistManager, String) {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory database");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let manager = PlaylistManager::new(db);
+        let playlist = manager
+            .create_playlist(name, false)
+            .await
+            .expect("create regular playlist");
+        (manager, playlist.id)
     }
 
     fn minimal_wav_bytes(sample: u8) -> Vec<u8> {
@@ -2448,6 +2533,226 @@ mod tests {
         assert!(!metadata_debug.contains("stream_url"));
         assert!(!metadata_debug.contains("cover_art_url"));
         assert!(!metadata_debug.contains("file_path"));
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn playlist_commit_authority_blocks_catalogue_publish_and_rejects_stale_guard() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("commit-guarded-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.playlist_adapter("commit-refresh", vec![fixture_track(track_id.clone())]),
+        )
+        .await;
+
+        let key = MediaKey::new(source_id, track_id.clone());
+        let resolved = registry.resolve_regular_playlist_tracks(&[key.clone(), key]);
+        let authority = registry
+            .acquire_regular_playlist_commit_authority(&resolved)
+            .expect("current duplicate occurrences are admitted");
+        assert_eq!(
+            authority.permit_count(),
+            2,
+            "one unique guard owns one session and one catalogue permit"
+        );
+
+        let mut invalidations = registry.subscribe_invalidations();
+        let owner = registry
+            .inner
+            .lifecycle
+            .begin_refresh(source_id, RefreshLane::Catalogue)
+            .expect("catalogue refresh admitted");
+        let generation = owner.generation();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let refreshed_track_id = track_id.clone();
+        owner.spawn(move |_session, _cancellation| async move {
+            let _ = started_tx.send(());
+            let _ = finish_rx.await;
+            let mut track = fixture_track(refreshed_track_id);
+            track.title = "Replacement catalogue".to_string();
+            RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(
+                vec![track],
+                RegularPlaylistCapability::SourceScopedEntries,
+            ))
+        });
+        started_rx.await.expect("refresh task started");
+        let _ = invalidations.borrow_and_update();
+        finish_tx.send(()).expect("refresh task remains alive");
+
+        timeout(Duration::from_secs(2), async {
+            while !authority.revocation_started() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("catalogue replacement reached revocation");
+        assert!(
+            !invalidations
+                .has_changed()
+                .expect("invalidation sender alive"),
+            "replacement cannot publish while commit authority is retained"
+        );
+
+        drop(authority);
+        timeout(Duration::from_secs(2), invalidations.changed())
+            .await
+            .expect("replacement publishes after permit release")
+            .expect("invalidation sender alive");
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if registry
+                    .snapshot(source_id)
+                    .and_then(|snapshot| snapshot.catalogue)
+                    .is_some_and(|catalogue| catalogue.generation == generation)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement catalogue accepted");
+        assert!(registry
+            .acquire_regular_playlist_commit_authority(&resolved)
+            .is_none());
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn playlist_final_authority_rejection_rolls_back_after_disconnect_wins() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("commit-stale-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.playlist_adapter("commit-stale", vec![fixture_track(track_id.clone())]),
+        )
+        .await;
+
+        let media_key = MediaKey::new(source_id, track_id);
+        let resolved = registry.resolve_regular_playlist_tracks(std::slice::from_ref(&media_key));
+        let (manager, playlist_id) = playlist_manager_fixture("Rejected guarded commit").await;
+        let input = PlaylistEntryInput::new(
+            media_key,
+            available(&resolved[0]).metadata().title(),
+            available(&resolved[0]).metadata().artist_name(),
+            available(&resolved[0]).metadata().album_title(),
+            available(&resolved[0]).metadata().duration_secs(),
+        );
+
+        let disconnect_waiter = Arc::new(Mutex::new(None));
+        let waiter_slot = Arc::clone(&disconnect_waiter);
+        let outcome = manager
+            .add_entries_if_authorized(&playlist_id, &[input], || {
+                let waiter = registry.disconnect(source_id).expect("disconnect admitted");
+                *lock(&waiter_slot) = Some(waiter);
+                registry.acquire_regular_playlist_commit_authority(&resolved)
+            })
+            .await
+            .expect("stale authority is a typed rejection");
+        assert_eq!(outcome, PlaylistEntryAddOutcome::Rejected);
+        assert!(manager
+            .get_playlist_entries(&playlist_id)
+            .await
+            .expect("load rolled-back playlist")
+            .is_empty());
+        let waiter = lock(&disconnect_waiter)
+            .take()
+            .expect("disconnect waiter retained");
+        waiter.wait().await;
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn playlist_commit_authority_blocks_disconnect_publish_and_rejects_stale_guard() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("commit-disconnect-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.playlist_adapter("commit-disconnect", vec![fixture_track(track_id.clone())]),
+        )
+        .await;
+
+        let media_key = MediaKey::new(source_id, track_id);
+        let resolved = registry.resolve_regular_playlist_tracks(std::slice::from_ref(&media_key));
+        let (manager, playlist_id) = playlist_manager_fixture("Guarded commit").await;
+        let input = PlaylistEntryInput::new(
+            media_key,
+            available(&resolved[0]).metadata().title(),
+            available(&resolved[0]).metadata().artist_name(),
+            available(&resolved[0]).metadata().album_title(),
+            available(&resolved[0]).metadata().duration_secs(),
+        );
+        let mut invalidations = registry.subscribe_invalidations();
+        let _ = invalidations.borrow_and_update();
+        let (disconnect_tx, disconnect_rx) = std::sync::mpsc::sync_channel(1);
+        let outcome = manager
+            .add_entries_if_authorized(&playlist_id, &[input], || {
+                let authority = registry
+                    .acquire_regular_playlist_commit_authority(&resolved)
+                    .expect("current occurrence is admitted at the commit boundary");
+                let disconnecting = registry.clone();
+                let _disconnect_worker = std::thread::spawn(move || {
+                    let waiter = disconnecting
+                        .disconnect(source_id)
+                        .expect("disconnect admitted");
+                    disconnect_tx
+                        .send(waiter)
+                        .expect("disconnect receiver remains alive");
+                });
+
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !authority.revocation_started() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "disconnect reached revocation"
+                    );
+                    std::thread::yield_now();
+                }
+                assert!(
+                    !invalidations
+                        .has_changed()
+                        .expect("invalidation sender alive"),
+                    "disconnect cannot publish before the database commit"
+                );
+                Some(authority)
+            })
+            .await
+            .expect("guarded append has no database failure");
+        assert!(matches!(outcome, PlaylistEntryAddOutcome::Committed(_)));
+        assert_eq!(
+            manager
+                .get_playlist_entries(&playlist_id)
+                .await
+                .expect("load committed occurrence")
+                .len(),
+            1
+        );
+
+        let waiter = disconnect_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("disconnect returns after commit releases authority");
+        timeout(Duration::from_secs(2), invalidations.changed())
+            .await
+            .expect("disconnect publishes after commit")
+            .expect("invalidation sender alive");
+        assert!(registry
+            .acquire_regular_playlist_commit_authority(&resolved)
+            .is_none());
+        waiter.wait().await;
 
         registry.shutdown().wait().await;
     }

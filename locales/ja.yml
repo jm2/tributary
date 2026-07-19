@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "選択したプレイリストは存在しなくなりました。"
   smart_playlist_evaluation_failed: "スマートプレイリストを評価できませんでした: %{error}"
   playlist_tracks_read_failed: "プレイリストの曲を読み込めませんでした: %{error}"
+  export_local_only_unsupported_body: "このプレイリストにはリモートまたは利用できない項目が含まれています。現在、XSPFにエクスポートできるのは、すべての項目がローカルライブラリで利用できるプレイリストだけです。"
   writer_worker_failed: "XSPF書き込み処理が停止しました: %{error}"
   write_failed: "XSPFファイルを書き込めませんでした: %{error}"
   export_success_heading: "XSPFプレイリストをエクスポートしました"

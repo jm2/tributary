@@ -181,6 +181,7 @@ playlist_io:
   playlist_missing: "The selected playlist no longer exists."
   smart_playlist_evaluation_failed: "Could not evaluate the smart playlist: %{error}"
   playlist_tracks_read_failed: "Could not read playlist tracks: %{error}"
+  export_local_only_unsupported_body: "This playlist contains remote or unavailable entries. XSPF export currently supports only playlists whose every entry is available in the local library."
   writer_worker_failed: "The XSPF writer worker stopped: %{error}"
   write_failed: "Could not write the XSPF file: %{error}"
   export_success_heading: "XSPF Playlist Exported"

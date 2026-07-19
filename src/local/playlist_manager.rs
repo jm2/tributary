@@ -45,6 +45,38 @@ pub struct PlaylistEntryInput {
     pub duration_secs: Option<u64>,
 }
 
+/// Result of an atomic playlist append with a final commit-time authority
+/// check.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlaylistEntryAddOutcome {
+    Committed(Vec<StoredPlaylistEntry>),
+    Rejected,
+}
+
+/// Finish an authority-bearing transaction on a dedicated blocking worker.
+///
+/// Lifecycle invalidation is synchronous and may wait for `authority` from a
+/// Tokio worker. The commit therefore needs an independent completion owner:
+/// even if every async worker is waiting in revocation, or the calling future
+/// is cancelled after this task is spawned, this worker drives the commit to
+/// completion and only then releases authority.
+async fn commit_with_authority<Authority>(
+    txn: DatabaseTransaction,
+    authority: Authority,
+) -> Result<(), DbErr>
+where
+    Authority: Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let committed = runtime.block_on(txn.commit());
+        drop(authority);
+        committed
+    })
+    .await
+    .map_err(|_| DbErr::Custom("Playlist commit worker failed".to_string()))?
+}
+
 impl PlaylistEntryInput {
     pub fn new(
         media_key: MediaKey,
@@ -107,6 +139,18 @@ pub struct StoredPlaylistEntry {
 pub struct LoadedPlaylistEntry {
     pub stored: StoredPlaylistEntry,
     pub local_track: Option<track::Model>,
+}
+
+/// Complete local-track snapshot required by the current XSPF export format.
+///
+/// XSPF export intentionally remains local-only. Callers must not treat the
+/// local compatibility projection as an export source because that projection
+/// omits remote and unresolved occurrences. This typed result makes the
+/// all-or-none boundary explicit before any destination is written.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LocalPlaylistExport {
+    Ready(Vec<track::Model>),
+    UnsupportedEntries,
 }
 
 impl StoredPlaylistEntry {
@@ -429,18 +473,51 @@ impl PlaylistManager {
     /// occurrences in input order. Local identities are resolved against the
     /// current track table inside the same transaction and receive the local
     /// foreign-key cache. Non-local identities are persisted without a URI or
-    /// local foreign key; callers must obtain and recheck live catalogue
-    /// authority before entering this storage boundary.
+    /// local foreign key. Remote callers use
+    /// [`Self::add_entries_if_authorized`] so live catalogue authority is
+    /// acquired only after these writes are staged and retained through the
+    /// commit.
     pub async fn add_entries(
         &self,
         playlist_id: &str,
         inputs: &[PlaylistEntryInput],
     ) -> Result<Vec<StoredPlaylistEntry>, DbErr> {
+        match self
+            .add_entries_if_authorized(playlist_id, inputs, || Some(()))
+            .await?
+        {
+            PlaylistEntryAddOutcome::Committed(inserted) => Ok(inserted),
+            PlaylistEntryAddOutcome::Rejected => {
+                unreachable!("unconditional playlist storage authority")
+            }
+        }
+    }
+
+    /// Stage exact source-scoped entries, then acquire final authority at the
+    /// transaction's commit boundary.
+    ///
+    /// Returning `None` from `authorize` rejects the whole mutation and drops
+    /// the transaction, including every staged insert. A returned opaque value
+    /// is retained across `commit().await`, allowing its owner to delay source
+    /// invalidation until the durable write has completed.
+    pub async fn add_entries_if_authorized<Authority, Authorize>(
+        &self,
+        playlist_id: &str,
+        inputs: &[PlaylistEntryInput],
+        authorize: Authorize,
+    ) -> Result<PlaylistEntryAddOutcome, DbErr>
+    where
+        Authorize: FnOnce() -> Option<Authority>,
+        Authority: Send + 'static,
+    {
         let txn = self.db.begin().await?;
         require_regular_playlist(&txn, playlist_id).await?;
         if inputs.is_empty() {
-            txn.commit().await?;
-            return Ok(Vec::new());
+            let Some(authority) = authorize() else {
+                return Ok(PlaylistEntryAddOutcome::Rejected);
+            };
+            commit_with_authority(txn, authority).await?;
+            return Ok(PlaylistEntryAddOutcome::Committed(Vec::new()));
         }
 
         for input in inputs {
@@ -546,8 +623,11 @@ impl PlaylistManager {
             inserted.push(StoredPlaylistEntry::from_model(model)?);
         }
 
-        txn.commit().await?;
-        Ok(inserted)
+        let Some(authority) = authorize() else {
+            return Ok(PlaylistEntryAddOutcome::Rejected);
+        };
+        commit_with_authority(txn, authority).await?;
+        Ok(PlaylistEntryAddOutcome::Committed(inserted))
     }
 
     /// Remove an entry from its owning regular playlist and close the gap.
@@ -704,6 +784,36 @@ impl PlaylistManager {
         }
         txn.commit().await?;
         Ok(loaded)
+    }
+
+    /// Prepare an all-or-none local snapshot for XSPF export.
+    ///
+    /// A regular playlist containing even one remote or currently unresolved
+    /// local occurrence is rejected as a whole. This prevents callers from
+    /// silently exporting only the rows returned by the compatibility
+    /// projection and presenting a truncated playlist as successful.
+    pub async fn local_playlist_export(
+        &self,
+        playlist_id: &str,
+    ) -> Result<LocalPlaylistExport, DbErr> {
+        let entries = self.load_playlist_entries(playlist_id).await?;
+        if entries
+            .iter()
+            .any(|entry| entry.stored.source_id != SourceId::local() || entry.local_track.is_none())
+        {
+            return Ok(LocalPlaylistExport::UnsupportedEntries);
+        }
+
+        let mut tracks = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let Some(local_track) = entry.local_track else {
+                // Keep the materialization fail-closed even if the predicate
+                // above is changed independently in a later refactor.
+                return Ok(LocalPlaylistExport::UnsupportedEntries);
+            };
+            tracks.push(local_track);
+        }
+        Ok(LocalPlaylistExport::Ready(tracks))
     }
 
     /// Get all matched tracks for a regular playlist (ordered by position).
@@ -1183,8 +1293,8 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     use super::{
-        recently_played_default_rules, top_25_most_played_default_rules, PlaylistEntryInput,
-        PlaylistManager, StoredPlaylistEntry,
+        recently_played_default_rules, top_25_most_played_default_rules, LocalPlaylistExport,
+        PlaylistEntryAddOutcome, PlaylistEntryInput, PlaylistManager, StoredPlaylistEntry,
     };
     use crate::architecture::{MediaKey, SourceId, TrackId};
     use crate::db::entities::{playlist, playlist_entry, track};
@@ -2001,6 +2111,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_authority_rejection_rolls_back_every_staged_entry() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Commit authority rollback", false)
+            .await
+            .expect("create playlist");
+        let input = PlaylistEntryInput::new(
+            MediaKey::new(
+                SourceId::random(),
+                TrackId::remote("staged-remote-track").expect("remote track ID"),
+            ),
+            "Staged title",
+            "Staged artist",
+            "Staged album",
+            Some(180),
+        );
+        let authorize_called = std::sync::atomic::AtomicBool::new(false);
+
+        let outcome = manager
+            .add_entries_if_authorized(&playlist.id, &[input.clone(), input.clone()], || {
+                authorize_called.store(true, std::sync::atomic::Ordering::Release);
+                Option::<()>::None
+            })
+            .await
+            .expect("authority rejection is not a database failure");
+        assert!(authorize_called.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(outcome, PlaylistEntryAddOutcome::Rejected);
+        assert!(playlist_entries(&db, &playlist.id).await.is_empty());
+
+        let committed = manager
+            .add_entries_if_authorized(&playlist.id, &[input], || Some(()))
+            .await
+            .expect("fresh authority commits");
+        let PlaylistEntryAddOutcome::Committed(entries) = committed else {
+            panic!("unconditional authority must commit");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].position, 0, "rollback leaves no position gap");
+    }
+
+    #[tokio::test]
     async fn aligned_playlist_load_retains_every_occurrence_and_only_joins_exact_local_rows() {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
@@ -2110,6 +2262,101 @@ mod tests {
             "local deletion preserves durable identity"
         );
         assert_eq!(loaded[4].stored.local_track_id, None);
+    }
+
+    #[tokio::test]
+    async fn local_playlist_export_is_all_or_none_for_remote_and_unresolved_entries() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Local-only export boundary", false)
+            .await
+            .expect("create playlist");
+
+        assert!(matches!(
+            manager
+                .local_playlist_export(&playlist.id)
+                .await
+                .expect("prepare empty export"),
+            LocalPlaylistExport::Ready(tracks) if tracks.is_empty()
+        ));
+
+        let local = insert_track(
+            &db,
+            "export-local",
+            "/music/export-local.flac",
+            "Local title",
+            "Local artist",
+            "Local album",
+            Some(180),
+        )
+        .await;
+        manager
+            .add_entries(
+                &playlist.id,
+                &[
+                    PlaylistEntryInput::local(&local).expect("local playlist input"),
+                    PlaylistEntryInput::local(&local).expect("duplicate local playlist input"),
+                ],
+            )
+            .await
+            .expect("append local occurrences");
+
+        let LocalPlaylistExport::Ready(tracks) = manager
+            .local_playlist_export(&playlist.id)
+            .await
+            .expect("prepare complete local export")
+        else {
+            panic!("fully resolved local playlist must be exportable");
+        };
+        assert_eq!(
+            tracks
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![local.id.as_str(), local.id.as_str()],
+            "local order and duplicate occurrences must be preserved"
+        );
+
+        let remote = manager
+            .add_entries(
+                &playlist.id,
+                &[PlaylistEntryInput::new(
+                    MediaKey::new(
+                        SourceId::random(),
+                        TrackId::remote("export-remote").expect("remote track ID"),
+                    ),
+                    "Remote title",
+                    "Remote artist",
+                    "Remote album",
+                    Some(200),
+                )],
+            )
+            .await
+            .expect("append remote occurrence");
+        assert!(matches!(
+            manager
+                .local_playlist_export(&playlist.id)
+                .await
+                .expect("reject remote export"),
+            LocalPlaylistExport::UnsupportedEntries
+        ));
+
+        manager
+            .remove_entries(&playlist.id, &[remote[0].id.clone()])
+            .await
+            .expect("remove remote occurrence");
+        track::Entity::delete_by_id(local.id)
+            .exec(&db)
+            .await
+            .expect("delete local row and clear its resolution cache");
+        assert!(matches!(
+            manager
+                .local_playlist_export(&playlist.id)
+                .await
+                .expect("reject unresolved local export"),
+            LocalPlaylistExport::UnsupportedEntries
+        ));
     }
 
     #[tokio::test]

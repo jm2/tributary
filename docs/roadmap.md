@@ -28,8 +28,9 @@ starts. Historical holistic-review documents are point-in-time findings, not act
   existing entry the built-in local `SourceId`, makes `(source_id, track_id)` canonical, and
   retains a separate nullable local-track foreign-key cache for deletion and reconciliation.
   Regular playlists now mix exact local occurrences with current authenticated Subsonic,
-  Jellyfin, Plex, and DAAP entries. Add validates a complete selection through the default-deny
-  live registry before one atomic ordered write; Remove uses exact durable occurrence IDs, so
+  Jellyfin, Plex, and DAAP entries. Add first resolves a complete selection through the default-deny
+  live registry, then revalidates after staging SQL and retains exact authority permits through its
+  atomic commit or rollback; Remove uses exact durable occurrence IDs, so
   duplicates remain independent. Rendering preserves every position and shows disconnected,
   retired/unavailable-source, unsupported-source, invalid-catalogue, missing-track, or
   missing/unmatched-local entries as localized unavailable rows that stay removable. Stale
@@ -153,14 +154,18 @@ before starting large protocol or transfer subsystems.
    shutdown, and final release invalidate or deny old guards at their defined boundaries. This
    internal foundation was not itself an Add/Remove/Play feature; [#142] is its reviewed consumer.
 7. **Completed: integrate mixed-source regular-playlist UI ([#142]).** Add consumes Record A's exact
-   current authority for authenticated Subsonic, Jellyfin, Plex, and DAAP entries and commits the
-   entire ordered selection or nothing. Remove addresses durable occurrence IDs atomically.
+   current authority for authenticated Subsonic, Jellyfin, Plex, and DAAP entries. Its transaction
+   revalidates after staging SQL and acquires an exact permit immediately before committing the
+   entire ordered selection or nothing. A stale final check rolls back; lifecycle invalidation
+   after admission waits for commit or rollback. Remove addresses durable occurrence IDs atomically.
    Projection preserves ordering and duplicates while retaining explicit removable unavailable
    rows without stale metadata or fingerprint matching. Queue items use each occurrence's real
    source, and guarded remote stream/artwork resolution rejects refresh, replacement, retirement,
    disconnect, stale epoch/generation, or missing membership at use. Local history ownership and
    remote rating capability do not widen. Radio-Browser, removable, external-file, and unknown
-   sources remain unsupported; smart playlists and XSPF import/export remain local-only. Native
+   sources remain unsupported; smart playlists and XSPF import/export remain local-only, and a
+   remote or unresolved regular occurrence makes XSPF export refuse all-or-none rather than emit a
+   local-only subset. Native
    Subsonic playlist semantics and mixed-source metadata export remain separate later policies.
 
 These contracts make Rhythmbox migration and Last.fm behavior much less ambiguous.

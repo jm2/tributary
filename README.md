@@ -689,15 +689,17 @@ Tributary supports mixed-source regular playlists and local-library smart playli
 - **Smart playlists** — iTunes-style rules engine with filterable metadata fields, text/numeric/date operators, sorting, and result limiting. Smart playlists are evaluated against the current local library whenever they are opened or exported; they are not stored snapshots. Create them via the sidebar context menu.
 
 **Add to Playlist** accepts built-in local tracks and exact current rows from retained authenticated
-Subsonic, Jellyfin, Plex, and DAAP catalogues. Before opening a database transaction, the registry
-validates every selected remote identity against the same current source session and accepted
-catalogue generation. The complete ordered selection is then added atomically. If one member is
-currently unsupported, disconnected, in an invalid catalogue, or missing, Tributary explains the
-result in the user's language and adds nothing. If the authority result becomes stale, it is
-discarded and nothing is written. Radio-Browser, removable media, ephemeral external files, and
-unknown sources remain unsupported. Removing rows is likewise one atomic operation over their exact
-durable entry IDs, so a duplicate or unavailable occurrence can be removed without affecting its
-neighbors.
+Subsonic, Jellyfin, Plex, and DAAP catalogues. The registry first resolves every selected remote
+identity against the same current source session and accepted catalogue generation. After the
+database transaction stages the complete ordered selection, it repeats that exact validation and
+acquires session/catalogue permits immediately before commit. Authority made stale during staging
+rolls back every insert; after admission, lifecycle invalidation waits for commit or rollback. The
+commit and permits have an independent completion owner, so cancellation cannot strand authority
+or abandon commit completion. If one member is unsupported, disconnected, in an invalid
+catalogue, or missing, Tributary explains the result in the user's language and adds nothing.
+Radio-Browser, removable media, ephemeral external files, and unknown sources remain unsupported.
+Removing rows is likewise one atomic operation over their exact durable entry IDs, so a duplicate
+or unavailable occurrence can be removed without affecting its neighbors.
 
 Opening a regular playlist retains every stored occurrence in position order. Available local rows
 use current database metadata; available authenticated rows use only the registry's sanitized live
@@ -750,6 +752,11 @@ before the temporary file or destination is touched. A corrupt negative stored d
 outside Tributary's supported `u64` millisecond range is omitted rather than blocking the otherwise
 valid playlist, because XSPF duration is optional.
 
+XSPF currently represents only local-library tracks. Exporting a regular playlist that contains
+any remote or unresolved occurrence is therefore refused as a whole with a visible explanation
+before the destination is touched; Tributary never silently exports just the playlist's local
+subset. Mixed-source metadata export remains deferred until it has an explicit no-locator policy.
+
 Ratings are deliberately outside this playlist interchange. XSPF v1 has no standard rating field,
 so export emits none; import treats rating-like `<meta>` and extension content as inert and never
 changes a matched local track's app-owned rating. See the [rating contract](docs/ratings.md) for the
@@ -790,9 +797,10 @@ instead counts that individual row as failed.
 
 XSPF import continues to create entries owned by the built-in local source. The source-scoped
 storage migration does not make an HTTP(S) location or service identifier a remote playlist
-authority. Export emits only resolved local tracks and therefore is not a complete export of a
-mixed regular playlist. Mixed-source metadata export is explicitly deferred until it has a policy
-that cannot request or serialize a protected remote locator.
+authority. Export refuses a regular playlist containing any remote or unresolved occurrence before
+touching the destination; it never emits a truncated local-only subset. Mixed-source metadata export
+is explicitly deferred until it has a policy that cannot request or serialize a protected remote
+locator.
 
 Apple Music and iTunes can export playlist metadata as XML, but their XML is an Apple property-list
 format, not XSPF. Follow Apple's official export steps for

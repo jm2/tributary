@@ -770,15 +770,23 @@ metadata export remain explicitly deferred P1.5 policies.
    before and after asynchronous work. This step deliberately added no mixed-source playlist UI.
 9. **Mixed-source regular-playlist consumer complete
    ([#142](https://github.com/jm2/tributary/pull/142)):** Add resolves and revalidates the entire
-   selected authenticated batch before one atomic ordered write; Remove addresses exact durable
-   occurrence IDs. Projection preserves positions and duplicates and retains disconnected,
+   selected authenticated batch. After staging SQL and immediately before commit, the transaction
+   performs its final revalidation and acquires exact session/catalogue permits that remain held
+   through commit or rollback. Authority made stale during staging rolls back; refresh, replacement,
+   disconnect, and shutdown after admission wait. The transaction and permits move to an independent
+   completion worker before waiting, so caller cancellation and synchronous revocation cannot
+   strand the permit or starve the database commit. Remove addresses exact durable occurrence IDs.
+   Projection preserves
+   positions and duplicates and retains disconnected,
    retired/unavailable-source, unsupported-source, invalid-catalogue, missing-track, and
    missing/unmatched-local entries as localized removable rows without displaying persisted
    fingerprints. Stale projection work/results are discarded, and the playlist is invalidated and
    reprojected; staleness is not a row reason. Queue items keep per-row media ownership, and remote
    stream/artwork calls deny stale closed guards at use. Local history ownership and remote rating
-   capability remain unchanged. Smart playlists and XSPF import/export remain local-only;
-   mixed-source metadata export and Subsonic-native playlist synchronization remain separate.
+   capability remain unchanged. Smart playlists and XSPF import/export remain local-only; a regular
+   playlist with any remote or unresolved occurrence is refused before XSPF export can touch its
+   destination. Mixed-source metadata export and Subsonic-native playlist synchronization remain
+   separate.
 
 The authenticated-remote cutover's locked debug and release suites each passed 20 library, 865
 application, and 10 repository-metadata tests (895 total), with locked all-target/all-feature

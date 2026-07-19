@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "所選播放清單已不存在。"
   smart_playlist_evaluation_failed: "無法計算智慧型播放清單：%{error}"
   playlist_tracks_read_failed: "無法讀取播放清單中的曲目：%{error}"
+  export_local_only_unsupported_body: "此播放清單包含遠端或無法使用的項目。目前，XSPF 匯出僅支援所有項目都可在本機媒體庫中使用的播放清單。"
   writer_worker_failed: "XSPF 寫入程序已停止：%{error}"
   write_failed: "無法寫入 XSPF 檔案：%{error}"
   export_success_heading: "已匯出 XSPF 播放清單"

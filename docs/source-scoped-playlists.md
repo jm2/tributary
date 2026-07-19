@@ -126,10 +126,16 @@ The current user-visible behavior is:
 
 - **All-or-none Add:** a local selection writes `(SourceId::local(), tracks.id)` plus the matching
   `local_track_id`. An authenticated Subsonic, Jellyfin, Plex, or DAAP selection must first resolve
-  every ordered `MediaKey` through Record A and recheck the complete result before one atomic
-  storage operation. A current unsupported, disconnected, missing, or invalid-catalogue selection
-  writes nothing and presents fixed localized copy; a result made stale before commit is discarded
-  and also writes nothing. Duplicate selections create distinct ordered occurrence IDs.
+  every ordered `MediaKey` through Record A. After staging the ordered SQL inserts and immediately
+  before commit, the same transaction revalidates the complete result and atomically acquires exact
+  current session/catalogue permits. A result made stale during staging rolls the transaction back;
+  after admission, refresh, replacement, disconnect, and shutdown wait for commit or rollback.
+  The transaction and permits transfer to an independent completion worker before that final wait,
+  so caller cancellation or a synchronous lifecycle revoker cannot strand authority or starve the
+  commit.
+  A current unsupported, disconnected, missing, or invalid-catalogue selection likewise writes
+  nothing and presents fixed localized copy. Duplicate selections create distinct ordered
+  occurrence IDs.
 - **Regular-playlist load:** reads every stored occurrence in position order. Local identities use
   exact current database rows; eligible non-local identities consume only the registry's current
   sanitized metadata. A missing local track, unavailable or retired source, unsupported owner,
@@ -157,9 +163,10 @@ The current user-visible behavior is:
   occurrence and its reconciliation evidence. Deleting a playlist still cascades its entries.
 - **Rename and root reauthorization:** ID-preserving operations retain both source-scoped identity
   and the local cache. Existing guarded path-evidence relocation remains local-only.
-- **XSPF export:** emits only resolved local tracks and is not a complete export of a mixed regular
-  playlist. Mixed-source metadata export is explicitly deferred until it has a policy that cannot
-  obtain or serialize a protected remote locator.
+- **XSPF export:** refuses a regular playlist containing any remote or unresolved occurrence before
+  touching the destination; it never emits a truncated local-only subset. Mixed-source metadata
+  export is explicitly deferred until it has a policy that cannot obtain or serialize a protected
+  remote locator.
 
 The existing P1.2 refusal remains the correct fail-closed result, but Record B narrows it to a
 selection that Record A does not authorize. Retained authenticated Subsonic, Jellyfin, Plex, and
@@ -300,7 +307,9 @@ The storage record is complete only when automated coverage demonstrates:
 
 The storage and authority foundation records do not retroactively claim their consumer. Native
 Subsonic playlist synchronization and mixed-source XSPF metadata export remain explicitly deferred
-and require their own validation.
+and require their own validation. Until a no-locator mixed-source export policy exists, a regular
+playlist containing any remote or unresolved occurrence is refused all-or-none before XSPF touches
+its destination; the local-only compatibility projection is never exported as a truncated result.
 
 Record A additionally requires automated coverage for default-deny adapters, the four explicit
 authenticated opt-ins, Invalid playlist indexing for missing/duplicate catalogue-native identity,
@@ -311,9 +320,10 @@ duplicate requested occurrences and isolate one missing track's Unavailable resu
 neighbors. Passing those tests alone does not claim Add/Remove/render/Play UI integration.
 
 Record B additionally requires automated coverage that the complete selected Add batch is resolved
-and revalidated all-or-none; local plus each of the four authenticated opt-ins are admitted while
-current radio, removable, external, unknown, unavailable, invalid, and missing cases write nothing,
-and stale Add results are discarded before any write. Projection tests preserve occurrence IDs,
+and admitted under commit-scoped authority all-or-none; local plus each of the four authenticated
+opt-ins are admitted while current radio, removable, external, unknown, unavailable, invalid, and
+missing cases write nothing, stale final acquisition rolls back staged writes, and lifecycle
+invalidation cannot cross an admitted commit. Projection tests preserve occurrence IDs,
 positions, and duplicates; retain every unavailable row without displaying fingerprints; discard
 stale projection work/results before current reprojection; and restore only exact reconnected
 identity. Remove tests address durable entry IDs atomically, including repeated and unavailable

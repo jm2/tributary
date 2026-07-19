@@ -10,7 +10,7 @@ use std::rc::Rc;
 use super::objects::{SourceObject, TrackObject};
 use super::window_state::WindowState;
 use crate::architecture::{MediaKey, SourceId, TrackId};
-use crate::local::playlist_manager::PlaylistEntryInput;
+use crate::local::playlist_manager::{PlaylistEntryAddOutcome, PlaylistEntryInput};
 use crate::source_registry::{RegularPlaylistTrackResolution, SourceRegistry};
 
 const CONTEXT_MENU_ACTION_GROUP: &str = "tracklist-ctx";
@@ -598,21 +598,33 @@ fn build_add_to_playlist_actions(
                             Ok(db) => {
                                 let manager =
                                     crate::local::playlist_manager::PlaylistManager::new(db);
-                                // This is the mutation's authority
-                                // linearization point. The storage operation
-                                // follows immediately and commits the whole
-                                // ordered selection or none of it.
-                                if !registry
-                                    .are_regular_playlist_tracks_current(&plan.authority)
+                                // Stage the complete ordered mutation first,
+                                // then acquire exact live authority at the
+                                // transaction's final commit boundary. The
+                                // manager retains it through commit; stale
+                                // acquisition rejects and rolls back every
+                                // staged insert.
+                                match manager
+                                    .add_entries_if_authorized(
+                                        &worker_pid,
+                                        &plan.inputs,
+                                        || {
+                                            registry.acquire_regular_playlist_commit_authority(
+                                                &plan.authority,
+                                            )
+                                        },
+                                    )
+                                    .await
                                 {
-                                    PlaylistMutationOutcome::Rejected
-                                } else {
-                                    match manager.add_entries(&worker_pid, &plan.inputs).await {
-                                        Ok(_) => PlaylistMutationOutcome::Committed,
-                                        Err(error) => {
-                                            tracing::error!(%error, playlist = %worker_pid, "Failed to add exact playlist occurrences");
-                                            PlaylistMutationOutcome::Failed
-                                        }
+                                    Ok(PlaylistEntryAddOutcome::Committed(_)) => {
+                                        PlaylistMutationOutcome::Committed
+                                    }
+                                    Ok(PlaylistEntryAddOutcome::Rejected) => {
+                                        PlaylistMutationOutcome::Rejected
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(%error, playlist = %worker_pid, "Failed to add exact playlist occurrences");
+                                        PlaylistMutationOutcome::Failed
                                     }
                                 }
                             }

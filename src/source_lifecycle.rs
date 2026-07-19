@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
+use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,8 +27,8 @@ use uuid::Uuid;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::architecture::media::MediaLease;
 use crate::architecture::media::ResolvedHttpRequest;
+use crate::architecture::media::{MediaLease, MediaLeasePermit};
 use crate::architecture::{SourceId, ViewOrigin};
 use crate::local::resolver::ResolvedFileMedia;
 
@@ -579,6 +580,42 @@ pub struct CurrentAcceptedCatalogue<T> {
     pub session_epoch: u64,
     pub authority: MediaLease,
     pub value: T,
+}
+
+/// One exact catalogue member required by a commit-scoped caller.
+///
+/// The selected key remains generic so the lifecycle layer can validate it
+/// through a bounded registry-owned payload selector without learning any
+/// backend catalogue representation.
+pub struct CatalogueCommitRequest<K> {
+    pub source_id: SourceId,
+    pub catalogue_generation: u64,
+    pub session_epoch: u64,
+    pub selected: K,
+}
+
+/// Opaque admission that orders one commit before exact session/catalogue
+/// invalidation can complete or publish.
+///
+/// Dropping this value is the only operation: it releases every in-flight
+/// permit. Callers must not retain it while asking the lifecycle registry to
+/// replace or disconnect one of the admitted sources.
+pub struct CatalogueCommitAuthority {
+    permits: Vec<MediaLeasePermit>,
+}
+
+impl CatalogueCommitAuthority {
+    #[cfg(test)]
+    pub(crate) fn permit_count(&self) -> usize {
+        self.permits.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revocation_started(&self) -> bool {
+        self.permits
+            .iter()
+            .any(MediaLeasePermit::revocation_started)
+    }
 }
 
 impl<S> AcceptedSnapshot<S> {
@@ -2117,6 +2154,92 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                 &catalogue_value,
             ))
         .then_some(selected)
+    }
+
+    /// Atomically admit one commit section over exact catalogue members.
+    ///
+    /// All unique catalogue guards are validated and acquire both their
+    /// session and catalogue permits while the lifecycle state lock remains
+    /// held. Immutable payload snapshots for all unique selected keys are
+    /// cloned in that same observation, then the bounded membership selector
+    /// runs after the lock is released. The permits keep those snapshots
+    /// authoritative throughout that unlocked validation.
+    ///
+    /// Replacement and disconnect also revoke under the state lock, so they
+    /// can neither slip between validation and acquisition nor publish an
+    /// invalidation until the returned authority is dropped. There is
+    /// intentionally no registry-lock recheck after permits are acquired: an
+    /// invalidator may already be waiting for those permits while holding the
+    /// state lock.
+    pub(crate) fn acquire_catalogue_commit_authority<K, Validate>(
+        &self,
+        requests: &[CatalogueCommitRequest<K>],
+        validate: Validate,
+    ) -> Option<CatalogueCommitAuthority>
+    where
+        K: Eq + Hash,
+        Validate: Fn(&S, &K) -> bool,
+    {
+        let (authority, selections) = {
+            let state = lock(&self.inner.state);
+            if state.gate != RegistryGate::Running {
+                return None;
+            }
+
+            let mut unique_tracks = HashSet::with_capacity(requests.len());
+            let mut unique_guards = HashSet::with_capacity(requests.len());
+            let mut leases = Vec::with_capacity(requests.len());
+            let mut selections = Vec::with_capacity(requests.len());
+            for request in requests {
+                let track_key = (
+                    request.source_id,
+                    request.session_epoch,
+                    request.catalogue_generation,
+                    &request.selected,
+                );
+                if !unique_tracks.insert(track_key) {
+                    continue;
+                }
+
+                let entry = state.entries.get(&request.source_id)?;
+                let active = entry.active.as_ref()?;
+                let catalogue = entry.catalogue.as_ref()?;
+                if active.epoch != request.session_epoch {
+                    return None;
+                }
+                if catalogue.session_epoch != request.session_epoch {
+                    return None;
+                }
+                if catalogue.generation != request.catalogue_generation {
+                    return None;
+                }
+                if !active.lease.is_active() || !catalogue.authority.is_active() {
+                    return None;
+                }
+                selections.push((Arc::clone(&catalogue.value), &request.selected));
+
+                let guard = (
+                    request.source_id,
+                    request.session_epoch,
+                    request.catalogue_generation,
+                );
+                if unique_guards.insert(guard) {
+                    leases.push((active.lease.clone(), catalogue.authority.clone()));
+                }
+            }
+
+            let mut permits = Vec::with_capacity(leases.len().saturating_mul(2));
+            for (session, catalogue) in leases {
+                permits.push(session.try_acquire()?);
+                permits.push(catalogue.try_acquire()?);
+            }
+            (CatalogueCommitAuthority { permits }, selections)
+        };
+
+        selections
+            .into_iter()
+            .all(|(catalogue, selected)| validate(catalogue.as_ref(), selected))
+            .then_some(authority)
     }
 
     /// Recheck the exact immutable catalogue captured before an unlocked

@@ -272,10 +272,14 @@ the 36-record feature backlog.
 
   Implemented contract: Add to Playlist accepts exact local rows plus current authenticated
   Subsonic, Jellyfin, Plex, and DAAP catalogue rows. It resolves the complete ordered remote
-  selection through Record A, rechecks current epoch/generation immediately before one atomic
-  storage operation, and writes nothing if any current member is unsupported, unavailable, missing,
-  or in an invalid catalogue. A result made stale before commit is discarded and also writes
-  nothing. Support is never inferred from a source key, backend label, cached GTK row, or persisted
+  selection through Record A. After staging its SQL inserts and immediately before commit, that
+  transaction revalidates the complete result and acquires exact session/catalogue permits. A
+  result made stale during staging rolls back; after admission, a concurrent refresh, replacement,
+  disconnect, or shutdown waits for commit or rollback. The transaction and permits transfer to an
+  independent completion worker, so cancellation cannot strand authority or abandon commit
+  completion. Any unsupported, unavailable, missing, or invalid-catalogue member likewise writes
+  nothing. Support is
+  never inferred from a source key, backend label, cached GTK row, or persisted
   fingerprint. Radio-Browser, removable media, ephemeral external files, and unknown sources remain
   unsupported and receive the localized all-or-none refusal.
 
@@ -297,8 +301,9 @@ the 36-record feature backlog.
   restores availability only for the same exact `(SourceId, TrackId)`. Only exact local occurrences
   contribute to local playback history. Remote ratings remain live read-only or unsupported and
   cannot be mutated through playlist membership. Smart playlists and XSPF import/export remain
-  local-only; mixed-source metadata export and Subsonic server-native synchronization remain
-  separate policy records.
+  local-only; attempting to export a regular playlist with any remote or unresolved occurrence is
+  refused all-or-none before the destination is touched. Mixed-source metadata export and
+  Subsonic server-native synchronization remain separate policy records.
 
 - [ ] Treat Subsonic server-native playlist import/synchronization as a separate capability slice,
   with direction, conflict, offline, deletion, and server-feature semantics documented first.
@@ -422,5 +427,5 @@ the 36-record feature backlog.
 | 2026-07-19 | P1.4 rating UI and smart-playlist rules | [#139](https://github.com/jm2/tributary/pull/139) | Added the exact Rating column with localized cell/editor states, keyboard-operable local set/clear, honest read-only/unavailable states, serialized post-commit exact-ID refresh, failure-safe feedback, versioned column-config exposure, null-last deterministic sorting, and capability-aware numeric/presence smart rules plus Highest/Lowest Rated selection. This completed P1.4. |
 | 2026-07-19 | P1.5 source-scoped regular-playlist storage | [#140](https://github.com/jm2/tributary/pull/140) | Added migration 13 and typed atomic storage around exact `(SourceId, TrackId)` occurrence identity, a separate nullable local foreign-key cache, exact schema/index recognition, lossless-or-refused downgrade, local compatibility, and explicit no-locator/no-credential boundaries. It intentionally reserved live authority, mixed-source UI, and Subsonic-native synchronization for separate records. |
 | 2026-07-19 | P1.5 live-catalogue playlist authority | [#141](https://github.com/jm2/tributary/pull/141) | Added default-deny adapter capability, exact ordered catalogue lookup with invalid-catalogue rejection and sanitized metadata, transient epoch/generation guards, closed media errors, and lifecycle-owned generation leases revoked independently of retained snapshots. It intentionally reserved Add/Remove/render/Play consumption for Record B. |
-| 2026-07-19 | P1.5 mixed-source regular-playlist UI | [#142](https://github.com/jm2/tributary/pull/142) | Integrated exact local and authenticated Subsonic/Jellyfin/Plex/DAAP entries through all-or-none Add, durable-occurrence Remove, ordered duplicate-preserving projection with explicit removable unavailable rows, and per-source guarded Play/artwork. Current closed unavailable reasons render honestly; stale projection results are discarded/reprojected and stale guards are denied. Local history and remote rating ownership remain unchanged. Smart playlists, XSPF import/export, mixed-source metadata export, and Subsonic-native synchronization remain separate. |
+| 2026-07-19 | P1.5 mixed-source regular-playlist UI | [#142](https://github.com/jm2/tributary/pull/142) | Integrated exact local and authenticated Subsonic/Jellyfin/Plex/DAAP entries through all-or-none Add, durable-occurrence Remove, ordered duplicate-preserving projection with explicit removable unavailable rows, and per-source guarded Play/artwork. Add revalidates after staging SQL, rolls back a stale result, and retains exact session/catalogue permits through an admitted commit or rollback. Current closed unavailable reasons render honestly; stale projection results are discarded/reprojected and stale guards are denied. Local history and remote rating ownership remain unchanged. Smart playlists and XSPF remain local-only; mixed/unresolved XSPF export refuses all-or-none instead of truncating, while mixed-source metadata export and Subsonic-native synchronization remain separate. |
 | 2026-07-18 | Linux watcher feedback-loop fix | [#103](https://github.com/jm2/tributary/pull/103) | Narrowed the external proposal to filter self-generated access events before queue admission without filtering genuine startup events or backend errors; bounded overflow still drives authoritative reconciliation. Persistent negative parse caching is deliberately excluded so failures remain retryable; this separate correctness fix does not advance the feature numerator. |
