@@ -1495,15 +1495,16 @@ pub fn build_window(
     // are already rate-limited by real occurrences, and an unbounded FIFO
     // avoids detached tasks silently waiting behind a busy initial scan. A
     // terminal marker below makes normal shutdown wait for every earlier
-    // mutation to finish.
-    let (library_command_tx, library_command_rx) = async_channel::unbounded();
+    // admitted history/root-trust command to finish.
+    let (library_commands, library_command_rx) =
+        super::library_commands::LibraryCommandAdmission::channel();
 
     // Save geometry, retire playback, close the source lifecycle gate, and
     // drain local-library mutations before allowing the window to disappear.
     let shutdown_sources = source_registry.clone();
     let shutdown_playback = playback_session.clone();
     let shutdown_output_slot = active_output_slot.clone();
-    let shutdown_library_commands = library_command_tx.clone();
+    let shutdown_library_commands = library_commands.clone();
     let shutdown_started = Rc::new(Cell::new(false));
     let shutdown_complete = Rc::new(Cell::new(false));
     window.connect_close_request(move |w| {
@@ -1513,6 +1514,18 @@ pub fn build_window(
         }
 
         if !shutdown_started.replace(true) {
+            // Close every UI producer before any widget, output, or source
+            // teardown can synchronously re-enter GTK, then append the marker
+            // in that same non-interleavable main-thread operation.
+            let (flush_tx, flush_rx) = async_channel::bounded(1);
+            let flush_queued = shutdown_library_commands.close_and_flush(flush_tx);
+            if !flush_queued {
+                warn!("Library mutation receiver stopped before shutdown flush");
+            }
+            // The close drain can wait behind an initial scan. Make the still-
+            // visible window inert immediately; media-key and application
+            // actions also consult the shared command-admission gate below.
+            w.set_sensitive(false);
             super::open_files::invalidate_admission();
             let external_source = shutdown_playback.borrow().current_external_source_id();
             // Revoke the event generation before stopping the output so no
@@ -1526,15 +1539,6 @@ pub fn build_window(
                 let _ = shutdown_sources.retire_external(source_id);
             }
             let barrier = shutdown_sources.shutdown();
-            let (flush_tx, flush_rx) = async_channel::bounded(1);
-            let flush_queued = shutdown_library_commands
-                .try_send(LibraryCommand::Flush {
-                    completion: flush_tx,
-                })
-                .is_ok();
-            if !flush_queued {
-                warn!("Library mutation receiver stopped before shutdown flush");
-            }
             let window = w.clone();
             let shutdown_complete = shutdown_complete.clone();
             glib::MainContext::default().spawn_local(async move {
@@ -1555,7 +1559,7 @@ pub fn build_window(
     let root_trust_prompts = root_trust::RootTrustPromptController::new(
         &window,
         &toast_overlay,
-        library_command_tx.clone(),
+        library_commands.clone(),
     );
 
     // ── Start the library engine on tokio ────────────────────────────
@@ -2022,9 +2026,14 @@ pub fn build_window(
             let playback_rt = rt_handle.clone();
             let playback_config = app_config.clone();
             let playback_source_registry = source_registry.clone();
+            let media_playback_admission = library_commands.clone();
 
             glib::MainContext::default().spawn_local(async move {
                 while let Ok(action) = media_rx.recv().await {
+                    if !media_playback_admission.is_open() {
+                        tracing::debug!(?action, "Ignoring OS media action during shutdown");
+                        continue;
+                    }
                     info!(?action, "OS media key");
                     let ctx = PlaybackContext {
                         model: sm.clone(),
@@ -2111,8 +2120,12 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         hb.play_button.connect_clicked(move |_| {
+            if !playback_admission.is_open() {
+                return;
+            }
             toggle_or_start(
                 &PlaybackContext {
                     model: sort_model.clone(),
@@ -2172,18 +2185,28 @@ pub fn build_window(
     // window; the final value always lands within the window.
     {
         let active_output = active_output.clone();
+        let volume_admission = library_commands.clone();
         let pending: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
         let scheduled = Rc::new(Cell::new(false));
         hb.volume_adj.connect_value_changed(move |adj| {
+            if !volume_admission.is_open() {
+                pending.set(None);
+                return;
+            }
             pending.set(Some(adj.value()));
             if scheduled.replace(true) {
                 return;
             }
             let active_output = active_output.clone();
+            let volume_admission = volume_admission.clone();
             let pending = pending.clone();
             let scheduled = scheduled.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
                 scheduled.set(false);
+                if !volume_admission.is_open() {
+                    pending.set(None);
+                    return;
+                }
                 if let Some(v) = pending.take() {
                     active_output.borrow_mut().set_volume(v);
                 }
@@ -2198,10 +2221,11 @@ pub fn build_window(
         let active_output = active_output.clone();
         let playback_session = playback_session.clone();
         let seeking = seeking.clone();
+        let playback_admission = library_commands.clone();
         let pending: Rc<Cell<Option<(PlayerEventGeneration, u64)>>> = Rc::new(Cell::new(None));
         let scheduled = Rc::new(Cell::new(false));
         hb.progress_adj.connect_value_changed(move |adj| {
-            if seeking.get() {
+            if seeking.get() || !playback_admission.is_open() {
                 return;
             }
             super::open_files::invalidate_admission();
@@ -2214,6 +2238,7 @@ pub fn build_window(
             }
             let active_output = active_output.clone();
             let playback_session = playback_session.clone();
+            let playback_admission = playback_admission.clone();
             let pending = pending.clone();
             let seeking = seeking.clone();
             let scheduled = scheduled.clone();
@@ -2223,6 +2248,9 @@ pub fn build_window(
                 // Re-check the guard: don't fire a stale seek if a
                 // programmatic update is in progress when the timer lands.
                 if seeking.get() {
+                    return;
+                }
+                if !playback_admission.is_open() {
                     return;
                 }
                 let Some((generation, target_ms)) = intent else {
@@ -2278,8 +2306,12 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         column_view.connect_activate(move |_view, position| {
+            if !playback_admission.is_open() {
+                return;
+            }
             play_track_at(
                 position,
                 &PlaybackContext {
@@ -2341,8 +2373,12 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         hb.next_button.connect_clicked(move |_| {
+            if !playback_admission.is_open() {
+                return;
+            }
             advance_track_from_user(
                 &PlaybackContext {
                     model: sm.clone(),
@@ -2380,8 +2416,12 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         hb.prev_button.connect_clicked(move |_| {
+            if !playback_admission.is_open() {
+                return;
+            }
             previous_or_restart_from_user(
                 &PlaybackContext {
                     model: sm.clone(),
@@ -2427,7 +2467,7 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
-        let playback_history_commands = library_command_tx.clone();
+        let playback_history_commands = library_commands.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -2458,14 +2498,11 @@ pub fn build_window(
                 if let Some(track_id) = playback_session.borrow_mut().observe_history_event(&event)
                 {
                     let counted_at_ms = Utc::now().timestamp_millis();
-                    if playback_history_commands
-                        .try_send(LibraryCommand::RecordPlaybackHistory {
-                            track_id,
-                            counted_at_ms,
-                        })
-                        .is_err()
-                    {
-                        warn!("Playback history command receiver stopped");
+                    if !playback_history_commands.try_send(LibraryCommand::RecordPlaybackHistory {
+                        track_id,
+                        counted_at_ms,
+                    }) {
+                        warn!("Playback history command admission is closed");
                     }
                 }
                 match event {
@@ -2729,9 +2766,15 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
         play_pending.connect_activate(move |_, _| {
+            if !playback_admission.is_open() {
+                super::open_files::invalidate_admission();
+                let _ = super::open_files::drain();
+                return;
+            }
             let delivery = super::open_files::drain();
             if delivery.is_empty() {
                 return;
@@ -2755,9 +2798,13 @@ pub fn build_window(
             let playback_rt = playback_rt.clone();
             let playback_config = playback_config.clone();
             let playback_source_registry = playback_source_registry.clone();
+            let playback_admission = playback_admission.clone();
             glib::MainContext::default().spawn_local(async move {
                 match admission.await {
-                    Ok(Some(pending)) if super::open_files::is_current(generation) => {
+                    Ok(Some(pending))
+                        if playback_admission.is_open()
+                            && super::open_files::is_current(generation) =>
+                    {
                         let ctx = super::playback::PlaybackContext {
                             model: sm,
                             active_source_key,

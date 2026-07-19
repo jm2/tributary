@@ -66,8 +66,10 @@ before starting large protocol or transfer subsystems.
    One `PlaybackSession` progress latch follows each exact local occurrence independently of output
    generations; rejected/stale events cannot contribute, pause/buffering/retry/seek/restart
    discontinuities re-anchor, and paused polls stay inert until Playing. A qualifying play enters a
-   shutdown-drained FIFO and atomically updates one stable local ID with a saturating count and
-   monotonic timestamp, then refreshes the Plays row and invalidates active/cached playlist
+   FIFO whose shared GTK admission gate closes before shutdown's terminal marker, making playback,
+   history, root-trust, media-key, seek, and open-file callbacks inert before the drain. The engine
+   atomically updates one stable local ID with a saturating count and monotonic timestamp, then
+   refreshes the Plays row and invalidates active/cached playlist
    projections only after commit. AirPlay 1 now publishes generation-scoped position evidence on a
    500 ms timer. Next, make Recently Played and Top 25
    deterministic, provide their live refresh/empty-state behavior, and migrate only exact untouched

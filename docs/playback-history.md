@@ -83,10 +83,16 @@ known-duration media.
   crossing, late duration acceptance, or qualifying unknown-duration natural end.
 
 "Exactly once" means once per adopted occurrence in the running playback session. Normal window
-shutdown first revokes player-event ownership, stops the output, queues a FIFO flush marker, and
-waits until every earlier history mutation has finished. A process crash or forced termination can
-still lose in-memory partial credit or an uncommitted decision; crash-replay exactly-once semantics
-would require a durable occurrence-ID ledger and are not claimed here.
+shutdown first closes the shared GTK-thread command-admission gate and makes playback, media-key,
+seek, open-file, history, and root-trust callbacks inert. In that same synchronous operation it
+appends a FIFO flush marker, then revokes player-event ownership, stops the output, and waits until
+every earlier admitted history/root-trust command has finished. Because all UI producers share the
+closed gate, no callback can append work behind the marker while a long initial or root-trust scan
+delays its acknowledgment. This command barrier does not claim to drain filesystem-watcher events,
+and the disabled window can remain visible while earlier serialized scan work finishes. A process
+crash or forced termination can still lose in-memory partial credit or an uncommitted decision;
+crash-replay exactly-once semantics would require a durable occurrence-ID ledger and are not
+claimed here.
 
 ## Durable representation and migration
 
@@ -135,7 +141,8 @@ The production pipeline now implements the schema and progress contract end to e
    polls without a later Playing event.
 3. The one-shot decision latches before synchronously entering the library engine's FIFO, so
    duplicate output ticks cannot enqueue duplicate writes for one occurrence. Normal shutdown
-   stops event production and waits for a terminal FIFO marker before closing.
+   atomically closes the shared UI admission gate before appending a terminal FIFO marker, makes
+   every playback/history/root-trust producer inert, and waits for the marker before closing.
 4. The library engine updates one exact local stable ID in a transaction, treats a missing row as
    a no-op, and publishes the selected replacement row only after commit.
 5. The UI replaces the exact existing local row by stable ID, allowing a Plays-sorted view to

@@ -108,8 +108,13 @@ playlist interaction boundary, and authoritative local playback events.
   Once an occurrence qualifies, its latch closes before synchronous FIFO enqueue. The library
   engine atomically updates only that stable `TrackId`, saturates `play_count` at `i32::MAX`, keeps
   the greatest existing/event timestamp, and treats a concurrently deleted row as a clean no-op.
-  Normal shutdown revokes event ownership, stops playback, and waits for all earlier queued
-  mutations. Only a committed update publishes the replacement row; the live local Plays value
+  Normal shutdown first closes one shared GTK command-admission gate, disables every playback,
+  media-key, seek, open-file, history, and root-trust producer, appends a FIFO marker, revokes event
+  ownership, stops playback, and waits for all earlier admitted history/root-trust commands.
+  Nothing can be admitted behind that marker while an initial or root-trust scan delays it; this
+  barrier deliberately does not claim to drain filesystem-watcher events, and the disabled window
+  may remain visible until the serialized scan finishes. Only a committed update publishes the
+  replacement row; the live local Plays value
   refreshes by stable ID and active/cached playlist projections are invalidated. AirPlay 1 now
   contributes the same evidence through generation-scoped 500 ms position samples. The complete
   contract is in [`playback-history.md`](playback-history.md).
@@ -251,4 +256,4 @@ playlist interaction boundary, and authoritative local playback events.
 | 2026-07-18 | P1.1 bounded shuffle history | [#132](https://github.com/jm2/tributary/pull/132) | Retained ten real prior occurrences, fixed forward traversal and complete Repeat All cycles, unified Previous dispatch, made toggle/reset semantics explicit, and added lifecycle/rollback regressions. |
 | 2026-07-18 | P1.2 honest unsupported playlist actions | [#133](https://github.com/jm2/tributary/pull/133) | Refused non-local Add to Playlist actions with an all-or-none localized dialog before database work, localized the existing context-menu labels, and regressed the fail-closed source policy plus every shipped catalog. |
 | 2026-07-18 | P1.3 playback-history contract and schema | [#134](https://github.com/jm2/tributary/pull/134) | Defined occurrence, threshold, duration, seek/retry/restart, clock, and legacy contracts; added migration 10 plus safe model conversion and a pure one-shot progress state. Production event writes and smart-playlist consumers remain the next two records. |
-| 2026-07-18 | P1.3 authoritative playback-history persistence | Pending PR | Bound one progress latch to each exact local queue occurrence independently of output generations; rejected/stale/retry events cannot double count, paused polls stay inert, and discontinuities re-anchor. Added a normal-shutdown FIFO drain, atomic stable-ID count/timestamp persistence, post-commit Plays refresh and playlist-projection invalidation, plus generation-scoped AirPlay position evidence. Deterministic Recently Played and Top 25 behavior remains the final P1.3 record. |
+| 2026-07-18 | P1.3 authoritative playback-history persistence | Pending PR | Bound one progress latch to each exact local queue occurrence independently of output generations; rejected/stale/retry events cannot double count, paused polls stay inert, and discontinuities re-anchor. Added a shared shutdown admission gate plus FIFO drain, atomic stable-ID count/timestamp persistence, post-commit Plays refresh and playlist-projection invalidation, plus generation-scoped AirPlay position evidence. Deterministic Recently Played and Top 25 behavior remains the final P1.3 record. |

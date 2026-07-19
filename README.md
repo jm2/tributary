@@ -768,7 +768,10 @@ buffering, retry, seek, and the Previous restart re-anchor the same occurrence, 
 stay inert until Playing and real navigation or Repeat One creates a new occurrence. Current output
 replacement ends playback. The database update targets the stable local track ID atomically,
 saturates its count, keeps the newest trustworthy timestamp, and refreshes the Plays row and
-playlist projections only after commit; normal shutdown waits for all earlier history mutations.
+playlist projections only after commit. Normal shutdown first closes the shared GTK command gate,
+disables playback/media/open-file producers, and appends a FIFO marker, so no later callback can
+queue behind the admitted history/root-trust commands it waits to finish. The disabled window can
+remain visible while an earlier serialized library scan finishes.
 AirPlay 1 contributes the same evidence through generation-scoped 500 ms position updates. Remote,
 radio, removable, and ephemeral files do not write local history. Deterministic Recently Played and
 Top 25 rules, ordering, empty-state behavior, untouched-default migration, and live smart-playlist
