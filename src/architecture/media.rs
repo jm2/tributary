@@ -9,7 +9,7 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Weak,
+    Arc, Condvar, Mutex, Weak,
 };
 
 use super::identity::{SourceId, TrackId};
@@ -183,7 +183,30 @@ fn canonical_address(address: SocketAddr, port: u16) -> Option<SocketAddr> {
 /// ticket derived from that session to fail closed immediately.
 #[derive(Clone)]
 pub struct MediaLease {
-    active: Arc<AtomicBool>,
+    state: Arc<MediaLeaseState>,
+}
+
+struct MediaLeaseState {
+    active: AtomicBool,
+    in_flight: Mutex<usize>,
+    idle: Condvar,
+}
+
+/// One admitted section that must finish before its media lease can be
+/// revoked.
+///
+/// This is deliberately crate-private and has no operations of its own. Its
+/// lifetime is the authority: dropping it releases the admission count and
+/// wakes a revoker waiting to invalidate the lease.
+pub struct MediaLeasePermit {
+    state: Arc<MediaLeaseState>,
+}
+
+impl MediaLeasePermit {
+    #[cfg(test)]
+    pub(crate) fn revocation_started(&self) -> bool {
+        !self.state.active.load(Ordering::Acquire)
+    }
 }
 
 /// Credential-free HTTP(S) stream locator retained only by a live source view.
@@ -325,16 +348,71 @@ pub type ResolvedStream = MediaRequest;
 impl MediaLease {
     pub(crate) fn new() -> Self {
         Self {
-            active: Arc::new(AtomicBool::new(true)),
+            state: Arc::new(MediaLeaseState {
+                active: AtomicBool::new(true),
+                in_flight: Mutex::new(0),
+                idle: Condvar::new(),
+            }),
         }
     }
 
+    /// Close new admission and wait for every already-admitted section.
+    ///
+    /// The active check and permit count are serialized by the same mutex as
+    /// revocation. Once this returns, no earlier permit remains and no later
+    /// acquisition can succeed.
     pub(crate) fn revoke(&self) {
-        self.active.store(false, Ordering::Release);
+        let mut in_flight = self
+            .state
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.state.active.store(false, Ordering::Release);
+        while *in_flight != 0 {
+            in_flight = self
+                .state
+                .idle
+                .wait(in_flight)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
+        self.state.active.load(Ordering::Acquire)
+    }
+
+    /// Atomically acquire one in-flight section if revocation has not begun.
+    pub(crate) fn try_acquire(&self) -> Option<MediaLeasePermit> {
+        let mut in_flight = self
+            .state
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.state.active.load(Ordering::Acquire) {
+            return None;
+        }
+        *in_flight = in_flight
+            .checked_add(1)
+            .expect("media lease in-flight permit count overflow");
+        Some(MediaLeasePermit {
+            state: Arc::clone(&self.state),
+        })
+    }
+}
+
+impl Drop for MediaLeasePermit {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .state
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *in_flight = in_flight
+            .checked_sub(1)
+            .expect("media lease in-flight permit count underflow");
+        if *in_flight == 0 {
+            self.state.idle.notify_all();
+        }
     }
 }
 
@@ -552,7 +630,37 @@ fn is_allowed_required_header(name: &HeaderName) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn lease_revocation_waits_for_admitted_permit_and_closes_new_admission() {
+        let lease = MediaLease::new();
+        let permit = lease.try_acquire().expect("active lease admits work");
+        let revoking = lease.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            revoking.revoke();
+            done_tx.send(()).expect("test receiver remains alive");
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while lease.is_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "revocation closed admission"
+            );
+            std::thread::yield_now();
+        }
+        assert!(lease.try_acquire().is_none());
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        drop(permit);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("revocation finishes after permit release");
+        worker.join().expect("revocation worker");
+    }
 
     #[test]
     fn endpoint_rejects_embedded_credentials_and_unsafe_schemes() {

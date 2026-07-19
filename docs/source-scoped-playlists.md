@@ -1,8 +1,10 @@
-# Source-scoped regular playlist storage and authority contract
+# Source-scoped regular playlist storage, authority, and UI contract
 
-This document defines the durable-storage contract and the following live-catalogue authority
-foundation for [P1.5](task.md#p15--persist-source-scoped-playlists). Neither foundation changes
-which source rows the shipping UI can add, display, or play.
+This document defines the durable-storage contract, live-catalogue authority, and mixed-source UI
+integration for [P1.5](task.md#p15--persist-source-scoped-playlists). The storage foundation landed
+in [#140](https://github.com/jm2/tributary/pull/140), Record A's default-deny live authority in
+[#141](https://github.com/jm2/tributary/pull/141), and Record B's Add/Remove/render/Play consumer in
+[#142](https://github.com/jm2/tributary/pull/142).
 
 The central rule is:
 
@@ -15,25 +17,25 @@ either component or persisted as remote playlist authority.
 
 ## Scope and delivery boundary
 
-This storage slice covers:
+The [#140](https://github.com/jm2/tributary/pull/140) storage slice covers:
 
 - migration 13 and the `playlist_entries` entity;
 - deterministic conversion of every valid existing entry to the built-in local `SourceId`;
 - a canonical source-scoped identity plus a separate local foreign-key cache;
 - preservation of playlist order, duplicate occurrences, entry identity, and local reconciliation
   evidence;
-- typed storage operations for future non-local additions without admitting locators or
-  credentials—the schema is source-generic, but this is an internal capability rather than a
-  promise that every source kind is addable; and
+- typed storage operations for non-local additions without admitting locators or credentials—the
+  schema is source-generic, but it is not by itself a promise that every source kind is addable; and
 - compatibility for all currently shipping local regular-playlist, XSPF-import, reconciliation,
   rename, and deletion paths.
 
-It deliberately does **not** enable remote Add to Playlist, mixed-source playlist rendering or
-playback, disconnected-row presentation, playlist-UI lifecycle refresh, or remote XSPF export.
-P1.5 Record A adds the internal live-registry authority described below; Record B must integrate it
-into those user-facing behaviors. Subsonic server-native playlist listing, import, synchronization,
-conflict handling, and deletion semantics remain a separate record and require their own design
-before implementation.
+At that delivery boundary the storage slice deliberately did **not** enable remote Add to Playlist,
+mixed-source rendering or playback, disconnected-row presentation, or playlist-UI lifecycle
+refresh. Record A added the internal live-registry authority described below, and Record B now
+integrates it into those user-facing behaviors without changing the durable schema. Remote XSPF
+metadata export still needs an explicit no-locator policy. Subsonic server-native playlist listing,
+import, synchronization, conflict handling, and deletion semantics remain a separate record and
+require their own design before implementation.
 
 Smart playlists are unaffected. They remain live queries over the local library rather than stored
 regular-playlist occurrences.
@@ -114,18 +116,42 @@ later appended column from making a valid migrated table look like the legacy de
 
 ## Storage operations and local compatibility
 
-The storage boundary accepts typed `SourceId` and `TrackId` values. A future non-local insertion
-may retain optional non-secret metadata fingerprints, must not provide a file path, and must commit
-all selected occurrences atomically. Those normalized snapshots are neither display fields,
-identity, nor matching authority. The exact same native track ID from two sources remains two
-different media objects.
+The storage boundary accepts typed `SourceId` and `TrackId` values. A non-local insertion may retain
+optional non-secret metadata fingerprints, must not provide a file path, and must commit all
+selected occurrences atomically. Those normalized snapshots are neither display fields, identity,
+nor matching authority. The exact same native track ID from two sources remains two different
+media objects.
 
-The user-visible behavior in this slice stays local-only:
+The current user-visible behavior is:
 
-- **Manual local add:** writes `(SourceId::local(), tracks.id)` and the matching
-  `local_track_id`, preserving normalized fingerprint metadata and duplicate occurrences.
-- **Regular-playlist load:** retains the established local projection and ordering. Stored
-  non-local or currently unmatched entries are not yet rendered or sent to playback.
+- **All-or-none Add:** a local selection writes `(SourceId::local(), tracks.id)` plus the matching
+  `local_track_id`. An authenticated Subsonic, Jellyfin, Plex, or DAAP selection must first resolve
+  every ordered `MediaKey` through Record A. After staging the ordered SQL inserts and immediately
+  before commit, the same transaction revalidates the complete result and atomically acquires exact
+  current session/catalogue permits. A result made stale during staging rolls the transaction back;
+  after admission, refresh, replacement, disconnect, and shutdown wait for commit or rollback.
+  The transaction and permits transfer to an independent completion worker before that final wait,
+  so caller cancellation or a synchronous lifecycle revoker cannot strand authority or starve the
+  commit.
+  A current unsupported, disconnected, missing, or invalid-catalogue selection likewise writes
+  nothing and presents fixed localized copy. Duplicate selections create distinct ordered
+  occurrence IDs.
+- **Regular-playlist load:** reads every stored occurrence in position order. Local identities use
+  exact current database rows; eligible non-local identities consume only the registry's current
+  sanitized metadata. A missing local track, unavailable or retired source, unsupported owner,
+  invalid catalogue, or missing remote track becomes an explicit localized unavailable row that
+  remains visible and removable. Stale projected work or results are discarded; the playlist is
+  invalidated and projected again from current authority rather than presenting staleness as a row
+  reason. Persisted fingerprints are never displayed as stale metadata or used to choose a
+  replacement.
+- **Exact Remove:** removes the selected durable entry IDs in one transaction. Each repeated
+  occurrence is independently addressable, unavailable rows require no live source authority, and
+  an error leaves every selected occurrence unchanged.
+- **Per-occurrence Play and artwork:** the playlist remains a `ViewOrigin`, while each projected
+  row and queue item retains its actual media-owning source. Local media uses current retained
+  root/file authority. Remote stream and artwork access revalidate the row's exact transient guard
+  before and after adapter work, so refresh, replacement, retirement, disconnect, shutdown, or a
+  stale epoch/generation cannot reuse a cached locator.
 - **XSPF import:** continues to create local-owned entries only. Exact file-path and deterministic
   metadata matching are unchanged, and an unmatched usable row remains a local occurrence with no
   `track_id` or `local_track_id` until reconciliation succeeds.
@@ -137,22 +163,22 @@ The user-visible behavior in this slice stays local-only:
   occurrence and its reconciliation evidence. Deleting a playlist still cascades its entries.
 - **Rename and root reauthorization:** ID-preserving operations retain both source-scoped identity
   and the local cache. Existing guarded path-evidence relocation remains local-only.
-- **XSPF export:** remains the existing local-track export in this slice. Mixed-source export needs
-  an explicit metadata-only policy and is part of the later presentation/integration work; it may
-  not obtain or serialize a protected remote locator.
+- **XSPF export:** refuses a regular playlist containing any remote or unresolved occurrence before
+  touching the destination; it never emits a truncated local-only subset. Mixed-source metadata
+  export is explicitly deferred until it has a policy that cannot obtain or serialize a protected
+  remote locator.
 
-The existing P1.2 refusal remains correct until Record B lands: selecting Add to Playlist
-from a remote, radio, removable, external, or malformed source still presents localized all-or-none
-copy before opening the database. Neither the storage capability nor Record A's internal lookup is
-itself UI authorization. Record B will initially admit only retained authenticated catalogues
-through the explicit registry capability. Radio-Browser, removable media, ephemeral external
-files, and unknown sources remain unsupported until their persistence and lifecycle semantics are
-separately designed.
+The existing P1.2 refusal remains the correct fail-closed result, but Record B narrows it to a
+selection that Record A does not authorize. Retained authenticated Subsonic, Jellyfin, Plex, and
+DAAP catalogues may opt in through the explicit capability. Radio-Browser, removable media,
+ephemeral external files, and unknown sources remain unsupported; a generic storage shape, backend
+label, source key, cached GTK row, or persisted fingerprint cannot authorize them.
 
 ## Live registry and accepted-catalogue authority
 
-P1.5 Record A establishes an internal authority boundary between durable source-scoped identity
-and later playlist UI integration ([#141](https://github.com/jm2/tributary/pull/141)).
+P1.5 Record A ([#141](https://github.com/jm2/tributary/pull/141)) establishes the internal
+authority boundary between durable source-scoped identity and Record B's playlist UI integration
+([#142](https://github.com/jm2/tributary/pull/142)).
 `ManagedSourceAdapter` exposes a closed
 `RegularPlaylistCapability`: its default is `Unsupported`, and only the retained authenticated
 Subsonic, Jellyfin, Plex, and DAAP catalogue adapters explicitly opt into
@@ -217,35 +243,44 @@ replacement or same-session catalogue refresh invalidates guards minted from the
 payload. Disconnect, shutdown, and final source release synchronously deny new authority before
 asynchronous teardown can finish.
 
-These APIs are an authority foundation only. The shipping Add/Remove/render/Play paths do not call
-them yet, do not show stored non-local rows, and retain the localized all-or-none refusal from P1.2.
+Record A did not by itself authorize a UI or database operation. Record B now makes these APIs the
+only non-local admission and projection authority: Add and rendering consume their ordered result,
+then guarded Play and artwork independently revalidate it at use. Remove instead consumes the
+durable playlist occurrence ID and therefore remains available even when its media owner is not.
+The localized P1.2 refusal still applies whenever the closed capability or current-state checks do
+not authorize the complete selected batch.
 
 ## Source lifecycle and unavailable identity
 
 Persistent membership does not imply a live source session. Only `source_id` and `track_id` survive
 restart; a session epoch is deliberately transient.
 
-Record A can now validate a non-local identity internally against the exact current
-`SourceRegistry` source, epoch, accepted catalogue generation, and native track. Record B must use
-that result to make disconnect, source retirement, a missing server-side track, refresh, or session
-replacement visibly unavailable while leaving the database row intact. Reconnection may restore it
-only when the same `SourceId` publishes the same `TrackId`; endpoint similarity and metadata are
-not identity evidence.
+Record B validates every non-local identity against the exact current `SourceRegistry` source,
+epoch, accepted catalogue generation, capability, and native track. A currently unavailable or
+retired source, unsupported source, invalid catalogue, or missing server-side track makes the
+occurrence visibly unavailable while leaving its durable row and position intact; a missing or
+unmatched local identity follows the corresponding local unavailable path. The unavailable
+projection uses fixed localized state, not a persisted fingerprint or stale metadata snapshot, and
+remains removable by exact entry ID. Refresh, session replacement, or any other authority change
+instead discards stale projection work/results, invalidates the playlist, and projects it again.
+Reconnection may restore it only when the same `SourceId` publishes the same `TrackId`; endpoint
+similarity and metadata are not identity evidence.
 
-Until Record B exists, stored non-local fixtures remain intentionally outside the regular-
-playlist UI projection. This prevents the storage migration from accidentally treating durable
-identity as a locator or presenting a row that the current queue still assigns to the local source.
+An available row carries its actual media-owning source separately from the playlist view. Its
+queue item adopts only the guard returned for that current projection. Source refresh or retirement
+invalidates active and cached playlist projections, while at-use stream and artwork checks prevent
+an already queued item carrying a stale guard from crossing the lifecycle boundary.
 
 ## Ratings and playback history
 
-This migration does not transfer ownership of track metadata:
+These records do not transfer ownership of track metadata:
 
-- Tributary ratings remain writable only for tracks owned by the local library. A future remote
-  playlist row will display the live source's read-only or unsupported rating capability; this
-  schema persists no rating snapshot and grants no write authority.
+- Tributary ratings remain writable only for tracks owned by the local library. A remote playlist
+  row displays the current live source's read-only or unsupported rating capability; this schema
+  persists no rating snapshot and grants no write authority.
 - Playback history remains local-only. A local occurrence reached through a regular playlist can
-  still contribute to its exact local track. A future remote occurrence must not update the local
-  `tracks` table merely because it appears beside local entries.
+  still contribute to its exact local track. A remote occurrence does not update the local
+  `tracks` table merely because it appears beside local entries or has an equal native ID.
 
 See the [rating contract](ratings.md), [playback-history contract](playback-history.md), and
 [source-lifecycle architecture](architecture/source-lifecycle.md) for those independent authority
@@ -270,9 +305,11 @@ The storage record is complete only when automated coverage demonstrates:
   deletion/retirement cannot cascade into playlist storage, and no remote locator or credential is
   accepted or serialized.
 
-Mixed-source rendering, interaction, playback, unavailable-state presentation, and native
-Subsonic playlist tests belong to their explicitly deferred records rather than being claimed by
-the storage or authority foundations.
+The storage and authority foundation records do not retroactively claim their consumer. Native
+Subsonic playlist synchronization and mixed-source XSPF metadata export remain explicitly deferred
+and require their own validation. Until a no-locator mixed-source export policy exists, a regular
+playlist containing any remote or unresolved occurrence is refused all-or-none before XSPF touches
+its destination; the local-only compatibility projection is never exported as a truncated result.
 
 Record A additionally requires automated coverage for default-deny adapters, the four explicit
 authenticated opt-ins, Invalid playlist indexing for missing/duplicate catalogue-native identity,
@@ -280,4 +317,19 @@ sanitized metadata, stale epoch/generation rejection, predecessor retention duri
 failed replacement, invalidation after replacement/refresh, synchronous disconnect/shutdown/final-
 release denial, and pre/post-async stream and artwork revalidation. Ordered lookup must preserve
 duplicate requested occurrences and isolate one missing track's Unavailable result from valid
-neighbors. Passing those tests does not claim Add/Remove/render/Play UI integration.
+neighbors. Passing those tests alone does not claim Add/Remove/render/Play UI integration.
+
+Record B additionally requires automated coverage that the complete selected Add batch is resolved
+and admitted under commit-scoped authority all-or-none; local plus each of the four authenticated
+opt-ins are admitted while current radio, removable, external, unknown, unavailable, invalid, and
+missing cases write nothing, stale final acquisition rolls back staged writes, and lifecycle
+invalidation cannot cross an admitted commit. Projection tests preserve occurrence IDs,
+positions, and duplicates; retain every unavailable row without displaying fingerprints; discard
+stale projection work/results before current reprojection; and restore only exact reconnected
+identity. Remove tests address durable entry IDs atomically, including repeated and unavailable
+occurrences. Queue and artwork tests retain per-row media ownership, use the closed guard at use,
+and reject refresh, replacement, retirement, stale epoch/generation, and missing membership. Rating
+and history regressions prove
+that playlist membership grants neither remote rating mutation nor local-history ownership to a
+remote occurrence. Every new unavailable and mutation result is non-fallback localized across all
+13 shipped catalogues.

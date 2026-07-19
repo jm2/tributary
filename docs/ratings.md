@@ -32,10 +32,11 @@ are `Unsupported`, so a new or incomplete remote adapter fails closed.
 
 Regular-playlist migration 13 does not change that ownership. Its durable `(source_id, track_id)`
 pair records membership only; neither the entry nor its safe match fingerprint stores a rating or
-grants mutation authority. Current local playlist projections continue to edit the exact linked
-local row. A later mixed-source projection must obtain a remote row's ReadOnly or Unsupported value
-from the current live source catalogue rather than treating persisted membership as metadata
-authority. See the [playlist storage contract](source-scoped-playlists.md).
+grants mutation authority. An available local playlist row continues to edit the exact linked
+local track. An available authenticated remote row obtains its ReadOnly or Unsupported value only
+from the current live source catalogue; an unavailable row has no persisted rating snapshot to
+display. Playlist membership, a cached GTK row, or a stored fingerprint never authorizes a remote
+write. See the [playlist storage contract](source-scoped-playlists.md).
 
 ## Local persistence
 

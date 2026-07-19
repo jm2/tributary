@@ -5,13 +5,13 @@
 //! platform context-menu key / Shift+F10.
 
 use adw::prelude::*;
-use sea_orm::{EntityTrait, QueryFilter};
 use std::rc::Rc;
 
-use super::browser;
 use super::objects::{SourceObject, TrackObject};
-use super::tracklist;
 use super::window_state::WindowState;
+use crate::architecture::{MediaKey, SourceId, TrackId};
+use crate::local::playlist_manager::{PlaylistEntryAddOutcome, PlaylistEntryInput};
+use crate::source_registry::{RegularPlaylistTrackResolution, SourceRegistry};
 
 const CONTEXT_MENU_ACTION_GROUP: &str = "tracklist-ctx";
 
@@ -69,43 +69,154 @@ impl ContextMenuPopupPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlaylistAddSupport {
-    LocalLibrary,
-    UnsupportedSource,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PlaylistAddCandidate {
+    Local(MediaKey),
+    Remote {
+        media_key: MediaKey,
+        session_epoch: u64,
+        catalogue_generation: u64,
+    },
 }
 
-impl PlaylistAddSupport {
-    fn from_source_key(source_key: &str) -> Self {
-        if source_key == "local" {
-            Self::LocalLibrary
-        } else {
-            Self::UnsupportedSource
-        }
-    }
-
-    fn activation(self) -> PlaylistAddActivation {
+impl PlaylistAddCandidate {
+    #[cfg(test)]
+    fn media_key(&self) -> &MediaKey {
         match self {
-            Self::LocalLibrary => PlaylistAddActivation::WriteLocalPlaylist,
-            Self::UnsupportedSource => PlaylistAddActivation::ExplainUnsupportedSource,
+            Self::Local(media_key) | Self::Remote { media_key, .. } => media_key,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlaylistAddActivation {
-    WriteLocalPlaylist,
-    ExplainUnsupportedSource,
+struct PlaylistAddPlan {
+    inputs: Vec<PlaylistEntryInput>,
+    authority: Vec<RegularPlaylistTrackResolution>,
 }
 
-#[derive(Clone, Copy)]
-struct PlaylistAddInteraction<'a> {
-    window: &'a gtk::glib::WeakRef<adw::ApplicationWindow>,
-    support: PlaylistAddSupport,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaylistMutationOutcome {
+    Committed,
+    Rejected,
+    Failed,
+}
+
+#[derive(Clone)]
+struct PlaylistMutationContext {
+    window: gtk::glib::WeakRef<adw::ApplicationWindow>,
+    rt_handle: tokio::runtime::Handle,
+    source_registry: SourceRegistry,
+    track_store: gtk::gio::ListStore,
+    master_tracks: std::rc::Rc<std::cell::RefCell<Vec<TrackObject>>>,
+    source_tracks:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Vec<TrackObject>>>>,
+    active_source_key: std::rc::Rc<std::cell::RefCell<String>>,
+    source_navigation: std::rc::Rc<std::cell::RefCell<super::source_navigation::SourceNavigation>>,
+    browser_widget: gtk::Box,
+    browser_state: super::browser::BrowserState,
+    status_label: gtk::Label,
+    column_view: gtk::ColumnView,
+}
+
+impl PlaylistMutationContext {
+    fn from_window(state: &WindowState) -> Self {
+        Self {
+            window: state.window.downgrade(),
+            rt_handle: state.rt_handle.clone(),
+            source_registry: state.source_registry.clone(),
+            track_store: state.track_store.clone(),
+            master_tracks: state.master_tracks.clone(),
+            source_tracks: state.source_tracks.clone(),
+            active_source_key: state.active_source_key.clone(),
+            source_navigation: state.source_navigation.clone(),
+            browser_widget: state.browser_widget.clone(),
+            browser_state: state.browser_state.clone(),
+            status_label: state.status_label.clone(),
+            column_view: state.column_view.clone(),
+        }
+    }
+
+    fn owns_navigation(&self, source_key: &str) -> bool {
+        *self.active_source_key.borrow() == source_key
+            && self.source_navigation.borrow().is_key(source_key)
+    }
+
+    fn current_request(&self, source_key: &str) -> Option<super::source_navigation::SourceRequest> {
+        let navigation = self.source_navigation.borrow();
+        navigation
+            .latest_request(source_key)
+            .filter(|request| navigation.is_current(request))
+    }
+
+    fn owns_request(&self, request: &super::source_navigation::SourceRequest) -> bool {
+        *self.active_source_key.borrow() == request.source_key()
+            && self.source_navigation.borrow().is_current(request)
+    }
+
+    fn show_unsupported(&self) {
+        if let Some(window) = self.window.upgrade() {
+            show_unsupported_playlist_add_dialog(&window);
+        }
+    }
+
+    fn show_mutation_failed(&self) {
+        if let Some(window) = self.window.upgrade() {
+            show_playlist_mutation_failed_dialog(&window);
+        }
+    }
+
+    fn refresh_playlist_after_commit(&self, playlist_id: &str) {
+        let source_key = format!("{}{playlist_id}", super::playback::PLAYLIST_SOURCE_PREFIX);
+        self.source_navigation
+            .borrow_mut()
+            .invalidate_key(&source_key);
+        self.source_tracks.borrow_mut().remove(&source_key);
+        if !self.owns_navigation(&source_key) {
+            return;
+        }
+
+        let request = self
+            .source_navigation
+            .borrow_mut()
+            .select(source_key.clone());
+        // A committed removal must not leave the now-invalid occurrence
+        // actionable while the authoritative replacement projection loads.
+        // Add uses the same path so a playlist opened during the write cannot
+        // expose a stale pre-commit snapshot either.
+        super::window::display_tracks(
+            &[],
+            &self.track_store,
+            &self.master_tracks,
+            &self.browser_widget,
+            &self.browser_state,
+            &self.status_label,
+            &self.column_view,
+        );
+        super::source_connect::load_playlist_source(
+            self.rt_handle.clone(),
+            self.source_registry.clone(),
+            playlist_id.to_string(),
+            request,
+            self.source_navigation.clone(),
+            self.source_tracks.clone(),
+            self.active_source_key.clone(),
+            self.track_store.clone(),
+            self.master_tracks.clone(),
+            self.browser_widget.clone(),
+            self.browser_state.clone(),
+            self.status_label.clone(),
+            self.column_view.clone(),
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnsupportedPlaylistAddCopy {
+    heading: String,
+    body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlaylistMutationFailedCopy {
     heading: String,
     body: String,
 }
@@ -120,6 +231,24 @@ fn unsupported_playlist_add_copy(locale: &str) -> UnsupportedPlaylistAddCopy {
 
 fn show_unsupported_playlist_add_dialog(window: &adw::ApplicationWindow) {
     let copy = unsupported_playlist_add_copy(&rust_i18n::locale());
+    let dialog = adw::AlertDialog::builder()
+        .heading(&copy.heading)
+        .body(&copy.body)
+        .build();
+    dialog.add_response("ok", rust_i18n::t!("dialogs.ok").as_ref());
+    dialog.present(Some(window));
+}
+
+fn playlist_mutation_failed_copy(locale: &str) -> PlaylistMutationFailedCopy {
+    PlaylistMutationFailedCopy {
+        heading: rust_i18n::t!("regular_playlist.mutation_failed_heading", locale = locale)
+            .into_owned(),
+        body: rust_i18n::t!("regular_playlist.mutation_failed_body", locale = locale).into_owned(),
+    }
+}
+
+fn show_playlist_mutation_failed_dialog(window: &adw::ApplicationWindow) {
+    let copy = playlist_mutation_failed_copy(&rust_i18n::locale());
     let dialog = adw::AlertDialog::builder()
         .heading(&copy.heading)
         .body(&copy.body)
@@ -183,28 +312,19 @@ fn expose_context_menu_accessibility(column_view: &gtk::ColumnView) {
 /// open the same selection-snapshotted action model relative to the focused
 /// tracklist, and are consumed only when a non-empty menu was opened.
 pub fn setup_context_menu(state: &WindowState) {
-    // The controllers retaining `popup_menu` live below this window. Keep a
-    // weak handle so the action factory cannot form a window ownership cycle.
-    let window = state.window.downgrade();
     let sm = state.sort_model.clone();
     let sidebar_store = state.sidebar_store.clone();
     let active_source_key = state.active_source_key.clone();
-    let rt_handle = state.rt_handle.clone();
-    let track_store = state.track_store.clone();
-    let source_tracks = state.source_tracks.clone();
-    let source_navigation = state.source_navigation.clone();
-    let master_tracks = state.master_tracks.clone();
-    let status_label = state.status_label.clone();
-    let browser_widget = state.browser_widget.clone();
-    let browser_state = state.browser_state.clone();
+    let mutation_context = PlaylistMutationContext::from_window(state);
 
     let popup_menu = Rc::new(
         move |cv: &gtk::ColumnView, anchor: Option<gtk::gdk::Rectangle>| {
             let active_key = active_source_key.borrow().clone();
             let is_playlist_view = active_key.starts_with("playlist:");
-            let playlist_add_support = PlaylistAddSupport::from_source_key(&active_key);
 
-            // Collect selected track URIs from the MultiSelection model.
+            // Freeze exact selected row identities while constructing this
+            // one-shot popover. No later mutation consults a URI, source label,
+            // or whatever rows happen to occupy these GTK positions.
             let selection_model = cv.model();
             let Some(sel) = selection_model.and_then(|m| m.downcast::<gtk::MultiSelection>().ok())
             else {
@@ -220,6 +340,7 @@ pub fn setup_context_menu(state: &WindowState) {
 
             let menu = gtk::gio::Menu::new();
             let action_group = gtk::gio::SimpleActionGroup::new();
+            let interaction_request = mutation_context.current_request(&active_key);
 
             if is_playlist_view {
                 build_remove_from_playlist_action(
@@ -228,14 +349,8 @@ pub fn setup_context_menu(state: &WindowState) {
                     &active_key,
                     &sm,
                     &popup_plan.selection,
-                    &rt_handle,
-                    &track_store,
-                    &source_tracks,
-                    &source_navigation,
-                    &master_tracks,
-                    &status_label,
-                    &browser_widget,
-                    &browser_state,
+                    interaction_request.as_ref(),
+                    &mutation_context,
                 );
             } else {
                 build_add_to_playlist_actions(
@@ -244,11 +359,8 @@ pub fn setup_context_menu(state: &WindowState) {
                     &sidebar_store,
                     &sm,
                     &popup_plan.selection,
-                    &rt_handle,
-                    PlaylistAddInteraction {
-                        window: &window,
-                        support: playlist_add_support,
-                    },
+                    interaction_request.as_ref(),
+                    &mutation_context,
                 );
             }
 
@@ -338,165 +450,74 @@ pub fn setup_context_menu(state: &WindowState) {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Build the "Remove from Playlist" action for playlist views.
-#[allow(clippy::too_many_arguments)]
 fn build_remove_from_playlist_action(
     menu: &gtk::gio::Menu,
     action_group: &gtk::gio::SimpleActionGroup,
     active_key: &str,
     sm: &gtk::SortListModel,
     selection: &SelectionSnapshot,
-    rt_handle: &tokio::runtime::Handle,
-    track_store: &gtk::gio::ListStore,
-    source_tracks: &std::rc::Rc<
-        std::cell::RefCell<std::collections::HashMap<String, Vec<TrackObject>>>,
-    >,
-    source_navigation: &std::rc::Rc<std::cell::RefCell<super::source_navigation::SourceNavigation>>,
-    master_tracks: &std::rc::Rc<std::cell::RefCell<Vec<TrackObject>>>,
-    status_label: &gtk::Label,
-    browser_widget: &gtk::Box,
-    browser_state: &browser::BrowserState,
+    interaction_request: Option<&super::source_navigation::SourceRequest>,
+    context: &PlaylistMutationContext,
 ) {
-    let playlist_id = active_key
-        .strip_prefix("playlist:")
-        .unwrap_or("")
-        .to_string();
-    let rt = rt_handle.clone();
-    let track_store = track_store.clone();
-    let source_tracks = source_tracks.clone();
-    let source_navigation = source_navigation.clone();
-    let master_tracks = master_tracks.clone();
-    let status_label = status_label.clone();
-    let browser_widget = browser_widget.clone();
-    let browser_state = browser_state.clone();
-    let active_key = active_key.to_string();
-
-    // Collect URIs of selected tracks.
-    let selected_uris = collect_selected_uris(sm, selection);
+    let Some(playlist_id) = active_key
+        .strip_prefix(super::playback::PLAYLIST_SOURCE_PREFIX)
+        .filter(|playlist_id| !playlist_id.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(entry_ids) = collect_selected_playlist_entry_ids(sm, selection) else {
+        // Smart-playlist and malformed rows do not carry durable occurrence
+        // bindings. Hiding the action avoids pretending a live query can be
+        // mutated like a regular playlist.
+        return;
+    };
 
     let remove_action = gtk::gio::SimpleAction::new("remove-from-playlist", None);
-    let uris = selected_uris;
+    let interaction_request = interaction_request.cloned();
+    let context = context.clone();
     remove_action.connect_activate(move |_, _| {
-        let pid = playlist_id.clone();
-        let uris = uris.clone();
-        let track_store = track_store.clone();
-        let source_tracks = source_tracks.clone();
-        let source_navigation = source_navigation.clone();
-        let master_tracks = master_tracks.clone();
-        let status_label = status_label.clone();
-        let browser_widget = browser_widget.clone();
-        let browser_state = browser_state.clone();
-        let active_key = active_key.clone();
-
-        // A popover action can outlive the rows it was built for. It must not
-        // mutate another source, and an already-running refresh must not put
-        // the just-removed entry back afterward.
-        if !source_navigation.borrow().is_key(&active_key) {
+        let Some(request) = interaction_request.as_ref() else {
+            return;
+        };
+        if !context.owns_request(request) {
             return;
         }
-        source_navigation.borrow_mut().select(active_key.clone());
 
-        // Remove from the visible store immediately. Honour the per-URI
-        // selection count so that selecting one of N duplicate rows removes
-        // exactly one occurrence, not all N.
-        let mut remaining = selection_counts(&uris);
-        let mut i: u32 = 0;
-        while i < track_store.n_items() {
-            let uri = track_store
-                .item(i)
-                .and_downcast::<TrackObject>()
-                .map(|t| t.uri());
-            let mut remove = false;
-            if let Some(u) = uri.as_deref() {
-                if let Some(count) = remaining.get_mut(u) {
-                    if *count > 0 {
-                        *count -= 1;
-                        remove = true;
-                    }
-                }
-            }
-            if remove {
-                track_store.remove(i);
-                // Don't advance `i` — the next item shifted down into
-                // this slot.
-            } else {
-                i += 1;
-            }
-        }
-
-        // Update master + status (same per-URI count limit as the store).
-        {
-            let mut st = source_tracks.borrow_mut();
-            if let Some(tracks) = st.get_mut(&active_key) {
-                let mut remaining = selection_counts(&uris);
-                tracks.retain(|t| match remaining.get_mut(t.uri().as_str()) {
-                    Some(count) if *count > 0 => {
-                        *count -= 1;
-                        false // remove this occurrence
-                    }
-                    _ => true, // keep
-                });
-            }
-        }
-        let st = source_tracks.borrow();
-        let current = st.get(&active_key).cloned().unwrap_or_default();
-        *master_tracks.borrow_mut() = current.clone();
-        tracklist::update_status(&status_label, &current);
-        browser::rebuild_browser_data(&browser_widget, &browser_state, &current);
-
-        // Remove from DB in background.
-        rt.spawn(async move {
-            match crate::db::connection::init_db().await {
+        let pid = playlist_id.clone();
+        let ids = entry_ids.clone();
+        let removed_count = ids.len();
+        let (result_tx, result_rx) = async_channel::bounded(1);
+        context.rt_handle.spawn(async move {
+            let outcome = match crate::db::connection::init_db().await {
                 Ok(db) => {
-                    let mgr = crate::local::playlist_manager::PlaylistManager::new(db.clone());
-                    // Get all entries for this playlist, match by track file path.
-                    if let Ok(entries) = crate::db::entities::playlist_entry::Entity::find()
-                        .filter(
-                            <crate::db::entities::playlist_entry::Column as sea_orm::ColumnTrait>::eq(
-                                &crate::db::entities::playlist_entry::Column::PlaylistId,
-                                &pid,
-                            ),
-                        )
-                        .filter(
-                            <crate::db::entities::playlist_entry::Column as sea_orm::ColumnTrait>::eq(
-                                &crate::db::entities::playlist_entry::Column::SourceId,
-                                crate::architecture::SourceId::local().to_string(),
-                            ),
-                        )
-                        .filter(
-                            <crate::db::entities::playlist_entry::Column as sea_orm::ColumnTrait>::is_not_null(
-                                &crate::db::entities::playlist_entry::Column::LocalTrackId,
-                            ),
-                        )
-                        .all(&db)
-                        .await
-                    {
-                        // Honour the per-URI selection count so duplicate
-                        // entries are removed one-for-one with the selected
-                        // rows rather than all at once.
-                        let mut remaining = selection_counts(&uris);
-                        for entry in entries {
-                            if let Some(ref track_id) = entry.local_track_id {
-                                // Look up the track to get its file path / URI.
-                                if let Ok(Some(track)) = crate::db::entities::track::Entity::find_by_id(track_id.clone())
-                                    .one(&db)
-                                    .await
-                                {
-                                    let track_uri = url::Url::from_file_path(&track.file_path)
-                                        .map(|u| u.to_string())
-                                        .unwrap_or_default();
-                                    if let Some(count) = remaining.get_mut(track_uri.as_str()) {
-                                        if *count > 0 {
-                                            *count -= 1;
-                                            let _ = mgr.remove_entry(&entry.id).await;
-                                        }
-                                    }
-                                }
-                            }
+                    let manager = crate::local::playlist_manager::PlaylistManager::new(db);
+                    match manager.remove_entries(&pid, &ids).await {
+                        Ok(()) => PlaylistMutationOutcome::Committed,
+                        Err(error) => {
+                            tracing::error!(%error, playlist = %pid, "Failed to remove exact playlist occurrences");
+                            PlaylistMutationOutcome::Failed
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to open DB for playlist remove");
+                Err(error) => {
+                    tracing::error!(%error, "Failed to open DB for playlist removal");
+                    PlaylistMutationOutcome::Failed
+                }
+            };
+            let _ = result_tx.send(outcome).await;
+        });
+
+        let context = context.clone();
+        let playlist_id = playlist_id.clone();
+        gtk::glib::MainContext::default().spawn_local(async move {
+            match result_rx.recv().await {
+                Ok(PlaylistMutationOutcome::Committed) => {
+                    tracing::info!(playlist = %playlist_id, count = removed_count, "Playlist occurrences removed");
+                    context.refresh_playlist_after_commit(&playlist_id);
+                }
+                Ok(PlaylistMutationOutcome::Rejected | PlaylistMutationOutcome::Failed) | Err(_) => {
+                    context.show_mutation_failed();
                 }
             }
         });
@@ -515,10 +536,11 @@ fn build_add_to_playlist_actions(
     sidebar_store: &gtk::gio::ListStore,
     sm: &gtk::SortListModel,
     selection: &SelectionSnapshot,
-    rt_handle: &tokio::runtime::Handle,
-    interaction: PlaylistAddInteraction<'_>,
+    interaction_request: Option<&super::source_navigation::SourceRequest>,
+    context: &PlaylistMutationContext,
 ) {
     let mut has_playlists = false;
+    let candidates = collect_selected_add_candidates(sm, selection);
 
     // Find all regular playlists from the sidebar store.
     let n = sidebar_store.n_items();
@@ -541,78 +563,91 @@ fn build_add_to_playlist_actions(
                 let pl_name = src.name();
                 let pl_id = src.playlist_id();
                 let action_name = format!("add-to-{}", pl_id.replace('-', "_"));
-
-                // Collect selected URIs.
-                let selected_uris = collect_selected_uris(sm, selection);
-
-                let rt = rt_handle.clone();
                 let add_action = gtk::gio::SimpleAction::new(&action_name, None);
-                let uris = selected_uris;
                 let pid = pl_id.clone();
-                // Materialize a fresh owned weak handle for the `'static`
-                // action closure; never let the borrowed factory input escape.
-                let window = interaction
-                    .window
-                    .upgrade()
-                    .map(|window| window.downgrade());
-                let activation = interaction.support.activation();
+                let interaction_request = interaction_request.cloned();
+                let candidates = candidates.clone();
+                let context = context.clone();
                 add_action.connect_activate(move |_, _| {
-                    if activation == PlaylistAddActivation::ExplainUnsupportedSource {
-                        if let Some(window) = window.as_ref().and_then(|window| window.upgrade()) {
-                            show_unsupported_playlist_add_dialog(&window);
-                        }
+                    let Some(request) = interaction_request.as_ref() else {
+                        context.show_unsupported();
+                        return;
+                    };
+                    if !context.owns_request(request) {
+                        context.show_unsupported();
                         return;
                     }
 
-                    let uris = uris.clone();
+                    let Some(candidates) = candidates.clone() else {
+                        context.show_unsupported();
+                        return;
+                    };
+                    let Ok(plan) =
+                        prepare_playlist_add_plan(&context.source_registry, &candidates)
+                    else {
+                        context.show_unsupported();
+                        return;
+                    };
+
                     let pid = pid.clone();
-                    rt.spawn(async move {
-                        match crate::db::connection::init_db().await {
+                    let worker_pid = pid.clone();
+                    let registry = context.source_registry.clone();
+                    let (result_tx, result_rx) = async_channel::bounded(1);
+                    context.rt_handle.spawn(async move {
+                        let outcome = match crate::db::connection::init_db().await {
                             Ok(db) => {
-                                let mgr = crate::local::playlist_manager::PlaylistManager::new(db.clone());
-                                let mut added = 0usize;
-                                let mut skipped = 0usize;
-                                for uri in &uris {
-                                    // Convert file:// URI back to path, find track in DB.
-                                    // Remote (http/https) tracks have no local DB row and
-                                    // cannot be added to a local playlist — count them as
-                                    // skipped rather than dropping them silently.
-                                    let mut ok = false;
-                                    if let Ok(url) = url::Url::parse(uri) {
-                                        if let Ok(path) = url.to_file_path() {
-                                            let path_str = path.to_string_lossy().to_string();
-                                            if let Ok(Some(track)) = <crate::db::entities::track::Entity as sea_orm::EntityTrait>::find()
-                                                .filter(<crate::db::entities::track::Column as sea_orm::ColumnTrait>::eq(
-                                                    &crate::db::entities::track::Column::FilePath,
-                                                    &path_str,
-                                                ))
-                                                .one(&db)
-                                                .await
-                                            {
-                                                ok = mgr.add_track(&pid, &track).await.is_ok();
-                                            }
-                                        }
+                                let manager =
+                                    crate::local::playlist_manager::PlaylistManager::new(db);
+                                // Stage the complete ordered mutation first,
+                                // then acquire exact live authority at the
+                                // transaction's final commit boundary. The
+                                // manager retains it through commit; stale
+                                // acquisition rejects and rolls back every
+                                // staged insert.
+                                match manager
+                                    .add_entries_if_authorized(
+                                        &worker_pid,
+                                        &plan.inputs,
+                                        || {
+                                            registry.acquire_regular_playlist_commit_authority(
+                                                &plan.authority,
+                                            )
+                                        },
+                                    )
+                                    .await
+                                {
+                                    Ok(PlaylistEntryAddOutcome::Committed(_)) => {
+                                        PlaylistMutationOutcome::Committed
                                     }
-                                    if ok {
-                                        added += 1;
-                                    } else {
-                                        skipped += 1;
+                                    Ok(PlaylistEntryAddOutcome::Rejected) => {
+                                        PlaylistMutationOutcome::Rejected
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(%error, playlist = %worker_pid, "Failed to add exact playlist occurrences");
+                                        PlaylistMutationOutcome::Failed
                                     }
                                 }
-                                if skipped > 0 {
-                                    tracing::warn!(
-                                        playlist = %pid,
-                                        added,
-                                        skipped,
-                                        "Some tracks could not be added (remote or missing tracks aren't supported in local playlists)"
-                                    );
-                                }
-                                // Report the count actually inserted, not the
-                                // full selection size.
-                                tracing::info!(playlist = %pid, count = added, "Tracks added to playlist");
                             }
-                            Err(e) => {
-                                tracing::error!(error = %e, "Failed to open DB for playlist add");
+                            Err(error) => {
+                                tracing::error!(%error, "Failed to open DB for playlist add");
+                                PlaylistMutationOutcome::Failed
+                            }
+                        };
+                        let _ = result_tx.send(outcome).await;
+                    });
+
+                    let context = context.clone();
+                    let playlist_id = pid.clone();
+                    let count = candidates.len();
+                    gtk::glib::MainContext::default().spawn_local(async move {
+                        match result_rx.recv().await {
+                            Ok(PlaylistMutationOutcome::Committed) => {
+                                tracing::info!(playlist = %playlist_id, count, "Tracks added to playlist");
+                                context.refresh_playlist_after_commit(&playlist_id);
+                            }
+                            Ok(PlaylistMutationOutcome::Rejected) => context.show_unsupported(),
+                            Ok(PlaylistMutationOutcome::Failed) | Err(_) => {
+                                context.show_mutation_failed();
                             }
                         }
                     });
@@ -625,6 +660,158 @@ fn build_add_to_playlist_actions(
             }
         }
     }
+}
+
+fn collect_selected_add_candidates(
+    sm: &gtk::SortListModel,
+    selection: &SelectionSnapshot,
+) -> Option<Vec<PlaylistAddCandidate>> {
+    selection
+        .positions
+        .iter()
+        .map(|position| {
+            let track = sm.item(*position)?.downcast::<TrackObject>().ok()?;
+            playlist_add_candidate(&track)
+        })
+        .collect()
+}
+
+fn playlist_add_candidate(track: &TrackObject) -> Option<PlaylistAddCandidate> {
+    let source_id = track.source_id()?;
+    let track_id = if source_id == SourceId::local() {
+        TrackId::new(track.track_id()).ok()?
+    } else {
+        TrackId::remote(track.track_id()).ok()?
+    };
+    let media_key = MediaKey::new(source_id, track_id);
+    if source_id == SourceId::local() {
+        Some(PlaylistAddCandidate::Local(media_key))
+    } else {
+        Some(PlaylistAddCandidate::Remote {
+            media_key,
+            session_epoch: track.source_session_epoch()?,
+            catalogue_generation: track.source_catalogue_generation()?,
+        })
+    }
+}
+
+fn prepare_playlist_add_plan(
+    registry: &SourceRegistry,
+    candidates: &[PlaylistAddCandidate],
+) -> Result<PlaylistAddPlan, ()> {
+    if candidates.is_empty() {
+        return Err(());
+    }
+    let remote_keys = candidates
+        .iter()
+        .filter_map(|candidate| match candidate {
+            PlaylistAddCandidate::Local(_) => None,
+            PlaylistAddCandidate::Remote { media_key, .. } => Some(media_key.clone()),
+        })
+        .collect::<Vec<_>>();
+    let authority = registry.resolve_regular_playlist_tracks(&remote_keys);
+    prepare_playlist_add_plan_from_authority(candidates, authority)
+}
+
+fn prepare_playlist_add_plan_from_authority(
+    candidates: &[PlaylistAddCandidate],
+    authority: Vec<RegularPlaylistTrackResolution>,
+) -> Result<PlaylistAddPlan, ()> {
+    let expected_remote = candidates
+        .iter()
+        .filter(|candidate| matches!(candidate, PlaylistAddCandidate::Remote { .. }))
+        .count();
+    if candidates.is_empty() || authority.len() != expected_remote {
+        return Err(());
+    }
+
+    let mut remote = authority.iter();
+    let mut inputs = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        match candidate {
+            PlaylistAddCandidate::Local(media_key) => {
+                // PlaylistManager resolves and snapshots exact local metadata
+                // inside the write transaction. Cached GTK metadata is never
+                // treated as persistence authority.
+                inputs.push(PlaylistEntryInput::new(media_key.clone(), "", "", "", None));
+            }
+            PlaylistAddCandidate::Remote {
+                media_key,
+                session_epoch,
+                catalogue_generation,
+            } => {
+                let Some(RegularPlaylistTrackResolution::Available(track)) = remote.next() else {
+                    return Err(());
+                };
+                let guard = track.guard();
+                if track.media_key() != media_key
+                    || !catalogue_observation_matches(
+                        media_key.source_id,
+                        *session_epoch,
+                        *catalogue_generation,
+                        guard.source_id(),
+                        guard.session_epoch(),
+                        guard.catalogue_generation(),
+                    )
+                {
+                    return Err(());
+                }
+                let metadata = track.metadata();
+                inputs.push(PlaylistEntryInput::new(
+                    media_key.clone(),
+                    metadata.title(),
+                    metadata.artist_name(),
+                    metadata.album_title(),
+                    metadata.duration_secs(),
+                ));
+            }
+        }
+    }
+    if remote.next().is_some() {
+        return Err(());
+    }
+    Ok(PlaylistAddPlan { inputs, authority })
+}
+
+fn catalogue_observation_matches(
+    expected_source: SourceId,
+    expected_epoch: u64,
+    expected_generation: u64,
+    actual_source: SourceId,
+    actual_epoch: u64,
+    actual_generation: u64,
+) -> bool {
+    expected_source == actual_source
+        && expected_epoch == actual_epoch
+        && expected_generation == actual_generation
+}
+
+fn collect_selected_playlist_entry_ids(
+    sm: &gtk::SortListModel,
+    selection: &SelectionSnapshot,
+) -> Option<Vec<String>> {
+    let bindings = selection.positions.iter().map(|position| {
+        sm.item(*position)
+            .and_downcast::<TrackObject>()
+            .and_then(|track| track.playlist_occurrence_binding())
+    });
+    exact_playlist_entry_ids(bindings)
+}
+
+fn exact_playlist_entry_ids(
+    bindings: impl IntoIterator<Item = Option<super::objects::PlaylistOccurrenceBinding>>,
+) -> Option<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut entry_ids = Vec::new();
+    for binding in bindings {
+        let binding = binding?;
+        let entry_id = binding.entry_id().to_string();
+        if !seen.insert(entry_id.clone()) {
+            return None;
+        }
+        entry_ids.push(entry_id);
+    }
+    (!entry_ids.is_empty()).then_some(entry_ids)
 }
 
 /// Build the "Properties…" action for selected tracks.
@@ -727,33 +914,6 @@ fn active_source_is_automatic_device(
     })
 }
 
-/// Build a map of `uri -> number of selected rows with that uri`.
-///
-/// A playlist may legitimately contain the same track more than once, so
-/// removal must honour the count of selected rows (remove exactly N
-/// occurrences) rather than treating the selection as a set and deleting
-/// every matching entry.
-fn selection_counts(uris: &[String]) -> std::collections::HashMap<&str, usize> {
-    let mut counts = std::collections::HashMap::new();
-    for uri in uris {
-        *counts.entry(uri.as_str()).or_insert(0) += 1;
-    }
-    counts
-}
-
-/// Collect URIs of selected tracks from the sort model.
-fn collect_selected_uris(sm: &gtk::SortListModel, selection: &SelectionSnapshot) -> Vec<String> {
-    let mut uris = Vec::new();
-    for &position in &selection.positions {
-        if let Some(item) = sm.item(position) {
-            if let Some(track) = item.downcast_ref::<TrackObject>() {
-                uris.push(track.uri());
-            }
-        }
-    }
-    uris
-}
-
 /// Traverse a `PopoverMenu`'s widget tree and disable scrollbars on any
 /// internal `ScrolledWindow`.  GTK4's `PopoverMenu::from_model()` wraps
 /// its content in a `ScrolledWindow` that adds unnecessary scrollbars
@@ -779,46 +939,218 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn playlist_add_support_is_exactly_local_and_fail_closed() {
-        assert_eq!(
-            PlaylistAddSupport::from_source_key("local"),
-            PlaylistAddSupport::LocalLibrary
-        );
-        assert_eq!(
-            PlaylistAddSupport::from_source_key("local").activation(),
-            PlaylistAddActivation::WriteLocalPlaylist
-        );
-
-        let remote = crate::architecture::SourceId::remote(
-            "subsonic",
-            &url::Url::parse("https://music.example.test/root/").expect("remote URL"),
-        )
-        .expect("remote source ID")
-        .to_string();
-        let radio = crate::architecture::SourceId::radio_browser().to_string();
-        let removable = crate::architecture::SourceId::removable("device:opaque-id")
-            .expect("removable source ID")
-            .to_string();
-
-        for source_key in [
-            remote.as_str(),
-            radio.as_str(),
-            removable.as_str(),
-            "playlist:local-view",
-            "remote-looking-but-malformed",
-            "",
-        ] {
-            assert_eq!(
-                PlaylistAddSupport::from_source_key(source_key),
-                PlaylistAddSupport::UnsupportedSource,
-                "{source_key:?} must not enter the local-only playlist write path"
-            );
-            assert_eq!(
-                PlaylistAddSupport::from_source_key(source_key).activation(),
-                PlaylistAddActivation::ExplainUnsupportedSource
-            );
+    fn remote_catalogue_track(
+        track_id: TrackId,
+        title: &str,
+    ) -> crate::architecture::models::Track {
+        crate::architecture::models::Track {
+            id: uuid::Uuid::new_v4(),
+            native_track_id: Some(track_id),
+            title: title.to_string(),
+            artist_name: "Current remote artist".to_string(),
+            album_artist_name: None,
+            artist_id: None,
+            album_title: "Current remote album".to_string(),
+            album_id: None,
+            track_number: Some(4),
+            disc_number: Some(1),
+            duration_secs: Some(245),
+            composer: None,
+            genre: Some("Remote genre".to_string()),
+            year: Some(2026),
+            file_path: Some("/private/must-not-cross.mp3".to_string()),
+            stream_url: Some(
+                url::Url::parse("https://secret.invalid/audio?token=private")
+                    .expect("fixture stream URL"),
+            ),
+            cover_art_url: Some(
+                url::Url::parse("https://secret.invalid/art?token=private")
+                    .expect("fixture artwork URL"),
+            ),
+            date_added: None,
+            date_modified: None,
+            bitrate_kbps: Some(320),
+            sample_rate_hz: Some(48_000),
+            format: Some("mp3".to_string()),
+            play_count: Some(12),
+            rating: crate::architecture::models::TrackRating::read_only(None),
+            last_played: None,
         }
+    }
+
+    #[test]
+    fn local_add_candidates_use_exact_row_identity_in_selection_order() {
+        let first = TrackObject::new(
+            1,
+            "Cached title must not authorize storage",
+            60,
+            "Artist",
+            "Album",
+            "",
+            "",
+            0,
+            "",
+            0,
+            0,
+            0,
+            "",
+            "file:///private/first.flac",
+        );
+        first.set_track_id("first-id");
+        assert!(first.set_source_id(SourceId::local()));
+        let second = TrackObject::new(
+            2,
+            "Second",
+            60,
+            "Artist",
+            "Album",
+            "",
+            "",
+            0,
+            "",
+            0,
+            0,
+            0,
+            "",
+            "file:///private/second.flac",
+        );
+        second.set_track_id("second-id");
+        assert!(second.set_source_id(SourceId::local()));
+
+        let candidates = [&second, &first]
+            .into_iter()
+            .map(playlist_add_candidate)
+            .collect::<Option<Vec<_>>>()
+            .expect("exact local candidates");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.media_key().track_id.as_str())
+                .collect::<Vec<_>>(),
+            ["second-id", "first-id"]
+        );
+        assert!(candidates
+            .iter()
+            .all(|candidate| matches!(candidate, PlaylistAddCandidate::Local(_))));
+    }
+
+    #[test]
+    fn mixed_add_plan_consumes_exact_available_remote_authority_in_order() {
+        let local_key = MediaKey::new(
+            SourceId::local(),
+            TrackId::new("local-track").expect("local track ID"),
+        );
+        let remote_source = SourceId::random();
+        let remote_id = TrackId::remote("remote-track").expect("remote track ID");
+        let remote_key = MediaKey::new(remote_source, remote_id.clone());
+        let remote_track = remote_catalogue_track(remote_id, "Current remote title");
+        let available = crate::source_registry::RegularPlaylistTrack::for_ui_test(
+            remote_key.clone(),
+            7,
+            11,
+            &remote_track,
+        );
+        let candidates = vec![
+            PlaylistAddCandidate::Local(local_key.clone()),
+            PlaylistAddCandidate::Remote {
+                media_key: remote_key.clone(),
+                session_epoch: 7,
+                catalogue_generation: 11,
+            },
+            PlaylistAddCandidate::Remote {
+                media_key: remote_key.clone(),
+                session_epoch: 7,
+                catalogue_generation: 11,
+            },
+        ];
+        let authority = vec![
+            RegularPlaylistTrackResolution::Available(Box::new(available.clone())),
+            RegularPlaylistTrackResolution::Available(Box::new(available)),
+        ];
+
+        let plan = prepare_playlist_add_plan_from_authority(&candidates, authority)
+            .expect("exact current mixed selection");
+        assert_eq!(
+            plan.inputs
+                .iter()
+                .map(|input| &input.media_key)
+                .collect::<Vec<_>>(),
+            [&local_key, &remote_key, &remote_key]
+        );
+        assert_eq!(plan.inputs[0].title, "");
+        for input in &plan.inputs[1..] {
+            assert_eq!(input.title, "Current remote title");
+            assert_eq!(input.artist, "Current remote artist");
+            assert_eq!(input.album, "Current remote album");
+            assert_eq!(input.duration_secs, Some(245));
+            let rendered = format!("{input:?}");
+            assert!(!rendered.contains("secret.invalid"));
+            assert!(!rendered.contains("token=private"));
+            assert!(!rendered.contains("must-not-cross"));
+        }
+        assert_eq!(plan.authority.len(), 2);
+
+        let stale = vec![RegularPlaylistTrackResolution::Available(Box::new(
+            crate::source_registry::RegularPlaylistTrack::for_ui_test(
+                remote_key,
+                7,
+                12,
+                &remote_track,
+            ),
+        ))];
+        assert!(prepare_playlist_add_plan_from_authority(&candidates[..2], stale).is_err());
+    }
+
+    #[test]
+    fn exact_remove_plan_preserves_duplicate_media_occurrences_but_rejects_duplicate_entry_ids() {
+        let track_id = TrackId::new("same-media").expect("track ID");
+        let first = super::super::objects::PlaylistOccurrenceBinding::available_local(
+            "entry-one",
+            track_id.clone(),
+        )
+        .expect("first occurrence");
+        let duplicate = super::super::objects::PlaylistOccurrenceBinding::available_local(
+            "entry-two",
+            track_id,
+        )
+        .expect("duplicate occurrence");
+        assert_eq!(
+            exact_playlist_entry_ids([Some(first.clone()), Some(duplicate)]),
+            Some(vec!["entry-one".to_string(), "entry-two".to_string()])
+        );
+        assert!(exact_playlist_entry_ids([Some(first.clone()), Some(first)]).is_none());
+    }
+
+    #[test]
+    fn remove_is_hidden_for_smart_or_unbound_rows_but_accepts_unavailable_occurrences() {
+        assert!(exact_playlist_entry_ids([None]).is_none());
+        let unavailable = super::super::objects::PlaylistOccurrenceBinding::unavailable(
+            "missing-entry",
+            SourceId::local(),
+            Some(TrackId::new("missing-track").expect("track ID")),
+            super::super::objects::PlaylistRowUnavailableReason::LocalTrackMissing,
+        )
+        .expect("unavailable durable occurrence");
+        assert_eq!(
+            exact_playlist_entry_ids([Some(unavailable)]),
+            Some(vec!["missing-entry".to_string()])
+        );
+    }
+
+    #[test]
+    fn catalogue_observation_rejects_stale_source_epoch_or_generation() {
+        let source = SourceId::random();
+        assert!(catalogue_observation_matches(source, 7, 11, source, 7, 11));
+        assert!(!catalogue_observation_matches(
+            source,
+            7,
+            11,
+            SourceId::random(),
+            7,
+            11
+        ));
+        assert!(!catalogue_observation_matches(source, 7, 11, source, 8, 11));
+        assert!(!catalogue_observation_matches(source, 7, 11, source, 7, 12));
     }
 
     #[test]
@@ -829,6 +1161,22 @@ mod tests {
 
         for locale in rust_i18n::available_locales!() {
             let localized = unsupported_playlist_add_copy(&locale);
+            assert!(!localized.heading.is_empty(), "{locale}: empty heading");
+            assert!(!localized.body.is_empty(), "{locale}: empty body");
+            if locale != "en" {
+                assert_ne!(localized, english, "{locale} must not fall back to English");
+            }
+        }
+    }
+
+    #[test]
+    fn playlist_mutation_failure_copy_is_localized_for_every_catalog() {
+        let english = playlist_mutation_failed_copy("en");
+        assert!(!english.heading.is_empty());
+        assert!(!english.body.is_empty());
+
+        for locale in rust_i18n::available_locales!() {
+            let localized = playlist_mutation_failed_copy(&locale);
             assert!(!localized.heading.is_empty(), "{locale}: empty heading");
             assert!(!localized.body.is_empty(), "{locale}: empty body");
             if locale != "en" {

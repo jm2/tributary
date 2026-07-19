@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "Выбранный плейлист больше не существует."
   smart_playlist_evaluation_failed: "Не удалось вычислить смарт-плейлист: %{error}"
   playlist_tracks_read_failed: "Не удалось прочитать композиции плейлиста: %{error}"
+  export_local_only_unsupported_body: "Этот плейлист содержит удалённые или недоступные элементы. Сейчас экспорт XSPF поддерживает только плейлисты, все элементы которых доступны в локальной медиатеке."
   writer_worker_failed: "Процесс записи XSPF остановился: %{error}"
   write_failed: "Не удалось записать файл XSPF: %{error}"
   export_success_heading: "Плейлист XSPF экспортирован"
@@ -190,7 +191,17 @@ context:
   add_to_playlist: "Добавить в плейлист"
   remove_from_playlist: "Удалить из плейлиста"
   playlist_add_unsupported_heading: "Композиции не добавлены"
-  playlist_add_unsupported_body: "Сейчас в плейлисты можно добавлять только композиции из локальной медиатеки Tributary. Из этого источника ничего не добавлено."
+  playlist_add_unsupported_body: "По крайней мере одна выбранная композиция недоступна или не поддерживается в обычных плейлистах. Ничего не добавлено."
+
+# ── Обычные плейлисты ───────────────────────────────────────────
+regular_playlist:
+  unavailable_track: "Недоступная композиция"
+  source_unavailable: "Источник отключён или недоступен"
+  source_unsupported: "Этот источник нельзя использовать в обычных плейлистах"
+  source_catalogue_unavailable: "Медиатека источника недоступна"
+  track_missing: "Композиции больше нет в этом источнике"
+  mutation_failed_heading: "Плейлист не обновлён"
+  mutation_failed_body: "Tributary не удалось обновить плейлист. Ничего не изменено."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "Wybrana lista już nie istnieje."
   smart_playlist_evaluation_failed: "Nie można obliczyć inteligentnej listy: %{error}"
   playlist_tracks_read_failed: "Nie można odczytać utworów z listy: %{error}"
+  export_local_only_unsupported_body: "Ta lista zawiera zdalne lub niedostępne pozycje. Eksport XSPF obsługuje obecnie tylko listy, których wszystkie pozycje są dostępne w lokalnej bibliotece."
   writer_worker_failed: "Proces zapisu XSPF został zatrzymany: %{error}"
   write_failed: "Nie można zapisać pliku XSPF: %{error}"
   export_success_heading: "Wyeksportowano listę XSPF"
@@ -190,7 +191,17 @@ context:
   add_to_playlist: "Dodaj do listy odtwarzania"
   remove_from_playlist: "Usuń z listy odtwarzania"
   playlist_add_unsupported_heading: "Utwory nie zostały dodane"
-  playlist_add_unsupported_body: "Obecnie do list odtwarzania można dodawać tylko utwory z lokalnej biblioteki Tributary. Nie dodano niczego z tego źródła."
+  playlist_add_unsupported_body: "Co najmniej jeden wybrany utwór jest niedostępny lub nie jest obsługiwany w zwykłych listach odtwarzania. Nic nie dodano."
+
+# ── Zwykłe listy odtwarzania ───────────────────────────────────────
+regular_playlist:
+  unavailable_track: "Niedostępny utwór"
+  source_unavailable: "Źródło jest rozłączone lub niedostępne"
+  source_unsupported: "Tego źródła nie można używać w zwykłych listach odtwarzania"
+  source_catalogue_unavailable: "Biblioteka źródła jest niedostępna"
+  track_missing: "Utwór nie istnieje już w tym źródle"
+  mutation_failed_heading: "Lista odtwarzania nie została zaktualizowana"
+  mutation_failed_body: "Nie udało się zaktualizować listy odtwarzania w Tributary. Niczego nie zmieniono."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

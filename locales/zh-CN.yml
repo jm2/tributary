@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "所选播放列表已不存在。"
   smart_playlist_evaluation_failed: "无法计算智能播放列表：%{error}"
   playlist_tracks_read_failed: "无法读取播放列表中的曲目：%{error}"
+  export_local_only_unsupported_body: "此播放列表包含远程或不可用的条目。目前，XSPF 导出仅支持所有条目都可在本地媒体库中使用的播放列表。"
   writer_worker_failed: "XSPF 写入进程已停止：%{error}"
   write_failed: "无法写入 XSPF 文件：%{error}"
   export_success_heading: "已导出 XSPF 播放列表"
@@ -190,7 +191,17 @@ context:
   add_to_playlist: "添加到播放列表"
   remove_from_playlist: "从播放列表中移除"
   playlist_add_unsupported_heading: "曲目未添加"
-  playlist_add_unsupported_body: "目前，只有 Tributary 本地音乐库中的曲目才能添加到播放列表。此数据源中的内容均未添加。"
+  playlist_add_unsupported_body: "至少有一个所选曲目不可用，或不支持添加到常规播放列表。未添加任何曲目。"
+
+# ── 常规播放列表 ────────────────────────────────────────────
+regular_playlist:
+  unavailable_track: "不可用的曲目"
+  source_unavailable: "数据源已断开连接或不可用"
+  source_unsupported: "此数据源不能用于常规播放列表"
+  source_catalogue_unavailable: "数据源音乐库不可用"
+  track_missing: "此数据源中已不存在该曲目"
+  mutation_failed_heading: "播放列表未更新"
+  mutation_failed_body: "Tributary 无法更新播放列表。未进行任何更改。"
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

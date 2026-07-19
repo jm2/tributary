@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "De geselecteerde afspeellijst bestaat niet meer."
   smart_playlist_evaluation_failed: "De slimme afspeellijst kon niet worden geëvalueerd: %{error}"
   playlist_tracks_read_failed: "De nummers van de afspeellijst konden niet worden gelezen: %{error}"
+  export_local_only_unsupported_body: "Deze afspeellijst bevat externe of niet-beschikbare items. XSPF-export ondersteunt momenteel alleen afspeellijsten waarvan elk item beschikbaar is in de lokale bibliotheek."
   writer_worker_failed: "Het XSPF-schrijfproces is gestopt: %{error}"
   write_failed: "Het XSPF-bestand kon niet worden geschreven: %{error}"
   export_success_heading: "XSPF-afspeellijst geëxporteerd"
@@ -190,7 +191,17 @@ context:
   add_to_playlist: "Toevoegen aan afspeellijst"
   remove_from_playlist: "Verwijderen uit afspeellijst"
   playlist_add_unsupported_heading: "Nummers zijn niet toegevoegd"
-  playlist_add_unsupported_body: "Op dit moment kunnen alleen nummers uit de lokale bibliotheek van Tributary aan afspeellijsten worden toegevoegd. Er is niets uit deze bron toegevoegd."
+  playlist_add_unsupported_body: "Ten minste één geselecteerd nummer is niet beschikbaar of wordt niet ondersteund in gewone afspeellijsten. Er is niets toegevoegd."
+
+# ── Gewone afspeellijsten ─────────────────────────────────────────
+regular_playlist:
+  unavailable_track: "Nummer niet beschikbaar"
+  source_unavailable: "Bron niet verbonden of niet beschikbaar"
+  source_unsupported: "Deze bron kan niet in gewone afspeellijsten worden gebruikt"
+  source_catalogue_unavailable: "Bronbibliotheek niet beschikbaar"
+  track_missing: "Het nummer bestaat niet meer in deze bron"
+  mutation_failed_heading: "Afspeellijst is niet bijgewerkt"
+  mutation_failed_body: "Tributary kon de afspeellijst niet bijwerken. Er is niets gewijzigd."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

@@ -59,6 +59,7 @@ const BROWSER_POS: i32 = 220;
 type SharedAudioOutput = Rc<RefCell<Box<dyn AudioOutput>>>;
 type PlaybackUiReset = Rc<dyn Fn()>;
 type SourcePlaybackInvalidator = Rc<dyn Fn(&str)>;
+type PlaylistPlaybackInvalidator = Rc<dyn Fn(crate::architecture::SourceId)>;
 
 fn configured_server_url(variable: &'static str) -> Option<String> {
     let raw = std::env::var(variable).ok()?;
@@ -144,6 +145,7 @@ fn set_remote_connecting_generation(
 
 #[derive(Clone)]
 struct SourceReducerContext {
+    rt_handle: tokio::runtime::Handle,
     source_registry: crate::source_registry::SourceRegistry,
     sidebar_store: gtk::gio::ListStore,
     sidebar_selection: gtk::SingleSelection,
@@ -160,6 +162,7 @@ struct SourceReducerContext {
     column_view: gtk::ColumnView,
     app_config: Rc<RefCell<preferences::AppConfig>>,
     invalidate_source_playback: SourcePlaybackInvalidator,
+    invalidate_playlist_playback: PlaylistPlaybackInvalidator,
 }
 
 #[derive(Default)]
@@ -310,8 +313,10 @@ impl SourceReducerContext {
     fn from_window(
         state: &WindowState,
         invalidate_source_playback: SourcePlaybackInvalidator,
+        invalidate_playlist_playback: PlaylistPlaybackInvalidator,
     ) -> Self {
         Self {
+            rt_handle: state.rt_handle.clone(),
             source_registry: state.source_registry.clone(),
             sidebar_store: state.sidebar_store.clone(),
             sidebar_selection: state.sidebar_selection.clone(),
@@ -328,6 +333,7 @@ impl SourceReducerContext {
             column_view: state.column_view.clone(),
             app_config: state.app_config.clone(),
             invalidate_source_playback,
+            invalidate_playlist_playback,
         }
     }
 }
@@ -746,7 +752,14 @@ fn publish_radio_view(
         .value
         .tracks()
         .iter()
-        .map(|track| arch_remote_track_to_object(track, accepted.session_epoch))
+        .map(|track| {
+            arch_remote_track_to_object(
+                track,
+                crate::architecture::SourceId::radio_browser(),
+                accepted.session_epoch,
+                accepted.generation,
+            )
+        })
         .collect();
     context
         .source_tracks
@@ -824,6 +837,7 @@ fn reconcile_source_baseline(
         radio_prerequisite_pending,
         &ui_owned_sources,
     );
+    let mut playlist_authority_changed = !clear_projections.is_empty();
 
     // Projection loss is authoritative before any plain row-state rebind.
     // In particular, a selected retained passwordless DAAP row must already
@@ -950,6 +964,10 @@ fn reconcile_source_baseline(
         {
             let identity = (catalogue.generation, catalogue.session_epoch);
             if reducer.published_catalogues.get(&source_id) != Some(&identity) {
+                playlist_authority_changed = true;
+                if reducer.published_catalogues.contains_key(&source_id) {
+                    (context.invalidate_playlist_playback)(source_id);
+                }
                 if reducer
                     .published_catalogues
                     .get(&source_id)
@@ -963,7 +981,14 @@ fn reconcile_source_baseline(
                     .value
                     .tracks()
                     .iter()
-                    .map(|track| arch_remote_track_to_object(track, catalogue.session_epoch))
+                    .map(|track| {
+                        arch_remote_track_to_object(
+                            track,
+                            source_id,
+                            catalogue.session_epoch,
+                            catalogue.generation,
+                        )
+                    })
                     .collect();
                 publish_remote_library(
                     source_id,
@@ -1071,14 +1096,35 @@ fn reconcile_source_baseline(
             "Source lifecycle reducer observed shutdown gate"
         );
     }
+
+    if playlist_authority_changed && !baseline.shutting_down {
+        invalidate_playlist_projections(
+            &context.rt_handle,
+            &context.source_registry,
+            &context.source_navigation,
+            &context.source_tracks,
+            &context.active_source_key,
+            &context.track_store,
+            &context.master_tracks,
+            &context.browser_widget,
+            &context.browser_state,
+            &context.status_label,
+            &context.column_view,
+        );
+    }
 }
 
 fn setup_source_lifecycle_reducer(
     state: &WindowState,
     mut invalidations: tokio::sync::watch::Receiver<u64>,
     invalidate_source_playback: SourcePlaybackInvalidator,
+    invalidate_playlist_playback: PlaylistPlaybackInvalidator,
 ) {
-    let context = SourceReducerContext::from_window(state, invalidate_source_playback);
+    let context = SourceReducerContext::from_window(
+        state,
+        invalidate_source_playback,
+        invalidate_playlist_playback,
+    );
     glib::MainContext::default().spawn_local(async move {
         let mut reducer = SourceReducerState::default();
         let baseline = context.source_registry.snapshot_all();
@@ -1352,6 +1398,27 @@ pub fn build_window(
                 clear_ui();
             }
             info!("Stopped playback owned by a retired source");
+        })
+    };
+    let invalidate_playlist_playback: PlaylistPlaybackInvalidator = {
+        let playback_session = playback_session.clone();
+        let active_output_slot = active_output_slot.clone();
+        let playback_ui_reset_slot = playback_ui_reset_slot.clone();
+        Rc::new(move |source_id| {
+            if !playback_session
+                .borrow_mut()
+                .clear_if_playlist_authority(source_id)
+            {
+                return;
+            }
+
+            if let Some(active_output) = active_output_slot.borrow().as_ref().cloned() {
+                active_output.borrow().stop();
+            }
+            if let Some(clear_ui) = playback_ui_reset_slot.borrow().as_ref().cloned() {
+                clear_ui();
+            }
+            info!(%source_id, "Stopped playlist playback after catalogue authority changed");
         })
     };
 
@@ -1843,6 +1910,7 @@ pub fn build_window(
         &source_connection_state,
         source_invalidations,
         invalidate_source_playback.clone(),
+        invalidate_playlist_playback,
     );
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1871,6 +1939,7 @@ pub fn build_window(
             setup_library_events(
                 engine_rx,
                 rt_handle.clone(),
+                source_registry.clone(),
                 track_store,
                 status_label,
                 master_tracks,
@@ -2914,6 +2983,7 @@ pub fn build_window(
     setup_library_events(
         engine_rx,
         rt_handle.clone(),
+        source_registry,
         track_store,
         status_label,
         master_tracks,
@@ -3051,6 +3121,7 @@ fn replace_existing_local_track(rows: &mut [TrackObject], replacement: &TrackObj
 #[allow(clippy::too_many_arguments)]
 fn invalidate_playlist_projections(
     rt_handle: &tokio::runtime::Handle,
+    source_registry: &crate::source_registry::SourceRegistry,
     source_navigation: &Rc<RefCell<SourceNavigation>>,
     source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
     active_source_key: &Rc<RefCell<String>>,
@@ -3095,6 +3166,7 @@ fn invalidate_playlist_projections(
         let request = source_navigation.borrow_mut().select(active_key);
         super::source_connect::load_playlist_source(
             rt_handle.clone(),
+            source_registry.clone(),
             playlist_id,
             request,
             source_navigation.clone(),
@@ -3115,6 +3187,7 @@ fn invalidate_playlist_projections(
 fn setup_library_events(
     engine_rx: async_channel::Receiver<LibraryEvent>,
     rt_handle: tokio::runtime::Handle,
+    source_registry: crate::source_registry::SourceRegistry,
     track_store: gtk::gio::ListStore,
     status_label: gtk::Label,
     master_tracks: Rc<RefCell<Vec<TrackObject>>>,
@@ -3402,6 +3475,7 @@ fn setup_library_events(
 
                     invalidate_playlist_projections(
                         &rt_handle,
+                        &source_registry,
                         &source_navigation,
                         &source_tracks,
                         &active_source_key,
@@ -3422,6 +3496,7 @@ fn setup_library_events(
                 LibraryEvent::PlaylistProjectionsInvalidated => {
                     invalidate_playlist_projections(
                         &rt_handle,
+                        &source_registry,
                         &source_navigation,
                         &source_tracks,
                         &active_source_key,
@@ -3805,16 +3880,24 @@ pub fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObje
         })
         .unwrap_or_default();
 
-    track_to_object(t, &uri, t.cover_art_url.as_ref().map(url::Url::as_str))
+    let object = track_to_object(t, &uri, t.cover_art_url.as_ref().map(url::Url::as_str));
+    let source_bound = object.set_source_id(crate::architecture::SourceId::local());
+    debug_assert!(source_bound, "a fresh local row accepts its exact owner");
+    object
 }
 
 /// Convert a remote track into a pathless row bound to one adopted session.
 fn arch_remote_track_to_object(
     track: &crate::architecture::models::Track,
+    source_id: crate::architecture::SourceId,
     session_epoch: u64,
+    catalogue_generation: u64,
 ) -> TrackObject {
     let object = track_to_object(track, "", None);
+    let source_bound = object.set_source_id(source_id);
+    debug_assert!(source_bound, "a fresh remote row accepts its exact owner");
     object.set_source_session_epoch(session_epoch);
+    object.set_source_catalogue_generation(catalogue_generation);
     object
 }
 
@@ -4045,10 +4128,13 @@ mod identity_tests {
             last_played: None,
         };
 
-        let row = arch_remote_track_to_object(&track, 9);
+        let source_id = crate::architecture::SourceId::random();
+        let row = arch_remote_track_to_object(&track, source_id, 9, 17);
         assert_eq!(row.track_id(), "rating-track");
         assert_eq!(row.rating(), rating);
+        assert_eq!(row.source_id(), Some(source_id));
         assert_eq!(row.source_session_epoch(), Some(9));
+        assert_eq!(row.source_catalogue_generation(), Some(17));
     }
 
     #[test]

@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "선택한 재생목록이 더 이상 존재하지 않습니다."
   smart_playlist_evaluation_failed: "스마트 재생목록을 평가할 수 없습니다: %{error}"
   playlist_tracks_read_failed: "재생목록의 트랙을 읽을 수 없습니다: %{error}"
+  export_local_only_unsupported_body: "이 재생목록에는 원격 또는 사용할 수 없는 항목이 있습니다. 현재 XSPF 내보내기는 모든 항목을 로컬 라이브러리에서 사용할 수 있는 재생목록만 지원합니다."
   writer_worker_failed: "XSPF 쓰기 작업이 중지되었습니다: %{error}"
   write_failed: "XSPF 파일을 쓸 수 없습니다: %{error}"
   export_success_heading: "XSPF 재생목록을 내보냄"
@@ -190,7 +191,17 @@ context:
   add_to_playlist: "재생목록에 추가"
   remove_from_playlist: "재생목록에서 제거"
   playlist_add_unsupported_heading: "트랙이 추가되지 않았습니다"
-  playlist_add_unsupported_body: "현재는 Tributary의 로컬 라이브러리에 있는 트랙만 재생목록에 추가할 수 있습니다. 이 소스에서는 아무것도 추가되지 않았습니다."
+  playlist_add_unsupported_body: "선택한 트랙 중 하나 이상을 사용할 수 없거나 일반 재생목록에서 지원하지 않습니다. 아무것도 추가되지 않았습니다."
+
+# ── 일반 재생목록 ───────────────────────────────────────────────
+regular_playlist:
+  unavailable_track: "사용할 수 없는 트랙"
+  source_unavailable: "소스 연결이 끊겼거나 사용할 수 없습니다"
+  source_unsupported: "이 소스는 일반 재생목록에서 사용할 수 없습니다"
+  source_catalogue_unavailable: "소스 라이브러리를 사용할 수 없습니다"
+  track_missing: "이 소스에 트랙이 더 이상 없습니다"
+  mutation_failed_heading: "재생목록이 업데이트되지 않았습니다"
+  mutation_failed_body: "Tributary가 재생목록을 업데이트하지 못했습니다. 변경된 내용이 없습니다."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

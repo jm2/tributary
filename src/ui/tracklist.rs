@@ -11,11 +11,11 @@ use gtk::gio;
 use gtk::prelude::*;
 
 use crate::architecture::models::{Rating, RatingCapability, TrackRating};
-use crate::architecture::TrackId;
+use crate::architecture::{SourceId, TrackId};
 use crate::local::engine::LibraryCommand;
 
 use super::library_commands::LibraryCommandAdmission;
-use super::objects::TrackObject;
+use super::objects::{PlaylistOccurrenceState, TrackObject};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RatingCellPresentation {
@@ -328,6 +328,21 @@ fn add_sorted_column<F, S>(
             .and_downcast::<gtk::Label>()
             .expect("Label");
         label.set_text(&getter(&track));
+        if matches!(
+            track
+                .playlist_occurrence_binding()
+                .map(|binding| binding.state()),
+            Some(PlaylistOccurrenceState::Unavailable(_))
+        ) {
+            let accessible = format!("{} — {}", track.title(), track.artist());
+            label.add_css_class("dim-label");
+            label.set_tooltip_text(Some(&accessible));
+            label.update_property(&[gtk::accessible::Property::Label(&accessible)]);
+        } else {
+            label.remove_css_class("dim-label");
+            label.set_tooltip_text(None);
+            label.reset_property(gtk::AccessibleProperty::Label);
+        }
     });
 
     // Clear label text on recycle to prevent stale data from appearing
@@ -336,6 +351,9 @@ fn add_sorted_column<F, S>(
         let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
         if let Some(label) = list_item.child().and_downcast::<gtk::Label>() {
             label.set_text("");
+            label.remove_css_class("dim-label");
+            label.set_tooltip_text(None);
+            label.reset_property(gtk::AccessibleProperty::Label);
         }
     });
 
@@ -461,12 +479,26 @@ fn add_rating_column(column_view: &gtk::ColumnView, library_commands: LibraryCom
             .and_downcast::<gtk::MenuButton>()
             .expect("rating MenuButton");
         let presentation = rating_cell_presentation(track.rating(), &rust_i18n::locale());
+        let unavailable = matches!(
+            track
+                .playlist_occurrence_binding()
+                .map(|binding| binding.state()),
+            Some(PlaylistOccurrenceState::Unavailable(_))
+        );
+        let accessible_label = if unavailable {
+            format!("{} — {}", track.title(), track.artist())
+        } else {
+            presentation.accessible_label.clone()
+        };
         button.set_label(&presentation.text);
-        button.set_sensitive(presentation.editable);
-        button.set_tooltip_text(Some(&presentation.accessible_label));
-        button.update_property(&[gtk::accessible::Property::Label(
-            &presentation.accessible_label,
-        )]);
+        button.set_sensitive(presentation.editable && local_rating_track_id(&track).is_some());
+        button.set_tooltip_text(Some(&accessible_label));
+        button.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
+        if unavailable {
+            button.add_css_class("dim-label");
+        } else {
+            button.remove_css_class("dim-label");
+        }
 
         if let Some(spin) = rating_spin_button(&button) {
             spin.set_value(f64::from(presentation.input_value));
@@ -480,6 +512,7 @@ fn add_rating_column(column_view: &gtk::ColumnView, library_commands: LibraryCom
             button.set_sensitive(false);
             button.set_label("");
             button.set_tooltip_text(None);
+            button.remove_css_class("dim-label");
             button.reset_property(gtk::AccessibleProperty::Label);
             if let Some(spin) = rating_spin_button(&button) {
                 spin.set_value(100.0);
@@ -543,13 +576,26 @@ fn queue_rating_command(
     let Some(track) = list_item.item().and_downcast::<TrackObject>() else {
         return false;
     };
-    if !matches!(track.rating(), TrackRating::Writable { .. }) {
-        return false;
-    }
-    let Ok(track_id) = TrackId::new(track.track_id()) else {
+    let Some(track_id) = local_rating_track_id(&track) else {
         return false;
     };
     commands.try_send(LibraryCommand::SetTrackRating { track_id, rating })
+}
+
+fn local_rating_track_id(track: &TrackObject) -> Option<TrackId> {
+    if track.source_id() != Some(SourceId::local()) {
+        return None;
+    }
+    if !matches!(track.rating(), TrackRating::Writable { .. }) {
+        return None;
+    }
+    if track
+        .playlist_occurrence_binding()
+        .is_some_and(|binding| binding.state() != PlaylistOccurrenceState::AvailableLocal)
+    {
+        return None;
+    }
+    TrackId::new(track.track_id()).ok()
 }
 
 fn rating_cell_presentation(rating: TrackRating, locale: &str) -> RatingCellPresentation {
@@ -821,5 +867,61 @@ mod tests {
             ],
             "Note",
         ));
+    }
+
+    #[test]
+    fn rating_write_requires_local_source_even_when_native_ids_and_cached_capability_collide() {
+        let native_id = "shared-native-id";
+        let writable = TrackRating::writable(Some(Rating::new(80).expect("rating")));
+        let local = track(native_id, writable);
+        assert!(local.set_source_id(SourceId::local()));
+        let remote = track(native_id, writable);
+        assert!(remote.set_source_id(SourceId::random()));
+
+        assert_eq!(
+            local_rating_track_id(&local).as_ref().map(TrackId::as_str),
+            Some(native_id)
+        );
+        assert_eq!(local_rating_track_id(&remote), None);
+    }
+
+    #[test]
+    fn rating_write_rejects_unavailable_or_malformed_playlist_bindings() {
+        use crate::ui::objects::{PlaylistOccurrenceBinding, PlaylistRowUnavailableReason};
+
+        let available_id = TrackId::new("available-local").expect("available track ID");
+        let available = track(
+            available_id.as_str(),
+            TrackRating::writable(Some(Rating::new(75).expect("rating"))),
+        );
+        available.set_playlist_occurrence_binding(
+            PlaylistOccurrenceBinding::available_local("entry-available", available_id.clone())
+                .expect("available binding"),
+        );
+
+        let unavailable_id = TrackId::new("missing-local").expect("missing track ID");
+        let unavailable = track(
+            unavailable_id.as_str(),
+            TrackRating::writable(Some(Rating::new(75).expect("rating"))),
+        );
+        unavailable.set_playlist_occurrence_binding(
+            PlaylistOccurrenceBinding::unavailable(
+                "entry-unavailable",
+                SourceId::local(),
+                Some(unavailable_id),
+                PlaylistRowUnavailableReason::LocalTrackMissing,
+            )
+            .expect("unavailable binding"),
+        );
+
+        let missing_source = track("missing-source", TrackRating::writable(None));
+        let malformed_id = track("initially-valid", TrackRating::writable(None));
+        assert!(malformed_id.set_source_id(SourceId::local()));
+        malformed_id.set_track_id("");
+
+        assert_eq!(local_rating_track_id(&available), Some(available_id));
+        assert_eq!(local_rating_track_id(&unavailable), None);
+        assert_eq!(local_rating_track_id(&missing_source), None);
+        assert_eq!(local_rating_track_id(&malformed_id), None);
     }
 }

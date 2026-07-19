@@ -38,7 +38,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Internet Radio (Top Clicked, Top Voted, Stations Near Me) | ✅ |
 | Tiered geo-location (geo-distance → state → country) | ✅ |
 | Column drag-and-drop reordering with persistence | ✅ |
-| Regular & smart playlists (iTunes-style rules engine) | ✅ Local-library UI; source-scoped storage and default-deny live-catalogue authority are implemented, while mixed-source UI/playback remains planned ([#47](https://github.com/jm2/tributary/issues/47)) |
+| Regular & smart playlists (iTunes-style rules engine) | ✅ Regular playlists mix local and authenticated Subsonic/Jellyfin/Plex/DAAP entries; smart playlists remain local-library queries ([#47](https://github.com/jm2/tributary/issues/47)) |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
 | Batch metadata editing (multi-select) | ✅ |
@@ -134,8 +134,9 @@ disagree, rather than values from an arbitrary SQLite row. `Album.artist_id` del
 empty because a compilation's album artist is not necessarily any performing-artist entity.
 Identity-bearing metadata edits therefore produce a new aggregate ID. Persisted local track IDs
 are preserved byte-for-byte; malformed legacy IDs use a frozen deterministic compatibility
-projection rather than a random fallback. Local and playlist queues resolve the exact current
-database row beneath retained, revalidated root and file authority at use time.
+projection rather than a random fallback. Local occurrences in local or playlist queues resolve
+the exact current database row beneath retained, revalidated root and file authority at use time;
+authenticated remote playlist occurrences resolve through their exact current registry guard.
 
 The [source identity and lifecycle decision](docs/architecture/source-lifecycle.md) documents that
 implemented seam, including provenance, cancellation, explicit DAAP/Jellyfin session retirement,
@@ -677,23 +678,46 @@ boundaries.
 
 ### Playlists
 
-Tributary supports regular and smart playlists for the local library:
+Tributary supports mixed-source regular playlists and local-library smart playlists:
 
-- **Regular playlists** — Right-click the Playlists header in the sidebar to create a new playlist. Right-click tracks in the tracklist to add them. Playlists survive library folder changes via fingerprint-based track matching. Their migrated storage identity is the source-scoped `(SourceId, TrackId)` pair, with a separate nullable local-track foreign-key cache for local deletion and reconciliation. Internal live-catalogue lookup now has an explicit default-deny authority boundary, but the current UI still creates and projects only local entries.
+- **Regular playlists** — Right-click the Playlists header in the sidebar to create one, then
+  right-click selected tracks to add them. Every ordered occurrence has its own durable entry ID
+  and exact `(SourceId, TrackId)` media identity, so duplicates remain distinct. Local entries
+  survive library-folder changes through the existing exact reconciliation contract; current
+  authenticated Subsonic, Jellyfin, Plex, and DAAP entries use live catalogue authority without
+  persisting a locator, credential, lease, route, session epoch, or display snapshot.
 - **Smart playlists** — iTunes-style rules engine with filterable metadata fields, text/numeric/date operators, sorting, and result limiting. Smart playlists are evaluated against the current local library whenever they are opened or exported; they are not stored snapshots. Create them via the sidebar context menu.
 
-**Add to Playlist** currently accepts tracks only from the built-in local library. Invoking it from
-an authenticated remote, internet-radio, removable-media, or other unsupported source shows a
-localized explanation and adds nothing; it never silently writes only a subset. Migration 13 and
-the storage API can represent a non-local occurrence without a URL, credential, lease, or session
-epoch, but that capability is not UI authorization.
+**Add to Playlist** accepts built-in local tracks and exact current rows from retained authenticated
+Subsonic, Jellyfin, Plex, and DAAP catalogues. The registry first resolves every selected remote
+identity against the same current source session and accepted catalogue generation. After the
+database transaction stages the complete ordered selection, it repeats that exact validation and
+acquires session/catalogue permits immediately before commit. Authority made stale during staging
+rolls back every insert; after admission, lifecycle invalidation waits for commit or rollback. The
+commit and permits have an independent completion owner, so cancellation cannot strand authority
+or abandon commit completion. If one member is unsupported, disconnected, in an invalid
+catalogue, or missing, Tributary explains the result in the user's language and adds nothing.
+Radio-Browser, removable media, ephemeral external files, and unknown sources remain unsupported.
+Removing rows is likewise one atomic operation over their exact durable entry IDs, so a duplicate
+or unavailable occurrence can be removed without affecting its neighbors.
+
+Opening a regular playlist retains every stored occurrence in position order. Available local rows
+use current database metadata; available authenticated rows use only the registry's sanitized live
+metadata. A disconnected or retired source, unsupported owner, invalid catalogue, missing native
+track, or missing/unmatched local identity produces an explicit localized unavailable row that
+remains visible and removable. Tributary does not display persisted reconciliation fingerprints as
+stale metadata or use them to guess another remote track. Stale projection work and results are
+discarded; the affected playlist is invalidated and projected again from current authority.
+Reconnection restores a row only when the same `SourceId` publishes the same exact native `TrackId`
+again.
 
 Inside `SourceRegistry`, regular-playlist catalogue authority defaults to Unsupported. Only the
 retained authenticated Subsonic, Jellyfin, Plex, and DAAP adapters explicitly advertise
 source-scoped entries; Radio-Browser, removable media, ephemeral external files, and unknown
-adapters remain unsupported. An internal lookup accepts an ordered set only from the exact current
-source, session epoch, and accepted catalogue generation, and returns a dedicated metadata
-whitelist without paths, URLs, locators, credentials, leases, routes, or raw backend errors. Its
+adapters remain unsupported. Playlist Add and rendering consume an ordered lookup that accepts
+only the exact current source, session epoch, and accepted catalogue generation and returns a
+dedicated metadata whitelist without paths, URLs, locators, credentials, leases, routes, or raw
+backend errors. Its
 closed guard carries the non-secret epoch and generation transiently; neither is written to the
 playlist. Guarded media maps backend failures to fixed categories and carries a lifecycle-owned
 generation lease that is explicitly revoked even if an observer still holds an old snapshot clone.
@@ -704,12 +728,17 @@ unsupported source receives an explicit unavailable result without erasing valid
 and artwork resolutions revalidate the transient guard around asynchronous adapter work so
 replacement, refresh, disconnect, shutdown, or final source release cannot revive an old result.
 
-This foundation does not change Add, Remove, rendering, or Play behavior by itself. Connecting or
-a failed replacement may continue using its already accepted predecessor; a successful
-replacement or same-session catalogue refresh invalidates old guards, and disconnect/shutdown deny
-new use synchronously. Mixed-source playlist UI, explicit unavailable states, and
-Subsonic-native playlist import/synchronization remain follow-on work under
-[P1.5](docs/task.md#p15--persist-source-scoped-playlists). See the
+Each playlist queue item keeps the playlist as its view origin while taking media ownership from
+that row's real source. Local items retain exact file authority; remote stream and artwork requests
+must pass guarded at-use resolution again. A refresh, replacement, retirement, disconnect, or
+shutdown therefore denies a stale item instead of replaying a cached URL. Only an exact local
+occurrence can update Tributary's local playback history. Remote ratings keep their live
+read-only/unsupported capability and never gain mutation authority from playlist membership.
+
+Smart playlists and XSPF import/export remain local-only. Mixed-source metadata export requires a
+separate no-locator policy, and Subsonic server-native playlist import/synchronization still needs
+direction, conflict, offline, deletion, and feature semantics. See
+[P1.5](docs/task.md#p15--persist-source-scoped-playlists) and the
 [source-scoped playlist storage contract](docs/source-scoped-playlists.md) for the exact boundary.
 
 #### Importing and exporting playlists
@@ -722,6 +751,11 @@ an error leaves an existing export unchanged. XML 1.0-forbidden control characte
 before the temporary file or destination is touched. A corrupt negative stored duration or one
 outside Tributary's supported `u64` millisecond range is omitted rather than blocking the otherwise
 valid playlist, because XSPF duration is optional.
+
+XSPF currently represents only local-library tracks. Exporting a regular playlist that contains
+any remote or unresolved occurrence is therefore refused as a whole with a visible explanation
+before the destination is touched; Tributary never silently exports just the playlist's local
+subset. Mixed-source metadata export remains deferred until it has an explicit no-locator policy.
 
 Ratings are deliberately outside this playlist interchange. XSPF v1 has no standard rating field,
 so export emits none; import treats rating-like `<meta>` and extension content as inert and never
@@ -763,8 +797,10 @@ instead counts that individual row as failed.
 
 XSPF import continues to create entries owned by the built-in local source. The source-scoped
 storage migration does not make an HTTP(S) location or service identifier a remote playlist
-authority, and current export remains a local-track export. A future mixed-source export must use
-safe metadata without requesting or serializing a protected remote locator.
+authority. Export refuses a regular playlist containing any remote or unresolved occurrence before
+touching the destination; it never emits a truncated local-only subset. Mixed-source metadata export
+is explicitly deferred until it has a policy that cannot request or serialize a protected remote
+locator.
 
 Apple Music and iTunes can export playlist metadata as XML, but their XML is an Apple property-list
 format, not XSPF. Follow Apple's official export steps for

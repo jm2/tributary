@@ -176,6 +176,7 @@ playlist_io:
   playlist_missing: "La playlist selezionata non esiste più."
   smart_playlist_evaluation_failed: "Impossibile valutare la playlist intelligente: %{error}"
   playlist_tracks_read_failed: "Impossibile leggere i brani della playlist: %{error}"
+  export_local_only_unsupported_body: "Questa playlist contiene elementi remoti o non disponibili. Attualmente l’esportazione XSPF supporta solo playlist i cui elementi sono tutti disponibili nella libreria locale."
   writer_worker_failed: "Il processo di scrittura XSPF si è interrotto: %{error}"
   write_failed: "Impossibile scrivere il file XSPF: %{error}"
   export_success_heading: "Playlist XSPF esportata"
@@ -190,7 +191,17 @@ context:
   add_to_playlist: "Aggiungi alla playlist"
   remove_from_playlist: "Rimuovi dalla playlist"
   playlist_add_unsupported_heading: "I brani non sono stati aggiunti"
-  playlist_add_unsupported_body: "Al momento, è possibile aggiungere alle playlist solo i brani della libreria locale di Tributary. Non è stato aggiunto nulla da questa sorgente."
+  playlist_add_unsupported_body: "Almeno un brano selezionato non è disponibile o non è supportato nelle playlist normali. Non è stato aggiunto nulla."
+
+# ── Playlist normali ─────────────────────────────────────────────
+regular_playlist:
+  unavailable_track: "Brano non disponibile"
+  source_unavailable: "Sorgente disconnessa o non disponibile"
+  source_unsupported: "Questa sorgente non può essere usata nelle playlist normali"
+  source_catalogue_unavailable: "Libreria della sorgente non disponibile"
+  track_missing: "Il brano non esiste più in questa sorgente"
+  mutation_failed_heading: "La playlist non è stata aggiornata"
+  mutation_failed_body: "Tributary non ha potuto aggiornare la playlist. Non è stato modificato nulla."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

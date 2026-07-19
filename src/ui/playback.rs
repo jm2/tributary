@@ -18,16 +18,18 @@ use crate::architecture::{MediaKey, SourceId, TrackId, ViewOrigin};
 use crate::audio::output::AudioOutput;
 use crate::audio::{PlayerEvent, PlayerEventGeneration, PlayerState};
 use crate::local::playback_history::PlaybackHistoryProgress;
+use crate::source_registry::RegularPlaylistCatalogueGuard;
 use crate::ui::header_bar::RepeatMode;
-use crate::ui::objects::TrackObject;
+use crate::ui::objects::{PlaylistOccurrenceState, TrackObject};
 
 use super::album_art;
 
 /// The source key of the local library.
 pub const LOCAL_SOURCE_KEY: &str = "local";
 
-/// The source-key prefix of every playlist view. Playlists are projections of
-/// the local library, so their queue items carry library track IDs too.
+/// The source-key prefix of every playlist view. A playlist remains only the
+/// view origin; each queue item carries its actual media owner's source and
+/// native track identity.
 pub const PLAYLIST_SOURCE_PREFIX: &str = "playlist:";
 
 /// Previous restarts the current item only after this position. At exactly
@@ -132,7 +134,17 @@ pub(super) fn refresh_projected_library_uris(
         return 0;
     }
 
-    let projected_ids: HashSet<String> = projected_rows.iter().map(TrackObject::track_id).collect();
+    let accepts_local_refresh = |row: &TrackObject| {
+        row.source_id() == Some(SourceId::local())
+            && row
+                .playlist_occurrence_binding()
+                .is_none_or(|binding| binding.state() == PlaylistOccurrenceState::AvailableLocal)
+    };
+    let projected_ids: HashSet<String> = projected_rows
+        .iter()
+        .filter(|row| accepts_local_refresh(row))
+        .map(TrackObject::track_id)
+        .collect();
     let mut committed_uris = HashMap::with_capacity(projected_ids.len());
     for track in committed_local_rows {
         let track_id = track.track_id();
@@ -147,6 +159,9 @@ pub(super) fn refresh_projected_library_uris(
 
     let mut refreshed = 0;
     for row in projected_rows {
+        if !accepts_local_refresh(row) {
+            continue;
+        }
         let Some(uri) = committed_uris.get(&row.track_id()) else {
             continue;
         };
@@ -166,9 +181,9 @@ pub struct PlaybackIdentity {
 }
 
 impl PlaybackIdentity {
-    fn new(view: &QueueView, track_id: TrackId) -> Self {
+    fn new(view: &QueueView, source_id: SourceId, track_id: TrackId) -> Self {
         Self {
-            media_key: MediaKey::new(view.source_id, track_id),
+            media_key: MediaKey::new(source_id, track_id),
             view_origin: view.origin.clone(),
         }
     }
@@ -218,6 +233,10 @@ pub struct QueueItem {
     /// Stable media identity remains `(SourceId, TrackId)`; the epoch prevents
     /// a captured queue from being retargeted to a replacement login.
     source_session_epoch: Option<u64>,
+    /// Exact accepted catalogue authority carried by a source-scoped regular
+    /// playlist occurrence. This is transient queue state and is revalidated
+    /// separately for stream and artwork at the point of use.
+    regular_playlist_guard: Option<RegularPlaylistCatalogueGuard>,
     /// This exact queue item owns a hidden ephemeral external-file source.
     /// Random SourceIds are also valid persisted remote identities, so source
     /// shape alone cannot safely recover this lifecycle distinction later.
@@ -233,7 +252,12 @@ pub struct QueueItem {
 }
 
 impl QueueItem {
-    fn from_track(identity: PlaybackIdentity, track: &TrackObject, occurrence: usize) -> Self {
+    fn from_track(
+        identity: PlaybackIdentity,
+        track: &TrackObject,
+        occurrence: usize,
+        regular_playlist_guard: Option<RegularPlaylistCatalogueGuard>,
+    ) -> Self {
         let is_library = is_library_source(identity.media_key.source_id);
         let duration_ms = match track.duration_secs() {
             0 => None,
@@ -243,12 +267,16 @@ impl QueueItem {
             identity,
             occurrence,
             row_instance_id: Some(track.row_instance_id()),
-            source_session_epoch: track.source_session_epoch(),
+            source_session_epoch: regular_playlist_guard
+                .map(RegularPlaylistCatalogueGuard::session_epoch)
+                .or_else(|| track.source_session_epoch()),
+            regular_playlist_guard,
             external_session: false,
             duration_ms,
-            // Local, playlist, and lifecycle-owned queues retain identity,
-            // ordering, and metadata but never a locator. Every output load
-            // resolves the exact source/track/epoch at the point of use.
+            // Local and lifecycle-owned rows (including either kind of
+            // regular-playlist occurrence) retain identity, ordering, and
+            // metadata but never a locator. Every output load resolves the
+            // exact source/track/authority at the point of use.
             uri: if is_library || track.source_session_epoch().is_some() {
                 String::new()
             } else {
@@ -271,6 +299,7 @@ impl QueueItem {
             occurrence: 0,
             row_instance_id: None,
             source_session_epoch: Some(session.session_epoch()),
+            regular_playlist_guard: None,
             external_session: true,
             duration_ms: track
                 .duration_secs
@@ -299,6 +328,7 @@ impl QueueItem {
             occurrence: 0,
             row_instance_id: None,
             source_session_epoch: None,
+            regular_playlist_guard: None,
             external_session: false,
             duration_ms: None,
             uri,
@@ -319,6 +349,7 @@ impl QueueItem {
             occurrence: 0,
             row_instance_id: None,
             source_session_epoch: Some(session_epoch),
+            regular_playlist_guard: None,
             external_session: true,
             duration_ms: None,
             uri: String::new(),
@@ -496,9 +527,24 @@ impl PlaybackSession {
     /// or library that reused the same server-native track identifiers.
     pub(crate) fn clear_if_source(&mut self, source_id: &str) -> bool {
         if self
-            .current_identity()
-            .is_none_or(|identity| !identity_is_owned_by_source(identity, source_id))
+            .queue
+            .iter()
+            .all(|item| !identity_is_owned_by_source(&item.identity, source_id))
         {
+            return false;
+        }
+        self.clear();
+        true
+    }
+
+    /// Clear a mixed regular-playlist queue only when it retained a guard
+    /// minted by the replaced catalogue. Ordinary source queues intentionally
+    /// keep their epoch-based behavior across same-session refreshes.
+    pub(crate) fn clear_if_playlist_authority(&mut self, source_id: SourceId) -> bool {
+        if self.queue.iter().all(|item| {
+            item.regular_playlist_guard
+                .is_none_or(|guard| guard.source_id() != source_id)
+        }) {
             return false;
         }
         self.clear();
@@ -1075,6 +1121,47 @@ struct CapturedQueue {
     selected_index: usize,
 }
 
+fn row_playback_identity(
+    view: &QueueView,
+    track: &TrackObject,
+) -> Option<(PlaybackIdentity, Option<RegularPlaylistCatalogueGuard>)> {
+    if let Some(binding) = track.playlist_occurrence_binding() {
+        let track_id = binding.track_id()?.clone();
+        let guard = match binding.state() {
+            PlaylistOccurrenceState::AvailableLocal => None,
+            PlaylistOccurrenceState::AvailableRemote(guard) => Some(guard),
+            PlaylistOccurrenceState::Unavailable(_) => return None,
+        };
+        return Some((
+            PlaybackIdentity::new(view, binding.source_id(), track_id),
+            guard,
+        ));
+    }
+
+    let source_id = track.source_id().unwrap_or(view.source_id);
+    let track_id = TrackId::new(track.track_id()).ok()?;
+    Some((PlaybackIdentity::new(view, source_id, track_id), None))
+}
+
+fn row_position_identity(view: &QueueView, track: &TrackObject) -> Option<(u64, MediaKey)> {
+    let (identity, _) = row_playback_identity(view, track)?;
+    Some((track.row_instance_id(), identity.media_key))
+}
+
+fn playable_model_positions(model: &impl IsA<gtk::gio::ListModel>, source_key: &str) -> Vec<u32> {
+    let Some(view) = queue_view(source_key) else {
+        return Vec::new();
+    };
+    (0..model.n_items())
+        .filter(|position| {
+            model
+                .item(*position)
+                .and_downcast::<TrackObject>()
+                .is_some_and(|track| row_playback_identity(&view, &track).is_some())
+        })
+        .collect()
+}
+
 /// Capture the current sorted/filtered projection as a playback-owned queue.
 ///
 /// All entry points that start playback from the track list go through this
@@ -1095,15 +1182,19 @@ fn capture_visible_queue(
         let Some(track) = model.item(model_index).and_downcast::<TrackObject>() else {
             continue;
         };
-        let Ok(track_id) = TrackId::new(track.track_id()) else {
+        let Some((identity, regular_playlist_guard)) = row_playback_identity(&view, &track) else {
             continue;
         };
         if model_index == selected_position {
             selected_index = Some(items.len());
         }
-        let identity = PlaybackIdentity::new(&view, track_id);
         let occurrence = occurrences.entry(identity.media_key.clone()).or_default();
-        items.push(QueueItem::from_track(identity, &track, *occurrence));
+        items.push(QueueItem::from_track(
+            identity,
+            &track,
+            *occurrence,
+            regular_playlist_guard,
+        ));
         *occurrence += 1;
     }
 
@@ -1283,7 +1374,18 @@ pub fn play_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
             ctx.active_output.borrow().play();
             true
         }
-        PlayRequest::StartAt(position) => play_track_at(position, ctx),
+        PlayRequest::StartAt(_) => {
+            let source_key = ctx.active_source_key.borrow().clone();
+            let playable = playable_model_positions(&ctx.model, &source_key);
+            let position = if shuffle {
+                playable
+                    .get(fastrand::usize(..playable.len().max(1)))
+                    .copied()
+            } else {
+                playable.first().copied()
+            };
+            position.is_some_and(|position| play_track_at(position, ctx))
+        }
         PlayRequest::Unavailable => false,
     }
 }
@@ -1436,10 +1538,19 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         let media_ctrl = Rc::clone(&ctx.media_ctrl);
         let album_art = ctx.album_art.clone();
         let external_session = item.external_session;
+        let regular_playlist_guard = item.regular_playlist_guard;
         glib::MainContext::default().spawn_local(async move {
-            let resolved = source_registry
-                .resolve_stream(source_id, expected_session_epoch, track_id)
-                .await;
+            let resolved = if let Some(guard) = regular_playlist_guard {
+                source_registry
+                    .resolve_regular_playlist_stream(guard, track_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            } else {
+                source_registry
+                    .resolve_stream(source_id, expected_session_epoch, track_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            };
             match resolved {
                 Ok(request) => {
                     if !session.borrow_mut().finish_pending_resolution(generation) {
@@ -1588,19 +1699,21 @@ fn update_now_playing_ui(
     // Scroll only when the queue's source and item are present in the current
     // view. Navigation still works when the user is viewing another source or
     // has filtered the playing item out.
-    if identity.is_some_and(|identity| {
-        identity_belongs_to_source(identity, &ctx.active_source_key.borrow())
-    }) {
+    let active_source_key = ctx.active_source_key.borrow().clone();
+    if let Some((identity, view)) = identity
+        .filter(|identity| identity_belongs_to_source(identity, &active_source_key))
+        .zip(queue_view(&active_source_key))
+    {
         if let Some(position) = find_queue_item_position(
             ctx.model.n_items(),
-            identity.map_or("", |identity| identity.media_key.track_id.as_str()),
+            &identity.media_key,
             item.occurrence,
             item.row_instance_id,
             |index| {
                 ctx.model
                     .item(index)
                     .and_downcast::<TrackObject>()
-                    .map(|track| (track.row_instance_id(), track.track_id()))
+                    .and_then(|track| row_position_identity(&view, &track))
             },
         ) {
             ctx.column_view.scroll_to(
@@ -1618,12 +1731,21 @@ fn update_now_playing_ui(
         let source_registry = ctx.source_registry.clone();
         let source_id = identity.media_key.source_id;
         let track_id = identity.media_key.track_id.clone();
+        let regular_playlist_guard = item.regular_playlist_guard;
         let album_art = ctx.album_art.clone();
         glib::MainContext::default().spawn_local(async move {
-            match source_registry
-                .resolve_artwork(source_id, expected_session_epoch, track_id)
-                .await
-            {
+            let resolved = if let Some(guard) = regular_playlist_guard {
+                source_registry
+                    .resolve_regular_playlist_artwork(guard, track_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            } else {
+                source_registry
+                    .resolve_artwork(source_id, expected_session_epoch, track_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            };
+            match resolved {
                 Ok(Some(request)) => {
                     album_art::fetch_resolved_album_art(&album_art, request, generation);
                 }
@@ -1655,12 +1777,12 @@ fn update_now_playing_ui(
 
 fn find_queue_item_position(
     item_count: u32,
-    track_id: &str,
+    media_key: &MediaKey,
     target_occurrence: usize,
     row_instance_id: Option<u64>,
-    mut item_at: impl FnMut(u32) -> Option<(u64, String)>,
+    mut item_at: impl FnMut(u32) -> Option<(u64, MediaKey)>,
 ) -> Option<u32> {
-    let items: Vec<Option<(u64, String)>> = (0..item_count).map(&mut item_at).collect();
+    let items: Vec<Option<(u64, MediaKey)>> = (0..item_count).map(&mut item_at).collect();
     if let Some(row_instance_id) = row_instance_id {
         if let Some(position) = items.iter().position(|item| {
             item.as_ref()
@@ -1672,7 +1794,7 @@ fn find_queue_item_position(
 
     let mut occurrence = 0usize;
     for (index, item) in items.into_iter().enumerate() {
-        if item.as_ref().map(|(_, id)| id.as_str()) != Some(track_id) {
+        if item.as_ref().map(|(_, key)| key) != Some(media_key) {
             continue;
         }
         if occurrence == target_occurrence {
@@ -1976,6 +2098,7 @@ mod tests {
         let view = queue_view(source).expect("test source identity");
         let identity = PlaybackIdentity::new(
             &view,
+            view.source_id,
             TrackId::new(id.to_string()).expect("test track identity"),
         );
         QueueItem {
@@ -1983,6 +2106,7 @@ mod tests {
             occurrence: 0,
             row_instance_id: None,
             source_session_epoch: None,
+            regular_playlist_guard: None,
             external_session: false,
             duration_ms: None,
             uri: if is_library_source(view.source_id) {
@@ -2081,9 +2205,10 @@ mod tests {
         let view = queue_view(source).expect("test source identity");
         let identity = PlaybackIdentity::new(
             &view,
+            row.source_id().unwrap_or(view.source_id),
             TrackId::new(row.track_id()).expect("test track identity"),
         );
-        QueueItem::from_track(identity, row, occurrence)
+        QueueItem::from_track(identity, row, occurrence, None)
     }
 
     fn refreshed_metadata() -> QueueTrackRefresh {
@@ -2285,11 +2410,16 @@ mod tests {
         let first = projected_row("a", "file:///music/old-a.flac");
         let unrelated = projected_row("b", "file:///music/b.flac");
         let duplicate = projected_row("a", "file:///music/old-a.flac");
+        for row in [&first, &unrelated, &duplicate] {
+            assert!(row.set_source_id(SourceId::local()));
+        }
         let rows = vec![first, unrelated, duplicate];
         let identities: Vec<u64> = rows.iter().map(TrackObject::row_instance_id).collect();
 
         let renamed = projected_row("a", "file:///music/renamed-a.flac");
         let empty = projected_row("b", "");
+        assert!(renamed.set_source_id(SourceId::local()));
+        assert!(empty.set_source_id(SourceId::local()));
         assert_eq!(refresh_projected_library_uris(&rows, &[renamed, empty]), 2);
 
         assert_eq!(rows[0].uri(), "file:///music/renamed-a.flac");
@@ -2302,6 +2432,49 @@ mod tests {
             identities,
             "URI refresh must preserve duplicate occurrence identity and order"
         );
+    }
+
+    #[test]
+    fn local_uri_refresh_never_retargets_a_remote_playlist_identity_collision() {
+        let local = projected_row("shared-id", "file:///music/old.flac");
+        assert!(local.set_source_id(SourceId::local()));
+        let remote = projected_row("shared-id", "");
+        let remote_source = SourceId::random();
+        assert!(remote.set_source_id(remote_source));
+        let replacement = projected_row("shared-id", "file:///music/new.flac");
+
+        assert_eq!(
+            refresh_projected_library_uris(&[local.clone(), remote.clone()], &[replacement]),
+            1
+        );
+        assert_eq!(local.uri(), "file:///music/new.flac");
+        assert_eq!(remote.uri(), "");
+        assert_eq!(remote.source_id(), Some(remote_source));
+    }
+
+    #[test]
+    fn local_uri_refresh_does_not_revive_an_unavailable_playlist_occurrence() {
+        use crate::ui::objects::{PlaylistOccurrenceBinding, PlaylistRowUnavailableReason};
+
+        let missing_id = TrackId::new("missing-local").expect("local track ID");
+        let unavailable = projected_row(missing_id.as_str(), "");
+        unavailable.set_playlist_occurrence_binding(
+            PlaylistOccurrenceBinding::unavailable(
+                "entry-missing",
+                SourceId::local(),
+                Some(missing_id),
+                PlaylistRowUnavailableReason::LocalTrackMissing,
+            )
+            .expect("missing local occurrence"),
+        );
+        let replacement = projected_row("missing-local", "file:///music/reappeared.flac");
+
+        assert_eq!(
+            refresh_projected_library_uris(std::slice::from_ref(&unavailable), &[replacement],),
+            0,
+            "only a new authoritative playlist projection may make the row available",
+        );
+        assert!(unavailable.uri().is_empty());
     }
 
     #[test]
@@ -2418,6 +2591,173 @@ mod tests {
         assert!(!session.has_current());
         assert!(!session.accepts_event_generation(b_again.generation));
         assert_eq!(output_state.borrow().stops, 1);
+    }
+
+    #[test]
+    fn regular_playlist_capture_skips_unavailable_rows_without_losing_duplicate_occurrences() {
+        use crate::ui::objects::{PlaylistOccurrenceBinding, PlaylistRowUnavailableReason};
+
+        let playlist_key = "playlist:mixed";
+        let stable_id = TrackId::new("same-local-track").expect("local track ID");
+        let first = projected_row(stable_id.as_str(), "file:///music/same.flac");
+        first.set_playlist_occurrence_binding(
+            PlaylistOccurrenceBinding::available_local("entry-first", stable_id.clone())
+                .expect("first occurrence"),
+        );
+        let missing = projected_row("missing-local-track", "");
+        missing.set_playlist_occurrence_binding(
+            PlaylistOccurrenceBinding::unavailable(
+                "entry-missing",
+                SourceId::local(),
+                Some(TrackId::new("missing-local-track").expect("missing local ID")),
+                PlaylistRowUnavailableReason::LocalTrackMissing,
+            )
+            .expect("missing occurrence"),
+        );
+        let duplicate = projected_row(stable_id.as_str(), "file:///music/same.flac");
+        duplicate.set_playlist_occurrence_binding(
+            PlaylistOccurrenceBinding::available_local("entry-duplicate", stable_id)
+                .expect("duplicate occurrence"),
+        );
+
+        let store = gtk::gio::ListStore::new::<TrackObject>();
+        store.append(&first);
+        store.append(&missing);
+        store.append(&duplicate);
+
+        assert_eq!(playable_model_positions(&store, playlist_key), [0, 2]);
+        assert!(
+            capture_visible_queue(&store, playlist_key, 1).is_none(),
+            "activating an unavailable row must not install a replacement queue"
+        );
+        let captured =
+            capture_visible_queue(&store, playlist_key, 2).expect("duplicate is playable");
+        assert_eq!(captured.selected_index, 1);
+        assert_eq!(captured.items.len(), 2);
+        assert_eq!(
+            captured
+                .items
+                .iter()
+                .map(|item| item.identity.media_key.track_id.as_str())
+                .collect::<Vec<_>>(),
+            ["same-local-track", "same-local-track"]
+        );
+        assert_eq!(captured.items[0].occurrence, 0);
+        assert_eq!(captured.items[1].occurrence, 1);
+        assert!(captured.items.iter().all(|item| {
+            item.identity.view_origin == Some(ViewOrigin::Playlist("mixed".to_string()))
+        }));
+    }
+
+    #[test]
+    fn available_remote_projection_carries_exact_guard_into_duplicate_queue_occurrences() {
+        use crate::local::playlist_manager::{LoadedPlaylistEntry, StoredPlaylistEntry};
+        use crate::source_registry::{RegularPlaylistTrack, RegularPlaylistTrackResolution};
+        use crate::ui::playlist_projection::project_playlist_rows;
+
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("remote/native-id").expect("remote track ID");
+        let media_key = MediaKey::new(source_id, track_id.clone());
+        let catalogue_track = crate::architecture::models::Track {
+            id: uuid::Uuid::new_v4(),
+            native_track_id: Some(track_id.clone()),
+            title: "Current remote title".to_string(),
+            artist_name: "Current remote artist".to_string(),
+            album_artist_name: None,
+            artist_id: None,
+            album_title: "Current remote album".to_string(),
+            album_id: None,
+            track_number: Some(3),
+            disc_number: Some(1),
+            duration_secs: Some(211),
+            composer: None,
+            genre: Some("Remote genre".to_string()),
+            year: Some(2026),
+            file_path: Some("/private/must-not-cross.flac".to_string()),
+            stream_url: Some(
+                url::Url::parse("https://secret.invalid/audio?token=private")
+                    .expect("fixture stream URL"),
+            ),
+            cover_art_url: Some(
+                url::Url::parse("https://secret.invalid/art?token=private")
+                    .expect("fixture artwork URL"),
+            ),
+            date_added: None,
+            date_modified: None,
+            bitrate_kbps: Some(1_024),
+            sample_rate_hz: Some(96_000),
+            format: Some("flac".to_string()),
+            play_count: Some(9),
+            rating: crate::architecture::models::TrackRating::read_only(None),
+            last_played: None,
+        };
+        let available =
+            RegularPlaylistTrack::for_ui_test(media_key.clone(), 17, 29, &catalogue_track);
+        let loaded = |entry_id: &str, position: i32| LoadedPlaylistEntry {
+            stored: StoredPlaylistEntry {
+                id: entry_id.to_string(),
+                playlist_id: "mixed".to_string(),
+                position,
+                source_id,
+                track_id: Some(track_id.clone()),
+                local_track_id: None,
+                match_title: "private persisted fingerprint".to_string(),
+                match_artist: "private persisted artist".to_string(),
+                match_album: "private persisted album".to_string(),
+                match_duration_secs: Some(999),
+                match_file_path: None,
+            },
+            local_track: None,
+        };
+        let projected = project_playlist_rows(
+            vec![loaded("entry-first", 0), loaded("entry-duplicate", 1)],
+            vec![
+                RegularPlaylistTrackResolution::Available(Box::new(available.clone())),
+                RegularPlaylistTrackResolution::Available(Box::new(available)),
+            ],
+        )
+        .expect("exact remote projection");
+        let rows = projected
+            .into_iter()
+            .map(crate::ui::source_connect::playlist_row_to_object)
+            .collect::<Vec<_>>();
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| {
+            row.source_id() == Some(source_id)
+                && row.source_session_epoch() == Some(17)
+                && row.source_catalogue_generation() == Some(29)
+                && row.title() == "Current remote title"
+                && row.uri().is_empty()
+                && row.cover_art_url().is_empty()
+        }));
+        assert_ne!(rows[0].row_instance_id(), rows[1].row_instance_id());
+
+        let store = gtk::gio::ListStore::new::<TrackObject>();
+        for row in &rows {
+            store.append(row);
+        }
+        let captured = capture_visible_queue(&store, "playlist:mixed", 1)
+            .expect("duplicate remote occurrence is playable");
+        assert_eq!(captured.selected_index, 1);
+        assert_eq!(captured.items.len(), 2);
+        for (occurrence, item) in captured.items.iter().enumerate() {
+            assert_eq!(item.identity.media_key, media_key);
+            assert_eq!(
+                item.identity.view_origin,
+                Some(ViewOrigin::playlist("mixed").expect("playlist origin"))
+            );
+            assert_eq!(item.occurrence, occurrence);
+            assert_eq!(item.source_session_epoch, Some(17));
+            let guard = item
+                .regular_playlist_guard
+                .expect("available remote occurrence keeps its closed guard");
+            assert_eq!(guard.source_id(), source_id);
+            assert_eq!(guard.session_epoch(), 17);
+            assert_eq!(guard.catalogue_generation(), 29);
+            assert!(item.uri().is_empty());
+            assert!(item.cover_art_url.is_empty());
+        }
     }
 
     #[test]
@@ -2969,6 +3309,19 @@ mod tests {
 
         assert!(session.clear_if_source("remote-a"));
         assert!(!session.accepts_event_generation(retired_generation));
+        assert!(!session.has_current());
+        assert!(session.queue.is_empty());
+    }
+
+    #[test]
+    fn source_retirement_clears_a_mixed_queue_before_navigation_reaches_it() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![item(LOCAL_SOURCE_KEY, "local"), item("remote-a", "remote")],
+            0,
+        ));
+        assert_eq!(current_source(&session), SourceId::local());
+        assert!(session.clear_if_source("remote-a"));
         assert!(!session.has_current());
         assert!(session.queue.is_empty());
     }
@@ -3691,13 +4044,14 @@ mod tests {
         let mut second = first.clone();
         second.occurrence = 1;
         second.row_instance_id = Some(22);
+        let media_key = first.identity.media_key.clone();
         let mut session = PlaybackSession::default();
         assert!(session.replace_queue(vec![first, second], 1));
 
         assert_eq!(current_id(&session), "same-track");
         assert_eq!(session.current().map(|item| item.occurrence), Some(1));
         assert_eq!(
-            find_queue_item_position(4, "same-track", 1, Some(22), |index| {
+            find_queue_item_position(4, &media_key, 1, Some(22), |index| {
                 [
                     (11, "same-track"),
                     (12, "other"),
@@ -3705,9 +4059,78 @@ mod tests {
                     (33, "same-track"),
                 ]
                 .get(index as usize)
-                .map(|(row_id, track_id)| (*row_id, (*track_id).to_string()))
+                .map(|(row_id, track_id)| {
+                    (
+                        *row_id,
+                        MediaKey::new(
+                            media_key.source_id,
+                            TrackId::new(*track_id).expect("test track ID"),
+                        ),
+                    )
+                })
             }),
             Some(2)
         );
+    }
+
+    #[test]
+    fn rebuilt_row_fallback_matches_source_and_track_identity() {
+        let shared_track_id = TrackId::new("same-native-id").expect("shared track ID");
+        let local_key = MediaKey::new(SourceId::local(), shared_track_id.clone());
+        let remote_key = MediaKey::new(SourceId::random(), shared_track_id);
+        let rebuilt_rows = [
+            Some((101, remote_key.clone())),
+            None, // unavailable or malformed rows do not participate
+            Some((102, local_key.clone())),
+            Some((103, remote_key.clone())),
+            Some((104, local_key.clone())),
+        ];
+
+        assert_eq!(
+            find_queue_item_position(5, &local_key, 0, None, |index| {
+                rebuilt_rows[index as usize].clone()
+            }),
+            Some(2),
+            "a remote row with the same native ID must not capture the local occurrence"
+        );
+        assert_eq!(
+            find_queue_item_position(5, &remote_key, 1, None, |index| {
+                rebuilt_rows[index as usize].clone()
+            }),
+            Some(3),
+            "occurrence counting must be scoped to the complete media key"
+        );
+    }
+
+    #[test]
+    fn rebuilt_row_candidates_skip_unavailable_and_malformed_playlist_rows() {
+        use crate::ui::objects::{PlaylistOccurrenceBinding, PlaylistRowUnavailableReason};
+
+        let view = queue_view("playlist:mixed").expect("playlist view");
+        let available_id = TrackId::new("available").expect("available track ID");
+        let available = projected_row(available_id.as_str(), "file:///music/available.flac");
+        available.set_playlist_occurrence_binding(
+            PlaylistOccurrenceBinding::available_local("entry-available", available_id.clone())
+                .expect("available occurrence"),
+        );
+        let unavailable = projected_row("missing", "");
+        unavailable.set_playlist_occurrence_binding(
+            PlaylistOccurrenceBinding::unavailable(
+                "entry-unavailable",
+                SourceId::local(),
+                Some(TrackId::new("missing").expect("missing track ID")),
+                PlaylistRowUnavailableReason::LocalTrackMissing,
+            )
+            .expect("unavailable occurrence"),
+        );
+        let malformed = projected_row("initially-valid", "");
+        malformed.set_track_id("");
+
+        assert_eq!(
+            row_position_identity(&view, &available).map(|(_, key)| key),
+            Some(MediaKey::new(SourceId::local(), available_id))
+        );
+        assert_eq!(row_position_identity(&view, &unavailable), None);
+        assert_eq!(row_position_identity(&view, &malformed), None);
     }
 }
