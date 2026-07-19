@@ -125,6 +125,42 @@ const DATE_OPS: &[&str] = &[
     "is not in the last",
 ];
 
+/// Relative-date unit names.
+const DATE_UNITS: &[&str] = &["days", "weeks", "months"];
+
+fn index_to_date_unit(idx: u32) -> DateUnit {
+    match idx {
+        1 => DateUnit::Weeks,
+        2 => DateUnit::Months,
+        _ => DateUnit::Days,
+    }
+}
+
+fn date_unit_to_index(unit: DateUnit) -> u32 {
+    match unit {
+        DateUnit::Days => 0,
+        DateUnit::Weeks => 1,
+        DateUnit::Months => 2,
+    }
+}
+
+fn relative_date_unit(operator: &RuleOperator) -> Option<DateUnit> {
+    match operator {
+        RuleOperator::IsInTheLast { unit, .. } | RuleOperator::IsNotInTheLast { unit, .. } => {
+            Some(*unit)
+        }
+        _ => None,
+    }
+}
+
+fn relative_date_operator(op_index: u32, amount: u32, unit: DateUnit) -> Option<RuleOperator> {
+    match op_index {
+        4 => Some(RuleOperator::IsInTheLast { amount, unit }),
+        5 => Some(RuleOperator::IsNotInTheLast { amount, unit }),
+        _ => None,
+    }
+}
+
 /// Limit unit names.
 const LIMIT_UNITS: &[&str] = &["items", "minutes", "hours", "MB", "GB"];
 
@@ -496,6 +532,21 @@ fn build_rule_row(
         .visible(false)
         .build();
 
+    // Unit selector for relative date operators. It remains part of every
+    // row so switching fields/operators cannot lose a previously selected
+    // Weeks/Months value, but is visible only for the two relative modes.
+    let date_unit_model = gtk::StringList::new(DATE_UNITS);
+    let date_unit_dropdown = gtk::DropDown::builder()
+        .model(&date_unit_model)
+        .selected(
+            existing
+                .and_then(|rule| relative_date_unit(&rule.operator))
+                .map(date_unit_to_index)
+                .unwrap_or(0),
+        )
+        .visible(false)
+        .build();
+
     // Remove button.
     let remove_btn = gtk::Button::builder()
         .icon_name("list-remove-symbolic")
@@ -506,6 +557,7 @@ fn build_rule_row(
     row.append(&field_dropdown);
     row.append(&op_dropdown);
     row.append(&value_entry);
+    row.append(&date_unit_dropdown);
     row.append(&value2_entry);
     row.append(&remove_btn);
 
@@ -523,6 +575,7 @@ fn build_rule_row(
         let op_model = op_model.clone();
         let op_dropdown = op_dropdown.clone();
         let value2 = value2_entry.clone();
+        let date_unit = date_unit_dropdown.clone();
 
         let update_ops = move |field_idx: u32| {
             let field = index_to_field(field_idx);
@@ -541,6 +594,7 @@ fn build_rule_row(
             }
             op_dropdown.set_selected(0);
             value2.set_visible(false);
+            date_unit.set_visible(false);
         };
 
         // Initial population.
@@ -555,6 +609,7 @@ fn build_rule_row(
     {
         let value2 = value2_entry.clone();
         let field_dd = field_dropdown.clone();
+        let date_unit = date_unit_dropdown.clone();
         op_dropdown.connect_selected_notify(move |dd| {
             let field = index_to_field(field_dd.selected());
             let is_range = match field_type(&field) {
@@ -562,6 +617,9 @@ fn build_rule_row(
                 _ => false,
             };
             value2.set_visible(is_range);
+            let is_relative_date =
+                matches!(field_type(&field), FieldType::Date) && matches!(dd.selected(), 4 | 5);
+            date_unit.set_visible(is_relative_date);
         });
     }
 
@@ -597,6 +655,7 @@ fn build_rule_row(
             },
         };
         op_dropdown.set_selected(op_idx);
+        date_unit_dropdown.set_visible(relative_date_unit(&rule.operator).is_some());
 
         // Set value.
         match &rule.value {
@@ -611,12 +670,21 @@ fn build_rule_row(
             RuleValue::Duration(d) => value_entry.set_text(&d.to_string()),
             RuleValue::Size(s) => value_entry.set_text(&s.to_string()),
         }
+        if let RuleOperator::IsInTheLast { amount, .. }
+        | RuleOperator::IsNotInTheLast { amount, .. } = &rule.operator
+        {
+            // The amount embedded in the operator is authoritative. Showing
+            // it prevents an inconsistent redundant RuleValue from changing
+            // the predicate merely because the editor was opened and saved.
+            value_entry.set_text(&amount.to_string());
+        }
     }
 
     // Store widget names for extraction.
     field_dropdown.set_widget_name("field");
     op_dropdown.set_widget_name("operator");
     value_entry.set_widget_name("value");
+    date_unit_dropdown.set_widget_name("date_unit");
     value2_entry.set_widget_name("value2");
 
     row
@@ -627,6 +695,7 @@ fn extract_rule_from_row(row: &gtk::Box) -> Option<SmartRule> {
     let mut field_dropdown: Option<gtk::DropDown> = None;
     let mut op_dropdown: Option<gtk::DropDown> = None;
     let mut value_entry: Option<gtk::Entry> = None;
+    let mut date_unit_dropdown: Option<gtk::DropDown> = None;
     let mut value2_entry: Option<gtk::Entry> = None;
 
     let mut child = row.first_child();
@@ -638,6 +707,8 @@ fn extract_rule_from_row(row: &gtk::Box) -> Option<SmartRule> {
             op_dropdown = widget.downcast_ref::<gtk::DropDown>().cloned();
         } else if name == "value" {
             value_entry = widget.downcast_ref::<gtk::Entry>().cloned();
+        } else if name == "date_unit" {
+            date_unit_dropdown = widget.downcast_ref::<gtk::DropDown>().cloned();
         } else if name == "value2" {
             value2_entry = widget.downcast_ref::<gtk::Entry>().cloned();
         }
@@ -647,6 +718,9 @@ fn extract_rule_from_row(row: &gtk::Box) -> Option<SmartRule> {
     let field_dd = field_dropdown?;
     let op_dd = op_dropdown?;
     let val_entry = value_entry?;
+    let date_unit = date_unit_dropdown
+        .map(|dropdown| index_to_date_unit(dropdown.selected()))
+        .unwrap_or(DateUnit::Days);
 
     let field = index_to_field(field_dd.selected());
     let val_text = val_entry.text().to_string();
@@ -691,20 +765,12 @@ fn extract_rule_from_row(row: &gtk::Box) -> Option<SmartRule> {
                 1 => RuleOperator::IsNot,
                 2 => RuleOperator::IsBefore,
                 3 => RuleOperator::IsAfter,
-                4 => {
-                    let amount = val_text.parse::<u32>().unwrap_or(30);
-                    RuleOperator::IsInTheLast {
-                        amount,
-                        unit: DateUnit::Days,
-                    }
-                }
-                5 => {
-                    let amount = val_text.parse::<u32>().unwrap_or(30);
-                    RuleOperator::IsNotInTheLast {
-                        amount,
-                        unit: DateUnit::Days,
-                    }
-                }
+                4 | 5 => relative_date_operator(
+                    op_dd.selected(),
+                    val_text.parse::<u32>().unwrap_or(30),
+                    date_unit,
+                )
+                .expect("relative date indexes are exhaustive"),
                 _ => RuleOperator::Is,
             };
             match &op {
@@ -975,5 +1041,38 @@ mod tests {
             LIMIT_SORTS[limit_sort_to_index(LimitSort::LeastRecentlyPlayed) as usize],
             "Least Recently Played"
         );
+    }
+
+    #[test]
+    fn relative_date_operators_preserve_amount_and_unit_through_editor_mappings() {
+        for unit in [DateUnit::Days, DateUnit::Weeks, DateUnit::Months] {
+            let unit_index = date_unit_to_index(unit);
+            assert_eq!(index_to_date_unit(unit_index), unit);
+
+            for operator_index in [4, 5] {
+                let operator = relative_date_operator(operator_index, 7, unit)
+                    .expect("relative operator index");
+                assert_eq!(relative_date_unit(&operator), Some(unit));
+                match operator {
+                    RuleOperator::IsInTheLast {
+                        amount,
+                        unit: restored,
+                    } if operator_index == 4 => {
+                        assert_eq!(amount, 7);
+                        assert_eq!(restored, unit);
+                    }
+                    RuleOperator::IsNotInTheLast {
+                        amount,
+                        unit: restored,
+                    } if operator_index == 5 => {
+                        assert_eq!(amount, 7);
+                        assert_eq!(restored, unit);
+                    }
+                    unexpected => panic!("unexpected relative operator: {unexpected:?}"),
+                }
+            }
+        }
+
+        assert_eq!(DATE_UNITS, ["days", "weeks", "months"]);
     }
 }

@@ -120,7 +120,7 @@ pub enum RuleOperator {
 }
 
 /// Date unit for relative date operators.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DateUnit {
     Days,
     Weeks,
