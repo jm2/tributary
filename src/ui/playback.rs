@@ -16,7 +16,8 @@ use tracing::warn;
 
 use crate::architecture::{MediaKey, SourceId, TrackId, ViewOrigin};
 use crate::audio::output::AudioOutput;
-use crate::audio::PlayerEventGeneration;
+use crate::audio::{PlayerEvent, PlayerEventGeneration, PlayerState};
+use crate::local::playback_history::PlaybackHistoryProgress;
 use crate::ui::header_bar::RepeatMode;
 use crate::ui::objects::TrackObject;
 
@@ -221,6 +222,9 @@ pub struct QueueItem {
     /// Random SourceIds are also valid persisted remote identities, so source
     /// shape alone cannot safely recover this lifecycle distinction later.
     external_session: bool,
+    /// Positive metadata duration captured with this queue occurrence.
+    /// Zero remains unknown so an output may supply its first real duration.
+    duration_ms: Option<u64>,
     uri: String,
     title: String,
     artist: String,
@@ -231,12 +235,17 @@ pub struct QueueItem {
 impl QueueItem {
     fn from_track(identity: PlaybackIdentity, track: &TrackObject, occurrence: usize) -> Self {
         let is_library = is_library_source(identity.media_key.source_id);
+        let duration_ms = match track.duration_secs() {
+            0 => None,
+            duration_secs => Some(duration_secs.saturating_mul(1_000)),
+        };
         Self {
             identity,
             occurrence,
             row_instance_id: Some(track.row_instance_id()),
             source_session_epoch: track.source_session_epoch(),
             external_session: false,
+            duration_ms,
             // Local, playlist, and lifecycle-owned queues retain identity,
             // ordering, and metadata but never a locator. Every output load
             // resolves the exact source/track/epoch at the point of use.
@@ -263,6 +272,10 @@ impl QueueItem {
             row_instance_id: None,
             source_session_epoch: Some(session.session_epoch()),
             external_session: true,
+            duration_ms: track
+                .duration_secs
+                .filter(|duration_secs| *duration_secs > 0)
+                .map(|duration_secs| duration_secs.saturating_mul(1_000)),
             uri: String::new(),
             title: track.title.clone(),
             artist: track.artist_name.clone(),
@@ -287,6 +300,7 @@ impl QueueItem {
             row_instance_id: None,
             source_session_epoch: None,
             external_session: false,
+            duration_ms: None,
             uri,
             title,
             artist,
@@ -306,6 +320,7 @@ impl QueueItem {
             row_instance_id: None,
             source_session_epoch: Some(session_epoch),
             external_session: true,
+            duration_ms: None,
             uri: String::new(),
             title: "External".to_string(),
             artist: "Artist".to_string(),
@@ -322,6 +337,38 @@ impl QueueItem {
     #[cfg(test)]
     pub(crate) const fn source_session_epoch(&self) -> Option<u64> {
         self.source_session_epoch
+    }
+}
+
+/// History state owned by one genuine playback occurrence.
+///
+/// Output generations are deliberately only delivery proofs. A retry can
+/// replace `accepted_generation` while retaining `progress`; queue navigation
+/// and repeat-one instead install a brand-new value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlaybackHistoryOccurrence {
+    track_id: TrackId,
+    progress: PlaybackHistoryProgress,
+    accepted_generation: Option<PlayerEventGeneration>,
+    playing: bool,
+    needs_reanchor: bool,
+}
+
+impl PlaybackHistoryOccurrence {
+    fn from_item(item: &QueueItem) -> Option<Self> {
+        is_library_source(item.identity.media_key.source_id).then(|| Self {
+            track_id: item.identity.media_key.track_id.clone(),
+            progress: PlaybackHistoryProgress::new(item.duration_ms),
+            accepted_generation: None,
+            playing: false,
+            needs_reanchor: true,
+        })
+    }
+
+    fn retire_delivery(&mut self) {
+        self.accepted_generation = None;
+        self.playing = false;
+        self.needs_reanchor = true;
     }
 }
 
@@ -397,6 +444,10 @@ pub struct PlaybackSession {
     /// resolution when applicable) instead of issuing `play()` to an output
     /// that has no loaded media.
     resolution_failed: bool,
+    /// Durable-history accounting for the current local queue occurrence.
+    /// Remote, removable, radio, and external items deliberately leave this
+    /// empty even when their backend-native track ID resembles a local ID.
+    history_occurrence: Option<PlaybackHistoryOccurrence>,
 }
 
 impl PlaybackSession {
@@ -2853,43 +2904,4 @@ mod tests {
 
         session.borrow_mut().clear();
 
-        assert_eq!(
-            resolve_session_play_request(&session, 3, false),
-            PlayRequest::StartAt(0)
-        );
-        assert!(
-            session
-                .try_borrow_mut()
-                .expect("play-request resolution must release its immutable borrow")
-                .replace_queue(vec![item("remote", "fresh")], 0),
-            "the StartAt arm must be able to install a fresh queue"
-        );
-    }
-
-    #[test]
-    fn duplicate_track_occurrences_keep_stable_identity_but_select_distinct_rows() {
-        let mut first = item("playlist:one", "same-track");
-        first.row_instance_id = Some(11);
-        let mut second = first.clone();
-        second.occurrence = 1;
-        second.row_instance_id = Some(22);
-        let mut session = PlaybackSession::default();
-        assert!(session.replace_queue(vec![first, second], 1));
-
-        assert_eq!(current_id(&session), "same-track");
-        assert_eq!(session.current().map(|item| item.occurrence), Some(1));
-        assert_eq!(
-            find_queue_item_position(4, "same-track", 1, Some(22), |index| {
-                [
-                    (11, "same-track"),
-                    (12, "other"),
-                    (22, "same-track"),
-                    (33, "same-track"),
-                ]
-                .get(index as usize)
-                .map(|(row_id, track_id)| (*row_id, (*track_id).to_string()))
-            }),
-            Some(2)
-        );
-    }
-}
+        asse

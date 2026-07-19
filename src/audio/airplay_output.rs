@@ -21,8 +21,10 @@
 //!
 //! A bus watch on the dedicated pipeline forwards EOS / errors / state
 //! changes into the same `PlayerEvent` channel the rest of the app
-//! consumes, so the header bar reflects what's actually happening on
-//! the receiver instead of optimistic guesses.
+//! consumes. A weak, generation-scoped timer publishes position and
+//! duration while the pipeline is actually playing, so progress accounting
+//! and the header bar reflect the accepted RAOP session rather than
+//! optimistic guesses.
 //!
 //! # Scope
 //!
@@ -41,7 +43,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket, PreparedGstreamerMedia};
 use super::output::{AudioOutput, OutputType};
@@ -245,6 +247,7 @@ impl AirPlayOutput {
                 return Err(failure);
             }
         };
+        Self::start_position_timer(&pipeline, &self.event_tx, generation);
         let session = Session {
             pipeline,
             media_ticket,
@@ -372,6 +375,59 @@ impl AirPlayOutput {
             glib::ControlFlow::Continue
         })
         .map_err(|e| format!("Failed to attach bus watch: {e}"))
+    }
+
+    /// Start a generation-scoped position timer for this exact RAOP session.
+    ///
+    /// AirPlay uses a dedicated pipeline rather than the main player, so it
+    /// needs its own progress publisher. The weak reference makes teardown
+    /// self-cancelling; retaining the generation captured at load time means
+    /// even a final delayed tick cannot be attributed to a replacement load.
+    fn start_position_timer(
+        pipeline: &gst::Pipeline,
+        event_tx: &async_channel::Sender<PlayerEvent>,
+        generation: PlayerEventGeneration,
+    ) {
+        let pipeline_weak = pipeline.downgrade();
+        let tx = event_tx.clone();
+
+        glib::timeout_add_local(Duration::from_millis(500), move || {
+            let Some(pipeline) = pipeline_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+
+            let (_, state, _) = pipeline.state(gst::ClockTime::ZERO);
+            let position_ms = pipeline
+                .query_position::<gst::ClockTime>()
+                .map(|position| position.mseconds());
+            let duration_ms = pipeline
+                .query_duration::<gst::ClockTime>()
+                .map(|duration| duration.mseconds());
+            if let Some(event) =
+                Self::position_sample_event(generation, state, position_ms, duration_ms)
+            {
+                let _ = tx.try_send(event);
+            }
+
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Turn one pipeline sample into the shared player-event contract.
+    /// Unknown duration remains zero, matching local, MPD, and Chromecast
+    /// output semantics; paused/stopped pipelines never publish progress.
+    fn position_sample_event(
+        generation: PlayerEventGeneration,
+        state: gst::State,
+        position_ms: Option<u64>,
+        duration_ms: Option<u64>,
+    ) -> Option<PlayerEvent> {
+        if state != gst::State::Playing {
+            return None;
+        }
+        position_ms.map(|position_ms| {
+            PlayerEvent::position(generation, position_ms, duration_ms.unwrap_or(0))
+        })
     }
 
     /// Build a pipeline using GStreamer's `raopsink`. The caller has
@@ -611,6 +667,53 @@ mod tests {
         let (tx, _rx) = async_channel::unbounded();
         let output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
         assert_eq!(output.state(), PlayerState::Stopped);
+    }
+
+    #[test]
+    fn airplay_position_samples_are_playing_only_and_keep_the_load_generation() {
+        let generation = PlayerEventGeneration::from_raw(73);
+
+        assert!(AirPlayOutput::position_sample_event(
+            generation,
+            gst::State::Paused,
+            Some(1_500),
+            Some(9_000),
+        )
+        .is_none());
+        assert!(AirPlayOutput::position_sample_event(
+            generation,
+            gst::State::Playing,
+            None,
+            Some(9_000),
+        )
+        .is_none());
+
+        assert!(matches!(
+            AirPlayOutput::position_sample_event(
+                generation,
+                gst::State::Playing,
+                Some(1_500),
+                Some(9_000),
+            ),
+            Some(PlayerEvent::PositionChanged {
+                generation: event_generation,
+                position_ms: 1_500,
+                duration_ms: 9_000,
+            }) if event_generation == generation
+        ));
+        assert!(matches!(
+            AirPlayOutput::position_sample_event(
+                generation,
+                gst::State::Playing,
+                Some(2_000),
+                None,
+            ),
+            Some(PlayerEvent::PositionChanged {
+                generation: event_generation,
+                position_ms: 2_000,
+                duration_ms: 0,
+            }) if event_generation == generation
+        ));
     }
 
     /// P2.9's core guarantee: a missing `raopsink` is refused with guidance

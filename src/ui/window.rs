@@ -16,7 +16,8 @@ use crate::audio::output::AudioOutput;
 use crate::audio::{PlayerEvent, PlayerState};
 use crate::desktop_integration::MediaAction;
 use crate::local::engine::{
-    LibraryEngine, LibraryEvent, RootReauthorizationOutcome, RootReauthorizationRequest,
+    LibraryCommand, LibraryEngine, LibraryEvent, RootReauthorizationOutcome,
+    RootReauthorizationRequest,
 };
 use crate::ui::header_bar::RepeatMode;
 
@@ -1531,8 +1532,11 @@ pub fn build_window(
     // validates every request against fresh filesystem evidence before it can
     // change persisted trust; the GTK side only queues an affirmative intent.
     let (library_command_tx, library_command_rx) = async_channel::bounded(LIBRARY_COMMAND_CAPACITY);
-    let root_trust_prompts =
-        root_trust::RootTrustPromptController::new(&window, &toast_overlay, library_command_tx);
+    let root_trust_prompts = root_trust::RootTrustPromptController::new(
+        &window,
+        &toast_overlay,
+        library_command_tx.clone(),
+    );
 
     // ── Start the library engine on tokio ────────────────────────────
     // Use the configured library paths from preferences, which default
@@ -2914,6 +2918,95 @@ fn refresh_active_playlist_uris(
     }
 }
 
+/// Replace one already-known local row by exact stable identity.
+///
+/// Playback-history events are updates, never discovery. Refusing to append a
+/// missing row prevents a delayed committed event from resurrecting a track
+/// that a newer library event already removed. URI equality is deliberately
+/// irrelevant: paths can move, and a remote source can expose the same URI.
+fn replace_existing_local_track(
+    rows: &mut [TrackObject],
+    replacement: &TrackObject,
+) -> bool {
+    let track_id = replacement.track_id();
+    if track_id.is_empty() {
+        return false;
+    }
+    let Some(index) = rows.iter().position(|row| row.track_id() == track_id) else {
+        return false;
+    };
+    rows[index] = replacement.clone();
+    true
+}
+
+/// Retire every cached playlist projection and reload the active one.
+///
+/// A playback-history commit can change smart-playlist membership and order,
+/// while ordinary playlists still need their displayed Plays value refreshed.
+/// Invalidating the navigation generation before clearing rows prevents a late
+/// pre-commit query from publishing stale projections again.
+#[allow(clippy::too_many_arguments)]
+fn invalidate_playlist_projections(
+    rt_handle: &tokio::runtime::Handle,
+    source_navigation: &Rc<RefCell<SourceNavigation>>,
+    source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    active_source_key: &Rc<RefCell<String>>,
+    track_store: &gtk::gio::ListStore,
+    master_tracks: &Rc<RefCell<Vec<TrackObject>>>,
+    browser_widget: &gtk::Box,
+    browser_state: &browser::BrowserState,
+    status_label: &gtk::Label,
+    column_view: &gtk::ColumnView,
+) {
+    let active_key = active_source_key.borrow().clone();
+    source_navigation
+        .borrow_mut()
+        .invalidate_prefix(PLAYLIST_SOURCE_PREFIX);
+    source_tracks
+        .borrow_mut()
+        .retain(|key, _| !key.starts_with(PLAYLIST_SOURCE_PREFIX));
+
+    let Some(playlist_id) = active_key
+        .strip_prefix(PLAYLIST_SOURCE_PREFIX)
+        .map(str::to_string)
+    else {
+        return;
+    };
+
+    // Stale rows may already have changed membership or ordering. Leave no
+    // old projection actionable while its committed replacement is loading.
+    display_tracks(
+        &[],
+        track_store,
+        master_tracks,
+        browser_widget,
+        browser_state,
+        status_label,
+        column_view,
+    );
+
+    // During remote authentication, visible source and latest navigation
+    // intent intentionally differ. Background playlist maintenance must not
+    // supersede that newer intent.
+    if source_navigation.borrow().is_key(&active_key) {
+        let request = source_navigation.borrow_mut().select(active_key);
+        super::source_connect::load_playlist_source(
+            rt_handle.clone(),
+            playlist_id,
+            request,
+            source_navigation.clone(),
+            source_tracks.clone(),
+            active_source_key.clone(),
+            track_store.clone(),
+            master_tracks.clone(),
+            browser_widget.clone(),
+            browser_state.clone(),
+            status_label.clone(),
+            column_view.clone(),
+        );
+    }
+}
+
 /// Spawn the library event receiver loop on the GTK main thread.
 #[allow(clippy::too_many_arguments)]
 fn setup_library_events(
@@ -3170,60 +3263,65 @@ fn setup_library_events(
                     scan_spinner.set_visible(false);
                 }
 
-                LibraryEvent::PlaylistProjectionsInvalidated => {
-                    let active_key = active_source_key.borrow().clone();
+                LibraryEvent::PlaybackHistoryUpdated(track) => {
+                    let replacement = arch_track_to_object(&track);
+                    let track_id = replacement.track_id();
+                    let local_updated = {
+                        let mut sources = source_tracks.borrow_mut();
+                        sources
+                            .get_mut("local")
+                            .is_some_and(|rows| replace_existing_local_track(rows, &replacement))
+                    };
 
-                    // Any local mutation can change a live smart playlist, and
-                    // reconciliation can remint/relink regular-playlist track
-                    // IDs. Retire pre-settlement requests before clearing the
-                    // cache so a late query cannot put stale rows back.
-                    source_navigation
-                        .borrow_mut()
-                        .invalidate_prefix(PLAYLIST_SOURCE_PREFIX);
-                    source_tracks
-                        .borrow_mut()
-                        .retain(|key, _| !key.starts_with(PLAYLIST_SOURCE_PREFIX));
-
-                    if let Some(playlist_id) = active_key
-                        .strip_prefix(PLAYLIST_SOURCE_PREFIX)
-                        .map(str::to_string)
-                    {
-                        // The old rows may hold orphaned/reminted IDs. Do not
-                        // leave them actionable while the settled projection
-                        // is loading.
-                        display_tracks(
-                            &[],
-                            &track_store,
-                            &master_tracks,
-                            &browser_widget,
-                            &browser_state,
-                            &status_label,
-                            &column_view,
-                        );
-
-                        // `active_source_key` names the visible rows, while
-                        // SourceNavigation names the user's latest intent.
-                        // During remote authentication those intentionally
-                        // differ. Never let background playlist maintenance
-                        // supersede that newer remote intent.
-                        if source_navigation.borrow().is_key(&active_key) {
-                            let request = source_navigation.borrow_mut().select(active_key.clone());
-                            super::source_connect::load_playlist_source(
-                                rt_handle.clone(),
-                                playlist_id,
-                                request,
-                                source_navigation.clone(),
-                                source_tracks.clone(),
-                                active_source_key.clone(),
-                                track_store.clone(),
-                                master_tracks.clone(),
-                                browser_widget.clone(),
-                                browser_state.clone(),
-                                status_label.clone(),
-                                column_view.clone(),
-                            );
+                    if local_updated && *active_source_key.borrow() == "local" {
+                        // Reinsert at the same base-model position. Gtk's sort
+                        // model sees an item change and can immediately reorder
+                        // a Plays-sorted view without rebuilding unrelated rows.
+                        for index in 0..track_store.n_items() {
+                            let Some(existing) =
+                                track_store.item(index).and_downcast::<TrackObject>()
+                            else {
+                                continue;
+                            };
+                            if existing.track_id() == track_id {
+                                track_store.remove(index);
+                                track_store.insert(index, &replacement);
+                                break;
+                            }
                         }
+                        let _ = replace_existing_local_track(
+                            &mut master_tracks.borrow_mut(),
+                            &replacement,
+                        );
                     }
+
+                    invalidate_playlist_projections(
+                        &rt_handle,
+                        &source_navigation,
+                        &source_tracks,
+                        &active_source_key,
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
+                }
+
+                LibraryEvent::PlaylistProjectionsInvalidated => {
+                    invalidate_playlist_projections(
+                        &rt_handle,
+                        &source_navigation,
+                        &source_tracks,
+                        &active_source_key,
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
                 }
 
                 LibraryEvent::PlaylistsLoaded(playlists) => {
@@ -3780,6 +3878,62 @@ mod identity_tests {
     use super::*;
     use crate::architecture::SourceId;
 
+    fn local_history_row(track_id: &str, uri: &str, play_count: u32) -> TrackObject {
+        let row = TrackObject::new(
+            1,
+            "Title",
+            180,
+            "Artist",
+            "Album",
+            "Genre",
+            "",
+            2026,
+            "2026-07-18",
+            320,
+            48_000,
+            play_count,
+            "flac",
+            uri,
+        );
+        row.set_track_id(track_id);
+        row
+    }
+
+    #[test]
+    fn playback_history_replaces_only_the_exact_existing_local_identity() {
+        let original = local_history_row("track-a", "file:///old/a.flac", 2);
+        let unrelated = local_history_row("track-b", "file:///music/b.flac", 7);
+        let mut rows = vec![original, unrelated.clone()];
+        let replacement = local_history_row("track-a", "file:///new/a.flac", 3);
+
+        assert!(replace_existing_local_track(&mut rows, &replacement));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].track_id(), "track-a");
+        assert_eq!(rows[0].uri(), "file:///new/a.flac");
+        assert_eq!(rows[0].play_count(), 3);
+        assert_eq!(rows[1].track_id(), unrelated.track_id());
+        assert_eq!(rows[1].play_count(), 7);
+    }
+
+    #[test]
+    fn playback_history_never_uri_matches_or_appends_a_missing_row() {
+        let retained = local_history_row("track-a", "file:///music/shared.flac", 2);
+        let mut rows = vec![retained.clone()];
+
+        let same_uri_wrong_id =
+            local_history_row("remote-collision", "file:///music/shared.flac", 99);
+        assert!(!replace_existing_local_track(
+            &mut rows,
+            &same_uri_wrong_id
+        ));
+        let missing = local_history_row("track-missing", "file:///music/missing.flac", 1);
+        assert!(!replace_existing_local_track(&mut rows, &missing));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].track_id(), retained.track_id());
+        assert_eq!(rows[0].play_count(), 2);
+    }
+
     fn disconnected_visible_snapshot(
         revision: u64,
     ) -> crate::source_lifecycle::LifecycleSnapshot<crate::source_registry::AcceptedView> {
@@ -4290,8 +4444,4 @@ mod identity_tests {
                 1,
                 false,
             ),
-            RemotePublicationSelection::Inactive,
-            "the reactivation superseded the deferred request exactly once"
-        );
-    }
-}
+            RemotePub
