@@ -26,6 +26,7 @@ const FIELD_NAMES: &[&str] = &[
     "Sample Rate (Hz)",
     "Format",
     "Play Count",
+    "Last Played",
     "Date Added",
     "Date Modified",
     "File Size (bytes)",
@@ -48,9 +49,10 @@ fn index_to_field(idx: u32) -> RuleField {
         11 => RuleField::SampleRate,
         12 => RuleField::Format,
         13 => RuleField::PlayCount,
-        14 => RuleField::DateAdded,
-        15 => RuleField::DateModified,
-        16 => RuleField::FileSize,
+        14 => RuleField::LastPlayed,
+        15 => RuleField::DateAdded,
+        16 => RuleField::DateModified,
+        17 => RuleField::FileSize,
         _ => RuleField::Title,
     }
 }
@@ -72,9 +74,10 @@ fn field_to_index(field: &RuleField) -> u32 {
         RuleField::SampleRate => 11,
         RuleField::Format => 12,
         RuleField::PlayCount => 13,
-        RuleField::DateAdded => 14,
-        RuleField::DateModified => 15,
-        RuleField::FileSize => 16,
+        RuleField::LastPlayed => 14,
+        RuleField::DateAdded => 15,
+        RuleField::DateModified => 16,
+        RuleField::FileSize => 17,
     }
 }
 
@@ -94,7 +97,7 @@ fn field_type(field: &RuleField) -> FieldType {
         | RuleField::Genre
         | RuleField::Composer
         | RuleField::Format => FieldType::Text,
-        RuleField::DateAdded | RuleField::DateModified => FieldType::Date,
+        RuleField::LastPlayed | RuleField::DateAdded | RuleField::DateModified => FieldType::Date,
         _ => FieldType::Number,
     }
 }
@@ -122,6 +125,42 @@ const DATE_OPS: &[&str] = &[
     "is not in the last",
 ];
 
+/// Relative-date unit names.
+const DATE_UNITS: &[&str] = &["days", "weeks", "months"];
+
+fn index_to_date_unit(idx: u32) -> DateUnit {
+    match idx {
+        1 => DateUnit::Weeks,
+        2 => DateUnit::Months,
+        _ => DateUnit::Days,
+    }
+}
+
+fn date_unit_to_index(unit: DateUnit) -> u32 {
+    match unit {
+        DateUnit::Days => 0,
+        DateUnit::Weeks => 1,
+        DateUnit::Months => 2,
+    }
+}
+
+fn relative_date_unit(operator: &RuleOperator) -> Option<DateUnit> {
+    match operator {
+        RuleOperator::IsInTheLast { unit, .. } | RuleOperator::IsNotInTheLast { unit, .. } => {
+            Some(*unit)
+        }
+        _ => None,
+    }
+}
+
+fn relative_date_operator(op_index: u32, amount: u32, unit: DateUnit) -> Option<RuleOperator> {
+    match op_index {
+        4 => Some(RuleOperator::IsInTheLast { amount, unit }),
+        5 => Some(RuleOperator::IsNotInTheLast { amount, unit }),
+        _ => None,
+    }
+}
+
 /// Limit unit names.
 const LIMIT_UNITS: &[&str] = &["items", "minutes", "hours", "MB", "GB"];
 
@@ -138,7 +177,45 @@ const LIMIT_SORTS: &[&str] = &[
     "Least Played",
     "Most Recently Added",
     "Least Recently Added",
+    "Most Recently Played",
+    "Least Recently Played",
 ];
+
+fn index_to_limit_sort(idx: u32) -> LimitSort {
+    match idx {
+        1 => LimitSort::Title,
+        2 => LimitSort::Album,
+        3 => LimitSort::Artist,
+        4 => LimitSort::Genre,
+        5 => LimitSort::Year,
+        6 => LimitSort::Bitrate,
+        7 => LimitSort::MostPlayed,
+        8 => LimitSort::LeastPlayed,
+        9 => LimitSort::MostRecentlyAdded,
+        10 => LimitSort::LeastRecentlyAdded,
+        11 => LimitSort::MostRecentlyPlayed,
+        12 => LimitSort::LeastRecentlyPlayed,
+        _ => LimitSort::Random,
+    }
+}
+
+fn limit_sort_to_index(sort: LimitSort) -> u32 {
+    match sort {
+        LimitSort::Random => 0,
+        LimitSort::Title => 1,
+        LimitSort::Album => 2,
+        LimitSort::Artist => 3,
+        LimitSort::Genre => 4,
+        LimitSort::Year => 5,
+        LimitSort::Bitrate => 6,
+        LimitSort::MostPlayed => 7,
+        LimitSort::LeastPlayed => 8,
+        LimitSort::MostRecentlyAdded => 9,
+        LimitSort::LeastRecentlyAdded => 10,
+        LimitSort::MostRecentlyPlayed => 11,
+        LimitSort::LeastRecentlyPlayed => 12,
+    }
+}
 
 // ── Public API ──────────────────────────────────────────────────────
 
@@ -259,19 +336,7 @@ pub fn show_smart_playlist_editor(
         .selected(
             existing_rules
                 .and_then(|r| r.limit.as_ref())
-                .map(|l| match l.selected_by {
-                    LimitSort::Random => 0,
-                    LimitSort::Title => 1,
-                    LimitSort::Album => 2,
-                    LimitSort::Artist => 3,
-                    LimitSort::Genre => 4,
-                    LimitSort::Year => 5,
-                    LimitSort::Bitrate => 6,
-                    LimitSort::MostPlayed => 7,
-                    LimitSort::LeastPlayed => 8,
-                    LimitSort::MostRecentlyAdded => 9,
-                    LimitSort::LeastRecentlyAdded => 10,
-                })
+                .map(|l| limit_sort_to_index(l.selected_by))
                 .unwrap_or(0),
         )
         .build();
@@ -404,19 +469,7 @@ pub fn show_smart_playlist_editor(
                 4 => LimitUnit::GB,
                 _ => LimitUnit::Items,
             };
-            let selected_by = match limit_sort_dropdown.selected() {
-                1 => LimitSort::Title,
-                2 => LimitSort::Album,
-                3 => LimitSort::Artist,
-                4 => LimitSort::Genre,
-                5 => LimitSort::Year,
-                6 => LimitSort::Bitrate,
-                7 => LimitSort::MostPlayed,
-                8 => LimitSort::LeastPlayed,
-                9 => LimitSort::MostRecentlyAdded,
-                10 => LimitSort::LeastRecentlyAdded,
-                _ => LimitSort::Random,
-            };
+            let selected_by = index_to_limit_sort(limit_sort_dropdown.selected());
             Some(SmartLimit {
                 value: limit_value.value() as u32,
                 unit,
@@ -479,6 +532,21 @@ fn build_rule_row(
         .visible(false)
         .build();
 
+    // Unit selector for relative date operators. It remains part of every
+    // row so switching fields/operators cannot lose a previously selected
+    // Weeks/Months value, but is visible only for the two relative modes.
+    let date_unit_model = gtk::StringList::new(DATE_UNITS);
+    let date_unit_dropdown = gtk::DropDown::builder()
+        .model(&date_unit_model)
+        .selected(
+            existing
+                .and_then(|rule| relative_date_unit(&rule.operator))
+                .map(date_unit_to_index)
+                .unwrap_or(0),
+        )
+        .visible(false)
+        .build();
+
     // Remove button.
     let remove_btn = gtk::Button::builder()
         .icon_name("list-remove-symbolic")
@@ -489,6 +557,7 @@ fn build_rule_row(
     row.append(&field_dropdown);
     row.append(&op_dropdown);
     row.append(&value_entry);
+    row.append(&date_unit_dropdown);
     row.append(&value2_entry);
     row.append(&remove_btn);
 
@@ -506,6 +575,7 @@ fn build_rule_row(
         let op_model = op_model.clone();
         let op_dropdown = op_dropdown.clone();
         let value2 = value2_entry.clone();
+        let date_unit = date_unit_dropdown.clone();
 
         let update_ops = move |field_idx: u32| {
             let field = index_to_field(field_idx);
@@ -524,6 +594,7 @@ fn build_rule_row(
             }
             op_dropdown.set_selected(0);
             value2.set_visible(false);
+            date_unit.set_visible(false);
         };
 
         // Initial population.
@@ -538,6 +609,7 @@ fn build_rule_row(
     {
         let value2 = value2_entry.clone();
         let field_dd = field_dropdown.clone();
+        let date_unit = date_unit_dropdown.clone();
         op_dropdown.connect_selected_notify(move |dd| {
             let field = index_to_field(field_dd.selected());
             let is_range = match field_type(&field) {
@@ -545,6 +617,9 @@ fn build_rule_row(
                 _ => false,
             };
             value2.set_visible(is_range);
+            let is_relative_date =
+                matches!(field_type(&field), FieldType::Date) && matches!(dd.selected(), 4 | 5);
+            date_unit.set_visible(is_relative_date);
         });
     }
 
@@ -580,6 +655,7 @@ fn build_rule_row(
             },
         };
         op_dropdown.set_selected(op_idx);
+        date_unit_dropdown.set_visible(relative_date_unit(&rule.operator).is_some());
 
         // Set value.
         match &rule.value {
@@ -594,12 +670,21 @@ fn build_rule_row(
             RuleValue::Duration(d) => value_entry.set_text(&d.to_string()),
             RuleValue::Size(s) => value_entry.set_text(&s.to_string()),
         }
+        if let RuleOperator::IsInTheLast { amount, .. }
+        | RuleOperator::IsNotInTheLast { amount, .. } = &rule.operator
+        {
+            // The amount embedded in the operator is authoritative. Showing
+            // it prevents an inconsistent redundant RuleValue from changing
+            // the predicate merely because the editor was opened and saved.
+            value_entry.set_text(&amount.to_string());
+        }
     }
 
     // Store widget names for extraction.
     field_dropdown.set_widget_name("field");
     op_dropdown.set_widget_name("operator");
     value_entry.set_widget_name("value");
+    date_unit_dropdown.set_widget_name("date_unit");
     value2_entry.set_widget_name("value2");
 
     row
@@ -610,6 +695,7 @@ fn extract_rule_from_row(row: &gtk::Box) -> Option<SmartRule> {
     let mut field_dropdown: Option<gtk::DropDown> = None;
     let mut op_dropdown: Option<gtk::DropDown> = None;
     let mut value_entry: Option<gtk::Entry> = None;
+    let mut date_unit_dropdown: Option<gtk::DropDown> = None;
     let mut value2_entry: Option<gtk::Entry> = None;
 
     let mut child = row.first_child();
@@ -621,6 +707,8 @@ fn extract_rule_from_row(row: &gtk::Box) -> Option<SmartRule> {
             op_dropdown = widget.downcast_ref::<gtk::DropDown>().cloned();
         } else if name == "value" {
             value_entry = widget.downcast_ref::<gtk::Entry>().cloned();
+        } else if name == "date_unit" {
+            date_unit_dropdown = widget.downcast_ref::<gtk::DropDown>().cloned();
         } else if name == "value2" {
             value2_entry = widget.downcast_ref::<gtk::Entry>().cloned();
         }
@@ -630,6 +718,9 @@ fn extract_rule_from_row(row: &gtk::Box) -> Option<SmartRule> {
     let field_dd = field_dropdown?;
     let op_dd = op_dropdown?;
     let val_entry = value_entry?;
+    let date_unit = date_unit_dropdown
+        .map(|dropdown| index_to_date_unit(dropdown.selected()))
+        .unwrap_or(DateUnit::Days);
 
     let field = index_to_field(field_dd.selected());
     let val_text = val_entry.text().to_string();
@@ -674,20 +765,12 @@ fn extract_rule_from_row(row: &gtk::Box) -> Option<SmartRule> {
                 1 => RuleOperator::IsNot,
                 2 => RuleOperator::IsBefore,
                 3 => RuleOperator::IsAfter,
-                4 => {
-                    let amount = val_text.parse::<u32>().unwrap_or(30);
-                    RuleOperator::IsInTheLast {
-                        amount,
-                        unit: DateUnit::Days,
-                    }
-                }
-                5 => {
-                    let amount = val_text.parse::<u32>().unwrap_or(30);
-                    RuleOperator::IsNotInTheLast {
-                        amount,
-                        unit: DateUnit::Days,
-                    }
-                }
+                4 | 5 => relative_date_operator(
+                    op_dd.selected(),
+                    val_text.parse::<u32>().unwrap_or(30),
+                    date_unit,
+                )
+                .expect("relative date indexes are exhaustive"),
                 _ => RuleOperator::Is,
             };
             match &op {
@@ -723,8 +806,10 @@ const SORT_FIELD_NAMES: &[&str] = &[
     "Duration",
     "Bitrate",
     "Play Count",
+    "Last Played",
     "Date Added",
     "Date Modified",
+    "Track ID",
 ];
 
 /// Map dropdown index to `SortField`.
@@ -742,8 +827,10 @@ fn index_to_sort_field(idx: u32) -> SortField {
         9 => SortField::Duration,
         10 => SortField::Bitrate,
         11 => SortField::PlayCount,
-        12 => SortField::DateAdded,
-        13 => SortField::DateModified,
+        12 => SortField::LastPlayed,
+        13 => SortField::DateAdded,
+        14 => SortField::DateModified,
+        15 => SortField::TrackId,
         _ => SortField::Artist,
     }
 }
@@ -763,8 +850,10 @@ fn sort_field_to_index(field: SortField) -> u32 {
         SortField::Duration => 9,
         SortField::Bitrate => 10,
         SortField::PlayCount => 11,
-        SortField::DateAdded => 12,
-        SortField::DateModified => 13,
+        SortField::LastPlayed => 12,
+        SortField::DateAdded => 13,
+        SortField::DateModified => 14,
+        SortField::TrackId => 15,
     }
 }
 
@@ -848,4 +937,142 @@ fn extract_sort_from_row(row: &gtk::Box) -> Option<SortCriterion> {
     };
 
     Some(SortCriterion { field, direction })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_rule_field_round_trips_through_the_editor_mapping() {
+        let fields = [
+            RuleField::Title,
+            RuleField::Artist,
+            RuleField::AlbumArtist,
+            RuleField::Album,
+            RuleField::Genre,
+            RuleField::Composer,
+            RuleField::Year,
+            RuleField::TrackNumber,
+            RuleField::DiscNumber,
+            RuleField::Duration,
+            RuleField::Bitrate,
+            RuleField::SampleRate,
+            RuleField::Format,
+            RuleField::PlayCount,
+            RuleField::LastPlayed,
+            RuleField::DateAdded,
+            RuleField::DateModified,
+            RuleField::FileSize,
+        ];
+
+        for field in fields {
+            assert_eq!(index_to_field(field_to_index(&field)), field);
+        }
+        assert_eq!(
+            FIELD_NAMES[field_to_index(&RuleField::LastPlayed) as usize],
+            "Last Played"
+        );
+        assert!(matches!(
+            field_type(&RuleField::LastPlayed),
+            FieldType::Date
+        ));
+    }
+
+    #[test]
+    fn every_sort_field_round_trips_through_the_editor_mapping() {
+        let fields = [
+            SortField::TrackId,
+            SortField::Artist,
+            SortField::AlbumArtist,
+            SortField::Album,
+            SortField::Title,
+            SortField::Composer,
+            SortField::Year,
+            SortField::TrackNumber,
+            SortField::DiscNumber,
+            SortField::Genre,
+            SortField::Duration,
+            SortField::Bitrate,
+            SortField::PlayCount,
+            SortField::LastPlayed,
+            SortField::DateAdded,
+            SortField::DateModified,
+        ];
+
+        for field in fields {
+            assert_eq!(index_to_sort_field(sort_field_to_index(field)), field);
+        }
+        assert_eq!(
+            SORT_FIELD_NAMES[sort_field_to_index(SortField::LastPlayed) as usize],
+            "Last Played"
+        );
+    }
+
+    #[test]
+    fn every_limit_selection_round_trips_including_playback_recency() {
+        let selections = [
+            LimitSort::Random,
+            LimitSort::Title,
+            LimitSort::Album,
+            LimitSort::Artist,
+            LimitSort::Genre,
+            LimitSort::Year,
+            LimitSort::Bitrate,
+            LimitSort::MostPlayed,
+            LimitSort::LeastPlayed,
+            LimitSort::MostRecentlyAdded,
+            LimitSort::LeastRecentlyAdded,
+            LimitSort::MostRecentlyPlayed,
+            LimitSort::LeastRecentlyPlayed,
+        ];
+
+        for selection in selections {
+            assert_eq!(
+                index_to_limit_sort(limit_sort_to_index(selection)),
+                selection
+            );
+        }
+        assert_eq!(
+            LIMIT_SORTS[limit_sort_to_index(LimitSort::MostRecentlyPlayed) as usize],
+            "Most Recently Played"
+        );
+        assert_eq!(
+            LIMIT_SORTS[limit_sort_to_index(LimitSort::LeastRecentlyPlayed) as usize],
+            "Least Recently Played"
+        );
+    }
+
+    #[test]
+    fn relative_date_operators_preserve_amount_and_unit_through_editor_mappings() {
+        for unit in [DateUnit::Days, DateUnit::Weeks, DateUnit::Months] {
+            let unit_index = date_unit_to_index(unit);
+            assert_eq!(index_to_date_unit(unit_index), unit);
+
+            for operator_index in [4, 5] {
+                let operator = relative_date_operator(operator_index, 7, unit)
+                    .expect("relative operator index");
+                assert_eq!(relative_date_unit(&operator), Some(unit));
+                match operator {
+                    RuleOperator::IsInTheLast {
+                        amount,
+                        unit: restored,
+                    } if operator_index == 4 => {
+                        assert_eq!(amount, 7);
+                        assert_eq!(restored, unit);
+                    }
+                    RuleOperator::IsNotInTheLast {
+                        amount,
+                        unit: restored,
+                    } if operator_index == 5 => {
+                        assert_eq!(amount, 7);
+                        assert_eq!(restored, unit);
+                    }
+                    unexpected => panic!("unexpected relative operator: {unexpected:?}"),
+                }
+            }
+        }
+
+        assert_eq!(DATE_UNITS, ["days", "weeks", "months"]);
+    }
 }

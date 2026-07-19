@@ -61,7 +61,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Multiple music library directories | ✅ |
 | Playlist import/export (XSPF) | ✅ |
 | Durable local playback history | ✅ Exact accepted local occurrences persist a saturating play count and monotonic last-played timestamp, with live Plays refresh ([contract](docs/playback-history.md)) |
-| Default smart playlists (Recently Added, Recently Played, Top 25) | ⚠️ Seeded; Recently Played and Top 25 still await deterministic history rules, ordering, migration, and live refresh ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
+| Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ Recently Played and Top 25 use deterministic authoritative history, safe untouched-default migration, and live projection refresh ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
 | Track ratings | ❌ Planned ([#37](https://github.com/jm2/tributary/issues/37)) |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
@@ -774,9 +774,16 @@ disables playback/media/open-file producers, and appends a FIFO marker, so no la
 queue behind the admitted history/root-trust commands it waits to finish. The disabled window can
 remain visible while an earlier serialized library scan finishes.
 AirPlay 1 contributes the same evidence through generation-scoped 500 ms position updates. Remote,
-radio, removable, and ephemeral files do not write local history. Deterministic Recently Played and
-Top 25 rules, ordering, empty-state behavior, untouched-default migration, and live smart-playlist
-refresh remain the final P1.3 slice.
+radio, removable, and ephemeral files do not write local history. Recently Played now uses one
+evaluation clock and includes only valid, non-future last-played instants in the inclusive previous
+14 days, newest first with stable track-ID ties; null or corrupt history yields an intentional empty
+playlist. Top 25 admits positive counts—including legacy counts with no timestamp—then uses count
+descending, last-played descending with unknown values last, and stable track ID before its 25-item
+cap. A committed history event invalidates cached playlist projections, rejects older asynchronous
+results, and reloads the active playlist. Fresh installations receive those exact rules, while an
+atomic migration upgrades only byte-exact untouched v0.5.0 and successor defaults and preserves
+renamed, edited, reformatted, or otherwise divergent playlists. The editor also exposes Last Played
+rules/sorts and Most/Least Recently Played limits without collapsing Weeks or Months back to Days.
 
 ### Keyboard Shortcuts
 

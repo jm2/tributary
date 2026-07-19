@@ -35,6 +35,7 @@ pub struct SortCriterion {
 /// Fields available for compound sort ordering.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum SortField {
+    TrackId,
     Artist,
     AlbumArtist,
     Album,
@@ -47,6 +48,7 @@ pub enum SortField {
     Duration,
     Bitrate,
     PlayCount,
+    LastPlayed,
     DateAdded,
     DateModified,
 }
@@ -90,6 +92,7 @@ pub enum RuleField {
     SampleRate,
     Format,
     PlayCount,
+    LastPlayed,
     DateAdded,
     DateModified,
     FileSize,
@@ -117,7 +120,7 @@ pub enum RuleOperator {
 }
 
 /// Date unit for relative date operators.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DateUnit {
     Days,
     Weeks,
@@ -154,12 +157,7 @@ pub enum LimitUnit {
 }
 
 /// How to select items when limiting.
-///
-/// Recently-played sort variants remain intentionally absent: the durable
-/// field exists, but production playback does not populate it and smart-rule
-/// evaluation does not expose it yet. P1.3c adds both pieces together so the
-/// modes cannot silently no-op.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LimitSort {
     Random,
     Title,
@@ -172,6 +170,8 @@ pub enum LimitSort {
     LeastPlayed,
     MostRecentlyAdded,
     LeastRecentlyAdded,
+    MostRecentlyPlayed,
+    LeastRecentlyPlayed,
 }
 
 // ── Track adapter trait ─────────────────────────────────────────────
@@ -181,6 +181,7 @@ pub enum LimitSort {
 /// This decouples the rule engine from any specific track type
 /// (DB model, UI TrackObject, etc).
 pub trait SmartTrack {
+    fn track_id(&self) -> &str;
     fn title(&self) -> &str;
     fn artist(&self) -> &str;
     fn album_artist(&self) -> &str;
@@ -195,6 +196,7 @@ pub trait SmartTrack {
     fn sample_rate_hz(&self) -> Option<i32>;
     fn format(&self) -> &str;
     fn play_count(&self) -> i32;
+    fn last_played_at_ms(&self) -> Option<i64>;
     fn date_added(&self) -> &str;
     fn date_modified(&self) -> &str;
     fn file_size_bytes(&self) -> Option<i64>;
@@ -202,6 +204,9 @@ pub trait SmartTrack {
 
 /// Implement `SmartTrack` for the SeaORM track model.
 impl SmartTrack for crate::db::entities::track::Model {
+    fn track_id(&self) -> &str {
+        &self.id
+    }
     fn title(&self) -> &str {
         &self.title
     }
@@ -244,6 +249,9 @@ impl SmartTrack for crate::db::entities::track::Model {
     fn play_count(&self) -> i32 {
         self.play_count
     }
+    fn last_played_at_ms(&self) -> Option<i64> {
+        self.last_played_at_ms
+    }
     fn date_added(&self) -> &str {
         &self.date_added
     }
@@ -262,6 +270,19 @@ impl SmartTrack for crate::db::entities::track::Model {
 /// Returns the matching tracks after applying the three evaluation stages in
 /// order: filter, limit selection/membership, then final compound ordering.
 pub fn evaluate<T: SmartTrack + Clone>(rules: &SmartRules, tracks: &[T]) -> Vec<T> {
+    evaluate_at(rules, tracks, chrono::Utc::now())
+}
+
+/// Evaluate rules using one immutable clock snapshot.
+///
+/// Capturing time once keeps every relative-date predicate in an evaluation on
+/// the same inclusive boundary, even when a large library takes long enough to
+/// cross a millisecond or day boundary while it is being filtered.
+fn evaluate_at<T: SmartTrack + Clone>(
+    rules: &SmartRules,
+    tracks: &[T],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<T> {
     // Filter tracks through rules.
     let mut results: Vec<T> = tracks
         .iter()
@@ -269,7 +290,7 @@ pub fn evaluate<T: SmartTrack + Clone>(rules: &SmartRules, tracks: &[T]) -> Vec<
             let matches: Vec<bool> = rules
                 .rules
                 .iter()
-                .map(|rule| evaluate_rule(rule, *track))
+                .map(|rule| evaluate_rule_at(rule, *track, now))
                 .collect();
 
             // Boundary semantics for an empty rules vector are intentionally
@@ -329,11 +350,7 @@ fn apply_compound_sort<T: SmartTrack>(results: &mut Vec<T>, criteria: &[SortCrit
 
     decorated.sort_by(|a, b| {
         for (idx, criterion) in criteria.iter().enumerate() {
-            let cmp = a.0[idx].cmp(&b.0[idx]);
-            let cmp = match criterion.direction {
-                SortDirection::Ascending => cmp,
-                SortDirection::Descending => cmp.reverse(),
-            };
+            let cmp = compare_sort_keys(&a.0[idx], &b.0[idx], criterion.direction);
             if cmp != std::cmp::Ordering::Equal {
                 return cmp;
             }
@@ -354,11 +371,48 @@ fn apply_compound_sort<T: SmartTrack>(results: &mut Vec<T>, criteria: &[SortCrit
 enum SortKey {
     Text(String),
     Int(Option<i64>),
+    /// Nullable playback timestamps always put unknown values last, in either
+    /// direction. Out-of-range Unix millisecond values are normalized to
+    /// unknown before reaching this key.
+    LastPlayed(Option<i64>),
+}
+
+fn compare_sort_keys(
+    left: &SortKey,
+    right: &SortKey,
+    direction: SortDirection,
+) -> std::cmp::Ordering {
+    if let (SortKey::LastPlayed(left), SortKey::LastPlayed(right)) = (left, right) {
+        return compare_optional_i64_null_last(*left, *right, direction);
+    }
+
+    let ordering = left.cmp(right);
+    match direction {
+        SortDirection::Ascending => ordering,
+        SortDirection::Descending => ordering.reverse(),
+    }
+}
+
+fn compare_optional_i64_null_last(
+    left: Option<i64>,
+    right: Option<i64>,
+    direction: SortDirection,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => match direction {
+            SortDirection::Ascending => left.cmp(&right),
+            SortDirection::Descending => right.cmp(&left),
+        },
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
 }
 
 /// Build the comparison key for a track's value in a single sort field.
 fn sort_key<T: SmartTrack>(track: &T, field: SortField) -> SortKey {
     match field {
+        SortField::TrackId => SortKey::Text(track.track_id().to_string()),
         SortField::Artist => SortKey::Text(track.artist().to_lowercase()),
         SortField::AlbumArtist => SortKey::Text(track.album_artist().to_lowercase()),
         SortField::Album => SortKey::Text(track.album().to_lowercase()),
@@ -371,13 +425,18 @@ fn sort_key<T: SmartTrack>(track: &T, field: SortField) -> SortKey {
         SortField::Duration => SortKey::Int(track.duration_secs()),
         SortField::Bitrate => SortKey::Int(track.bitrate_kbps().map(i64::from)),
         SortField::PlayCount => SortKey::Int(Some(i64::from(track.play_count()))),
+        SortField::LastPlayed => SortKey::LastPlayed(valid_last_played_ms(track)),
         SortField::DateAdded => SortKey::Text(track.date_added().to_string()),
         SortField::DateModified => SortKey::Text(track.date_modified().to_string()),
     }
 }
 
 /// Evaluate a single rule against a track.
-fn evaluate_rule<T: SmartTrack>(rule: &SmartRule, track: &T) -> bool {
+fn evaluate_rule_at<T: SmartTrack>(
+    rule: &SmartRule,
+    track: &T,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
     match rule.field {
         RuleField::Title => eval_text(track.title(), &rule.operator, &rule.value),
         RuleField::Artist => eval_text(track.artist(), &rule.operator, &rule.value),
@@ -411,10 +470,34 @@ fn evaluate_rule<T: SmartTrack>(rule: &SmartRule, track: &T) -> bool {
         RuleField::PlayCount => {
             eval_number(Some(track.play_count() as i64), &rule.operator, &rule.value)
         }
+        RuleField::LastPlayed => {
+            // Playback history is persisted at millisecond precision. Compare it
+            // against a clock at that same precision so the inclusive lower
+            // boundary does not lose its final representable millisecond when
+            // `Utc::now()` carries fractional-millisecond nanoseconds. Keep the
+            // original clock for RFC3339 date-added/modified fields below.
+            let history_now = chrono::DateTime::from_timestamp_millis(now.timestamp_millis())
+                .expect("a valid UTC instant remains representable at millisecond precision");
+            eval_optional_instant(
+                track
+                    .last_played_at_ms()
+                    .and_then(chrono::DateTime::from_timestamp_millis),
+                &rule.operator,
+                &rule.value,
+                history_now,
+            )
+        }
         RuleField::FileSize => eval_number(track.file_size_bytes(), &rule.operator, &rule.value),
-        RuleField::DateAdded => eval_date(track.date_added(), &rule.operator, &rule.value),
-        RuleField::DateModified => eval_date(track.date_modified(), &rule.operator, &rule.value),
+        RuleField::DateAdded => eval_date_at(track.date_added(), &rule.operator, &rule.value, now),
+        RuleField::DateModified => {
+            eval_date_at(track.date_modified(), &rule.operator, &rule.value, now)
+        }
     }
+}
+
+#[cfg(test)]
+fn evaluate_rule<T: SmartTrack>(rule: &SmartRule, track: &T) -> bool {
+    evaluate_rule_at(rule, track, chrono::Utc::now())
 }
 
 /// Evaluate a text field against a text operator.
@@ -500,11 +583,27 @@ fn eval_number(field_val: Option<i64>, op: &RuleOperator, value: &RuleValue) -> 
 ///
 /// Both sides are now parsed. An unparseable instant or rule date makes the
 /// rule fail to match rather than match everything.
-fn eval_date(field_val: &str, op: &RuleOperator, value: &RuleValue) -> bool {
-    let Some(instant) = parse_track_instant(field_val) else {
+fn eval_date_at(
+    field_val: &str,
+    op: &RuleOperator,
+    value: &RuleValue,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    eval_optional_instant(parse_track_instant(field_val), op, value, now)
+}
+
+/// Evaluate a parsed instant. A missing or unrepresentable timestamp is
+/// unknown and therefore never satisfies a predicate, including negative
+/// predicates such as `IsNot` and `IsNotInTheLast`.
+fn eval_optional_instant(
+    instant: Option<chrono::DateTime<chrono::Utc>>,
+    op: &RuleOperator,
+    value: &RuleValue,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(instant) = instant else {
         return false;
     };
-
     match op {
         RuleOperator::Is => {
             rule_day(value).is_some_and(|(start, end)| instant >= start && instant < end)
@@ -518,14 +617,22 @@ fn eval_date(field_val: &str, op: &RuleOperator, value: &RuleValue) -> bool {
         RuleOperator::IsAfter => rule_day(value).is_some_and(|(_, end)| instant >= end),
         RuleOperator::IsInTheLast { amount, unit } => {
             // A window too large to represent reaches back past any possible
-            // track, so everything is inside it.
-            date_cutoff(*amount, *unit).is_none_or(|cutoff| instant >= cutoff)
+            // track. The upper bound is also inclusive: a future timestamp is
+            // not evidence that a track was played within the past window.
+            instant <= now
+                && date_cutoff_from(now, *amount, *unit).is_none_or(|cutoff| instant >= cutoff)
         }
         RuleOperator::IsNotInTheLast { amount, unit } => {
-            date_cutoff(*amount, *unit).is_some_and(|cutoff| instant < cutoff)
+            instant <= now
+                && date_cutoff_from(now, *amount, *unit).is_some_and(|cutoff| instant < cutoff)
         }
         _ => false,
     }
+}
+
+#[cfg(test)]
+fn eval_date(field_val: &str, op: &RuleOperator, value: &RuleValue) -> bool {
+    eval_date_at(field_val, op, value, chrono::Utc::now())
 }
 
 /// Parse a track timestamp, which is stored as RFC3339 with an offset.
@@ -559,7 +666,11 @@ fn rule_day(
 /// checked throughout: `amount` is a `u32` straight from the editor, and the
 /// old `Duration::days(i64::from(amount) * 30)` could push the subtraction past
 /// chrono's representable range and panic.
-fn date_cutoff(amount: u32, unit: DateUnit) -> Option<chrono::DateTime<chrono::Utc>> {
+fn date_cutoff_from(
+    now: chrono::DateTime<chrono::Utc>,
+    amount: u32,
+    unit: DateUnit,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     let days_per_unit: i64 = match unit {
         DateUnit::Days => 1,
         DateUnit::Weeks => 7,
@@ -568,7 +679,20 @@ fn date_cutoff(amount: u32, unit: DateUnit) -> Option<chrono::DateTime<chrono::U
 
     let days_ago = i64::from(amount).checked_mul(days_per_unit)?;
     let window = chrono::TimeDelta::try_days(days_ago)?;
-    chrono::Utc::now().checked_sub_signed(window)
+    now.checked_sub_signed(window)
+}
+
+#[cfg(test)]
+fn date_cutoff(amount: u32, unit: DateUnit) -> Option<chrono::DateTime<chrono::Utc>> {
+    date_cutoff_from(chrono::Utc::now(), amount, unit)
+}
+
+/// Normalize a nullable playback timestamp for sorting. Chrono rejects Unix
+/// millisecond values outside its representable range; treating those as
+/// unknown keeps corrupt metadata out of recency ordering.
+fn valid_last_played_ms<T: SmartTrack>(track: &T) -> Option<i64> {
+    let timestamp = track.last_played_at_ms()?;
+    chrono::DateTime::from_timestamp_millis(timestamp).map(|_| timestamp)
 }
 
 /// Apply result limiting: sort then truncate.
@@ -600,16 +724,52 @@ fn apply_limit<T: SmartTrack>(results: &mut Vec<T>, limit: &SmartLimit) {
             results.sort_by_key(|t| std::cmp::Reverse(t.bitrate_kbps()));
         }
         LimitSort::MostPlayed => {
-            results.sort_by_key(|t| std::cmp::Reverse(t.play_count()));
+            results.sort_by(|left, right| {
+                right
+                    .play_count()
+                    .cmp(&left.play_count())
+                    .then_with(|| {
+                        compare_optional_i64_null_last(
+                            valid_last_played_ms(left),
+                            valid_last_played_ms(right),
+                            SortDirection::Descending,
+                        )
+                    })
+                    .then_with(|| left.track_id().cmp(right.track_id()))
+            });
         }
         LimitSort::LeastPlayed => {
-            results.sort_by_key(|t| t.play_count());
+            results.sort_by(|left, right| {
+                left.play_count()
+                    .cmp(&right.play_count())
+                    .then_with(|| left.track_id().cmp(right.track_id()))
+            });
         }
         LimitSort::MostRecentlyAdded => {
             results.sort_by(|a, b| b.date_added().cmp(a.date_added()));
         }
         LimitSort::LeastRecentlyAdded => {
             results.sort_by(|a, b| a.date_added().cmp(b.date_added()));
+        }
+        LimitSort::MostRecentlyPlayed => {
+            results.sort_by(|left, right| {
+                compare_optional_i64_null_last(
+                    valid_last_played_ms(left),
+                    valid_last_played_ms(right),
+                    SortDirection::Descending,
+                )
+                .then_with(|| left.track_id().cmp(right.track_id()))
+            });
+        }
+        LimitSort::LeastRecentlyPlayed => {
+            results.sort_by(|left, right| {
+                compare_optional_i64_null_last(
+                    valid_last_played_ms(left),
+                    valid_last_played_ms(right),
+                    SortDirection::Ascending,
+                )
+                .then_with(|| left.track_id().cmp(right.track_id()))
+            });
         }
     }
 
@@ -685,6 +845,7 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct TestTrack {
+        id: String,
         title: String,
         artist: String,
         album: String,
@@ -698,6 +859,7 @@ mod tests {
         sample_rate_hz: Option<i32>,
         format: String,
         play_count: i32,
+        last_played_at_ms: Option<i64>,
         date_added: String,
         date_modified: String,
         file_size_bytes: Option<i64>,
@@ -706,6 +868,7 @@ mod tests {
     impl TestTrack {
         fn new(title: &str, artist: &str, album: &str) -> Self {
             Self {
+                id: title.to_string(),
                 title: title.to_string(),
                 artist: artist.to_string(),
                 album: album.to_string(),
@@ -719,6 +882,7 @@ mod tests {
                 sample_rate_hz: None,
                 format: String::new(),
                 play_count: 0,
+                last_played_at_ms: None,
                 date_added: "2025-01-01T00:00:00Z".to_string(),
                 date_modified: "2025-01-01T00:00:00Z".to_string(),
                 file_size_bytes: None,
@@ -727,6 +891,9 @@ mod tests {
     }
 
     impl SmartTrack for TestTrack {
+        fn track_id(&self) -> &str {
+            &self.id
+        }
         fn title(&self) -> &str {
             &self.title
         }
@@ -768,6 +935,9 @@ mod tests {
         }
         fn play_count(&self) -> i32 {
             self.play_count
+        }
+        fn last_played_at_ms(&self) -> Option<i64> {
+            self.last_played_at_ms
         }
         fn date_added(&self) -> &str {
             &self.date_added
@@ -1345,6 +1515,209 @@ mod tests {
             value: RuleValue::Text("flac".into()),
         };
         assert!(evaluate_rule(&rule, &t)); // case-insensitive
+    }
+
+    #[test]
+    fn recently_played_uses_one_inclusive_clock_and_stable_track_id_ties() {
+        // The production clock normally carries sub-millisecond precision while
+        // playback history does not. This fractional instant proves that the
+        // exact stored cutoff millisecond remains included and cutoff - 1 ms is
+        // excluded.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-18T12:00:00.123456789Z")
+            .expect("fixed clock")
+            .with_timezone(&chrono::Utc);
+        let cutoff = now - chrono::TimeDelta::days(14);
+
+        let mut newest = TestTrack::new("newest", "Artist", "Album");
+        newest.id = "newest".into();
+        newest.last_played_at_ms = Some(now.timestamp_millis());
+
+        let mut tie_b = TestTrack::new("tie b", "Artist", "Album");
+        tie_b.id = "b".into();
+        tie_b.last_played_at_ms = Some(cutoff.timestamp_millis());
+
+        let mut tie_a = TestTrack::new("tie a", "Artist", "Album");
+        tie_a.id = "a".into();
+        tie_a.last_played_at_ms = Some(cutoff.timestamp_millis());
+
+        let mut too_old = TestTrack::new("old", "Artist", "Album");
+        too_old.last_played_at_ms = Some(cutoff.timestamp_millis() - 1);
+
+        let mut future = TestTrack::new("future", "Artist", "Album");
+        future.last_played_at_ms = Some(now.timestamp_millis() + 1);
+
+        let never = TestTrack::new("never", "Artist", "Album");
+        let mut corrupt = TestTrack::new("corrupt", "Artist", "Album");
+        corrupt.last_played_at_ms = Some(i64::MAX);
+
+        let rules = SmartRules {
+            match_mode: MatchMode::All,
+            rules: vec![SmartRule {
+                field: RuleField::LastPlayed,
+                operator: RuleOperator::IsInTheLast {
+                    amount: 14,
+                    unit: DateUnit::Days,
+                },
+                value: RuleValue::Number(14),
+            }],
+            limit: None,
+            sort_order: vec![
+                SortCriterion {
+                    field: SortField::LastPlayed,
+                    direction: SortDirection::Descending,
+                },
+                SortCriterion {
+                    field: SortField::TrackId,
+                    direction: SortDirection::Ascending,
+                },
+            ],
+        };
+
+        let result = evaluate_at(
+            &rules,
+            &[too_old, tie_b, never, newest, corrupt, tie_a, future],
+            now,
+        );
+        let ids: Vec<_> = result.iter().map(SmartTrack::track_id).collect();
+        assert_eq!(ids, ["newest", "a", "b"]);
+    }
+
+    #[test]
+    fn recently_played_is_empty_when_history_is_empty_or_unknown() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-18T12:00:00Z")
+            .expect("fixed clock")
+            .with_timezone(&chrono::Utc);
+        let never = TestTrack::new("never", "Artist", "Album");
+        let mut corrupt = TestTrack::new("corrupt", "Artist", "Album");
+        corrupt.last_played_at_ms = Some(i64::MAX);
+        let rules = SmartRules {
+            match_mode: MatchMode::All,
+            rules: vec![SmartRule {
+                field: RuleField::LastPlayed,
+                operator: RuleOperator::IsInTheLast {
+                    amount: 14,
+                    unit: DateUnit::Days,
+                },
+                value: RuleValue::Number(14),
+            }],
+            limit: None,
+            sort_order: Vec::new(),
+        };
+
+        assert!(evaluate_at(&rules, &[never, corrupt], now).is_empty());
+    }
+
+    #[test]
+    fn top_25_order_includes_legacy_null_times_and_caps_membership() {
+        let mut tied_b = TestTrack::new("tied b", "Artist", "Album");
+        tied_b.id = "b".into();
+        tied_b.play_count = 100;
+        tied_b.last_played_at_ms = Some(200);
+
+        let mut tied_a = TestTrack::new("tied a", "Artist", "Album");
+        tied_a.id = "a".into();
+        tied_a.play_count = 100;
+        tied_a.last_played_at_ms = Some(200);
+
+        let mut older = TestTrack::new("older", "Artist", "Album");
+        older.id = "c".into();
+        older.play_count = 100;
+        older.last_played_at_ms = Some(100);
+
+        let mut legacy = TestTrack::new("legacy", "Artist", "Album");
+        legacy.id = "d".into();
+        legacy.play_count = 100;
+        legacy.last_played_at_ms = None;
+
+        let mut tracks = vec![legacy, tied_b, older, tied_a];
+        for count in (1..=22).rev() {
+            let mut track = TestTrack::new(&format!("count {count}"), "Artist", "Album");
+            track.id = format!("low-{count:02}");
+            track.play_count = count;
+            tracks.push(track);
+        }
+        let mut never_played = TestTrack::new("never", "Artist", "Album");
+        never_played.play_count = 0;
+        tracks.push(never_played);
+
+        let rules = SmartRules {
+            match_mode: MatchMode::All,
+            rules: vec![SmartRule {
+                field: RuleField::PlayCount,
+                operator: RuleOperator::GreaterThan,
+                value: RuleValue::Number(0),
+            }],
+            limit: Some(SmartLimit {
+                value: 25,
+                unit: LimitUnit::Items,
+                selected_by: LimitSort::MostPlayed,
+            }),
+            sort_order: vec![
+                SortCriterion {
+                    field: SortField::PlayCount,
+                    direction: SortDirection::Descending,
+                },
+                SortCriterion {
+                    field: SortField::LastPlayed,
+                    direction: SortDirection::Descending,
+                },
+                SortCriterion {
+                    field: SortField::TrackId,
+                    direction: SortDirection::Ascending,
+                },
+            ],
+        };
+
+        let result = evaluate(&rules, &tracks);
+        assert_eq!(result.len(), 25);
+        let ids: Vec<_> = result.iter().map(SmartTrack::track_id).collect();
+        assert_eq!(&ids[..4], &["a", "b", "c", "d"]);
+        assert!(
+            ids.contains(&"d"),
+            "legacy positive/null-time track is retained"
+        );
+        assert!(
+            !ids.contains(&"low-01"),
+            "the lowest positive count is capped"
+        );
+        assert!(!ids.contains(&"never"), "zero-count tracks do not qualify");
+    }
+
+    #[test]
+    fn recent_play_limit_sorts_keep_unknown_timestamps_last() {
+        let mut newest = TestTrack::new("newest", "Artist", "Album");
+        newest.last_played_at_ms = Some(300);
+        let mut oldest = TestTrack::new("oldest", "Artist", "Album");
+        oldest.last_played_at_ms = Some(100);
+        let never = TestTrack::new("never", "Artist", "Album");
+        let mut corrupt = TestTrack::new("corrupt", "Artist", "Album");
+        corrupt.last_played_at_ms = Some(i64::MAX);
+        let tracks = [never, newest, corrupt, oldest];
+
+        for (selected_by, expected) in [
+            (
+                LimitSort::MostRecentlyPlayed,
+                ["newest", "oldest", "corrupt", "never"],
+            ),
+            (
+                LimitSort::LeastRecentlyPlayed,
+                ["oldest", "newest", "corrupt", "never"],
+            ),
+        ] {
+            let rules = SmartRules {
+                match_mode: MatchMode::All,
+                rules: vec![],
+                limit: Some(SmartLimit {
+                    value: 4,
+                    unit: LimitUnit::Items,
+                    selected_by,
+                }),
+                sort_order: Vec::new(),
+            };
+            let result = evaluate(&rules, &tracks);
+            let actual: Vec<_> = result.iter().map(SmartTrack::track_id).collect();
+            assert_eq!(actual, expected);
+        }
     }
 
     // ── Date cutoff computation ─────────────────────────────────────

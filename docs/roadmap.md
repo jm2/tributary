@@ -6,7 +6,7 @@ This document explains the product and engineering work that remains **after** t
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
 remediation record is preserved separately in
 [`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **220/223 (98.7%)**, with only three
-real-environment validation records left. The feature backlog is now **4/35 (11.4%)** complete. Neither
+real-environment validation records left. The feature backlog is now **5/35 (14.3%)** complete. Neither
 percentage estimates equal engineering effort, and the historical percentage is not a claim that
 Tributary has implemented every requested product feature.
 
@@ -41,8 +41,17 @@ starts. Historical holistic-review documents are point-in-time findings, not act
   defines occurrence, threshold, duration, seek/retry/restart, clock, and legacy semantics.
   `PlaybackSession` rejects stale/rejected generations and re-anchors discontinuities; the library
   engine atomically updates one stable local track ID, and committed changes refresh the Plays row
-  and invalidate playlist projections. AirPlay 1 supplies generation-scoped 500 ms progress. The
-  deterministic Recently Played/Top 25 consumer and seeded-default migration slice remains open.
+  and invalidate playlist projections. AirPlay 1 supplies generation-scoped 500 ms progress.
+  Recently Played evaluates one inclusive 14-day clock window over representable, non-future
+  timestamps, newest first with stable ID ties. Top 25 selects and presents positive counts by
+  count descending, last-played descending with unknown timestamps last, then stable ID, capped at
+  25; a legacy positive count with no timestamp remains eligible. Empty or unknown recency history
+  does not make Recently Played a match-all playlist. Committed history invalidates cached
+  projections and immediately reloads an active playlist behind a navigation-generation guard.
+  Fresh installations seed those rules, while migration 11 atomically rewrites only byte-exact
+  untouched v0.5.0 defaults and their immediate no-field successors; user-owned variants remain
+  unchanged. Last Played editor fields, Most/Least Recently Played limits, and Days/Weeks/Months
+  relative units round-trip losslessly.
 
 ## Proposed implementation order
 
@@ -61,8 +70,9 @@ before starting large protocol or transfer subsystems.
    before database work. Full support remains separate: regular playlist entries need persistent
    source-scoped `(SourceId, TrackId)` identity, disconnected-source semantics, and playback-time
    resolution; Subsonic server-native playlist import/sync is another slice.
-3. **In progress: implement trustworthy local playback history.** The durable schema,
-   [counted-play contract](playback-history.md), and production persistence pipeline are complete.
+3. **Completed: implement trustworthy local playback history.** The durable schema,
+   [counted-play contract](playback-history.md), production persistence pipeline, and seeded
+   consumers are complete.
    One `PlaybackSession` progress latch follows each exact local occurrence independently of output
    generations; rejected/stale events cannot contribute, pause/buffering/retry/seek/restart
    discontinuities re-anchor, and paused polls stay inert until Playing. A qualifying play enters a
@@ -71,12 +81,23 @@ before starting large protocol or transfer subsystems.
    atomically updates one stable local ID with a saturating count and monotonic timestamp, then
    refreshes the Plays row and invalidates active/cached playlist
    projections only after commit. AirPlay 1 now publishes generation-scoped position evidence on a
-   500 ms timer. Next, make Recently Played and Top 25
-   deterministic, provide their live refresh/empty-state behavior, and migrate only exact untouched
-   historical defaults. Until that final slice lands, those seeded consumers remain incomplete.
-4. **Add ratings ([#37]).** Decide whether ratings are app-local, written to tags, synchronized to
-   capable servers, or some explicit combination. Then add schema/model/backend propagation, an
-   editable and sortable column, smart-playlist rules, and mixed-capability behavior.
+   500 ms timer. Recently Played uses one clock snapshot, an inclusive preceding 14-day window over
+   valid non-future timestamps, newest-first presentation, and a stable-ID tie-breaker. Top 25
+   admits only positive counts—including legacy counts without timestamps—and selects/presents at
+   most 25 by count descending, last-played descending with unknown timestamps last, then stable
+   ID. Null, corrupt, future, and out-of-window recency evidence cannot turn empty history into a
+   match-all result. A committed history event invalidates every cached playlist projection,
+   rejects older asynchronous results by navigation generation, and reloads an active playlist.
+   Fresh defaults store the canonical rules; one transactional migration recognizes only the
+   byte-exact released v0.5.0 JSON (including `live_updating: true`) and its immediate no-field
+   successor when the name, smart flag, rules, and redundant match/live/limit columns all match.
+   Renamed, edited, reformatted, or otherwise divergent playlists remain byte-for-byte user-owned.
+   The editor exposes Last Played filtering/sorting and Most/Least Recently Played limits while
+   preserving relative-rule amounts and Days/Weeks/Months units across reopen/save.
+4. **Next: add ratings ([#37]).** Decide whether ratings are app-local, written to tags,
+   synchronized to capable servers, or some explicit combination. Then add
+   schema/model/backend propagation, an editable and sortable column, smart-playlist rules, and
+   mixed-capability behavior.
 
 These foundations make Rhythmbox migration and Last.fm behavior much less ambiguous.
 
@@ -142,7 +163,7 @@ mistaken for work already underway.
 
 | Issue | Current implementation state | Likely implementation shape |
 |---|---|---|
-| [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus the migrated playback-history representation, threshold contract, and production local-history writes are partial foundations; deterministic smart-playlist consumers and ratings remain incomplete. | Complete playback-history consumers and ratings first; then transactional, idempotent migration with conflict reporting. |
+| [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus the complete playback-history schema, threshold, persistence, and deterministic-consumer contracts are foundations; ratings remain incomplete. | Complete ratings first; then transactional, idempotent migration with conflict reporting. |
 | [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | No Last.fm client or scrobble pipeline. | Authorization, secret storage, authoritative thresholds, retry/offline queue, and privacy UX. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
 | [#47 — Remote/Subsonic tracks in playlists](https://github.com/jm2/tributary/issues/47) | Non-local Add to Playlist attempts are now refused visibly and atomically; durable remote entries and server-native playlist sync are not implemented. | Source-scoped playlist schema/resolution first; server playlist sync separately. |

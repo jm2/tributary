@@ -1,7 +1,7 @@
 # Playback-history contract
 
-Status: contract/schema foundation and authoritative production persistence implemented on
-2026-07-18; deterministic smart-playlist consumers remain the final P1.3 slice.
+Status: contract, schema, authoritative production persistence, and deterministic smart-playlist
+consumers implemented on 2026-07-18.
 
 This document defines when Tributary may record a local play and how that history is represented.
 The contract is deliberately stricter than "a load was requested": rejected media, stale output
@@ -154,13 +154,13 @@ The production pipeline now implements the schema and progress contract end to e
 6. AirPlay 1 now publishes the same accepted position evidence as the other implemented outputs
    through a generation-scoped 500 ms timer.
 
-This pipeline records exact local history but intentionally does not yet change the seeded
-Recently Played or Top 25 rules. Their deterministic filtering, ordering, empty-state, live refresh,
-and safe untouched-default migration remain the final P1.3 slice.
+This pipeline also drives the seeded Recently Played and Top 25 rules. Every committed history
+event invalidates cached playlist projections before reloading an active playlist; the navigation
+generation rejects any pre-commit asynchronous result that arrives afterward.
 
 ## Smart-playlist consumers
 
-The final P1.3 slice will make the seeded consumers deterministic:
+The seeded consumers are deterministic:
 
 - **Recently Played:** tracks with a non-null `last_played` in the preceding 14 days, newest first,
   with stable track identity as the final tie-breaker.
@@ -169,9 +169,20 @@ The final P1.3 slice will make the seeded consumers deterministic:
 
 Legacy positive counts remain eligible for Top 25. A legacy null `last_played` never qualifies for
 Recently Played until a real counted occurrence supplies one. Empty history produces intentional
-empty playlists rather than a match-all fallback. Existing seeded playlists may be migrated only
-when their smart flag and exact serialized historical rules still match Tributary's old defaults;
-renamed or edited user playlists must be preserved.
+empty playlists rather than a match-all fallback. One immutable clock snapshot governs all
+relative-date predicates in an evaluation; unrepresentable or future timestamps do not qualify,
+and unknown timestamps sort after known values. The editor exposes Last Played as a date rule and
+sort field, restores Most/Least Recently Played limit selection, and preserves the embedded amount
+and Days/Weeks/Months unit when a relative rule is reopened and saved.
+
+Fresh installations seed the canonical rules above. Migration 11 recognizes both exact historical
+representations: the released v0.5.0 JSON containing `live_updating: true` and the immediate
+no-field successor. It rewrites both defaults in one transaction only when the English name, smart
+flag, byte-exact serialized rules, and redundant match/live/limit columns all retain Tributary's
+original signature. IDs, timestamps, and compatibility columns remain unchanged. Renamed, edited,
+reformatted, non-smart, non-live, or otherwise divergent playlists are treated as user-owned and
+left byte-for-byte intact. A failed second/default update rolls the entire migration back; retry is
+idempotent.
 
 ## Required validation
 
@@ -183,5 +194,9 @@ regressions additionally cover local-only and playlist-projected identity, rejec
 generations, delivery retry, discontinuity re-anchoring, duplicate occurrences, navigation and
 repeat boundaries, exact-ID atomic updates, deleted rows, negative-count repair, count saturation,
 regressed timestamps, committed-only publication, stable-ID row replacement, playlist-projection
-invalidation, and generation-preserving AirPlay position samples. The final slice must add the
-consumer and seeded-default migration regressions described above.
+invalidation, and generation-preserving AirPlay position samples. Consumer regressions additionally
+pin the exact inclusive 14-day edge, one-millisecond exclusion, future/null/corrupt handling,
+empty history, stable timestamp ties, Top 25 positive-count membership and cutoff, legacy
+positive/null-time rows, current database reevaluation, exact fresh seed bytes, both released
+historical migration signatures, every compatibility-column and JSON near miss, atomic rollback and
+retry, downgrade preservation, and editor field/sort/limit/unit round trips.

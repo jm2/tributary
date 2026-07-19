@@ -41,10 +41,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row; the live Plays value refreshes by stable identity and active/cached playlist projections are
   invalidated without URI matching or phantom rows. AirPlay 1's dedicated RAOP pipeline now samples
   position and duration on a 500 ms timer while Playing and emits generation-scoped evidence when
-  available, bringing it under the same accounting boundary as the other outputs. Deterministic
-  Recently Played and Top 25 filtering, ordering, empty-state, untouched-default migration, and
-  live smart-playlist refresh
-  remain the final P1.3 slice and are not claimed here.
+  available, bringing it under the same accounting boundary as the other outputs. The seeded
+  history consumers now use this same committed history through the deterministic contract below.
+- **Recently Played and Top 25 now reflect authoritative history deterministically** — One clock
+  snapshot governs each smart-playlist evaluation. Recently Played includes only representable,
+  non-future `last_played` instants in the inclusive preceding 14 days, orders newest first, and
+  breaks timestamp ties by stable `TrackId`; null, corrupt, legacy-unknown, and out-of-window values
+  never turn an empty history into a match-all playlist. Top 25 includes only positive counts,
+  selects and presents by descending count, then descending last-played with unknown values last,
+  then stable `TrackId`, and caps membership at 25. A legacy positive count with no timestamp
+  remains eligible for Top 25. Committed history events already invalidate every cached playlist
+  projection, reject pre-commit asynchronous results by navigation generation, and immediately
+  reload an active playlist, so membership and ordering update without a restart. Fresh defaults
+  persist those canonical rules; migration 11 atomically rewrites only byte-exact untouched
+  Tributary defaults from both the released v0.5.0 JSON shape and its no-field successor, including
+  exact smart/live/match/limit compatibility columns. Renamed, edited, reformatted, non-smart, or
+  otherwise divergent playlists remain byte-for-byte user-owned, and interrupted migration is
+  rollback- and retry-safe. The smart-playlist editor now exposes Last Played filtering/sorting and
+  Most/Least Recently Played limit selection, and preserves authorable Days, Weeks, or Months when
+  a relative date rule is reopened and saved.
+  ([#137](https://github.com/jm2/tributary/pull/137))
 
 ### Fixed
 - **Linux library reads no longer feed a recursive rescan loop** — Filesystem notifications
