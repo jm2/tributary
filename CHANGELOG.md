@@ -26,10 +26,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with native zero retained as canonical 1. Missing, malformed, or numerically unrepresentable
   remote values remain read-only unrated without rejecting their response; DAAP, radio, removable,
   external, and unknown sources are Unsupported, and every remote mutation fails closed. XSPF v1
-  deliberately omits ratings, ignores rating-like meta/extension
-  input, and playlist import cannot modify a matched library rating. Accessible editing, display,
-  sorting, and smart-playlist rules remain the next P1.4 slice; the complete contract is in
+  deliberately omits ratings, ignores rating-like meta/extension input, and playlist import cannot
+  modify a matched library rating. The complete contract is in
   [`docs/ratings.md`](docs/ratings.md).
+- **Ratings are now editable, sortable, and usable in smart playlists**
+  ([#139](https://github.com/jm2/tributary/pull/139)) — The track list exposes one exact integer
+  Rating column. Writable local rows open a keyboard-operable localized popover that accepts only
+  1–100 and can clear a rating; read-only remotes explicitly show their value or unrated state as
+  read-only, while rating-incapable rows show Unavailable and cannot open an editor. Radio-Browser's
+  intentionally compact station schema omits Rating with its other track-only metadata. Every
+  nonnumeric cell state, editor action, accessibility label, and failure message is localized
+  across all 13 shipped catalogs. Existing profiles see the new column once through a versioned
+  config migration, while current profiles retain an intentional hidden or reordered choice.
+  Local set/clear requests enter the existing GTK-thread FIFO by exact typed `TrackId`, never
+  mutate the row optimistically, and are published only after the SQLite transaction commits.
+  Committed rows replace only the matching local identity and invalidate active and cached regular
+  or smart-playlist projections; deletion races remain clean no-ops. A storage failure logs its
+  detail internally with redacted identity metadata, sends only a typed identity to GTK, and shows
+  fixed localized feedback.
+  Normal shutdown closes rating admission before the same terminal FIFO marker used by playback
+  history, so accepted writes drain and later callbacks cannot cross the barrier.
+  Column sorting keeps rated values before missing values in both directions, orders
+  readable-unrated before unsupported, and resolves equal values by stable `TrackId`. Smart
+  playlists add Rating to filters and compound sorting, exact/not/strict greater/less/inclusive
+  range predicates, explicit Is Rated and Is Unrated predicates, and Highest/Lowest Rated limit
+  selection. Missing readable values satisfy no numeric predicate—including Is Not—and
+  unsupported values satisfy neither numeric nor presence predicates. The editor retains invalid
+  input, presents localized visible/accessibility feedback, and disables OK instead of clamping or
+  saving it; defensively loaded operands outside 1–100, reversed ranges, and noncanonical presence
+  placeholders fail closed. Missing values remain last for ascending and descending primary or
+  secondary rating sorts, and limits use stable-ID ties. Existing serialized rule ordering, seeded
+  defaults, and migration-11 signatures remain unchanged.
 - **Local playback history now has a durable contract, schema, and production pipeline** — Local
   track rows gain a nullable UTC epoch-millisecond `last_played` value, while the architecture
   model safely rejects out-of-range stored timestamps. Migration 10 preserves every nonnegative legacy play

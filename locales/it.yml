@@ -62,9 +62,26 @@ columns:
   bitrate: "Bitrate"
   sample_rate: "Frequenza di campionamento"
   plays: "Riproduzioni"
+  rating: "Valutazione"
   format: "Formato"
   country: "Paese"
   state_province: "Regione"
+
+# ── Track ratings ─────────────────────────────────────────────
+ratings:
+  unrated: "Senza valutazione"
+  read_only_value: "%{value} (sola lettura)"
+  read_only_unrated: "Senza valutazione (sola lettura)"
+  unavailable: "Non disponibile"
+  edit_value: "Valutazione %{value}. Attiva per modificarla con un valore da 1 a 100."
+  edit_unrated: "Senza valutazione. Attiva per impostare una valutazione da 1 a 100."
+  input_label: "Valutazione da 1 a 100"
+  apply: "Applica valutazione"
+  clear: "Rimuovi valutazione"
+  update_failed: "Impossibile aggiornare la valutazione del brano."
+  rule_not_integer: "Inserisci una valutazione intera da 1 a 100."
+  rule_out_of_range: "I valori della valutazione devono essere compresi tra 1 e 100."
+  rule_reversed_range: "La prima valutazione non deve superare la seconda."
 
 # ── Preferences ────────────────────────────────────────────────────
 preferences:

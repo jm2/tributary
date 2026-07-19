@@ -24,11 +24,13 @@ pub const ALL_COLUMNS: &[&str] = &[
     "Bitrate",
     "Sample Rate",
     "Plays",
+    "Rating",
     "Format",
 ];
 
 /// Columns visible by default — all columns enabled.
 const DEFAULT_VISIBLE: &[&str] = ALL_COLUMNS;
+const CURRENT_COLUMN_SCHEMA_VERSION: u32 = 1;
 
 // ── Persisted configuration ─────────────────────────────────────────────
 
@@ -44,6 +46,10 @@ pub struct AppConfig {
     /// Tracklist column display order (by title). Persisted across restarts.
     #[serde(default = "default_column_order")]
     pub column_order: Vec<String>,
+    /// One-time evolution marker for newly introduced tracklist columns.
+    /// Zero identifies configurations written before this field existed.
+    #[serde(default)]
+    pub column_schema_version: u32,
     /// Paths to local music library folders.
     ///
     /// Migrated from the old single `library_path: String` field.
@@ -195,6 +201,7 @@ impl Default for AppConfig {
                 .map(str::to_string)
                 .collect(),
             column_order: default_column_order(),
+            column_schema_version: CURRENT_COLUMN_SCHEMA_VERSION,
             library_paths: default_library_paths(),
             pending_root_reauthorizations: Vec::new(),
             location_enabled: None,
@@ -484,12 +491,39 @@ pub fn load_config() -> AppConfig {
     }
 
     match serde_json::from_value(value) {
-        Ok(config) => config,
+        Ok(mut config) => {
+            migrate_column_schema(&mut config);
+            config
+        }
         Err(e) => {
             warn!(error = %e, "Failed to deserialize config.json — falling back to defaults");
             AppConfig::default()
         }
     }
+}
+
+/// Expose each newly introduced column exactly once for established profiles.
+///
+/// Column titles are persistence keys. A version marker distinguishes an old
+/// profile that could not mention Rating from a current profile where the user
+/// intentionally hid or reordered it.
+fn migrate_column_schema(config: &mut AppConfig) {
+    if config.column_schema_version >= CURRENT_COLUMN_SCHEMA_VERSION {
+        return;
+    }
+
+    if !config.column_order.iter().any(|title| title == "Rating") {
+        let insertion = config
+            .column_order
+            .iter()
+            .position(|title| title == "Plays")
+            .map_or(config.column_order.len(), |index| index + 1);
+        config.column_order.insert(insertion, "Rating".to_string());
+    }
+    if !config.visible_columns.iter().any(|title| title == "Rating") {
+        config.visible_columns.push("Rating".to_string());
+    }
+    config.column_schema_version = CURRENT_COLUMN_SCHEMA_VERSION;
 }
 
 /// Save the configuration through an atomic same-directory replacement.
@@ -1620,5 +1654,47 @@ mod tests {
             round_trip["pending_root_reauthorizations"],
             serde_json::json!([])
         );
+    }
+
+    #[test]
+    fn legacy_column_config_exposes_rating_once_without_losing_user_order() {
+        let mut config = AppConfig {
+            visible_columns: vec!["Title".to_string(), "Plays".to_string()],
+            column_order: vec![
+                "Artist".to_string(),
+                "Title".to_string(),
+                "Plays".to_string(),
+                "Format".to_string(),
+            ],
+            column_schema_version: 0,
+            ..AppConfig::default()
+        };
+
+        migrate_column_schema(&mut config);
+        assert_eq!(
+            config.column_order,
+            ["Artist", "Title", "Plays", "Rating", "Format"]
+        );
+        assert_eq!(config.visible_columns, ["Title", "Plays", "Rating"]);
+        assert_eq!(config.column_schema_version, CURRENT_COLUMN_SCHEMA_VERSION);
+
+        let once = config.clone();
+        migrate_column_schema(&mut config);
+        assert_eq!(config.column_order, once.column_order);
+        assert_eq!(config.visible_columns, once.visible_columns);
+    }
+
+    #[test]
+    fn current_column_config_preserves_an_intentionally_hidden_rating() {
+        let mut config = AppConfig {
+            visible_columns: vec!["Title".to_string()],
+            column_order: vec!["Rating".to_string(), "Title".to_string()],
+            column_schema_version: CURRENT_COLUMN_SCHEMA_VERSION,
+            ..AppConfig::default()
+        };
+
+        migrate_column_schema(&mut config);
+        assert_eq!(config.visible_columns, ["Title"]);
+        assert_eq!(config.column_order, ["Rating", "Title"]);
     }
 }

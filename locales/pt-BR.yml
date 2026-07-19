@@ -62,9 +62,26 @@ columns:
   bitrate: "Taxa de bits"
   sample_rate: "Taxa de amostragem"
   plays: "Reproduções"
+  rating: "Avaliação"
   format: "Formato"
   country: "País"
   state_province: "Estado"
+
+# ── Track ratings ─────────────────────────────────────────────
+ratings:
+  unrated: "Sem avaliação"
+  read_only_value: "%{value} (somente leitura)"
+  read_only_unrated: "Sem avaliação (somente leitura)"
+  unavailable: "Indisponível"
+  edit_value: "Avaliação %{value}. Ative para editar com um valor de 1 a 100."
+  edit_unrated: "Sem avaliação. Ative para definir uma avaliação de 1 a 100."
+  input_label: "Avaliação de 1 a 100"
+  apply: "Aplicar avaliação"
+  clear: "Limpar avaliação"
+  update_failed: "Não foi possível atualizar a avaliação da faixa."
+  rule_not_integer: "Insira uma avaliação em número inteiro de 1 a 100."
+  rule_out_of_range: "Os valores de avaliação devem estar entre 1 e 100."
+  rule_reversed_range: "A primeira avaliação não pode ser maior que a segunda."
 
 # ── Preferences ────────────────────────────────────────────────────
 preferences:

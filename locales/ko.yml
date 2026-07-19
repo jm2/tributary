@@ -62,9 +62,26 @@ columns:
   bitrate: "비트레이트"
   sample_rate: "샘플레이트"
   plays: "재생 횟수"
+  rating: "평점"
   format: "형식"
   country: "국가"
   state_province: "시/도"
+
+# ── Track ratings ─────────────────────────────────────────────
+ratings:
+  unrated: "평점 없음"
+  read_only_value: "%{value} (읽기 전용)"
+  read_only_unrated: "평점 없음 (읽기 전용)"
+  unavailable: "사용할 수 없음"
+  edit_value: "평점 %{value}. 활성화하면 1~100 범위에서 편집할 수 있습니다."
+  edit_unrated: "평점 없음. 활성화하면 1~100 범위의 평점을 설정할 수 있습니다."
+  input_label: "1~100 사이의 평점"
+  apply: "평점 적용"
+  clear: "평점 지우기"
+  update_failed: "트랙 평점을 업데이트할 수 없습니다."
+  rule_not_integer: "1에서 100 사이의 정수 평점을 입력하세요."
+  rule_out_of_range: "평점 값은 1에서 100 사이여야 합니다."
+  rule_reversed_range: "첫 번째 평점은 두 번째 평점보다 클 수 없습니다."
 
 # ── Preferences ────────────────────────────────────────────────────
 preferences:

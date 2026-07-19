@@ -22,10 +22,12 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use super::backend::LocalBackend;
 use super::root_authority::{AbsenceProof, BoundDirectory, BoundFile, RootAuthorityLease};
 use super::tag_parser::{self, ParsedTrack};
 use super::tag_writer;
 use crate::architecture::{
+    backend::MediaBackend,
     models::{Rating, Track, TrackRating},
     TrackId,
 };
@@ -67,6 +69,14 @@ pub enum LibraryEvent {
     /// boxed value is the row selected in the same transaction as the atomic
     /// increment, converted only after that transaction committed.
     PlaybackHistoryUpdated(Box<Track>),
+    /// One local track's app-owned rating committed durably. Consumers must
+    /// replace their published row from this value rather than mutating it
+    /// optimistically when the command is admitted.
+    TrackRatingUpdated(Box<Track>),
+    /// A local rating write failed before commit. The storage error is logged
+    /// internally but deliberately excluded from this UI-facing event so GTK
+    /// can select fixed, localized copy without exposing database details.
+    TrackRatingUpdateFailed { track_id: TrackId },
     /// Complete, exact-configured roots which require an explicit user trust
     /// decision before their observed storage may become authoritative.
     RootTrustRequired(Vec<RootTrustRequest>),
@@ -265,10 +275,16 @@ pub enum LibraryCommand {
         track_id: TrackId,
         counted_at_ms: i64,
     },
+    /// Set or clear one app-owned rating for an exact local source-native
+    /// track identity. Publication occurs only after the transaction commits.
+    SetTrackRating {
+        track_id: TrackId,
+        rating: Option<Rating>,
+    },
     /// Acknowledge only after every command queued before this marker has
     /// finished. Normal application shutdown uses this FIFO barrier so an
-    /// already-latched playback occurrence cannot be lost while the initial
-    /// scan or watcher owner is still busy.
+    /// already-admitted playback-history or rating mutation cannot be lost
+    /// while the initial scan or watcher owner is still busy.
     Flush {
         completion: async_channel::Sender<()>,
     },
@@ -381,9 +397,9 @@ impl LibraryEngine {
             }
         }
 
-        // Keep trust decisions usable even when watcher installation failed
-        // or a previously installed watcher backend shut down. Commands are
-        // serialized through the same engine owner in both modes.
+        // Keep serialized UI mutations usable even when watcher installation
+        // failed or a previously installed watcher backend shut down. Commands
+        // use the same engine owner in both modes.
         process_library_commands_without_watcher(
             db.as_ref(),
             &music_dirs,
@@ -3081,10 +3097,33 @@ async fn process_library_command(
                         .await;
                 }
                 Ok(None) => {
-                    debug!(track_id = %track_id.as_str(), "Ignored playback history for a missing local track");
+                    debug!(
+                        ?track_id,
+                        "Ignored playback history for a missing local track"
+                    );
                 }
                 Err(error) => {
-                    warn!(track_id = %track_id.as_str(), %error, "Failed to record local playback history");
+                    warn!(?track_id, %error, "Failed to record local playback history");
+                }
+            }
+            return None;
+        }
+        LibraryCommand::SetTrackRating { track_id, rating } => {
+            let backend = LocalBackend::new(db.clone());
+            match backend.set_track_rating(&track_id, rating).await {
+                Ok(Some(track)) => {
+                    let _ = tx
+                        .send(LibraryEvent::TrackRatingUpdated(Box::new(track)))
+                        .await;
+                }
+                Ok(None) => {
+                    debug!(?track_id, "Ignored rating update for a missing local track");
+                }
+                Err(error) => {
+                    warn!(?track_id, %error, "Failed to update local track rating");
+                    let _ = tx
+                        .send(LibraryEvent::TrackRatingUpdateFailed { track_id })
+                        .await;
                 }
             }
             return None;
@@ -5071,7 +5110,7 @@ async fn process_directory_events(
             continue;
         }
 
-        // A trust decision is one serialized engine command. Drain at most one
+        // Each UI mutation is one serialized engine command. Drain at most one
         // per batch boundary so it cannot interleave with a watcher mutation.
         if commands_open {
             match command_rx.try_recv() {
@@ -7849,6 +7888,127 @@ mod tests {
             .expect("rejected row exists");
         assert_eq!(rejected.play_count, 20);
         assert_eq!(rejected.last_played_at_ms, Some(2_000));
+    }
+
+    #[tokio::test]
+    async fn rating_commands_publish_only_committed_rows_before_flush_ack() {
+        let db = rename_test_database().await;
+        insert_playback_history_test_track(&db, "rating-committed", 10, Some(1_000)).await;
+        insert_playback_history_test_track(&db, "rating-rejected", 20, Some(2_000)).await;
+        insert_playback_history_test_track(&db, "rating-bystander", 30, Some(3_000)).await;
+        db.execute_unprepared(
+            "CREATE TRIGGER reject_track_rating
+             BEFORE UPDATE OF rating ON tracks
+             WHEN OLD.id = 'rating-rejected'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected rating failure with unsafe details');
+             END",
+        )
+        .await
+        .expect("create rating failure trigger");
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        command_tx
+            .send(LibraryCommand::SetTrackRating {
+                track_id: TrackId::new("rating-rejected").expect("valid rejected ID"),
+                rating: Some(Rating::new(25).unwrap()),
+            })
+            .await
+            .expect("send rejected rating command");
+        command_tx
+            .send(LibraryCommand::SetTrackRating {
+                track_id: TrackId::new("rating-missing").expect("valid missing ID"),
+                rating: Some(Rating::new(50).unwrap()),
+            })
+            .await
+            .expect("send missing rating command");
+        command_tx
+            .send(LibraryCommand::SetTrackRating {
+                track_id: TrackId::new("rating-committed").expect("valid committed ID"),
+                rating: Some(Rating::new(73).unwrap()),
+            })
+            .await
+            .expect("send committed rating command");
+        command_tx
+            .send(LibraryCommand::SetTrackRating {
+                track_id: TrackId::new("rating-committed").expect("valid committed ID"),
+                rating: None,
+            })
+            .await
+            .expect("send committed rating-clear command");
+        let (flush_tx, flush_rx) = async_channel::bounded(1);
+        command_tx
+            .send(LibraryCommand::Flush {
+                completion: flush_tx,
+            })
+            .await
+            .expect("queue FIFO shutdown flush after rating commands");
+        drop(command_tx);
+
+        let mut completed = HashMap::new();
+        process_library_commands_without_watcher(&db, &[], &event_tx, &command_rx, &mut completed)
+            .await;
+        flush_rx
+            .recv()
+            .await
+            .expect("flush is acknowledged after preceding rating commands finish");
+        assert!(
+            completed.is_empty(),
+            "rating commands are never trust receipts"
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(
+            events.len(),
+            3,
+            "a missing row is a clean no-op while failure and commits are explicit"
+        );
+        assert!(matches!(
+            &events[0],
+            LibraryEvent::TrackRatingUpdateFailed { track_id }
+                if track_id.as_str() == "rating-rejected"
+        ));
+
+        let LibraryEvent::TrackRatingUpdated(rated) = &events[1] else {
+            panic!("the first committed rating must be published after the failure");
+        };
+        assert_eq!(
+            rated.native_track_id.as_ref().map(TrackId::as_str),
+            Some("rating-committed")
+        );
+        assert_eq!(
+            rated.rating,
+            TrackRating::writable(Some(Rating::new(73).unwrap()))
+        );
+
+        let LibraryEvent::TrackRatingUpdated(cleared) = &events[2] else {
+            panic!("the committed clear must retain FIFO publication order");
+        };
+        assert_eq!(
+            cleared.native_track_id.as_ref().map(TrackId::as_str),
+            Some("rating-committed")
+        );
+        assert_eq!(cleared.rating, TrackRating::writable(None));
+
+        let committed = track::Entity::find_by_id("rating-committed")
+            .one(&db)
+            .await
+            .expect("query committed row after events")
+            .expect("committed row exists");
+        assert_eq!(committed.rating, None);
+        let rejected = track::Entity::find_by_id("rating-rejected")
+            .one(&db)
+            .await
+            .expect("query rejected row")
+            .expect("rejected row exists");
+        assert_eq!(rejected.rating, Some(88));
+        let bystander = track::Entity::find_by_id("rating-bystander")
+            .one(&db)
+            .await
+            .expect("query bystander row")
+            .expect("bystander row exists");
+        assert_eq!(bystander.rating, Some(88));
     }
 
     fn parsed_rename_track(path: &str, title: &str) -> ParsedTrack {

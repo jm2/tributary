@@ -1,6 +1,6 @@
 //! Tracklist — iTunes-style dense metadata grid using `GtkColumnView`.
 //!
-//! 13 resizable, sortable columns backed by `gio::ListStore<TrackObject>`
+//! 14 resizable, sortable columns backed by `gio::ListStore<TrackObject>`
 //! wrapped in a `gtk::SortListModel` for click-to-sort column headers.
 
 use std::cell::RefCell;
@@ -10,7 +10,20 @@ use std::rc::Rc;
 use gtk::gio;
 use gtk::prelude::*;
 
+use crate::architecture::models::{Rating, RatingCapability, TrackRating};
+use crate::architecture::TrackId;
+use crate::local::engine::LibraryCommand;
+
+use super::library_commands::LibraryCommandAdmission;
 use super::objects::TrackObject;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RatingCellPresentation {
+    text: String,
+    accessible_label: String,
+    editable: bool,
+    input_value: u8,
+}
 
 /// Build the tracklist view.
 ///
@@ -18,8 +31,9 @@ use super::objects::TrackObject;
 /// The caller uses `track_store` for mutation (add/remove) and `sort_model`
 /// for position lookups (playback, next/prev) since positions in the
 /// ColumnView correspond to the sorted order, not the raw store order.
-pub fn build_tracklist(
+pub(super) fn build_tracklist(
     initial_tracks: &[TrackObject],
+    library_commands: LibraryCommandAdmission,
 ) -> (
     gtk::Box,
     gio::ListStore,
@@ -147,6 +161,7 @@ pub fn build_tracklist(
         |t: &TrackObject| t.play_count_display(),
         |a, b| a.play_count().cmp(&b.play_count()),
     );
+    add_rating_column(&column_view, library_commands);
     add_sorted_column(
         &column_view,
         "Format",
@@ -343,4 +358,468 @@ fn add_sorted_column<F, S>(
         .build();
 
     column_view.append_column(&column);
+}
+
+fn add_rating_column(column_view: &gtk::ColumnView, library_commands: LibraryCommandAdmission) {
+    let factory = gtk::SignalListItemFactory::new();
+    let setup_commands = library_commands.clone();
+
+    factory.connect_setup(move |_, list_item| {
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
+
+        let input_label = gtk::Label::builder()
+            .label(rust_i18n::t!("ratings.input_label").as_ref())
+            .halign(gtk::Align::Start)
+            .build();
+        let spin = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
+        spin.set_numeric(true);
+        spin.set_value(100.0);
+        spin.update_property(&[gtk::accessible::Property::Label(
+            rust_i18n::t!("ratings.input_label").as_ref(),
+        )]);
+
+        let apply = gtk::Button::builder()
+            .label(rust_i18n::t!("ratings.apply").as_ref())
+            .build();
+        let clear = gtk::Button::builder()
+            .label(rust_i18n::t!("ratings.clear").as_ref())
+            .build();
+        let actions = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .halign(gtk::Align::End)
+            .build();
+        actions.append(&clear);
+        actions.append(&apply);
+
+        let editor = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .margin_top(8)
+            .margin_bottom(8)
+            .margin_start(8)
+            .margin_end(8)
+            .build();
+        editor.append(&input_label);
+        editor.append(&spin);
+        editor.append(&actions);
+
+        let popover = gtk::Popover::builder().child(&editor).build();
+        let button = gtk::MenuButton::builder()
+            .popover(&popover)
+            .css_classes(["flat"])
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Center)
+            .margin_start(2)
+            .margin_end(2)
+            .build();
+        button.set_sensitive(false);
+        list_item.set_child(Some(&button));
+
+        let apply_item = list_item.downgrade();
+        let apply_spin = spin.downgrade();
+        let apply_button = button.downgrade();
+        let apply_commands = setup_commands.clone();
+        apply.connect_clicked(move |_| {
+            let (Some(list_item), Some(spin), Some(button)) = (
+                apply_item.upgrade(),
+                apply_spin.upgrade(),
+                apply_button.upgrade(),
+            ) else {
+                return;
+            };
+            let Ok(rating) = Rating::try_from(spin.value_as_int()) else {
+                return;
+            };
+            if queue_rating_command(&list_item, &apply_commands, Some(rating)) {
+                button.popdown();
+            }
+        });
+
+        let clear_item = list_item.downgrade();
+        let clear_button = button.downgrade();
+        let clear_commands = setup_commands.clone();
+        clear.connect_clicked(move |_| {
+            let (Some(list_item), Some(button)) = (clear_item.upgrade(), clear_button.upgrade())
+            else {
+                return;
+            };
+            if queue_rating_command(&list_item, &clear_commands, None) {
+                button.popdown();
+            }
+        });
+    });
+
+    factory.connect_bind(|_, list_item| {
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
+        let track = list_item
+            .item()
+            .and_downcast::<TrackObject>()
+            .expect("TrackObject");
+        let button = list_item
+            .child()
+            .and_downcast::<gtk::MenuButton>()
+            .expect("rating MenuButton");
+        let presentation = rating_cell_presentation(track.rating(), &rust_i18n::locale());
+        button.set_label(&presentation.text);
+        button.set_sensitive(presentation.editable);
+        button.set_tooltip_text(Some(&presentation.accessible_label));
+        button.update_property(&[gtk::accessible::Property::Label(
+            &presentation.accessible_label,
+        )]);
+
+        if let Some(spin) = rating_spin_button(&button) {
+            spin.set_value(f64::from(presentation.input_value));
+        }
+    });
+
+    factory.connect_unbind(|_, list_item| {
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
+        if let Some(button) = list_item.child().and_downcast::<gtk::MenuButton>() {
+            button.popdown();
+            button.set_sensitive(false);
+            button.set_label("");
+            button.set_tooltip_text(None);
+            button.reset_property(gtk::AccessibleProperty::Label);
+            if let Some(spin) = rating_spin_button(&button) {
+                spin.set_value(100.0);
+            }
+        }
+    });
+
+    let rating_title = rust_i18n::t!("columns.rating").into_owned();
+    let sort_rating_title = rating_title.clone();
+    let column_view_weak = column_view.downgrade();
+    let sorter = gtk::CustomSorter::new(move |a, b| {
+        let first = a
+            .downcast_ref::<TrackObject>()
+            .expect("sort model contains TrackObject");
+        let second = b
+            .downcast_ref::<TrackObject>()
+            .expect("sort model contains TrackObject");
+        let descending = column_view_weak.upgrade().is_some_and(|view| {
+            view.sorter()
+                .and_downcast::<gtk::ColumnViewSorter>()
+                .is_some_and(|sorter| {
+                    rating_sort_is_descending(
+                        (0..sorter.n_sort_columns()).filter_map(|index| {
+                            let (column, order) = sorter.nth_sort_column(index);
+                            Some((column?.title()?, order))
+                        }),
+                        &sort_rating_title,
+                    )
+                })
+        });
+        compare_rating_rows(first, second, descending).into()
+    });
+
+    let column = gtk::ColumnViewColumn::builder()
+        .title(&rating_title)
+        .factory(&factory)
+        .sorter(&sorter)
+        .resizable(true)
+        .fixed_width(120)
+        .build();
+    column_view.append_column(&column);
+}
+
+fn rating_spin_button(button: &gtk::MenuButton) -> Option<gtk::SpinButton> {
+    button
+        .popover()
+        .and_downcast::<gtk::Popover>()?
+        .child()
+        .and_downcast::<gtk::Box>()?
+        .first_child()?
+        .next_sibling()?
+        .downcast::<gtk::SpinButton>()
+        .ok()
+}
+
+fn queue_rating_command(
+    list_item: &gtk::ListItem,
+    commands: &LibraryCommandAdmission,
+    rating: Option<Rating>,
+) -> bool {
+    let Some(track) = list_item.item().and_downcast::<TrackObject>() else {
+        return false;
+    };
+    if !matches!(track.rating(), TrackRating::Writable { .. }) {
+        return false;
+    }
+    let Ok(track_id) = TrackId::new(track.track_id()) else {
+        return false;
+    };
+    commands.try_send(LibraryCommand::SetTrackRating { track_id, rating })
+}
+
+fn rating_cell_presentation(rating: TrackRating, locale: &str) -> RatingCellPresentation {
+    let input_value = rating.value().map_or(100, Rating::value);
+    match rating {
+        TrackRating::Writable { value: Some(value) } => RatingCellPresentation {
+            text: value.value().to_string(),
+            accessible_label: rust_i18n::t!(
+                "ratings.edit_value",
+                locale = locale,
+                value = value.value()
+            )
+            .into_owned(),
+            editable: true,
+            input_value,
+        },
+        TrackRating::Writable { value: None } => RatingCellPresentation {
+            text: rust_i18n::t!("ratings.unrated", locale = locale).into_owned(),
+            accessible_label: rust_i18n::t!("ratings.edit_unrated", locale = locale).into_owned(),
+            editable: true,
+            input_value,
+        },
+        TrackRating::ReadOnly { value: Some(value) } => RatingCellPresentation {
+            text: rust_i18n::t!(
+                "ratings.read_only_value",
+                locale = locale,
+                value = value.value()
+            )
+            .into_owned(),
+            accessible_label: rust_i18n::t!(
+                "ratings.read_only_value",
+                locale = locale,
+                value = value.value()
+            )
+            .into_owned(),
+            editable: false,
+            input_value,
+        },
+        TrackRating::ReadOnly { value: None } => RatingCellPresentation {
+            text: rust_i18n::t!("ratings.read_only_unrated", locale = locale).into_owned(),
+            accessible_label: rust_i18n::t!("ratings.read_only_unrated", locale = locale)
+                .into_owned(),
+            editable: false,
+            input_value,
+        },
+        TrackRating::Unsupported => RatingCellPresentation {
+            text: rust_i18n::t!("ratings.unavailable", locale = locale).into_owned(),
+            accessible_label: rust_i18n::t!("ratings.unavailable", locale = locale).into_owned(),
+            editable: false,
+            input_value,
+        },
+    }
+}
+
+fn compare_rating_rows(first: &TrackObject, second: &TrackObject, descending: bool) -> Ordering {
+    let first_rating = first.rating();
+    let second_rating = second.rating();
+    let first_category = rating_sort_category(first_rating);
+    let second_category = rating_sort_category(second_rating);
+    let category_order = first_category.cmp(&second_category);
+    if category_order != Ordering::Equal {
+        return if descending {
+            category_order.reverse()
+        } else {
+            category_order
+        };
+    }
+
+    first_rating
+        .value()
+        .map(Rating::value)
+        .cmp(&second_rating.value().map(Rating::value))
+        .then_with(|| first.track_id().cmp(&second.track_id()))
+}
+
+fn rating_sort_category(rating: TrackRating) -> u8 {
+    if rating.value().is_some() {
+        0
+    } else if rating.capability() == RatingCapability::Unsupported {
+        2
+    } else {
+        1
+    }
+}
+
+/// Return the direction assigned specifically to Rating, including when GTK
+/// uses it as a secondary compound-sort key.
+fn rating_sort_is_descending<I, S>(columns: I, rating_title: &str) -> bool
+where
+    I: IntoIterator<Item = (S, gtk::SortType)>,
+    S: AsRef<str>,
+{
+    columns
+        .into_iter()
+        .any(|(title, order)| title.as_ref() == rating_title && order == gtk::SortType::Descending)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use serde::Deserialize;
+
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct RatingCatalog {
+        columns: RatingColumns,
+        ratings: RatingMessages,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RatingColumns {
+        rating: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RatingMessages {
+        unrated: String,
+        read_only_value: String,
+        read_only_unrated: String,
+        unavailable: String,
+        edit_value: String,
+        edit_unrated: String,
+        input_label: String,
+        apply: String,
+        clear: String,
+        update_failed: String,
+    }
+
+    fn track(id: &str, rating: TrackRating) -> TrackObject {
+        let track = TrackObject::new(
+            1, "Title", 60, "Artist", "Album", "", "", 0, "", 0, 0, 0, "", "",
+        );
+        track.set_track_id(id);
+        track.set_rating(rating);
+        track
+    }
+
+    fn final_rating_order(first: &TrackObject, second: &TrackObject, descending: bool) -> Ordering {
+        let order = compare_rating_rows(first, second, descending);
+        if descending {
+            order.reverse()
+        } else {
+            order
+        }
+    }
+
+    #[test]
+    fn rating_presentations_are_honest_and_accessible_in_every_locale() {
+        let value = Rating::new(73).unwrap();
+        let locale_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+        let value_placeholder = ["%", "{", "value", "}"].concat();
+        for locale in rust_i18n::available_locales!() {
+            let path = locale_dir.join(format!("{locale}.yml"));
+            let yaml = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let catalog: RatingCatalog = serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            let writable =
+                rating_cell_presentation(TrackRating::writable(Some(value)), locale.as_ref());
+            let unrated = rating_cell_presentation(TrackRating::writable(None), locale.as_ref());
+            let read_only =
+                rating_cell_presentation(TrackRating::read_only(Some(value)), locale.as_ref());
+            let read_only_unrated =
+                rating_cell_presentation(TrackRating::read_only(None), locale.as_ref());
+            let unsupported = rating_cell_presentation(TrackRating::unsupported(), locale.as_ref());
+
+            assert!(writable.editable);
+            assert!(unrated.editable);
+            assert!(!read_only.editable);
+            assert!(!read_only_unrated.editable);
+            assert!(!unsupported.editable);
+            assert_eq!(writable.text, "73");
+            assert_eq!(unrated.text, catalog.ratings.unrated);
+            assert_eq!(
+                writable.accessible_label,
+                catalog.ratings.edit_value.replace(&value_placeholder, "73")
+            );
+            assert_eq!(unrated.accessible_label, catalog.ratings.edit_unrated);
+            assert_eq!(
+                read_only.text,
+                catalog
+                    .ratings
+                    .read_only_value
+                    .replace(&value_placeholder, "73")
+            );
+            assert_eq!(read_only_unrated.text, catalog.ratings.read_only_unrated);
+            assert_eq!(unsupported.text, catalog.ratings.unavailable);
+            assert_eq!(
+                rust_i18n::t!("columns.rating", locale = locale).as_ref(),
+                catalog.columns.rating
+            );
+            assert_eq!(
+                rust_i18n::t!("ratings.input_label", locale = locale).as_ref(),
+                catalog.ratings.input_label
+            );
+            assert_eq!(
+                rust_i18n::t!("ratings.apply", locale = locale).as_ref(),
+                catalog.ratings.apply
+            );
+            assert_eq!(
+                rust_i18n::t!("ratings.clear", locale = locale).as_ref(),
+                catalog.ratings.clear
+            );
+            assert_eq!(
+                rust_i18n::t!("ratings.update_failed", locale = locale).as_ref(),
+                catalog.ratings.update_failed
+            );
+            assert!(writable.accessible_label.contains("73"));
+            assert!(!writable.accessible_label.contains(&value_placeholder));
+            for presentation in [writable, unrated, read_only, read_only_unrated, unsupported] {
+                assert!(!presentation.text.trim().is_empty(), "locale {locale}");
+                assert!(
+                    !presentation.accessible_label.trim().is_empty(),
+                    "locale {locale}"
+                );
+                assert!((1..=100).contains(&presentation.input_value));
+            }
+        }
+    }
+
+    #[test]
+    fn rating_sort_keeps_missing_values_last_in_both_directions() {
+        let low = track("low", TrackRating::writable(Some(Rating::new(10).unwrap())));
+        let high = track(
+            "high",
+            TrackRating::read_only(Some(Rating::new(90).unwrap())),
+        );
+        let unrated = track("unrated", TrackRating::writable(None));
+        let unsupported = track("unsupported", TrackRating::unsupported());
+
+        assert_eq!(final_rating_order(&low, &high, false), Ordering::Less);
+        assert_eq!(final_rating_order(&high, &low, true), Ordering::Less);
+        for descending in [false, true] {
+            assert_eq!(
+                final_rating_order(&low, &unrated, descending),
+                Ordering::Less
+            );
+            assert_eq!(
+                final_rating_order(&unrated, &unsupported, descending),
+                Ordering::Less
+            );
+        }
+    }
+
+    #[test]
+    fn equal_ratings_have_a_deterministic_exact_id_tie_break() {
+        let rating = TrackRating::writable(Some(Rating::new(50).unwrap()));
+        let first = track("a", rating);
+        let second = track("b", rating);
+        assert_eq!(final_rating_order(&first, &second, false), Ordering::Less);
+        assert_eq!(final_rating_order(&second, &first, true), Ordering::Less);
+    }
+
+    #[test]
+    fn secondary_rating_sort_uses_its_own_direction() {
+        assert!(rating_sort_is_descending(
+            [
+                ("Artiste", gtk::SortType::Ascending),
+                ("Note", gtk::SortType::Descending),
+            ],
+            "Note",
+        ));
+        assert!(!rating_sort_is_descending(
+            [
+                ("Artiste", gtk::SortType::Descending),
+                ("Note", gtk::SortType::Ascending),
+            ],
+            "Note",
+        ));
+    }
 }

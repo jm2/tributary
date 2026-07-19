@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gtk::glib;
 use gtk::subclass::prelude::*;
 
+use crate::architecture::models::TrackRating;
+
 static NEXT_ROW_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
@@ -43,6 +45,9 @@ mod imp {
         pub bitrate_kbps: Cell<u32>,
         pub sample_rate_hz: Cell<u32>,
         pub play_count: Cell<u32>,
+        /// Canonical rating plus the capability of the publishing source.
+        /// The fail-closed default is `Unsupported` for UI-only rows.
+        pub rating: Cell<TrackRating>,
         pub format: RefCell<String>,
         /// Playable URI (`file:///…` or stream URL).
         pub uri: RefCell<String>,
@@ -173,6 +178,9 @@ impl TrackObject {
     pub fn play_count(&self) -> u32 {
         self.imp().play_count.get()
     }
+    pub fn rating(&self) -> TrackRating {
+        self.imp().rating.get()
+    }
     pub fn format(&self) -> String {
         self.imp().format.borrow().clone()
     }
@@ -216,6 +224,10 @@ impl TrackObject {
 
     pub fn set_disc_number(&self, disc: u32) {
         self.imp().disc_number.set(disc);
+    }
+
+    pub fn set_rating(&self, rating: TrackRating) {
+        self.imp().rating.set(rating);
     }
 
     pub fn duration_display(&self) -> String {
@@ -262,6 +274,8 @@ impl TrackObject {
 
 #[cfg(test)]
 mod tests {
+    use crate::architecture::models::Rating;
+
     use super::*;
 
     fn track(uri: &str) -> TrackObject {
@@ -293,5 +307,23 @@ mod tests {
             "",
             "malformed persisted identity must fail resolution, not become a path identity"
         );
+    }
+
+    #[test]
+    fn rating_projection_defaults_fail_closed_and_preserves_every_state() {
+        let row = track("file:///music/rating.flac");
+        assert_eq!(row.rating(), TrackRating::unsupported());
+
+        let value = Rating::new(73).unwrap();
+        for rating in [
+            TrackRating::unsupported(),
+            TrackRating::read_only(None),
+            TrackRating::read_only(Some(value)),
+            TrackRating::writable(None),
+            TrackRating::writable(Some(value)),
+        ] {
+            row.set_rating(rating);
+            assert_eq!(row.rating(), rating);
+        }
     }
 }

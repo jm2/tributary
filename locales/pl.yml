@@ -62,9 +62,26 @@ columns:
   bitrate: "Bitrate"
   sample_rate: "Częstotliwość próbkowania"
   plays: "Odtworzenia"
+  rating: "Ocena"
   format: "Format"
   country: "Kraj"
   state_province: "Województwo"
+
+# ── Track ratings ─────────────────────────────────────────────
+ratings:
+  unrated: "Brak oceny"
+  read_only_value: "%{value} (tylko do odczytu)"
+  read_only_unrated: "Brak oceny (tylko do odczytu)"
+  unavailable: "Niedostępne"
+  edit_value: "Ocena %{value}. Aktywuj, aby zmienić ją na wartość od 1 do 100."
+  edit_unrated: "Brak oceny. Aktywuj, aby ustawić ocenę od 1 do 100."
+  input_label: "Ocena od 1 do 100"
+  apply: "Zastosuj ocenę"
+  clear: "Wyczyść ocenę"
+  update_failed: "Nie udało się zaktualizować oceny utworu."
+  rule_not_integer: "Wprowadź ocenę jako liczbę całkowitą od 1 do 100."
+  rule_out_of_range: "Wartości ocen muszą mieścić się w zakresie od 1 do 100."
+  rule_reversed_range: "Pierwsza ocena nie może być wyższa od drugiej."
 
 # ── Preferences ────────────────────────────────────────────────────
 preferences:

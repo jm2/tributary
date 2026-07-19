@@ -62,9 +62,26 @@ columns:
   bitrate: "Tasa de bits"
   sample_rate: "Frecuencia de muestreo"
   plays: "Reproducciones"
+  rating: "Valoración"
   format: "Formato"
   country: "País"
   state_province: "Estado/Provincia"
+
+# ── Track ratings ─────────────────────────────────────────────
+ratings:
+  unrated: "Sin valorar"
+  read_only_value: "%{value} (solo lectura)"
+  read_only_unrated: "Sin valorar (solo lectura)"
+  unavailable: "No disponible"
+  edit_value: "Valoración %{value}. Activa para editarla con un valor del 1 al 100."
+  edit_unrated: "Sin valorar. Activa para establecer una valoración del 1 al 100."
+  input_label: "Valoración del 1 al 100"
+  apply: "Aplicar valoración"
+  clear: "Borrar valoración"
+  update_failed: "No se pudo actualizar la valoración de la pista."
+  rule_not_integer: "Introduce una valoración entera del 1 al 100."
+  rule_out_of_range: "Los valores de valoración deben estar entre 1 y 100."
+  rule_reversed_range: "La primera valoración no debe superar la segunda."
 
 # ── Preferences ────────────────────────────────────────────────────
 preferences:

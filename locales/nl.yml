@@ -62,9 +62,26 @@ columns:
   bitrate: "Bitrate"
   sample_rate: "Samplefrequentie"
   plays: "Keer afgespeeld"
+  rating: "Beoordeling"
   format: "Formaat"
   country: "Land"
   state_province: "Provincie"
+
+# ── Track ratings ─────────────────────────────────────────────
+ratings:
+  unrated: "Niet beoordeeld"
+  read_only_value: "%{value} (alleen-lezen)"
+  read_only_unrated: "Niet beoordeeld (alleen-lezen)"
+  unavailable: "Niet beschikbaar"
+  edit_value: "Beoordeling %{value}. Activeer om deze te wijzigen naar een waarde van 1 tot 100."
+  edit_unrated: "Niet beoordeeld. Activeer om een beoordeling van 1 tot 100 in te stellen."
+  input_label: "Beoordeling van 1 tot 100"
+  apply: "Beoordeling toepassen"
+  clear: "Beoordeling wissen"
+  update_failed: "De beoordeling van het nummer kon niet worden bijgewerkt."
+  rule_not_integer: "Voer een geheel getal van 1 tot 100 in als beoordeling."
+  rule_out_of_range: "Beoordelingen moeten tussen 1 en 100 liggen."
+  rule_reversed_range: "De eerste beoordeling mag niet hoger zijn dan de tweede."
 
 # ── Preferences ────────────────────────────────────────────────────
 preferences:

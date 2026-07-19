@@ -62,9 +62,26 @@ columns:
   bitrate: "Bitrate"
   sample_rate: "Sample Rate"
   plays: "Plays"
+  rating: "Rating"
   format: "Format"
   country: "Country"
   state_province: "State/Province"
+
+# ── Track ratings ─────────────────────────────────────────────
+ratings:
+  unrated: "Unrated"
+  read_only_value: "%{value} (read-only)"
+  read_only_unrated: "Unrated (read-only)"
+  unavailable: "Unavailable"
+  edit_value: "Rating %{value}. Activate to edit from 1 to 100."
+  edit_unrated: "Unrated. Activate to set a rating from 1 to 100."
+  input_label: "Rating from 1 to 100"
+  apply: "Apply Rating"
+  clear: "Clear Rating"
+  update_failed: "Could not update the track rating."
+  rule_not_integer: "Enter a whole-number rating from 1 to 100."
+  rule_out_of_range: "Rating values must be from 1 to 100."
+  rule_reversed_range: "The first rating must not exceed the second."
 
 # ── Preferences ────────────────────────────────────────────────────
 preferences:

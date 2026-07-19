@@ -683,6 +683,7 @@ mod tests {
     use crate::db::entities::{playlist, playlist_entry, track};
     use crate::db::migration::Migrator;
     use crate::local::playlist_io::ImportedTrack;
+    use crate::local::smart_rules;
 
     /// Open a fresh in-memory SQLite database with all migrations applied.
     ///
@@ -906,6 +907,90 @@ mod tests {
             .map(|track| track.id)
             .collect();
         assert_eq!(top_ids, ["history-older", "history-newer"]);
+    }
+
+    #[tokio::test]
+    async fn smart_playlist_rating_rules_use_persisted_values_and_deterministic_membership() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+
+        for (id, rating) in [
+            ("b", Some(80)),
+            ("a", Some(80)),
+            ("low", Some(20)),
+            ("none", None),
+        ] {
+            let track = insert_track(
+                &db,
+                id,
+                &format!("/music/{id}.flac"),
+                id,
+                "Artist",
+                "Album",
+                Some(180),
+            )
+            .await;
+            let mut active: track::ActiveModel = track.into();
+            active.rating = Set(rating);
+            active.update(&db).await.expect("persist test rating");
+        }
+
+        let playlist = manager
+            .create_playlist("Highest rated", true)
+            .await
+            .expect("create smart playlist");
+        let highest = smart_rules::SmartRules {
+            match_mode: smart_rules::MatchMode::All,
+            rules: vec![smart_rules::SmartRule {
+                field: smart_rules::RuleField::Rating,
+                operator: smart_rules::RuleOperator::IsRated,
+                value: smart_rules::RuleValue::Number(1),
+            }],
+            limit: Some(smart_rules::SmartLimit {
+                value: 2,
+                unit: smart_rules::LimitUnit::Items,
+                selected_by: smart_rules::LimitSort::HighestRated,
+            }),
+            sort_order: vec![smart_rules::SortCriterion {
+                field: smart_rules::SortField::Rating,
+                direction: smart_rules::SortDirection::Descending,
+            }],
+        };
+        manager
+            .set_smart_rules(&playlist.id, &highest)
+            .await
+            .expect("save rating rules");
+        let highest_ids: Vec<_> = manager
+            .evaluate_smart_playlist(&playlist.id)
+            .await
+            .expect("evaluate rating rules")
+            .into_iter()
+            .map(|track| track.id)
+            .collect();
+        assert_eq!(highest_ids, ["a", "b"]);
+
+        let unrated = smart_rules::SmartRules {
+            match_mode: smart_rules::MatchMode::All,
+            rules: vec![smart_rules::SmartRule {
+                field: smart_rules::RuleField::Rating,
+                operator: smart_rules::RuleOperator::IsUnrated,
+                value: smart_rules::RuleValue::Number(1),
+            }],
+            limit: None,
+            sort_order: Vec::new(),
+        };
+        manager
+            .set_smart_rules(&playlist.id, &unrated)
+            .await
+            .expect("save unrated rule");
+        let unrated_ids: Vec<_> = manager
+            .evaluate_smart_playlist(&playlist.id)
+            .await
+            .expect("evaluate unrated rule")
+            .into_iter()
+            .map(|track| track.id)
+            .collect();
+        assert_eq!(unrated_ids, ["none"]);
     }
 
     #[tokio::test]

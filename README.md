@@ -62,7 +62,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Playlist import/export (XSPF) | ✅ |
 | Durable local playback history | ✅ Exact accepted local occurrences persist a saturating play count and monotonic last-played timestamp, with live Plays refresh ([contract](docs/playback-history.md)) |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ Recently Played and Top 25 use deterministic authoritative history, safe untouched-default migration, and live projection refresh ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
-| Track ratings | ⚠️ Storage, ownership, and source capabilities implemented; accessible editing, display, sorting, and smart rules remain ([contract](docs/ratings.md), [#37](https://github.com/jm2/tributary/issues/37)) |
+| Track ratings | ✅ Exact 1–100 local editing, read-only/unsupported source states, deterministic sorting, live refresh, and smart-playlist rules ([contract](docs/ratings.md)) |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
 | Linux and macOS file associations | ✅ |
@@ -649,6 +649,32 @@ track, and final replacement refreshes the original path without losing its stab
 history, or playlist links. Supported formats:
 MP3 (ID3v2), M4A/AAC, OGG Vorbis, and FLAC.
 
+### Track ratings
+
+The Rating column shows Tributary's exact whole-number 1–100 value. Activate a local row's rating
+button with a pointer or keyboard to open its editor, choose a value, and select **Apply**; select
+**Clear** to return it to Unrated. A requested change is shown only after it commits to the local
+library. If storage fails, Tributary keeps the old value and shows a localized failure message.
+The Rating column can be hidden or reordered in Preferences like the other track columns.
+
+Authenticated Subsonic, Jellyfin, and Plex libraries can publish ratings, but Tributary does not
+write them back: those cells say that the exact value or Unrated state is read-only. DAAP and
+removable-media rows show Unavailable. Externally opened files have no library row and their
+hidden source remains rating-incapable. Radio-Browser's compact station view omits Rating together
+with other track-only metadata; its rows remain rating-incapable. Sorting by Rating keeps rated rows
+first whether ascending or descending; missing readable values follow them and unsupported rows
+come last, with deterministic stable-ID ties.
+
+Smart-playlist rules can compare Rating with **is**, **is not**, **greater than**, **less than**, or
+an inclusive **in range** value, and can test **is rated** or **is unrated** explicitly. Numeric
+operands must be in 1–100. An unrated readable track does not satisfy a numeric rule (including
+**is not**); an unsupported track satisfies neither numeric nor rated/unrated rules. Rating is also
+available for compound sorting and for **Highest Rated** or **Lowest Rated** limit selection, with
+missing values kept last. Invalid or reversed numeric input is not clamped: the editor retains the
+text, explains the problem visibly and accessibly, and disables OK until it is valid. See the
+[rating contract](docs/ratings.md) for source conversions, persistence, and playlist-interchange
+boundaries.
+
 ### Playlists
 
 Tributary supports regular and smart playlists for the local library:
@@ -676,7 +702,7 @@ valid playlist, because XSPF duration is optional.
 Ratings are deliberately outside this playlist interchange. XSPF v1 has no standard rating field,
 so export emits none; import treats rating-like `<meta>` and extension content as inert and never
 changes a matched local track's app-owned rating. See the [rating contract](docs/ratings.md) for the
-ownership and future opt-in metadata-transfer boundary.
+ownership and separate opt-in metadata-transfer boundary.
 
 Import requires a valid leading XML 1.0 declaration when one is present, `version="1"`, and the
 canonical XSPF namespace, expressed either as the default namespace or through a prefix. It
