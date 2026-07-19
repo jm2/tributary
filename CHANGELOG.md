@@ -47,6 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remain the final P1.3 slice and are not claimed here.
 
 ### Fixed
+- **Linux library reads no longer feed a recursive rescan loop** — Filesystem notifications
+  explicitly classified as access or access-time observations and produced by Tributary's own
+  metadata reads are discarded in the watcher callback, before they can consume the bounded event
+  queue and falsely request another full-library reconciliation. The filter does not discard real
+  create, write, rename, remove, or backend-error events; if accepted events fill the bounded queue,
+  overflow evidence remains retained and still schedules an authoritative reconciliation instead
+  of being drained or cleared. The persistent unparseable-file cache from
+  the original proposal is intentionally excluded: a transient parser or I/O failure can be retried
+  by a later scan rather than becoming a stale negative result.
+  ([#103](https://github.com/jm2/tributary/pull/103))
 - **Unsupported playlist additions now fail visibly and atomically** — Choosing Add to Playlist
   from an authenticated remote, internet-radio, removable-media, or unknown/pathless source now
   shows a localized explanation before any runtime task, database connection, or playlist write.
