@@ -62,9 +62,26 @@ columns:
   bitrate: "Débit"
   sample_rate: "Fréquence d'échantillonnage"
   plays: "Lectures"
+  rating: "Note"
   format: "Format"
   country: "Pays"
   state_province: "Région"
+
+# ── Track ratings ─────────────────────────────────────────────
+ratings:
+  unrated: "Non noté"
+  read_only_value: "%{value} (lecture seule)"
+  read_only_unrated: "Non noté (lecture seule)"
+  unavailable: "Indisponible"
+  edit_value: "Note %{value}. Activez pour la modifier avec une valeur de 1 à 100."
+  edit_unrated: "Non noté. Activez pour définir une note de 1 à 100."
+  input_label: "Note de 1 à 100"
+  apply: "Appliquer la note"
+  clear: "Effacer la note"
+  update_failed: "Impossible de mettre à jour la note du morceau."
+  rule_not_integer: "Saisissez une note entière comprise entre 1 et 100."
+  rule_out_of_range: "Les notes doivent être comprises entre 1 et 100."
+  rule_reversed_range: "La première note ne doit pas dépasser la seconde."
 
 # ── Preferences ────────────────────────────────────────────────────
 preferences:

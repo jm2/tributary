@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::architecture::models::{Rating, TrackRating};
+
 // ── Data types ──────────────────────────────────────────────────────
 
 /// A complete smart playlist rule configuration.
@@ -51,6 +53,7 @@ pub enum SortField {
     LastPlayed,
     DateAdded,
     DateModified,
+    Rating,
 }
 
 /// Sort direction.
@@ -96,6 +99,7 @@ pub enum RuleField {
     DateAdded,
     DateModified,
     FileSize,
+    Rating,
 }
 
 /// Operators for filtering.
@@ -117,6 +121,11 @@ pub enum RuleOperator {
     IsAfter,
     IsInTheLast { amount: u32, unit: DateUnit },
     IsNotInTheLast { amount: u32, unit: DateUnit },
+    // Rating-presence operators. These are deliberately distinct from
+    // numeric equality so an unsupported source is not mistaken for an
+    // unrated source.
+    IsRated,
+    IsUnrated,
 }
 
 /// Date unit for relative date operators.
@@ -172,6 +181,8 @@ pub enum LimitSort {
     LeastRecentlyAdded,
     MostRecentlyPlayed,
     LeastRecentlyPlayed,
+    HighestRated,
+    LowestRated,
 }
 
 // ── Track adapter trait ─────────────────────────────────────────────
@@ -197,6 +208,7 @@ pub trait SmartTrack {
     fn format(&self) -> &str;
     fn play_count(&self) -> i32;
     fn last_played_at_ms(&self) -> Option<i64>;
+    fn rating(&self) -> TrackRating;
     fn date_added(&self) -> &str;
     fn date_modified(&self) -> &str;
     fn file_size_bytes(&self) -> Option<i64>;
@@ -251,6 +263,9 @@ impl SmartTrack for crate::db::entities::track::Model {
     }
     fn last_played_at_ms(&self) -> Option<i64> {
         self.last_played_at_ms
+    }
+    fn rating(&self) -> TrackRating {
+        TrackRating::writable(self.rating.and_then(|value| Rating::try_from(value).ok()))
     }
     fn date_added(&self) -> &str {
         &self.date_added
@@ -348,6 +363,10 @@ fn apply_compound_sort<T: SmartTrack>(results: &mut Vec<T>, criteria: &[SortCrit
         })
         .collect();
 
+    let needs_rating_tie_breaker = criteria
+        .iter()
+        .any(|criterion| criterion.field == SortField::Rating);
+
     decorated.sort_by(|a, b| {
         for (idx, criterion) in criteria.iter().enumerate() {
             let cmp = compare_sort_keys(&a.0[idx], &b.0[idx], criterion.direction);
@@ -355,7 +374,11 @@ fn apply_compound_sort<T: SmartTrack>(results: &mut Vec<T>, criteria: &[SortCrit
                 return cmp;
             }
         }
-        std::cmp::Ordering::Equal
+        if needs_rating_tie_breaker {
+            a.1.track_id().cmp(b.1.track_id())
+        } else {
+            std::cmp::Ordering::Equal
+        }
     });
 
     // Undecorate: drop the keys and keep the sorted tracks.
@@ -375,6 +398,8 @@ enum SortKey {
     /// direction. Out-of-range Unix millisecond values are normalized to
     /// unknown before reaching this key.
     LastPlayed(Option<i64>),
+    /// Ratings put unrated and unsupported tracks last in either direction.
+    Rating(Option<i64>),
 }
 
 fn compare_sort_keys(
@@ -382,8 +407,12 @@ fn compare_sort_keys(
     right: &SortKey,
     direction: SortDirection,
 ) -> std::cmp::Ordering {
-    if let (SortKey::LastPlayed(left), SortKey::LastPlayed(right)) = (left, right) {
-        return compare_optional_i64_null_last(*left, *right, direction);
+    match (left, right) {
+        (SortKey::LastPlayed(left), SortKey::LastPlayed(right))
+        | (SortKey::Rating(left), SortKey::Rating(right)) => {
+            return compare_optional_i64_null_last(*left, *right, direction);
+        }
+        _ => {}
     }
 
     let ordering = left.cmp(right);
@@ -428,6 +457,7 @@ fn sort_key<T: SmartTrack>(track: &T, field: SortField) -> SortKey {
         SortField::LastPlayed => SortKey::LastPlayed(valid_last_played_ms(track)),
         SortField::DateAdded => SortKey::Text(track.date_added().to_string()),
         SortField::DateModified => SortKey::Text(track.date_modified().to_string()),
+        SortField::Rating => SortKey::Rating(rating_value(track).map(i64::from)),
     }
 }
 
@@ -470,6 +500,7 @@ fn evaluate_rule_at<T: SmartTrack>(
         RuleField::PlayCount => {
             eval_number(Some(track.play_count() as i64), &rule.operator, &rule.value)
         }
+        RuleField::Rating => eval_rating(track.rating(), &rule.operator, &rule.value),
         RuleField::LastPlayed => {
             // Playback history is persisted at millisecond precision. Compare it
             // against a clock at that same precision so the inclusive lower
@@ -562,6 +593,60 @@ fn eval_number(field_val: Option<i64>, op: &RuleOperator, value: &RuleValue) -> 
                 false
             }
         }
+        _ => false,
+    }
+}
+
+/// Evaluate a rating without collapsing an unsupported source into the
+/// readable-but-unrated state.
+///
+/// Numeric predicates accept only canonical 1..=100 operands. A missing
+/// readable value satisfies no numeric predicate, including `IsNot`; callers
+/// must use `IsUnrated` when they mean absence. Unsupported ratings satisfy
+/// neither numeric nor presence predicates. Presence predicates validate the
+/// exact canonical inert `Number(1)` placeholder before otherwise ignoring it.
+fn eval_rating(rating: TrackRating, op: &RuleOperator, value: &RuleValue) -> bool {
+    if !canonical_rating_rule_value(op, value) {
+        return false;
+    }
+
+    let readable_value = match rating {
+        TrackRating::Unsupported => return false,
+        TrackRating::ReadOnly { value } | TrackRating::Writable { value } => value,
+    };
+
+    match op {
+        RuleOperator::IsRated => readable_value.is_some(),
+        RuleOperator::IsUnrated => readable_value.is_none(),
+        RuleOperator::Is
+        | RuleOperator::IsNot
+        | RuleOperator::GreaterThan
+        | RuleOperator::LessThan
+        | RuleOperator::InRange => {
+            let Some(rating) = readable_value else {
+                return false;
+            };
+            eval_number(Some(i64::from(rating.value())), op, value)
+        }
+        _ => false,
+    }
+}
+
+fn canonical_rating_rule_value(op: &RuleOperator, value: &RuleValue) -> bool {
+    let canonical = |value: i64| (i64::from(Rating::MIN)..=i64::from(Rating::MAX)).contains(&value);
+
+    match (op, value) {
+        (
+            RuleOperator::Is
+            | RuleOperator::IsNot
+            | RuleOperator::GreaterThan
+            | RuleOperator::LessThan,
+            RuleValue::Number(value),
+        ) => canonical(*value),
+        (RuleOperator::InRange, RuleValue::NumberRange(low, high)) => {
+            canonical(*low) && canonical(*high) && low <= high
+        }
+        (RuleOperator::IsRated | RuleOperator::IsUnrated, RuleValue::Number(1)) => true,
         _ => false,
     }
 }
@@ -695,6 +780,10 @@ fn valid_last_played_ms<T: SmartTrack>(track: &T) -> Option<i64> {
     chrono::DateTime::from_timestamp_millis(timestamp).map(|_| timestamp)
 }
 
+fn rating_value<T: SmartTrack>(track: &T) -> Option<u8> {
+    track.rating().value().map(Rating::value)
+}
+
 /// Apply result limiting: sort then truncate.
 fn apply_limit<T: SmartTrack>(results: &mut Vec<T>, limit: &SmartLimit) {
     // Sort by the selected criteria.
@@ -766,6 +855,26 @@ fn apply_limit<T: SmartTrack>(results: &mut Vec<T>, limit: &SmartLimit) {
                 compare_optional_i64_null_last(
                     valid_last_played_ms(left),
                     valid_last_played_ms(right),
+                    SortDirection::Ascending,
+                )
+                .then_with(|| left.track_id().cmp(right.track_id()))
+            });
+        }
+        LimitSort::HighestRated => {
+            results.sort_by(|left, right| {
+                compare_optional_i64_null_last(
+                    rating_value(left).map(i64::from),
+                    rating_value(right).map(i64::from),
+                    SortDirection::Descending,
+                )
+                .then_with(|| left.track_id().cmp(right.track_id()))
+            });
+        }
+        LimitSort::LowestRated => {
+            results.sort_by(|left, right| {
+                compare_optional_i64_null_last(
+                    rating_value(left).map(i64::from),
+                    rating_value(right).map(i64::from),
                     SortDirection::Ascending,
                 )
                 .then_with(|| left.track_id().cmp(right.track_id()))
@@ -860,6 +969,7 @@ mod tests {
         format: String,
         play_count: i32,
         last_played_at_ms: Option<i64>,
+        rating: TrackRating,
         date_added: String,
         date_modified: String,
         file_size_bytes: Option<i64>,
@@ -883,6 +993,7 @@ mod tests {
                 format: String::new(),
                 play_count: 0,
                 last_played_at_ms: None,
+                rating: TrackRating::writable(None),
                 date_added: "2025-01-01T00:00:00Z".to_string(),
                 date_modified: "2025-01-01T00:00:00Z".to_string(),
                 file_size_bytes: None,
@@ -938,6 +1049,9 @@ mod tests {
         }
         fn last_played_at_ms(&self) -> Option<i64> {
             self.last_played_at_ms
+        }
+        fn rating(&self) -> TrackRating {
+            self.rating
         }
         fn date_added(&self) -> &str {
             &self.date_added
@@ -1141,6 +1255,128 @@ mod tests {
             &RuleOperator::InRange,
             &RuleValue::NumberRange(1990, 2010)
         ));
+    }
+
+    // ── Rating operator tests ──────────────────────────────────────
+
+    fn rating(value: u8) -> Rating {
+        Rating::new(value).expect("canonical test rating")
+    }
+
+    #[test]
+    fn rating_numeric_predicates_require_a_readable_value_and_canonical_operand() {
+        let rated = TrackRating::read_only(Some(rating(75)));
+        assert!(eval_rating(
+            rated,
+            &RuleOperator::Is,
+            &RuleValue::Number(75)
+        ));
+        assert!(eval_rating(
+            rated,
+            &RuleOperator::IsNot,
+            &RuleValue::Number(50)
+        ));
+        assert!(eval_rating(
+            rated,
+            &RuleOperator::GreaterThan,
+            &RuleValue::Number(74)
+        ));
+        assert!(eval_rating(
+            rated,
+            &RuleOperator::InRange,
+            &RuleValue::NumberRange(75, 100)
+        ));
+
+        for invalid in [0, 101, i64::MIN, i64::MAX] {
+            assert!(!eval_rating(
+                rated,
+                &RuleOperator::IsNot,
+                &RuleValue::Number(invalid)
+            ));
+        }
+        for invalid_range in [
+            RuleValue::NumberRange(0, 75),
+            RuleValue::NumberRange(75, 101),
+            RuleValue::NumberRange(90, 10),
+        ] {
+            assert!(!eval_rating(rated, &RuleOperator::InRange, &invalid_range));
+        }
+
+        for absent in [
+            TrackRating::writable(None),
+            TrackRating::read_only(None),
+            TrackRating::unsupported(),
+        ] {
+            assert!(!eval_rating(
+                absent,
+                &RuleOperator::IsNot,
+                &RuleValue::Number(50)
+            ));
+        }
+    }
+
+    #[test]
+    fn rating_presence_predicates_distinguish_unrated_from_unsupported() {
+        for rated in [
+            TrackRating::writable(Some(rating(1))),
+            TrackRating::read_only(Some(rating(100))),
+        ] {
+            assert!(eval_rating(
+                rated,
+                &RuleOperator::IsRated,
+                &RuleValue::Number(1)
+            ));
+            assert!(!eval_rating(
+                rated,
+                &RuleOperator::IsUnrated,
+                &RuleValue::Number(1)
+            ));
+        }
+
+        for unrated in [TrackRating::writable(None), TrackRating::read_only(None)] {
+            assert!(!eval_rating(
+                unrated,
+                &RuleOperator::IsRated,
+                &RuleValue::Number(1)
+            ));
+            assert!(eval_rating(
+                unrated,
+                &RuleOperator::IsUnrated,
+                &RuleValue::Number(1)
+            ));
+        }
+
+        for operator in [RuleOperator::IsRated, RuleOperator::IsUnrated] {
+            assert!(!eval_rating(
+                TrackRating::unsupported(),
+                &operator,
+                &RuleValue::Number(1)
+            ));
+        }
+    }
+
+    #[test]
+    fn rating_presence_predicates_require_the_canonical_inert_placeholder() {
+        for (operator, matching_rating) in [
+            (
+                RuleOperator::IsRated,
+                TrackRating::writable(Some(rating(50))),
+            ),
+            (RuleOperator::IsUnrated, TrackRating::read_only(None)),
+        ] {
+            for malformed in [
+                RuleValue::Number(0),
+                RuleValue::Number(2),
+                RuleValue::Number(100),
+                RuleValue::Text("1".into()),
+                RuleValue::NumberRange(1, 1),
+            ] {
+                assert!(
+                    !eval_rating(matching_rating, &operator, &malformed),
+                    "{operator:?} accepted malformed placeholder {malformed:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1716,6 +1952,87 @@ mod tests {
             };
             let result = evaluate(&rules, &tracks);
             let actual: Vec<_> = result.iter().map(SmartTrack::track_id).collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn rating_compound_sort_is_null_last_in_both_directions_with_stable_id_ties() {
+        let mut tied_b = TestTrack::new("tied b", "Artist", "Album");
+        tied_b.id = "b".into();
+        tied_b.rating = TrackRating::read_only(Some(rating(80)));
+        let mut tied_a = TestTrack::new("tied a", "Artist", "Album");
+        tied_a.id = "a".into();
+        tied_a.rating = TrackRating::writable(Some(rating(80)));
+        let mut low = TestTrack::new("low", "Artist", "Album");
+        low.id = "low".into();
+        low.rating = TrackRating::writable(Some(rating(20)));
+        let mut unrated = TestTrack::new("unrated", "Artist", "Album");
+        unrated.id = "unrated".into();
+        let mut unsupported = TestTrack::new("unsupported", "Artist", "Album");
+        unsupported.id = "unsupported".into();
+        unsupported.rating = TrackRating::unsupported();
+        let tracks = [unrated, tied_b, unsupported, low, tied_a];
+
+        for (direction, expected) in [
+            (
+                SortDirection::Ascending,
+                ["low", "a", "b", "unrated", "unsupported"],
+            ),
+            (
+                SortDirection::Descending,
+                ["a", "b", "low", "unrated", "unsupported"],
+            ),
+        ] {
+            let rules = SmartRules {
+                match_mode: MatchMode::All,
+                rules: vec![],
+                limit: None,
+                sort_order: vec![SortCriterion {
+                    field: SortField::Rating,
+                    direction,
+                }],
+            };
+            let actual: Vec<_> = evaluate(&rules, &tracks)
+                .iter()
+                .map(|track| track.track_id().to_string())
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn rating_limit_selection_uses_ratings_for_membership_and_stable_id_ties() {
+        let mut tied_b = TestTrack::new("tied b", "Artist", "Album");
+        tied_b.id = "b".into();
+        tied_b.rating = TrackRating::writable(Some(rating(80)));
+        let mut tied_a = TestTrack::new("tied a", "Artist", "Album");
+        tied_a.id = "a".into();
+        tied_a.rating = TrackRating::writable(Some(rating(80)));
+        let mut low = TestTrack::new("low", "Artist", "Album");
+        low.id = "low".into();
+        low.rating = TrackRating::writable(Some(rating(20)));
+        let unrated = TestTrack::new("unrated", "Artist", "Album");
+        let tracks = [unrated, tied_b, low, tied_a];
+
+        for (selected_by, expected) in [
+            (LimitSort::HighestRated, ["a", "b"]),
+            (LimitSort::LowestRated, ["low", "a"]),
+        ] {
+            let rules = SmartRules {
+                match_mode: MatchMode::All,
+                rules: vec![],
+                limit: Some(SmartLimit {
+                    value: 2,
+                    unit: LimitUnit::Items,
+                    selected_by,
+                }),
+                sort_order: Vec::new(),
+            };
+            let actual: Vec<_> = evaluate(&rules, &tracks)
+                .iter()
+                .map(|track| track.track_id().to_string())
+                .collect();
             assert_eq!(actual, expected);
         }
     }

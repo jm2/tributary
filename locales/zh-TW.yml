@@ -62,9 +62,26 @@ columns:
   bitrate: "位元率"
   sample_rate: "取樣率"
   plays: "播放次數"
+  rating: "評分"
   format: "格式"
   country: "國家"
   state_province: "縣市"
+
+# ── Track ratings ─────────────────────────────────────────────
+ratings:
+  unrated: "未評分"
+  read_only_value: "%{value}（唯讀）"
+  read_only_unrated: "未評分（唯讀）"
+  unavailable: "無法使用"
+  edit_value: "評分 %{value}。啟用即可編輯，範圍為 1 到 100。"
+  edit_unrated: "未評分。啟用即可設定 1 到 100 的評分。"
+  input_label: "1 到 100 的評分"
+  apply: "套用評分"
+  clear: "清除評分"
+  update_failed: "無法更新曲目評分。"
+  rule_not_integer: "請輸入 1 到 100 之間的整數評分。"
+  rule_out_of_range: "評分值必須介於 1 到 100 之間。"
+  rule_reversed_range: "第一個評分不得高於第二個評分。"
 
 # ── Preferences ────────────────────────────────────────────────────
 preferences:

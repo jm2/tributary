@@ -1313,10 +1313,17 @@ pub fn build_window(
         playlist_action_rx,
     ) = sidebar::build_sidebar(&sources);
 
+    // Commands are queued synchronously on the GTK thread. Playback and
+    // rating producers share one unbounded FIFO so admitted mutations cannot
+    // silently wait behind detached tasks. A terminal marker below makes
+    // normal shutdown wait for every earlier admitted command to finish.
+    let (library_commands, library_command_rx) =
+        super::library_commands::LibraryCommandAdmission::channel();
+
     // ── Tracklist (starts empty — populated by FullSync) ──────────────
     let empty_tracks: Vec<TrackObject> = Vec::new();
     let (tracklist_widget, track_store, status_label, column_view, sort_model) =
-        tracklist::build_tracklist(&empty_tracks);
+        tracklist::build_tracklist(&empty_tracks, library_commands.clone());
 
     // ── Shared playback state ────────────────────────────────────────
     let master_tracks: Rc<RefCell<Vec<TrackObject>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1490,14 +1497,6 @@ pub fn build_window(
     if saved_geo.is_some_and(|g| g.is_maximized) {
         window.maximize();
     }
-
-    // Commands are queued synchronously on the GTK thread. Playback decisions
-    // are already rate-limited by real occurrences, and an unbounded FIFO
-    // avoids detached tasks silently waiting behind a busy initial scan. A
-    // terminal marker below makes normal shutdown wait for every earlier
-    // admitted history/root-trust command to finish.
-    let (library_commands, library_command_rx) =
-        super::library_commands::LibraryCommandAdmission::channel();
 
     // Save geometry, retire playback, close the source lifecycle gate, and
     // drain local-library mutations before allowing the window to disappear.
@@ -3027,9 +3026,9 @@ fn refresh_active_playlist_uris(
 
 /// Replace one already-known local row by exact stable identity.
 ///
-/// Playback-history events are updates, never discovery. Refusing to append a
-/// missing row prevents a delayed committed event from resurrecting a track
-/// that a newer library event already removed. URI equality is deliberately
+/// Committed metadata events are updates, never discovery. Refusing to append
+/// a missing row prevents a delayed event from resurrecting a track that a
+/// newer library event already removed. URI equality is deliberately
 /// irrelevant: paths can move, and a remote source can expose the same URI.
 fn replace_existing_local_track(rows: &mut [TrackObject], replacement: &TrackObject) -> bool {
     let track_id = replacement.track_id();
@@ -3045,10 +3044,10 @@ fn replace_existing_local_track(rows: &mut [TrackObject], replacement: &TrackObj
 
 /// Retire every cached playlist projection and reload the active one.
 ///
-/// A playback-history commit can change smart-playlist membership and order,
-/// while ordinary playlists still need their displayed Plays value refreshed.
-/// Invalidating the navigation generation before clearing rows prevents a late
-/// pre-commit query from publishing stale projections again.
+/// A playback-history or rating commit can change smart-playlist membership
+/// and order, while ordinary playlists still need refreshed displayed values.
+/// Invalidating the navigation generation before clearing rows prevents a
+/// late pre-commit query from publishing stale projections again.
 #[allow(clippy::too_many_arguments)]
 fn invalidate_playlist_projections(
     rt_handle: &tokio::runtime::Handle,
@@ -3367,7 +3366,8 @@ fn setup_library_events(
                     scan_spinner.set_visible(false);
                 }
 
-                LibraryEvent::PlaybackHistoryUpdated(track) => {
+                LibraryEvent::PlaybackHistoryUpdated(track)
+                | LibraryEvent::TrackRatingUpdated(track) => {
                     let replacement = arch_track_to_object(&track);
                     let track_id = replacement.track_id();
                     let local_updated = {
@@ -3380,7 +3380,8 @@ fn setup_library_events(
                     if local_updated && *active_source_key.borrow() == "local" {
                         // Reinsert at the same base-model position. Gtk's sort
                         // model sees an item change and can immediately reorder
-                        // a Plays-sorted view without rebuilding unrelated rows.
+                        // a Plays- or Rating-sorted view without rebuilding
+                        // unrelated rows.
                         for index in 0..track_store.n_items() {
                             let Some(existing) =
                                 track_store.item(index).and_downcast::<TrackObject>()
@@ -3411,6 +3412,11 @@ fn setup_library_events(
                         &status_label,
                         &column_view,
                     );
+                }
+
+                LibraryEvent::TrackRatingUpdateFailed { track_id } => {
+                    warn!(?track_id, "Local track rating update failed");
+                    status_label.set_text(rust_i18n::t!("ratings.update_failed").as_ref());
                 }
 
                 LibraryEvent::PlaylistProjectionsInvalidated => {
@@ -3849,6 +3855,8 @@ fn track_to_object(
         obj.set_cover_art_url(artwork_reference);
     }
 
+    obj.set_rating(t.rating);
+
     // Propagate album artist for browser grouping.
     if let Some(ref aa) = t.album_artist_name {
         obj.set_album_artist(aa);
@@ -3980,7 +3988,10 @@ pub fn remove_empty_category_header(store: &gtk::gio::ListStore, category: &str)
 #[cfg(test)]
 mod identity_tests {
     use super::*;
-    use crate::architecture::SourceId;
+    use crate::architecture::{
+        models::{Rating, Track, TrackRating},
+        SourceId,
+    };
 
     fn local_history_row(track_id: &str, uri: &str, play_count: u32) -> TrackObject {
         let row = TrackObject::new(
@@ -4004,23 +4015,71 @@ mod identity_tests {
     }
 
     #[test]
-    fn playback_history_replaces_only_the_exact_existing_local_identity() {
+    fn architecture_track_projection_preserves_the_exact_rating_state() {
+        let rating = TrackRating::read_only(Some(Rating::new(73).unwrap()));
+        let track = Track {
+            id: uuid::Uuid::nil(),
+            native_track_id: Some(crate::architecture::TrackId::new("rating-track").unwrap()),
+            title: "Title".to_string(),
+            artist_name: "Artist".to_string(),
+            album_artist_name: None,
+            artist_id: None,
+            album_title: "Album".to_string(),
+            album_id: None,
+            track_number: Some(1),
+            disc_number: Some(1),
+            duration_secs: Some(180),
+            composer: None,
+            genre: None,
+            year: None,
+            file_path: None,
+            stream_url: None,
+            cover_art_url: None,
+            date_added: None,
+            date_modified: None,
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            format: None,
+            play_count: None,
+            rating,
+            last_played: None,
+        };
+
+        let row = arch_remote_track_to_object(&track, 9);
+        assert_eq!(row.track_id(), "rating-track");
+        assert_eq!(row.rating(), rating);
+        assert_eq!(row.source_session_epoch(), Some(9));
+    }
+
+    #[test]
+    fn committed_metadata_replaces_only_the_exact_existing_local_identity() {
         let original = local_history_row("track-a", "file:///old/a.flac", 2);
         let unrelated = local_history_row("track-b", "file:///music/b.flac", 7);
+        original.set_rating(TrackRating::writable(None));
+        unrelated.set_rating(TrackRating::writable(Some(Rating::new(90).unwrap())));
         let mut rows = vec![original, unrelated.clone()];
         let replacement = local_history_row("track-a", "file:///new/a.flac", 3);
+        replacement.set_rating(TrackRating::writable(Some(Rating::new(73).unwrap())));
 
         assert!(replace_existing_local_track(&mut rows, &replacement));
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].track_id(), "track-a");
         assert_eq!(rows[0].uri(), "file:///new/a.flac");
         assert_eq!(rows[0].play_count(), 3);
+        assert_eq!(
+            rows[0].rating(),
+            TrackRating::writable(Some(Rating::new(73).unwrap()))
+        );
         assert_eq!(rows[1].track_id(), unrelated.track_id());
         assert_eq!(rows[1].play_count(), 7);
+        assert_eq!(
+            rows[1].rating(),
+            TrackRating::writable(Some(Rating::new(90).unwrap()))
+        );
     }
 
     #[test]
-    fn playback_history_never_uri_matches_or_appends_a_missing_row() {
+    fn committed_metadata_never_uri_matches_or_appends_a_missing_row() {
         let retained = local_history_row("track-a", "file:///music/shared.flac", 2);
         let mut rows = vec![retained.clone()];
 

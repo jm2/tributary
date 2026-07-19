@@ -1,10 +1,12 @@
-//! GTK-thread admission gate for serialized history and root-trust commands.
+//! GTK-thread admission gate for serialized history, rating, and root-trust
+//! commands.
 //!
 //! Every producer of the admitted [`LibraryCommand`] variants shares this
 //! boundary. Normal shutdown closes admission and appends one terminal FIFO
-//! marker in the same synchronous operation, so no history or root-trust
-//! command can be queued behind that marker. Playlist CRUD and filesystem-
-//! watcher mutations use separate boundaries and are not covered here.
+//! marker in the same synchronous operation, so no history, rating, or
+//! root-trust command can be queued behind that marker. Playlist CRUD and
+//! filesystem-watcher mutations use separate boundaries and are not covered
+//! here.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -65,7 +67,7 @@ impl LibraryCommandAdmission {
 
 #[cfg(test)]
 mod tests {
-    use crate::architecture::TrackId;
+    use crate::architecture::{models::Rating, TrackId};
 
     use super::*;
 
@@ -76,15 +78,24 @@ mod tests {
         }
     }
 
+    fn rating_command(id: &str, rating: Option<u8>) -> LibraryCommand {
+        LibraryCommand::SetTrackRating {
+            track_id: TrackId::new(id).expect("valid rating test ID"),
+            rating: rating.map(|value| Rating::new(value).expect("valid test rating")),
+        }
+    }
+
     #[test]
     fn close_rejects_post_marker_work_while_flush_is_pending() {
         let (admission, rx) = LibraryCommandAdmission::channel();
-        assert!(admission.try_send(history_command("before-close", 1)));
+        assert!(admission.try_send(rating_command("rating-before-close", Some(72))));
+        assert!(admission.try_send(history_command("history-before-close", 1)));
 
         let (completion_tx, completion_rx) = async_channel::bounded(1);
         assert!(admission.close_and_flush(completion_tx));
         assert!(!admission.is_open());
-        assert!(!admission.try_send(history_command("after-close", 2)));
+        assert!(!admission.try_send(rating_command("rating-after-close", None)));
+        assert!(!admission.try_send(history_command("history-after-close", 2)));
         assert!(matches!(
             completion_rx.try_recv(),
             Err(async_channel::TryRecvError::Empty)
@@ -92,8 +103,14 @@ mod tests {
 
         assert!(matches!(
             rx.try_recv(),
+            Ok(LibraryCommand::SetTrackRating { track_id, rating })
+                if track_id.as_str() == "rating-before-close"
+                    && rating == Some(Rating::new(72).unwrap())
+        ));
+        assert!(matches!(
+            rx.try_recv(),
             Ok(LibraryCommand::RecordPlaybackHistory { track_id, counted_at_ms: 1 })
-                if track_id.as_str() == "before-close"
+                if track_id.as_str() == "history-before-close"
         ));
         let completion = match rx.try_recv() {
             Ok(LibraryCommand::Flush { completion }) => completion,
@@ -104,7 +121,8 @@ mod tests {
             Err(async_channel::TryRecvError::Empty)
         ));
         assert!(!admission.close_and_flush(async_channel::bounded(1).0));
-        assert!(!admission.try_send(history_command("still-closed", 3)));
+        assert!(!admission.try_send(rating_command("rating-still-closed", Some(50))));
+        assert!(!admission.try_send(history_command("history-still-closed", 3)));
         assert!(matches!(
             rx.try_recv(),
             Err(async_channel::TryRecvError::Empty)

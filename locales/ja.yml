@@ -62,9 +62,26 @@ columns:
   bitrate: "ビットレート"
   sample_rate: "サンプルレート"
   plays: "再生回数"
+  rating: "評価"
   format: "形式"
   country: "国"
   state_province: "都道府県"
+
+# ── Track ratings ─────────────────────────────────────────────
+ratings:
+  unrated: "未評価"
+  read_only_value: "%{value}（読み取り専用）"
+  read_only_unrated: "未評価（読み取り専用）"
+  unavailable: "利用できません"
+  edit_value: "評価 %{value}。操作すると、1～100の範囲で編集できます。"
+  edit_unrated: "未評価。操作すると、1～100の範囲で評価を設定できます。"
+  input_label: "1～100の評価"
+  apply: "評価を適用"
+  clear: "評価をクリア"
+  update_failed: "トラックの評価を更新できませんでした。"
+  rule_not_integer: "1から100までの整数で評価を入力してください。"
+  rule_out_of_range: "評価は1から100までの値にしてください。"
+  rule_reversed_range: "最初の評価は2番目の評価以下にしてください。"
 
 # ── Preferences ────────────────────────────────────────────────────
 preferences:

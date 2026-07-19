@@ -62,9 +62,26 @@ columns:
   bitrate: "Bitrate"
   sample_rate: "Abtastrate"
   plays: "Wiedergaben"
+  rating: "Bewertung"
   format: "Format"
   country: "Land"
   state_province: "Bundesland"
+
+# ── Track ratings ─────────────────────────────────────────────
+ratings:
+  unrated: "Nicht bewertet"
+  read_only_value: "%{value} (schreibgeschützt)"
+  read_only_unrated: "Nicht bewertet (schreibgeschützt)"
+  unavailable: "Nicht verfügbar"
+  edit_value: "Bewertung %{value}. Aktivieren, um die Bewertung auf einen Wert von 1 bis 100 zu ändern."
+  edit_unrated: "Nicht bewertet. Aktivieren, um eine Bewertung von 1 bis 100 festzulegen."
+  input_label: "Bewertung von 1 bis 100"
+  apply: "Bewertung übernehmen"
+  clear: "Bewertung löschen"
+  update_failed: "Die Titelbewertung konnte nicht aktualisiert werden."
+  rule_not_integer: "Geben Sie eine ganzzahlige Bewertung von 1 bis 100 ein."
+  rule_out_of_range: "Bewertungen müssen zwischen 1 und 100 liegen."
+  rule_reversed_range: "Die erste Bewertung darf die zweite nicht überschreiten."
 
 # ── Preferences ────────────────────────────────────────────────────
 preferences:

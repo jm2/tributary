@@ -6,11 +6,11 @@ This document explains the product and engineering work that remains **after** t
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
 remediation record is preserved separately in
 [`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **220/223 (98.7%)**, with only three
-real-environment validation records left. The feature backlog is now **6/35 (17.1%)** complete. Neither
+real-environment validation records left. The feature backlog is now **7/35 (20.0%)** complete. Neither
 percentage estimates equal engineering effort, and the historical percentage is not a claim that
 Tributary has implemented every requested product feature.
 
-The entries below are candidates, not release promises. As of this audit, all 11 open GitHub
+The entries below are candidates, not release promises. As of this audit, all 10 remaining open GitHub
 issues are unlabeled, unassigned, have no milestone, and have no discussion establishing product
 priority. An issue should receive acceptance criteria, dependencies, and a milestone before work
 starts. Historical holistic-review documents are point-in-time findings, not active roadmaps.
@@ -53,14 +53,17 @@ starts. Historical holistic-review documents are point-in-time findings, not act
   untouched v0.5.0 defaults and their immediate no-field successors; user-owned variants remain
   unchanged. Last Played editor fields, Most/Least Recently Played limits, and Days/Weeks/Months
   relative units round-trip losslessly.
-- The [rating foundation](ratings.md) defines one canonical whole integer from 1 through 100 with
-  `None` as unrated. Tributary owns nullable ratings only for local SQLite tracks; migration 12
-  leaves legacy rows unrated, local metadata refresh preserves values, and exact-ID set/clear is
-  transactional. Subsonic's valid 1–5 `userRating` and Jellyfin/Plex's valid finite 0–10 user
-  ratings propagate read-only through explicit capability states. DAAP, radio, removable, external,
-  and unknown sources remain unsupported, all remote writes fail closed, and catalogue admission
-  rejects source/track capability drift. The visible accessible editor, column, sorting, and smart
-  rules remain the next P1.4 record.
+- The complete [rating contract](ratings.md) defines one canonical whole integer from 1 through 100
+  with `None` as unrated. Tributary owns nullable ratings only for local SQLite tracks; migration 12
+  leaves legacy rows unrated, metadata refresh preserves values, and exact-ID set/clear is
+  serialized, transactional, committed-only, and live in local or playlist views. The visible
+  Rating column supports keyboard editing for writable local rows and explicitly labels read-only
+  values/unrated state or unsupported rows; Radio-Browser keeps its compact station-only column
+  set and omits Rating. Subsonic's valid 1–5 `userRating` and Jellyfin/Plex's
+  valid finite 0–10 ratings propagate read-only; DAAP, radio, removable, external, and unknown
+  sources remain unsupported. Both column and smart-playlist rating sorts keep missing values last
+  in either direction with deterministic ties. Smart filters provide validated 1–100 numeric/range
+  predicates and capability-aware Is Rated/Is Unrated behavior, plus Highest/Lowest Rated limits.
 
 ## Proposed implementation order
 
@@ -103,11 +106,11 @@ before starting large protocol or transfer subsystems.
    Renamed, edited, reformatted, or otherwise divergent playlists remain byte-for-byte user-owned.
    The editor exposes Last Played filtering/sorting and Most/Least Recently Played limits while
    preserving relative-rule amounts and Days/Weeks/Months units across reopen/save.
-4. **In progress: add ratings ([#37]).** The [ownership and capability contract](ratings.md),
-   migration, model/backend propagation, transactional local persistence, validated read-only
-   Subsonic/Jellyfin/Plex conversion, and rating-neutral XSPF boundary are complete. Next add the
-   accessible editor and column, sorting, smart-playlist rules, live local refresh, and explicit
-   read-only/unsupported presentation.
+4. **Completed: add ratings ([#37]).** The [rating contract](ratings.md), migration,
+   model/backend propagation, transactional exact-local-ID persistence, validated read-only
+   Subsonic/Jellyfin/Plex conversion, rating-neutral XSPF boundary, accessible capability-aware
+   column/editor, committed live refresh, deterministic null-last sorting, and validated smart
+   filters/sorts/limits are complete.
 
 These foundations make Rhythmbox migration and Last.fm behavior much less ambiguous.
 
@@ -167,19 +170,18 @@ These foundations make Rhythmbox migration and Last.fm behavior much less ambigu
 
 ## Live open issues
 
-This is a snapshot of the open issue set on 2026-07-18. GitHub remains authoritative for whether an
+This is a snapshot of the remaining open issue set on 2026-07-19. GitHub remains authoritative for whether an
 issue is open; this table records the implementation assessment so a feature request is not
 mistaken for work already underway.
 
 | Issue | Current implementation state | Likely implementation shape |
 |---|---|---|
-| [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus playback-history and local-rating storage are foundations; XSPF deliberately transfers neither history nor ratings. | Complete rating UI/rules, then build a separate transactional, idempotent migration with explicit metadata consent and conflict reporting. |
+| [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus completed playback-history and rating contracts are foundations; XSPF deliberately transfers neither history nor ratings. | Build a separate transactional, idempotent migration with explicit metadata consent and conflict reporting. |
 | [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | No Last.fm client or scrobble pipeline. | Authorization, secret storage, authoritative thresholds, retry/offline queue, and privacy UX. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
 | [#47 — Remote/Subsonic tracks in playlists](https://github.com/jm2/tributary/issues/47) | Non-local Add to Playlist attempts are now refused visibly and atomically; durable remote entries and server-native playlist sync are not implemented. | Source-scoped playlist schema/resolution first; server playlist sync separately. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |
-| [#37 — Rating column](https://github.com/jm2/tributary/issues/37) | Canonical model, local schema/persistence, source capabilities, validated read-only remote propagation, and interchange policy are complete; no visible column/editor or rating smart rules yet. | Add accessible local editing and display, sorting/rules, live refresh, and explicit read-only/unsupported states. |
 | [#29 — UI refinement](https://github.com/jm2/tributary/issues/29) | Requested separators/alignment changes are not implemented. | Split into independently reviewable visual changes after current-theme design review. |
 | [#14 — Browse by folder](https://github.com/jm2/tributary/issues/14) | Browser panes expose Genre, Artist, and Album only. | Root-relative folder model and lazy UI with multiple-root and unavailable-root semantics. |
 | [#11 — Offline cache/download](https://github.com/jm2/tributary/issues/11) | No remote download or offline catalogue subsystem. | Large persistent cache/download epic with quota, retry, reconciliation, and secure auth handling. |
