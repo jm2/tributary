@@ -1,6 +1,6 @@
 # Tributary active implementation backlog
 
-Last audited: 2026-07-18
+Last audited: 2026-07-19
 
 This is the executable backlog for feature fixes and additions. It replaces the completed
 holistic-review tracker, which is preserved as
@@ -21,21 +21,21 @@ state.
 - Do not treat the order below as a release promise. It is a dependency-aware starting order and
   can change as issues receive product decisions and milestones.
 
-Current status: **5/35 (14.3%)** active implementation records complete. This percentage measures
+Current status: **6/35 (17.1%)** active implementation records complete. This percentage measures
 checklist completion, not equal engineering effort: several P3 records are deliberately large
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
 ## Current focus
 
-P1.1, P1.2, and all three P1.3 playback-history records are complete. Continue with P1.4: decide
-rating ownership and capability semantics before adding storage, propagation, editing, display,
-sorting, and smart-playlist rules. The rest of P1 builds on the source-scoped identity already
+P1.1, P1.2, all three P1.3 playback-history records, and the P1.4 rating foundation are complete.
+Continue with P1.4's accessible local editing, display, sorting, and smart-playlist rules, including
+honest read-only and unsupported source states. The rest of P1 builds on the source-scoped identity already
 present in the runtime, the now-bounded shuffle navigation semantics, an honest local-only playlist
 interaction boundary, and authoritative local playback history with deterministic live consumers.
 
 The independent Linux watcher correctness fix tracked in
-[#103](https://github.com/jm2/tributary/pull/103) does not change the **5/35** feature total.
+[#103](https://github.com/jm2/tributary/pull/103) does not change the **6/35** feature total.
 The salvaged scope rejects explicitly classified access/access-time noise before the bounded watcher
 queue without filtering real bootstrap mutations or backend errors, while retaining overflow
 evidence for authoritative reconciliation. It intentionally omits the original persistent
@@ -160,14 +160,28 @@ the 35-record feature backlog.
 
 ### P1.4 — Add ratings as a real library field
 
-- [ ] Decide rating ownership and capability semantics, then add the database migration, model,
+- [x] Decide rating ownership and capability semantics, then add the database migration, model,
   backend propagation, import/export representation, and safe legacy defaults
-  ([#37](https://github.com/jm2/tributary/issues/37)).
+  ([#37](https://github.com/jm2/tributary/issues/37); implementation PR pending publication).
 - [ ] Add accessible editing, display, sorting, and smart-playlist rules, with explicit behavior for
   read-only or rating-incapable sources.
 
-  Decide explicitly whether ratings are Tributary-local, written to embedded tags, synchronized to
-  capable servers, or a supported combination before implementing the schema.
+  Implemented foundation: [`ratings.md`](ratings.md) defines a canonical whole integer from 1
+  through 100, with `None` as unrated, and one coherent Writable, ReadOnly, or Unsupported state per
+  track. Tributary owns and transactionally writes ratings only for exact local-library IDs in
+  SQLite; migration 12 leaves every legacy row `NULL`, enforces integer/range storage, validates
+  interrupted upgrades, and supports down/up retry. Existing-row metadata refreshes and recognized
+  paired watcher file/directory renames preserve ratings; an offline or otherwise unrecognized
+  remove-plus-add becomes a new unrated row. Embedded tags are neither read nor written for this
+  field.
+
+  Subsonic's valid integer 1–5 `userRating` maps read-only to 20-point increments. Jellyfin and Plex
+  accept only finite native user ratings in 0–10, round the tenfold value, and preserve native zero
+  as canonical 1; malformed or absent values are read-only unrated. DAAP, radio, removable,
+  external, and unknown sources are Unsupported, all remote mutations fail closed, and catalogue
+  admission rejects per-track/source capability disagreement. XSPF v1 intentionally emits no
+  rating and ignores rating-like metadata on import; playlist matching never mutates library
+  ratings. A future metadata transfer requires separate opt-in conflict handling.
 
 ### P1.5 — Persist source-scoped playlists
 
@@ -293,4 +307,5 @@ the 35-record feature backlog.
 | 2026-07-18 | P1.3 playback-history contract and schema | [#134](https://github.com/jm2/tributary/pull/134) | Defined occurrence, threshold, duration, seek/retry/restart, clock, and legacy contracts; added migration 10 plus safe model conversion and a pure one-shot progress state. Production event writes and smart-playlist consumers were tracked as follow-on records. |
 | 2026-07-18 | P1.3 authoritative playback-history persistence | [#135](https://github.com/jm2/tributary/pull/135), [#136](https://github.com/jm2/tributary/pull/136) | Bound one progress latch to each exact local queue occurrence independently of output generations; rejected/stale/retry events cannot double count, paused polls stay inert, Repeat One rolls back only its tentative occurrence before generation handoff, and other discontinuities re-anchor. Added a shared shutdown admission gate plus FIFO drain, atomic stable-ID count/timestamp persistence with legacy-negative repair, post-commit Plays refresh and playlist-projection invalidation, plus generation-scoped AirPlay position evidence. Seeded history consumers were completed in the following record. |
 | 2026-07-18 | P1.3 deterministic history smart playlists | [#137](https://github.com/jm2/tributary/pull/137) | Made Recently Played and Top 25 deterministic over authoritative history, including intentional empty states, stable ordering and Top 25 membership, committed-event live refresh, exact untouched-default migration from both released historical signatures, and lossless editor round trips for Last Played fields, limits, and relative units. This completed P1.3. |
+| 2026-07-19 | P1.4 rating ownership and persistence foundation | Pending publication | Defined the canonical 1–100 value and coherent Writable/ReadOnly/Unsupported capabilities; added constrained nullable migration 12, transactional exact-local-ID set/clear, scan preservation, validated read-only Subsonic/Jellyfin/Plex conversion, fail-closed catalogue invariants and remote writes, and an explicit rating-neutral XSPF/import policy. Accessible editing, display, sorting, and smart rules remain the next P1.4 record. |
 | 2026-07-18 | Linux watcher feedback-loop fix | [#103](https://github.com/jm2/tributary/pull/103) | Narrowed the external proposal to filter self-generated access events before queue admission without filtering genuine startup events or backend errors; bounded overflow still drives authoritative reconciliation. Persistent negative parse caching is deliberately excluded so failures remain retryable; this separate correctness fix does not advance the feature numerator. |

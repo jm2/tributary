@@ -62,7 +62,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Playlist import/export (XSPF) | ✅ |
 | Durable local playback history | ✅ Exact accepted local occurrences persist a saturating play count and monotonic last-played timestamp, with live Plays refresh ([contract](docs/playback-history.md)) |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ Recently Played and Top 25 use deterministic authoritative history, safe untouched-default migration, and live projection refresh ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
-| Track ratings | ❌ Planned ([#37](https://github.com/jm2/tributary/issues/37)) |
+| Track ratings | ⚠️ Storage, ownership, and source capabilities implemented; accessible editing, display, sorting, and smart rules remain ([contract](docs/ratings.md), [#37](https://github.com/jm2/tributary/issues/37)) |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
 | Linux and macOS file associations | ✅ |
@@ -672,6 +672,11 @@ an error leaves an existing export unchanged. XML 1.0-forbidden control characte
 before the temporary file or destination is touched. A corrupt negative stored duration or one
 outside Tributary's supported `u64` millisecond range is omitted rather than blocking the otherwise
 valid playlist, because XSPF duration is optional.
+
+Ratings are deliberately outside this playlist interchange. XSPF v1 has no standard rating field,
+so export emits none; import treats rating-like `<meta>` and extension content as inert and never
+changes a matched local track's app-owned rating. See the [rating contract](docs/ratings.md) for the
+ownership and future opt-in metadata-transfer boundary.
 
 Import requires a valid leading XML 1.0 declaration when one is present, `version="1"`, and the
 canonical XSPF namespace, expressed either as the default namespace or through a prefix. It

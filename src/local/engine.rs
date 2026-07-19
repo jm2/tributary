@@ -25,7 +25,10 @@ use walkdir::WalkDir;
 use super::root_authority::{AbsenceProof, BoundDirectory, BoundFile, RootAuthorityLease};
 use super::tag_parser::{self, ParsedTrack};
 use super::tag_writer;
-use crate::architecture::{models::Track, TrackId};
+use crate::architecture::{
+    models::{Rating, Track, TrackRating},
+    TrackId,
+};
 use crate::db::entities::{library_root, playlist_entry, root_reauthorization_receipt, track};
 
 /// Frozen namespace for projecting a legacy non-UUID SQLite track key into
@@ -5926,6 +5929,7 @@ where
             format: Set(Some(parsed.format.clone())),
             play_count: Set(0),
             last_played_at_ms: Set(None),
+            rating: Set(None),
             date_added: Set(now),
             date_modified: Set(mtime),
             file_size_bytes: Set(parsed.file_size_bytes.map(|s| s as i64)),
@@ -6327,6 +6331,7 @@ pub fn db_model_to_track(model: &track::Model) -> Track {
         // Legacy/corrupt negative counts must never wrap into enormous UI
         // values while the repair migration is pending or being inspected.
         play_count: Some(u32::try_from(model.play_count).unwrap_or_default()),
+        rating: TrackRating::writable(model.rating.and_then(|value| Rating::try_from(value).ok())),
         last_played: model
             .last_played_at_ms
             .and_then(chrono::DateTime::<Utc>::from_timestamp_millis),
@@ -7633,6 +7638,7 @@ mod tests {
             format: Some("FLAC".to_string()),
             play_count,
             last_played_at_ms: Some(1_748_776_400_123),
+            rating: Some(88),
             date_added: "2025-01-02T03:04:05Z".to_string(),
             date_modified: "2025-01-02T03:04:05Z".to_string(),
             file_size_bytes: Some(1_000),
@@ -8116,6 +8122,11 @@ mod tests {
         assert_eq!(renamed.artist_name, "Updated Artist");
         assert_eq!(renamed.play_count, 17);
         assert_eq!(renamed.last_played_at_ms, Some(1_748_776_400_123));
+        assert_eq!(
+            renamed.rating,
+            Some(88),
+            "metadata refresh preserves app rating"
+        );
         assert_eq!(renamed.date_added, "2025-01-02T03:04:05Z");
 
         let entry_after = playlist_entry::Entity::find_by_id(&entry_before.id)
@@ -8879,6 +8890,11 @@ mod tests {
         );
         assert_eq!(renamed.play_count, 11, "history survives the move");
         assert_eq!(renamed.last_played_at_ms, Some(1_748_776_400_123));
+        assert_eq!(
+            renamed.rating,
+            Some(88),
+            "directory move preserves app rating"
+        );
         assert_eq!(renamed.date_added, "2025-01-02T03:04:05Z");
         assert_eq!(
             renamed.date_modified, "2025-01-02T03:04:05Z",
@@ -11375,6 +11391,7 @@ mod tests {
             format: Some("MP3".to_string()),
             play_count: 0,
             last_played_at_ms: None,
+            rating: None,
             date_added: "2026-07-10T00:00:00Z".to_string(),
             date_modified: "2026-07-10T00:00:00Z".to_string(),
             file_size_bytes: None,
@@ -11468,6 +11485,7 @@ mod tests {
             format: Some("FLAC".to_string()),
             play_count: 5,
             last_played_at_ms: Some(1_748_776_400_123),
+            rating: Some(91),
             date_added: "2025-01-15T10:30:00+00:00".to_string(),
             date_modified: "2025-06-01T14:00:00+00:00".to_string(),
             file_size_bytes: Some(30_000_000),
@@ -11491,6 +11509,10 @@ mod tests {
         assert_eq!(track.sample_rate_hz, Some(44100));
         assert_eq!(track.format, Some("FLAC".to_string()));
         assert_eq!(track.play_count, Some(5));
+        assert_eq!(
+            track.rating,
+            TrackRating::writable(Some(Rating::new(91).unwrap()))
+        );
         assert_eq!(
             track.last_played.map(|instant| instant.timestamp_millis()),
             Some(1_748_776_400_123)
@@ -11522,6 +11544,7 @@ mod tests {
             format: None,
             play_count: 0,
             last_played_at_ms: None,
+            rating: None,
             date_added: "2025-01-01T00:00:00+00:00".to_string(),
             date_modified: "2025-01-01T00:00:00+00:00".to_string(),
             file_size_bytes: None,
@@ -11538,7 +11561,43 @@ mod tests {
         assert_eq!(track.sample_rate_hz, None);
         assert_eq!(track.format, None);
         assert_eq!(track.play_count, Some(0));
+        assert_eq!(track.rating, TrackRating::writable(None));
         assert_eq!(track.last_played, None);
+    }
+
+    #[test]
+    fn test_db_model_to_track_rejects_corrupt_stored_ratings() {
+        for corrupt in [0, 101] {
+            let model = track::Model {
+                id: format!("corrupt-rating-{corrupt}"),
+                file_path: format!("/music/corrupt-{corrupt}.mp3"),
+                title: "Corrupt rating".to_string(),
+                artist_name: "Artist".to_string(),
+                album_artist_name: None,
+                album_title: "Album".to_string(),
+                genre: None,
+                composer: None,
+                year: None,
+                track_number: None,
+                disc_number: None,
+                duration_secs: None,
+                bitrate_kbps: None,
+                sample_rate_hz: None,
+                format: None,
+                play_count: 0,
+                last_played_at_ms: None,
+                rating: Some(corrupt),
+                date_added: "2025-01-01T00:00:00Z".to_string(),
+                date_modified: "2025-01-01T00:00:00Z".to_string(),
+                file_size_bytes: None,
+            };
+
+            assert_eq!(
+                db_model_to_track(&model).rating,
+                TrackRating::writable(None),
+                "corrupt stored rating {corrupt} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -11561,6 +11620,7 @@ mod tests {
             format: None,
             play_count: 0,
             last_played_at_ms: None,
+            rating: None,
             date_added: "2025-01-01T00:00:00+00:00".to_string(),
             date_modified: "2025-01-01T00:00:00+00:00".to_string(),
             file_size_bytes: None,
@@ -11603,6 +11663,7 @@ mod tests {
             format: None,
             play_count: 0,
             last_played_at_ms: Some(i64::MAX),
+            rating: None,
             date_added: "not-a-date".to_string(),
             date_modified: "also-not-a-date".to_string(),
             file_size_bytes: None,
@@ -11635,6 +11696,7 @@ mod tests {
             format: Some("FLAC".to_string()),
             play_count: -1,
             last_played_at_ms: None,
+            rating: None,
             date_added: "2025-01-01T00:00:00Z".to_string(),
             date_modified: "2025-01-01T00:00:00Z".to_string(),
             file_size_bytes: None,

@@ -164,6 +164,9 @@ pub struct SongEntry {
     pub cover_art: Option<String>,
     #[serde(default)]
     pub play_count: Option<u32>,
+    /// User rating on Subsonic's documented integer one-through-five scale.
+    #[serde(default, deserialize_with = "crate::remote_rating_wire::optional_i32")]
+    pub user_rating: Option<i32>,
     #[serde(default)]
     pub composer: Option<String>,
     #[serde(default)]
@@ -182,4 +185,33 @@ pub struct SearchResult3 {
     pub album: Vec<AlbumEntry>,
     #[serde(default)]
     pub song: Vec<SongEntry>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn song_rating_wire_field_is_tolerant() {
+        let missing: SongEntry = serde_json::from_value(serde_json::json!({"id": "song"})).unwrap();
+        assert_eq!(missing.user_rating, None);
+
+        for (wire, expected) in [
+            (serde_json::Value::Null, None),
+            (serde_json::json!(4), Some(4)),
+            (serde_json::json!(-1), Some(-1)),
+            (serde_json::json!(4.0), None),
+            (serde_json::json!("4"), None),
+            (serde_json::json!(true), None),
+            (serde_json::json!({"stars": 4}), None),
+            (serde_json::json!(i64::from(i32::MAX) + 1), None),
+        ] {
+            let entry: SongEntry = serde_json::from_value(serde_json::json!({
+                "id": "song",
+                "userRating": wire,
+            }))
+            .expect("malformed optional rating must not reject the song");
+            assert_eq!(entry.user_rating, expected);
+        }
+    }
 }

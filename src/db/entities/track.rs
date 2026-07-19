@@ -27,6 +27,8 @@ pub struct Model {
     pub format: Option<String>,
     pub play_count: i32,
     pub last_played_at_ms: Option<i64>,
+    /// Tributary-owned whole-integer rating in 1..=100; `NULL` is unrated.
+    pub rating: Option<i32>,
     pub date_added: String,
     pub date_modified: String,
     pub file_size_bytes: Option<i64>,

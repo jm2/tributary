@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Ratings now have a durable ownership, capability, and persistence foundation** — A canonical
+  rating is one validated whole integer from 1 through 100, while `None` alone means unrated.
+  Tracks carry one coherent Writable, ReadOnly, or Unsupported state, and the catalogue seam rejects
+  any per-track capability that disagrees with its backend. Migration 12 adds a nullable local
+  SQLite integer with independent storage-type/range enforcement, leaves every legacy row unrated,
+  rejects interrupted lookalike schemas without the canonical constraint, and supports down/up
+  retry. Tributary owns ratings only for local-library tracks: `LocalBackend` transactionally sets
+  or clears one exact native ID, returns only committed state, treats deletion as a clean no-op,
+  and existing-row metadata refresh or a recognized paired watcher rename preserves the value
+  without reading or writing embedded tags. An unrecognized remove-plus-add remains a new unrated
+  track.
+  Subsonic's valid signed 1–5 `userRating` maps read-only to 20-point increments; valid finite
+  Jellyfin `UserData.Rating` and Plex `userRating` values in 0–10 map through rounded tenfold values,
+  with native zero retained as canonical 1. Missing or malformed remote values remain read-only
+  unrated; DAAP, radio, removable, external, and unknown sources are Unsupported, and every remote
+  mutation fails closed. XSPF v1 deliberately omits ratings, ignores rating-like meta/extension
+  input, and playlist import cannot modify a matched library rating. Accessible editing, display,
+  sorting, and smart-playlist rules remain the next P1.4 slice; the complete contract is in
+  [`docs/ratings.md`](docs/ratings.md).
 - **Local playback history now has a durable contract, schema, and production pipeline** — Local
   track rows gain a nullable UTC epoch-millisecond `last_played` value, while the architecture
   model safely rejects out-of-range stored timestamps. Migration 10 preserves every nonnegative legacy play

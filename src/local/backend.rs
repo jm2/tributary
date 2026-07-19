@@ -5,14 +5,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use sea_orm::sea_query::{Expr, Func};
 use sea_orm::{
-    ColumnTrait, Condition, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, QuerySelect,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult,
+    QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use uuid::Uuid;
 
 use crate::architecture::backend::{BackendResult, MediaBackend};
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
+use crate::architecture::TrackId;
 use crate::db::entities::track;
 
 use super::engine::db_model_to_track;
@@ -227,6 +228,77 @@ impl MediaBackend for LocalBackend {
             .map_err(|error| BackendError::Internal(error.into()))
     }
 
+    fn rating_capability(&self) -> RatingCapability {
+        RatingCapability::Writable
+    }
+
+    async fn set_track_rating(
+        &self,
+        track_id: &TrackId,
+        rating: Option<Rating>,
+    ) -> BackendResult<Option<Track>> {
+        let transaction = self
+            .db
+            .begin()
+            .await
+            .map_err(|error| BackendError::Internal(error.into()))?;
+        let update = transaction
+            .execute(Statement::from_sql_and_values(
+                transaction.get_database_backend(),
+                "UPDATE tracks SET rating = ? WHERE id = ?",
+                [
+                    rating.map(|value| i32::from(value.value())).into(),
+                    track_id.as_str().into(),
+                ],
+            ))
+            .await;
+        let update = match update {
+            Ok(update) => update,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(BackendError::Internal(error.into()));
+            }
+        };
+
+        if update.rows_affected() == 0 {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| BackendError::Internal(error.into()))?;
+            return Ok(None);
+        }
+        if update.rows_affected() != 1 {
+            let affected = update.rows_affected();
+            let _ = transaction.rollback().await;
+            return Err(BackendError::Internal(anyhow::anyhow!(
+                "rating update for exact track ID affected {affected} rows"
+            )));
+        }
+
+        let updated = match track::Entity::find_by_id(track_id.as_str())
+            .one(&transaction)
+            .await
+        {
+            Ok(Some(updated)) => updated,
+            Ok(None) => {
+                let _ = transaction.rollback().await;
+                return Err(BackendError::Internal(anyhow::anyhow!(
+                    "rated track disappeared before commit"
+                )));
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(BackendError::Internal(error.into()));
+            }
+        };
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| BackendError::Internal(error.into()))?;
+        Ok(Some(db_model_to_track(&updated)))
+    }
+
     async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
         let mut grouped = BTreeMap::<(String, String), AlbumTotals>::new();
         for row in self.aggregate_fragments().await? {
@@ -426,6 +498,7 @@ mod tests {
             format: Set(Some("FLAC".to_owned())),
             play_count: Set(0),
             last_played_at_ms: Set(None),
+            rating: Set(None),
             date_added: Set("2026-07-17T00:00:00Z".to_owned()),
             date_modified: Set("2026-07-17T00:00:00Z".to_owned()),
             file_size_bytes: Set(None),
@@ -666,5 +739,112 @@ mod tests {
         assert_eq!(stats.total_albums, 0);
         assert_eq!(stats.total_artists, 0);
         assert_eq!(stats.total_duration_secs, 0);
+    }
+
+    #[tokio::test]
+    async fn local_ratings_set_clear_and_target_only_the_exact_id() {
+        let backend = populated_backend().await;
+        assert_eq!(backend.rating_capability(), RatingCapability::Writable);
+        let exact = TrackId::new(Uuid::from_u128(2).to_string()).expect("exact local ID");
+
+        let rated = backend
+            .set_track_rating(&exact, Some(Rating::new(73).unwrap()))
+            .await
+            .expect("persist rating")
+            .expect("rated row exists");
+        assert_eq!(
+            rated.rating,
+            TrackRating::writable(Some(Rating::new(73).unwrap()))
+        );
+
+        let sibling = track::Entity::find_by_id(Uuid::from_u128(1).to_string())
+            .one(&backend.db)
+            .await
+            .expect("query sibling")
+            .expect("sibling exists");
+        assert_eq!(sibling.rating, None);
+
+        let cleared = backend
+            .set_track_rating(&exact, None)
+            .await
+            .expect("clear rating")
+            .expect("cleared row exists");
+        assert_eq!(cleared.rating, TrackRating::writable(None));
+        let stored = track::Entity::find_by_id(exact.as_str())
+            .one(&backend.db)
+            .await
+            .expect("query cleared row")
+            .expect("cleared row exists");
+        assert_eq!(stored.rating, None);
+
+        let missing = TrackId::new("missing-local-track").unwrap();
+        assert!(backend
+            .set_track_rating(&missing, Some(Rating::new(50).unwrap()))
+            .await
+            .expect("missing rating write is a clean no-op")
+            .is_none());
+
+        backend
+            .db
+            .execute_unprepared(
+                "INSERT INTO tracks (
+                     id, file_path, title, artist_name, album_title, play_count,
+                     date_added, date_modified
+                 ) VALUES (
+                     'legacy-non-uuid-id', '/music/legacy.flac', 'Legacy',
+                     'Artist', 'Album', 0, 'added', 'modified'
+                 )",
+            )
+            .await
+            .expect("insert legacy non-UUID row");
+        let legacy_id = TrackId::new("legacy-non-uuid-id").unwrap();
+        let legacy = backend
+            .set_track_rating(&legacy_id, Some(Rating::new(41).unwrap()))
+            .await
+            .expect("persist rating through exact legacy ID")
+            .expect("legacy row exists");
+        assert_eq!(legacy.native_track_id.as_ref(), Some(&legacy_id));
+        assert_eq!(
+            legacy.rating,
+            TrackRating::writable(Some(Rating::new(41).unwrap()))
+        );
+    }
+
+    #[tokio::test]
+    async fn local_rating_update_rolls_back_if_row_disappears_before_fetch() {
+        let backend = populated_backend().await;
+        let exact_text = Uuid::from_u128(1).to_string();
+        backend
+            .db
+            .execute(Statement::from_sql_and_values(
+                backend.db.get_database_backend(),
+                "UPDATE tracks SET rating = ? WHERE id = ?",
+                [35_i32.into(), exact_text.clone().into()],
+            ))
+            .await
+            .expect("seed pre-update rating");
+        backend
+            .db
+            .execute_unprepared(&format!(
+                "CREATE TRIGGER delete_rated_track AFTER UPDATE OF rating ON tracks \
+                 WHEN NEW.id = '{exact_text}' BEGIN \
+                 DELETE FROM tracks WHERE id = NEW.id; END"
+            ))
+            .await
+            .expect("install disappearance trigger");
+
+        let exact = TrackId::new(exact_text.clone()).unwrap();
+        let error = backend
+            .set_track_rating(&exact, Some(Rating::new(92).unwrap()))
+            .await
+            .expect_err("post-update disappearance must fail closed");
+        assert!(error.to_string().contains("disappeared before commit"));
+
+        let restored = track::Entity::find_by_id(exact_text)
+            .one(&backend.db)
+            .await
+            .expect("query rolled-back row")
+            .expect("rollback restores deleted row");
+        assert_eq!(restored.rating, Some(35));
     }
 }

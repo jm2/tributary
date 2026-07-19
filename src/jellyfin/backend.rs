@@ -485,6 +485,10 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
         Ok(self.cache.read().await.tracks.clone())
     }
 
+    fn rating_capability(&self) -> RatingCapability {
+        RatingCapability::ReadOnly
+    }
+
     async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
         let cache = self.cache.read().await;
         let mut albums = cache.albums.clone();
@@ -642,6 +646,12 @@ fn jellyfin_item_to_track(
         sample_rate_hz,
         format: item.container.clone(),
         play_count: item.user_data.as_ref().and_then(|ud| ud.play_count),
+        rating: TrackRating::read_only(
+            item.user_data
+                .as_ref()
+                .and_then(|data| data.rating)
+                .and_then(Rating::from_ten_point_scale),
+        ),
         last_played: None,
     }
 }
@@ -650,6 +660,7 @@ fn jellyfin_item_to_track(
 mod tests {
     use axum::http::{header::LOCATION, HeaderValue, StatusCode};
 
+    use crate::architecture::MediaBackend as _;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
 
     use super::*;
@@ -714,7 +725,7 @@ mod tests {
                             "Bitrate": 1_411_000,
                             "MediaStreams": [{"Type": "Audio", "SampleRate": 48_000}]
                         }],
-                        "UserData": {"PlayCount": 4}
+                        "UserData": {"PlayCount": 4, "Rating": 7.34}
                     }],
                     "TotalRecordCount": 1
                 }))),
@@ -746,6 +757,22 @@ mod tests {
                     }],
                     "TotalRecordCount": 1
                 }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("SearchTerm", "Fixture")
+                .with_query("IncludeItemTypes", "Audio,MusicAlbum,MusicArtist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [{
+                        "Id": "search-track",
+                        "Name": "Fixture Search Song",
+                        "Type": "Audio",
+                        "Album": "Fixture Album",
+                        "AlbumId": "album-1",
+                        "AlbumArtist": "Fixture Artist",
+                        "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}],
+                        "UserData": {"Rating": 4.26}
+                    }],
+                    "TotalRecordCount": 1
+                }))),
         ])
         .await;
         let token = Uuid::new_v4().to_string();
@@ -756,6 +783,14 @@ mod tests {
                 .expect("connect Jellyfin fixture");
 
         assert_eq!(backend.music_libraries().len(), 1);
+        assert_eq!(backend.rating_capability(), RatingCapability::ReadOnly);
+        let published = crate::architecture::load_track_catalog(&backend)
+            .await
+            .expect("catalogue rating capabilities agree");
+        assert_eq!(
+            published[0].rating,
+            TrackRating::read_only(Some(Rating::new(73).unwrap()))
+        );
         let cache = backend.cache.read().await;
         assert_eq!(cache.tracks.len(), 1);
         assert_eq!(cache.tracks[0].title, "Fixture Song");
@@ -763,8 +798,15 @@ mod tests {
         assert_eq!(cache.artists.len(), 1);
         drop(cache);
 
+        let search = backend.search("Fixture", 10).await.expect("search fixture");
+        assert_eq!(search.tracks.len(), 1);
+        assert_eq!(
+            search.tracks[0].rating,
+            TrackRating::read_only(Some(Rating::new(43).unwrap()))
+        );
+
         let requests = service.requests();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         for request in requests {
             let authorization = request
                 .headers
@@ -775,6 +817,39 @@ mod tests {
             assert!(request.body.is_empty());
         }
         service.finish().await;
+    }
+
+    #[test]
+    fn jellyfin_user_rating_is_validated_read_only_ten_point_data() {
+        for (native, expected) in [
+            (None, None),
+            (Some(-0.01), None),
+            (Some(0.0), Some(1)),
+            (Some(7.34), Some(73)),
+            (Some(10.0), Some(100)),
+            (Some(10.01), None),
+        ] {
+            let item: JellyfinItem = serde_json::from_value(serde_json::json!({
+                "Id": "track-id",
+                "UserData": {"Rating": native}
+            }))
+            .unwrap();
+            let track = jellyfin_item_to_track(
+                &item,
+                TrackId::remote("track-id").unwrap(),
+                Uuid::new_v4(),
+                None,
+                None,
+            );
+            assert_eq!(track.rating.capability(), RatingCapability::ReadOnly);
+            assert_eq!(
+                track.rating.value().map(Rating::value),
+                expected,
+                "native Jellyfin rating {native:?}"
+            );
+        }
+        assert_eq!(Rating::from_ten_point_scale(f64::NAN), None);
+        assert_eq!(Rating::from_ten_point_scale(f64::INFINITY), None);
     }
 
     #[tokio::test]

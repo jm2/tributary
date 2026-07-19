@@ -272,6 +272,7 @@ fn pathless_track(
         sample_rate_hz: parsed.sample_rate_hz,
         format: Some(parsed.format),
         play_count: None,
+        rating: crate::architecture::models::TrackRating::unsupported(),
         last_played: None,
     }
 }

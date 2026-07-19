@@ -71,6 +71,7 @@ mod platform_runtime;
 #[allow(dead_code)]
 mod plex;
 mod radio;
+mod remote_rating_wire;
 mod removable;
 #[allow(dead_code)]
 mod source_lifecycle;

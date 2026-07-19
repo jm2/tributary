@@ -14,6 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
 
+use crate::architecture::models::RatingCapability;
 use crate::architecture::SourceId;
 use crate::source_lifecycle::{FailureCategory, SourceProvenance};
 use crate::source_registry::SourceRegistry;
@@ -659,6 +660,9 @@ async fn replacement_rejects_stale_epoch_stream_and_art_before_adapter_invocatio
         connect_daap(&registry, source_id, "First", first_server.base_url.clone());
     let (first_epoch, first_tracks) =
         wait_for_catalogue(&registry, source_id, first_generation).await;
+    assert!(first_tracks
+        .iter()
+        .all(|track| track.rating.capability() == RatingCapability::Unsupported));
     let track_id = first_tracks[0]
         .native_track_id
         .clone()

@@ -207,6 +207,13 @@ pub struct JellyfinMediaStream {
 pub struct JellyfinUserData {
     #[serde(rename = "PlayCount", default)]
     pub play_count: Option<u32>,
+    /// User rating on Jellyfin's nullable decimal zero-through-ten scale.
+    #[serde(
+        rename = "Rating",
+        default,
+        deserialize_with = "crate::remote_rating_wire::optional_f64"
+    )]
+    pub rating: Option<f64>,
 }
 
 // ── UDP Discovery ───────────────────────────────────────────────────────
@@ -226,3 +233,32 @@ pub struct JellyfinDiscoveryResponse {
 
 // The `/System/Ping` endpoint returns a plain string `"Jellyfin Server"`
 // with HTTP 200 — no JSON body to deserialize.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_rating_wire_field_is_tolerant() {
+        let missing: JellyfinItem =
+            serde_json::from_value(serde_json::json!({"Id": "track"})).unwrap();
+        assert!(missing.user_data.is_none());
+
+        for (wire, expected) in [
+            (serde_json::Value::Null, None),
+            (serde_json::json!(7.5), Some(7.5)),
+            (serde_json::json!(7), Some(7.0)),
+            (serde_json::json!("7.5"), None),
+            (serde_json::json!(false), None),
+            (serde_json::json!([7.5]), None),
+            (serde_json::json!({"value": 7.5}), None),
+        ] {
+            let item: JellyfinItem = serde_json::from_value(serde_json::json!({
+                "Id": "track",
+                "UserData": {"Rating": wire},
+            }))
+            .expect("malformed optional rating must not reject the item");
+            assert_eq!(item.user_data.and_then(|data| data.rating), expected);
+        }
+    }
+}

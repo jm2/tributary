@@ -444,6 +444,10 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
         Ok(self.cache.read().await.tracks.clone())
     }
 
+    fn rating_capability(&self) -> RatingCapability {
+        RatingCapability::ReadOnly
+    }
+
     async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
         let cache = self.cache.read().await;
         let mut albums = cache.albums.clone();
@@ -583,6 +587,7 @@ fn song_to_track(
         sample_rate_hz: None,
         format: song.suffix.clone(),
         play_count: song.play_count,
+        rating: TrackRating::read_only(song.user_rating.and_then(Rating::from_five_star_scale)),
         last_played: None,
     }
 }
@@ -695,6 +700,7 @@ mod tests {
                             "song": [{
                                 "id": "shared-native-id",
                                 "title": "Song",
+                                "userRating": 4,
                                 "coverArt": "full-song-cover"
                             }]
                         }
@@ -719,6 +725,7 @@ mod tests {
                             "song": [{
                                 "id": "shared-native-id",
                                 "title": "Song",
+                                "userRating": 3,
                                 "coverArt": "search-song-cover"
                             }]
                         }
@@ -733,6 +740,14 @@ mod tests {
                 .await
                 .expect("connect to fixture");
         let shared_id = TrackId::remote("shared-native-id").expect("track ID");
+        assert_eq!(backend.rating_capability(), RatingCapability::ReadOnly);
+        let published = crate::architecture::load_track_catalog(&backend)
+            .await
+            .expect("catalogue rating capabilities agree");
+        assert_eq!(
+            published[0].rating,
+            TrackRating::read_only(Some(Rating::new(80).unwrap()))
+        );
 
         let initial = backend
             .resolve_artwork(&shared_id)
@@ -745,6 +760,10 @@ mod tests {
         assert_eq!(results.tracks.len(), 1);
         assert_eq!(results.albums.len(), 1);
         assert_eq!(results.artists.len(), 1);
+        assert_eq!(
+            results.tracks[0].rating,
+            TrackRating::read_only(Some(Rating::new(60).unwrap()))
+        );
         let searched = backend
             .resolve_artwork(&shared_id)
             .await
@@ -782,6 +801,37 @@ mod tests {
             assert!(request.body.is_empty());
         }
         service.finish().await;
+    }
+
+    #[test]
+    fn subsonic_user_rating_is_exact_read_only_five_star_data() {
+        for (native, expected) in [
+            (None, None),
+            (Some(-1), None),
+            (Some(0), None),
+            (Some(1), Some(20)),
+            (Some(5), Some(100)),
+            (Some(6), None),
+        ] {
+            let song: SongEntry = serde_json::from_value(serde_json::json!({
+                "id": "song-id",
+                "userRating": native
+            }))
+            .unwrap();
+            let track = song_to_track(
+                &song,
+                TrackId::remote("song-id").unwrap(),
+                Uuid::new_v4(),
+                None,
+                None,
+            );
+            assert_eq!(track.rating.capability(), RatingCapability::ReadOnly);
+            assert_eq!(
+                track.rating.value().map(Rating::value),
+                expected,
+                "native Subsonic rating {native:?}"
+            );
+        }
     }
 
     #[tokio::test]

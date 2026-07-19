@@ -40,6 +40,8 @@ pub struct ImportedTrack {
 /// Writes a valid XSPF v1 XML document containing `<location>`, `<title>`,
 /// `<creator>`, and `<album>` for each track, plus `<duration>` whenever the
 /// stored value is non-negative and representable as `u64` milliseconds.
+/// Ratings are intentionally omitted: XSPF v1 has no standard rating field,
+/// and a playlist export is not a consent-bearing metadata transfer.
 pub fn export_xspf(tracks: &[track::Model], path: &Path) -> anyhow::Result<()> {
     // Validate and render the whole document before touching the destination.
     let document = serialize_xspf(tracks)?;
@@ -143,6 +145,8 @@ fn serialize_xspf(tracks: &[track::Model]) -> anyhow::Result<Vec<u8>> {
 /// nesting therefore cannot manufacture phantom playlist entries.
 ///
 /// Returns a list of `ImportedTrack` with whatever metadata the file provides.
+/// Rating-like `<meta>` or extension content is intentionally inert and can
+/// never overwrite Tributary's app-owned library rating.
 pub fn import_xspf(path: &Path) -> anyhow::Result<Vec<ImportedTrack>> {
     let content = std::fs::read_to_string(path)?;
     let tracks = parse_xspf(&content)?;
@@ -832,6 +836,7 @@ mod tests {
             format: None,
             play_count: 0,
             last_played_at_ms: None,
+            rating: None,
             date_added: "2026-01-01T00:00:00Z".to_string(),
             date_modified: "2026-01-01T00:00:00Z".to_string(),
             file_size_bytes: None,
@@ -977,6 +982,26 @@ mod tests {
         assert_eq!(tracks.len(), 2);
         assert!(tracks[0].title.is_empty());
         assert_eq!(tracks[1].title, "Real");
+    }
+
+    #[test]
+    fn rating_like_meta_and_extension_content_is_inert_on_import() {
+        let tracks = import_document(concat!(
+            "<playlist version='1' xmlns='http://xspf.org/ns/0/' ",
+            "xmlns:t='https://github.com/jm2/tributary/xspf'>",
+            "<trackList><track>",
+            "<title>Real</title><creator>Artist</creator>",
+            "<meta rel='rating'>100</meta>",
+            "<meta rel='https://example.invalid/rating'>1</meta>",
+            "<extension application='https://example.invalid/player'>",
+            "<t:rating>55</t:rating></extension>",
+            "</track></trackList></playlist>"
+        ))
+        .expect("rating-like nonstandard metadata remains inert");
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "Real");
+        assert_eq!(tracks[0].artist, "Artist");
     }
 
     #[test]
@@ -1353,6 +1378,26 @@ mod tests {
         assert!(document.contains("<duration>100000</duration>"));
         assert!(document.contains("<title>Negative</title>"));
         assert!(document.contains("<title>Overflow</title>"));
+    }
+
+    #[test]
+    fn xspf_export_omits_app_owned_ratings() {
+        let mut rated = library_track(
+            "rated",
+            "/rated.flac",
+            "Rated",
+            "Artist",
+            "Album",
+            Some(100),
+        );
+        rated.rating = Some(87);
+
+        let document = String::from_utf8(serialize_xspf(&[rated]).expect("serialize rated track"))
+            .expect("serialized XSPF is UTF-8");
+        assert!(!document.to_ascii_lowercase().contains("rating"));
+        assert!(!document.contains("<meta"));
+        assert!(!document.contains("<extension"));
+        assert!(document.contains("<title>Rated</title>"));
     }
 
     #[test]
