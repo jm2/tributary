@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Ratings now have a durable ownership, capability, and persistence foundation** — A canonical
+- **Ratings now have a durable ownership, capability, and persistence foundation**
+  ([#138](https://github.com/jm2/tributary/pull/138)) — A canonical
   rating is one validated whole integer from 1 through 100, while `None` alone means unrated.
   Tracks carry one coherent Writable, ReadOnly, or Unsupported state, and the catalogue seam rejects
   any per-track capability that disagrees with its backend. Migration 12 adds a nullable local
