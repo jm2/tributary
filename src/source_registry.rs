@@ -72,8 +72,6 @@ pub enum RegularPlaylistCapability {
 /// Guards are minted only by a successful registry lookup and must never be
 /// persisted. A session replacement changes `session_epoch`; a same-session
 /// catalogue replacement changes `catalogue_generation`.
-// Record A intentionally lands this authority surface before Record B wires UI consumers.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegularPlaylistCatalogueGuard {
     source_id: SourceId,
@@ -81,7 +79,6 @@ pub struct RegularPlaylistCatalogueGuard {
     catalogue_generation: u64,
 }
 
-#[allow(dead_code)]
 impl RegularPlaylistCatalogueGuard {
     pub const fn source_id(self) -> SourceId {
         self.source_id
@@ -98,7 +95,6 @@ impl RegularPlaylistCatalogueGuard {
 
 /// Fixed, non-sensitive reason that a persisted source-scoped identity cannot
 /// currently be projected from a regular playlist.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegularPlaylistUnavailableReason {
     SourceUnavailable,
@@ -110,7 +106,6 @@ pub enum RegularPlaylistUnavailableReason {
 /// Closed failure returned by guarded regular-playlist media resolution.
 /// Raw adapter errors, URLs, credentials, and native IDs never cross this
 /// boundary.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RegularPlaylistMediaError {
     #[error("regular playlist media authority is unavailable")]
@@ -120,7 +115,6 @@ pub enum RegularPlaylistMediaError {
 }
 
 /// One available regular-playlist track resolved from an exact live catalogue.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct RegularPlaylistTrack {
     media_key: MediaKey,
@@ -128,7 +122,6 @@ pub struct RegularPlaylistTrack {
     metadata: RegularPlaylistTrackMetadata,
 }
 
-#[allow(dead_code)]
 impl RegularPlaylistTrack {
     pub fn media_key(&self) -> &MediaKey {
         &self.media_key
@@ -141,6 +134,29 @@ impl RegularPlaylistTrack {
     pub fn metadata(&self) -> &RegularPlaylistTrackMetadata {
         &self.metadata
     }
+
+    /// Construct a registry-shaped available result for cross-module UI
+    /// tests without making catalogue guards forgeable in production.
+    #[cfg(test)]
+    pub(crate) fn for_ui_test(
+        media_key: MediaKey,
+        session_epoch: u64,
+        catalogue_generation: u64,
+        track: &Track,
+    ) -> Self {
+        assert_ne!(media_key.source_id, SourceId::local());
+        assert_ne!(session_epoch, 0);
+        assert_ne!(catalogue_generation, 0);
+        Self {
+            guard: RegularPlaylistCatalogueGuard {
+                source_id: media_key.source_id,
+                session_epoch,
+                catalogue_generation,
+            },
+            media_key,
+            metadata: RegularPlaylistTrackMetadata::from_track(track),
+        }
+    }
 }
 
 /// Whitelisted display, sorting, rating, and history metadata for a regular
@@ -149,7 +165,6 @@ impl RegularPlaylistTrack {
 /// This is deliberately not a `Track` clone. Adding a new field to `Track`
 /// cannot silently expose a locator, credential, or future private adapter
 /// detail across the playlist authority boundary.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegularPlaylistTrackMetadata {
     title: String,
@@ -172,7 +187,6 @@ pub struct RegularPlaylistTrackMetadata {
     last_played: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[allow(dead_code)]
 impl RegularPlaylistTrackMetadata {
     fn from_track(track: &Track) -> Self {
         Self {
@@ -237,6 +251,9 @@ impl RegularPlaylistTrackMetadata {
         self.year
     }
 
+    // Kept in the explicit catalogue whitelist for future source-aware sort
+    // projections; Record B does not yet expose a Date Added column.
+    #[allow(dead_code)]
     pub fn date_added(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.date_added
     }
@@ -265,6 +282,9 @@ impl RegularPlaylistTrackMetadata {
         self.rating
     }
 
+    // Remote history is intentionally read-only. The value may cross this
+    // sanitized boundary even though local-only history UI does not consume it.
+    #[allow(dead_code)]
     pub fn last_played(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.last_played
     }
@@ -273,7 +293,6 @@ impl RegularPlaylistTrackMetadata {
 /// One unavailable regular-playlist identity. Its optional private guard lets
 /// the registry distinguish a still-current missing/unsupported catalogue
 /// observation from a replacement without exposing lifecycle internals.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct RegularPlaylistUnavailable {
     media_key: MediaKey,
@@ -281,7 +300,6 @@ pub struct RegularPlaylistUnavailable {
     observed_guard: Option<RegularPlaylistCatalogueGuard>,
 }
 
-#[allow(dead_code)]
 impl RegularPlaylistUnavailable {
     pub fn media_key(&self) -> &MediaKey {
         &self.media_key
@@ -293,14 +311,12 @@ impl RegularPlaylistUnavailable {
 }
 
 /// Ordered result of resolving one persisted source-scoped playlist identity.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub enum RegularPlaylistTrackResolution {
     Available(Box<RegularPlaylistTrack>),
     Unavailable(RegularPlaylistUnavailable),
 }
 
-#[allow(dead_code)]
 impl RegularPlaylistTrackResolution {
     pub fn media_key(&self) -> &MediaKey {
         match self {
@@ -426,13 +442,10 @@ pub enum ViewLoadResult {
 struct AcceptedSourcePayload {
     tracks: Arc<Vec<Track>>,
     public_streams: HashMap<TrackId, PublicHttpEndpoint>,
-    #[allow(dead_code)]
     regular_playlist_capability: RegularPlaylistCapability,
-    #[allow(dead_code)]
     regular_playlist_index: RegularPlaylistTrackIndex,
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
 enum RegularPlaylistTrackIndex {
     Unsupported,
@@ -480,7 +493,6 @@ impl AcceptedSourcePayload {
         AcceptedView::published(Arc::clone(&self.tracks))
     }
 
-    #[allow(dead_code)]
     fn regular_playlist_track(&self, track_id: &TrackId) -> Option<&Track> {
         if self.regular_playlist_capability != RegularPlaylistCapability::SourceScopedEntries {
             return None;
@@ -1306,7 +1318,6 @@ impl SourceRegistry {
     /// observed independently under the lifecycle lock, while metadata copies
     /// and ordering work happen outside it. Similar metadata, another source's
     /// matching native ID, and endpoint identity are never considered.
-    #[allow(dead_code)]
     pub fn resolve_regular_playlist_tracks(
         &self,
         media_keys: &[MediaKey],
@@ -1416,7 +1427,6 @@ impl SourceRegistry {
     /// Recheck that an ordered lookup result still describes the current
     /// source/catalogue authority. Metadata is immutable within a guard, so
     /// only exact identity, guard, and closed availability state are compared.
-    #[allow(dead_code)]
     pub fn are_regular_playlist_tracks_current(
         &self,
         resolutions: &[RegularPlaylistTrackResolution],
@@ -1436,7 +1446,6 @@ impl SourceRegistry {
     /// the playlist row. The returned protected request carries the accepted
     /// catalogue's revocable lease, so a same-session catalogue replacement
     /// also invalidates a request after resolution but before consumption.
-    #[allow(dead_code)]
     pub async fn resolve_regular_playlist_stream(
         &self,
         guard: RegularPlaylistCatalogueGuard,
@@ -1469,7 +1478,6 @@ impl SourceRegistry {
 
     /// Artwork counterpart of [`Self::resolve_regular_playlist_stream`] with
     /// the same exact pre/post guard checks and catalogue-generation lease.
-    #[allow(dead_code)]
     pub async fn resolve_regular_playlist_artwork(
         &self,
         guard: RegularPlaylistCatalogueGuard,
@@ -1555,7 +1563,6 @@ impl SourceRegistry {
     }
 }
 
-#[allow(dead_code)]
 fn regular_playlist_authority_eq(
     observed: &RegularPlaylistTrackResolution,
     current: &RegularPlaylistTrackResolution,
@@ -1577,7 +1584,6 @@ fn regular_playlist_authority_eq(
     }
 }
 
-#[allow(dead_code)]
 fn regular_playlist_media_error(
     error: crate::source_lifecycle::CatalogueMediaResolveError,
 ) -> RegularPlaylistMediaError {

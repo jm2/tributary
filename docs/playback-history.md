@@ -18,8 +18,9 @@ events, retries, seeks, and wall-clock changes must not manufacture listening hi
 - Regular-playlist migration 13 stores membership by `(source_id, track_id)` but does not broaden
   this boundary. Only an occurrence whose `source_id` is exactly the built-in local source and
   whose nullable local foreign-key cache resolves to that row can contribute local history. A
-  future mixed playlist may place remote and local occurrences beside each other without letting a
-  remote native ID update a coincidentally equal local ID. See the
+  mixed regular playlist may place remote and local occurrences beside each other, but its queue
+  retains each row's real media owner and never lets a remote native ID update a coincidentally
+  equal local ID. An unavailable remote row cannot enter playback. See the
   [playlist storage contract](source-scoped-playlists.md).
 - `PlaybackSession` owns one `PlaybackHistoryProgress` value per queue occurrence, independently
   of replaceable output-event generations. A retry may bind a new accepted delivery to the same

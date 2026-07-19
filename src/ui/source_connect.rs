@@ -10,10 +10,16 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use tracing::info;
 
+use crate::architecture::SourceId;
 use crate::local::engine::LibraryEvent;
+use crate::source_registry::RegularPlaylistTrackResolution;
 
-use super::objects::{SourceObject, TrackObject};
+use super::objects::{
+    PlaylistOccurrenceBinding, PlaylistOccurrenceState, PlaylistRowUnavailableReason, SourceObject,
+    TrackObject,
+};
 use super::playback::refresh_projected_library_uris;
+use super::playlist_projection::{project_playlist_rows, PlaylistRowContent, PlaylistRowSpec};
 use super::preferences;
 use super::radio::{apply_radio_columns, handle_radio_nearme, is_radio_backend, radio_view_origin};
 use super::server_dialogs::{show_auth_dialog, validate_remote_server_url};
@@ -25,7 +31,11 @@ use super::window::{arch_track_to_object, display_tracks};
 use super::window_state::WindowState;
 
 enum PlaylistLoadOutcome {
-    Loaded(Vec<crate::architecture::models::Track>),
+    Smart(Vec<crate::architecture::models::Track>),
+    Regular {
+        rows: Vec<PlaylistRowSpec>,
+        authority: Vec<RegularPlaylistTrackResolution>,
+    },
     Missing,
     Failed,
 }
@@ -302,11 +312,110 @@ fn evict_source_completion(
     }
 }
 
+fn playlist_unavailable_reason_text(reason: PlaylistRowUnavailableReason) -> String {
+    playlist_unavailable_reason_text_for_locale(reason, &rust_i18n::locale())
+}
+
+fn playlist_unavailable_reason_text_for_locale(
+    reason: PlaylistRowUnavailableReason,
+    locale: &str,
+) -> String {
+    let key = match reason {
+        PlaylistRowUnavailableReason::LocalTrackMissing
+        | PlaylistRowUnavailableReason::LocalTrackUnmatched
+        | PlaylistRowUnavailableReason::TrackMissing => "regular_playlist.track_missing",
+        PlaylistRowUnavailableReason::SourceUnavailable => "regular_playlist.source_unavailable",
+        PlaylistRowUnavailableReason::UnsupportedSource => "regular_playlist.source_unsupported",
+        PlaylistRowUnavailableReason::InvalidCatalogue => {
+            "regular_playlist.source_catalogue_unavailable"
+        }
+    };
+    rust_i18n::t!(key, locale = locale).into_owned()
+}
+
+fn unavailable_playlist_row(binding: PlaylistOccurrenceBinding) -> TrackObject {
+    let reason = match binding.state() {
+        PlaylistOccurrenceState::Unavailable(reason) => reason,
+        PlaylistOccurrenceState::AvailableLocal | PlaylistOccurrenceState::AvailableRemote(_) => {
+            unreachable!("unavailable content carries a closed unavailable binding")
+        }
+    };
+    let row = TrackObject::new(
+        0,
+        rust_i18n::t!("regular_playlist.unavailable_track").as_ref(),
+        0,
+        &playlist_unavailable_reason_text(reason),
+        "",
+        "",
+        "",
+        0,
+        "",
+        0,
+        0,
+        0,
+        "",
+        "",
+    );
+    row.set_playlist_occurrence_binding(binding);
+    row
+}
+
+fn remote_playlist_row(
+    binding: PlaylistOccurrenceBinding,
+    track: crate::source_registry::RegularPlaylistTrack,
+) -> TrackObject {
+    let metadata = track.metadata();
+    let row = TrackObject::new(
+        metadata.track_number().unwrap_or(0),
+        metadata.title(),
+        metadata.duration_secs().unwrap_or(0),
+        metadata.artist_name(),
+        metadata.album_title(),
+        metadata.genre().unwrap_or("Unknown"),
+        metadata.composer().unwrap_or(""),
+        metadata.year().unwrap_or(0),
+        &metadata
+            .date_modified()
+            .map(|date| date.format("%Y-%m-%d").to_string())
+            .unwrap_or_default(),
+        metadata.bitrate_kbps().unwrap_or(0),
+        metadata.sample_rate_hz().unwrap_or(0),
+        metadata.play_count().unwrap_or(0),
+        metadata.format().unwrap_or(""),
+        "",
+    );
+    if let Some(album_artist) = metadata.album_artist_name() {
+        row.set_album_artist(album_artist);
+    }
+    row.set_disc_number(metadata.disc_number().unwrap_or(0));
+    row.set_rating(metadata.rating());
+    let guard = track.guard();
+    row.set_source_session_epoch(guard.session_epoch());
+    row.set_source_catalogue_generation(guard.catalogue_generation());
+    row.set_playlist_occurrence_binding(binding);
+    row
+}
+
+pub(super) fn playlist_row_to_object(spec: PlaylistRowSpec) -> TrackObject {
+    let (binding, content) = spec.into_parts();
+    match content {
+        PlaylistRowContent::AvailableLocal(track) => {
+            let architecture_track = crate::local::engine::db_model_to_track(&track);
+            let row = arch_track_to_object(&architecture_track);
+            row.set_playlist_occurrence_binding(binding);
+            row
+        }
+        PlaylistRowContent::AvailableRemote(track) => remote_playlist_row(binding, track),
+        PlaylistRowContent::Unavailable => unavailable_playlist_row(binding),
+    }
+}
+
 /// Load and publish a playlist through the same generation-owned path used by
 /// both explicit navigation and post-reconciliation refreshes.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn load_playlist_source(
     rt_handle: tokio::runtime::Handle,
+    source_registry: crate::source_registry::SourceRegistry,
     playlist_id: String,
     request: SourceRequest,
     navigation: Rc<RefCell<SourceNavigation>>,
@@ -320,6 +429,7 @@ pub(super) fn load_playlist_source(
     column_view: gtk::ColumnView,
 ) {
     let (tracks_tx, tracks_rx) = async_channel::bounded::<PlaylistLoadOutcome>(1);
+    let registry_for_load = source_registry.clone();
 
     rt_handle.spawn(async move {
         let outcome = match crate::db::connection::init_db().await {
@@ -327,21 +437,54 @@ pub(super) fn load_playlist_source(
                 let manager = crate::local::playlist_manager::PlaylistManager::new(db);
                 match manager.get_playlist(&playlist_id).await {
                     Ok(Some(playlist)) => {
-                        let models = if playlist.is_smart {
-                            manager.evaluate_smart_playlist(&playlist_id).await
+                        if playlist.is_smart {
+                            match manager.evaluate_smart_playlist(&playlist_id).await {
+                                Ok(models) => PlaylistLoadOutcome::Smart(
+                                    models
+                                        .iter()
+                                        .map(crate::local::engine::db_model_to_track)
+                                        .collect(),
+                                ),
+                                Err(error) => {
+                                    tracing::warn!(%error, "Failed to evaluate smart playlist");
+                                    PlaylistLoadOutcome::Failed
+                                }
+                            }
                         } else {
-                            manager.get_playlist_tracks(&playlist_id).await
-                        };
-                        match models {
-                            Ok(models) => PlaylistLoadOutcome::Loaded(
-                                models
-                                    .iter()
-                                    .map(crate::local::engine::db_model_to_track)
-                                    .collect(),
-                            ),
-                            Err(error) => {
-                                tracing::warn!(%error, "Failed to load playlist tracks");
-                                PlaylistLoadOutcome::Failed
+                            match manager.load_playlist_entries(&playlist_id).await {
+                                Ok(entries) => {
+                                    let remote_keys = entries
+                                        .iter()
+                                        .filter(|entry| {
+                                            entry.stored.source_id != SourceId::local()
+                                        })
+                                        .filter_map(|entry| entry.stored.media_key())
+                                        .collect::<Vec<_>>();
+                                    let authority = registry_for_load
+                                        .resolve_regular_playlist_tracks(&remote_keys);
+                                    match project_playlist_rows(entries, authority.clone()) {
+                                        Ok(rows)
+                                            if registry_for_load
+                                                .are_regular_playlist_tracks_current(&authority) =>
+                                        {
+                                            PlaylistLoadOutcome::Regular { rows, authority }
+                                        }
+                                        Ok(_) => {
+                                            tracing::debug!(
+                                                "Playlist catalogue changed while rows were projected"
+                                            );
+                                            PlaylistLoadOutcome::Failed
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(%error, "Playlist projection failed closed");
+                                            PlaylistLoadOutcome::Failed
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "Failed to load regular playlist entries");
+                                    PlaylistLoadOutcome::Failed
+                                }
                             }
                         }
                     }
@@ -367,8 +510,21 @@ pub(super) fn load_playlist_source(
         let Ok(outcome) = tracks_rx.recv().await else {
             return;
         };
-        let tracks = match outcome {
-            PlaylistLoadOutcome::Loaded(tracks) => tracks,
+        let objects = match outcome {
+            PlaylistLoadOutcome::Smart(tracks) => {
+                tracks.iter().map(arch_track_to_object).collect::<Vec<_>>()
+            }
+            PlaylistLoadOutcome::Regular { rows, authority } => {
+                if !source_registry.are_regular_playlist_tracks_current(&authority) {
+                    tracing::debug!(
+                        source = %request.source_key(),
+                        generation = request.generation(),
+                        "Discarding playlist rows whose catalogue authority changed before publication"
+                    );
+                    return;
+                }
+                rows.into_iter().map(playlist_row_to_object).collect()
+            }
             PlaylistLoadOutcome::Missing => {
                 if evict_source_completion(
                     &navigation,
@@ -395,7 +551,6 @@ pub(super) fn load_playlist_source(
                 return;
             }
         };
-        let objects: Vec<TrackObject> = tracks.iter().map(arch_track_to_object).collect();
 
         // A paired rename may commit while this database result is in flight.
         // Overlay the latest committed local paths at the GTK publication
@@ -585,6 +740,7 @@ pub fn setup_source_connect(state: &WindowState) {
 
             load_playlist_source(
                 rt_handle.clone(),
+                source_registry.clone(),
                 playlist_id,
                 request,
                 source_navigation.clone(),
@@ -1053,10 +1209,11 @@ mod tests {
     use url::Url;
 
     use super::{
-        cache_source_completion, evict_source_completion, prepare_remote_auth_submission,
+        cache_source_completion, evict_source_completion,
+        playlist_unavailable_reason_text_for_locale, prepare_remote_auth_submission,
         remote_failure_category, resolve_source_key, retained_removable_connect_failure,
-        with_active_source_key_snapshot, PendingConnection, RemoteFailureCategory,
-        SourceNavigation, TrackObject,
+        with_active_source_key_snapshot, PendingConnection, PlaylistRowUnavailableReason,
+        RemoteFailureCategory, SourceNavigation, TrackObject,
     };
     use crate::architecture::error::BackendError;
     use crate::architecture::AdvertisedHttpRoute;
@@ -1377,6 +1534,42 @@ mod tests {
                         "{locale} must not fall back to English for {category:?}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn every_playlist_unavailable_state_has_non_fallback_localized_copy() {
+        let reasons = [
+            PlaylistRowUnavailableReason::LocalTrackMissing,
+            PlaylistRowUnavailableReason::LocalTrackUnmatched,
+            PlaylistRowUnavailableReason::SourceUnavailable,
+            PlaylistRowUnavailableReason::UnsupportedSource,
+            PlaylistRowUnavailableReason::InvalidCatalogue,
+            PlaylistRowUnavailableReason::TrackMissing,
+        ];
+        let english_title =
+            rust_i18n::t!("regular_playlist.unavailable_track", locale = "en").into_owned();
+        let english_reasons =
+            reasons.map(|reason| playlist_unavailable_reason_text_for_locale(reason, "en"));
+
+        for locale in rust_i18n::available_locales!() {
+            let title =
+                rust_i18n::t!("regular_playlist.unavailable_track", locale = locale).into_owned();
+            assert!(!title.is_empty(), "{locale}: empty unavailable title");
+            for (reason, english) in reasons.into_iter().zip(english_reasons.iter()) {
+                let localized = playlist_unavailable_reason_text_for_locale(reason, &locale);
+                assert!(!localized.is_empty(), "{locale}: empty {reason:?} copy");
+                if locale != "en" {
+                    assert_ne!(
+                        localized,
+                        english.as_str(),
+                        "{locale}: fallback for {reason:?}"
+                    );
+                }
+            }
+            if locale != "en" {
+                assert_ne!(title, english_title, "{locale}: unavailable title fallback");
             }
         }
     }

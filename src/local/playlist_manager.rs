@@ -96,6 +96,19 @@ pub struct StoredPlaylistEntry {
     pub match_file_path: Option<String>,
 }
 
+/// One durable regular-playlist occurrence aligned with its current local
+/// library row, when the occurrence is owned by the built-in local source and
+/// its foreign-key cache still resolves.
+///
+/// Non-local and currently unmatched local occurrences deliberately carry
+/// `None`. The durable entry is retained in every case so callers never lose
+/// playlist order or confuse repeated media identities with one occurrence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedPlaylistEntry {
+    pub stored: StoredPlaylistEntry,
+    pub local_track: Option<track::Model>,
+}
+
 impl StoredPlaylistEntry {
     pub fn media_key(&self) -> Option<MediaKey> {
         self.track_id
@@ -416,8 +429,8 @@ impl PlaylistManager {
     /// occurrences in input order. Local identities are resolved against the
     /// current track table inside the same transaction and receive the local
     /// foreign-key cache. Non-local identities are persisted without a URI or
-    /// local foreign key; the UI does not expose remote mutations until its
-    /// live-session projection is implemented.
+    /// local foreign key; callers must obtain and recheck live catalogue
+    /// authority before entering this storage boundary.
     pub async fn add_entries(
         &self,
         playlist_id: &str,
@@ -651,6 +664,46 @@ impl PlaylistManager {
             .into_iter()
             .map(StoredPlaylistEntry::from_model)
             .collect()
+    }
+
+    /// Load every durable regular-playlist occurrence in stored order and
+    /// align it with its exact current local row when one exists.
+    ///
+    /// Playlist validation and the ordered left join share one read
+    /// transaction. Remote and unmatched local entries remain present with no
+    /// local model; duplicate occurrences remain separate rows even when they
+    /// resolve to the same local track.
+    pub async fn load_playlist_entries(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<LoadedPlaylistEntry>, DbErr> {
+        let txn = self.db.begin().await?;
+        require_regular_playlist(&txn, playlist_id).await?;
+        let rows = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
+            .order_by_asc(playlist_entry::Column::Position)
+            .find_also_related(track::Entity)
+            .all(&txn)
+            .await?;
+
+        let mut loaded = Vec::with_capacity(rows.len());
+        for (entry, local_track) in rows {
+            let stored = StoredPlaylistEntry::from_model(entry)?;
+            let local_track = if stored.source_id == SourceId::local() {
+                local_track
+            } else {
+                // Typed decoding rejects a non-local foreign-key cache. Keep
+                // the projection fail-closed as well if a future relation or
+                // schema change ever produces an unexpected joined row.
+                None
+            };
+            loaded.push(LoadedPlaylistEntry {
+                stored,
+                local_track,
+            });
+        }
+        txn.commit().await?;
+        Ok(loaded)
     }
 
     /// Get all matched tracks for a regular playlist (ordered by position).
@@ -1945,6 +1998,118 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
+    }
+
+    #[tokio::test]
+    async fn aligned_playlist_load_retains_every_occurrence_and_only_joins_exact_local_rows() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_playlist("Aligned mixed load", false)
+            .await
+            .expect("create playlist");
+        let local = insert_track(
+            &db,
+            "shared-native-id",
+            "/music/local.flac",
+            "Local title",
+            "Local artist",
+            "Local album",
+            Some(180),
+        )
+        .await;
+        let vanished = insert_track(
+            &db,
+            "vanished-local-id",
+            "/music/vanished.flac",
+            "Vanished title",
+            "Local artist",
+            "Local album",
+            Some(190),
+        )
+        .await;
+        let first_remote_source = SourceId::random();
+        let second_remote_source = SourceId::random();
+        let shared_remote_id = TrackId::remote("shared-native-id").expect("remote track ID");
+        let inserted = manager
+            .add_entries(
+                &playlist.id,
+                &[
+                    PlaylistEntryInput::new(
+                        MediaKey::new(first_remote_source, shared_remote_id.clone()),
+                        "First remote",
+                        "Remote artist",
+                        "Remote album",
+                        Some(200),
+                    ),
+                    PlaylistEntryInput::local(&local).expect("local playlist input"),
+                    PlaylistEntryInput::new(
+                        MediaKey::new(second_remote_source, shared_remote_id),
+                        "Second remote",
+                        "Remote artist",
+                        "Remote album",
+                        Some(210),
+                    ),
+                    PlaylistEntryInput::local(&local).expect("duplicate local playlist input"),
+                    PlaylistEntryInput::local(&vanished).expect("vanishing local playlist input"),
+                ],
+            )
+            .await
+            .expect("append mixed occurrences");
+
+        track::Entity::delete_by_id(vanished.id.clone())
+            .exec(&db)
+            .await
+            .expect("delete local row and clear its foreign-key cache");
+
+        let loaded = manager
+            .load_playlist_entries(&playlist.id)
+            .await
+            .expect("load aligned occurrences");
+        assert_eq!(loaded.len(), inserted.len());
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|entry| entry.stored.id.as_str())
+                .collect::<Vec<_>>(),
+            inserted
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|entry| entry.stored.position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(loaded[0].local_track, None, "remote rows never join local");
+        assert_eq!(loaded[2].local_track, None, "source identity isolates IDs");
+        assert_eq!(
+            loaded[1]
+                .local_track
+                .as_ref()
+                .map(|track| track.id.as_str()),
+            Some(local.id.as_str())
+        );
+        assert_eq!(
+            loaded[3]
+                .local_track
+                .as_ref()
+                .map(|track| track.id.as_str()),
+            Some(local.id.as_str()),
+            "duplicate occurrences remain independently aligned"
+        );
+        assert_ne!(loaded[1].stored.id, loaded[3].stored.id);
+        assert_eq!(loaded[1].stored.media_key(), loaded[3].stored.media_key());
+        assert_eq!(loaded[4].local_track, None);
+        assert_eq!(
+            loaded[4].stored.track_id.as_ref().map(TrackId::as_str),
+            Some(vanished.id.as_str()),
+            "local deletion preserves durable identity"
+        );
+        assert_eq!(loaded[4].stored.local_track_id, None);
     }
 
     #[tokio::test]

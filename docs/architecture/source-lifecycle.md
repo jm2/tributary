@@ -4,8 +4,8 @@
   P3.1 is complete. Physical removable-hardware, installed Flatpak portal/USB/custom-library, and
   packaged Windows DAAP/Subsonic playback validation remain tracked field work outside this
   decision. P1.5 migration 13 extends the same identity boundary into regular-playlist storage,
-  and Record A adds a default-deny live-catalogue authority boundary; mixed-source UI integration
-  remains a follow-up and does not reopen P3.1.
+  Record A adds a default-deny live-catalogue authority boundary, and Record B consumes it in
+  mixed-source Add/Remove/render/Play without reopening P3.1.
 - Decision date: 2026-07-17
 - Historical tracker:
   [P3.1](../task-remediation-2026-07.md#p31-introduce-a-sourcesession-registry)
@@ -41,10 +41,11 @@ generation-owned and cancelled on relocation, pre-unmount, removal, or shutdown.
 Regular-playlist storage now follows the same identity rule. Migration 13 assigns every existing
 entry to the built-in local source and stores its canonical `(source_id, track_id)` separately from
 the nullable local-track foreign-key cache. This foundation can represent another source without
-persisting its locator, credentials, lease, or session epoch. The shipping playlist projection is
-still deliberately local-only. P1.5 Record A now gives the live registry an internal, exact
-source/session/catalogue authority query, while Record B remains responsible for consuming it in
-Add/Remove/render/Play behavior. The full boundary is specified in
+persisting its locator, credentials, lease, or session epoch. P1.5 Record A gives the live registry
+an internal, exact source/session/catalogue authority query. Record B now makes that query the only
+non-local authority for regular-playlist Add and rendering, retains exact durable occurrence IDs
+for Remove, and carries each available row's closed guard into at-use stream and artwork
+resolution. The full boundary is specified in
 [`source-scoped-playlists.md`](../source-scoped-playlists.md).
 
 The implementation has now converged on this boundary. PR #120 implements stable identity, PR #121
@@ -174,7 +175,7 @@ Backend-native `TrackId` values are represented as follows:
 | Adapter | Native track identity |
 |---|---|
 | Local library | Exact SQLite `tracks.id` string |
-| Regular-playlist occurrence | The exact `TrackId` of its owning source; internal authority lookup exists, but rendered playlist rows remain local-only pending P1.5 Record B |
+| Regular-playlist occurrence | The exact `TrackId` of its owning source; local rows resolve through current database/file authority, while authenticated remote rows require current Record A catalogue authority and guarded at-use media resolution |
 | Subsonic | Exact song `id` returned by the server |
 | Jellyfin | Exact audio item `Id` returned by the server |
 | Plex | Exact track `ratingKey`; the media-part key remains a locator |
@@ -327,10 +328,12 @@ The local playback adapter resolves the exact database `TrackId` at use, obtains
 path, proves it is contained by the most-specific currently configured authoritative root,
 acquires retained root/marker/ancestor/file authority, and keeps that authority until the output
 or file server has finished consuming it. It rechecks database bindings after acquisition and
-rechecks current root configuration before output handoff. The current playlist navigation path
-queries entries by playlist ID and resolves their nullable `local_track_id` cache from the same
-current snapshot. Stored non-local identities remain outside that projection until Record B wires
-the live-registry authority foundation into the UI.
+rechecks current root configuration before output handoff. Regular-playlist navigation reads every
+durable entry by playlist ID in position order. It resolves a local occurrence's nullable
+`local_track_id` cache against the current database and each eligible non-local occurrence through
+the live-registry authority foundation. Missing local tracks and unavailable remote authority
+remain explicit removable rows rather than being omitted. Smart-playlist projection remains a live
+local-library query.
 
 Fingerprint/path fallback is only a local reconciliation operation. It is restricted to the exact
 built-in local `source_id` and updates both canonical `track_id` and `local_track_id` only after a
@@ -342,9 +345,11 @@ receives or reopens the playback-time path.
 
 A playlist is a `ViewOrigin`, not a source session. Each durable regular-playlist occurrence now
 names its actual media owner with `(source_id, track_id)` while keeping the playlist ID, entry ID,
-and position as view/occurrence state. The current regular- and smart-playlist queue path still
-publishes only local rows. Record A can validate exact current remote catalogue identity internally;
-mixed-source GTK rows, current-epoch adoption, unavailable presentation, and playback are Record B.
+and position as view/occurrence state. A regular-playlist row separately retains that media owner,
+its durable occurrence ID, and any current transient catalogue guard; the queue does not replace
+them with the playlist or local source. Unavailable rows expose fixed localized state without stale
+metadata or persisted fingerprints and cannot enter playback, but they remain removable. Smart
+playlist queues remain local-only.
 Deleting or rebuilding a playlist retires that view's pending navigation without pretending that
 the view owns any contributing source session.
 
@@ -596,11 +601,11 @@ queue can extend the same ephemeral-source rule explicitly.
   full and Range requests independent even when cloned OS handles share a cursor. Every
   replacement, Stop, error, terminal queue completion, ticket drop, or output teardown retires
   future lookups. Shared Chromecast cleanup retains legacy explicit-file routes while revoking
-  credential and retained-authority routes. The currently shipping playlist queue identity uses
-  the local source plus a separate `ViewOrigin`, so generic local retirement also retires a
-  playlist-origin queue without losing view navigation. P1.5 Record B will select the source per
-  stored occurrence through Record A's authority result and retain that same separation between
-  media owner and playlist view.
+  credential and retained-authority routes. A playlist queue retains its separate `ViewOrigin` but
+  selects the media source per stored occurrence. An exact local row takes the local authority path;
+  an authenticated remote row takes Record A's guarded stream/artwork path. Refresh, replacement,
+  retirement, disconnect, shutdown, stale epoch/generation, or missing membership therefore denies
+  a queued remote item at use without conflating source retirement with playlist navigation.
 - Removable sources derive `SourceId` from the best-available logical key and exact `TrackId` from
   the losslessly encoded mount-relative native path. Their registry-owned adapter publishes a
   pathless, epoch-bound accepted catalogue; retained mounted-root authority, an exact membership
@@ -722,9 +727,9 @@ persist credentials. Exact lifecycle trait names and event-channel shapes remain
 implementation details so long as one registry enforces this contract. A typed retained mutation
 authority for pathless removable Properties editing is deliberately deferred; the UI omits that
 action instead of reconstructing a path or weakening playback authority. Source-scoped regular-
-playlist storage and its default-deny live-catalogue authority are specified separately. Their
-Add/Remove/render/Play UI integration and Subsonic-native playlist synchronization remain
-explicitly deferred P1.5 work.
+playlist storage, default-deny live-catalogue authority, and Add/Remove/render/Play consumer are
+specified separately and complete. Subsonic-native playlist synchronization and mixed-source XSPF
+metadata export remain explicitly deferred P1.5 policies.
 
 ## Implementation sequence
 
@@ -762,7 +767,18 @@ explicitly deferred P1.5 work.
    capability and exact current source/session/catalogue lookup now bridge durable source-scoped
    identity to sanitized accepted metadata. Authenticated remote adapters opt in; radio,
    removable, external, and default adapters do not. Guarded stream/artwork resolution revalidates
-   before and after asynchronous work. This step deliberately adds no mixed-source playlist UI.
+   before and after asynchronous work. This step deliberately added no mixed-source playlist UI.
+9. **Mixed-source regular-playlist consumer complete
+   ([#142](https://github.com/jm2/tributary/pull/142)):** Add resolves and revalidates the entire
+   selected authenticated batch before one atomic ordered write; Remove addresses exact durable
+   occurrence IDs. Projection preserves positions and duplicates and retains disconnected,
+   retired/unavailable-source, unsupported-source, invalid-catalogue, missing-track, and
+   missing/unmatched-local entries as localized removable rows without displaying persisted
+   fingerprints. Stale projection work/results are discarded, and the playlist is invalidated and
+   reprojected; staleness is not a row reason. Queue items keep per-row media ownership, and remote
+   stream/artwork calls deny stale closed guards at use. Local history ownership and remote rating
+   capability remain unchanged. Smart playlists and XSPF import/export remain local-only;
+   mixed-source metadata export and Subsonic-native playlist synchronization remain separate.
 
 The authenticated-remote cutover's locked debug and release suites each passed 20 library, 865
 application, and 10 repository-metadata tests (895 total), with locked all-target/all-feature

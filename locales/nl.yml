@@ -190,7 +190,17 @@ context:
   add_to_playlist: "Toevoegen aan afspeellijst"
   remove_from_playlist: "Verwijderen uit afspeellijst"
   playlist_add_unsupported_heading: "Nummers zijn niet toegevoegd"
-  playlist_add_unsupported_body: "Op dit moment kunnen alleen nummers uit de lokale bibliotheek van Tributary aan afspeellijsten worden toegevoegd. Er is niets uit deze bron toegevoegd."
+  playlist_add_unsupported_body: "Ten minste één geselecteerd nummer is niet beschikbaar of wordt niet ondersteund in gewone afspeellijsten. Er is niets toegevoegd."
+
+# ── Gewone afspeellijsten ─────────────────────────────────────────
+regular_playlist:
+  unavailable_track: "Nummer niet beschikbaar"
+  source_unavailable: "Bron niet verbonden of niet beschikbaar"
+  source_unsupported: "Deze bron kan niet in gewone afspeellijsten worden gebruikt"
+  source_catalogue_unavailable: "Bronbibliotheek niet beschikbaar"
+  track_missing: "Het nummer bestaat niet meer in deze bron"
+  mutation_failed_heading: "Afspeellijst is niet bijgewerkt"
+  mutation_failed_body: "Tributary kon de afspeellijst niet bijwerken. Er is niets gewijzigd."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

@@ -190,7 +190,17 @@ context:
   add_to_playlist: "Dodaj do listy odtwarzania"
   remove_from_playlist: "Usuń z listy odtwarzania"
   playlist_add_unsupported_heading: "Utwory nie zostały dodane"
-  playlist_add_unsupported_body: "Obecnie do list odtwarzania można dodawać tylko utwory z lokalnej biblioteki Tributary. Nie dodano niczego z tego źródła."
+  playlist_add_unsupported_body: "Co najmniej jeden wybrany utwór jest niedostępny lub nie jest obsługiwany w zwykłych listach odtwarzania. Nic nie dodano."
+
+# ── Zwykłe listy odtwarzania ───────────────────────────────────────
+regular_playlist:
+  unavailable_track: "Niedostępny utwór"
+  source_unavailable: "Źródło jest rozłączone lub niedostępne"
+  source_unsupported: "Tego źródła nie można używać w zwykłych listach odtwarzania"
+  source_catalogue_unavailable: "Biblioteka źródła jest niedostępna"
+  track_missing: "Utwór nie istnieje już w tym źródle"
+  mutation_failed_heading: "Lista odtwarzania nie została zaktualizowana"
+  mutation_failed_body: "Nie udało się zaktualizować listy odtwarzania w Tributary. Niczego nie zmieniono."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

@@ -190,7 +190,17 @@ context:
   add_to_playlist: "Añadir a lista de reproducción"
   remove_from_playlist: "Quitar de lista de reproducción"
   playlist_add_unsupported_heading: "No se añadieron pistas"
-  playlist_add_unsupported_body: "Por ahora, solo se pueden añadir a las listas de reproducción pistas de la biblioteca local de Tributary. No se añadió nada de esta fuente."
+  playlist_add_unsupported_body: "Al menos una pista seleccionada no está disponible o no es compatible con las listas de reproducción normales. No se añadió nada."
+
+# ── Listas de reproducción normales ───────────────────────────────────
+regular_playlist:
+  unavailable_track: "Pista no disponible"
+  source_unavailable: "Fuente desconectada o no disponible"
+  source_unsupported: "Esta fuente no se puede usar en listas de reproducción normales"
+  source_catalogue_unavailable: "Biblioteca de la fuente no disponible"
+  track_missing: "La pista ya no existe en esta fuente"
+  mutation_failed_heading: "No se actualizó la lista de reproducción"
+  mutation_failed_body: "Tributary no pudo actualizar la lista de reproducción. No se cambió nada."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

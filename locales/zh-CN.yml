@@ -190,7 +190,17 @@ context:
   add_to_playlist: "添加到播放列表"
   remove_from_playlist: "从播放列表中移除"
   playlist_add_unsupported_heading: "曲目未添加"
-  playlist_add_unsupported_body: "目前，只有 Tributary 本地音乐库中的曲目才能添加到播放列表。此数据源中的内容均未添加。"
+  playlist_add_unsupported_body: "至少有一个所选曲目不可用，或不支持添加到常规播放列表。未添加任何曲目。"
+
+# ── 常规播放列表 ────────────────────────────────────────────
+regular_playlist:
+  unavailable_track: "不可用的曲目"
+  source_unavailable: "数据源已断开连接或不可用"
+  source_unsupported: "此数据源不能用于常规播放列表"
+  source_catalogue_unavailable: "数据源音乐库不可用"
+  track_missing: "此数据源中已不存在该曲目"
+  mutation_failed_heading: "播放列表未更新"
+  mutation_failed_body: "Tributary 无法更新播放列表。未进行任何更改。"
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

@@ -190,7 +190,17 @@ context:
   add_to_playlist: "Ajouter à la liste de lecture"
   remove_from_playlist: "Retirer de la liste de lecture"
   playlist_add_unsupported_heading: "Les pistes n’ont pas été ajoutées"
-  playlist_add_unsupported_body: "Pour le moment, seules les pistes de la bibliothèque locale de Tributary peuvent être ajoutées aux listes de lecture. Aucune piste provenant de cette source n’a été ajoutée."
+  playlist_add_unsupported_body: "Au moins une piste sélectionnée est indisponible ou n’est pas prise en charge dans les listes de lecture normales. Aucune piste n’a été ajoutée."
+
+# ── Listes de lecture normales ───────────────────────────────────────
+regular_playlist:
+  unavailable_track: "Piste indisponible"
+  source_unavailable: "Source déconnectée ou indisponible"
+  source_unsupported: "Cette source ne peut pas être utilisée dans les listes de lecture normales"
+  source_catalogue_unavailable: "Bibliothèque de la source indisponible"
+  track_missing: "La piste n’existe plus dans cette source"
+  mutation_failed_heading: "La liste de lecture n’a pas été mise à jour"
+  mutation_failed_body: "Tributary n’a pas pu mettre à jour la liste de lecture. Aucune modification n’a été effectuée."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

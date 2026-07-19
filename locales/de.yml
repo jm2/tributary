@@ -190,7 +190,17 @@ context:
   add_to_playlist: "Zur Wiedergabeliste hinzufügen"
   remove_from_playlist: "Aus Wiedergabeliste entfernen"
   playlist_add_unsupported_heading: "Titel wurden nicht hinzugefügt"
-  playlist_add_unsupported_body: "Derzeit können nur Titel aus der lokalen Bibliothek von Tributary zu Wiedergabelisten hinzugefügt werden. Aus dieser Quelle wurde nichts hinzugefügt."
+  playlist_add_unsupported_body: "Mindestens ein ausgewählter Titel ist nicht verfügbar oder wird in regulären Wiedergabelisten nicht unterstützt. Es wurde nichts hinzugefügt."
+
+# ── Reguläre Wiedergabelisten ─────────────────────────────────────
+regular_playlist:
+  unavailable_track: "Nicht verfügbarer Titel"
+  source_unavailable: "Quelle getrennt oder nicht verfügbar"
+  source_unsupported: "Diese Quelle kann nicht in regulären Wiedergabelisten verwendet werden"
+  source_catalogue_unavailable: "Medienbibliothek der Quelle nicht verfügbar"
+  track_missing: "Der Titel ist in dieser Quelle nicht mehr vorhanden"
+  mutation_failed_heading: "Wiedergabeliste wurde nicht aktualisiert"
+  mutation_failed_body: "Tributary konnte die Wiedergabeliste nicht aktualisieren. Es wurde nichts geändert."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

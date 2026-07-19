@@ -190,7 +190,17 @@ context:
   add_to_playlist: "Aggiungi alla playlist"
   remove_from_playlist: "Rimuovi dalla playlist"
   playlist_add_unsupported_heading: "I brani non sono stati aggiunti"
-  playlist_add_unsupported_body: "Al momento, è possibile aggiungere alle playlist solo i brani della libreria locale di Tributary. Non è stato aggiunto nulla da questa sorgente."
+  playlist_add_unsupported_body: "Almeno un brano selezionato non è disponibile o non è supportato nelle playlist normali. Non è stato aggiunto nulla."
+
+# ── Playlist normali ─────────────────────────────────────────────
+regular_playlist:
+  unavailable_track: "Brano non disponibile"
+  source_unavailable: "Sorgente disconnessa o non disponibile"
+  source_unsupported: "Questa sorgente non può essere usata nelle playlist normali"
+  source_catalogue_unavailable: "Libreria della sorgente non disponibile"
+  track_missing: "Il brano non esiste più in questa sorgente"
+  mutation_failed_heading: "La playlist non è stata aggiornata"
+  mutation_failed_body: "Tributary non ha potuto aggiornare la playlist. Non è stato modificato nulla."
 
 # ── Properties dialog ──────────────────────────────────────────────
 properties:

@@ -15,6 +15,7 @@ pub mod persistence;
 pub mod playback;
 pub mod playlist_actions;
 pub mod playlist_editor;
+pub mod playlist_projection;
 pub mod preferences;
 pub mod properties_dialog;
 pub mod radio;
