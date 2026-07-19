@@ -25,6 +25,7 @@ use tokio::task::AbortHandle;
 use uuid::Uuid;
 
 use crate::architecture::backend::BackendResult;
+use crate::architecture::error::BackendError;
 use crate::architecture::media::MediaLease;
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::architecture::{SourceId, ViewOrigin};
@@ -35,6 +36,13 @@ use crate::local::resolver::ResolvedFileMedia;
 pub enum AdapterStream {
     ProtectedHttp(Box<ResolvedHttpRequest>),
     File(ResolvedFileMedia),
+}
+
+/// Internal distinction used to close raw adapter errors at the public
+/// regular-playlist registry boundary.
+pub enum CatalogueMediaResolveError {
+    Unavailable,
+    Backend(BackendError),
 }
 
 impl AdapterStream {
@@ -545,6 +553,7 @@ pub struct AcceptedSnapshot<S> {
     pub generation: u64,
     pub session_epoch: u64,
     pub value: Arc<S>,
+    authority: MediaLease,
 }
 
 /// Value selected from the newest accepted view that contributes it.
@@ -555,7 +564,46 @@ pub struct AcceptedSnapshot<S> {
 pub struct LatestAcceptedView<T> {
     pub generation: u64,
     pub session_epoch: u64,
+    pub(crate) authority: MediaLease,
     pub value: T,
+}
+
+/// Value selected from the one currently accepted source-wide catalogue.
+///
+/// The immutable catalogue snapshot, generation, active session epoch, and
+/// authority are captured atomically. The selector then runs outside the
+/// lifecycle lock. The selected value must not retain the catalogue payload
+/// itself.
+pub struct CurrentAcceptedCatalogue<T> {
+    pub generation: u64,
+    pub session_epoch: u64,
+    pub authority: MediaLease,
+    pub value: T,
+}
+
+impl<S> AcceptedSnapshot<S> {
+    fn new(generation: u64, session_epoch: u64, value: S) -> Self {
+        Self {
+            generation,
+            session_epoch,
+            value: Arc::new(value),
+            authority: MediaLease::new(),
+        }
+    }
+
+    fn revoke(&self) {
+        self.authority.revoke();
+    }
+
+    pub(crate) fn map<T>(self, project: impl FnOnce(&S) -> T) -> AcceptedSnapshot<T> {
+        let value = project(self.value.as_ref());
+        AcceptedSnapshot {
+            generation: self.generation,
+            session_epoch: self.session_epoch,
+            value: Arc::new(value),
+            authority: self.authority,
+        }
+    }
 }
 
 impl<S> Clone for AcceptedSnapshot<S> {
@@ -564,6 +612,7 @@ impl<S> Clone for AcceptedSnapshot<S> {
             generation: self.generation,
             session_epoch: self.session_epoch,
             value: Arc::clone(&self.value),
+            authority: self.authority.clone(),
         }
     }
 }
@@ -679,6 +728,42 @@ impl<A: ?Sized, S> Entry<A, S> {
 
     fn session_epoch(&self) -> Option<u64> {
         self.active.as_ref().map(|session| session.epoch)
+    }
+
+    fn replace_catalogue(&mut self, accepted: AcceptedSnapshot<S>) {
+        if let Some(previous) = self.catalogue.as_ref() {
+            previous.revoke();
+        }
+        self.catalogue = Some(accepted);
+    }
+
+    fn replace_view(&mut self, view: ViewOrigin, accepted: AcceptedSnapshot<S>) {
+        if let Some(previous) = self.views.get(&view) {
+            previous.revoke();
+        }
+        self.views.insert(view, accepted);
+    }
+
+    fn remove_view(&mut self, view: &ViewOrigin) -> bool {
+        let Some(removed) = self.views.get(view) else {
+            return false;
+        };
+        removed.revoke();
+        self.views.remove(view);
+        true
+    }
+
+    fn revoke_snapshots(&mut self) -> bool {
+        let had_snapshots = self.catalogue.is_some() || !self.views.is_empty();
+        if let Some(catalogue) = self.catalogue.as_ref() {
+            catalogue.revoke();
+        }
+        for view in self.views.values() {
+            view.revoke();
+        }
+        self.catalogue = None;
+        self.views.clear();
+        had_snapshots
     }
 
     fn active_state(&self) -> SourceState {
@@ -955,8 +1040,7 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
                     active.lease.revoke();
                     retirements.push((active.adapter, self.tracker.participate()));
                 }
-                entry.catalogue = None;
-                entry.views.clear();
+                entry.revoke_snapshots();
                 entry.failure = None;
                 entry.refresh_failures.clear();
                 entry.disconnect_retirement = None;
@@ -1044,6 +1128,9 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
             return false;
         }
         self.publish_locked(state, source_id, LifecycleChange::Pruned);
+        if let Some(entry) = state.entries.get_mut(&source_id) {
+            entry.revoke_snapshots();
+        }
         state.entries.remove(&source_id);
         true
     }
@@ -1547,20 +1634,16 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
         ) {
             return false;
         }
-        let accepted = AcceptedSnapshot {
-            generation,
-            session_epoch,
-            value: Arc::new(snapshot),
-        };
+        let accepted = AcceptedSnapshot::new(generation, session_epoch, snapshot);
         let entry = state
             .entries
             .get_mut(&source_id)
             .expect("current source exists");
         entry.refreshes.remove(lane);
         match lane {
-            RefreshLane::Catalogue => entry.catalogue = Some(accepted),
+            RefreshLane::Catalogue => entry.replace_catalogue(accepted),
             RefreshLane::View(view) => {
-                entry.views.insert(view.clone(), accepted);
+                entry.replace_view(view.clone(), accepted);
             }
         }
         self.set_refresh_failure_locked(
@@ -1905,11 +1988,14 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         entry
             .views
             .values()
-            .filter(|accepted| accepted.session_epoch == expected_session_epoch)
+            .filter(|accepted| {
+                accepted.session_epoch == expected_session_epoch && accepted.authority.is_active()
+            })
             .filter_map(|accepted| {
                 select(accepted.value.as_ref()).map(|value| LatestAcceptedView {
                     generation: accepted.generation,
                     session_epoch: accepted.session_epoch,
+                    authority: accepted.authority.clone(),
                     value,
                 })
             })
@@ -1931,6 +2017,132 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             .is_some_and(|accepted| accepted.generation == winner_generation)
     }
 
+    /// Select a bounded value from the currently accepted source-wide
+    /// catalogue and its exact active session in one locked observation.
+    ///
+    /// This deliberately does not inspect [`SourceState`]. A predecessor
+    /// catalogue remains authoritative while a replacement is connecting or
+    /// after that replacement fails. Conversely, a catalogue without its
+    /// exact active, unrevoked session is never selectable.
+    pub(crate) fn resolve_current_accepted_catalogue<T, Select>(
+        &self,
+        source_id: SourceId,
+        select: Select,
+    ) -> Option<CurrentAcceptedCatalogue<T>>
+    where
+        Select: FnOnce(&S) -> Option<T>,
+    {
+        let (generation, session_epoch, session_lease, authority, catalogue_value) = {
+            let state = lock(&self.inner.state);
+            if state.gate != RegistryGate::Running {
+                return None;
+            }
+            let entry = state.entries.get(&source_id)?;
+            let active = entry.active.as_ref()?;
+            if !active.lease.is_active() {
+                return None;
+            }
+            let catalogue = entry.catalogue.as_ref()?;
+            if catalogue.session_epoch != active.epoch || !catalogue.authority.is_active() {
+                return None;
+            }
+            (
+                catalogue.generation,
+                catalogue.session_epoch,
+                active.lease.clone(),
+                catalogue.authority.clone(),
+                Arc::clone(&catalogue.value),
+            )
+        };
+        let value = select(catalogue_value.as_ref())?;
+        if !session_lease.is_active()
+            || !authority.is_active()
+            || !self.is_exact_catalogue_snapshot_current(
+                source_id,
+                generation,
+                session_epoch,
+                &catalogue_value,
+            )
+        {
+            return None;
+        }
+        Some(CurrentAcceptedCatalogue {
+            generation,
+            session_epoch,
+            authority,
+            value,
+        })
+    }
+
+    /// Select from one exact accepted catalogue identity.
+    pub(crate) fn resolve_exact_accepted_catalogue<T, Select>(
+        &self,
+        source_id: SourceId,
+        expected_generation: u64,
+        expected_session_epoch: u64,
+        select: Select,
+    ) -> Option<T>
+    where
+        Select: FnOnce(&S) -> Option<T>,
+    {
+        let (session_lease, authority, catalogue_value) = {
+            let state = lock(&self.inner.state);
+            if state.gate != RegistryGate::Running {
+                return None;
+            }
+            let entry = state.entries.get(&source_id)?;
+            let active = entry.active.as_ref()?;
+            let catalogue = entry.catalogue.as_ref()?;
+            if !active.lease.is_active()
+                || active.epoch != expected_session_epoch
+                || catalogue.session_epoch != expected_session_epoch
+                || catalogue.generation != expected_generation
+                || !catalogue.authority.is_active()
+            {
+                return None;
+            }
+            (
+                active.lease.clone(),
+                catalogue.authority.clone(),
+                Arc::clone(&catalogue.value),
+            )
+        };
+        let selected = select(catalogue_value.as_ref())?;
+        (session_lease.is_active()
+            && authority.is_active()
+            && self.is_exact_catalogue_snapshot_current(
+                source_id,
+                expected_generation,
+                expected_session_epoch,
+                &catalogue_value,
+            ))
+        .then_some(selected)
+    }
+
+    /// Recheck the exact immutable catalogue captured before an unlocked
+    /// selector ran. Generation and epoch are necessary but the pointer check
+    /// also proves that no replacement reused the expected metadata.
+    fn is_exact_catalogue_snapshot_current(
+        &self,
+        source_id: SourceId,
+        expected_generation: u64,
+        expected_session_epoch: u64,
+        expected_value: &Arc<S>,
+    ) -> bool {
+        let state = lock(&self.inner.state);
+        state.gate == RegistryGate::Running
+            && state.entries.get(&source_id).is_some_and(|entry| {
+                entry.active.as_ref().is_some_and(|active| {
+                    active.epoch == expected_session_epoch && active.lease.is_active()
+                }) && entry.catalogue.as_ref().is_some_and(|catalogue| {
+                    catalogue.generation == expected_generation
+                        && catalogue.session_epoch == expected_session_epoch
+                        && catalogue.authority.is_active()
+                        && Arc::ptr_eq(&catalogue.value, expected_value)
+                })
+            })
+    }
+
     /// Validate one accepted catalogue identity without cloning its value.
     pub fn is_current_catalogue(
         &self,
@@ -1938,15 +2150,8 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         generation: u64,
         session_epoch: u64,
     ) -> bool {
-        let state = lock(&self.inner.state);
-        state.gate == RegistryGate::Running
-            && state
-                .entries
-                .get(&source_id)
-                .and_then(|entry| entry.catalogue.as_ref())
-                .is_some_and(|catalogue| {
-                    catalogue.generation == generation && catalogue.session_epoch == session_epoch
-                })
+        self.resolve_exact_accepted_catalogue(source_id, generation, session_epoch, |_| Some(()))
+            .is_some()
     }
 
     /// Atomically capture the global revision and every logical source.
@@ -1981,6 +2186,154 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             adapter: session.adapter.operational(),
             lease: session.lease.clone(),
         })
+    }
+
+    /// Resolve through one exact accepted catalogue and active adapter.
+    ///
+    /// The catalogue snapshot is captured atomically with the adapter, epoch,
+    /// and leases. Its selector runs outside the lifecycle lock, and exact
+    /// identity and authority are checked again after the async adapter call.
+    /// This is intentionally separate from exact-session media
+    /// resolution: a same-session catalogue replacement must revoke a
+    /// persisted playlist reference even though the adapter epoch is stable.
+    async fn resolve_exact_catalogue_session<R, T, Select, F, Fut>(
+        &self,
+        source_id: SourceId,
+        expected_generation: u64,
+        expected_session_epoch: u64,
+        select: Select,
+        resolve: F,
+    ) -> Result<(R, MediaLease, MediaLease, T), CatalogueMediaResolveError>
+    where
+        S: Send + Sync,
+        T: Send,
+        Select: Fn(&S) -> Option<T> + Send + Sync,
+        F: FnOnce(Arc<A>) -> Fut + Send,
+        Fut: Future<Output = BackendResult<R>> + Send,
+    {
+        let (session, catalogue_authority, catalogue_value) = {
+            let state = lock(&self.inner.state);
+            if state.gate != RegistryGate::Running {
+                return Err(CatalogueMediaResolveError::Unavailable);
+            }
+            let Some(entry) = state.entries.get(&source_id) else {
+                return Err(CatalogueMediaResolveError::Unavailable);
+            };
+            let Some(active) = entry.active.as_ref() else {
+                return Err(CatalogueMediaResolveError::Unavailable);
+            };
+            let Some(catalogue) = entry.catalogue.as_ref() else {
+                return Err(CatalogueMediaResolveError::Unavailable);
+            };
+            if !active.lease.is_active()
+                || active.epoch != expected_session_epoch
+                || catalogue.session_epoch != expected_session_epoch
+                || catalogue.generation != expected_generation
+                || !catalogue.authority.is_active()
+            {
+                return Err(CatalogueMediaResolveError::Unavailable);
+            }
+            (
+                SessionHandle {
+                    session_epoch: active.epoch,
+                    adapter: active.adapter.operational(),
+                    lease: active.lease.clone(),
+                },
+                catalogue.authority.clone(),
+                Arc::clone(&catalogue.value),
+            )
+        };
+
+        let selected =
+            select(catalogue_value.as_ref()).ok_or(CatalogueMediaResolveError::Unavailable)?;
+        if !session.lease.is_active()
+            || !catalogue_authority.is_active()
+            || !self.is_exact_catalogue_snapshot_current(
+                source_id,
+                expected_generation,
+                expected_session_epoch,
+                &catalogue_value,
+            )
+        {
+            return Err(CatalogueMediaResolveError::Unavailable);
+        }
+
+        let lease = session.lease.clone();
+        let resolved = resolve(session.adapter).await;
+        let remains_current = lease.is_active()
+            && catalogue_authority.is_active()
+            && self.is_exact_catalogue_snapshot_current(
+                source_id,
+                expected_generation,
+                expected_session_epoch,
+                &catalogue_value,
+            );
+        if !remains_current {
+            return Err(CatalogueMediaResolveError::Unavailable);
+        }
+        let resolved = resolved.map_err(CatalogueMediaResolveError::Backend)?;
+        Ok((resolved, lease, catalogue_authority, selected))
+    }
+
+    /// Resolve one stream through exact catalogue membership and attach the
+    /// captured session lease before returning it with the selector value.
+    pub(crate) async fn resolve_catalogue_stream<T, Select, F, Fut>(
+        &self,
+        source_id: SourceId,
+        expected_generation: u64,
+        expected_session_epoch: u64,
+        select: Select,
+        resolve: F,
+    ) -> Result<(AdapterStream, MediaLease, T), CatalogueMediaResolveError>
+    where
+        S: Send + Sync,
+        T: Send,
+        Select: Fn(&S) -> Option<T> + Send + Sync,
+        F: FnOnce(Arc<A>) -> Fut + Send,
+        Fut: Future<Output = BackendResult<AdapterStream>> + Send,
+    {
+        let (stream, lease, catalogue_authority, selected) = self
+            .resolve_exact_catalogue_session(
+                source_id,
+                expected_generation,
+                expected_session_epoch,
+                select,
+                resolve,
+            )
+            .await?;
+        Ok((stream.with_lease(lease), catalogue_authority, selected))
+    }
+
+    /// Optional-artwork counterpart of [`Self::resolve_catalogue_stream`].
+    pub(crate) async fn resolve_catalogue_optional_http<T, Select, F, Fut>(
+        &self,
+        source_id: SourceId,
+        expected_generation: u64,
+        expected_session_epoch: u64,
+        select: Select,
+        resolve: F,
+    ) -> Result<(Option<ResolvedHttpRequest>, MediaLease, T), CatalogueMediaResolveError>
+    where
+        S: Send + Sync,
+        T: Send,
+        Select: Fn(&S) -> Option<T> + Send + Sync,
+        F: FnOnce(Arc<A>) -> Fut + Send,
+        Fut: Future<Output = BackendResult<Option<ResolvedHttpRequest>>> + Send,
+    {
+        let (request, lease, catalogue_authority, selected) = self
+            .resolve_exact_catalogue_session(
+                source_id,
+                expected_generation,
+                expected_session_epoch,
+                select,
+                resolve,
+            )
+            .await?;
+        Ok((
+            request.map(|request| request.with_lease(lease)),
+            catalogue_authority,
+            selected,
+        ))
     }
 
     /// Resolve an adapter-owned capability through one exact session and
@@ -2390,7 +2743,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             return false;
         };
         let pending = entry.refreshes.remove(&lane);
-        let removed_snapshot = entry.views.remove(view).is_some();
+        let removed_snapshot = entry.remove_view(view);
         let removed_failure = entry.refresh_failures.get(&lane).copied();
         let had_pending = pending.is_some();
         if let Some(operation) = pending {
@@ -2564,9 +2917,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             RegistryInner::<A, S>::cancel_pending(refresh);
         }
         let active = entry.active.take();
-        let had_snapshots = entry.catalogue.is_some() || !entry.views.is_empty();
-        entry.catalogue = None;
-        entry.views.clear();
+        let had_snapshots = entry.revoke_snapshots();
         let session_failure = entry.failure;
         let refresh_failure_lanes: Vec<_> = entry
             .refresh_failures
@@ -2688,15 +3039,13 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                 for refresh in entry.refreshes.drain().map(|(_, operation)| operation) {
                     RegistryInner::<A, S>::cancel_pending(refresh);
                 }
-                let had_snapshots = entry.catalogue.is_some() || !entry.views.is_empty();
+                let had_snapshots = entry.revoke_snapshots();
                 let session_failure = entry.failure;
                 let refresh_failure_lanes: Vec<_> = entry
                     .refresh_failures
                     .iter()
                     .map(|(lane, failure)| (lane.clone(), failure.correlation))
                     .collect();
-                entry.catalogue = None;
-                entry.views.clear();
                 (
                     entry.active.take(),
                     entry.disconnect_retirement.is_some(),
@@ -2911,24 +3260,26 @@ impl<A: LifecycleAdapter + ?Sized, S> ConnectOwner<A, S> {
                 RegistryInner::<A, S>::cancel_pending(refresh);
             }
             let replaced_epoch = predecessor.as_ref().map(|session| session.epoch);
+            if let Some(predecessor) = predecessor.as_ref() {
+                // Lock-free consumers must lose predecessor authority before
+                // any successor state is installed. Retirement repeats this
+                // idempotent revocation when it takes close ownership.
+                predecessor.lease.revoke();
+            }
             let lease = MediaLease::new();
-            let accepted_snapshot = AcceptedSnapshot {
-                generation: self.generation,
-                session_epoch,
-                value: Arc::new(snapshot),
-            };
+            let accepted_snapshot = AcceptedSnapshot::new(self.generation, session_epoch, snapshot);
             {
                 let entry = state
                     .entries
                     .get_mut(&self.source_id)
                     .expect("accepted source exists");
+                entry.revoke_snapshots();
                 entry.active = Some(ActiveSession {
                     epoch: session_epoch,
                     adapter,
                     lease: lease.clone(),
                 });
                 entry.catalogue = Some(accepted_snapshot);
-                entry.views.clear();
             }
             if let Some(predecessor) = predecessor {
                 jobs.push(self.inner.prepare_retirement_locked(
@@ -5196,6 +5547,366 @@ mod tests {
         predecessor.allow_close();
         predecessor.probe.wait_for_completions(1).await;
         shutdown_immediate(&registry).await;
+    }
+
+    #[tokio::test]
+    async fn accepted_catalogue_selector_preserves_predecessor_and_rejects_exact_staleness() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        claim(&registry, source_id, SourceProvenance::Saved);
+        let mut predecessor = AdapterFixture::immediate();
+        let (epoch, _) = adopt(&registry, source_id, &mut predecessor, vec!["predecessor"]);
+        let initial = registry
+            .resolve_current_accepted_catalogue(source_id, |catalogue| catalogue.first().copied())
+            .expect("accepted predecessor catalogue");
+        assert_eq!(initial.session_epoch, epoch);
+        assert_eq!(initial.value, "predecessor");
+        assert!(initial.authority.is_active());
+
+        let replacement = registry
+            .begin_connect(source_id)
+            .expect("replacement pending");
+        let during_connect = registry
+            .resolve_current_accepted_catalogue(source_id, |catalogue| catalogue.first().copied())
+            .expect("predecessor remains accepted while connecting");
+        assert_eq!(during_connect.generation, initial.generation);
+        assert!(replacement.fail(FailureCategory::Timeout));
+        assert_eq!(
+            registry
+                .resolve_current_accepted_catalogue(source_id, |catalogue| {
+                    catalogue.first().copied()
+                })
+                .expect("failed replacement preserves predecessor")
+                .generation,
+            initial.generation
+        );
+
+        let stale_selector_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&stale_selector_calls);
+        assert!(registry
+            .resolve_exact_accepted_catalogue(
+                source_id,
+                initial.generation.wrapping_add(1),
+                epoch,
+                move |_| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    Some(())
+                },
+            )
+            .is_none());
+        assert_eq!(stale_selector_calls.load(Ordering::Acquire), 0);
+
+        let refresh = registry
+            .begin_refresh(source_id, RefreshLane::Catalogue)
+            .expect("catalogue refresh");
+        let refreshed_generation = refresh.generation();
+        assert!(refresh.submit(vec!["refreshed"]));
+        assert!(!initial.authority.is_active());
+        assert!(registry
+            .resolve_exact_accepted_catalogue(source_id, initial.generation, epoch, |_| Some(()),)
+            .is_none());
+        assert_eq!(
+            registry
+                .resolve_current_accepted_catalogue(source_id, |catalogue| {
+                    catalogue.first().copied()
+                })
+                .expect("refreshed catalogue")
+                .generation,
+            refreshed_generation
+        );
+        shutdown_immediate(&registry).await;
+    }
+
+    #[tokio::test]
+    async fn accepted_snapshot_authority_revokes_while_parked_clone_remains_alive() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        claim(&registry, source_id, SourceProvenance::Saved);
+        let mut adapter = AdapterFixture::immediate();
+        adopt(&registry, source_id, &mut adapter, vec!["initial"]);
+
+        let parked_refresh = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("parked accepted snapshot");
+        assert!(parked_refresh.authority.is_active());
+        let refresh = registry
+            .begin_refresh(source_id, RefreshLane::Catalogue)
+            .expect("refresh");
+        assert!(refresh.submit(vec!["replacement"]));
+        assert!(
+            !parked_refresh.authority.is_active(),
+            "replacement revokes authority independently of payload Arc lifetime"
+        );
+        assert_eq!(parked_refresh.value.as_slice(), &["initial"]);
+
+        let parked_disconnect = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("parked replacement snapshot");
+        assert!(parked_disconnect.authority.is_active());
+        let waiter = registry.disconnect(source_id).expect("disconnect");
+        assert!(
+            !parked_disconnect.authority.is_active(),
+            "disconnect revokes authority synchronously while clone is parked"
+        );
+        waiter.wait().await;
+        assert!(registry.shutdown().is_complete());
+    }
+
+    #[tokio::test]
+    async fn catalogue_selectors_run_unlocked_and_revalidate_before_return_or_adapter_work() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        claim(&registry, source_id, SourceProvenance::Saved);
+        let mut adapter = AdapterFixture::immediate();
+        let (epoch, _) = adopt(&registry, source_id, &mut adapter, vec!["initial"]);
+
+        let selector_registry = registry.clone();
+        let current = registry.resolve_current_accepted_catalogue(source_id, move |catalogue| {
+            assert!(selector_registry.inner.state.try_lock().is_ok());
+            let refresh = selector_registry
+                .begin_refresh(source_id, RefreshLane::Catalogue)
+                .expect("refresh from current selector");
+            assert!(refresh.submit(vec!["after-current"]));
+            catalogue.first().copied()
+        });
+        assert!(
+            current.is_none(),
+            "selector-time refresh must stale the result"
+        );
+
+        let after_current = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("catalogue after current-selector refresh");
+        let selector_registry = registry.clone();
+        let exact = registry.resolve_exact_accepted_catalogue(
+            source_id,
+            after_current.generation,
+            epoch,
+            move |catalogue| {
+                assert!(selector_registry.inner.state.try_lock().is_ok());
+                let refresh = selector_registry
+                    .begin_refresh(source_id, RefreshLane::Catalogue)
+                    .expect("refresh from exact selector");
+                assert!(refresh.submit(vec!["after-exact"]));
+                catalogue.first().copied()
+            },
+        );
+        assert!(
+            exact.is_none(),
+            "exact selector must recheck after selection"
+        );
+
+        let after_exact = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("catalogue after exact-selector refresh");
+        let adapter_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&adapter_calls);
+        let selector_registry = registry.clone();
+        let result = registry
+            .resolve_catalogue_optional_http(
+                source_id,
+                after_exact.generation,
+                epoch,
+                move |catalogue| {
+                    assert!(selector_registry.inner.state.try_lock().is_ok());
+                    let refresh = selector_registry
+                        .begin_refresh(source_id, RefreshLane::Catalogue)
+                        .expect("refresh from media selector");
+                    assert!(refresh.submit(vec!["after-media"]));
+                    catalogue.contains(&"after-exact").then_some(())
+                },
+                move |_| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    async { Ok(None) }
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            adapter_calls.load(Ordering::Acquire),
+            0,
+            "a selector-time refresh must prevent stale adapter work"
+        );
+
+        shutdown_immediate(&registry).await;
+    }
+
+    #[tokio::test]
+    async fn guarded_catalogue_resolution_closes_pre_call_and_in_flight_refresh_races() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        claim(&registry, source_id, SourceProvenance::Saved);
+        let mut adapter = AdapterFixture::immediate();
+        let (epoch, _) = adopt(&registry, source_id, &mut adapter, vec!["track"]);
+        let generation = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("catalogue")
+            .generation;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stale_calls = Arc::clone(&calls);
+        assert!(registry
+            .resolve_catalogue_stream(
+                source_id,
+                generation.wrapping_add(1),
+                epoch,
+                |_| Some(()),
+                move |_| async move {
+                    stale_calls.fetch_add(1, Ordering::AcqRel);
+                    Ok(AdapterStream::ProtectedHttp(Box::new(
+                        ResolvedHttpRequest::new(
+                            url::Url::parse("http://example.test/stale").expect("URL"),
+                        )?,
+                    )))
+                },
+            )
+            .await
+            .is_err());
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        let missing_calls = Arc::clone(&calls);
+        assert!(registry
+            .resolve_catalogue_optional_http(
+                source_id,
+                generation,
+                epoch,
+                |_| None::<()>,
+                move |_| async move {
+                    missing_calls.fetch_add(1, Ordering::AcqRel);
+                    Ok(None)
+                },
+            )
+            .await
+            .is_err());
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        let delayed_registry = registry.clone();
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let delayed = tokio::spawn(async move {
+            delayed_registry
+                .resolve_catalogue_stream(
+                    source_id,
+                    generation,
+                    epoch,
+                    |catalogue| catalogue.contains(&"track").then_some(()),
+                    move |_| async move {
+                        let _ = started.send(());
+                        let _ = release_rx.await;
+                        Ok(AdapterStream::ProtectedHttp(Box::new(
+                            ResolvedHttpRequest::new(
+                                url::Url::parse("http://example.test/delayed").expect("URL"),
+                            )?,
+                        )))
+                    },
+                )
+                .await
+        });
+        started_rx.await.expect("resolver entered");
+        let refresh = registry
+            .begin_refresh(source_id, RefreshLane::Catalogue)
+            .expect("same-session refresh");
+        assert!(refresh.submit(vec!["other"]));
+        release.send(()).expect("release resolver");
+        assert!(delayed.await.expect("resolution task").is_err());
+
+        let after_stream_refresh = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("refreshed catalogue");
+        let delayed_registry = registry.clone();
+        let (error_started, error_started_rx) = oneshot::channel();
+        let (release_error, release_error_rx) = oneshot::channel();
+        let delayed_error = tokio::spawn(async move {
+            delayed_registry
+                .resolve_catalogue_stream(
+                    source_id,
+                    after_stream_refresh.generation,
+                    epoch,
+                    |catalogue| catalogue.contains(&"other").then_some(()),
+                    move |_| async move {
+                        let _ = error_started.send(());
+                        let _ = release_error_rx.await;
+                        Err(BackendError::Timeout { duration_secs: 1 })
+                    },
+                )
+                .await
+        });
+        error_started_rx.await.expect("error resolver entered");
+        let refresh = registry
+            .begin_refresh(source_id, RefreshLane::Catalogue)
+            .expect("backend-error-racing refresh");
+        assert!(refresh.submit(vec!["after-error"]));
+        release_error.send(()).expect("release error resolver");
+        assert!(matches!(
+            delayed_error.await.expect("error resolution task"),
+            Err(CatalogueMediaResolveError::Unavailable)
+        ));
+
+        let after_error_refresh = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("catalogue after backend-error race");
+        let delayed_registry = registry.clone();
+        let (art_started, art_started_rx) = oneshot::channel();
+        let (release_art, release_art_rx) = oneshot::channel();
+        let delayed_art = tokio::spawn(async move {
+            delayed_registry
+                .resolve_catalogue_optional_http(
+                    source_id,
+                    after_error_refresh.generation,
+                    epoch,
+                    |catalogue| catalogue.contains(&"after-error").then_some(()),
+                    move |_| async move {
+                        let _ = art_started.send(());
+                        let _ = release_art_rx.await;
+                        Ok(Some(ResolvedHttpRequest::new(
+                            url::Url::parse("http://example.test/delayed-art").expect("URL"),
+                        )?))
+                    },
+                )
+                .await
+        });
+        art_started_rx.await.expect("artwork resolver entered");
+        let refresh = registry
+            .begin_refresh(source_id, RefreshLane::Catalogue)
+            .expect("artwork-racing refresh");
+        assert!(refresh.submit(vec!["third"]));
+        release_art.send(()).expect("release artwork resolver");
+        assert!(delayed_art.await.expect("artwork task").is_err());
+
+        let refreshed = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("twice-refreshed catalogue");
+        let selector_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&selector_calls);
+        let resolved = registry
+            .resolve_catalogue_optional_http(
+                source_id,
+                refreshed.generation,
+                epoch,
+                move |catalogue| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    catalogue.contains(&"third").then_some("selected")
+                },
+                |_| async { Ok(None) },
+            )
+            .await;
+        let Ok((none, authority, selected)) = resolved else {
+            panic!("authorized absent artwork must resolve");
+        };
+        assert!(none.is_none());
+        assert!(authority.is_active());
+        assert_eq!(selected, "selected");
+        assert_eq!(selector_calls.load(Ordering::Acquire), 1);
+        shutdown_immediate(&registry).await;
+        assert!(!authority.is_active());
     }
 
     #[tokio::test]

@@ -21,11 +21,11 @@ use crate::architecture::backend::{
 };
 use crate::architecture::error::BackendError;
 use crate::architecture::media::{
-    MediaLease, MediaRequest, PublicHttpAuthority, PublicHttpEndpoint, RemoteMediaResolver,
+    MediaRequest, PublicHttpAuthority, PublicHttpEndpoint, RemoteMediaResolver,
     ResolvedHttpRequest, ResolvedPublicHttpRequest,
 };
 use crate::architecture::models::{RatingCapability, Track};
-use crate::architecture::{SourceId, TrackId, ViewOrigin};
+use crate::architecture::{MediaKey, SourceId, TrackId, ViewOrigin};
 use crate::external_file::{ExternalFileCandidate, ExternalFileHint};
 use crate::local::resolver::ResolvedFileMedia;
 use crate::source_lifecycle::{
@@ -52,6 +52,262 @@ type ArtworkFuture =
 pub enum ResolvedSourceStream {
     Http(MediaRequest),
     File(ResolvedFileMedia),
+}
+
+/// Whether one managed adapter permits Tributary-owned regular-playlist
+/// membership over its accepted source-wide catalogue.
+///
+/// This capability does not represent server-native playlist synchronization
+/// and is never sufficient authority by itself. Registry operations also
+/// require an exact active catalogue, session, generation, and track identity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RegularPlaylistCapability {
+    #[default]
+    Unsupported,
+    SourceScopedEntries,
+}
+
+/// Transient identity of one exact accepted catalogue.
+///
+/// Guards are minted only by a successful registry lookup and must never be
+/// persisted. A session replacement changes `session_epoch`; a same-session
+/// catalogue replacement changes `catalogue_generation`.
+// Record A intentionally lands this authority surface before Record B wires UI consumers.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegularPlaylistCatalogueGuard {
+    source_id: SourceId,
+    session_epoch: u64,
+    catalogue_generation: u64,
+}
+
+#[allow(dead_code)]
+impl RegularPlaylistCatalogueGuard {
+    pub const fn source_id(self) -> SourceId {
+        self.source_id
+    }
+
+    pub const fn session_epoch(self) -> u64 {
+        self.session_epoch
+    }
+
+    pub const fn catalogue_generation(self) -> u64 {
+        self.catalogue_generation
+    }
+}
+
+/// Fixed, non-sensitive reason that a persisted source-scoped identity cannot
+/// currently be projected from a regular playlist.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegularPlaylistUnavailableReason {
+    SourceUnavailable,
+    UnsupportedSource,
+    InvalidCatalogue,
+    TrackMissing,
+}
+
+/// Closed failure returned by guarded regular-playlist media resolution.
+/// Raw adapter errors, URLs, credentials, and native IDs never cross this
+/// boundary.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RegularPlaylistMediaError {
+    #[error("regular playlist media authority is unavailable")]
+    Unavailable,
+    #[error("regular playlist media backend failed")]
+    BackendFailure(FailureCategory),
+}
+
+/// One available regular-playlist track resolved from an exact live catalogue.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct RegularPlaylistTrack {
+    media_key: MediaKey,
+    guard: RegularPlaylistCatalogueGuard,
+    metadata: RegularPlaylistTrackMetadata,
+}
+
+#[allow(dead_code)]
+impl RegularPlaylistTrack {
+    pub fn media_key(&self) -> &MediaKey {
+        &self.media_key
+    }
+
+    pub const fn guard(&self) -> RegularPlaylistCatalogueGuard {
+        self.guard
+    }
+
+    pub fn metadata(&self) -> &RegularPlaylistTrackMetadata {
+        &self.metadata
+    }
+}
+
+/// Whitelisted display, sorting, rating, and history metadata for a regular
+/// playlist row.
+///
+/// This is deliberately not a `Track` clone. Adding a new field to `Track`
+/// cannot silently expose a locator, credential, or future private adapter
+/// detail across the playlist authority boundary.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegularPlaylistTrackMetadata {
+    title: String,
+    artist_name: String,
+    album_artist_name: Option<String>,
+    album_title: String,
+    track_number: Option<u32>,
+    disc_number: Option<u32>,
+    duration_secs: Option<u64>,
+    composer: Option<String>,
+    genre: Option<String>,
+    year: Option<i32>,
+    date_added: Option<chrono::DateTime<chrono::Utc>>,
+    date_modified: Option<chrono::DateTime<chrono::Utc>>,
+    bitrate_kbps: Option<u32>,
+    sample_rate_hz: Option<u32>,
+    format: Option<String>,
+    play_count: Option<u32>,
+    rating: crate::architecture::models::TrackRating,
+    last_played: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[allow(dead_code)]
+impl RegularPlaylistTrackMetadata {
+    fn from_track(track: &Track) -> Self {
+        Self {
+            title: track.title.clone(),
+            artist_name: track.artist_name.clone(),
+            album_artist_name: track.album_artist_name.clone(),
+            album_title: track.album_title.clone(),
+            track_number: track.track_number,
+            disc_number: track.disc_number,
+            duration_secs: track.duration_secs,
+            composer: track.composer.clone(),
+            genre: track.genre.clone(),
+            year: track.year,
+            date_added: track.date_added,
+            date_modified: track.date_modified,
+            bitrate_kbps: track.bitrate_kbps,
+            sample_rate_hz: track.sample_rate_hz,
+            format: track.format.clone(),
+            play_count: track.play_count,
+            rating: track.rating,
+            last_played: track.last_played,
+        }
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn artist_name(&self) -> &str {
+        &self.artist_name
+    }
+
+    pub fn album_artist_name(&self) -> Option<&str> {
+        self.album_artist_name.as_deref()
+    }
+
+    pub fn album_title(&self) -> &str {
+        &self.album_title
+    }
+
+    pub const fn track_number(&self) -> Option<u32> {
+        self.track_number
+    }
+
+    pub const fn disc_number(&self) -> Option<u32> {
+        self.disc_number
+    }
+
+    pub const fn duration_secs(&self) -> Option<u64> {
+        self.duration_secs
+    }
+
+    pub fn composer(&self) -> Option<&str> {
+        self.composer.as_deref()
+    }
+
+    pub fn genre(&self) -> Option<&str> {
+        self.genre.as_deref()
+    }
+
+    pub const fn year(&self) -> Option<i32> {
+        self.year
+    }
+
+    pub fn date_added(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.date_added
+    }
+
+    pub fn date_modified(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.date_modified
+    }
+
+    pub const fn bitrate_kbps(&self) -> Option<u32> {
+        self.bitrate_kbps
+    }
+
+    pub const fn sample_rate_hz(&self) -> Option<u32> {
+        self.sample_rate_hz
+    }
+
+    pub fn format(&self) -> Option<&str> {
+        self.format.as_deref()
+    }
+
+    pub const fn play_count(&self) -> Option<u32> {
+        self.play_count
+    }
+
+    pub const fn rating(&self) -> crate::architecture::models::TrackRating {
+        self.rating
+    }
+
+    pub fn last_played(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.last_played
+    }
+}
+
+/// One unavailable regular-playlist identity. Its optional private guard lets
+/// the registry distinguish a still-current missing/unsupported catalogue
+/// observation from a replacement without exposing lifecycle internals.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct RegularPlaylistUnavailable {
+    media_key: MediaKey,
+    reason: RegularPlaylistUnavailableReason,
+    observed_guard: Option<RegularPlaylistCatalogueGuard>,
+}
+
+#[allow(dead_code)]
+impl RegularPlaylistUnavailable {
+    pub fn media_key(&self) -> &MediaKey {
+        &self.media_key
+    }
+
+    pub const fn reason(&self) -> RegularPlaylistUnavailableReason {
+        self.reason
+    }
+}
+
+/// Ordered result of resolving one persisted source-scoped playlist identity.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub enum RegularPlaylistTrackResolution {
+    Available(Box<RegularPlaylistTrack>),
+    Unavailable(RegularPlaylistUnavailable),
+}
+
+#[allow(dead_code)]
+impl RegularPlaylistTrackResolution {
+    pub fn media_key(&self) -> &MediaKey {
+        match self {
+            Self::Available(track) => track.media_key(),
+            Self::Unavailable(track) => track.media_key(),
+        }
+    }
 }
 
 impl ResolvedSourceStream {
@@ -143,13 +399,6 @@ impl AcceptedView {
         })
     }
 
-    fn catalogue(tracks: Vec<Track>) -> Self {
-        Self {
-            tracks: Arc::new(tracks),
-            public_streams: HashMap::new(),
-        }
-    }
-
     fn published(tracks: Arc<Vec<Track>>) -> Self {
         Self {
             tracks,
@@ -177,7 +426,18 @@ pub enum ViewLoadResult {
 struct AcceptedSourcePayload {
     tracks: Arc<Vec<Track>>,
     public_streams: HashMap<TrackId, PublicHttpEndpoint>,
-    view_lease: MediaLease,
+    #[allow(dead_code)]
+    regular_playlist_capability: RegularPlaylistCapability,
+    #[allow(dead_code)]
+    regular_playlist_index: RegularPlaylistTrackIndex,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+enum RegularPlaylistTrackIndex {
+    Unsupported,
+    Invalid,
+    Exact(Arc<HashMap<TrackId, usize>>),
 }
 
 impl AcceptedSourcePayload {
@@ -185,27 +445,64 @@ impl AcceptedSourcePayload {
         Self {
             tracks: view.tracks,
             public_streams: view.public_streams,
-            view_lease: MediaLease::new(),
+            regular_playlist_capability: RegularPlaylistCapability::Unsupported,
+            regular_playlist_index: RegularPlaylistTrackIndex::Unsupported,
         }
     }
 
-    fn catalogue(tracks: Vec<Track>) -> Self {
-        Self::from_view(AcceptedView::catalogue(tracks))
+    fn catalogue(tracks: Vec<Track>, capability: RegularPlaylistCapability) -> Self {
+        let regular_playlist_index = match capability {
+            RegularPlaylistCapability::Unsupported => RegularPlaylistTrackIndex::Unsupported,
+            RegularPlaylistCapability::SourceScopedEntries => {
+                let mut exact = HashMap::with_capacity(tracks.len());
+                let valid = tracks.iter().enumerate().all(|(index, track)| {
+                    track
+                        .native_track_id
+                        .as_ref()
+                        .is_some_and(|track_id| exact.insert(track_id.clone(), index).is_none())
+                });
+                if valid {
+                    RegularPlaylistTrackIndex::Exact(Arc::new(exact))
+                } else {
+                    RegularPlaylistTrackIndex::Invalid
+                }
+            }
+        };
+        Self {
+            tracks: Arc::new(tracks),
+            public_streams: HashMap::new(),
+            regular_playlist_capability: capability,
+            regular_playlist_index,
+        }
     }
 
     fn published(&self) -> AcceptedView {
         AcceptedView::published(Arc::clone(&self.tracks))
     }
-}
 
-impl Drop for AcceptedSourcePayload {
-    fn drop(&mut self) {
-        self.view_lease.revoke();
+    #[allow(dead_code)]
+    fn regular_playlist_track(&self, track_id: &TrackId) -> Option<&Track> {
+        if self.regular_playlist_capability != RegularPlaylistCapability::SourceScopedEntries {
+            return None;
+        }
+        let RegularPlaylistTrackIndex::Exact(index) = &self.regular_playlist_index else {
+            return None;
+        };
+        index
+            .get(track_id)
+            .and_then(|index| self.tracks.get(*index))
     }
 }
 
 /// Heterogeneous operational contract stored by one lifecycle registry.
 pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
+    /// Explicit opt-in for Tributary-owned source-scoped regular playlists.
+    /// Future adapters remain denied until their accepted catalogue and media
+    /// resolver satisfy the same exact-ID authority contract.
+    fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
+        RegularPlaylistCapability::Unsupported
+    }
+
     /// Load the first complete catalogue after construction is staged.
     fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture;
 
@@ -231,8 +528,19 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
     }
 }
 
+mod source_scoped_playlist_sealed {
+    pub trait Adapter {}
+}
+
+fn source_scoped_playlist_capability<A>() -> RegularPlaylistCapability
+where
+    A: source_scoped_playlist_sealed::Adapter,
+{
+    RegularPlaylistCapability::SourceScopedEntries
+}
+
 macro_rules! standard_remote_adapter {
-    ($adapter:ty) => {
+    ($adapter:ty, $regular_playlist_capability:expr) => {
         impl LifecycleAdapter for $adapter {
             fn close(self: Arc<Self>, _authority: CloseAuthority) -> AdapterCloseFuture {
                 Box::pin(async { Ok(()) })
@@ -240,6 +548,10 @@ macro_rules! standard_remote_adapter {
         }
 
         impl ManagedSourceAdapter for $adapter {
+            fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
+                $regular_playlist_capability
+            }
+
             fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
                 Box::pin(
                     async move { crate::architecture::load_track_catalog(self.as_ref()).await },
@@ -263,12 +575,20 @@ macro_rules! standard_remote_adapter {
     };
 }
 
-standard_remote_adapter!(crate::subsonic::SubsonicBackend);
+impl source_scoped_playlist_sealed::Adapter for crate::subsonic::SubsonicBackend {}
+standard_remote_adapter!(
+    crate::subsonic::SubsonicBackend,
+    source_scoped_playlist_capability::<crate::subsonic::SubsonicBackend>()
+);
 // Plex's legacy auth token is a durable credential, not a revocable server
 // session: its documented revocation mechanisms are account/device-wide, so
 // Tributary has no safe per-adapter close authority. Constructors may therefore
 // be aborted, while disconnect only revokes local media/session authority.
-standard_remote_adapter!(crate::plex::PlexBackend);
+impl source_scoped_playlist_sealed::Adapter for crate::plex::PlexBackend {}
+standard_remote_adapter!(
+    crate::plex::PlexBackend,
+    source_scoped_playlist_capability::<crate::plex::PlexBackend>()
+);
 
 impl LifecycleAdapter for crate::jellyfin::JellyfinBackend {
     fn close(self: Arc<Self>, _authority: CloseAuthority) -> AdapterCloseFuture {
@@ -281,6 +601,10 @@ impl LifecycleAdapter for crate::jellyfin::JellyfinBackend {
 }
 
 impl ManagedSourceAdapter for crate::jellyfin::JellyfinBackend {
+    fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
+        source_scoped_playlist_capability::<Self>()
+    }
+
     fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
         Box::pin(async move {
             self.ensure_initialized().await?;
@@ -302,6 +626,8 @@ impl ManagedSourceAdapter for crate::jellyfin::JellyfinBackend {
         )
     }
 }
+
+impl source_scoped_playlist_sealed::Adapter for crate::jellyfin::JellyfinBackend {}
 
 mod sealed {
     pub trait AbortableSourceAdapter {}
@@ -334,6 +660,10 @@ fn validate_daap_initial_catalogue(
 }
 
 impl ManagedSourceAdapter for crate::daap::DaapBackend {
+    fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
+        source_scoped_playlist_capability::<Self>()
+    }
+
     fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
         Box::pin(async move {
             let tracks = self.load_catalogue().await?;
@@ -355,6 +685,8 @@ impl ManagedSourceAdapter for crate::daap::DaapBackend {
         )
     }
 }
+
+impl source_scoped_playlist_sealed::Adapter for crate::daap::DaapBackend {}
 
 struct BuiltInInstallation {
     _claim_id: ProvenanceClaimId,
@@ -524,6 +856,7 @@ impl SourceRegistry {
         let source_id = adapter.source_id();
         let track_id = adapter.track_id().clone();
         let track = adapter.track().clone();
+        let regular_playlist_capability = adapter.regular_playlist_capability();
         #[cfg(test)]
         let close_probe = adapter.close_probe();
         let claim_id = self
@@ -534,7 +867,7 @@ impl SourceRegistry {
         let adopted = self.inner.lifecycle.adopt_stateless_session(
             source_id,
             Box::new(adapter),
-            AcceptedSourcePayload::catalogue(vec![track.clone()]),
+            AcceptedSourcePayload::catalogue(vec![track.clone()], regular_playlist_capability),
         );
         let Some((_, session_epoch)) = adopted else {
             let _ = self.inner.lifecycle.release_provenance(source_id, claim_id);
@@ -769,10 +1102,12 @@ impl SourceRegistry {
                 if cancellation.is_cancelled() {
                     return RefreshTaskResult::Cancelled;
                 }
+                let regular_playlist_capability = adapter.regular_playlist_capability();
                 match adapter.load_initial_catalogue().await {
-                    Ok(tracks) => {
-                        RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(tracks))
-                    }
+                    Ok(tracks) => RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(
+                        tracks,
+                        regular_playlist_capability,
+                    )),
                     Err(error) => RefreshTaskResult::Failed(failure_category(&error)),
                 }
             },
@@ -814,10 +1149,12 @@ impl SourceRegistry {
                 if cancellation.is_cancelled() {
                     return RefreshTaskResult::Cancelled;
                 }
+                let regular_playlist_capability = adapter.regular_playlist_capability();
                 match adapter.load_initial_catalogue().await {
-                    Ok(tracks) => {
-                        RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(tracks))
-                    }
+                    Ok(tracks) => RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(
+                        tracks,
+                        regular_playlist_capability,
+                    )),
                     Err(error) => RefreshTaskResult::Failed(failure_category(&error)),
                 }
             },
@@ -878,10 +1215,11 @@ impl SourceRegistry {
                 return None;
             }
         };
+        let regular_playlist_capability = adapter.regular_playlist_capability();
         let (_, session_epoch) = self.inner.lifecycle.adopt_stateless_session(
             source_id,
             adapter,
-            AcceptedSourcePayload::catalogue(Vec::new()),
+            AcceptedSourcePayload::catalogue(Vec::new(), regular_playlist_capability),
         )?;
         installation.session_epoch = Some(session_epoch);
         Some(session_epoch)
@@ -962,6 +1300,201 @@ impl SourceRegistry {
         }
     }
 
+    /// Resolve persisted source-scoped identities in their input order.
+    ///
+    /// Every requested occurrence receives exactly one result. Sources are
+    /// observed independently under the lifecycle lock, while metadata copies
+    /// and ordering work happen outside it. Similar metadata, another source's
+    /// matching native ID, and endpoint identity are never considered.
+    #[allow(dead_code)]
+    pub fn resolve_regular_playlist_tracks(
+        &self,
+        media_keys: &[MediaKey],
+    ) -> Vec<RegularPlaylistTrackResolution> {
+        let mut by_source: HashMap<SourceId, Vec<(usize, TrackId)>> = HashMap::new();
+        for (position, media_key) in media_keys.iter().enumerate() {
+            by_source
+                .entry(media_key.source_id)
+                .or_default()
+                .push((position, media_key.track_id.clone()));
+        }
+
+        let mut results: Vec<Option<RegularPlaylistTrackResolution>> = vec![None; media_keys.len()];
+        for (source_id, occurrences) in by_source {
+            let accepted =
+                self.inner
+                    .lifecycle
+                    .resolve_current_accepted_catalogue(source_id, |payload| {
+                        Some((
+                            payload.regular_playlist_capability,
+                            payload.regular_playlist_index.clone(),
+                            Arc::clone(&payload.tracks),
+                        ))
+                    });
+
+            let Some(accepted) = accepted else {
+                for (position, track_id) in occurrences {
+                    results[position] = Some(RegularPlaylistTrackResolution::Unavailable(
+                        RegularPlaylistUnavailable {
+                            media_key: MediaKey::new(source_id, track_id),
+                            reason: RegularPlaylistUnavailableReason::SourceUnavailable,
+                            observed_guard: None,
+                        },
+                    ));
+                }
+                continue;
+            };
+
+            let guard = RegularPlaylistCatalogueGuard {
+                source_id,
+                session_epoch: accepted.session_epoch,
+                catalogue_generation: accepted.generation,
+            };
+            let (capability, index, tracks) = accepted.value;
+            for (position, track_id) in occurrences {
+                let media_key = MediaKey::new(source_id, track_id.clone());
+                let resolution = match (&capability, &index) {
+                    (RegularPlaylistCapability::Unsupported, _) => {
+                        RegularPlaylistTrackResolution::Unavailable(RegularPlaylistUnavailable {
+                            media_key,
+                            reason: RegularPlaylistUnavailableReason::UnsupportedSource,
+                            observed_guard: Some(guard),
+                        })
+                    }
+                    (
+                        RegularPlaylistCapability::SourceScopedEntries,
+                        RegularPlaylistTrackIndex::Invalid,
+                    ) => RegularPlaylistTrackResolution::Unavailable(RegularPlaylistUnavailable {
+                        media_key,
+                        reason: RegularPlaylistUnavailableReason::InvalidCatalogue,
+                        observed_guard: Some(guard),
+                    }),
+                    (
+                        RegularPlaylistCapability::SourceScopedEntries,
+                        RegularPlaylistTrackIndex::Exact(index),
+                    ) => {
+                        if let Some(track) = index
+                            .get(&track_id)
+                            .and_then(|track_index| tracks.get(*track_index))
+                        {
+                            RegularPlaylistTrackResolution::Available(Box::new(
+                                RegularPlaylistTrack {
+                                    media_key,
+                                    guard,
+                                    metadata: RegularPlaylistTrackMetadata::from_track(track),
+                                },
+                            ))
+                        } else {
+                            RegularPlaylistTrackResolution::Unavailable(
+                                RegularPlaylistUnavailable {
+                                    media_key,
+                                    reason: RegularPlaylistUnavailableReason::TrackMissing,
+                                    observed_guard: Some(guard),
+                                },
+                            )
+                        }
+                    }
+                    // Constructor invariants keep these combinations
+                    // unreachable. Treat any future drift as invalid rather
+                    // than granting playlist authority.
+                    _ => RegularPlaylistTrackResolution::Unavailable(RegularPlaylistUnavailable {
+                        media_key,
+                        reason: RegularPlaylistUnavailableReason::InvalidCatalogue,
+                        observed_guard: Some(guard),
+                    }),
+                };
+                results[position] = Some(resolution);
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|result| result.expect("every playlist occurrence is resolved exactly once"))
+            .collect()
+    }
+
+    /// Recheck that an ordered lookup result still describes the current
+    /// source/catalogue authority. Metadata is immutable within a guard, so
+    /// only exact identity, guard, and closed availability state are compared.
+    #[allow(dead_code)]
+    pub fn are_regular_playlist_tracks_current(
+        &self,
+        resolutions: &[RegularPlaylistTrackResolution],
+    ) -> bool {
+        let media_keys: Vec<_> = resolutions
+            .iter()
+            .map(|resolution| resolution.media_key().clone())
+            .collect();
+        let current = self.resolve_regular_playlist_tracks(&media_keys);
+        resolutions
+            .iter()
+            .zip(current.iter())
+            .all(|(observed, current)| regular_playlist_authority_eq(observed, current))
+    }
+
+    /// Resolve one stream only through the exact catalogue guard that minted
+    /// the playlist row. The returned protected request carries the accepted
+    /// catalogue's revocable lease, so a same-session catalogue replacement
+    /// also invalidates a request after resolution but before consumption.
+    #[allow(dead_code)]
+    pub async fn resolve_regular_playlist_stream(
+        &self,
+        guard: RegularPlaylistCatalogueGuard,
+        track_id: TrackId,
+    ) -> Result<ResolvedSourceStream, RegularPlaylistMediaError> {
+        let selected_track_id = track_id.clone();
+        let (stream, accepted_authority, ()) = self
+            .inner
+            .lifecycle
+            .resolve_catalogue_stream(
+                guard.source_id,
+                guard.catalogue_generation,
+                guard.session_epoch,
+                move |payload| {
+                    payload
+                        .regular_playlist_track(&selected_track_id)
+                        .map(|_| ())
+                },
+                move |adapter| async move { adapter.resolve_stream(track_id).await },
+            )
+            .await
+            .map_err(regular_playlist_media_error)?;
+        match stream {
+            AdapterStream::ProtectedHttp(request) => Ok(ResolvedSourceStream::Http(
+                MediaRequest::ProtectedHttp(Box::new((*request).with_lease(accepted_authority))),
+            )),
+            AdapterStream::File(_) => Err(RegularPlaylistMediaError::Unavailable),
+        }
+    }
+
+    /// Artwork counterpart of [`Self::resolve_regular_playlist_stream`] with
+    /// the same exact pre/post guard checks and catalogue-generation lease.
+    #[allow(dead_code)]
+    pub async fn resolve_regular_playlist_artwork(
+        &self,
+        guard: RegularPlaylistCatalogueGuard,
+        track_id: TrackId,
+    ) -> Result<Option<ResolvedHttpRequest>, RegularPlaylistMediaError> {
+        let selected_track_id = track_id.clone();
+        let (request, accepted_authority, ()) = self
+            .inner
+            .lifecycle
+            .resolve_catalogue_optional_http(
+                guard.source_id,
+                guard.catalogue_generation,
+                guard.session_epoch,
+                move |payload| {
+                    payload
+                        .regular_playlist_track(&selected_track_id)
+                        .map(|_| ())
+                },
+                move |adapter| async move { adapter.resolve_artwork(track_id).await },
+            )
+            .await
+            .map_err(regular_playlist_media_error)?;
+        Ok(request.map(|request| request.with_lease(accepted_authority)))
+    }
+
     pub async fn resolve_stream(
         &self,
         source_id: SourceId,
@@ -971,21 +1504,14 @@ impl SourceRegistry {
         if let Some(resolved) = self.inner.lifecycle.resolve_latest_accepted_view(
             source_id,
             expected_session_epoch,
-            |payload| {
-                payload
-                    .public_streams
-                    .get(&track_id)
-                    .cloned()
-                    .map(|endpoint| (endpoint, payload.view_lease.clone()))
-            },
+            |payload| payload.public_streams.get(&track_id).cloned(),
         ) {
             let authority: Arc<dyn PublicHttpAuthority> = self.inner.clone();
             let authority = Arc::downgrade(&authority);
-            let (endpoint, lease) = resolved.value;
             return Ok(ResolvedSourceStream::Http(MediaRequest::PublicHttp(
                 ResolvedPublicHttpRequest::new(
-                    endpoint,
-                    lease,
+                    resolved.value,
+                    resolved.authority,
                     authority,
                     source_id,
                     track_id,
@@ -1026,6 +1552,42 @@ impl SourceRegistry {
                 move |adapter| async move { adapter.resolve_artwork(track_id).await },
             )
             .await
+    }
+}
+
+#[allow(dead_code)]
+fn regular_playlist_authority_eq(
+    observed: &RegularPlaylistTrackResolution,
+    current: &RegularPlaylistTrackResolution,
+) -> bool {
+    match (observed, current) {
+        (
+            RegularPlaylistTrackResolution::Available(observed),
+            RegularPlaylistTrackResolution::Available(current),
+        ) => observed.media_key == current.media_key && observed.guard == current.guard,
+        (
+            RegularPlaylistTrackResolution::Unavailable(observed),
+            RegularPlaylistTrackResolution::Unavailable(current),
+        ) => {
+            observed.media_key == current.media_key
+                && observed.reason == current.reason
+                && observed.observed_guard == current.observed_guard
+        }
+        _ => false,
+    }
+}
+
+#[allow(dead_code)]
+fn regular_playlist_media_error(
+    error: crate::source_lifecycle::CatalogueMediaResolveError,
+) -> RegularPlaylistMediaError {
+    match error {
+        crate::source_lifecycle::CatalogueMediaResolveError::Unavailable => {
+            RegularPlaylistMediaError::Unavailable
+        }
+        crate::source_lifecycle::CatalogueMediaResolveError::Backend(error) => {
+            RegularPlaylistMediaError::BackendFailure(failure_category(&error))
+        }
     }
 }
 
@@ -1079,11 +1641,7 @@ fn public_snapshot(
 fn public_accepted_snapshot(
     snapshot: crate::source_lifecycle::AcceptedSnapshot<AcceptedSourcePayload>,
 ) -> crate::source_lifecycle::AcceptedSnapshot<AcceptedView> {
-    crate::source_lifecycle::AcceptedSnapshot {
-        generation: snapshot.generation,
-        session_epoch: snapshot.session_epoch,
-        value: Arc::new(snapshot.value.published()),
-    }
+    snapshot.map(AcceptedSourcePayload::published)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1198,7 +1756,9 @@ mod tests {
     struct FakeProbe {
         close_calls: AtomicUsize,
         stream_calls: AtomicUsize,
+        artwork_calls: AtomicUsize,
         close_release: watch::Sender<bool>,
+        stream_release: watch::Sender<bool>,
         view_specs: Mutex<HashMap<ViewOrigin, VecDeque<ViewSpec>>>,
     }
 
@@ -1210,10 +1770,13 @@ mod tests {
     impl FakeProbe {
         fn new(close_released: bool) -> Arc<Self> {
             let (close_release, _receiver) = watch::channel(close_released);
+            let (stream_release, _receiver) = watch::channel(true);
             Arc::new(Self {
                 close_calls: AtomicUsize::new(0),
                 stream_calls: AtomicUsize::new(0),
+                artwork_calls: AtomicUsize::new(0),
                 close_release,
+                stream_release,
                 view_specs: Mutex::new(HashMap::new()),
             })
         }
@@ -1233,6 +1796,26 @@ mod tests {
                 label,
                 probe: Arc::clone(self),
                 close_release: self.close_release.subscribe(),
+                catalogue: Vec::new(),
+                regular_playlist_capability: RegularPlaylistCapability::Unsupported,
+                stream_failure: None,
+                artwork_available: false,
+            }
+        }
+
+        fn playlist_adapter(
+            self: &Arc<Self>,
+            label: &'static str,
+            catalogue: Vec<Track>,
+        ) -> FakeAdapter {
+            FakeAdapter {
+                label,
+                probe: Arc::clone(self),
+                close_release: self.close_release.subscribe(),
+                catalogue,
+                regular_playlist_capability: RegularPlaylistCapability::SourceScopedEntries,
+                stream_failure: None,
+                artwork_available: true,
             }
         }
 
@@ -1251,6 +1834,10 @@ mod tests {
         label: &'static str,
         probe: Arc<FakeProbe>,
         close_release: watch::Receiver<bool>,
+        catalogue: Vec<Track>,
+        regular_playlist_capability: RegularPlaylistCapability,
+        stream_failure: Option<String>,
+        artwork_available: bool,
     }
 
     #[async_trait]
@@ -1304,6 +1891,18 @@ mod tests {
     impl RemoteMediaResolver for FakeAdapter {
         async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
             self.probe.stream_calls.fetch_add(1, Ordering::AcqRel);
+            let mut release = self.probe.stream_release.subscribe();
+            while !*release.borrow_and_update() {
+                if release.changed().await.is_err() {
+                    break;
+                }
+            }
+            if let Some(message) = &self.stream_failure {
+                return Err(BackendError::ConnectionFailed {
+                    message: message.clone(),
+                    source: None,
+                });
+            }
             ResolvedHttpRequest::new(
                 Url::parse(&format!(
                     "https://media.invalid/{}/{}",
@@ -1316,9 +1915,22 @@ mod tests {
 
         async fn resolve_artwork(
             &self,
-            _track_id: &TrackId,
+            track_id: &TrackId,
         ) -> BackendResult<Option<ResolvedHttpRequest>> {
-            Ok(None)
+            self.probe.artwork_calls.fetch_add(1, Ordering::AcqRel);
+            if self.artwork_available {
+                ResolvedHttpRequest::new(
+                    Url::parse(&format!(
+                        "https://art.invalid/{}/{}",
+                        self.label,
+                        track_id.as_str()
+                    ))
+                    .expect("fixture URL"),
+                )
+                .map(Some)
+            } else {
+                Ok(None)
+            }
         }
     }
 
@@ -1338,8 +1950,12 @@ mod tests {
     }
 
     impl ManagedSourceAdapter for FakeAdapter {
+        fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
+            self.regular_playlist_capability
+        }
+
         fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
-            Box::pin(async { Ok(Vec::new()) })
+            Box::pin(async move { Ok(self.catalogue.clone()) })
         }
 
         fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
@@ -1480,6 +2096,24 @@ mod tests {
         assert!(matches!(error, BackendError::Internal(_)));
     }
 
+    #[test]
+    fn authenticated_adapter_playlist_capability_declarations_are_explicit() {
+        fn assert_source_scoped<A>()
+        where
+            A: source_scoped_playlist_sealed::Adapter,
+        {
+            assert_eq!(
+                source_scoped_playlist_capability::<A>(),
+                RegularPlaylistCapability::SourceScopedEntries
+            );
+        }
+
+        assert_source_scoped::<crate::subsonic::SubsonicBackend>();
+        assert_source_scoped::<crate::jellyfin::JellyfinBackend>();
+        assert_source_scoped::<crate::plex::PlexBackend>();
+        assert_source_scoped::<crate::daap::DaapBackend>();
+    }
+
     async fn wait_for_catalogue(registry: &SourceRegistry, source_id: SourceId) -> (u64, u64) {
         timeout(Duration::from_secs(2), async {
             loop {
@@ -1536,6 +2170,74 @@ mod tests {
             .expect("fixture connection admitted");
         let (_, session_epoch) = wait_for_catalogue(registry, source_id).await;
         (source_id, session_epoch)
+    }
+
+    async fn connect_playlist_fixture(
+        registry: &SourceRegistry,
+        source_id: SourceId,
+        adapter: FakeAdapter,
+    ) -> (u64, u64) {
+        registry
+            .claim_provenance(source_id, SourceProvenance::Saved)
+            .expect("saved claim");
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(adapter) },
+            )
+            .expect("playlist fixture admitted");
+        wait_for_catalogue(registry, source_id).await
+    }
+
+    fn available(resolution: &RegularPlaylistTrackResolution) -> &RegularPlaylistTrack {
+        let RegularPlaylistTrackResolution::Available(track) = resolution else {
+            panic!("expected available regular-playlist track");
+        };
+        track
+    }
+
+    fn unavailable_reason(
+        resolution: &RegularPlaylistTrackResolution,
+    ) -> RegularPlaylistUnavailableReason {
+        let RegularPlaylistTrackResolution::Unavailable(track) = resolution else {
+            panic!("expected unavailable regular-playlist track");
+        };
+        track.reason()
+    }
+
+    async fn refresh_playlist_catalogue(
+        registry: &SourceRegistry,
+        source_id: SourceId,
+        tracks: Vec<Track>,
+        capability: RegularPlaylistCapability,
+    ) -> u64 {
+        let owner = registry
+            .inner
+            .lifecycle
+            .begin_refresh(source_id, RefreshLane::Catalogue)
+            .expect("catalogue refresh admitted");
+        let generation = owner.generation();
+        owner.spawn(move |_session, _cancellation| async move {
+            RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(tracks, capability))
+        });
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if registry
+                    .inner
+                    .lifecycle
+                    .snapshot(source_id)
+                    .and_then(|snapshot| snapshot.catalogue)
+                    .is_some_and(|catalogue| catalogue.generation == generation)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("catalogue refresh accepted");
+        generation
     }
 
     fn consume_public(request: ResolvedSourceStream) -> BackendResult<Url> {
@@ -1675,6 +2377,441 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regular_playlist_lookup_is_ordered_source_scoped_and_metadata_is_whitelisted() {
+        let registry = registry();
+        let shared_id = TrackId::remote("shared-native-id").expect("track ID");
+        let other_id = TrackId::remote("other-native-id").expect("track ID");
+        let missing_id = TrackId::remote("missing-native-id").expect("track ID");
+        let secret = format!("secret-locator-{}", Uuid::new_v4());
+
+        let mut first = fixture_track(shared_id.clone());
+        first.title = "First source".to_string();
+        first.file_path = Some(format!("/private/{secret}"));
+        first.stream_url = Some(
+            Url::parse(&format!("https://stream.invalid/audio?token={secret}"))
+                .expect("fixture URL"),
+        );
+        first.cover_art_url = Some(
+            Url::parse(&format!("https://art.invalid/cover?token={secret}")).expect("fixture URL"),
+        );
+        let mut other = fixture_track(other_id.clone());
+        other.title = "Other track".to_string();
+        let first_source = SourceId::random();
+        let first_probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            first_source,
+            first_probe.playlist_adapter("first", vec![first, other]),
+        )
+        .await;
+
+        let mut second = fixture_track(shared_id.clone());
+        second.title = "Second source".to_string();
+        let second_source = SourceId::random();
+        let second_probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            second_source,
+            second_probe.playlist_adapter("second", vec![second]),
+        )
+        .await;
+
+        let keys = vec![
+            MediaKey::new(first_source, other_id),
+            MediaKey::new(second_source, shared_id.clone()),
+            MediaKey::new(first_source, shared_id.clone()),
+            MediaKey::new(first_source, shared_id),
+            MediaKey::new(first_source, missing_id),
+        ];
+        let resolved = registry.resolve_regular_playlist_tracks(&keys);
+        assert_eq!(resolved.len(), keys.len());
+        assert_eq!(available(&resolved[0]).metadata().title(), "Other track");
+        assert_eq!(available(&resolved[1]).metadata().title(), "Second source");
+        assert_eq!(available(&resolved[2]).metadata().title(), "First source");
+        assert_eq!(available(&resolved[3]).metadata().title(), "First source");
+        assert_eq!(available(&resolved[2]).media_key(), &keys[2]);
+        assert_eq!(available(&resolved[3]).media_key(), &keys[3]);
+        assert_eq!(
+            unavailable_reason(&resolved[4]),
+            RegularPlaylistUnavailableReason::TrackMissing
+        );
+        assert!(registry.are_regular_playlist_tracks_current(&resolved));
+
+        let metadata_debug = format!("{:?}", available(&resolved[2]).metadata());
+        assert!(!metadata_debug.contains(&secret));
+        assert!(!metadata_debug.contains("stream_url"));
+        assert!(!metadata_debug.contains("cover_art_url"));
+        assert!(!metadata_debug.contains("file_path"));
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn regular_playlist_default_deny_and_invalid_catalogues_fail_closed() {
+        let registry = registry();
+        let track_id = TrackId::remote("track").expect("track ID");
+
+        let unsupported_source = SourceId::random();
+        let unsupported_probe = FakeProbe::new(true);
+        let mut unsupported = unsupported_probe.adapter("unsupported");
+        unsupported.catalogue = vec![fixture_track(track_id.clone())];
+        connect_playlist_fixture(&registry, unsupported_source, unsupported).await;
+        let unsupported = registry.resolve_regular_playlist_tracks(&[MediaKey::new(
+            unsupported_source,
+            track_id.clone(),
+        )]);
+        assert_eq!(
+            unavailable_reason(&unsupported[0]),
+            RegularPlaylistUnavailableReason::UnsupportedSource
+        );
+        assert_eq!(unsupported_probe.stream_calls.load(Ordering::Acquire), 0);
+
+        let duplicate_source = SourceId::random();
+        let duplicate_probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            duplicate_source,
+            duplicate_probe.playlist_adapter(
+                "duplicate",
+                vec![
+                    fixture_track(track_id.clone()),
+                    fixture_track(track_id.clone()),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(
+            registry
+                .snapshot(duplicate_source)
+                .and_then(|snapshot| snapshot.catalogue)
+                .expect("general duplicate catalogue remains published")
+                .value
+                .tracks()
+                .len(),
+            2
+        );
+        let duplicate = registry
+            .resolve_regular_playlist_tracks(&[MediaKey::new(duplicate_source, track_id.clone())]);
+        assert_eq!(
+            unavailable_reason(&duplicate[0]),
+            RegularPlaylistUnavailableReason::InvalidCatalogue
+        );
+
+        let missing_identity_source = SourceId::random();
+        let missing_identity_probe = FakeProbe::new(true);
+        let mut missing_identity = fixture_track(track_id.clone());
+        missing_identity.native_track_id = None;
+        connect_playlist_fixture(
+            &registry,
+            missing_identity_source,
+            missing_identity_probe.playlist_adapter("missing", vec![missing_identity]),
+        )
+        .await;
+        let invalid = registry
+            .resolve_regular_playlist_tracks(&[MediaKey::new(missing_identity_source, track_id)]);
+        assert_eq!(
+            unavailable_reason(&invalid[0]),
+            RegularPlaylistUnavailableReason::InvalidCatalogue
+        );
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn guarded_playlist_media_rechecks_generation_and_retains_exact_authority() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("guarded-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.playlist_adapter("guarded", vec![fixture_track(track_id.clone())]),
+        )
+        .await;
+        let initial =
+            registry.resolve_regular_playlist_tracks(&[MediaKey::new(source_id, track_id.clone())]);
+        let guard = available(&initial[0]).guard();
+        assert_eq!(guard.source_id(), source_id);
+
+        let stream = registry
+            .resolve_regular_playlist_stream(guard, track_id.clone())
+            .await
+            .expect("guarded stream");
+        assert!(protected_request_is_active(&stream));
+        let artwork = registry
+            .resolve_regular_playlist_artwork(guard, track_id.clone())
+            .await
+            .expect("guarded artwork")
+            .expect("fixture artwork");
+        assert!(artwork.is_active());
+        let parked = registry
+            .inner
+            .lifecycle
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("parked payload snapshot");
+
+        let mut refreshed_track = fixture_track(track_id.clone());
+        refreshed_track.title = "Refreshed".to_string();
+        let refreshed_generation = refresh_playlist_catalogue(
+            &registry,
+            source_id,
+            vec![refreshed_track],
+            RegularPlaylistCapability::SourceScopedEntries,
+        )
+        .await;
+        assert_ne!(refreshed_generation, guard.catalogue_generation());
+        assert!(!protected_request_is_active(&stream));
+        assert!(!artwork.is_active());
+        assert_eq!(parked.value.tracks[0].title, "Station");
+
+        let calls_before_stale = probe.stream_calls.load(Ordering::Acquire);
+        let stale = registry
+            .resolve_regular_playlist_stream(guard, track_id.clone())
+            .await;
+        assert!(matches!(stale, Err(RegularPlaylistMediaError::Unavailable)));
+        assert_eq!(
+            probe.stream_calls.load(Ordering::Acquire),
+            calls_before_stale
+        );
+        assert!(!registry.are_regular_playlist_tracks_current(&initial));
+
+        let current =
+            registry.resolve_regular_playlist_tracks(&[MediaKey::new(source_id, track_id.clone())]);
+        assert_eq!(available(&current[0]).metadata().title(), "Refreshed");
+        assert!(registry.are_regular_playlist_tracks_current(&current));
+
+        probe.stream_release.send_replace(false);
+        let current_guard = available(&current[0]).guard();
+        let delayed_registry = registry.clone();
+        let delayed_track = track_id.clone();
+        let calls_before_delayed = probe.stream_calls.load(Ordering::Acquire);
+        let delayed = tokio::spawn(async move {
+            delayed_registry
+                .resolve_regular_playlist_stream(current_guard, delayed_track)
+                .await
+        });
+        timeout(Duration::from_secs(2), async {
+            while probe.stream_calls.load(Ordering::Acquire) == calls_before_delayed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("adapter resolution started");
+        refresh_playlist_catalogue(
+            &registry,
+            source_id,
+            vec![fixture_track(track_id)],
+            RegularPlaylistCapability::SourceScopedEntries,
+        )
+        .await;
+        probe.stream_release.send_replace(true);
+        assert!(matches!(
+            delayed.await.expect("resolution task"),
+            Err(RegularPlaylistMediaError::Unavailable)
+        ));
+
+        let before_disconnect = registry.resolve_regular_playlist_tracks(&[MediaKey::new(
+            source_id,
+            TrackId::remote("guarded-track").expect("track ID"),
+        )]);
+        let disconnect_guard = available(&before_disconnect[0]).guard();
+        let disconnect_track = available(&before_disconnect[0])
+            .media_key()
+            .track_id
+            .clone();
+        let disconnect_stream = registry
+            .resolve_regular_playlist_stream(disconnect_guard, disconnect_track.clone())
+            .await
+            .expect("pre-disconnect stream");
+        let disconnect_art = registry
+            .resolve_regular_playlist_artwork(disconnect_guard, disconnect_track.clone())
+            .await
+            .expect("pre-disconnect artwork")
+            .expect("fixture artwork");
+        let parked_disconnect = registry
+            .inner
+            .lifecycle
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("parked disconnect snapshot");
+        let calls_before_disconnect = probe.stream_calls.load(Ordering::Acquire);
+        let waiter = registry.disconnect(source_id).expect("disconnect source");
+        assert!(!protected_request_is_active(&disconnect_stream));
+        assert!(!disconnect_art.is_active());
+        assert_eq!(parked_disconnect.value.tracks.len(), 1);
+        let disconnected = registry
+            .resolve_regular_playlist_tracks(&[MediaKey::new(source_id, disconnect_track.clone())]);
+        assert_eq!(disconnected.len(), 1);
+        assert_eq!(
+            unavailable_reason(&disconnected[0]),
+            RegularPlaylistUnavailableReason::SourceUnavailable
+        );
+        assert!(matches!(
+            registry
+                .resolve_regular_playlist_stream(disconnect_guard, disconnect_track)
+                .await,
+            Err(RegularPlaylistMediaError::Unavailable)
+        ));
+        assert_eq!(
+            probe.stream_calls.load(Ordering::Acquire),
+            calls_before_disconnect
+        );
+        waiter.wait().await;
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn guarded_playlist_media_rejects_replacement_without_calling_successor() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("replacement-track").expect("track ID");
+        let predecessor = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            predecessor.playlist_adapter("predecessor", vec![fixture_track(track_id.clone())]),
+        )
+        .await;
+        let initial =
+            registry.resolve_regular_playlist_tracks(&[MediaKey::new(source_id, track_id.clone())]);
+        let old_guard = available(&initial[0]).guard();
+        let old_stream = registry
+            .resolve_regular_playlist_stream(old_guard, track_id.clone())
+            .await
+            .expect("predecessor stream");
+        let old_art = registry
+            .resolve_regular_playlist_artwork(old_guard, track_id.clone())
+            .await
+            .expect("predecessor artwork")
+            .expect("fixture artwork");
+        let parked = registry
+            .inner
+            .lifecycle
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("parked predecessor snapshot");
+
+        let successor = FakeProbe::new(true);
+        let successor_for_connect = Arc::clone(&successor);
+        let successor_track = track_id.clone();
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move {
+                    Ok(successor_for_connect
+                        .playlist_adapter("successor", vec![fixture_track(successor_track)]))
+                },
+            )
+            .expect("replacement admitted");
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let current = registry
+                    .resolve_regular_playlist_tracks(&[MediaKey::new(source_id, track_id.clone())]);
+                if matches!(&current[0], RegularPlaylistTrackResolution::Available(track)
+                    if track.guard().session_epoch() != old_guard.session_epoch())
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successor catalogue accepted");
+        assert!(!protected_request_is_active(&old_stream));
+        assert!(!old_art.is_active());
+        assert_eq!(parked.value.tracks.len(), 1);
+        assert!(matches!(
+            registry
+                .resolve_regular_playlist_stream(old_guard, track_id.clone())
+                .await,
+            Err(RegularPlaylistMediaError::Unavailable)
+        ));
+        assert_eq!(successor.stream_calls.load(Ordering::Acquire), 0);
+
+        let fresh =
+            registry.resolve_regular_playlist_tracks(&[MediaKey::new(source_id, track_id.clone())]);
+        registry
+            .resolve_regular_playlist_stream(available(&fresh[0]).guard(), track_id)
+            .await
+            .expect("fresh successor guard");
+        assert_eq!(successor.stream_calls.load(Ordering::Acquire), 1);
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn guarded_playlist_media_does_not_retain_final_registry_authority() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("last-handle-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.playlist_adapter("last-handle", vec![fixture_track(track_id.clone())]),
+        )
+        .await;
+        let resolved =
+            registry.resolve_regular_playlist_tracks(&[MediaKey::new(source_id, track_id.clone())]);
+        let guard = available(&resolved[0]).guard();
+        let stream = registry
+            .resolve_regular_playlist_stream(guard, track_id.clone())
+            .await
+            .expect("guarded stream");
+        let artwork = registry
+            .resolve_regular_playlist_artwork(guard, track_id)
+            .await
+            .expect("guarded artwork")
+            .expect("fixture artwork");
+        let parked = registry
+            .inner
+            .lifecycle
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("parked catalogue snapshot");
+        assert!(protected_request_is_active(&stream));
+        assert!(artwork.is_active());
+
+        drop(registry);
+
+        assert!(!protected_request_is_active(&stream));
+        assert!(!artwork.is_active());
+        assert_eq!(parked.value.tracks.len(), 1);
+        probe.wait_for_close_calls(1).await;
+    }
+
+    #[tokio::test]
+    async fn guarded_playlist_media_closes_raw_adapter_errors() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("secret-track-id").expect("track ID");
+        let probe = FakeProbe::new(true);
+        let secret = format!("https://user:password@private.invalid/{}", Uuid::new_v4());
+        let mut adapter = probe.playlist_adapter("failure", vec![fixture_track(track_id.clone())]);
+        adapter.stream_failure = Some(secret.clone());
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let resolution =
+            registry.resolve_regular_playlist_tracks(&[MediaKey::new(source_id, track_id.clone())]);
+        let result = registry
+            .resolve_regular_playlist_stream(available(&resolution[0]).guard(), track_id)
+            .await;
+        let Err(error) = result else {
+            panic!("adapter failure must be closed");
+        };
+        assert_eq!(
+            error,
+            RegularPlaylistMediaError::BackendFailure(FailureCategory::Connection)
+        );
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(&secret));
+        assert!(!rendered.contains("password"));
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
     async fn repeated_concurrent_builtin_refreshes_share_one_session_epoch() {
         let registry = registry();
         let source_id = SourceId::radio_browser();
@@ -1693,6 +2830,14 @@ mod tests {
             )
             .expect("existing built-in retained");
         assert_eq!(first_epoch, repeated_epoch);
+        let radio_playlist = registry.resolve_regular_playlist_tracks(&[MediaKey::new(
+            source_id,
+            TrackId::remote("shared-station").expect("track ID"),
+        )]);
+        assert_eq!(
+            unavailable_reason(&radio_playlist[0]),
+            RegularPlaylistUnavailableReason::UnsupportedSource
+        );
 
         let top_clicked = ViewOrigin::radio("top-clicked").expect("view");
         let top_voted = ViewOrigin::radio("top-voted").expect("view");
@@ -2287,6 +3432,12 @@ mod tests {
                 .expect("decode accepted identity"),
             std::path::PathBuf::from("accepted.wav")
         );
+        let playlist =
+            registry.resolve_regular_playlist_tracks(&[MediaKey::new(source_id, track_id.clone())]);
+        assert_eq!(
+            unavailable_reason(&playlist[0]),
+            RegularPlaylistUnavailableReason::UnsupportedSource
+        );
 
         let appeared_later = mount.path().join("appeared-later.wav");
         std::fs::write(&appeared_later, minimal_wav_bytes(0x40))
@@ -2520,6 +3671,14 @@ mod tests {
         assert!(published.file_path.is_none());
         assert!(published.stream_url.is_none());
         assert!(published.cover_art_url.is_none());
+        let playlist = registry.resolve_regular_playlist_tracks(&[MediaKey::new(
+            session.source_id(),
+            session.track_id().clone(),
+        )]);
+        assert_eq!(
+            unavailable_reason(&playlist[0]),
+            RegularPlaylistUnavailableReason::UnsupportedSource
+        );
 
         let wrong_track = TrackId::external();
         assert!(registry

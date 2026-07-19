@@ -21,7 +21,7 @@ state.
 - Do not treat the order below as a release promise. It is a dependency-aware starting order and
   can change as issues receive product decisions and milestones.
 
-Current status: **8/35 (22.9%)** active implementation records complete. This percentage measures
+Current status: **9/36 (25.0%)** active implementation records complete. This percentage measures
 checklist completion, not equal engineering effort: several P3 records are deliberately large
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
@@ -29,20 +29,21 @@ real-environment validation, not missing implementation.
 ## Current focus
 
 P1.1, P1.2, all three P1.3 playback-history records, both P1.4 rating records, and P1.5's
-source-scoped regular-playlist storage foundation are complete. Continue with P1.5's live-registry
-resolution and mixed-source Add/Remove/Play interaction record. That slice must retain the storage
-contract's no-locator/no-credential boundary while making disconnected, retired, and stale-epoch
-states honest. The rest of P1 builds on the source-scoped identity already present in the runtime,
-the now-bounded shuffle navigation semantics, authoritative local playback history with
-deterministic live consumers, and an exact capability-aware rating field.
+source-scoped regular-playlist storage and live-catalogue authority foundations are complete.
+Continue with P1.5 Record B, which will use that default-deny authority in Add/Remove/render/Play UI
+and make disconnected, retired, stale-epoch, and missing-track states visible without weakening the
+storage contract's no-locator/no-credential boundary. The rest of P1 builds on the source-scoped
+identity already present in the runtime, the now-bounded shuffle navigation semantics,
+authoritative local playback history with deterministic live consumers, and an exact
+capability-aware rating field.
 
 The independent Linux watcher correctness fix tracked in
-[#103](https://github.com/jm2/tributary/pull/103) does not change the **8/35** feature total.
+[#103](https://github.com/jm2/tributary/pull/103) does not change the **9/36** feature total.
 The salvaged scope rejects explicitly classified access/access-time noise before the bounded watcher
 queue without filtering real bootstrap mutations or backend errors, while retaining overflow
 evidence for authoritative reconciliation. It intentionally omits the original persistent
 unparseable-file cache so transient parser and I/O failures remain retryable. It is tracked outside
-the 35-record feature backlog.
+the 36-record feature backlog.
 
 ## P1 — Correctness and shared feature foundations
 
@@ -229,20 +230,58 @@ the 35-record feature backlog.
   non-local path evidence and persists no URL, credential, lease, or session epoch; existing local
   Add/load, XSPF import/export, reconciliation, rename, root-reauthorization, and deletion behaviors
   remain the compatibility boundary for this slice.
-- [ ] Resolve remote playlist entries only through the live `SourceRegistry` session; implement
-  Add/Remove/Play UI, disconnected states, source retirement, stale-epoch rejection, and mixed-source
-  playlist tests without persisting locators or credentials.
 
-  Explicitly deferred from migration 13: the current UI still refuses every non-local Add before
-  database work and projects only local entries. This record will admit only retained authenticated
-  catalogues through an explicit capability check. Radio-Browser, removable media, ephemeral
-  external files, and unknown sources remain unsupported until separately designed; a generic
-  storage shape alone does not authorize them.
+- [x] **Record A — Live catalogue authority:** establish the live-registry and accepted-catalogue
+  authority foundation for source-scoped regular-playlist entries. Capability must default to
+  unsupported and opt in only authenticated Subsonic, Jellyfin, Plex, and DAAP adapters. Ordered
+  lookup must accept only the exact current source session, catalogue generation, and native-track
+  identities, returning no locator, credential, lease, or route. Its closed result may carry the
+  non-secret session epoch and catalogue generation transiently; neither becomes playlist storage.
+  Guarded media resolution remains a separate at-use operation with retained private authority
+  ([#141](https://github.com/jm2/tributary/pull/141)).
+
+  Implemented contract: `ManagedSourceAdapter` exposes an
+  explicit `Unsupported` or `SourceScopedEntries` capability. The default and Radio-Browser,
+  removable-media, and ephemeral external-file adapters remain unsupported; only the four retained
+  authenticated catalogue adapters opt in. Registry lookup returns one ordered resolution per
+  requested occurrence. Unsupported sources, unavailable sessions, and missing exact tracks return
+  fixed unavailable results independently without erasing valid neighbors. If an otherwise
+  accepted catalogue contains a missing or duplicate native identity, its frozen regular-playlist
+  authority index is `Invalid` and every requested occurrence for that source fails closed; the
+  catalogue may remain available to existing non-playlist UI. Repeated requested IDs remain ordered
+  duplicate occurrences. Available rows use a dedicated display/sort/rating/history metadata
+  whitelist rather than a `Track` clone. The lifecycle snapshot owns a separately revocable
+  generation lease, so replacement or teardown invalidates guarded media even while an observer
+  retains an old snapshot clone; raw adapter failures become fixed media-error categories.
+  Catalogue projection runs on the captured immutable snapshot outside the lifecycle mutex, then
+  exact pointer identity and both leases are rechecked before return or adapter work. Revalidation
+  denies a guard made stale by refresh, replacement, retirement, release, or shutdown.
+  The capability does not authorize a database write, UI row, playback request, or source-native
+  playlist mutation.
+
+  Coverage pins the default-deny and four-opt-in matrix, `Invalid` indexing, ordered
+  duplicate requests, all four closed unavailable reasons, locator-free metadata, current-result
+  rechecks, predecessor retention, refresh/replacement invalidation, unlocked selector re-entry,
+  selector-time stale-work denial, synchronous lifecycle denial, and
+  membership/capability/epoch/generation checks before and after stream or artwork resolution.
+
+- [ ] **Record B — Mixed-source UI integration:** integrate the registry authority foundation into
+  regular-playlist Add, Remove, rendering, and Play behavior, with explicit disconnected/missing
+  states, source retirement, stale-epoch rejection, occurrence ordering, duplicates, and all-or-none
+  multi-selection tests.
+
+  Explicitly deferred from Record A: the current UI still refuses every non-local Add before
+  database work and projects only local entries. Record B must consume the registry result rather
+  than infer support from a source key, backend label, cached GTK row, or persisted fingerprint.
+  Radio-Browser, removable media, ephemeral external files, and unknown sources remain unsupported
+  until separately designed; neither a generic storage shape nor a registry lookup API authorizes
+  them.
+
 - [ ] Treat Subsonic server-native playlist import/synchronization as a separate capability slice,
   with direction, conflict, offline, deletion, and server-feature semantics documented first.
 
   No Subsonic playlist endpoint, origin mapping, import, or synchronization behavior is part of the
-  storage migration or the mixed-source interaction record.
+  storage migration, authority foundation, or mixed-source interaction record.
 
 ## P2 — User-facing integrations and bounded enhancements
 
@@ -358,5 +397,6 @@ the 35-record feature backlog.
 | 2026-07-18 | P1.3 deterministic history smart playlists | [#137](https://github.com/jm2/tributary/pull/137) | Made Recently Played and Top 25 deterministic over authoritative history, including intentional empty states, stable ordering and Top 25 membership, committed-event live refresh, exact untouched-default migration from both released historical signatures, and lossless editor round trips for Last Played fields, limits, and relative units. This completed P1.3. |
 | 2026-07-19 | P1.4 rating ownership and persistence foundation | [#138](https://github.com/jm2/tributary/pull/138) | Defined the canonical 1–100 value and coherent Writable/ReadOnly/Unsupported capabilities; added constrained nullable migration 12, transactional exact-local-ID set/clear, scan preservation, validated read-only Subsonic/Jellyfin/Plex conversion, fail-closed catalogue invariants and remote writes, and an explicit rating-neutral XSPF/import policy. Accessible editing, display, sorting, and smart rules were tracked in the following P1.4 record. |
 | 2026-07-19 | P1.4 rating UI and smart-playlist rules | [#139](https://github.com/jm2/tributary/pull/139) | Added the exact Rating column with localized cell/editor states, keyboard-operable local set/clear, honest read-only/unavailable states, serialized post-commit exact-ID refresh, failure-safe feedback, versioned column-config exposure, null-last deterministic sorting, and capability-aware numeric/presence smart rules plus Highest/Lowest Rated selection. This completed P1.4. |
-| 2026-07-19 | P1.5 source-scoped regular-playlist storage | [#140](https://github.com/jm2/tributary/pull/140) | Added migration 13 and typed atomic storage around exact `(SourceId, TrackId)` occurrence identity, a separate nullable local foreign-key cache, exact schema/index recognition, lossless-or-refused downgrade, local compatibility, and explicit no-locator/no-credential boundaries. Mixed-source live resolution and Subsonic-native synchronization remain the next two records. |
+| 2026-07-19 | P1.5 source-scoped regular-playlist storage | [#140](https://github.com/jm2/tributary/pull/140) | Added migration 13 and typed atomic storage around exact `(SourceId, TrackId)` occurrence identity, a separate nullable local foreign-key cache, exact schema/index recognition, lossless-or-refused downgrade, local compatibility, and explicit no-locator/no-credential boundaries. Default-deny live-catalogue authority, mixed-source UI integration, and Subsonic-native synchronization remain the next three records. |
+| 2026-07-19 | P1.5 live-catalogue playlist authority | [#141](https://github.com/jm2/tributary/pull/141) | Added default-deny adapter capability, exact ordered catalogue lookup with invalid-catalogue rejection and sanitized metadata, transient epoch/generation guards, closed media errors, and lifecycle-owned generation leases revoked independently of retained snapshots. Mixed-source Add/Remove/render/Play remains the next record. |
 | 2026-07-18 | Linux watcher feedback-loop fix | [#103](https://github.com/jm2/tributary/pull/103) | Narrowed the external proposal to filter self-generated access events before queue admission without filtering genuine startup events or backend errors; bounded overflow still drives authoritative reconciliation. Persistent negative parse caching is deliberately excluded so failures remain retryable; this separate correctness fix does not advance the feature numerator. |
