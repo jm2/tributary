@@ -26,6 +26,7 @@ const FIELD_NAMES: &[&str] = &[
     "Sample Rate (Hz)",
     "Format",
     "Play Count",
+    "Last Played",
     "Date Added",
     "Date Modified",
     "File Size (bytes)",
@@ -48,9 +49,10 @@ fn index_to_field(idx: u32) -> RuleField {
         11 => RuleField::SampleRate,
         12 => RuleField::Format,
         13 => RuleField::PlayCount,
-        14 => RuleField::DateAdded,
-        15 => RuleField::DateModified,
-        16 => RuleField::FileSize,
+        14 => RuleField::LastPlayed,
+        15 => RuleField::DateAdded,
+        16 => RuleField::DateModified,
+        17 => RuleField::FileSize,
         _ => RuleField::Title,
     }
 }
@@ -72,9 +74,10 @@ fn field_to_index(field: &RuleField) -> u32 {
         RuleField::SampleRate => 11,
         RuleField::Format => 12,
         RuleField::PlayCount => 13,
-        RuleField::DateAdded => 14,
-        RuleField::DateModified => 15,
-        RuleField::FileSize => 16,
+        RuleField::LastPlayed => 14,
+        RuleField::DateAdded => 15,
+        RuleField::DateModified => 16,
+        RuleField::FileSize => 17,
     }
 }
 
@@ -94,7 +97,7 @@ fn field_type(field: &RuleField) -> FieldType {
         | RuleField::Genre
         | RuleField::Composer
         | RuleField::Format => FieldType::Text,
-        RuleField::DateAdded | RuleField::DateModified => FieldType::Date,
+        RuleField::LastPlayed | RuleField::DateAdded | RuleField::DateModified => FieldType::Date,
         _ => FieldType::Number,
     }
 }
@@ -138,7 +141,45 @@ const LIMIT_SORTS: &[&str] = &[
     "Least Played",
     "Most Recently Added",
     "Least Recently Added",
+    "Most Recently Played",
+    "Least Recently Played",
 ];
+
+fn index_to_limit_sort(idx: u32) -> LimitSort {
+    match idx {
+        1 => LimitSort::Title,
+        2 => LimitSort::Album,
+        3 => LimitSort::Artist,
+        4 => LimitSort::Genre,
+        5 => LimitSort::Year,
+        6 => LimitSort::Bitrate,
+        7 => LimitSort::MostPlayed,
+        8 => LimitSort::LeastPlayed,
+        9 => LimitSort::MostRecentlyAdded,
+        10 => LimitSort::LeastRecentlyAdded,
+        11 => LimitSort::MostRecentlyPlayed,
+        12 => LimitSort::LeastRecentlyPlayed,
+        _ => LimitSort::Random,
+    }
+}
+
+fn limit_sort_to_index(sort: LimitSort) -> u32 {
+    match sort {
+        LimitSort::Random => 0,
+        LimitSort::Title => 1,
+        LimitSort::Album => 2,
+        LimitSort::Artist => 3,
+        LimitSort::Genre => 4,
+        LimitSort::Year => 5,
+        LimitSort::Bitrate => 6,
+        LimitSort::MostPlayed => 7,
+        LimitSort::LeastPlayed => 8,
+        LimitSort::MostRecentlyAdded => 9,
+        LimitSort::LeastRecentlyAdded => 10,
+        LimitSort::MostRecentlyPlayed => 11,
+        LimitSort::LeastRecentlyPlayed => 12,
+    }
+}
 
 // ── Public API ──────────────────────────────────────────────────────
 
@@ -259,19 +300,7 @@ pub fn show_smart_playlist_editor(
         .selected(
             existing_rules
                 .and_then(|r| r.limit.as_ref())
-                .map(|l| match l.selected_by {
-                    LimitSort::Random => 0,
-                    LimitSort::Title => 1,
-                    LimitSort::Album => 2,
-                    LimitSort::Artist => 3,
-                    LimitSort::Genre => 4,
-                    LimitSort::Year => 5,
-                    LimitSort::Bitrate => 6,
-                    LimitSort::MostPlayed => 7,
-                    LimitSort::LeastPlayed => 8,
-                    LimitSort::MostRecentlyAdded => 9,
-                    LimitSort::LeastRecentlyAdded => 10,
-                })
+                .map(|l| limit_sort_to_index(l.selected_by))
                 .unwrap_or(0),
         )
         .build();
@@ -404,19 +433,7 @@ pub fn show_smart_playlist_editor(
                 4 => LimitUnit::GB,
                 _ => LimitUnit::Items,
             };
-            let selected_by = match limit_sort_dropdown.selected() {
-                1 => LimitSort::Title,
-                2 => LimitSort::Album,
-                3 => LimitSort::Artist,
-                4 => LimitSort::Genre,
-                5 => LimitSort::Year,
-                6 => LimitSort::Bitrate,
-                7 => LimitSort::MostPlayed,
-                8 => LimitSort::LeastPlayed,
-                9 => LimitSort::MostRecentlyAdded,
-                10 => LimitSort::LeastRecentlyAdded,
-                _ => LimitSort::Random,
-            };
+            let selected_by = index_to_limit_sort(limit_sort_dropdown.selected());
             Some(SmartLimit {
                 value: limit_value.value() as u32,
                 unit,
@@ -723,8 +740,10 @@ const SORT_FIELD_NAMES: &[&str] = &[
     "Duration",
     "Bitrate",
     "Play Count",
+    "Last Played",
     "Date Added",
     "Date Modified",
+    "Track ID",
 ];
 
 /// Map dropdown index to `SortField`.
@@ -742,8 +761,10 @@ fn index_to_sort_field(idx: u32) -> SortField {
         9 => SortField::Duration,
         10 => SortField::Bitrate,
         11 => SortField::PlayCount,
-        12 => SortField::DateAdded,
-        13 => SortField::DateModified,
+        12 => SortField::LastPlayed,
+        13 => SortField::DateAdded,
+        14 => SortField::DateModified,
+        15 => SortField::TrackId,
         _ => SortField::Artist,
     }
 }
@@ -763,8 +784,10 @@ fn sort_field_to_index(field: SortField) -> u32 {
         SortField::Duration => 9,
         SortField::Bitrate => 10,
         SortField::PlayCount => 11,
-        SortField::DateAdded => 12,
-        SortField::DateModified => 13,
+        SortField::LastPlayed => 12,
+        SortField::DateAdded => 13,
+        SortField::DateModified => 14,
+        SortField::TrackId => 15,
     }
 }
 
@@ -848,4 +871,109 @@ fn extract_sort_from_row(row: &gtk::Box) -> Option<SortCriterion> {
     };
 
     Some(SortCriterion { field, direction })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_rule_field_round_trips_through_the_editor_mapping() {
+        let fields = [
+            RuleField::Title,
+            RuleField::Artist,
+            RuleField::AlbumArtist,
+            RuleField::Album,
+            RuleField::Genre,
+            RuleField::Composer,
+            RuleField::Year,
+            RuleField::TrackNumber,
+            RuleField::DiscNumber,
+            RuleField::Duration,
+            RuleField::Bitrate,
+            RuleField::SampleRate,
+            RuleField::Format,
+            RuleField::PlayCount,
+            RuleField::LastPlayed,
+            RuleField::DateAdded,
+            RuleField::DateModified,
+            RuleField::FileSize,
+        ];
+
+        for field in fields {
+            assert_eq!(index_to_field(field_to_index(&field)), field);
+        }
+        assert_eq!(
+            FIELD_NAMES[field_to_index(&RuleField::LastPlayed) as usize],
+            "Last Played"
+        );
+        assert!(matches!(
+            field_type(&RuleField::LastPlayed),
+            FieldType::Date
+        ));
+    }
+
+    #[test]
+    fn every_sort_field_round_trips_through_the_editor_mapping() {
+        let fields = [
+            SortField::TrackId,
+            SortField::Artist,
+            SortField::AlbumArtist,
+            SortField::Album,
+            SortField::Title,
+            SortField::Composer,
+            SortField::Year,
+            SortField::TrackNumber,
+            SortField::DiscNumber,
+            SortField::Genre,
+            SortField::Duration,
+            SortField::Bitrate,
+            SortField::PlayCount,
+            SortField::LastPlayed,
+            SortField::DateAdded,
+            SortField::DateModified,
+        ];
+
+        for field in fields {
+            assert_eq!(index_to_sort_field(sort_field_to_index(field)), field);
+        }
+        assert_eq!(
+            SORT_FIELD_NAMES[sort_field_to_index(SortField::LastPlayed) as usize],
+            "Last Played"
+        );
+    }
+
+    #[test]
+    fn every_limit_selection_round_trips_including_playback_recency() {
+        let selections = [
+            LimitSort::Random,
+            LimitSort::Title,
+            LimitSort::Album,
+            LimitSort::Artist,
+            LimitSort::Genre,
+            LimitSort::Year,
+            LimitSort::Bitrate,
+            LimitSort::MostPlayed,
+            LimitSort::LeastPlayed,
+            LimitSort::MostRecentlyAdded,
+            LimitSort::LeastRecentlyAdded,
+            LimitSort::MostRecentlyPlayed,
+            LimitSort::LeastRecentlyPlayed,
+        ];
+
+        for selection in selections {
+            assert_eq!(
+                index_to_limit_sort(limit_sort_to_index(selection)),
+                selection
+            );
+        }
+        assert_eq!(
+            LIMIT_SORTS[limit_sort_to_index(LimitSort::MostRecentlyPlayed) as usize],
+            "Most Recently Played"
+        );
+        assert_eq!(
+            LIMIT_SORTS[limit_sort_to_index(LimitSort::LeastRecentlyPlayed) as usize],
+            "Least Recently Played"
+        );
+    }
 }

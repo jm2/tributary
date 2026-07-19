@@ -565,50 +565,17 @@ impl PlaylistManager {
         info!(id = %pl.id, "Seeded: Recently Added");
         created.push(pl);
 
-        // 2. Recently Played — Date Modified in last 14 days AND Play Count > 0
-        let rules_recently_played = smart_rules::SmartRules {
-            match_mode: smart_rules::MatchMode::All,
-            rules: vec![
-                smart_rules::SmartRule {
-                    field: smart_rules::RuleField::DateModified,
-                    operator: smart_rules::RuleOperator::IsInTheLast {
-                        amount: 14,
-                        unit: smart_rules::DateUnit::Days,
-                    },
-                    value: smart_rules::RuleValue::Number(14),
-                },
-                smart_rules::SmartRule {
-                    field: smart_rules::RuleField::PlayCount,
-                    operator: smart_rules::RuleOperator::GreaterThan,
-                    value: smart_rules::RuleValue::Number(0),
-                },
-            ],
-            limit: None,
-            sort_order: vec![smart_rules::SortCriterion {
-                field: smart_rules::SortField::DateModified,
-                direction: smart_rules::SortDirection::Descending,
-            }],
-        };
+        // 2. Recently Played — authoritative playback time in the inclusive
+        // last-14-day window, newest first with stable TrackId ties.
+        let rules_recently_played = recently_played_default_rules();
         let pl = self.create_playlist("Recently Played", true).await?;
         self.set_smart_rules(&pl.id, &rules_recently_played).await?;
         info!(id = %pl.id, "Seeded: Recently Played");
         created.push(pl);
 
-        // 3. Top 25 Most Played — Play Count > 0, limit 25, sort by Most Played
-        let rules_top25 = smart_rules::SmartRules {
-            match_mode: smart_rules::MatchMode::All,
-            rules: vec![smart_rules::SmartRule {
-                field: smart_rules::RuleField::PlayCount,
-                operator: smart_rules::RuleOperator::GreaterThan,
-                value: smart_rules::RuleValue::Number(0),
-            }],
-            limit: Some(smart_rules::SmartLimit {
-                value: 25,
-                unit: smart_rules::LimitUnit::Items,
-                selected_by: smart_rules::LimitSort::MostPlayed,
-            }),
-            sort_order: vec![],
-        };
+        // 3. Top 25 Most Played — positive counts only, then count descending,
+        // playback time descending (unknown last), and stable TrackId ties.
+        let rules_top25 = top_25_most_played_default_rules();
         let pl = self.create_playlist("Top 25 Most Played", true).await?;
         self.set_smart_rules(&pl.id, &rules_top25).await?;
         info!(id = %pl.id, "Seeded: Top 25 Most Played");
@@ -616,6 +583,61 @@ impl PlaylistManager {
 
         info!(count = created.len(), "Default smart playlists seeded");
         Ok(created)
+    }
+}
+
+fn recently_played_default_rules() -> smart_rules::SmartRules {
+    smart_rules::SmartRules {
+        match_mode: smart_rules::MatchMode::All,
+        rules: vec![smart_rules::SmartRule {
+            field: smart_rules::RuleField::LastPlayed,
+            operator: smart_rules::RuleOperator::IsInTheLast {
+                amount: 14,
+                unit: smart_rules::DateUnit::Days,
+            },
+            value: smart_rules::RuleValue::Number(14),
+        }],
+        limit: None,
+        sort_order: vec![
+            smart_rules::SortCriterion {
+                field: smart_rules::SortField::LastPlayed,
+                direction: smart_rules::SortDirection::Descending,
+            },
+            smart_rules::SortCriterion {
+                field: smart_rules::SortField::TrackId,
+                direction: smart_rules::SortDirection::Ascending,
+            },
+        ],
+    }
+}
+
+fn top_25_most_played_default_rules() -> smart_rules::SmartRules {
+    smart_rules::SmartRules {
+        match_mode: smart_rules::MatchMode::All,
+        rules: vec![smart_rules::SmartRule {
+            field: smart_rules::RuleField::PlayCount,
+            operator: smart_rules::RuleOperator::GreaterThan,
+            value: smart_rules::RuleValue::Number(0),
+        }],
+        limit: Some(smart_rules::SmartLimit {
+            value: 25,
+            unit: smart_rules::LimitUnit::Items,
+            selected_by: smart_rules::LimitSort::MostPlayed,
+        }),
+        sort_order: vec![
+            smart_rules::SortCriterion {
+                field: smart_rules::SortField::PlayCount,
+                direction: smart_rules::SortDirection::Descending,
+            },
+            smart_rules::SortCriterion {
+                field: smart_rules::SortField::LastPlayed,
+                direction: smart_rules::SortDirection::Descending,
+            },
+            smart_rules::SortCriterion {
+                field: smart_rules::SortField::TrackId,
+                direction: smart_rules::SortDirection::Ascending,
+            },
+        ],
     }
 }
 
@@ -657,7 +679,7 @@ mod tests {
     };
     use sea_orm_migration::MigratorTrait;
 
-    use super::PlaylistManager;
+    use super::{recently_played_default_rules, top_25_most_played_default_rules, PlaylistManager};
     use crate::db::entities::{playlist, playlist_entry, track};
     use crate::db::migration::Migrator;
     use crate::local::playlist_io::ImportedTrack;
@@ -736,6 +758,68 @@ mod tests {
             .all(db)
             .await
             .expect("load playlist entries")
+    }
+
+    #[test]
+    fn playback_history_default_rules_have_canonical_serialized_forms() {
+        let recently_played = serde_json::to_string(&recently_played_default_rules())
+            .expect("serialize Recently Played defaults");
+        assert_eq!(
+            recently_played,
+            r#"{"match_mode":"All","rules":[{"field":"LastPlayed","operator":{"IsInTheLast":{"amount":14,"unit":"Days"}},"value":{"Number":14}}],"limit":null,"sort_order":[{"field":"LastPlayed","direction":"Descending"},{"field":"TrackId","direction":"Ascending"}]}"#
+        );
+
+        let top_25 = serde_json::to_string(&top_25_most_played_default_rules())
+            .expect("serialize Top 25 defaults");
+        assert_eq!(
+            top_25,
+            r#"{"match_mode":"All","rules":[{"field":"PlayCount","operator":"GreaterThan","value":{"Number":0}}],"limit":{"value":25,"unit":"Items","selected_by":"MostPlayed"},"sort_order":[{"field":"PlayCount","direction":"Descending"},{"field":"LastPlayed","direction":"Descending"},{"field":"TrackId","direction":"Ascending"}]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_seed_persists_canonical_history_rules_and_redundant_columns() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        manager.seed_defaults().await.expect("seed defaults");
+
+        let recently_played = playlist::Entity::find()
+            .filter(playlist::Column::Name.eq("Recently Played"))
+            .one(&db)
+            .await
+            .expect("query Recently Played")
+            .expect("Recently Played seed");
+        assert_eq!(
+            recently_played.smart_rules_json.as_deref(),
+            Some(
+                r#"{"match_mode":"All","rules":[{"field":"LastPlayed","operator":{"IsInTheLast":{"amount":14,"unit":"Days"}},"value":{"Number":14}}],"limit":null,"sort_order":[{"field":"LastPlayed","direction":"Descending"},{"field":"TrackId","direction":"Ascending"}]}"#
+            )
+        );
+        assert!(!recently_played.limit_enabled);
+        assert_eq!(recently_played.limit_value, None);
+        assert_eq!(recently_played.limit_unit, None);
+        assert_eq!(recently_played.limit_sort, None);
+        assert_eq!(recently_played.match_mode, "all");
+        assert!(recently_played.live_updating);
+
+        let top_25 = playlist::Entity::find()
+            .filter(playlist::Column::Name.eq("Top 25 Most Played"))
+            .one(&db)
+            .await
+            .expect("query Top 25")
+            .expect("Top 25 seed");
+        assert_eq!(
+            top_25.smart_rules_json.as_deref(),
+            Some(
+                r#"{"match_mode":"All","rules":[{"field":"PlayCount","operator":"GreaterThan","value":{"Number":0}}],"limit":{"value":25,"unit":"Items","selected_by":"MostPlayed"},"sort_order":[{"field":"PlayCount","direction":"Descending"},{"field":"LastPlayed","direction":"Descending"},{"field":"TrackId","direction":"Ascending"}]}"#
+            )
+        );
+        assert!(top_25.limit_enabled);
+        assert_eq!(top_25.limit_value, Some(25));
+        assert_eq!(top_25.limit_unit.as_deref(), Some(r#""Items""#));
+        assert_eq!(top_25.limit_sort.as_deref(), Some(r#""MostPlayed""#));
+        assert_eq!(top_25.match_mode, "all");
+        assert!(top_25.live_updating);
     }
 
     #[tokio::test]
