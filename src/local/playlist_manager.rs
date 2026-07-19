@@ -1060,29 +1060,30 @@ async fn assign_contiguous_positions(
 
     // Park every row above the complete current range, then assign 0..N.
     // The unique position index remains valid after every individual update.
+    // Reuse the snapshot already validated above: querying each entry again
+    // in both passes would add 2N database round trips while holding the
+    // write transaction.
+    let mut current_by_id: HashMap<String, playlist_entry::Model> = current
+        .into_iter()
+        .map(|entry| (entry.id.clone(), entry))
+        .collect();
+    let mut parked_entries = Vec::with_capacity(entry_ids.len());
     for (offset, entry_id) in entry_ids.iter().enumerate() {
         let offset = i32::try_from(offset)
             .map_err(|_| DbErr::Custom("Playlist has too many entries".to_string()))?;
-        let mut entry: playlist_entry::ActiveModel =
-            playlist_entry::Entity::find_by_id(entry_id.clone())
-                .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
-                .one(txn)
-                .await?
-                .ok_or_else(|| DbErr::RecordNotFound(format!("Entry {entry_id} not found")))?
-                .into();
+        let mut entry: playlist_entry::ActiveModel = current_by_id
+            .remove(entry_id)
+            .ok_or_else(|| DbErr::RecordNotFound(format!("Entry {entry_id} not found")))?
+            .into();
         entry.position = Set(parking_start + offset);
-        entry.update(txn).await?;
+        parked_entries.push(entry.update(txn).await?);
     }
-    for (position, entry_id) in entry_ids.iter().enumerate() {
+    debug_assert!(current_by_id.is_empty());
+
+    for (position, entry) in parked_entries.into_iter().enumerate() {
         let position = i32::try_from(position)
             .map_err(|_| DbErr::Custom("Playlist has too many entries".to_string()))?;
-        let mut entry: playlist_entry::ActiveModel =
-            playlist_entry::Entity::find_by_id(entry_id.clone())
-                .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
-                .one(txn)
-                .await?
-                .ok_or_else(|| DbErr::RecordNotFound(format!("Entry {entry_id} not found")))?
-                .into();
+        let mut entry: playlist_entry::ActiveModel = entry.into();
         entry.position = Set(position);
         entry.update(txn).await?;
     }
