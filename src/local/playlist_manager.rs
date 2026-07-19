@@ -823,6 +823,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seeded_history_playlists_reflect_committed_history_rows() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let older = insert_track(
+            &db,
+            "history-older",
+            "/music/history-older.flac",
+            "Older play",
+            "Artist",
+            "Album",
+            Some(180),
+        )
+        .await;
+        let newer = insert_track(
+            &db,
+            "history-newer",
+            "/music/history-newer.flac",
+            "Newer play",
+            "Artist",
+            "Album",
+            Some(180),
+        )
+        .await;
+        manager.seed_defaults().await.expect("seed defaults");
+
+        let recently_played = playlist::Entity::find()
+            .filter(playlist::Column::Name.eq("Recently Played"))
+            .one(&db)
+            .await
+            .expect("query Recently Played")
+            .expect("Recently Played seed");
+        let top_25 = playlist::Entity::find()
+            .filter(playlist::Column::Name.eq("Top 25 Most Played"))
+            .one(&db)
+            .await
+            .expect("query Top 25")
+            .expect("Top 25 seed");
+
+        assert!(manager
+            .evaluate_smart_playlist(&recently_played.id)
+            .await
+            .expect("evaluate empty Recently Played")
+            .is_empty());
+        assert!(manager
+            .evaluate_smart_playlist(&top_25.id)
+            .await
+            .expect("evaluate empty Top 25")
+            .is_empty());
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut older_active: track::ActiveModel = older.into();
+        older_active.play_count = Set(7);
+        older_active.last_played_at_ms = Set(Some(now_ms - 2_000));
+        older_active
+            .update(&db)
+            .await
+            .expect("commit older playback history");
+        let mut newer_active: track::ActiveModel = newer.into();
+        newer_active.play_count = Set(2);
+        newer_active.last_played_at_ms = Set(Some(now_ms - 1_000));
+        newer_active
+            .update(&db)
+            .await
+            .expect("commit newer playback history");
+
+        let recent_ids: Vec<_> = manager
+            .evaluate_smart_playlist(&recently_played.id)
+            .await
+            .expect("reevaluate Recently Played")
+            .into_iter()
+            .map(|track| track.id)
+            .collect();
+        assert_eq!(recent_ids, ["history-newer", "history-older"]);
+
+        let top_ids: Vec<_> = manager
+            .evaluate_smart_playlist(&top_25.id)
+            .await
+            .expect("reevaluate Top 25")
+            .into_iter()
+            .map(|track| track.id)
+            .collect();
+        assert_eq!(top_ids, ["history-older", "history-newer"]);
+    }
+
+    #[tokio::test]
     async fn import_commits_matched_unmatched_and_failed_counts_and_reconciles_path() {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
