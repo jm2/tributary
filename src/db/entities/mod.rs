@@ -5,4 +5,3 @@ pub mod playlist;
 pub mod playlist_entry;
 pub mod root_reauthorization_receipt;
 pub mod track;
-pub mod unparseable_file;

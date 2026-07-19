@@ -149,7 +149,7 @@ mod tests {
         let db = Database::connect("sqlite::memory:")
             .await
             .expect("open in-memory database");
-        Migrator::up(&db, Some(9))
+        Migrator::up(&db, Some(8))
             .await
             .expect("apply migrations preceding reauthorization receipts");
         db

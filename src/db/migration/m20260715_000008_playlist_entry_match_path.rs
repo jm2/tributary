@@ -67,7 +67,7 @@ mod tests {
         let db = Database::connect("sqlite::memory:")
             .await
             .expect("open in-memory database");
-        Migrator::up(&db, Some(8))
+        Migrator::up(&db, Some(7))
             .await
             .expect("apply migrations preceding playlist entry match path");
         db

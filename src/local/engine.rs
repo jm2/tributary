@@ -26,9 +26,7 @@ use super::root_authority::{AbsenceProof, BoundDirectory, BoundFile, RootAuthori
 use super::tag_parser::{self, ParsedTrack};
 use super::tag_writer;
 use crate::architecture::{models::Track, TrackId};
-use crate::db::entities::{
-    library_root, playlist_entry, root_reauthorization_receipt, track, unparseable_file,
-};
+use crate::db::entities::{library_root, playlist_entry, root_reauthorization_receipt, track};
 
 /// Frozen namespace for projecting a legacy non-UUID SQLite track key into
 /// compatibility APIs that have not yet migrated from `Uuid`.
@@ -348,20 +346,6 @@ impl LibraryEngine {
         if let Err(e) = initial_scan(&db, &music_dirs, &tx).await {
             error!(error = %e, "Initial scan failed");
             let _ = tx.send(LibraryEvent::Error(e.to_string())).await;
-        }
-
-        // Discard filesystem events that the initial scan itself generated
-        // (e.g. creating the .tributary-root-id marker).  Without this flush
-        // the marker-creation event immediately triggers
-        // reconcile_root_marker_mutations, which starts a redundant second
-        // full scan before the watcher event loop even settles.
-        // Also reset the overflow flag: the bounded watcher channel may have
-        // filled during the scan (directory-traversal events), leaving a
-        // stale overflow that would otherwise trigger an immediate
-        // reconciliation scan on the very first event-loop iteration.
-        if let Some(watcher) = watcher.as_mut() {
-            discard_watcher_backlog(&mut watcher.rx);
-            watcher.ingress_overflowed.store(false, Ordering::Release);
         }
 
         // A missing or temporarily unwatchable root can become available
@@ -3268,7 +3252,6 @@ async fn initial_scan_with_root_trust_guards(
     // mounts remain independent reconciliation scopes even while unmounted.
     let existing_tracks = track::Entity::find().all(db).await?;
     let persisted_roots = library_root::Entity::find().all(db).await?;
-    let unparseable_files = unparseable_file::Entity::find().all(db).await?;
     let dirs = expanded_scan_roots(&configured_dirs, &persisted_roots).map_err(|error| {
         anyhow::anyhow!(
             "failed to inspect mounted library scopes; scan disabled to protect metadata: {error}"
@@ -3291,10 +3274,6 @@ async fn initial_scan_with_root_trust_guards(
     // from memory instead of issuing one SELECT per file. The same snapshot is
     // reused for the stale-removal pass below.
     let existing_by_path: HashMap<&str, &track::Model> = existing_tracks
-        .iter()
-        .map(|model| (model.file_path.as_str(), model))
-        .collect();
-    let unparseable_by_path: HashMap<&str, &unparseable_file::Model> = unparseable_files
         .iter()
         .map(|model| (model.file_path.as_str(), model))
         .collect();
@@ -3555,7 +3534,6 @@ async fn initial_scan_with_root_trust_guards(
 
     for path in &audio_files {
         let path_str = path.to_string_lossy().to_string();
-        let path_mtime = get_mtime(path);
         on_disk_paths.insert(path_str.clone());
 
         // Look up the existing row (if any) in the preloaded map.
@@ -3563,20 +3541,11 @@ async fn initial_scan_with_root_trust_guards(
 
         let needs_update = match existing {
             // Compare FS mtime with stored date_modified.
-            Some(row) => path_mtime != row.date_modified,
+            Some(row) => get_mtime(path) != row.date_modified,
             None => true,
         };
 
         if needs_update {
-            // Skip files that were previously determined unparseable
-            // when their mtime hasn't changed (file has not been fixed).
-            if let Some(failed) = unparseable_by_path.get(path_str.as_str()) {
-                if path_mtime == failed.date_modified {
-                    scanned += 1;
-                    continue;
-                }
-            }
-
             let (identity_allows_parse, invalidated_root) = match revalidate_scan_root_for_path(
                 path,
                 &mut root_scans,
@@ -3631,15 +3600,6 @@ async fn initial_scan_with_root_trust_guards(
 
             match parse_result {
                 Ok(Ok(parsed)) => {
-                    // This file parsed successfully.  Remove any prior
-                    // unparseable-file record so the next scan knows to
-                    // use the new track row instead of marking it again.
-                    if unparseable_by_path.contains_key(path_str.as_str()) {
-                        if let Err(error) = delete_unparseable_file(db, &path_str).await {
-                            warn!(path = %path_str, %error, "Failed to clear unparseable-file record");
-                        }
-                    }
-
                     let (identity_allows_upsert, invalidated_root) =
                         match revalidate_scan_root_for_path(path, &mut root_scans).await {
                             Ok(result) => result,
@@ -3711,12 +3671,6 @@ async fn initial_scan_with_root_trust_guards(
                 }
                 Ok(Err(e)) => {
                     warn!(path = %path_str, error = %e, "Skipping unparseable file");
-                    // Record the failure so subsequent scans skip this file.
-                    // If the file is later fixed (mtime changes), the record
-                    // is superseded and the parse is re-attempted.
-                    if let Err(error) = upsert_unparseable_file(db, &path_str, &path_mtime).await {
-                        warn!(path = %path_str, %error, "Failed to record unparseable file");
-                    }
                 }
                 Err(e) => {
                     warn!(path = %path_str, error = %e, "spawn_blocking failed");
@@ -3872,17 +3826,6 @@ async fn initial_scan_with_root_trust_guards(
                 }
                 Err(error) => {
                     warn!(path = %row.file_path, %error, "Failed to remove stale track transactionally");
-                }
-            }
-        }
-
-        // Remove unparseable-file records for files no longer on disk.
-        // These are ephemeral derived state so a simple existence check
-        // against the scan results is sufficient.
-        for path in unparseable_by_path.keys() {
-            if !on_disk_paths.contains(*path) {
-                if let Err(error) = delete_unparseable_file(db, path).await {
-                    warn!(path = %path, %error, "Failed to remove stale unparseable-file record");
                 }
             }
         }
@@ -4528,19 +4471,23 @@ where
     }
 }
 
-fn marker_event_invalidates_root(kind: notify::EventKind) -> bool {
+fn watcher_event_kind_is_observational_access(kind: notify::EventKind) -> bool {
     use notify::event::{MetadataKind, ModifyKind};
     use notify::EventKind;
 
+    matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
+    )
+}
+
+fn marker_event_invalidates_root(kind: notify::EventKind) -> bool {
     // Reading the marker is part of every authorization probe and some
     // backends report open/read/close (or the resulting atime update) through
     // the same watcher. Those observations must not invalidate the identity
     // they just verified. Every potentially mutating or unknown event remains
     // fail-closed.
-    !matches!(
-        kind,
-        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
-    )
+    !watcher_event_kind_is_observational_access(kind)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -4915,7 +4862,7 @@ async fn settle_playlist_projections_after_watcher_batch(
     result
 }
 
-const WATCHER_EVENT_CAPACITY: usize = 65536;
+const WATCHER_EVENT_CAPACITY: usize = 256;
 const WATCHER_DEBOUNCE_MS: u64 = 1500;
 const WATCHER_RECONCILIATION_RETRY_MS: u64 = 1000;
 
@@ -4954,6 +4901,17 @@ fn enqueue_watcher_result(
     ingress_overflowed: &AtomicBool,
     result: notify::Result<notify::Event>,
 ) {
+    // Tag reads can generate an event per file on Linux (including atime
+    // metadata updates under relatime). These events are observational and
+    // were already ignored by batching, so keep them out of the bounded queue
+    // before a large scan can falsely report stream loss and rescan forever.
+    // A backend rescan flag remains authoritative even on an access event.
+    if result.as_ref().is_ok_and(|event| {
+        !event.need_rescan() && watcher_event_kind_is_observational_access(event.kind)
+    }) {
+        return;
+    }
+
     match tx.try_send(result) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -5395,28 +5353,8 @@ async fn process_directory_events(
                             if let Some(displaced) = displaced {
                                 let displaced = *displaced;
                                 let _ = tx
-                                    .send(LibraryEvent::TrackRemoved(displaced.file_path.clone()))
+                                    .send(LibraryEvent::TrackRemoved(displaced.file_path))
                                     .await;
-                                // Clean up unparseable-file record for the displaced destination.
-                                if let Err(error) =
-                                    delete_unparseable_file(db.as_ref(), &displaced.file_path).await
-                                {
-                                    warn!(path = %displaced.file_path, %error, "Failed to remove unparseable-file record for displaced file");
-                                }
-                            }
-                            // Clean up unparseable-file record for the source path.
-                            let from_str = pair.from.to_string_lossy();
-                            if let Err(error) =
-                                delete_unparseable_file(db.as_ref(), from_str.as_ref()).await
-                            {
-                                warn!(from = %pair.from.display(), %error, "Failed to remove unparseable-file record after rename");
-                            }
-                            // Clean up unparseable-file record for the destination path.
-                            let to_str = pair.to.to_string_lossy();
-                            if let Err(error) =
-                                delete_unparseable_file(db.as_ref(), to_str.as_ref()).await
-                            {
-                                warn!(to = %pair.to.display(), %error, "Failed to remove unparseable-file record at rename destination");
                             }
                             let _ = tx
                                 .send(LibraryEvent::TrackUpserted(Box::new(db_model_to_track(
@@ -5657,7 +5595,7 @@ async fn process_directory_events(
             match delete_track_if_root_stable(db.as_ref(), &mut root_cache, music_dirs, path).await
             {
                 Ok(true) => {
-                    let _ = tx.send(LibraryEvent::TrackRemoved(path_str.clone())).await;
+                    let _ = tx.send(LibraryEvent::TrackRemoved(path_str)).await;
                     track_mutation_committed = true;
                 }
                 Ok(false) => {
@@ -5667,10 +5605,6 @@ async fn process_directory_events(
                     warn!(path = %path.display(), %error, "Failed to process watched removal safely");
                     reconciliation_required = true;
                 }
-            }
-            // Clean up any unparseable-file record for the removed file.
-            if let Err(error) = delete_unparseable_file(db.as_ref(), &path_str).await {
-                warn!(path = %path.display(), %error, "Failed to remove unparseable-file record for deleted file");
             }
         }
 
@@ -5872,13 +5806,6 @@ async fn process_directory_events(
                             Ok(GuardedTrackUpsertOutcome::Committed(model)) => {
                                 upsert_committed = true;
                                 track_mutation_committed = true;
-                                // Clear any prior unparseable-file record now
-                                // that the file parsed successfully.
-                                if let Err(error) =
-                                    delete_unparseable_file(db.as_ref(), &path_str).await
-                                {
-                                    warn!(path = %path_str, %error, "Failed to clear unparseable-file record after successful parse");
-                                }
                                 let t = db_model_to_track(&model);
                                 let _ = tx.send(LibraryEvent::TrackUpserted(Box::new(t))).await;
                             }
@@ -6353,55 +6280,6 @@ fn get_mtime(path: &Path) -> String {
             dt.to_rfc3339()
         })
         .unwrap_or_default()
-}
-
-/// Record a file that could not be parsed so subsequent scans skip it
-/// unless its mtime changes (indicating the file may have been fixed).
-async fn upsert_unparseable_file(
-    db: &DatabaseConnection,
-    file_path: &str,
-    date_modified: &str,
-) -> anyhow::Result<()> {
-    // match unparseable_file::Entity::find_by_id(file_path)
-    //     .one(db)
-    //     .await?
-    // {
-    //     Some(existing) => {
-    //         let mut active: unparseable_file::ActiveModel = existing.into();
-    //         active.date_modified = Set(date_modified.to_owned());
-    //         active.update(db).await?;
-    //     }
-    //     None => {
-    //         unparseable_file::ActiveModel {
-    //             file_path: Set(file_path.to_owned()),
-    //             date_modified: Set(date_modified.to_owned()),
-    //         }
-    //         .insert(db)
-    //         .await?;
-    //     }
-    // }
-    let active = unparseable_file::ActiveModel {
-        file_path: Set(file_path.to_owned()),
-        date_modified: Set(date_modified.to_owned()),
-    };
-    unparseable_file::Entity::insert(active)
-        .on_conflict(
-            sea_orm::sea_query::OnConflict::column(unparseable_file::Column::FilePath)
-                .update_column(unparseable_file::Column::DateModified)
-                .to_owned(),
-        )
-        .exec(db)
-        .await?;
-    Ok(())
-}
-
-/// Remove a previously-recorded unparseable-file entry after the file has
-/// been successfully parsed, preventing stale records from accumulating.
-async fn delete_unparseable_file(db: &DatabaseConnection, file_path: &str) -> anyhow::Result<()> {
-    unparseable_file::Entity::delete_by_id(file_path)
-        .exec(db)
-        .await?;
-    Ok(())
 }
 
 /// Convert a database `track::Model` to an architecture `Track`.
@@ -7240,6 +7118,76 @@ mod tests {
             event = event.set_tracker(tracker);
         }
         event
+    }
+
+    #[test]
+    fn watcher_ingress_filters_access_noise_before_the_bounded_queue() {
+        use notify::event::{AccessKind, AccessMode, Flag, MetadataKind, ModifyKind};
+        use notify::EventKind;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let overflowed = AtomicBool::new(false);
+
+        for index in 0..1_024 {
+            let kind = match index % 4 {
+                0 => EventKind::Access(AccessKind::Open(AccessMode::Read)),
+                1 => EventKind::Access(AccessKind::Read),
+                2 => EventKind::Access(AccessKind::Close(AccessMode::Read)),
+                _ => EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)),
+            };
+            enqueue_watcher_result(
+                &tx,
+                &overflowed,
+                Ok(notify::Event::new(kind)
+                    .add_path(PathBuf::from(format!("/music/{index}.flac")))),
+            );
+        }
+
+        assert!(!overflowed.load(Ordering::Acquire));
+        assert!(
+            rx.try_recv().is_err(),
+            "access noise must not enter the queue"
+        );
+
+        let create = notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+            .add_path(PathBuf::from("/music/real-change.flac"));
+        enqueue_watcher_result(&tx, &overflowed, Ok(create));
+        let dropped = notify::Event::new(EventKind::Remove(notify::event::RemoveKind::File))
+            .add_path(PathBuf::from("/music/second-real-change.flac"));
+        enqueue_watcher_result(&tx, &overflowed, Ok(dropped));
+
+        assert!(
+            overflowed.load(Ordering::Acquire),
+            "real mutation overflow must remain authoritative"
+        );
+        assert_eq!(
+            rx.try_recv()
+                .expect("real change remains queueable after the access storm")
+                .expect("queued notify event")
+                .paths,
+            [PathBuf::from("/music/real-change.flac")]
+        );
+        overflowed.store(false, Ordering::Release);
+
+        let rescan = notify::Event::new(EventKind::Access(AccessKind::Read))
+            .set_flag(Flag::Rescan)
+            .add_path(PathBuf::from("/music"));
+        enqueue_watcher_result(&tx, &overflowed, Ok(rescan));
+        assert!(rx
+            .try_recv()
+            .expect("backend rescan evidence must survive access filtering")
+            .expect("queued notify event")
+            .need_rescan());
+
+        enqueue_watcher_result(
+            &tx,
+            &overflowed,
+            Err(notify::Error::generic("backend stream failed")),
+        );
+        assert!(rx
+            .try_recv()
+            .expect("watcher errors must survive access filtering")
+            .is_err());
     }
 
     #[test]
