@@ -470,14 +470,23 @@ fn evaluate_rule_at<T: SmartTrack>(
         RuleField::PlayCount => {
             eval_number(Some(track.play_count() as i64), &rule.operator, &rule.value)
         }
-        RuleField::LastPlayed => eval_optional_instant(
-            track
-                .last_played_at_ms()
-                .and_then(chrono::DateTime::from_timestamp_millis),
-            &rule.operator,
-            &rule.value,
-            now,
-        ),
+        RuleField::LastPlayed => {
+            // Playback history is persisted at millisecond precision. Compare it
+            // against a clock at that same precision so the inclusive lower
+            // boundary does not lose its final representable millisecond when
+            // `Utc::now()` carries fractional-millisecond nanoseconds. Keep the
+            // original clock for RFC3339 date-added/modified fields below.
+            let history_now = chrono::DateTime::from_timestamp_millis(now.timestamp_millis())
+                .expect("a valid UTC instant remains representable at millisecond precision");
+            eval_optional_instant(
+                track
+                    .last_played_at_ms()
+                    .and_then(chrono::DateTime::from_timestamp_millis),
+                &rule.operator,
+                &rule.value,
+                history_now,
+            )
+        }
         RuleField::FileSize => eval_number(track.file_size_bytes(), &rule.operator, &rule.value),
         RuleField::DateAdded => eval_date_at(track.date_added(), &rule.operator, &rule.value, now),
         RuleField::DateModified => {
@@ -1510,7 +1519,11 @@ mod tests {
 
     #[test]
     fn recently_played_uses_one_inclusive_clock_and_stable_track_id_ties() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-07-18T12:00:00Z")
+        // The production clock normally carries sub-millisecond precision while
+        // playback history does not. This fractional instant proves that the
+        // exact stored cutoff millisecond remains included and cutoff - 1 ms is
+        // excluded.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-18T12:00:00.123456789Z")
             .expect("fixed clock")
             .with_timezone(&chrono::Utc);
         let cutoff = now - chrono::TimeDelta::days(14);
