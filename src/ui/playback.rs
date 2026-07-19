@@ -1796,12 +1796,36 @@ pub fn previous_or_restart_from_user(
 
 /// Replay the current queue item without consulting the mutable view.
 pub fn replay_current(ctx: &PlaybackContext) -> bool {
-    let previous = ctx.session.borrow().clone();
-    ctx.session.borrow_mut().begin_repeat_one_occurrence();
-    if play_current(ctx) {
+    replay_current_occurrence(ctx.session.as_ref(), || play_current(ctx))
+}
+
+fn replay_current_occurrence(
+    session: &RefCell<PlaybackSession>,
+    play: impl FnOnce() -> bool,
+) -> bool {
+    // `play_current` returns false only before it begins a new output/event
+    // generation. Snapshot just the tentative occurrence so a pre-handoff
+    // failure can restore its predecessor without cloning or rolling back the
+    // queue, shuffle traversal, resolution state, or event ownership.
+    let (previous_occurrence, previous_generation) = {
+        let mut session = session.borrow_mut();
+        let previous = session.history_occurrence.clone();
+        let generation = session.event_generation;
+        session.begin_repeat_one_occurrence();
+        (previous, generation)
+    };
+    if play() {
         true
     } else {
-        *ctx.session.borrow_mut() = previous;
+        let mut session = session.borrow_mut();
+        if session.event_generation == previous_generation {
+            session.history_occurrence = previous_occurrence;
+        } else {
+            debug_assert!(
+                false,
+                "a failed repeat-one handoff must not advance output ownership"
+            );
+        }
         false
     }
 }
@@ -3480,6 +3504,51 @@ mod tests {
             "a backward Previous restart is not skip evidence"
         );
         assert!(!restarted.observe_history_seek(generation.next(), 0, 1_000));
+    }
+
+    #[test]
+    fn repeat_one_failure_rolls_back_only_its_tentative_history_occurrence() {
+        let mut playback = PlaybackSession::default();
+        assert!(playback.replace_queue(
+            vec![history_item("local", "repeat-rollback", Some(20_000))],
+            0,
+        ));
+        let generation = accept_history_load(&mut playback);
+        observe_playing(&mut playback, generation);
+        assert_eq!(observe_position(&mut playback, generation, 0, 20_000), None);
+        assert_eq!(
+            observe_position(&mut playback, generation, 4_000, 20_000),
+            None
+        );
+        let previous_occurrence = playback
+            .history_occurrence
+            .clone()
+            .expect("current local occurrence");
+        let session = RefCell::new(playback);
+
+        assert!(!replay_current_occurrence(&session, || {
+            let session = session.borrow();
+            let tentative = session
+                .history_occurrence
+                .as_ref()
+                .expect("tentative repeat occurrence");
+            assert_ne!(tentative, &previous_occurrence);
+            assert_eq!(session.event_generation, generation);
+            false
+        }));
+
+        let session = session.borrow();
+        assert_eq!(session.event_generation, generation);
+        assert_eq!(
+            session
+                .current()
+                .map(|item| item.identity.media_key.track_id.as_str()),
+            Some("repeat-rollback")
+        );
+        assert_eq!(
+            session.history_occurrence.as_ref(),
+            Some(&previous_occurrence)
+        );
     }
 
     #[test]

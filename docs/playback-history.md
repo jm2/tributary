@@ -37,7 +37,10 @@ output-target replacement instead clears playback and ends the occurrence. Repla
 Stop, application restart, or retiring the owning source also ends the old occurrence; partial
 credit is intentionally in-memory only. A failed or rejected candidate never becomes a countable
 occurrence, a terminal error is not natural end, and a retry generation cannot count separately
-from the occurrence it is recovering.
+from the occurrence it is recovering. Repeat One installs its fresh occurrence tentatively before
+the replay handoff. If replay fails before advancing output generation, Tributary restores only the
+prior history occurrence; it never clones or rolls back queue, shuffle, resolution, or event state,
+and it never restores anything after output ownership advances.
 
 ## Counted-play threshold
 
@@ -120,7 +123,7 @@ SQLite's equivalent nullable, default-free `INTEGER` spelling while rejecting in
 nullability, default, or primary-key shapes. Rolling the migration down necessarily discards stored
 last-played timestamps but preserves tracks and play counts; reapplying starts those timestamps as
 null. No history index is added yet because smart playlists currently materialize the local table
-before evaluation; an index would add write cost without serving the current query path.
+in memory before evaluation; an index would add write cost without serving the current query path.
 
 Production persistence atomically saturates `play_count` at `i32::MAX` and sets
 `last_played_at_ms` to `max(existing, event_timestamp)`. The bound update targets one exact stable

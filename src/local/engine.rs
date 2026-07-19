@@ -2987,10 +2987,10 @@ async fn refresh_unavailable_root_trust_evidence(
 ///
 /// The write uses a single bound-parameter statement so a concurrent caller
 /// can never lose an increment between a read and a write. SQLite stores the
-/// application count as a signed integer, so legacy negative values are
-/// repaired to the first legitimate play and the public `u32` projection is
-/// capped at the entity's `i32` ceiling. The updated row is selected while the
-/// same write transaction is still held and is returned only after COMMIT.
+/// application count as a non-null signed integer, so legacy negative values
+/// are repaired to the first legitimate play and the public `u32` projection
+/// is capped at the entity's `i32` ceiling. The updated row is selected while
+/// the same write transaction is still held and is returned only after COMMIT.
 async fn record_playback_history(
     db: &DatabaseConnection,
     track_id: &TrackId,
