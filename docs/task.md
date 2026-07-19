@@ -21,17 +21,18 @@ state.
 - Do not treat the order below as a release promise. It is a dependency-aware starting order and
   can change as issues receive product decisions and milestones.
 
-Current status: **3/35 (8.6%)** active implementation records complete. This percentage measures
+Current status: **4/35 (11.4%)** active implementation records complete. This percentage measures
 checklist completion, not equal engineering effort: several P3 records are deliberately large
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
 ## Current focus
 
-P1.1, P1.2, and the P1.3 playback-history contract/schema foundation are complete. Continue with
-authoritative per-occurrence persistence and live UI invalidation in the second P1.3 record. The
-rest of P1 builds on the source-scoped identity already present in the runtime, the now-bounded
-shuffle navigation semantics, and an honest local-only playlist interaction boundary.
+P1.1, P1.2, and the first two P1.3 playback-history records are complete. Continue with the final
+P1.3 record: deterministic Recently Played and Top 25 behavior, safe migration of untouched seeded
+defaults, and live smart-playlist refresh. The rest of P1 builds on the source-scoped identity
+already present in the runtime, the now-bounded shuffle navigation semantics, an honest local-only
+playlist interaction boundary, and authoritative local playback events.
 
 ## P1 — Correctness and shared feature foundations
 
@@ -90,22 +91,32 @@ shuffle navigation semantics, and an honest local-only playlist interaction boun
 - [x] Define and migrate the durable playback-history contract: counted-play threshold,
   `last_played`, repeat/seek/restart semantics, clock representation, and legacy-row behavior
   ([contract](playback-history.md); [#134](https://github.com/jm2/tributary/pull/134)).
-- [ ] Persist play-count and last-played updates from authoritative playback events exactly once,
+- [x] Persist play-count and last-played updates from authoritative playback events exactly once,
   without counting rejected loads, stale generations, or retries, and refresh affected UI state.
 - [ ] Make Recently Played and Top 25 reflect the new history contract deterministically, including
   live refresh, ordering, empty-state, migration, and regression coverage.
 
-  Implemented foundation: local tracks now have a nullable UTC epoch-millisecond `last_played`
-  field, negative legacy counts are repaired without inventing timestamps, and a pure one-shot
-  occurrence state accounts only for observed forward playback. A positive duration counts at half
-  duration rounded up and capped at four minutes; missing/zero duration uses four minutes or an
-  unskipped authoritative natural end. Pause, buffering, seek jumps, restarts, and retries cannot
-  manufacture credit, while Repeat One creates a new occurrence. The complete contract and future
-  persistence/smart-playlist boundaries are recorded in [`playback-history.md`](playback-history.md).
+  Implemented history pipeline: local tracks have a nullable UTC epoch-millisecond `last_played`
+  field, negative legacy counts are repaired without inventing timestamps, and `PlaybackSession`
+  owns one-shot progress separately from replaceable output-event generations. Only a successfully
+  accepted exact local occurrence—including its regular/smart-playlist projection—can earn
+  observed forward-playback credit. Rejected and stale deliveries earn none; retries, pause,
+  buffering, seeks, and the three-second Previous restart re-anchor the same occurrence without
+  jump credit. Paused/Stopped position polls stay inert until Playing; navigation and Repeat One
+  create fresh occurrences, while the current output-target replacement ends playback.
 
-  Production playback still does not increment `play_count` or write `last_played`; that is the
-  second record. Recently Played and Top 25 therefore remain ordinarily empty until the second and
-  third records complete.
+  Once an occurrence qualifies, its latch closes before synchronous FIFO enqueue. The library
+  engine atomically updates only that stable `TrackId`, saturates `play_count` at `i32::MAX`, keeps
+  the greatest existing/event timestamp, and treats a concurrently deleted row as a clean no-op.
+  Normal shutdown revokes event ownership, stops playback, and waits for all earlier queued
+  mutations. Only a committed update publishes the replacement row; the live local Plays value
+  refreshes by stable ID and active/cached playlist projections are invalidated. AirPlay 1 now
+  contributes the same evidence through generation-scoped 500 ms position samples. The complete
+  contract is in [`playback-history.md`](playback-history.md).
+
+  Recently Played and Top 25 are still incomplete: the final P1.3 record must give them the
+  deterministic rules, ordering, empty-state, safe seeded-default migration, and live refresh
+  defined by the contract.
 
 ### P1.4 — Add ratings as a real library field
 
@@ -240,3 +251,4 @@ shuffle navigation semantics, and an honest local-only playlist interaction boun
 | 2026-07-18 | P1.1 bounded shuffle history | [#132](https://github.com/jm2/tributary/pull/132) | Retained ten real prior occurrences, fixed forward traversal and complete Repeat All cycles, unified Previous dispatch, made toggle/reset semantics explicit, and added lifecycle/rollback regressions. |
 | 2026-07-18 | P1.2 honest unsupported playlist actions | [#133](https://github.com/jm2/tributary/pull/133) | Refused non-local Add to Playlist actions with an all-or-none localized dialog before database work, localized the existing context-menu labels, and regressed the fail-closed source policy plus every shipped catalog. |
 | 2026-07-18 | P1.3 playback-history contract and schema | [#134](https://github.com/jm2/tributary/pull/134) | Defined occurrence, threshold, duration, seek/retry/restart, clock, and legacy contracts; added migration 10 plus safe model conversion and a pure one-shot progress state. Production event writes and smart-playlist consumers remain the next two records. |
+| 2026-07-18 | P1.3 authoritative playback-history persistence | Pending PR | Bound one progress latch to each exact local queue occurrence independently of output generations; rejected/stale/retry events cannot double count, paused polls stay inert, and discontinuities re-anchor. Added a normal-shutdown FIFO drain, atomic stable-ID count/timestamp persistence, post-commit Plays refresh and playlist-projection invalidation, plus generation-scoped AirPlay position evidence. Deterministic Recently Played and Top 25 behavior remains the final P1.3 record. |

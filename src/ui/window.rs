@@ -8,12 +8,13 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
+use chrono::Utc;
 use gtk::glib;
 use tracing::{info, warn};
 
 use crate::audio::local_output::LocalOutput;
 use crate::audio::output::AudioOutput;
-use crate::audio::{PlayerEvent, PlayerState};
+use crate::audio::{PlayerEvent, PlayerEventGeneration, PlayerState};
 use crate::desktop_integration::MediaAction;
 use crate::local::engine::{
     LibraryCommand, LibraryEngine, LibraryEvent, RootReauthorizationOutcome,
@@ -54,10 +55,6 @@ const SIDEBAR_POS: i32 = 200;
 
 /// Browser paned default position (px from top of right content area).
 const BROWSER_POS: i32 = 220;
-
-/// User trust decisions are serialized by the engine; this bounded queue
-/// prevents a stalled engine from accumulating unbounded confirmations.
-const LIBRARY_COMMAND_CAPACITY: usize = 16;
 
 type SharedAudioOutput = Rc<RefCell<Box<dyn AudioOutput>>>;
 type PlaybackUiReset = Rc<dyn Fn()>;
@@ -1494,12 +1491,19 @@ pub fn build_window(
         window.maximize();
     }
 
-    // Save geometry and synchronously close the sole source lifecycle gate.
-    // Its persistent barrier joins every admitted constructor and owned
-    // adapter teardown, including DAAP and interactive Jellyfin logout, before
-    // close() is allowed to proceed.
+    // Commands are queued synchronously on the GTK thread. Playback decisions
+    // are already rate-limited by real occurrences, and an unbounded FIFO
+    // avoids detached tasks silently waiting behind a busy initial scan. A
+    // terminal marker below makes normal shutdown wait for every earlier
+    // mutation to finish.
+    let (library_command_tx, library_command_rx) = async_channel::unbounded();
+
+    // Save geometry, retire playback, close the source lifecycle gate, and
+    // drain local-library mutations before allowing the window to disappear.
     let shutdown_sources = source_registry.clone();
     let shutdown_playback = playback_session.clone();
+    let shutdown_output_slot = active_output_slot.clone();
+    let shutdown_library_commands = library_command_tx.clone();
     let shutdown_started = Rc::new(Cell::new(false));
     let shutdown_complete = Rc::new(Cell::new(false));
     window.connect_close_request(move |w| {
@@ -1511,14 +1515,32 @@ pub fn build_window(
         if !shutdown_started.replace(true) {
             super::open_files::invalidate_admission();
             let external_source = shutdown_playback.borrow().current_external_source_id();
+            // Revoke the event generation before stopping the output so no
+            // terminal callback can enqueue behind the FIFO flush marker.
+            shutdown_playback.borrow_mut().clear();
+            let shutdown_output = shutdown_output_slot.borrow().as_ref().cloned();
+            if let Some(shutdown_output) = shutdown_output {
+                shutdown_output.borrow().stop();
+            }
             if let Some(source_id) = external_source {
-                shutdown_playback.borrow_mut().clear();
                 let _ = shutdown_sources.retire_external(source_id);
             }
             let barrier = shutdown_sources.shutdown();
+            let (flush_tx, flush_rx) = async_channel::bounded(1);
+            let flush_queued = shutdown_library_commands
+                .try_send(LibraryCommand::Flush {
+                    completion: flush_tx,
+                })
+                .is_ok();
+            if !flush_queued {
+                warn!("Library mutation receiver stopped before shutdown flush");
+            }
             let window = w.clone();
             let shutdown_complete = shutdown_complete.clone();
             glib::MainContext::default().spawn_local(async move {
+                if flush_queued && flush_rx.recv().await.is_err() {
+                    warn!("Library mutation shutdown flush was not acknowledged");
+                }
                 barrier.wait().await;
                 shutdown_complete.set(true);
                 window.close();
@@ -1528,10 +1550,8 @@ pub fn build_window(
         glib::Propagation::Stop
     });
 
-    // Root trust is the only UI-to-library-engine command path. The engine
-    // validates every request against fresh filesystem evidence before it can
-    // change persisted trust; the GTK side only queues an affirmative intent.
-    let (library_command_tx, library_command_rx) = async_channel::bounded(LIBRARY_COMMAND_CAPACITY);
+    // The engine validates every root-trust request against fresh filesystem
+    // evidence before it can change persisted trust.
     let root_trust_prompts = root_trust::RootTrustPromptController::new(
         &window,
         &toast_overlay,
@@ -2176,31 +2196,52 @@ pub fn build_window(
     // position-poll updates (guarded by `seeking`) so they never seek.
     {
         let active_output = active_output.clone();
+        let playback_session = playback_session.clone();
         let seeking = seeking.clone();
-        let pending: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let pending: Rc<Cell<Option<(PlayerEventGeneration, u64)>>> = Rc::new(Cell::new(None));
         let scheduled = Rc::new(Cell::new(false));
         hb.progress_adj.connect_value_changed(move |adj| {
             if seeking.get() {
                 return;
             }
             super::open_files::invalidate_admission();
-            pending.set(Some(adj.value() as u64));
+            pending.set(Some((
+                playback_session.borrow().current_event_generation(),
+                adj.value() as u64,
+            )));
             if scheduled.replace(true) {
                 return;
             }
             let active_output = active_output.clone();
+            let playback_session = playback_session.clone();
             let pending = pending.clone();
             let seeking = seeking.clone();
             let scheduled = scheduled.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
                 scheduled.set(false);
+                let intent = pending.take();
                 // Re-check the guard: don't fire a stale seek if a
                 // programmatic update is in progress when the timer lands.
-                if !seeking.get() {
-                    if let Some(p) = pending.take() {
-                        active_output.borrow().seek_to(p);
-                    }
+                if seeking.get() {
+                    return;
                 }
+                let Some((generation, target_ms)) = intent else {
+                    return;
+                };
+                if !playback_session
+                    .borrow()
+                    .accepts_event_generation(generation)
+                {
+                    return;
+                }
+
+                let actual_position_ms = active_output.borrow().position_ms().unwrap_or(0);
+                let _ = playback_session.borrow_mut().observe_history_seek(
+                    generation,
+                    actual_position_ms,
+                    target_ms,
+                );
+                active_output.borrow().seek_to(target_ms);
             });
         });
     }
@@ -2386,6 +2427,7 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_history_commands = library_command_tx.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -2407,6 +2449,24 @@ pub fn build_window(
                 {
                     tracing::debug!(?event_generation, "Ignoring stale player event");
                     continue;
+                }
+
+                // Account before EOS repeat/advance or error recovery mutates
+                // the occurrence. The session latches exactly once and the
+                // unbounded FIFO accepts synchronously, so no detached send
+                // task can outlive the normal-shutdown drain marker.
+                if let Some(track_id) = playback_session.borrow_mut().observe_history_event(&event)
+                {
+                    let counted_at_ms = Utc::now().timestamp_millis();
+                    if playback_history_commands
+                        .try_send(LibraryCommand::RecordPlaybackHistory {
+                            track_id,
+                            counted_at_ms,
+                        })
+                        .is_err()
+                    {
+                        warn!("Playback history command receiver stopped");
+                    }
                 }
                 match event {
                     PlayerEvent::StateChanged { state, .. } => {
@@ -2924,10 +2984,7 @@ fn refresh_active_playlist_uris(
 /// missing row prevents a delayed committed event from resurrecting a track
 /// that a newer library event already removed. URI equality is deliberately
 /// irrelevant: paths can move, and a remote source can expose the same URI.
-fn replace_existing_local_track(
-    rows: &mut [TrackObject],
-    replacement: &TrackObject,
-) -> bool {
+fn replace_existing_local_track(rows: &mut [TrackObject], replacement: &TrackObject) -> bool {
     let track_id = replacement.track_id();
     if track_id.is_empty() {
         return false;
@@ -3922,10 +3979,7 @@ mod identity_tests {
 
         let same_uri_wrong_id =
             local_history_row("remote-collision", "file:///music/shared.flac", 99);
-        assert!(!replace_existing_local_track(
-            &mut rows,
-            &same_uri_wrong_id
-        ));
+        assert!(!replace_existing_local_track(&mut rows, &same_uri_wrong_id));
         let missing = local_history_row("track-missing", "file:///music/missing.flac", 1);
         assert!(!replace_existing_local_track(&mut rows, &missing));
 
@@ -4444,4 +4498,8 @@ mod identity_tests {
                 1,
                 false,
             ),
-            RemotePub
+            RemotePublicationSelection::Inactive,
+            "the reactivation superseded the deferred request exactly once"
+        );
+    }
+}

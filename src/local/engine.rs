@@ -262,6 +262,13 @@ pub enum LibraryCommand {
         track_id: TrackId,
         counted_at_ms: i64,
     },
+    /// Acknowledge only after every command queued before this marker has
+    /// finished. Normal application shutdown uses this FIFO barrier so an
+    /// already-latched playback occurrence cannot be lost while the initial
+    /// scan or watcher owner is still busy.
+    Flush {
+        completion: async_channel::Sender<()>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -3077,6 +3084,10 @@ async fn process_library_command(
                     warn!(track_id = %track_id.as_str(), %error, "Failed to record local playback history");
                 }
             }
+            return None;
+        }
+        LibraryCommand::Flush { completion } => {
+            let _ = completion.send(()).await;
             return None;
         }
     };
@@ -7658,7 +7669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playback_history_commands_emit_only_committed_rows() {
+    async fn playback_history_commands_emit_only_committed_rows_before_flush_ack() {
         let db = rename_test_database().await;
         insert_playback_history_test_track(&db, "history-committed", 10, Some(1_000)).await;
         insert_playback_history_test_track(&db, "history-rejected", 20, Some(2_000)).await;
@@ -7674,7 +7685,7 @@ mod tests {
         .expect("create playback-history failure trigger");
 
         let (event_tx, event_rx) = async_channel::unbounded();
-        let (command_tx, command_rx) = async_channel::bounded(3);
+        let (command_tx, command_rx) = async_channel::unbounded();
         command_tx
             .send(LibraryCommand::RecordPlaybackHistory {
                 track_id: TrackId::new("history-rejected").expect("valid rejected ID"),
@@ -7696,11 +7707,22 @@ mod tests {
             })
             .await
             .expect("send committed command after rejected transaction");
+        let (flush_tx, flush_rx) = async_channel::bounded(1);
+        command_tx
+            .send(LibraryCommand::Flush {
+                completion: flush_tx,
+            })
+            .await
+            .expect("queue FIFO shutdown flush after history commands");
         drop(command_tx);
 
         let mut completed = HashMap::new();
         process_library_commands_without_watcher(&db, &[], &event_tx, &command_rx, &mut completed)
             .await;
+        flush_rx
+            .recv()
+            .await
+            .expect("flush is acknowledged after preceding commands finish");
         assert!(
             completed.is_empty(),
             "history commands are never trust receipts"

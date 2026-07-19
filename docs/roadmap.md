@@ -6,7 +6,7 @@ This document explains the product and engineering work that remains **after** t
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
 remediation record is preserved separately in
 [`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **220/223 (98.7%)**, with only three
-real-environment validation records left. The feature backlog is now **3/35 (8.6%)** complete. Neither
+real-environment validation records left. The feature backlog is now **4/35 (11.4%)** complete. Neither
 percentage estimates equal engineering effort, and the historical percentage is not a claim that
 Tributary has implemented every requested product feature.
 
@@ -36,10 +36,13 @@ starts. Historical holistic-review documents are point-in-time findings, not act
 - Shuffled playback retains the current queue occurrence plus ten real predecessors. Previous and
   subsequent forward navigation follow that fixed history, Repeat All uses complete bounded
   occurrence cycles, and the header and OS media controls share one exact restart threshold.
-- Local tracks now have a migrated nullable UTC-millisecond `last_played` field and a tested pure
-  counted-play state. The [playback-history contract](playback-history.md) defines occurrence,
-  threshold, duration, seek/retry/restart, clock, and legacy semantics. Production playback-event
-  persistence, live UI refresh, and useful Recently Played/Top 25 consumers are not implemented yet.
+- Local tracks have a migrated nullable UTC-millisecond `last_played` field and authoritative
+  per-occurrence production persistence. The [playback-history contract](playback-history.md)
+  defines occurrence, threshold, duration, seek/retry/restart, clock, and legacy semantics.
+  `PlaybackSession` rejects stale/rejected generations and re-anchors discontinuities; the library
+  engine atomically updates one stable local track ID, and committed changes refresh the Plays row
+  and invalidate playlist projections. AirPlay 1 supplies generation-scoped 500 ms progress. The
+  deterministic Recently Played/Top 25 consumer and seeded-default migration slice remains open.
 
 ## Proposed implementation order
 
@@ -58,14 +61,17 @@ before starting large protocol or transfer subsystems.
    before database work. Full support remains separate: regular playlist entries need persistent
    source-scoped `(SourceId, TrackId)` identity, disconnected-source semantics, and playback-time
    resolution; Subsonic server-native playlist import/sync is another slice.
-3. **In progress: implement trustworthy local playback history.** The durable schema and
-   [counted-play contract](playback-history.md) are complete: local rows can represent a trustworthy
-   last-played instant, corrupt negative legacy counts are repaired, and a pure per-occurrence state
-   pins half-duration/four-minute, seek, retry, restart, duration, and natural-end semantics. Next,
-   connect only generation-accepted playback events to one atomic stable-ID update and refresh the
-   affected row/projections. Then make Recently Played and Top 25 deterministic and migrate only
-   untouched historical defaults. Until those two slices land, production playback still does not
-   write history and the seeded consumers remain ordinarily empty.
+3. **In progress: implement trustworthy local playback history.** The durable schema,
+   [counted-play contract](playback-history.md), and production persistence pipeline are complete.
+   One `PlaybackSession` progress latch follows each exact local occurrence independently of output
+   generations; rejected/stale events cannot contribute, pause/buffering/retry/seek/restart
+   discontinuities re-anchor, and paused polls stay inert until Playing. A qualifying play enters a
+   shutdown-drained FIFO and atomically updates one stable local ID with a saturating count and
+   monotonic timestamp, then refreshes the Plays row and invalidates active/cached playlist
+   projections only after commit. AirPlay 1 now publishes generation-scoped position evidence on a
+   500 ms timer. Next, make Recently Played and Top 25
+   deterministic, provide their live refresh/empty-state behavior, and migrate only exact untouched
+   historical defaults. Until that final slice lands, those seeded consumers remain incomplete.
 4. **Add ratings ([#37]).** Decide whether ratings are app-local, written to tags, synchronized to
    capable servers, or some explicit combination. Then add schema/model/backend propagation, an
    editable and sortable column, smart-playlist rules, and mixed-capability behavior.
@@ -134,10 +140,10 @@ mistaken for work already underway.
 
 | Issue | Current implementation state | Likely implementation shape |
 |---|---|---|
-| [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus the migrated playback-history representation and threshold contract are partial foundations; production history writes and ratings remain incomplete. | Complete playback history and ratings first; then transactional, idempotent migration with conflict reporting. |
+| [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus the migrated playback-history representation, threshold contract, and production local-history writes are partial foundations; deterministic smart-playlist consumers and ratings remain incomplete. | Complete playback-history consumers and ratings first; then transactional, idempotent migration with conflict reporting. |
 | [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | No Last.fm client or scrobble pipeline. | Authorization, secret storage, authoritative thresholds, retry/offline queue, and privacy UX. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
-| [#47 — Remote/Subsonic tracks in playlists](https://github.com/jm2/tributary/issues/47) | Remote rows are skipped by the local-only playlist writer; the failure is not user-visible. | Immediate UX fix, then source-scoped playlist schema/resolution; server playlist sync separately. |
+| [#47 — Remote/Subsonic tracks in playlists](https://github.com/jm2/tributary/issues/47) | Non-local Add to Playlist attempts are now refused visibly and atomically; durable remote entries and server-native playlist sync are not implemented. | Source-scoped playlist schema/resolution first; server playlist sync separately. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |
 | [#37 — Rating column](https://github.com/jm2/tributary/issues/37) | No rating field in the core track model, database, or track list. | Define ownership/sync semantics, then schema, editing, sorting, rules, and backend capabilities. |
