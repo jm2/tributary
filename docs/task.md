@@ -34,6 +34,14 @@ sorting, and smart-playlist rules. The rest of P1 builds on the source-scoped id
 present in the runtime, the now-bounded shuffle navigation semantics, an honest local-only playlist
 interaction boundary, and authoritative local playback history with deterministic live consumers.
 
+The independent Linux watcher correctness fix tracked in
+[#103](https://github.com/jm2/tributary/pull/103) does not change the **5/35** feature total.
+The salvaged scope rejects explicitly classified access/access-time noise before the bounded watcher
+queue without filtering real bootstrap mutations or backend errors, while retaining overflow
+evidence for authoritative reconciliation. It intentionally omits the original persistent
+unparseable-file cache so transient parser and I/O failures remain retryable. It is tracked outside
+the 35-record feature backlog.
+
 ## P1 — Correctness and shared feature foundations
 
 ### P1.1 — Harden and document existing shuffled playback history
@@ -285,3 +293,4 @@ interaction boundary, and authoritative local playback history with deterministi
 | 2026-07-18 | P1.3 playback-history contract and schema | [#134](https://github.com/jm2/tributary/pull/134) | Defined occurrence, threshold, duration, seek/retry/restart, clock, and legacy contracts; added migration 10 plus safe model conversion and a pure one-shot progress state. Production event writes and smart-playlist consumers were tracked as follow-on records. |
 | 2026-07-18 | P1.3 authoritative playback-history persistence | [#135](https://github.com/jm2/tributary/pull/135), [#136](https://github.com/jm2/tributary/pull/136) | Bound one progress latch to each exact local queue occurrence independently of output generations; rejected/stale/retry events cannot double count, paused polls stay inert, Repeat One rolls back only its tentative occurrence before generation handoff, and other discontinuities re-anchor. Added a shared shutdown admission gate plus FIFO drain, atomic stable-ID count/timestamp persistence with legacy-negative repair, post-commit Plays refresh and playlist-projection invalidation, plus generation-scoped AirPlay position evidence. Seeded history consumers were completed in the following record. |
 | 2026-07-18 | P1.3 deterministic history smart playlists | Pending publication | Made Recently Played and Top 25 deterministic over authoritative history, including intentional empty states, stable ordering and Top 25 membership, committed-event live refresh, exact untouched-default migration from both released historical signatures, and lossless editor round trips for Last Played fields, limits, and relative units. This completed P1.3. |
+| 2026-07-18 | Linux watcher feedback-loop fix | [#103](https://github.com/jm2/tributary/pull/103) | Narrowed the external proposal to filter self-generated access events before queue admission without filtering genuine startup events or backend errors; bounded overflow still drives authoritative reconciliation. Persistent negative parse caching is deliberately excluded so failures remain retryable; this separate correctness fix does not advance the feature numerator. |

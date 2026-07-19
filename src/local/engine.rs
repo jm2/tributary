@@ -4471,19 +4471,23 @@ where
     }
 }
 
-fn marker_event_invalidates_root(kind: notify::EventKind) -> bool {
+fn watcher_event_kind_is_observational_access(kind: notify::EventKind) -> bool {
     use notify::event::{MetadataKind, ModifyKind};
     use notify::EventKind;
 
+    matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
+    )
+}
+
+fn marker_event_invalidates_root(kind: notify::EventKind) -> bool {
     // Reading the marker is part of every authorization probe and some
     // backends report open/read/close (or the resulting atime update) through
     // the same watcher. Those observations must not invalidate the identity
     // they just verified. Every potentially mutating or unknown event remains
     // fail-closed.
-    !matches!(
-        kind,
-        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
-    )
+    !watcher_event_kind_is_observational_access(kind)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -4897,6 +4901,17 @@ fn enqueue_watcher_result(
     ingress_overflowed: &AtomicBool,
     result: notify::Result<notify::Event>,
 ) {
+    // Tag reads can generate an event per file on Linux (including atime
+    // metadata updates under relatime). These events are observational and
+    // were already ignored by batching, so keep them out of the bounded queue
+    // before a large scan can falsely report stream loss and rescan forever.
+    // A backend rescan flag remains authoritative even on an access event.
+    if result.as_ref().is_ok_and(|event| {
+        !event.need_rescan() && watcher_event_kind_is_observational_access(event.kind)
+    }) {
+        return;
+    }
+
     match tx.try_send(result) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -7103,6 +7118,77 @@ mod tests {
             event = event.set_tracker(tracker);
         }
         event
+    }
+
+    #[test]
+    fn watcher_ingress_filters_access_noise_before_the_bounded_queue() {
+        use notify::event::{AccessKind, AccessMode, Flag, MetadataKind, ModifyKind};
+        use notify::EventKind;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let overflowed = AtomicBool::new(false);
+
+        for index in 0..1_024 {
+            let kind = match index % 5 {
+                0 => EventKind::Access(AccessKind::Open(AccessMode::Read)),
+                1 => EventKind::Access(AccessKind::Open(AccessMode::Any)),
+                2 => EventKind::Access(AccessKind::Read),
+                3 => EventKind::Access(AccessKind::Close(AccessMode::Read)),
+                _ => EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)),
+            };
+            enqueue_watcher_result(
+                &tx,
+                &overflowed,
+                Ok(notify::Event::new(kind)
+                    .add_path(PathBuf::from(format!("/music/{index}.flac")))),
+            );
+        }
+
+        assert!(!overflowed.load(Ordering::Acquire));
+        assert!(
+            rx.try_recv().is_err(),
+            "access noise must not enter the queue"
+        );
+
+        let create = notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+            .add_path(PathBuf::from("/music/real-change.flac"));
+        enqueue_watcher_result(&tx, &overflowed, Ok(create));
+        let dropped = notify::Event::new(EventKind::Remove(notify::event::RemoveKind::File))
+            .add_path(PathBuf::from("/music/second-real-change.flac"));
+        enqueue_watcher_result(&tx, &overflowed, Ok(dropped));
+
+        assert!(
+            overflowed.load(Ordering::Acquire),
+            "real mutation overflow must remain authoritative"
+        );
+        assert_eq!(
+            rx.try_recv()
+                .expect("real change remains queueable after the access storm")
+                .expect("queued notify event")
+                .paths,
+            [PathBuf::from("/music/real-change.flac")]
+        );
+        overflowed.store(false, Ordering::Release);
+
+        let rescan = notify::Event::new(EventKind::Access(AccessKind::Read))
+            .set_flag(Flag::Rescan)
+            .add_path(PathBuf::from("/music"));
+        enqueue_watcher_result(&tx, &overflowed, Ok(rescan));
+        assert!(rx
+            .try_recv()
+            .expect("backend rescan evidence must survive access filtering")
+            .expect("queued notify event")
+            .need_rescan());
+
+        enqueue_watcher_result(
+            &tx,
+            &overflowed,
+            Err(notify::Error::generic("backend stream failed")),
+        );
+        assert!(rx
+            .try_recv()
+            .expect("watcher errors must survive access filtering")
+            .is_err());
     }
 
     #[test]
