@@ -24,15 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through a local regular or smart playlist—can earn credit. Rejected/stale events earn none;
   pause, buffering, retry, resume, seek, and the three-second Previous restart re-anchor without
   jump credit, while explicit Paused/Stopped state keeps later position polls inert until Playing
-  and successful navigation or Repeat One creates a fresh occurrence. Current output replacement
-  ends playback. The latch closes before synchronous FIFO enqueue, preventing duplicate ticks from
+  and successful navigation or Repeat One creates a fresh occurrence. Repeat One snapshots only
+  the prior history occurrence: a failure before output-generation handoff restores that occurrence
+  without cloning or rewinding the queue, shuffle, resolution, or event state, while a generation
+  change can never be rolled back. Current output replacement ends playback. The latch closes
+  before synchronous FIFO enqueue, preventing duplicate ticks from
   enqueueing another write. Normal shutdown synchronously closes one shared GTK-thread admission
   gate before appending its FIFO marker, disables playback, media-key, seek, open-file, history,
   and root-trust producers, revokes event ownership, stops the output, and waits for every earlier
   admitted history/root-trust command; no callback can queue work behind the marker. That durable
   drain may keep the disabled window visible while an earlier serialized initial or root-trust scan
-  finishes. The library engine then atomically updates only that stable `TrackId`,
-  saturates `play_count` at `i32::MAX`, keeps `max(existing, event_timestamp)`, and treats a
+  finishes. The library engine then atomically updates only that stable `TrackId`, defensively
+  repairs an impossible nullable or legacy-negative count to one, saturates `play_count` at
+  `i32::MAX`, keeps `max(existing, event_timestamp)`, and treats a
   concurrently deleted row as a clean no-op. Only a committed update publishes its replacement
   row; the live Plays value refreshes by stable identity and active/cached playlist projections are
   invalidated without URI matching or phantom rows. AirPlay 1's dedicated RAOP pipeline now samples

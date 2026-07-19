@@ -767,7 +767,8 @@ regular/smart-playlist projection—at most once. Rejected or stale loads earn n
 buffering, retry, seek, and the Previous restart re-anchor the same occurrence, while paused polls
 stay inert until Playing and real navigation or Repeat One creates a new occurrence. Current output
 replacement ends playback. The database update targets the stable local track ID atomically,
-saturates its count, keeps the newest trustworthy timestamp, and refreshes the Plays row and
+repairs incompatible null or negative count corruption, saturates its count, keeps the newest
+trustworthy timestamp, and refreshes the Plays row and
 playlist projections only after commit. Normal shutdown first closes the shared GTK command gate,
 disables playback/media/open-file producers, and appends a FIFO marker, so no later callback can
 queue behind the admitted history/root-trust commands it waits to finish. The disabled window can
