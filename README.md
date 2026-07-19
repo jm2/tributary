@@ -60,8 +60,8 @@ Tributary provides a unified interface for managing and streaming music from mul
 | USB file transfer (copy to device with progress) | ❌ Planned ([#8](https://github.com/jm2/tributary/issues/8)) |
 | Multiple music library directories | ✅ |
 | Playlist import/export (XSPF) | ✅ |
-| Durable local playback history | ⚠️ Contract, schema, and tested progress accounting are implemented; playback-event persistence is next ([contract](docs/playback-history.md)) |
-| Default smart playlists (Recently Added, Recently Played, Top 25) | ⚠️ Seeded; Recently Played and Top 25 still await history persistence and deterministic consumers ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
+| Durable local playback history | ✅ Exact accepted local occurrences persist a saturating play count and monotonic last-played timestamp, with live Plays refresh ([contract](docs/playback-history.md)) |
+| Default smart playlists (Recently Added, Recently Played, Top 25) | ⚠️ Seeded; Recently Played and Top 25 still await deterministic history rules, ordering, migration, and live refresh ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
 | Track ratings | ❌ Planned ([#37](https://github.com/jm2/tributary/issues/37)) |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
@@ -762,8 +762,20 @@ podcasts. Tributary deliberately does not guess through any of those gaps.
 
 The [local playback-history contract](docs/playback-history.md) defines a counted play as half of a
 known duration, rounded up and capped at four minutes, with a conservative unknown-duration rule.
-Its schema and progress accounting are present, but this build does not yet persist production
-playback events or update Recently Played and Top 25; those are the next two P1.3 slices.
+Production playback now persists each qualifying exact local queue occurrence—including a local
+regular/smart-playlist projection—at most once. Rejected or stale loads earn nothing; pause,
+buffering, retry, seek, and the Previous restart re-anchor the same occurrence, while paused polls
+stay inert until Playing and real navigation or Repeat One creates a new occurrence. Current output
+replacement ends playback. The database update targets the stable local track ID atomically,
+saturates its count, keeps the newest trustworthy timestamp, and refreshes the Plays row and
+playlist projections only after commit. Normal shutdown first closes the shared GTK command gate,
+disables playback/media/open-file producers, and appends a FIFO marker, so no later callback can
+queue behind the admitted history/root-trust commands it waits to finish. The disabled window can
+remain visible while an earlier serialized library scan finishes.
+AirPlay 1 contributes the same evidence through generation-scoped 500 ms position updates. Remote,
+radio, removable, and ephemeral files do not write local history. Deterministic Recently Played and
+Top 25 rules, ordering, empty-state behavior, untouched-default migration, and live smart-playlist
+refresh remain the final P1.3 slice.
 
 ### Keyboard Shortcuts
 

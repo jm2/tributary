@@ -8,9 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Local playback history now has a durable contract and schema foundation** — Local track rows
-  gain a nullable UTC epoch-millisecond `last_played` value, while the architecture model safely
-  rejects out-of-range stored timestamps. Migration 10 preserves every nonnegative legacy play
+- **Local playback history now has a durable contract, schema, and production pipeline** — Local
+  track rows gain a nullable UTC epoch-millisecond `last_played` value, while the architecture
+  model safely rejects out-of-range stored timestamps. Migration 10 preserves every nonnegative legacy play
   count, repairs negative corruption to zero, never invents a timestamp from file or library dates,
   validates interrupted SQLite upgrades (including SQLite's equivalent nullable `INTEGER`
   spelling while rejecting incompatible shapes), and supports down/up retry. A pure per-occurrence
@@ -19,8 +19,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   natural end. Duration freezes on the first positive value; seeks, neutral retry/resume anchors,
   and restarts earn no jump credit; only a forward user seek suppresses the early unknown-duration
   end rule; backward replay preserves accumulated listening; and the count signal latches once.
-  Production playback-event writes, Plays-column refresh, and deterministic Recently Played
-  and Top 25 behavior remain the next two P1.3 slices and are not claimed by this foundation.
+  `PlaybackSession` now owns that latch per exact local queue occurrence, separately from replaceable
+  output-event generations. Only a successfully accepted local delivery—including one reached
+  through a local regular or smart playlist—can earn credit. Rejected/stale events earn none;
+  pause, buffering, retry, resume, seek, and the three-second Previous restart re-anchor without
+  jump credit, while explicit Paused/Stopped state keeps later position polls inert until Playing
+  and successful navigation or Repeat One creates a fresh occurrence. Current output replacement
+  ends playback. The latch closes before synchronous FIFO enqueue, preventing duplicate ticks from
+  enqueueing another write. Normal shutdown synchronously closes one shared GTK-thread admission
+  gate before appending its FIFO marker, disables playback, media-key, seek, open-file, history,
+  and root-trust producers, revokes event ownership, stops the output, and waits for every earlier
+  admitted history/root-trust command; no callback can queue work behind the marker. That durable
+  drain may keep the disabled window visible while an earlier serialized initial or root-trust scan
+  finishes. The library engine then atomically updates only that stable `TrackId`,
+  saturates `play_count` at `i32::MAX`, keeps `max(existing, event_timestamp)`, and treats a
+  concurrently deleted row as a clean no-op. Only a committed update publishes its replacement
+  row; the live Plays value refreshes by stable identity and active/cached playlist projections are
+  invalidated without URI matching or phantom rows. AirPlay 1's dedicated RAOP pipeline now samples
+  position and duration on a 500 ms timer while Playing and emits generation-scoped evidence when
+  available, bringing it under the same accounting boundary as the other outputs. Deterministic
+  Recently Played and Top 25 filtering, ordering, empty-state, untouched-default migration, and
+  live smart-playlist refresh
+  remain the final P1.3 slice and are not claimed here.
 
 ### Fixed
 - **Unsupported playlist additions now fail visibly and atomically** — Choosing Add to Playlist

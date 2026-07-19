@@ -8,15 +8,17 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
+use chrono::Utc;
 use gtk::glib;
 use tracing::{info, warn};
 
 use crate::audio::local_output::LocalOutput;
 use crate::audio::output::AudioOutput;
-use crate::audio::{PlayerEvent, PlayerState};
+use crate::audio::{PlayerEvent, PlayerEventGeneration, PlayerState};
 use crate::desktop_integration::MediaAction;
 use crate::local::engine::{
-    LibraryEngine, LibraryEvent, RootReauthorizationOutcome, RootReauthorizationRequest,
+    LibraryCommand, LibraryEngine, LibraryEvent, RootReauthorizationOutcome,
+    RootReauthorizationRequest,
 };
 use crate::ui::header_bar::RepeatMode;
 
@@ -53,10 +55,6 @@ const SIDEBAR_POS: i32 = 200;
 
 /// Browser paned default position (px from top of right content area).
 const BROWSER_POS: i32 = 220;
-
-/// User trust decisions are serialized by the engine; this bounded queue
-/// prevents a stalled engine from accumulating unbounded confirmations.
-const LIBRARY_COMMAND_CAPACITY: usize = 16;
 
 type SharedAudioOutput = Rc<RefCell<Box<dyn AudioOutput>>>;
 type PlaybackUiReset = Rc<dyn Fn()>;
@@ -1493,12 +1491,20 @@ pub fn build_window(
         window.maximize();
     }
 
-    // Save geometry and synchronously close the sole source lifecycle gate.
-    // Its persistent barrier joins every admitted constructor and owned
-    // adapter teardown, including DAAP and interactive Jellyfin logout, before
-    // close() is allowed to proceed.
+    // Commands are queued synchronously on the GTK thread. Playback decisions
+    // are already rate-limited by real occurrences, and an unbounded FIFO
+    // avoids detached tasks silently waiting behind a busy initial scan. A
+    // terminal marker below makes normal shutdown wait for every earlier
+    // admitted history/root-trust command to finish.
+    let (library_commands, library_command_rx) =
+        super::library_commands::LibraryCommandAdmission::channel();
+
+    // Save geometry, retire playback, close the source lifecycle gate, and
+    // drain local-library mutations before allowing the window to disappear.
     let shutdown_sources = source_registry.clone();
     let shutdown_playback = playback_session.clone();
+    let shutdown_output_slot = active_output_slot.clone();
+    let shutdown_library_commands = library_commands.clone();
     let shutdown_started = Rc::new(Cell::new(false));
     let shutdown_complete = Rc::new(Cell::new(false));
     window.connect_close_request(move |w| {
@@ -1508,16 +1514,37 @@ pub fn build_window(
         }
 
         if !shutdown_started.replace(true) {
+            // Close every UI producer before any widget, output, or source
+            // teardown can synchronously re-enter GTK, then append the marker
+            // in that same non-interleavable main-thread operation.
+            let (flush_tx, flush_rx) = async_channel::bounded(1);
+            let flush_queued = shutdown_library_commands.close_and_flush(flush_tx);
+            if !flush_queued {
+                warn!("Library mutation receiver stopped before shutdown flush");
+            }
+            // The close drain can wait behind an initial scan. Make the still-
+            // visible window inert immediately; media-key and application
+            // actions also consult the shared command-admission gate below.
+            w.set_sensitive(false);
             super::open_files::invalidate_admission();
             let external_source = shutdown_playback.borrow().current_external_source_id();
+            // Revoke the event generation before stopping the output so no
+            // terminal callback can enqueue behind the FIFO flush marker.
+            shutdown_playback.borrow_mut().clear();
+            let shutdown_output = shutdown_output_slot.borrow().as_ref().cloned();
+            if let Some(shutdown_output) = shutdown_output {
+                shutdown_output.borrow().stop();
+            }
             if let Some(source_id) = external_source {
-                shutdown_playback.borrow_mut().clear();
                 let _ = shutdown_sources.retire_external(source_id);
             }
             let barrier = shutdown_sources.shutdown();
             let window = w.clone();
             let shutdown_complete = shutdown_complete.clone();
             glib::MainContext::default().spawn_local(async move {
+                if flush_queued && flush_rx.recv().await.is_err() {
+                    warn!("Library mutation shutdown flush was not acknowledged");
+                }
                 barrier.wait().await;
                 shutdown_complete.set(true);
                 window.close();
@@ -1527,12 +1554,13 @@ pub fn build_window(
         glib::Propagation::Stop
     });
 
-    // Root trust is the only UI-to-library-engine command path. The engine
-    // validates every request against fresh filesystem evidence before it can
-    // change persisted trust; the GTK side only queues an affirmative intent.
-    let (library_command_tx, library_command_rx) = async_channel::bounded(LIBRARY_COMMAND_CAPACITY);
-    let root_trust_prompts =
-        root_trust::RootTrustPromptController::new(&window, &toast_overlay, library_command_tx);
+    // The engine validates every root-trust request against fresh filesystem
+    // evidence before it can change persisted trust.
+    let root_trust_prompts = root_trust::RootTrustPromptController::new(
+        &window,
+        &toast_overlay,
+        library_commands.clone(),
+    );
 
     // ── Start the library engine on tokio ────────────────────────────
     // Use the configured library paths from preferences, which default
@@ -1998,9 +2026,14 @@ pub fn build_window(
             let playback_rt = rt_handle.clone();
             let playback_config = app_config.clone();
             let playback_source_registry = source_registry.clone();
+            let media_playback_admission = library_commands.clone();
 
             glib::MainContext::default().spawn_local(async move {
                 while let Ok(action) = media_rx.recv().await {
+                    if !media_playback_admission.is_open() {
+                        tracing::debug!(?action, "Ignoring OS media action during shutdown");
+                        continue;
+                    }
                     info!(?action, "OS media key");
                     let ctx = PlaybackContext {
                         model: sm.clone(),
@@ -2087,8 +2120,12 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         hb.play_button.connect_clicked(move |_| {
+            if !playback_admission.is_open() {
+                return;
+            }
             toggle_or_start(
                 &PlaybackContext {
                     model: sort_model.clone(),
@@ -2148,18 +2185,28 @@ pub fn build_window(
     // window; the final value always lands within the window.
     {
         let active_output = active_output.clone();
+        let volume_admission = library_commands.clone();
         let pending: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
         let scheduled = Rc::new(Cell::new(false));
         hb.volume_adj.connect_value_changed(move |adj| {
+            if !volume_admission.is_open() {
+                pending.set(None);
+                return;
+            }
             pending.set(Some(adj.value()));
             if scheduled.replace(true) {
                 return;
             }
             let active_output = active_output.clone();
+            let volume_admission = volume_admission.clone();
             let pending = pending.clone();
             let scheduled = scheduled.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
                 scheduled.set(false);
+                if !volume_admission.is_open() {
+                    pending.set(None);
+                    return;
+                }
                 if let Some(v) = pending.take() {
                     active_output.borrow_mut().set_volume(v);
                 }
@@ -2172,31 +2219,57 @@ pub fn build_window(
     // position-poll updates (guarded by `seeking`) so they never seek.
     {
         let active_output = active_output.clone();
+        let playback_session = playback_session.clone();
         let seeking = seeking.clone();
-        let pending: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let playback_admission = library_commands.clone();
+        let pending: Rc<Cell<Option<(PlayerEventGeneration, u64)>>> = Rc::new(Cell::new(None));
         let scheduled = Rc::new(Cell::new(false));
         hb.progress_adj.connect_value_changed(move |adj| {
-            if seeking.get() {
+            if seeking.get() || !playback_admission.is_open() {
                 return;
             }
             super::open_files::invalidate_admission();
-            pending.set(Some(adj.value() as u64));
+            pending.set(Some((
+                playback_session.borrow().current_event_generation(),
+                adj.value() as u64,
+            )));
             if scheduled.replace(true) {
                 return;
             }
             let active_output = active_output.clone();
+            let playback_session = playback_session.clone();
+            let playback_admission = playback_admission.clone();
             let pending = pending.clone();
             let seeking = seeking.clone();
             let scheduled = scheduled.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
                 scheduled.set(false);
+                let intent = pending.take();
                 // Re-check the guard: don't fire a stale seek if a
                 // programmatic update is in progress when the timer lands.
-                if !seeking.get() {
-                    if let Some(p) = pending.take() {
-                        active_output.borrow().seek_to(p);
-                    }
+                if seeking.get() {
+                    return;
                 }
+                if !playback_admission.is_open() {
+                    return;
+                }
+                let Some((generation, target_ms)) = intent else {
+                    return;
+                };
+                if !playback_session
+                    .borrow()
+                    .accepts_event_generation(generation)
+                {
+                    return;
+                }
+
+                let actual_position_ms = active_output.borrow().position_ms().unwrap_or(0);
+                let _ = playback_session.borrow_mut().observe_history_seek(
+                    generation,
+                    actual_position_ms,
+                    target_ms,
+                );
+                active_output.borrow().seek_to(target_ms);
             });
         });
     }
@@ -2233,8 +2306,12 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         column_view.connect_activate(move |_view, position| {
+            if !playback_admission.is_open() {
+                return;
+            }
             play_track_at(
                 position,
                 &PlaybackContext {
@@ -2296,8 +2373,12 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         hb.next_button.connect_clicked(move |_| {
+            if !playback_admission.is_open() {
+                return;
+            }
             advance_track_from_user(
                 &PlaybackContext {
                     model: sm.clone(),
@@ -2335,8 +2416,12 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         hb.prev_button.connect_clicked(move |_| {
+            if !playback_admission.is_open() {
+                return;
+            }
             previous_or_restart_from_user(
                 &PlaybackContext {
                     model: sm.clone(),
@@ -2382,6 +2467,7 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_history_commands = library_commands.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -2403,6 +2489,21 @@ pub fn build_window(
                 {
                     tracing::debug!(?event_generation, "Ignoring stale player event");
                     continue;
+                }
+
+                // Account before EOS repeat/advance or error recovery mutates
+                // the occurrence. The session latches exactly once and the
+                // unbounded FIFO accepts synchronously, so no detached send
+                // task can outlive the normal-shutdown drain marker.
+                if let Some(track_id) = playback_session.borrow_mut().observe_history_event(&event)
+                {
+                    let counted_at_ms = Utc::now().timestamp_millis();
+                    if !playback_history_commands.try_send(LibraryCommand::RecordPlaybackHistory {
+                        track_id,
+                        counted_at_ms,
+                    }) {
+                        warn!("Playback history command admission is closed");
+                    }
                 }
                 match event {
                     PlayerEvent::StateChanged { state, .. } => {
@@ -2665,9 +2766,15 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_admission = library_commands.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
         play_pending.connect_activate(move |_, _| {
+            if !playback_admission.is_open() {
+                super::open_files::invalidate_admission();
+                let _ = super::open_files::drain();
+                return;
+            }
             let delivery = super::open_files::drain();
             if delivery.is_empty() {
                 return;
@@ -2691,9 +2798,13 @@ pub fn build_window(
             let playback_rt = playback_rt.clone();
             let playback_config = playback_config.clone();
             let playback_source_registry = playback_source_registry.clone();
+            let playback_admission = playback_admission.clone();
             glib::MainContext::default().spawn_local(async move {
                 match admission.await {
-                    Ok(Some(pending)) if super::open_files::is_current(generation) => {
+                    Ok(Some(pending))
+                        if playback_admission.is_open()
+                            && super::open_files::is_current(generation) =>
+                    {
                         let ctx = super::playback::PlaybackContext {
                             model: sm,
                             active_source_key,
@@ -2911,6 +3022,92 @@ fn refresh_active_playlist_uris(
     let refreshed = refresh_projected_library_uris(&rows, committed_local_rows);
     if refreshed > 0 {
         info!(refreshed, "Refreshed active playlist paths");
+    }
+}
+
+/// Replace one already-known local row by exact stable identity.
+///
+/// Playback-history events are updates, never discovery. Refusing to append a
+/// missing row prevents a delayed committed event from resurrecting a track
+/// that a newer library event already removed. URI equality is deliberately
+/// irrelevant: paths can move, and a remote source can expose the same URI.
+fn replace_existing_local_track(rows: &mut [TrackObject], replacement: &TrackObject) -> bool {
+    let track_id = replacement.track_id();
+    if track_id.is_empty() {
+        return false;
+    }
+    let Some(index) = rows.iter().position(|row| row.track_id() == track_id) else {
+        return false;
+    };
+    rows[index] = replacement.clone();
+    true
+}
+
+/// Retire every cached playlist projection and reload the active one.
+///
+/// A playback-history commit can change smart-playlist membership and order,
+/// while ordinary playlists still need their displayed Plays value refreshed.
+/// Invalidating the navigation generation before clearing rows prevents a late
+/// pre-commit query from publishing stale projections again.
+#[allow(clippy::too_many_arguments)]
+fn invalidate_playlist_projections(
+    rt_handle: &tokio::runtime::Handle,
+    source_navigation: &Rc<RefCell<SourceNavigation>>,
+    source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    active_source_key: &Rc<RefCell<String>>,
+    track_store: &gtk::gio::ListStore,
+    master_tracks: &Rc<RefCell<Vec<TrackObject>>>,
+    browser_widget: &gtk::Box,
+    browser_state: &browser::BrowserState,
+    status_label: &gtk::Label,
+    column_view: &gtk::ColumnView,
+) {
+    let active_key = active_source_key.borrow().clone();
+    source_navigation
+        .borrow_mut()
+        .invalidate_prefix(PLAYLIST_SOURCE_PREFIX);
+    source_tracks
+        .borrow_mut()
+        .retain(|key, _| !key.starts_with(PLAYLIST_SOURCE_PREFIX));
+
+    let Some(playlist_id) = active_key
+        .strip_prefix(PLAYLIST_SOURCE_PREFIX)
+        .map(str::to_string)
+    else {
+        return;
+    };
+
+    // Stale rows may already have changed membership or ordering. Leave no
+    // old projection actionable while its committed replacement is loading.
+    display_tracks(
+        &[],
+        track_store,
+        master_tracks,
+        browser_widget,
+        browser_state,
+        status_label,
+        column_view,
+    );
+
+    // During remote authentication, visible source and latest navigation
+    // intent intentionally differ. Background playlist maintenance must not
+    // supersede that newer intent.
+    if source_navigation.borrow().is_key(&active_key) {
+        let request = source_navigation.borrow_mut().select(active_key);
+        super::source_connect::load_playlist_source(
+            rt_handle.clone(),
+            playlist_id,
+            request,
+            source_navigation.clone(),
+            source_tracks.clone(),
+            active_source_key.clone(),
+            track_store.clone(),
+            master_tracks.clone(),
+            browser_widget.clone(),
+            browser_state.clone(),
+            status_label.clone(),
+            column_view.clone(),
+        );
     }
 }
 
@@ -3170,60 +3367,65 @@ fn setup_library_events(
                     scan_spinner.set_visible(false);
                 }
 
-                LibraryEvent::PlaylistProjectionsInvalidated => {
-                    let active_key = active_source_key.borrow().clone();
+                LibraryEvent::PlaybackHistoryUpdated(track) => {
+                    let replacement = arch_track_to_object(&track);
+                    let track_id = replacement.track_id();
+                    let local_updated = {
+                        let mut sources = source_tracks.borrow_mut();
+                        sources
+                            .get_mut("local")
+                            .is_some_and(|rows| replace_existing_local_track(rows, &replacement))
+                    };
 
-                    // Any local mutation can change a live smart playlist, and
-                    // reconciliation can remint/relink regular-playlist track
-                    // IDs. Retire pre-settlement requests before clearing the
-                    // cache so a late query cannot put stale rows back.
-                    source_navigation
-                        .borrow_mut()
-                        .invalidate_prefix(PLAYLIST_SOURCE_PREFIX);
-                    source_tracks
-                        .borrow_mut()
-                        .retain(|key, _| !key.starts_with(PLAYLIST_SOURCE_PREFIX));
-
-                    if let Some(playlist_id) = active_key
-                        .strip_prefix(PLAYLIST_SOURCE_PREFIX)
-                        .map(str::to_string)
-                    {
-                        // The old rows may hold orphaned/reminted IDs. Do not
-                        // leave them actionable while the settled projection
-                        // is loading.
-                        display_tracks(
-                            &[],
-                            &track_store,
-                            &master_tracks,
-                            &browser_widget,
-                            &browser_state,
-                            &status_label,
-                            &column_view,
-                        );
-
-                        // `active_source_key` names the visible rows, while
-                        // SourceNavigation names the user's latest intent.
-                        // During remote authentication those intentionally
-                        // differ. Never let background playlist maintenance
-                        // supersede that newer remote intent.
-                        if source_navigation.borrow().is_key(&active_key) {
-                            let request = source_navigation.borrow_mut().select(active_key.clone());
-                            super::source_connect::load_playlist_source(
-                                rt_handle.clone(),
-                                playlist_id,
-                                request,
-                                source_navigation.clone(),
-                                source_tracks.clone(),
-                                active_source_key.clone(),
-                                track_store.clone(),
-                                master_tracks.clone(),
-                                browser_widget.clone(),
-                                browser_state.clone(),
-                                status_label.clone(),
-                                column_view.clone(),
-                            );
+                    if local_updated && *active_source_key.borrow() == "local" {
+                        // Reinsert at the same base-model position. Gtk's sort
+                        // model sees an item change and can immediately reorder
+                        // a Plays-sorted view without rebuilding unrelated rows.
+                        for index in 0..track_store.n_items() {
+                            let Some(existing) =
+                                track_store.item(index).and_downcast::<TrackObject>()
+                            else {
+                                continue;
+                            };
+                            if existing.track_id() == track_id {
+                                track_store.remove(index);
+                                track_store.insert(index, &replacement);
+                                break;
+                            }
                         }
+                        let _ = replace_existing_local_track(
+                            &mut master_tracks.borrow_mut(),
+                            &replacement,
+                        );
                     }
+
+                    invalidate_playlist_projections(
+                        &rt_handle,
+                        &source_navigation,
+                        &source_tracks,
+                        &active_source_key,
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
+                }
+
+                LibraryEvent::PlaylistProjectionsInvalidated => {
+                    invalidate_playlist_projections(
+                        &rt_handle,
+                        &source_navigation,
+                        &source_tracks,
+                        &active_source_key,
+                        &track_store,
+                        &master_tracks,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                    );
                 }
 
                 LibraryEvent::PlaylistsLoaded(playlists) => {
@@ -3779,6 +3981,59 @@ pub fn remove_empty_category_header(store: &gtk::gio::ListStore, category: &str)
 mod identity_tests {
     use super::*;
     use crate::architecture::SourceId;
+
+    fn local_history_row(track_id: &str, uri: &str, play_count: u32) -> TrackObject {
+        let row = TrackObject::new(
+            1,
+            "Title",
+            180,
+            "Artist",
+            "Album",
+            "Genre",
+            "",
+            2026,
+            "2026-07-18",
+            320,
+            48_000,
+            play_count,
+            "flac",
+            uri,
+        );
+        row.set_track_id(track_id);
+        row
+    }
+
+    #[test]
+    fn playback_history_replaces_only_the_exact_existing_local_identity() {
+        let original = local_history_row("track-a", "file:///old/a.flac", 2);
+        let unrelated = local_history_row("track-b", "file:///music/b.flac", 7);
+        let mut rows = vec![original, unrelated.clone()];
+        let replacement = local_history_row("track-a", "file:///new/a.flac", 3);
+
+        assert!(replace_existing_local_track(&mut rows, &replacement));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].track_id(), "track-a");
+        assert_eq!(rows[0].uri(), "file:///new/a.flac");
+        assert_eq!(rows[0].play_count(), 3);
+        assert_eq!(rows[1].track_id(), unrelated.track_id());
+        assert_eq!(rows[1].play_count(), 7);
+    }
+
+    #[test]
+    fn playback_history_never_uri_matches_or_appends_a_missing_row() {
+        let retained = local_history_row("track-a", "file:///music/shared.flac", 2);
+        let mut rows = vec![retained.clone()];
+
+        let same_uri_wrong_id =
+            local_history_row("remote-collision", "file:///music/shared.flac", 99);
+        assert!(!replace_existing_local_track(&mut rows, &same_uri_wrong_id));
+        let missing = local_history_row("track-missing", "file:///music/missing.flac", 1);
+        assert!(!replace_existing_local_track(&mut rows, &missing));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].track_id(), retained.track_id());
+        assert_eq!(rows[0].play_count(), 2);
+    }
 
     fn disconnected_visible_snapshot(
         revision: u64,

@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set, TransactionTrait,
+    Set, Statement, TransactionTrait,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -25,7 +25,7 @@ use walkdir::WalkDir;
 use super::root_authority::{AbsenceProof, BoundDirectory, BoundFile, RootAuthorityLease};
 use super::tag_parser::{self, ParsedTrack};
 use super::tag_writer;
-use crate::architecture::models::Track;
+use crate::architecture::{models::Track, TrackId};
 use crate::db::entities::{library_root, playlist_entry, root_reauthorization_receipt, track};
 
 /// Frozen namespace for projecting a legacy non-UUID SQLite track key into
@@ -60,6 +60,10 @@ pub enum LibraryEvent {
     /// Persisted track changes and any resulting playlist reconciliation have
     /// settled, so active playlist projections should be loaded again.
     PlaylistProjectionsInvalidated,
+    /// One local track's playback-history mutation committed durably. The
+    /// boxed value is the row selected in the same transaction as the atomic
+    /// increment, converted only after that transaction committed.
+    PlaybackHistoryUpdated(Box<Track>),
     /// Complete, exact-configured roots which require an explicit user trust
     /// decision before their observed storage may become authoritative.
     RootTrustRequired(Vec<RootTrustRequest>),
@@ -252,6 +256,19 @@ impl std::fmt::Debug for RootTrustRequest {
 #[derive(Clone, Debug)]
 pub enum LibraryCommand {
     ConfirmRootTrust(RootTrustRequest),
+    /// Durably count one accepted playback occurrence for an exact local
+    /// source-native track identity.
+    RecordPlaybackHistory {
+        track_id: TrackId,
+        counted_at_ms: i64,
+    },
+    /// Acknowledge only after every command queued before this marker has
+    /// finished. Normal application shutdown uses this FIFO barrier so an
+    /// already-latched playback occurrence cannot be lost while the initial
+    /// scan or watcher owner is still busy.
+    Flush {
+        completion: async_channel::Sender<()>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -2966,6 +2983,81 @@ async fn refresh_unavailable_root_trust_evidence(
     }
 }
 
+/// Atomically increment one exact local track's durable playback history.
+///
+/// The write uses a single bound-parameter statement so a concurrent caller
+/// can never lose an increment between a read and a write. SQLite stores the
+/// application count as a signed integer, so legacy negative values are
+/// repaired to the first legitimate play and the public `u32` projection is
+/// capped at the entity's `i32` ceiling. The updated row is selected while the
+/// same write transaction is still held and is returned only after COMMIT.
+async fn record_playback_history(
+    db: &DatabaseConnection,
+    track_id: &TrackId,
+    counted_at_ms: i64,
+) -> anyhow::Result<Option<Track>> {
+    let transaction = db.begin().await?;
+    let update = transaction
+        .execute(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "UPDATE tracks
+             SET play_count = CASE
+                     WHEN play_count < 0 THEN 1
+                     WHEN play_count < ? THEN play_count + 1
+                     ELSE ?
+                 END,
+                 last_played_at_ms = CASE
+                     WHEN last_played_at_ms IS NULL OR last_played_at_ms < ? THEN ?
+                     ELSE last_played_at_ms
+                 END
+             WHERE id = ?",
+            [
+                i32::MAX.into(),
+                i32::MAX.into(),
+                counted_at_ms.into(),
+                counted_at_ms.into(),
+                track_id.as_str().into(),
+            ],
+        ))
+        .await;
+
+    let update = match update {
+        Ok(update) => update,
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            return Err(error.into());
+        }
+    };
+
+    if update.rows_affected() == 0 {
+        transaction.commit().await?;
+        return Ok(None);
+    }
+    if update.rows_affected() != 1 {
+        let affected = update.rows_affected();
+        let _ = transaction.rollback().await;
+        anyhow::bail!("playback-history update for exact track ID affected {affected} rows");
+    }
+
+    let updated = match track::Entity::find_by_id(track_id.as_str())
+        .one(&transaction)
+        .await
+    {
+        Ok(Some(updated)) => updated,
+        Ok(None) => {
+            let _ = transaction.rollback().await;
+            anyhow::bail!("playback-history row disappeared before commit");
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            return Err(error.into());
+        }
+    };
+
+    transaction.commit().await?;
+    Ok(Some(db_model_to_track(&updated)))
+}
+
 async fn process_library_command(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
@@ -2973,7 +3065,32 @@ async fn process_library_command(
     completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
     command: LibraryCommand,
 ) -> Option<PendingRootTrustScan> {
-    let LibraryCommand::ConfirmRootTrust(request) = command;
+    let request = match command {
+        LibraryCommand::ConfirmRootTrust(request) => request,
+        LibraryCommand::RecordPlaybackHistory {
+            track_id,
+            counted_at_ms,
+        } => {
+            match record_playback_history(db, &track_id, counted_at_ms).await {
+                Ok(Some(track)) => {
+                    let _ = tx
+                        .send(LibraryEvent::PlaybackHistoryUpdated(Box::new(track)))
+                        .await;
+                }
+                Ok(None) => {
+                    debug!(track_id = %track_id.as_str(), "Ignored playback history for a missing local track");
+                }
+                Err(error) => {
+                    warn!(track_id = %track_id.as_str(), %error, "Failed to record local playback history");
+                }
+            }
+            return None;
+        }
+        LibraryCommand::Flush { completion } => {
+            let _ = completion.send(()).await;
+            return None;
+        }
+    };
 
     if let Some(completion) = completed_commands.get(&request.request_id).cloned() {
         emit_root_trust_finished(
@@ -7436,6 +7553,210 @@ mod tests {
         };
         let active: track::ActiveModel = model.into();
         active.insert(db).await.expect("insert rename test track")
+    }
+
+    async fn insert_playback_history_test_track(
+        db: &DatabaseConnection,
+        id: &str,
+        play_count: i32,
+        last_played_at_ms: Option<i64>,
+    ) -> track::Model {
+        let model =
+            insert_rename_test_track(db, id, &format!("/history/{id}.flac"), id, play_count).await;
+        let mut active: track::ActiveModel = model.into();
+        active.last_played_at_ms = Set(last_played_at_ms);
+        active
+            .update(db)
+            .await
+            .expect("set playback-history test timestamp")
+    }
+
+    #[tokio::test]
+    async fn playback_history_atomically_updates_only_the_exact_track_id() {
+        let db = rename_test_database().await;
+        insert_playback_history_test_track(&db, "history-exact", 7, Some(1_000)).await;
+        insert_playback_history_test_track(&db, "history-exact-sibling", 3, Some(900)).await;
+        let exact = TrackId::new("history-exact").expect("valid exact track ID");
+
+        let first = record_playback_history(&db, &exact, 2_000)
+            .await
+            .expect("record first occurrence")
+            .expect("exact track exists");
+        assert_eq!(first.native_track_id.as_ref(), Some(&exact));
+        assert_eq!(first.play_count, Some(8));
+        assert_eq!(
+            first.last_played.map(|value| value.timestamp_millis()),
+            Some(2_000)
+        );
+
+        let regressed = record_playback_history(&db, &exact, 1_500)
+            .await
+            .expect("record occurrence with regressed wall clock")
+            .expect("exact track still exists");
+        assert_eq!(regressed.play_count, Some(9));
+        assert_eq!(
+            regressed.last_played.map(|value| value.timestamp_millis()),
+            Some(2_000),
+            "last-played timestamps are monotonic even while every occurrence increments"
+        );
+
+        let sibling = track::Entity::find_by_id("history-exact-sibling")
+            .one(&db)
+            .await
+            .expect("query sibling")
+            .expect("sibling exists");
+        assert_eq!(sibling.play_count, 3);
+        assert_eq!(sibling.last_played_at_ms, Some(900));
+    }
+
+    #[tokio::test]
+    async fn playback_history_repairs_negative_counts_and_saturates_at_i32_max() {
+        let db = rename_test_database().await;
+        insert_playback_history_test_track(&db, "history-negative", -17, None).await;
+        insert_playback_history_test_track(&db, "history-saturated", i32::MAX - 1, Some(100)).await;
+
+        let negative = TrackId::new("history-negative").expect("valid negative fixture ID");
+        let repaired = record_playback_history(&db, &negative, 42)
+            .await
+            .expect("repair negative count")
+            .expect("negative fixture exists");
+        assert_eq!(repaired.play_count, Some(1));
+        assert_eq!(
+            repaired.last_played.map(|value| value.timestamp_millis()),
+            Some(42)
+        );
+
+        let saturated = TrackId::new("history-saturated").expect("valid saturated fixture ID");
+        let updated = record_playback_history(&db, &saturated, 200)
+            .await
+            .expect("record saturated occurrence")
+            .expect("saturated fixture exists");
+        assert_eq!(updated.play_count, Some(i32::MAX as u32));
+        assert_eq!(
+            updated.last_played.map(|value| value.timestamp_millis()),
+            Some(200),
+            "timestamp advances as the count reaches its storage ceiling"
+        );
+
+        let regressed = record_playback_history(&db, &saturated, 150)
+            .await
+            .expect("record saturated occurrence with regressed timestamp")
+            .expect("saturated fixture still exists");
+        assert_eq!(regressed.play_count, Some(i32::MAX as u32));
+        assert_eq!(
+            regressed.last_played.map(|value| value.timestamp_millis()),
+            Some(200)
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_history_missing_rows_are_clean_no_ops() {
+        let db = rename_test_database().await;
+        insert_playback_history_test_track(&db, "history-bystander", 4, Some(321)).await;
+        let missing = TrackId::new("history-missing").expect("valid missing track ID");
+
+        assert!(record_playback_history(&db, &missing, 999)
+            .await
+            .expect("missing history update is not an error")
+            .is_none());
+        let bystander = track::Entity::find_by_id("history-bystander")
+            .one(&db)
+            .await
+            .expect("query bystander")
+            .expect("bystander exists");
+        assert_eq!(bystander.play_count, 4);
+        assert_eq!(bystander.last_played_at_ms, Some(321));
+    }
+
+    #[tokio::test]
+    async fn playback_history_commands_emit_only_committed_rows_before_flush_ack() {
+        let db = rename_test_database().await;
+        insert_playback_history_test_track(&db, "history-committed", 10, Some(1_000)).await;
+        insert_playback_history_test_track(&db, "history-rejected", 20, Some(2_000)).await;
+        db.execute_unprepared(
+            "CREATE TRIGGER reject_playback_history
+             BEFORE UPDATE OF play_count, last_played_at_ms ON tracks
+             WHEN OLD.id = 'history-rejected'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected playback-history failure');
+             END",
+        )
+        .await
+        .expect("create playback-history failure trigger");
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        command_tx
+            .send(LibraryCommand::RecordPlaybackHistory {
+                track_id: TrackId::new("history-rejected").expect("valid rejected ID"),
+                counted_at_ms: 3_000,
+            })
+            .await
+            .expect("send rejected command");
+        command_tx
+            .send(LibraryCommand::RecordPlaybackHistory {
+                track_id: TrackId::new("history-missing").expect("valid missing ID"),
+                counted_at_ms: 3_000,
+            })
+            .await
+            .expect("send missing command");
+        command_tx
+            .send(LibraryCommand::RecordPlaybackHistory {
+                track_id: TrackId::new("history-committed").expect("valid committed ID"),
+                counted_at_ms: 3_000,
+            })
+            .await
+            .expect("send committed command after rejected transaction");
+        let (flush_tx, flush_rx) = async_channel::bounded(1);
+        command_tx
+            .send(LibraryCommand::Flush {
+                completion: flush_tx,
+            })
+            .await
+            .expect("queue FIFO shutdown flush after history commands");
+        drop(command_tx);
+
+        let mut completed = HashMap::new();
+        process_library_commands_without_watcher(&db, &[], &event_tx, &command_rx, &mut completed)
+            .await;
+        flush_rx
+            .recv()
+            .await
+            .expect("flush is acknowledged after preceding commands finish");
+        assert!(
+            completed.is_empty(),
+            "history commands are never trust receipts"
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(events.len(), 1, "missing and failed updates emit nothing");
+        let LibraryEvent::PlaybackHistoryUpdated(updated) = &events[0] else {
+            panic!("only the committed playback-history event is expected");
+        };
+        assert_eq!(
+            updated.native_track_id.as_ref().map(TrackId::as_str),
+            Some("history-committed")
+        );
+        assert_eq!(updated.play_count, Some(11));
+        assert_eq!(
+            updated.last_played.map(|value| value.timestamp_millis()),
+            Some(3_000)
+        );
+
+        let committed = track::Entity::find_by_id("history-committed")
+            .one(&db)
+            .await
+            .expect("query committed row after event")
+            .expect("committed row exists");
+        assert_eq!(committed.play_count, 11);
+        assert_eq!(committed.last_played_at_ms, Some(3_000));
+        let rejected = track::Entity::find_by_id("history-rejected")
+            .one(&db)
+            .await
+            .expect("query rejected row")
+            .expect("rejected row exists");
+        assert_eq!(rejected.play_count, 20);
+        assert_eq!(rejected.last_played_at_ms, Some(2_000));
     }
 
     fn parsed_rename_track(path: &str, title: &str) -> ParsedTrack {
