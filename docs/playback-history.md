@@ -124,9 +124,6 @@ nullability, default, or primary-key shapes. Rolling the migration down necessar
 last-played timestamps but preserves tracks and play counts; reapplying starts those timestamps as
 null. No history index is added yet because smart playlists currently materialize the local table
 in memory before evaluation; an index would add write cost without serving the current query path.
-Although the supported schema keeps `play_count` non-null, the atomic runtime update also treats a
-null count in a manually rebuilt or otherwise incompatible table as zero and repairs it to the
-first legitimate play before selecting the row into the non-null entity model.
 
 Production persistence atomically saturates `play_count` at `i32::MAX` and sets
 `last_played_at_ms` to `max(existing, event_timestamp)`. The bound update targets one exact stable

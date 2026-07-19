@@ -2987,12 +2987,10 @@ async fn refresh_unavailable_root_trust_evidence(
 ///
 /// The write uses a single bound-parameter statement so a concurrent caller
 /// can never lose an increment between a read and a write. SQLite stores the
-/// application count as a non-null signed integer. The explicit null branch is
-/// defensive for a manually rebuilt or otherwise incompatible table: null and
-/// legacy negative values are both repaired to the first legitimate play, and
-/// the public `u32` projection is capped at the entity's `i32` ceiling. The
-/// updated row is selected while the same write transaction is still held and
-/// is returned only after COMMIT.
+/// application count as a non-null signed integer, so legacy negative values
+/// are repaired to the first legitimate play and the public `u32` projection
+/// is capped at the entity's `i32` ceiling. The updated row is selected while
+/// the same write transaction is still held and is returned only after COMMIT.
 async fn record_playback_history(
     db: &DatabaseConnection,
     track_id: &TrackId,
@@ -3004,7 +3002,7 @@ async fn record_playback_history(
             transaction.get_database_backend(),
             "UPDATE tracks
              SET play_count = CASE
-                     WHEN play_count IS NULL OR play_count < 0 THEN 1
+                     WHEN play_count < 0 THEN 1
                      WHEN play_count < ? THEN play_count + 1
                      ELSE ?
                  END,
@@ -7648,49 +7646,6 @@ mod tests {
         assert_eq!(
             regressed.last_played.map(|value| value.timestamp_millis()),
             Some(200)
-        );
-    }
-
-    #[tokio::test]
-    async fn playback_history_defensively_repairs_a_nullable_count_table() {
-        let db = rename_test_database().await;
-        insert_playback_history_test_track(&db, "history-null", 9, None).await;
-
-        // The supported schema declares play_count NOT NULL. Rebuild only this
-        // test table without constraints to prove the atomic SQL repairs an
-        // incompatible/manual nullable schema instead of saturating NULL.
-        db.execute_unprepared("PRAGMA foreign_keys = OFF")
-            .await
-            .expect("disable foreign keys for test-only table rebuild");
-        db.execute_unprepared("CREATE TABLE tracks_nullable AS SELECT * FROM tracks")
-            .await
-            .expect("copy tracks into nullable test table");
-        db.execute_unprepared("DROP TABLE tracks")
-            .await
-            .expect("drop constrained tracks table");
-        db.execute_unprepared("ALTER TABLE tracks_nullable RENAME TO tracks")
-            .await
-            .expect("install nullable tracks table");
-        db.execute_unprepared("PRAGMA foreign_keys = ON")
-            .await
-            .expect("restore foreign-key enforcement");
-        db.execute(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            "UPDATE tracks SET play_count = NULL WHERE id = ?",
-            ["history-null".into()],
-        ))
-        .await
-        .expect("inject unsupported nullable count");
-
-        let track_id = TrackId::new("history-null").expect("valid nullable fixture ID");
-        let repaired = record_playback_history(&db, &track_id, 77)
-            .await
-            .expect("repair nullable count")
-            .expect("nullable fixture exists");
-        assert_eq!(repaired.play_count, Some(1));
-        assert_eq!(
-            repaired.last_played.map(|value| value.timestamp_millis()),
-            Some(77)
         );
     }
 
