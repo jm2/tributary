@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Local playback history now has a durable contract and schema foundation** — Local track rows
+  gain a nullable UTC epoch-millisecond `last_played` value, while the architecture model safely
+  rejects out-of-range stored timestamps. Migration 10 preserves every nonnegative legacy play
+  count, repairs negative corruption to zero, never invents a timestamp from file or library dates,
+  validates interrupted SQLite upgrades (including SQLite's equivalent nullable `INTEGER`
+  spelling while rejecting incompatible shapes), and supports down/up retry. A pure per-occurrence
+  state counts observed forward playback at half of a positive duration rounded up and capped at
+  four minutes; missing or zero duration uses the four-minute fallback or an unskipped authoritative
+  natural end. Duration freezes on the first positive value; seeks, neutral retry/resume anchors,
+  and restarts earn no jump credit; only a forward user seek suppresses the early unknown-duration
+  end rule; backward replay preserves accumulated listening; and the count signal latches once.
+  Production playback-event writes, Plays-column refresh, and deterministic Recently Played
+  and Top 25 behavior remain the next two P1.3 slices and are not claimed by this foundation.
+
 ### Fixed
 - **Unsupported playlist additions now fail visibly and atomically** — Choosing Add to Playlist
   from an authenticated remote, internet-radio, removable-media, or unknown/pathless source now

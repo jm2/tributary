@@ -1448,6 +1448,7 @@ mod tests {
             sample_rate_hz: None,
             format: None,
             play_count: None,
+            last_played: None,
         }
     }
 

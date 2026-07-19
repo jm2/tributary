@@ -642,6 +642,7 @@ fn jellyfin_item_to_track(
         sample_rate_hz,
         format: item.container.clone(),
         play_count: item.user_data.as_ref().and_then(|ud| ud.play_count),
+        last_played: None,
     }
 }
 

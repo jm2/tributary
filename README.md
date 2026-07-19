@@ -60,7 +60,8 @@ Tributary provides a unified interface for managing and streaming music from mul
 | USB file transfer (copy to device with progress) | ❌ Planned ([#8](https://github.com/jm2/tributary/issues/8)) |
 | Multiple music library directories | ✅ |
 | Playlist import/export (XSPF) | ✅ |
-| Default smart playlists (Recently Added, Recently Played, Top 25) | ⚠️ Seeded; Recently Played and Top 25 need durable playback history ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
+| Durable local playback history | ⚠️ Contract, schema, and tested progress accounting are implemented; playback-event persistence is next ([contract](docs/playback-history.md)) |
+| Default smart playlists (Recently Added, Recently Played, Top 25) | ⚠️ Seeded; Recently Played and Top 25 still await history persistence and deterministic consumers ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
 | Track ratings | ❌ Planned ([#37](https://github.com/jm2/tributary/issues/37)) |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
@@ -465,13 +466,14 @@ src/
 │   ├── entities/
 │   │   └── track.rs        # SeaORM entity for tracks table
 │   └── migration/
-│       └── m20250101_000001_create_tables.rs
+│       └── *.rs            # Ordered, retry-safe SQLite schema migrations
 ├── desktop_integration/
 │   └── mod.rs              # OS media controls via souvlaki (MPRIS/SMTC/Now Playing)
 ├── local/
 │   ├── mod.rs              # Local backend root
 │   ├── backend.rs          # MediaBackend impl (LocalBackend)
 │   ├── engine.rs           # Async scan + notify FS watcher + LibraryEvent channel
+│   ├── playback_history.rs # Pure counted-play occurrence accounting
 │   ├── tag_parser.rs       # lofty audio tag extraction
 │   ├── tag_writer.rs       # lofty audio tag writing (MP3, M4A, OGG, FLAC)
 │   ├── playlist_manager.rs # Regular + smart playlist CRUD
@@ -757,6 +759,11 @@ podcasts. Tributary deliberately does not guess through any of those gaps.
 - **Repeat** — cycles through Off → All → One
 - **Seek** — drag the progress scrubber
 - **Volume** — drag the volume slider (cubic perceptual curve)
+
+The [local playback-history contract](docs/playback-history.md) defines a counted play as half of a
+known duration, rounded up and capped at four minutes, with a conservative unknown-duration rule.
+Its schema and progress accounting are present, but this build does not yet persist production
+playback events or update Recently Played and Top 25; those are the next two P1.3 slices.
 
 ### Keyboard Shortcuts
 

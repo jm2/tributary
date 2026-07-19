@@ -5793,6 +5793,7 @@ where
             sample_rate_hz: Set(parsed.sample_rate_hz.map(|s| s as i32)),
             format: Set(Some(parsed.format.clone())),
             play_count: Set(0),
+            last_played_at_ms: Set(None),
             date_added: Set(now),
             date_modified: Set(mtime),
             file_size_bytes: Set(parsed.file_size_bytes.map(|s| s as i64)),
@@ -6191,7 +6192,12 @@ pub fn db_model_to_track(model: &track::Model) -> Track {
         bitrate_kbps: model.bitrate_kbps.map(|b| b as u32),
         sample_rate_hz: model.sample_rate_hz.map(|s| s as u32),
         format: model.format.clone(),
-        play_count: Some(model.play_count as u32),
+        // Legacy/corrupt negative counts must never wrap into enormous UI
+        // values while the repair migration is pending or being inspected.
+        play_count: Some(u32::try_from(model.play_count).unwrap_or_default()),
+        last_played: model
+            .last_played_at_ms
+            .and_then(chrono::DateTime::<Utc>::from_timestamp_millis),
     }
 }
 
@@ -7423,6 +7429,7 @@ mod tests {
             sample_rate_hz: Some(44_100),
             format: Some("FLAC".to_string()),
             play_count,
+            last_played_at_ms: Some(1_748_776_400_123),
             date_added: "2025-01-02T03:04:05Z".to_string(),
             date_modified: "2025-01-02T03:04:05Z".to_string(),
             file_size_bytes: Some(1_000),
@@ -7701,6 +7708,7 @@ mod tests {
         assert_eq!(renamed.title, "Updated Title");
         assert_eq!(renamed.artist_name, "Updated Artist");
         assert_eq!(renamed.play_count, 17);
+        assert_eq!(renamed.last_played_at_ms, Some(1_748_776_400_123));
         assert_eq!(renamed.date_added, "2025-01-02T03:04:05Z");
 
         let entry_after = playlist_entry::Entity::find_by_id(&entry_before.id)
@@ -8463,6 +8471,7 @@ mod tests {
             directory_fixture_key("/music/Renamed/01.flac")
         );
         assert_eq!(renamed.play_count, 11, "history survives the move");
+        assert_eq!(renamed.last_played_at_ms, Some(1_748_776_400_123));
         assert_eq!(renamed.date_added, "2025-01-02T03:04:05Z");
         assert_eq!(
             renamed.date_modified, "2025-01-02T03:04:05Z",
@@ -10958,6 +10967,7 @@ mod tests {
             sample_rate_hz: None,
             format: Some("MP3".to_string()),
             play_count: 0,
+            last_played_at_ms: None,
             date_added: "2026-07-10T00:00:00Z".to_string(),
             date_modified: "2026-07-10T00:00:00Z".to_string(),
             file_size_bytes: None,
@@ -11050,6 +11060,7 @@ mod tests {
             sample_rate_hz: Some(44100),
             format: Some("FLAC".to_string()),
             play_count: 5,
+            last_played_at_ms: Some(1_748_776_400_123),
             date_added: "2025-01-15T10:30:00+00:00".to_string(),
             date_modified: "2025-06-01T14:00:00+00:00".to_string(),
             file_size_bytes: Some(30_000_000),
@@ -11073,6 +11084,10 @@ mod tests {
         assert_eq!(track.sample_rate_hz, Some(44100));
         assert_eq!(track.format, Some("FLAC".to_string()));
         assert_eq!(track.play_count, Some(5));
+        assert_eq!(
+            track.last_played.map(|instant| instant.timestamp_millis()),
+            Some(1_748_776_400_123)
+        );
         assert_eq!(track.file_path, Some("/music/song.flac".to_string()));
         assert!(track.stream_url.is_none());
         assert!(track.cover_art_url.is_none());
@@ -11099,6 +11114,7 @@ mod tests {
             sample_rate_hz: None,
             format: None,
             play_count: 0,
+            last_played_at_ms: None,
             date_added: "2025-01-01T00:00:00+00:00".to_string(),
             date_modified: "2025-01-01T00:00:00+00:00".to_string(),
             file_size_bytes: None,
@@ -11115,6 +11131,7 @@ mod tests {
         assert_eq!(track.sample_rate_hz, None);
         assert_eq!(track.format, None);
         assert_eq!(track.play_count, Some(0));
+        assert_eq!(track.last_played, None);
     }
 
     #[test]
@@ -11136,6 +11153,7 @@ mod tests {
             sample_rate_hz: None,
             format: None,
             play_count: 0,
+            last_played_at_ms: None,
             date_added: "2025-01-01T00:00:00+00:00".to_string(),
             date_modified: "2025-01-01T00:00:00+00:00".to_string(),
             file_size_bytes: None,
@@ -11177,6 +11195,7 @@ mod tests {
             sample_rate_hz: None,
             format: None,
             play_count: 0,
+            last_played_at_ms: Some(i64::MAX),
             date_added: "not-a-date".to_string(),
             date_modified: "also-not-a-date".to_string(),
             file_size_bytes: None,
@@ -11186,6 +11205,35 @@ mod tests {
         // Invalid dates should result in None, not a panic.
         assert!(track.date_added.is_none());
         assert!(track.date_modified.is_none());
+        assert!(track.last_played.is_none());
+    }
+
+    #[test]
+    fn test_db_model_to_track_repairs_negative_play_count_at_the_read_boundary() {
+        let model = track::Model {
+            id: "legacy-negative-play-count".to_string(),
+            file_path: "/music/legacy.flac".to_string(),
+            title: "Legacy".to_string(),
+            artist_name: "Artist".to_string(),
+            album_artist_name: None,
+            album_title: "Album".to_string(),
+            genre: None,
+            composer: None,
+            year: None,
+            track_number: None,
+            disc_number: None,
+            duration_secs: None,
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            format: Some("FLAC".to_string()),
+            play_count: -1,
+            last_played_at_ms: None,
+            date_added: "2025-01-01T00:00:00Z".to_string(),
+            date_modified: "2025-01-01T00:00:00Z".to_string(),
+            file_size_bytes: None,
+        };
+
+        assert_eq!(db_model_to_track(&model).play_count, Some(0));
     }
 
     #[test]

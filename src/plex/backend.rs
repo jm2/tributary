@@ -647,6 +647,7 @@ fn plex_track_to_track(
         sample_rate_hz: None, // Not available in Plex track metadata.
         format,
         play_count: plex.view_count,
+        last_played: None,
     }
 }
 

@@ -452,6 +452,7 @@ mod tests {
             artist_name: Set("Artist".to_string()),
             album_title: Set("Album".to_string()),
             play_count: Set(0),
+            last_played_at_ms: Set(None),
             date_added: Set("2026-07-17T00:00:00+00:00".to_string()),
             date_modified: Set("2026-07-17T00:00:00+00:00".to_string()),
             ..Default::default()

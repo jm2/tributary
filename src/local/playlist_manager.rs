@@ -717,6 +717,7 @@ mod tests {
             sample_rate_hz: None,
             format: None,
             play_count: 0,
+            last_played_at_ms: None,
             date_added: "2026-07-12T00:00:00Z".to_string(),
             date_modified: "2026-07-12T00:00:00Z".to_string(),
             file_size_bytes: None,

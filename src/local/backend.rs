@@ -425,6 +425,7 @@ mod tests {
             sample_rate_hz: Set(None),
             format: Set(Some("FLAC".to_owned())),
             play_count: Set(0),
+            last_played_at_ms: Set(None),
             date_added: Set("2026-07-17T00:00:00Z".to_owned()),
             date_modified: Set("2026-07-17T00:00:00Z".to_owned()),
             file_size_bytes: Set(None),

@@ -345,6 +345,7 @@ fn station_track(station: &RadioStation, track_id: TrackId) -> Track {
         sample_rate_hz: None,
         format: nonempty(&station.codec),
         play_count: None,
+        last_played: None,
     }
 }
 

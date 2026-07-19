@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod engine;
+pub mod playback_history;
 pub mod playlist_io;
 pub mod playlist_manager;
 pub mod resolver;
