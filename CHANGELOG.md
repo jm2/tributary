@@ -59,10 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Track` clone, so file paths, file/network URLs, stream and artwork locators, credentials, leases,
   routes, raw backend failures, and future unreviewed fields cannot cross implicitly. Its closed
   authority guard may carry the non-secret session epoch and catalogue generation transiently, but
-  neither is written into playlist storage. Guarded stream and artwork resolution rechecks exact
-  membership, capability, epoch, and generation before adapter work and after the asynchronous
-  result returns, then maps raw adapter errors to fixed categories. A lifecycle-owned generation
-  lease is explicitly revoked on snapshot replacement/removal and every teardown path, so retained
+  neither is written into playlist storage. Immutable catalogue projection runs outside the
+  lifecycle mutex, then exact snapshot identity and both leases are rechecked before adapter work;
+  this keeps a selector from re-entering or extending the critical section without widening stale
+  authority. Guarded stream and artwork resolution rechecks exact membership, capability, epoch,
+  and generation again after the asynchronous result returns, then maps raw adapter errors to fixed
+  categories. A lifecycle-owned generation lease is explicitly revoked on snapshot
+  replacement/removal and every teardown path, so retained
   snapshot clones cannot keep an already returned request active.
   Connecting or a failed replacement preserves the accepted predecessor; successful replacement
   or same-session catalogue refresh invalidates old guards. Disconnect, shutdown, and final source

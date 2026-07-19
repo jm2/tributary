@@ -253,14 +253,17 @@ the 36-record feature backlog.
   whitelist rather than a `Track` clone. The lifecycle snapshot owns a separately revocable
   generation lease, so replacement or teardown invalidates guarded media even while an observer
   retains an old snapshot clone; raw adapter failures become fixed media-error categories.
-  Revalidation denies a guard made stale by refresh, replacement, retirement, release, or shutdown.
+  Catalogue projection runs on the captured immutable snapshot outside the lifecycle mutex, then
+  exact pointer identity and both leases are rechecked before return or adapter work. Revalidation
+  denies a guard made stale by refresh, replacement, retirement, release, or shutdown.
   The capability does not authorize a database write, UI row, playback request, or source-native
   playlist mutation.
 
   Coverage pins the default-deny and four-opt-in matrix, `Invalid` indexing, ordered
   duplicate requests, all four closed unavailable reasons, locator-free metadata, current-result
-  rechecks, predecessor retention, refresh/replacement invalidation, synchronous lifecycle denial,
-  and membership/capability/epoch/generation checks before and after stream or artwork resolution.
+  rechecks, predecessor retention, refresh/replacement invalidation, unlocked selector re-entry,
+  selector-time stale-work denial, synchronous lifecycle denial, and
+  membership/capability/epoch/generation checks before and after stream or artwork resolution.
 
 - [ ] **Record B — Mixed-source UI integration:** integrate the registry authority foundation into
   regular-playlist Add, Remove, rendering, and Play behavior, with explicit disconnected/missing

@@ -196,6 +196,13 @@ also carries its non-secret session epoch and accepted catalogue generation tran
 value is persisted in `playlist_entries`. Lookup does not write those entries, mint playback
 authority, or authorize a source-native playlist operation.
 
+Projection from the captured immutable catalogue `Arc` runs outside the lifecycle mutex. Before a
+lookup returns or guarded adapter work begins, the registry reacquires the mutex and requires the
+same exact `Arc` identity, source, epoch, generation, catalogue authority, and active session
+lease. A selector can therefore re-enter registry code without deadlock, while a refresh,
+replacement, or disconnect completed during selection makes the result unavailable and prevents
+stale adapter work.
+
 `resolve_regular_playlist_stream(guard, TrackId)` and
 `resolve_regular_playlist_artwork(guard, TrackId)` independently revalidate exact source
 membership, capability, session epoch, and catalogue generation before adapter work and again after

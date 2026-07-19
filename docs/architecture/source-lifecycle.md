@@ -558,6 +558,10 @@ queue can extend the same ephemeral-source rule explicitly.
   successful replacement or same-session refresh invalidates old guards, while disconnect,
   shutdown, and final release deny synchronously. None of these internal APIs enables
   Add/Remove/render/Play UI behavior.
+  Catalogue selectors run against a captured immutable `Arc` outside the lifecycle mutex, followed
+  by an exact pointer/source/epoch/generation/lease recheck before a value returns or adapter work
+  starts. Selector-time refresh or teardown therefore denies stale work without making registry
+  re-entry part of the critical section.
 - `PlaybackSession` captures immutable source/track identity, queue order, duplicate occurrence,
   and playback event generation independently of GTK sorting/filtering. Queue identity is a
   `MediaKey`; playlists and radio queries retain a separate `ViewOrigin`, so local invalidation

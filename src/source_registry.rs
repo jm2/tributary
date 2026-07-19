@@ -1319,10 +1319,7 @@ impl SourceRegistry {
                 .push((position, media_key.track_id.clone()));
         }
 
-        let mut results: Vec<Option<RegularPlaylistTrackResolution>> =
-            std::iter::repeat_with(|| None)
-                .take(media_keys.len())
-                .collect();
+        let mut results: Vec<Option<RegularPlaylistTrackResolution>> = vec![None; media_keys.len()];
         for (source_id, occurrences) in by_source {
             let accepted =
                 self.inner
