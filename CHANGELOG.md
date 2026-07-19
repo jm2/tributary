@@ -23,9 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   track.
   Subsonic's valid signed 1–5 `userRating` maps read-only to 20-point increments; valid finite
   Jellyfin `UserData.Rating` and Plex `userRating` values in 0–10 map through rounded tenfold values,
-  with native zero retained as canonical 1. Missing or malformed remote values remain read-only
-  unrated; DAAP, radio, removable, external, and unknown sources are Unsupported, and every remote
-  mutation fails closed. XSPF v1 deliberately omits ratings, ignores rating-like meta/extension
+  with native zero retained as canonical 1. Missing, malformed, or numerically unrepresentable
+  remote values remain read-only unrated without rejecting their response; DAAP, radio, removable,
+  external, and unknown sources are Unsupported, and every remote mutation fails closed. XSPF v1
+  deliberately omits ratings, ignores rating-like meta/extension
   input, and playlist import cannot modify a matched library rating. Accessible editing, display,
   sorting, and smart-playlist rules remain the next P1.4 slice; the complete contract is in
   [`docs/ratings.md`](docs/ratings.md).

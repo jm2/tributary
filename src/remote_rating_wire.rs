@@ -26,3 +26,34 @@ where
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     Ok(value.and_then(|value| value.as_f64()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct OptionalRatings {
+        #[serde(default, deserialize_with = "optional_i32")]
+        integer: Option<i32>,
+        #[serde(default, deserialize_with = "optional_f64")]
+        decimal: Option<f64>,
+    }
+
+    #[test]
+    fn syntactically_valid_oversized_numbers_fail_soft() {
+        for json in [
+            r#"{"integer": 1e400, "decimal": 1e400}"#,
+            r#"{"integer": 999999999999999999999999999999999999999999,
+                 "decimal": -1e400}"#,
+        ] {
+            assert_eq!(
+                serde_json::from_str::<OptionalRatings>(json)
+                    .expect("oversized optional ratings must not reject their object"),
+                OptionalRatings {
+                    integer: None,
+                    decimal: None,
+                }
+            );
+        }
+    }
+}

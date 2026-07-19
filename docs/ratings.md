@@ -64,9 +64,10 @@ Tributary does not send rating mutations to any remote server.
 - **Plex:** optional `userRating` follows the same validated decimal 0–10 conversion as Jellyfin.
   Plex `ratingKey` remains only the item's identifier and is never interpreted as a rating.
 
-Malformed non-finite or out-of-range Jellyfin/Plex values become read-only unrated state. They are
-not clamped into plausible user data. DAAP's current requested metadata, Radio-Browser, removable
-files, and external files expose no unambiguous native rating, so they remain `Unsupported`.
+Malformed, numerically unrepresentable, non-finite, or out-of-range Jellyfin/Plex values become
+read-only unrated state without rejecting the surrounding response. They are not clamped into
+plausible user data. DAAP's current requested metadata, Radio-Browser, removable files, and external
+files expose no unambiguous native rating, so they remain `Unsupported`.
 
 ## XSPF and imports
 

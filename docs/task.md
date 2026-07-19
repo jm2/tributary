@@ -179,8 +179,9 @@ the 35-record feature backlog.
 
   Subsonic's valid integer 1–5 `userRating` maps read-only to 20-point increments. Jellyfin and Plex
   accept only finite native user ratings in 0–10, round the tenfold value, and preserve native zero
-  as canonical 1; malformed or absent values are read-only unrated. DAAP, radio, removable,
-  external, and unknown sources are Unsupported, all remote mutations fail closed, and catalogue
+  as canonical 1; malformed, absent, or numerically unrepresentable values are read-only unrated
+  without rejecting their response. DAAP, radio, removable, external, and unknown sources are
+  Unsupported, all remote mutations fail closed, and catalogue
   admission rejects per-track/source capability disagreement. XSPF v1 intentionally emits no
   rating and ignores rating-like metadata on import; playlist matching never mutates library
   ratings. A future metadata transfer requires separate opt-in conflict handling.
