@@ -35,12 +35,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and root-reauthorization paths retain their prior behavior through the new schema. The shipping UI
   remains intentionally local-only in this slice: it still refuses non-local Add before database
   work and does not render or play stored non-local
-  fixtures. Live `SourceRegistry` resolution, capability-gated authenticated-source Add/Remove/Play,
-  disconnected states, lifecycle/epoch handling, and mixed-source export follow separately;
-  Radio-Browser, removable, external, and unknown sources remain unsupported. Subsonic
-  server-native playlist import or synchronization is a third, separately designed capability.
+  fixtures. The internal live-catalogue authority foundation is described below;
+  capability-gated authenticated-source Add/Remove/Play, disconnected presentation, and
+  mixed-source export remain a later UI record. Subsonic server-native playlist import or
+  synchronization is another separately designed capability.
   The complete boundary and validation matrix are in
   [`docs/source-scoped-playlists.md`](docs/source-scoped-playlists.md).
+- **Regular playlists now have default-deny live-catalogue authority**
+  ([#141](https://github.com/jm2/tributary/pull/141)) —
+  `ManagedSourceAdapter` exposes one explicit `Unsupported` or `SourceScopedEntries` capability. The
+  default, Radio-Browser, removable-media, ephemeral external-file, and unknown adapters remain
+  unsupported; only retained authenticated Subsonic, Jellyfin, Plex, and DAAP catalogues opt in.
+  Each accepted source payload freezes that capability with its complete catalogue. Authority
+  lookup returns one ordered resolution per occurrence against the exact current `SourceId`,
+  non-secret session epoch, accepted catalogue generation, capability, and native-track membership.
+  An otherwise accepted catalogue with a missing or duplicate native ID receives an `Invalid`
+  playlist-authority index, so every playlist occurrence for it fails closed without choosing a
+  duplicate while existing non-playlist UI may continue using the catalogue. Repeated requested IDs
+  remain repeated ordered occurrences. Missing exact tracks, unsupported sources, and unavailable
+  sessions receive fixed unavailable results independently; revalidation denies guards made stale
+  by replacement, refresh, retirement, release, or shutdown.
+  Returned track metadata uses a dedicated display/sort/rating/history whitelist rather than a
+  `Track` clone, so file paths, file/network URLs, stream and artwork locators, credentials, leases,
+  routes, raw backend failures, and future unreviewed fields cannot cross implicitly. Its closed
+  authority guard may carry the non-secret session epoch and catalogue generation transiently, but
+  neither is written into playlist storage. Guarded stream and artwork resolution rechecks exact
+  membership, capability, epoch, and generation before adapter work and after the asynchronous
+  result returns, then maps raw adapter errors to fixed categories. A lifecycle-owned generation
+  lease is explicitly revoked on snapshot replacement/removal and every teardown path, so retained
+  snapshot clones cannot keep an already returned request active.
+  Connecting or a failed replacement preserves the accepted predecessor; successful replacement
+  or same-session catalogue refresh invalidates old guards. Disconnect, shutdown, and final source
+  release synchronously deny new authority before asynchronous teardown completes.
+  This is an internal authority foundation only: the shipping UI still refuses non-local Add and
+  does not remove, render, or play remote playlist entries. Those interactions, explicit
+  unavailable states, mixed-source export, and Subsonic-native playlist synchronization remain
+  separately tracked.
 - **Ratings now have a durable ownership, capability, and persistence foundation**
   ([#138](https://github.com/jm2/tributary/pull/138)) — A canonical
   rating is one validated whole integer from 1 through 100, while `None` alone means unrated.
@@ -162,8 +192,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an unexpected subset. The existing Add to Playlist, Remove from Playlist, and Properties context
   labels now use their shipped translations as well, and the refusal copy is covered across all 13
   locale catalogs. Local-library playlist behavior is unchanged. The source-scoped storage
-  foundation is now described above, while live non-local playlist interaction remains a later
-  P1.5 slice.
+  and default-deny live-catalogue authority foundations are now described above, while live
+  non-local playlist interaction remains P1.5 Record B.
 - **Shuffled Previous and Next now follow a bounded real playback timeline** — Tributary retains
   the current queue occurrence plus ten actual predecessors, walks backward without fabricating a
   random track at the oldest boundary, and replays fixed forward history before drawing again.

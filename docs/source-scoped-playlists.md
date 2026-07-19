@@ -1,8 +1,8 @@
-# Source-scoped regular playlist storage contract
+# Source-scoped regular playlist storage and authority contract
 
-This document defines the durable-storage foundation for the first record in
-[P1.5](task.md#p15--persist-source-scoped-playlists). It changes how regular-playlist membership is
-represented without yet changing which source rows the shipping UI can add, display, or play.
+This document defines the durable-storage contract and the following live-catalogue authority
+foundation for [P1.5](task.md#p15--persist-source-scoped-playlists). Neither foundation changes
+which source rows the shipping UI can add, display, or play.
 
 The central rule is:
 
@@ -29,10 +29,11 @@ This storage slice covers:
   rename, and deletion paths.
 
 It deliberately does **not** enable remote Add to Playlist, mixed-source playlist rendering or
-playback, disconnected-row presentation, lifecycle refresh, or remote XSPF export. Those behaviors
-need the live `SourceRegistry` and remain the second P1.5 record. Subsonic server-native playlist
-listing, import, synchronization, conflict handling, and deletion semantics remain the separate
-third record and require their own design before implementation.
+playback, disconnected-row presentation, playlist-UI lifecycle refresh, or remote XSPF export.
+P1.5 Record A adds the internal live-registry authority described below; Record B must integrate it
+into those user-facing behaviors. Subsonic server-native playlist listing, import, synchronization,
+conflict handling, and deletion semantics remain a separate record and require their own design
+before implementation.
 
 Smart playlists are unaffected. They remain live queries over the local library rather than stored
 regular-playlist occurrences.
@@ -140,26 +141,91 @@ The user-visible behavior in this slice stays local-only:
   an explicit metadata-only policy and is part of the later presentation/integration work; it may
   not obtain or serialize a protected remote locator.
 
-The existing P1.2 refusal remains correct until the second record lands: selecting Add to Playlist
+The existing P1.2 refusal remains correct until Record B lands: selecting Add to Playlist
 from a remote, radio, removable, external, or malformed source still presents localized all-or-none
-copy before opening the database. The new storage capability is not itself UI authorization.
-That follow-up will initially admit only retained authenticated catalogues through an explicit
-capability check. Radio-Browser, removable media, ephemeral external files, and unknown sources
-remain unsupported until their persistence and lifecycle semantics are separately designed.
+copy before opening the database. Neither the storage capability nor Record A's internal lookup is
+itself UI authorization. Record B will initially admit only retained authenticated catalogues
+through the explicit registry capability. Radio-Browser, removable media, ephemeral external
+files, and unknown sources remain unsupported until their persistence and lifecycle semantics are
+separately designed.
+
+## Live registry and accepted-catalogue authority
+
+P1.5 Record A establishes an internal authority boundary between durable source-scoped identity
+and later playlist UI integration ([#141](https://github.com/jm2/tributary/pull/141)).
+`ManagedSourceAdapter` exposes a closed
+`RegularPlaylistCapability`: its default is `Unsupported`, and only the retained authenticated
+Subsonic, Jellyfin, Plex, and DAAP catalogue adapters explicitly opt into
+`SourceScopedEntries`. Radio-Browser, removable media, ephemeral external files, the trait default,
+and unknown source kinds remain unsupported. Backend names, source provenance, persisted row shape,
+and the mere existence of a catalogue never imply support.
+
+One accepted source payload freezes the advertised capability with its complete catalogue.
+`resolve_regular_playlist_tracks(&[MediaKey])` returns exactly one ordered
+`RegularPlaylistTrackResolution` for each requested occurrence. An authority lookup must match all
+of the following exactly:
+
+1. the requested `SourceId` is the current registered source;
+2. the non-secret session epoch is still the accepted session;
+3. the accepted catalogue generation is still current;
+4. the adapter capability is `SourceScopedEntries`; and
+5. for each requested occurrence, its native `TrackId` is canonical and present in the accepted
+   catalogue's unique native-ID mapping.
+
+An otherwise accepted catalogue with a missing or duplicate catalogue-native identity receives an
+`Invalid` regular-playlist authority index. Every requested occurrence for that source then fails
+closed as `InvalidCatalogue`, while the catalogue can remain available to existing non-playlist UI
+and no duplicate is chosen. Repeated requested IDs remain valid ordered duplicate occurrences and
+produce repeated ordered results when the index is valid. Lookup returns exactly one Available or
+fixed-reason Unavailable result per requested occurrence: a missing member fails only that
+occurrence, while an unsupported source or unavailable session marks its affected occurrences
+without erasing valid neighbors from another source. Revalidation separately rejects results made
+stale by retirement, replacement, refresh, release, or shutdown.
+
+An Available result exposes only its exact `media_key()`, transient `guard()`, and sanitized
+`metadata()`. An Unavailable result exposes its `media_key()` plus one closed reason:
+`SourceUnavailable`, `UnsupportedSource`, `InvalidCatalogue`, or `TrackMissing`—never a backend
+error. `are_regular_playlist_tracks_current` rechecks a previously returned ordered result against
+the current authority state without trusting its metadata copy.
+
+Successful lookup returns a dedicated, whitelisted `RegularPlaylistTrackMetadata` value rather
+than cloning `Track`. Only the display, sort, rating, and history fields named by that DTO cross the
+boundary; paths, file and network URLs, stream/artwork locators, credentials, leases, routes, and
+raw backend errors cannot be inherited accidentally when `Track` grows a field. The closed guard
+also carries its non-secret session epoch and accepted catalogue generation transiently; neither
+value is persisted in `playlist_entries`. Lookup does not write those entries, mint playback
+authority, or authorize a source-native playlist operation.
+
+`resolve_regular_playlist_stream(guard, TrackId)` and
+`resolve_regular_playlist_artwork(guard, TrackId)` independently revalidate exact source
+membership, capability, session epoch, and catalogue generation before adapter work and again after
+the asynchronous result returns. They discard raw adapter failures at the registry seam and expose
+only `RegularPlaylistMediaError::Unavailable` or a closed `BackendFailure(FailureCategory)`.
+Every lifecycle `AcceptedSnapshot` owns a separate generation lease. Replacement, view removal,
+disconnect, shutdown, final-handle teardown, and defensive pruning revoke that lease explicitly
+before clearing the snapshot, so a parked `Arc` snapshot cannot delay invalidation; a returned
+guarded stream or artwork request carries that same authority through consumption. Connecting or a
+failed replacement can retain the already accepted predecessor and its authority. A successful
+replacement or same-session catalogue refresh invalidates guards minted from the previous accepted
+payload. Disconnect, shutdown, and final source release synchronously deny new authority before
+asynchronous teardown can finish.
+
+These APIs are an authority foundation only. The shipping Add/Remove/render/Play paths do not call
+them yet, do not show stored non-local rows, and retain the localized all-or-none refusal from P1.2.
 
 ## Source lifecycle and unavailable identity
 
 Persistent membership does not imply a live source session. Only `source_id` and `track_id` survive
 restart; a session epoch is deliberately transient.
 
-The second P1.5 record will resolve a non-local entry by asking the live `SourceRegistry` for the
-exact source and track, adopting only the current non-secret session epoch at publication and
-playback time. Disconnect, source retirement, a missing server-side track, or an epoch replacement
-must leave the database row intact and make it visibly unavailable. Reconnection may restore it
+Record A can now validate a non-local identity internally against the exact current
+`SourceRegistry` source, epoch, accepted catalogue generation, and native track. Record B must use
+that result to make disconnect, source retirement, a missing server-side track, refresh, or session
+replacement visibly unavailable while leaving the database row intact. Reconnection may restore it
 only when the same `SourceId` publishes the same `TrackId`; endpoint similarity and metadata are
 not identity evidence.
 
-Until that slice exists, stored non-local fixtures remain intentionally outside the regular-
+Until Record B exists, stored non-local fixtures remain intentionally outside the regular-
 playlist UI projection. This prevents the storage migration from accidentally treating durable
 identity as a locator or presenting a row that the current queue still assigns to the local source.
 
@@ -197,5 +263,14 @@ The storage record is complete only when automated coverage demonstrates:
   deletion/retirement cannot cascade into playlist storage, and no remote locator or credential is
   accepted or serialized.
 
-Mixed-source rendering, interaction, playback, lifecycle, and native Subsonic playlist tests belong
-to their explicitly deferred records rather than being claimed by this storage foundation.
+Mixed-source rendering, interaction, playback, unavailable-state presentation, and native
+Subsonic playlist tests belong to their explicitly deferred records rather than being claimed by
+the storage or authority foundations.
+
+Record A additionally requires automated coverage for default-deny adapters, the four explicit
+authenticated opt-ins, Invalid playlist indexing for missing/duplicate catalogue-native identity,
+sanitized metadata, stale epoch/generation rejection, predecessor retention during connecting or a
+failed replacement, invalidation after replacement/refresh, synchronous disconnect/shutdown/final-
+release denial, and pre/post-async stream and artwork revalidation. Ordered lookup must preserve
+duplicate requested occurrences and isolate one missing track's Unavailable result from valid
+neighbors. Passing those tests does not claim Add/Remove/render/Play UI integration.

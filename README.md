@@ -38,7 +38,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Internet Radio (Top Clicked, Top Voted, Stations Near Me) | ✅ |
 | Tiered geo-location (geo-distance → state → country) | ✅ |
 | Column drag-and-drop reordering with persistence | ✅ |
-| Regular & smart playlists (iTunes-style rules engine) | ✅ Local-library UI; regular-entry storage now has a source-scoped identity foundation, while mixed-source UI/playback remains planned ([#47](https://github.com/jm2/tributary/issues/47)) |
+| Regular & smart playlists (iTunes-style rules engine) | ✅ Local-library UI; source-scoped storage and default-deny live-catalogue authority are implemented, while mixed-source UI/playback remains planned ([#47](https://github.com/jm2/tributary/issues/47)) |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
 | Batch metadata editing (multi-select) | ✅ |
@@ -449,7 +449,7 @@ src/
 │   ├── identity.rs         # Stable source/media/view identity types
 │   ├── media.rs            # Retained resolved-media capabilities
 │   └── error.rs            # BackendError (thiserror)
-├── source_registry.rs      # Source lifecycle, provenance, epochs, at-use resolution
+├── source_registry.rs      # Source lifecycle, provenance, playlist authority, at-use resolution
 ├── removable.rs            # Retained removable-mount catalogue/media adapter
 ├── external_file.rs        # Ephemeral retained OS-open file adapter
 ├── audio/
@@ -679,16 +679,36 @@ boundaries.
 
 Tributary supports regular and smart playlists for the local library:
 
-- **Regular playlists** — Right-click the Playlists header in the sidebar to create a new playlist. Right-click tracks in the tracklist to add them. Playlists survive library folder changes via fingerprint-based track matching. Their migrated storage identity is the source-scoped `(SourceId, TrackId)` pair, with a separate nullable local-track foreign-key cache for local deletion and reconciliation; the current UI still projects only local entries.
+- **Regular playlists** — Right-click the Playlists header in the sidebar to create a new playlist. Right-click tracks in the tracklist to add them. Playlists survive library folder changes via fingerprint-based track matching. Their migrated storage identity is the source-scoped `(SourceId, TrackId)` pair, with a separate nullable local-track foreign-key cache for local deletion and reconciliation. Internal live-catalogue lookup now has an explicit default-deny authority boundary, but the current UI still creates and projects only local entries.
 - **Smart playlists** — iTunes-style rules engine with filterable metadata fields, text/numeric/date operators, sorting, and result limiting. Smart playlists are evaluated against the current local library whenever they are opened or exported; they are not stored snapshots. Create them via the sidebar context menu.
 
 **Add to Playlist** currently accepts tracks only from the built-in local library. Invoking it from
 an authenticated remote, internet-radio, removable-media, or other unsupported source shows a
 localized explanation and adds nothing; it never silently writes only a subset. Migration 13 and
 the storage API can represent a non-local occurrence without a URL, credential, lease, or session
-epoch, but that capability is not UI authorization. Live `SourceRegistry` resolution,
-mixed-source Add/Remove/Play behavior, disconnected states, and Subsonic-native playlist
-import/synchronization remain follow-on work under
+epoch, but that capability is not UI authorization.
+
+Inside `SourceRegistry`, regular-playlist catalogue authority defaults to Unsupported. Only the
+retained authenticated Subsonic, Jellyfin, Plex, and DAAP adapters explicitly advertise
+source-scoped entries; Radio-Browser, removable media, ephemeral external files, and unknown
+adapters remain unsupported. An internal lookup accepts an ordered set only from the exact current
+source, session epoch, and accepted catalogue generation, and returns a dedicated metadata
+whitelist without paths, URLs, locators, credentials, leases, routes, or raw backend errors. Its
+closed guard carries the non-secret epoch and generation transiently; neither is written to the
+playlist. Guarded media maps backend failures to fixed categories and carries a lifecycle-owned
+generation lease that is explicitly revoked even if an observer still holds an old snapshot clone.
+Malformed or duplicate catalogue-native IDs make that catalogue's playlist-authority index
+`Invalid`, while the catalogue can remain available to existing non-playlist UI and repeated
+requested IDs remain repeated ordered occurrences. A missing exact track, unavailable session, or
+unsupported source receives an explicit unavailable result without erasing valid neighbors. Stream
+and artwork resolutions revalidate the transient guard around asynchronous adapter work so
+replacement, refresh, disconnect, shutdown, or final source release cannot revive an old result.
+
+This foundation does not change Add, Remove, rendering, or Play behavior by itself. Connecting or
+a failed replacement may continue using its already accepted predecessor; a successful
+replacement or same-session catalogue refresh invalidates old guards, and disconnect/shutdown deny
+new use synchronously. Mixed-source playlist UI, explicit unavailable states, and
+Subsonic-native playlist import/synchronization remain follow-on work under
 [P1.5](docs/task.md#p15--persist-source-scoped-playlists). See the
 [source-scoped playlist storage contract](docs/source-scoped-playlists.md) for the exact boundary.
 

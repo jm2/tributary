@@ -6,9 +6,9 @@ This document explains the product and engineering work that remains **after** t
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
 remediation record is preserved separately in
 [`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **220/223 (98.7%)**, with only three
-real-environment validation records left. The feature backlog is now **8/35 (22.9%)** complete. Neither
-percentage estimates equal engineering effort, and the historical percentage is not a claim that
-Tributary has implemented every requested product feature.
+real-environment validation records left. The feature backlog is now **9/36 (25.0%)** complete.
+Neither percentage estimates equal engineering effort, and the historical percentage is not a
+claim that Tributary has implemented every requested product feature.
 
 The entries below are candidates, not release promises. As of this audit, all 10 remaining open GitHub
 issues are unlabeled, unassigned, have no milestone, and have no discussion establishing product
@@ -30,6 +30,11 @@ starts. Historical holistic-review documents are point-in-time findings, not act
   shipping UI remains a local-library projection, so it does not yet create, render, or play the
   non-local rows. An Add to Playlist attempt from any unsupported source still explains that
   boundary in the user's language and performs no database work instead of silently skipping rows.
+  The internal live-catalogue authority layer now defaults every adapter to unsupported and permits
+  source-scoped entry lookup only for explicitly opted-in authenticated Subsonic, Jellyfin, Plex,
+  and DAAP sessions. Exact source, epoch, accepted catalogue generation, membership, and capability
+  are revalidated around asynchronous media resolution; sanitized results expose no locator,
+  credential, lease, route, or raw backend failure. This foundation does not enable UI actions.
   Subsonic server-side playlists are not imported. See the
   [storage contract](source-scoped-playlists.md).
 - XSPF v1 import/export is implemented with exact path and deterministic normalized-metadata
@@ -84,8 +89,9 @@ before starting large protocol or transfer subsystems.
 2. **Completed: make remote-to-playlist behavior explicit ([#47]).** Add to Playlist now snapshots
    the active source and refuses every non-local selection with a localized, all-or-none dialog
    before database work. Full support remains separate: the source-scoped `(SourceId, TrackId)`
-   storage foundation is complete, while disconnected-source semantics and playback-time
-   resolution are current; Subsonic server-native playlist import/sync is another slice.
+   storage and internal live-catalogue authority foundations are complete, and user-facing
+   disconnected/Add/Remove/render/Play behavior is the current record. Subsonic server-native
+   playlist import/sync is another slice.
 3. **Completed: implement trustworthy local playback history.** The durable schema,
    [counted-play contract](playback-history.md), production persistence pipeline, and seeded
    consumers are complete.
@@ -121,9 +127,30 @@ before starting large protocol or transfer subsystems.
    deterministically converts every valid existing entry to the local source, preserves entry
    identity, ordering, duplicates, fingerprints, and local `ON DELETE SET NULL` behavior through a
    separate cache, rejects non-local path evidence, and passed exact up/down/rollback, compatibility,
-   debug/release, and strict-lint validation. Live registry resolution and mixed-source UI/playback
-   are now the current P1.5 record; native Subsonic playlist semantics remain the following record
-   rather than being implied by the schema.
+   debug/release, and strict-lint validation.
+6. **Completed: publish default-deny live-catalogue playlist authority ([#141]).**
+   `ManagedSourceAdapter` exposes an explicit `Unsupported` or `SourceScopedEntries` capability, with
+   only authenticated Subsonic, Jellyfin, Plex, and DAAP adapters opting in. Lookup returns one
+   ordered resolution per requested occurrence against the exact current source, session epoch,
+   and accepted catalogue generation; repeated requested IDs preserve occurrence order. Missing
+   exact tracks, unavailable sessions, and unsupported sources return fixed unavailable results
+   independently. An otherwise accepted catalogue with a missing or duplicate native identity
+   receives an `Invalid` playlist-authority index, so every playlist occurrence for it is
+   unavailable without discarding the catalogue from existing non-playlist UI. Accepted metadata
+   crosses a dedicated display/sort/rating/history whitelist rather than a `Track` clone; its closed
+   guard carries the non-secret epoch and generation transiently, and neither is persisted.
+   Stream/artwork resolution rechecks capability, membership, epoch, and generation before and
+   after asynchronous adapter work, closes raw failures to fixed categories, and carries an
+   explicitly revoked lifecycle generation lease through consumption even if an old snapshot clone
+   remains alive. Connecting or failed replacement may
+   retain an accepted predecessor; successful replacement, same-session refresh, disconnect,
+   shutdown, and final release invalidate or deny old guards at their defined boundaries. This
+   internal foundation is not an Add/Remove/Play feature.
+7. **Current: integrate mixed-source regular-playlist UI.** Add, Remove, rendering, unavailable-row
+   presentation, and Play must consume Record A's exact registry authority without deriving support
+   from backend labels, cached GTK rows, metadata, or persisted locators. Radio-Browser, removable,
+   external-file, and unknown sources stay unsupported. Native Subsonic playlist semantics remain a
+   separate later record rather than being implied by either foundation.
 
 These foundations make Rhythmbox migration and Last.fm behavior much less ambiguous.
 
@@ -192,7 +219,7 @@ mistaken for work already underway.
 | [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus completed playback-history and rating contracts are foundations; XSPF deliberately transfers neither history nor ratings. | Build a separate transactional, idempotent migration with explicit metadata consent and conflict reporting. |
 | [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | No Last.fm client or scrobble pipeline. | Authorization, secret storage, authoritative thresholds, retry/offline queue, and privacy UX. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
-| [#47 — Remote/Subsonic tracks in playlists](https://github.com/jm2/tributary/issues/47) | Non-local Add to Playlist attempts are refused visibly and atomically. The source-scoped storage contract and migration-13 foundation are complete, but no user-facing capability policy yet admits, renders, resolves, or plays remote rows; server-native playlist sync is absent. | Implement live registry-backed mixed-source interaction; design server playlist import/sync separately. |
+| [#47 — Remote/Subsonic tracks in playlists](https://github.com/jm2/tributary/issues/47) | Non-local Add to Playlist attempts are refused visibly and atomically. Source-scoped storage is complete, and a default-deny registry authority foundation now validates exact current authenticated catalogues without exposing locators; no user-facing action yet admits, renders, or plays remote rows, and server-native playlist sync is absent. | Publish the authority foundation, integrate mixed-source UI against it, then design server playlist import/sync separately. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |
 | [#29 — UI refinement](https://github.com/jm2/tributary/issues/29) | Requested separators/alignment changes are not implemented. | Split into independently reviewable visual changes after current-theme design review. |
@@ -269,3 +296,4 @@ When an item becomes active:
 [#50]: https://github.com/jm2/tributary/issues/50
 [#57]: https://github.com/jm2/tributary/issues/57
 [#140]: https://github.com/jm2/tributary/pull/140
+[#141]: https://github.com/jm2/tributary/pull/141
