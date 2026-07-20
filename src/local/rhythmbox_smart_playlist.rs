@@ -512,19 +512,37 @@ mod tests {
     fn parsed_ratings(values: &[&str]) -> Vec<RhythmboxRating> {
         let mut xml = "<rhythmdb version=\"2.0\">".to_owned();
         for (index, value) in values.iter().enumerate() {
+            let location = if cfg!(windows) {
+                format!("file:///C:/rating-{index}")
+            } else {
+                format!("file:///rating-{index}")
+            };
             write!(
                 xml,
-                "<entry type=\"song\"><location>file:///rating-{index}</location><rating>{value}</rating></entry>"
+                "<entry type=\"song\"><location>{location}</location><rating>{value}</rating></entry>"
             )
             .unwrap();
         }
         xml.push_str("</rhythmdb>");
-        parse_rhythmbox_documents(xml.as_bytes(), None, RhythmboxImportLimits::default())
-            .unwrap()
-            .tracks
+        let parsed =
+            parse_rhythmbox_documents(xml.as_bytes(), None, RhythmboxImportLimits::default())
+                .unwrap()
+                .tracks;
+        assert_eq!(
+            parsed.len(),
+            values.len(),
+            "every rating fixture must parse"
+        );
+        let ratings = parsed
             .into_iter()
             .filter_map(|track| track.rating)
-            .collect()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ratings.len(),
+            values.len(),
+            "every rating fixture must retain its rating"
+        );
+        ratings
     }
 
     fn translated_rule(
