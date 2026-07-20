@@ -1204,6 +1204,16 @@ pub fn build_window(
     // reducer takes an atomic baseline later, then discards queued revisions
     // already represented by that baseline.
     let source_invalidations = source_registry.subscribe_invalidations();
+    let server_playlist_invalidations = source_registry.subscribe_invalidations();
+    // The GTK thread creates the coordinator's control and persistent drain
+    // surfaces before asynchronous database initialisation. Its owner is
+    // Tokio-only and remains capability-free until the engine supplies the
+    // database-backed runtime adapter.
+    let (server_playlist_coordinator, server_playlist_coordinator_shutdown) = {
+        let _runtime = rt_handle.enter();
+        crate::server_playlist_coordinator::spawn_server_playlist_coordinator()
+    };
+    let server_playlist_coordinator_barrier = server_playlist_coordinator_shutdown.barrier();
     let remote_provenance = crate::source_registry::ProvenanceClaims::default();
 
     // ── Load and apply persisted preferences ─────────────────────────
@@ -1592,6 +1602,8 @@ pub fn build_window(
     let shutdown_playback = playback_session.clone();
     let shutdown_output_slot = active_output_slot.clone();
     let shutdown_library_commands = library_commands.clone();
+    let shutdown_server_playlists = server_playlist_coordinator.clone();
+    let shutdown_server_playlist_barrier = server_playlist_coordinator_barrier.clone();
     let shutdown_started = Rc::new(Cell::new(false));
     let shutdown_complete = Rc::new(Cell::new(false));
     window.connect_close_request(move |w| {
@@ -1601,6 +1613,10 @@ pub fn build_window(
         }
 
         if !shutdown_started.replace(true) {
+            // Close server-playlist admission before source revocation. A
+            // mutation already admitted at the coordinator edge retains both
+            // guards through its database commit and is drained below.
+            shutdown_server_playlists.close();
             // Close every UI producer before any widget, output, or source
             // teardown can synchronously re-enter GTK, then append the marker
             // in that same non-interleavable main-thread operation.
@@ -1628,11 +1644,13 @@ pub fn build_window(
             let barrier = shutdown_sources.shutdown();
             let window = w.clone();
             let shutdown_complete = shutdown_complete.clone();
+            let server_playlist_barrier = shutdown_server_playlist_barrier.clone();
             glib::MainContext::default().spawn_local(async move {
                 if flush_queued && flush_rx.recv().await.is_err() {
                     warn!("Library mutation shutdown flush was not acknowledged");
                 }
                 barrier.wait().await;
+                server_playlist_barrier.wait().await;
                 shutdown_complete.set(true);
                 window.close();
             });
@@ -1676,21 +1694,33 @@ pub fn build_window(
 
     let engine_tx_clone = engine_tx.clone();
     let engine_playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
+    let engine_server_playlist_coordinator = server_playlist_coordinator.clone();
+    let engine_source_registry = source_registry.clone();
     rt_handle.spawn(async move {
         match crate::db::connection::init_db().await {
             Ok(db) => {
+                let services = crate::local::engine::LibraryEngineServices::new(
+                    engine_playlist_sidebar_refresh,
+                    playlist_sidebar_refresh_rx,
+                    engine_server_playlist_coordinator,
+                    server_playlist_coordinator_shutdown,
+                    engine_source_registry,
+                    server_playlist_invalidations,
+                );
                 let engine = LibraryEngine::new(
                     db,
                     music_dirs,
                     pending_root_reauthorizations,
                     engine_tx_clone,
                     library_command_rx,
-                    engine_playlist_sidebar_refresh,
-                    playlist_sidebar_refresh_rx,
+                    services,
                 );
                 engine.run().await;
             }
             Err(e) => {
+                if let Err(error) = server_playlist_coordinator_shutdown.shutdown().await {
+                    warn!(%error, "Server playlist coordinator owner failed after database error");
+                }
                 tracing::error!(error = %e, "Failed to initialise database");
                 let _ = engine_tx_clone
                     .send(LibraryEvent::Error(format!("Database error: {e}")))

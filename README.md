@@ -39,7 +39,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Tiered geo-location (geo-distance → state → country) | ✅ |
 | Column drag-and-drop reordering with persistence | ✅ |
 | Regular & smart playlists (iTunes-style rules engine) | ✅ Regular playlists mix local and authenticated Subsonic/Jellyfin/Plex/DAAP entries; smart playlists remain local-library queries ([#142](https://github.com/jm2/tributary/pull/142)) |
-| Subsonic server-native playlist import/sync | 🚧 Pull-only contract, bounded reads, strict link persistence, atomic sync, typed read-only sidebar state, durable full-snapshot ordering, and localized recovery-shell groundwork are complete; the coordinator and user-facing actions/reconnect UX remain tracked in [#143](https://github.com/jm2/tributary/issues/143) |
+| Subsonic server-native playlist import/sync | 🚧 Pull-only contract, bounded reads, strict link persistence, atomic sync, durable full-snapshot ordering, and the headless latest-request/reconnect coordinator are complete; the virtualized browser and visible accessible action/recovery wiring remain tracked in [#143](https://github.com/jm2/tributary/issues/143) |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
 | Batch metadata editing (multi-select) | ✅ |
@@ -452,6 +452,7 @@ src/
 │   ├── media.rs            # Retained resolved-media capabilities
 │   └── error.rs            # BackendError (thiserror)
 ├── source_registry.rs      # Source lifecycle, provenance, playlist authority, at-use resolution
+├── server_playlist_coordinator.rs # GTK-free latest-request lanes, admission, and shutdown drain
 ├── removable.rs            # Retained removable-mount catalogue/media adapter
 ├── external_file.rs        # Ephemeral retained OS-open file adapter
 ├── audio/
@@ -475,6 +476,7 @@ src/
 │   ├── mod.rs              # Local backend root
 │   ├── backend.rs          # MediaBackend impl (LocalBackend)
 │   ├── engine.rs           # Async scan + notify FS watcher + LibraryEvent channel
+│   ├── server_playlist_runtime.rs # Exact-session reconnect and manual pull facade
 │   ├── playback_history.rs # Pure counted-play occurrence accounting
 │   ├── tag_parser.rs       # lofty audio tag extraction
 │   ├── tag_writer.rs       # lofty audio tag writing (MP3, M4A, OGG, FLAC)
@@ -751,19 +753,46 @@ specific pull or absence result being committed, closing the gap between fetchin
 without persisting live authority or allowing authority from another current operation to be
 substituted.
 
-The UI groundwork now reads playlist and link state together, gives pull mirrors an explicit typed
+The UI groundwork reads playlist and link state together, gives pull mirrors an explicit typed
 read-only/conflict/missing identity, and excludes them from every ordinary playlist edit menu and
 track mutation target without depending on their translated name or compatibility backend string.
-Ordinary playlist sidebar changes now appear only after database commit, including atomic
-smart-playlist creation. A separate localized and accessible footer shell is reserved for sync and
-recovery status so the track-count label remains truthful. The shell is initially hidden: the
-engine APIs are not yet connected to user actions, and no server-playlist browser, manual/reconnect
-coordinator, or automatic scheduling ships yet. Migration 15 and a lifecycle-owned publisher now
-give scan seeding, ordinary CRUD, raw/cascade writes to the two domain tables, and server-link
-changes one durable revisioned full-sidebar lane. It reads each revision and complete redacted join
-coherently,
-coalesces refresh hints, polls for lost hints, and makes GTK ignore equal or older delivery instead
-of applying partial row callbacks. See
+Ordinary playlist sidebar changes appear only after database commit, including atomic
+smart-playlist creation. Migration 15 and a lifecycle-owned publisher give scan seeding, ordinary
+CRUD, raw/cascade writes to the two domain tables, and server-link changes one durable revisioned
+full-sidebar lane. It reads each revision and complete redacted join coherently, coalesces refresh
+hints, polls the local revision for lost hints, and makes GTK ignore equal or older delivery instead
+of applying partial row callbacks.
+
+Server-playlist work now runs through a GTK-free latest-request coordinator with distinct typed,
+content-redacted lanes for a source, a source/native remote playlist, and a durable local playlist.
+A same-key successor cancels only work that has not reached final admission. Once admitted, the
+successor waits for both the predecessor task and its move-only guard to settle; unrelated keys
+remain concurrent. Reconnect reserves one coordinator-global request stamp before discovery and
+shares it across the delayed local fan-out. Direct requests reserve and enqueue atomically against
+that stamped submission path, so a manual request begun later wins for an overlapping mirror.
+
+The lifecycle observer schedules one reconnect sweep for each accepted source session epoch and no
+more for catalogue-only invalidations in that session. A sweep captures the exact durable revision
+of every linked mirror before network I/O, obtains one complete listing from that exact observed
+session, uses indexed exact presence or sealed absence, and admits no more than eight local fan-out
+operations at once. It neither polls a server periodically nor infers deletion from an incomplete,
+failed, stale, or wrong-session response. Manual Sync Now, Retry, Replace Local with Server,
+Unlink, and Remove Local Copy use the same local lane through a redacted internal completion facade;
+never-started displacement is distinct from unexpected interruption after start.
+
+Pull and missing-state persistence stages SQL first, then jointly acquires the coordinator admission
+guard and the registry authority sealed to that exact pull or absence result. Both survive through
+commit or rollback; local Unlink and Remove are coordinator-guarded after staging as well. Normal
+shutdown closes coordinator admission before source shutdown, cancels only pre-admission work, and
+uses a persistent barrier to drain admitted tasks and guards. Committed changes feed the durable
+full-snapshot publisher.
+
+A separate localized and accessible footer shell is still hidden. P1.5 Record E remains open for a
+virtualized server-playlist browser, opaque Import Copy/Keep Synced action tokens, and visible
+accessible GTK Sync/Retry/Replace/Unlink/Remove recovery wiring. This pull-only scope performs no
+server playlist creation/update/deletion, fuzzy metadata merge, or periodic server polling; only
+authenticated Subsonic has server-playlist read authority, and native playlist IDs never enter GTK.
+See
 [P1.5](docs/task.md#p15--persist-source-scoped-playlists), the
 [source-scoped regular-playlist contract](docs/source-scoped-playlists.md), and
 [#143](https://github.com/jm2/tributary/issues/143) for the remaining delivery stages.

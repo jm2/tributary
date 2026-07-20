@@ -8,6 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Server-native playlist pulls now have a GTK-free latest-request coordinator and reconnect
+  runtime** — A lifecycle-owned owner serializes starts and final admission across three typed,
+  content-redacted lanes: one source, one source/native remote playlist, or one durable local
+  playlist. A newer request cancels a same-key predecessor only before admission. If the
+  predecessor is already admitted, its successor waits until both the operation task and its
+  move-only admission guard settle; unrelated keys continue concurrently. Checked per-key
+  generations fail closed on exhaustion. A separate coordinator-global request stamp is reserved
+  before reconnect discovery and reused by its delayed local fan-out. Direct requests reserve and
+  enqueue atomically against stamped fan-out submission, so a newer manual request for the same
+  mirror cannot be overwritten by older reconnect work.
+  The source-lifecycle observer schedules exactly one sweep for each newly accepted
+  `(SourceId, session epoch)`, ignoring catalogue-only invalidations within that session. Each sweep
+  captures every durable link revision before network I/O, reads one complete listing from the
+  exact observed session, uses its indexed exact-presence or sealed-absence evidence, and fans out
+  at most eight local operations at once. Manual Sync Now, Retry, Replace Local with Server,
+  Unlink, and Remove Local Copy enter those same local lanes through a completion facade whose
+  status and diagnostics contain no playlist identity or server-controlled content. A pending
+  operation displaced before it starts reports superseded, while a started task lost unexpectedly
+  reports interrupted.
+  Pull and missing-state transactions stage SQL first, then jointly acquire the coordinator guard
+  and exact sealed registry commit authority immediately before persistence; both remain held
+  through commit or rollback. Unlink and local removal now have the same post-staging coordinator
+  admission guard. Superseded or rejected work rolls back without a sidebar hint, while applied,
+  conflict, missing, unlink, and removal outcomes request the durable full-snapshot publisher.
+  Normal shutdown closes coordinator admission before source shutdown, cancels only
+  pre-admission work, and drains admitted tasks and guards through a cloneable persistent barrier.
+  This remains pull-only: it adds no server mutation, periodic polling, fuzzy title/artist merge,
+  non-Subsonic server-playlist authority, or native playlist IDs in GTK. P1.5 Record E remains open
+  for the virtualized server-playlist browser, opaque Import Copy/Keep Synced action tokens, and
+  visible localized, accessible GTK recovery/action wiring. Validation passes 71 focused
+  server-playlist tests plus real one- and nine-mirror reconnect integrations; the latter measures
+  one shared list, eight blocked exact-ID operations, a held ninth, and all nine commits after
+  release. Locked debug and release suites each pass 20 library, 1,248 application, and 10
+  repository-contract tests (1,278 total), with strict all-target/all-feature Clippy in both
+  profiles, Rust 1.92 checking, formatting, whitespace, and independent code/privacy/documentation
+  review green.
 - **Playlist sidebar publication is now durably ordered and full-snapshot only**
   ([#147](https://github.com/jm2/tributary/pull/147)) — Migration 15
   adds one exact singleton SQLite revision and six guarded triggers over playlist parents and
@@ -31,8 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write committed.
   The former partial row insertion/rebind/removal callbacks are gone, so a delayed scan can no
   longer erase a create/import, revert a rename, resurrect a delete, or roll back a mirror-state
-  classification. This slice performs no server listing, pull scheduling, browser work, or
-  recovery action; those remain in P1.5 Record E.
+  classification. At that PR's delivery boundary the slice performed no server listing, pull
+  scheduling, browser work, or recovery action. The headless listing and reconnect coordinator is
+  now documented above; browser and visible recovery actions remain in P1.5 Record E.
 - **Server-native playlist UI now has fail-closed structural and localization groundwork**
   ([#146](https://github.com/jm2/tributary/pull/146)) —
   Sidebar sections and playlists carry typed identities instead of treating translated labels or
@@ -57,7 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offline Retry; resets recycled action/accessibility state; and never presents a last-success time
   as freshness. All 13 locale catalogs provide the exact visible, confirmation, tooltip, and
   accessibility keys with tests that reject missing or English-fallback values. The shell remains
-  unwired and hidden until the next Record E coordinator/browser slices. A follow-up durable
+  unwired and hidden at that PR's delivery boundary. The headless coordinator above now supplies
+  the operation and reconnect lifecycle, but the browser and visible GTK actions remain open. A
+  follow-up durable
   revision lane now orders complete joined snapshots across scans, CRUD, cascades, and link-state
   writers; this structural change itself performs no server listing, pull, reconnect scheduling,
   polling, or mutation.
@@ -99,9 +138,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admission waits. This authority neither depends on nor grants music-catalogue/playback authority.
   The new raw link entity and validated link, ticket, copy, preparation, and outcome diagnostics
   redact server-controlled native identity, synchronized names, and digests.
-  User-facing Import Copy/Keep Synced/Sync Now actions, reconnect scheduling, localized
-  conflict/missing/offline recovery, and latest-request operation generations remain the next
-  staged record; this engine still performs no server playlist mutation or periodic polling.
+  At that PR's delivery boundary, Import Copy/Keep Synced/Sync Now actions, reconnect scheduling,
+  localized conflict/missing/offline recovery, and latest-request operation generations remained
+  staged. The headless coordinator and reconnect runtime are now documented above; the browser and
+  visible GTK action/recovery wiring remain. The engine still performs no server playlist mutation
+  or periodic polling.
 - **Subsonic server-native playlists now have a pull-only contract and exact-session read
   foundation** ([#144](https://github.com/jm2/tributary/pull/144)) — The accepted
   [`docs/subsonic-playlist-sync.md`](docs/subsonic-playlist-sync.md) contract separates a future
@@ -137,7 +178,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   membership does not require accepted music-catalogue membership and deliberately grants no
   display, stream, artwork, rating, or history authority. At that delivery boundary the foundation
   added no database migration, playlist/link write, synchronization scheduler, or UI. Persistence
-  and the atomic engine are now documented above; scheduler and UI remain the final staged record.
+  and the atomic engine are now documented above. At that PR's delivery boundary the scheduler and
+  UI remained staged; the headless scheduler/coordinator is now implemented above, while the
+  virtualized browser and visible GTK actions remain in Record E.
 - **Regular playlists now have a source-scoped storage foundation**
   ([#140](https://github.com/jm2/tributary/pull/140)) — Migration 13 makes the exact
   `(source_id, track_id)` pair canonical for each durable regular-playlist occurrence while keeping
@@ -201,7 +244,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release synchronously deny new authority before asynchronous teardown completes.
   This PR's delivery boundary was an internal authority foundation rather than a UI authorization;
   the mixed-source record immediately below is its reviewed consumer. Mixed-source XSPF export
-  remains separately tracked, as does server-native Subsonic UI/reconnect integration.
+  remains separately tracked. At that PR's delivery boundary server-native Subsonic UI/reconnect
+  integration was also deferred; the current headless reconnect state and remaining GTK work are
+  documented above.
 - **Regular playlists now integrate exact mixed-source entries end to end**
   ([#142](https://github.com/jm2/tributary/pull/142)) — Add to Playlist now accepts exact local
   tracks plus rows from current authenticated Subsonic, Jellyfin, Plex, and DAAP catalogues. One
@@ -237,8 +282,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconnect restores a row only when the same `SourceId` publishes the same exact `TrackId`.
   Playback-history ownership remains local-only. Remote ratings retain their live read-only or
   unsupported state, and playlist membership grants no mutation authority. Smart playlists and
-  XSPF import/export remain local-only; mixed-source metadata export and Subsonic server-native
-  playlist synchronization remain explicitly deferred.
+  XSPF import/export remain local-only. At that PR's delivery boundary mixed-source metadata export
+  and Subsonic server-native playlist synchronization were explicitly deferred; the latter's
+  current headless coordination state and remaining GTK work are documented above.
 - **Ratings now have a durable ownership, capability, and persistence foundation**
   ([#138](https://github.com/jm2/tributary/pull/138)) — A canonical
   rating is one validated whole integer from 1 through 100, while `None` alone means unrated.

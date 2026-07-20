@@ -18,6 +18,7 @@ use sea_orm::{
     Set, Statement, TransactionTrait,
 };
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -331,8 +332,42 @@ pub struct LibraryEngine {
     pending_root_reauthorizations: Vec<RootReauthorizationRequest>,
     tx: async_channel::Sender<LibraryEvent>,
     command_rx: async_channel::Receiver<LibraryCommand>,
+    services: LibraryEngineServices,
+}
+
+/// Lifecycle-owned services consumed together by one library engine run.
+///
+/// Grouping these channels and owner handles makes their shared teardown
+/// ordering explicit at the construction boundary.
+pub struct LibraryEngineServices {
     playlist_sidebar_refresh: PlaylistSidebarRefresh,
     playlist_sidebar_refresh_rx: PlaylistSidebarRefreshReceiver,
+    server_playlist_coordinator:
+        crate::server_playlist_coordinator::ServerPlaylistCoordinatorHandle,
+    server_playlist_coordinator_shutdown:
+        crate::server_playlist_coordinator::ServerPlaylistCoordinatorShutdown,
+    source_registry: crate::source_registry::SourceRegistry,
+    server_playlist_invalidations: tokio::sync::watch::Receiver<u64>,
+}
+
+impl LibraryEngineServices {
+    pub fn new(
+        playlist_sidebar_refresh: PlaylistSidebarRefresh,
+        playlist_sidebar_refresh_rx: PlaylistSidebarRefreshReceiver,
+        server_playlist_coordinator: crate::server_playlist_coordinator::ServerPlaylistCoordinatorHandle,
+        server_playlist_coordinator_shutdown: crate::server_playlist_coordinator::ServerPlaylistCoordinatorShutdown,
+        source_registry: crate::source_registry::SourceRegistry,
+        server_playlist_invalidations: tokio::sync::watch::Receiver<u64>,
+    ) -> Self {
+        Self {
+            playlist_sidebar_refresh,
+            playlist_sidebar_refresh_rx,
+            server_playlist_coordinator,
+            server_playlist_coordinator_shutdown,
+            source_registry,
+            server_playlist_invalidations,
+        }
+    }
 }
 
 impl LibraryEngine {
@@ -345,8 +380,7 @@ impl LibraryEngine {
         pending_root_reauthorizations: Vec<RootReauthorizationRequest>,
         tx: async_channel::Sender<LibraryEvent>,
         command_rx: async_channel::Receiver<LibraryCommand>,
-        playlist_sidebar_refresh: PlaylistSidebarRefresh,
-        playlist_sidebar_refresh_rx: PlaylistSidebarRefreshReceiver,
+        services: LibraryEngineServices,
     ) -> Self {
         Self {
             db,
@@ -354,8 +388,7 @@ impl LibraryEngine {
             pending_root_reauthorizations,
             tx,
             command_rx,
-            playlist_sidebar_refresh,
-            playlist_sidebar_refresh_rx,
+            services,
         }
     }
 
@@ -368,10 +401,33 @@ impl LibraryEngine {
             pending_root_reauthorizations,
             tx,
             command_rx,
+            services,
+        } = self;
+        let LibraryEngineServices {
             playlist_sidebar_refresh,
             playlist_sidebar_refresh_rx,
-        } = self;
+            server_playlist_coordinator,
+            server_playlist_coordinator_shutdown,
+            source_registry,
+            server_playlist_invalidations,
+        } = services;
         let db = Arc::new(db);
+
+        let server_playlist_operations =
+            super::server_playlist_runtime::ServerPlaylistOperations::new(
+                db.as_ref().clone(),
+                server_playlist_coordinator.clone(),
+                source_registry,
+                playlist_sidebar_refresh.clone(),
+            );
+        let server_playlist_observer_shutdown = CancellationToken::new();
+        let server_playlist_observer = tokio::spawn(
+            super::server_playlist_runtime::run_server_playlist_reconnect_observer(
+                server_playlist_operations,
+                server_playlist_invalidations,
+                server_playlist_observer_shutdown.clone(),
+            ),
+        );
 
         // This engine instance is the sole owner of both the database-backed
         // publisher and its event bridge. The refresh signal can be requested
@@ -472,6 +528,18 @@ impl LibraryEngine {
         )
         .await;
 
+        server_playlist_observer_shutdown.cancel();
+        if let Err(error) = server_playlist_observer.await {
+            warn!(
+                cancelled = error.is_cancelled(),
+                panicked = error.is_panic(),
+                "Server playlist reconnect observer task failed"
+            );
+        }
+        server_playlist_coordinator.close();
+        if let Err(error) = server_playlist_coordinator_shutdown.shutdown().await {
+            warn!(%error, "Server playlist coordinator owner failed");
+        }
         playlist_sidebar_refresh.close();
         if let Err(error) = playlist_publisher.await {
             warn!(%error, "Playlist sidebar publisher task failed");

@@ -42,8 +42,11 @@ are implemented without reusing or widening this regular-playlist authority. Rec
 typed read-only sidebar state, ordinary-action exclusion, commit-only local CRUD publication, and
 the localized recovery-shell plan. A follow-up durable SQLite revision and lifecycle-owned
 full-snapshot publisher now order scan seeding, ordinary CRUD, raw/cascade domain-table writes, and
-server-link changes; GTK rejects equal or older snapshots. Its coordinator, reconnect scheduling,
-browser, and wired server-playlist controls remain separate follow-on slices.
+server-link changes; GTK rejects equal or older snapshots. A separate GTK-free coordinator now
+orders typed source/remote/local operations, serializes same-key work through admitted settlement,
+schedules bounded exact-session reconnect recovery, reports redacted manual completions, and drains
+admitted work during shutdown. The browser and visible server-playlist controls remain the final
+follow-on slice.
 
 Smart playlists are unaffected. They remain live queries over the local library rather than stored
 regular-playlist occurrences.
@@ -326,8 +329,10 @@ cross into GTK. Structural header/playlist kinds replace translated-name and bac
 editability tests. Linked mirrors are visibly read-only or conflicted/missing and are omitted from
 ordinary Rename, Export, Delete, Edit Smart, Add, and Remove affordances; manager transactions still
 enforce the same boundary if presentation becomes stale. A separate localized footer shell is
-reserved for sync/recovery state, but remains hidden until the exact-session coordinator and user
-actions are connected. Migration 15's exact singleton revision and six transaction-local triggers
+reserved for sync/recovery state, but remains hidden until user actions are connected. Coordinator
+stamps, generations, cancellation, admission guards, native identity, and observed epochs never
+enter GTK, and this separate lane grants no Record A catalogue, playback, rating, or history
+authority. Migration 15's exact singleton revision and six transaction-local triggers
 now cover playlist parents, links, raw writes to those tables, and cascades. One lifecycle-owned
 publisher reads a coherent complete redacted join, coalesces post-commit hints, polls for lost
 hints, and publishes the first valid snapshot and thereafter only strictly newer snapshots; GTK
@@ -358,8 +363,10 @@ The storage and authority foundation records do not retroactively claim their co
 Subsonic link persistence and atomic synchronization now have their own strict migration,
 transaction, revision-CAS, lifecycle-permit, drift, missing, unlink/removal, and redaction
 validation. Typed read-only sidebar presentation, the localized recovery-shell plan, and durable
-full-snapshot sidebar ordering are now implemented; their operation coordinator, browser,
-reconnect/action consumer, and mixed-source XSPF metadata export remain explicitly deferred. Until
+full-snapshot sidebar ordering, same-key coordinator, exact-session reconnect scheduler,
+post-staging joint admission, bounded fan-out, shutdown drain, and redacted manual completion
+facade are now implemented. The server-playlist browser, visible action consumer, accessibility
+coverage, and mixed-source XSPF metadata export remain explicitly deferred. Until
 a no-locator mixed-source export policy exists,
 a regular playlist containing any remote or unresolved occurrence is refused all-or-none before
 XSPF touches its destination; the local-only compatibility projection is never exported as a

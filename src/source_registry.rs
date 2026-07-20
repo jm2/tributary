@@ -104,6 +104,7 @@ pub struct ServerPlaylistListing {
     source_id: SourceId,
     receipt: SessionOperationReceipt<dyn ManagedSourceAdapter>,
     playlists: Vec<ServerPlaylistSummary>,
+    playlist_ids: HashSet<NativePlaylistId>,
 }
 
 /// Unforgeable in-process identity for one exact successful server-playlist
@@ -139,9 +140,8 @@ impl ServerPlaylistListing {
     /// Select one exact native identity only when the complete list contains
     /// it. Similar names, contents, casing, and whitespace never match.
     pub fn select(&self, native_id: &NativePlaylistId) -> Option<ServerPlaylistSelection> {
-        self.playlists
-            .iter()
-            .any(|playlist| playlist.native_id() == native_id)
+        self.playlist_ids
+            .contains(native_id)
             .then(|| ServerPlaylistSelection {
                 source_id: self.source_id,
                 native_id: native_id.clone(),
@@ -156,15 +156,12 @@ impl ServerPlaylistListing {
         &self,
         native_id: &NativePlaylistId,
     ) -> Option<ServerPlaylistAbsenceEvidence> {
-        self.playlists
-            .iter()
-            .all(|playlist| playlist.native_id() != native_id)
-            .then(|| ServerPlaylistAbsenceEvidence {
-                source_id: self.source_id,
-                native_id: native_id.clone(),
-                receipt: self.receipt.clone(),
-                commit_binding: ServerPlaylistCommitBinding::fresh(),
-            })
+        (!self.playlist_ids.contains(native_id)).then(|| ServerPlaylistAbsenceEvidence {
+            source_id: self.source_id,
+            native_id: native_id.clone(),
+            receipt: self.receipt.clone(),
+            commit_binding: ServerPlaylistCommitBinding::fresh(),
+        })
     }
 }
 
@@ -1655,6 +1652,20 @@ impl SourceRegistry {
             .lifecycle
             .active_session_epoch(source_id)
             .ok_or(ServerPlaylistError::Unavailable)?;
+        self.list_server_playlists_for_session(source_id, session_epoch)
+            .await
+    }
+
+    /// List server-owned playlists only through the exact observed session.
+    ///
+    /// Reconnect scheduling captures an atomic lifecycle baseline before its
+    /// task runs. Requiring that baseline's epoch here prevents delayed work
+    /// for a predecessor from silently adopting a successor session.
+    pub(crate) async fn list_server_playlists_for_session(
+        &self,
+        source_id: SourceId,
+        session_epoch: u64,
+    ) -> Result<ServerPlaylistListing, ServerPlaylistError> {
         let (playlists, receipt) = self
             .inner
             .lifecycle
@@ -1669,10 +1680,15 @@ impl SourceRegistry {
             .await
             .map_err(server_playlist_error)?;
 
+        let playlist_ids = playlists
+            .iter()
+            .map(|playlist| playlist.native_id().clone())
+            .collect();
         Ok(ServerPlaylistListing {
             source_id,
             receipt,
             playlists,
+            playlist_ids,
         })
     }
 
@@ -2265,6 +2281,10 @@ mod tests {
         ServerPlaylistImportOutcome, ServerPlaylistLocalState, ServerPlaylistMissingOutcome,
         ServerPlaylistPullOutcome, ServerPlaylistPullPolicy, ServerPlaylistRemoteState,
     };
+    use crate::local::server_playlist_runtime::{
+        run_server_playlist_reconnect_observer, ServerPlaylistOperationOutcome,
+        ServerPlaylistOperations,
+    };
 
     use super::*;
 
@@ -2278,6 +2298,7 @@ mod tests {
         close_release: watch::Sender<bool>,
         stream_release: watch::Sender<bool>,
         server_playlist_release: watch::Sender<bool>,
+        server_playlist_snapshot_release: watch::Sender<bool>,
         view_specs: Mutex<HashMap<ViewOrigin, VecDeque<ViewSpec>>>,
     }
 
@@ -2291,6 +2312,7 @@ mod tests {
             let (close_release, _receiver) = watch::channel(close_released);
             let (stream_release, _receiver) = watch::channel(true);
             let (server_playlist_release, _receiver) = watch::channel(true);
+            let (server_playlist_snapshot_release, _receiver) = watch::channel(true);
             Arc::new(Self {
                 close_calls: AtomicUsize::new(0),
                 stream_calls: AtomicUsize::new(0),
@@ -2301,6 +2323,7 @@ mod tests {
                 close_release,
                 stream_release,
                 server_playlist_release,
+                server_playlist_snapshot_release,
                 view_specs: Mutex::new(HashMap::new()),
             })
         }
@@ -2325,6 +2348,7 @@ mod tests {
                 server_playlist_capability: ServerPlaylistCapability::Unsupported,
                 server_playlists: Vec::new(),
                 server_playlist_snapshot: None,
+                server_playlist_snapshots: HashMap::new(),
                 server_playlist_list_failure: None,
                 server_playlist_snapshot_failure: None,
                 stream_failure: None,
@@ -2346,6 +2370,7 @@ mod tests {
                 server_playlist_capability: ServerPlaylistCapability::Unsupported,
                 server_playlists: Vec::new(),
                 server_playlist_snapshot: None,
+                server_playlist_snapshots: HashMap::new(),
                 server_playlist_list_failure: None,
                 server_playlist_snapshot_failure: None,
                 stream_failure: None,
@@ -2380,11 +2405,46 @@ mod tests {
                 server_playlist_capability: ServerPlaylistCapability::PullSnapshots,
                 server_playlists: vec![summary],
                 server_playlist_snapshot: Some(snapshot),
+                server_playlist_snapshots: HashMap::new(),
                 server_playlist_list_failure: None,
                 server_playlist_snapshot_failure: None,
                 stream_failure: None,
                 artwork_available: true,
             }
+        }
+
+        fn server_playlist_adapter_with_snapshots(
+            self: &Arc<Self>,
+            label: &'static str,
+            snapshots: Vec<ServerPlaylistSnapshot>,
+        ) -> FakeAdapter {
+            let server_playlists = snapshots
+                .iter()
+                .map(|snapshot| {
+                    ServerPlaylistSummary::new(
+                        snapshot.native_id().clone(),
+                        snapshot.name().map(str::to_string),
+                        snapshot.owner().map(str::to_string),
+                        snapshot.advertised_track_count(),
+                    )
+                    .expect("snapshot metadata remains valid as a summary")
+                })
+                .collect::<Vec<_>>();
+            let server_playlist_snapshots = snapshots
+                .into_iter()
+                .map(|snapshot| (snapshot.native_id().clone(), snapshot))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(
+                server_playlist_snapshots.len(),
+                server_playlists.len(),
+                "fixture server playlist identities must be unique"
+            );
+
+            let mut adapter = self.server_playlist_adapter(label);
+            adapter.server_playlists = server_playlists;
+            adapter.server_playlist_snapshot = None;
+            adapter.server_playlist_snapshots = server_playlist_snapshots;
+            adapter
         }
 
         async fn wait_for_close_calls(&self, expected: usize) {
@@ -2407,6 +2467,7 @@ mod tests {
         server_playlist_capability: ServerPlaylistCapability,
         server_playlists: Vec<ServerPlaylistSummary>,
         server_playlist_snapshot: Option<ServerPlaylistSnapshot>,
+        server_playlist_snapshots: HashMap<NativePlaylistId, ServerPlaylistSnapshot>,
         server_playlist_list_failure: Option<String>,
         server_playlist_snapshot_failure: Option<String>,
         stream_failure: Option<String>,
@@ -2565,17 +2626,27 @@ mod tests {
 
         fn get_server_playlist(
             self: Arc<Self>,
-            _native_id: NativePlaylistId,
+            native_id: NativePlaylistId,
         ) -> ServerPlaylistSnapshotFuture {
             self.probe
                 .server_playlist_snapshot_calls
                 .fetch_add(1, Ordering::AcqRel);
             let mut release = self.probe.server_playlist_release.subscribe();
-            let snapshot = self.server_playlist_snapshot.clone();
+            let mut snapshot_release = self.probe.server_playlist_snapshot_release.subscribe();
+            let snapshot = self
+                .server_playlist_snapshots
+                .get(&native_id)
+                .cloned()
+                .or_else(|| self.server_playlist_snapshot.clone());
             let failure = self.server_playlist_snapshot_failure.clone();
             Box::pin(async move {
                 while !*release.borrow_and_update() {
                     if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+                while !*snapshot_release.borrow_and_update() {
+                    if snapshot_release.changed().await.is_err() {
                         break;
                     }
                 }
@@ -3004,6 +3075,10 @@ mod tests {
             .list_server_playlists(source_id)
             .await
             .expect("predecessor listing");
+        let predecessor_epoch = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.session_epoch)
+            .expect("predecessor epoch");
         let native_id = listing.playlists()[0].native_id().clone();
         let delayed_selection = listing.select(&native_id).expect("predecessor selection");
         let stale_selection = listing
@@ -3049,6 +3124,20 @@ mod tests {
             )
             .expect("successor connection admitted");
         let _ = wait_for_catalogue(&registry, source_id).await;
+
+        assert!(matches!(
+            registry
+                .list_server_playlists_for_session(source_id, predecessor_epoch)
+                .await,
+            Err(ServerPlaylistError::Unavailable)
+        ));
+        assert_eq!(
+            successor_probe
+                .server_playlist_list_calls
+                .load(Ordering::Acquire),
+            0,
+            "a delayed predecessor reconnect must not list through its successor"
+        );
 
         assert!(matches!(
             registry.get_server_playlist(stale_selection).await,
@@ -3953,6 +4042,438 @@ mod tests {
             updated_entries
         );
 
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconnect_runtime_applies_exact_presence_reports_failures_and_marks_only_proven_absence(
+    ) {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect runtime database");
+        Migrator::up(&database, None)
+            .await
+            .expect("migrate runtime database");
+        let manager = PlaylistManager::new(database.clone());
+        let registry = registry();
+        let source_id = SourceId::random();
+
+        let initial_probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            initial_probe.server_playlist_adapter("runtime-initial"),
+        )
+        .await;
+        let initial_listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("list initial runtime playlist");
+        let native_id = initial_listing.playlists()[0].native_id().clone();
+        let initial_pull = registry
+            .get_server_playlist(
+                initial_listing
+                    .select(&native_id)
+                    .expect("select initial runtime playlist"),
+            )
+            .await
+            .expect("fetch initial runtime playlist");
+        let created = manager
+            .create_server_playlist_mirror_if_authorized(&initial_pull, "Fallback", || {
+                registry.acquire_server_playlist_pull_commit_authority(&initial_pull)
+            })
+            .await
+            .expect("create runtime mirror");
+        let ServerPlaylistCreateOutcome::Committed { copy, .. } = created else {
+            panic!("initial runtime pull creates one mirror");
+        };
+        let playlist_id = copy.playlist_id().to_string();
+        registry
+            .disconnect(source_id)
+            .expect("disconnect initial runtime session")
+            .wait()
+            .await;
+
+        let invalidations = registry.subscribe_invalidations();
+        let (refresh, refresh_rx) =
+            crate::local::playlist_sidebar::playlist_sidebar_refresh_channel();
+        let (snapshot_tx, snapshot_rx) = async_channel::bounded(4);
+        let publisher = tokio::spawn(
+            crate::local::playlist_sidebar::run_playlist_sidebar_publisher(
+                database.clone(),
+                refresh_rx,
+                snapshot_tx,
+            ),
+        );
+        let initial_sidebar = snapshot_rx
+            .recv()
+            .await
+            .expect("initial runtime sidebar snapshot");
+        let (coordinator, coordinator_shutdown) =
+            crate::server_playlist_coordinator::spawn_server_playlist_coordinator();
+        let operations = ServerPlaylistOperations::new(
+            database.clone(),
+            coordinator.clone(),
+            registry.clone(),
+            refresh.clone(),
+        );
+        let observer_shutdown = tokio_util::sync::CancellationToken::new();
+        let observer = tokio::spawn(run_server_playlist_reconnect_observer(
+            operations.clone(),
+            invalidations,
+            observer_shutdown.clone(),
+        ));
+
+        let updated_probe = FakeProbe::new(true);
+        let mut updated = updated_probe.server_playlist_adapter("runtime-updated");
+        let first = TrackId::remote("runtime-updated-first").expect("updated first track");
+        let second = TrackId::remote("runtime-updated-second").expect("updated second track");
+        updated.server_playlists = vec![ServerPlaylistSummary::new(
+            native_id.clone(),
+            Some("Runtime updated".to_string()),
+            None,
+            Some(3),
+        )
+        .expect("updated runtime summary")];
+        updated.server_playlist_snapshot = Some(
+            ServerPlaylistSnapshot::new(
+                native_id.clone(),
+                Some("Runtime updated".to_string()),
+                None,
+                Some(3),
+                vec![first.clone(), second.clone(), first.clone()],
+            )
+            .expect("updated runtime snapshot"),
+        );
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(updated) },
+            )
+            .expect("connect updated runtime session");
+        let _ = wait_for_catalogue(&registry, source_id).await;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let link = manager
+                    .get_server_playlist_link(&playlist_id)
+                    .await
+                    .expect("load automatically updated link")
+                    .expect("runtime mirror remains linked");
+                if link.last_synced_name == "Runtime updated" && link.state_revision == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reconnect sweep applies exact present snapshot");
+        let updated_sidebar = snapshot_rx
+            .recv()
+            .await
+            .expect("runtime update publishes sidebar snapshot");
+        assert!(updated_sidebar.revision() > initial_sidebar.revision());
+        assert_eq!(
+            manager
+                .get_playlist_entries(&playlist_id)
+                .await
+                .expect("load runtime-updated entries")
+                .into_iter()
+                .map(|entry| entry.track_id)
+                .collect::<Vec<_>>(),
+            vec![Some(first.clone()), Some(second), Some(first)]
+        );
+
+        registry
+            .disconnect(source_id)
+            .expect("disconnect updated runtime session")
+            .wait()
+            .await;
+        let failing_probe = FakeProbe::new(true);
+        let mut failing = failing_probe.server_playlist_adapter("runtime-detail-failure");
+        let secret = format!("runtime-secret-{}", Uuid::new_v4());
+        failing.server_playlist_snapshot_failure = Some(secret.clone());
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(failing) },
+            )
+            .expect("connect failing runtime session");
+        let _ = wait_for_catalogue(&registry, source_id).await;
+        let before_failure = manager
+            .get_server_playlist_link(&playlist_id)
+            .await
+            .expect("load link before detail failure")
+            .expect("runtime mirror remains linked before failure");
+        let submission = operations.sync_now(playlist_id.clone());
+        assert_eq!(
+            submission.status(),
+            crate::server_playlist_coordinator::ServerPlaylistRequestStatus::Queued
+        );
+        let rendered = format!("{submission:?}");
+        assert!(!rendered.contains(&playlist_id));
+        assert!(!rendered.contains(native_id.as_str()));
+        assert!(!rendered.contains(&secret));
+        assert_eq!(
+            submission.completion().await,
+            ServerPlaylistOperationOutcome::Unavailable
+        );
+        assert_eq!(
+            manager
+                .get_server_playlist_link(&playlist_id)
+                .await
+                .expect("load link after detail failure")
+                .expect("detail failure retains link"),
+            before_failure,
+            "detail failure cannot be reclassified as absence"
+        );
+
+        registry
+            .disconnect(source_id)
+            .expect("disconnect failing runtime session")
+            .wait()
+            .await;
+        let absent_probe = FakeProbe::new(true);
+        let mut absent = absent_probe.server_playlist_adapter("runtime-absent");
+        absent.server_playlists.clear();
+        absent.server_playlist_snapshot = None;
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(absent) },
+            )
+            .expect("connect absent runtime session");
+        let _ = wait_for_catalogue(&registry, source_id).await;
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let link = manager
+                    .get_server_playlist_link(&playlist_id)
+                    .await
+                    .expect("load automatically missing link")
+                    .expect("missing runtime mirror remains linked");
+                if link.remote_state == ServerPlaylistRemoteState::Missing
+                    && link.state_revision == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("complete-list absence marks runtime mirror missing");
+        let missing_sidebar = snapshot_rx
+            .recv()
+            .await
+            .expect("runtime absence publishes sidebar snapshot");
+        assert!(missing_sidebar.revision() > updated_sidebar.revision());
+
+        observer_shutdown.cancel();
+        observer.await.expect("reconnect observer exits cleanly");
+        coordinator.close();
+        coordinator_shutdown
+            .shutdown()
+            .await
+            .expect("coordinator drains runtime operations");
+        refresh.close();
+        publisher.await.expect("sidebar publisher exits cleanly");
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconnect_runtime_holds_the_ninth_detail_until_one_of_eight_operations_finishes() {
+        const FANOUT_CAP: usize = 8;
+        const MIRROR_COUNT: usize = FANOUT_CAP + 1;
+
+        fn snapshots(label: &str) -> Vec<ServerPlaylistSnapshot> {
+            (0..MIRROR_COUNT)
+                .map(|index| {
+                    ServerPlaylistSnapshot::new(
+                        NativePlaylistId::new(format!("fanout-native-{index}"))
+                            .expect("fanout native playlist ID"),
+                        Some(format!("Fanout {label} {index}")),
+                        None,
+                        Some(1),
+                        vec![TrackId::remote(format!("fanout-{label}-track-{index}"))
+                            .expect("fanout track ID")],
+                    )
+                    .expect("fanout server playlist snapshot")
+                })
+                .collect()
+        }
+
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect fanout database");
+        Migrator::up(&database, None)
+            .await
+            .expect("migrate fanout database");
+        let manager = PlaylistManager::new(database.clone());
+        let registry = registry();
+        let source_id = SourceId::random();
+
+        let initial_probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            initial_probe
+                .server_playlist_adapter_with_snapshots("fanout-initial", snapshots("initial")),
+        )
+        .await;
+        let initial_listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("list initial fanout playlists");
+        let native_ids = initial_listing
+            .playlists()
+            .iter()
+            .map(|summary| summary.native_id().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(native_ids.len(), MIRROR_COUNT);
+
+        let mut playlist_ids = Vec::with_capacity(MIRROR_COUNT);
+        for native_id in native_ids {
+            let pull = registry
+                .get_server_playlist(
+                    initial_listing
+                        .select(&native_id)
+                        .expect("select exact initial fanout playlist"),
+                )
+                .await
+                .expect("fetch exact initial fanout playlist");
+            let created = manager
+                .create_server_playlist_mirror_if_authorized(&pull, "Fallback", || {
+                    registry.acquire_server_playlist_pull_commit_authority(&pull)
+                })
+                .await
+                .expect("create initial fanout mirror");
+            let ServerPlaylistCreateOutcome::Committed { copy, .. } = created else {
+                panic!("each exact fanout identity creates one mirror");
+            };
+            playlist_ids.push(copy.playlist_id().to_string());
+        }
+        registry
+            .disconnect(source_id)
+            .expect("disconnect initial fanout session")
+            .wait()
+            .await;
+
+        let invalidations = registry.subscribe_invalidations();
+        let (refresh, _refresh_rx) =
+            crate::local::playlist_sidebar::playlist_sidebar_refresh_channel();
+        let (coordinator, coordinator_shutdown) =
+            crate::server_playlist_coordinator::spawn_server_playlist_coordinator();
+        let operations = ServerPlaylistOperations::new(
+            database,
+            coordinator.clone(),
+            registry.clone(),
+            refresh.clone(),
+        );
+        let observer_shutdown = tokio_util::sync::CancellationToken::new();
+        let observer = tokio::spawn(run_server_playlist_reconnect_observer(
+            operations,
+            invalidations,
+            observer_shutdown.clone(),
+        ));
+
+        let successor_probe = FakeProbe::new(true);
+        successor_probe
+            .server_playlist_snapshot_release
+            .send_replace(false);
+        let successor = successor_probe
+            .server_playlist_adapter_with_snapshots("fanout-successor", snapshots("updated"));
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(successor) },
+            )
+            .expect("successor fanout connection admitted");
+        let _ = wait_for_catalogue(&registry, source_id).await;
+
+        timeout(Duration::from_secs(2), async {
+            while successor_probe
+                .server_playlist_snapshot_calls
+                .load(Ordering::Acquire)
+                < FANOUT_CAP
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first eight fanout details start");
+        assert_eq!(
+            successor_probe
+                .server_playlist_snapshot_calls
+                .load(Ordering::Acquire),
+            FANOUT_CAP,
+            "the reconnect sweep must not cross its detail/commit fanout cap"
+        );
+        assert!(
+            timeout(Duration::from_millis(50), async {
+                while successor_probe
+                    .server_playlist_snapshot_calls
+                    .load(Ordering::Acquire)
+                    < MIRROR_COUNT
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "the ninth detail started while all eight fanout slots were blocked"
+        );
+        assert_eq!(
+            successor_probe
+                .server_playlist_list_calls
+                .load(Ordering::Acquire),
+            1,
+            "one reconnect sweep must share one complete listing"
+        );
+
+        successor_probe
+            .server_playlist_snapshot_release
+            .send_replace(true);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let mut all_committed = successor_probe
+                    .server_playlist_snapshot_calls
+                    .load(Ordering::Acquire)
+                    == MIRROR_COUNT;
+                for (index, playlist_id) in playlist_ids.iter().enumerate() {
+                    let link = manager
+                        .get_server_playlist_link(playlist_id)
+                        .await
+                        .expect("load fanout link after release")
+                        .expect("fanout mirror remains linked");
+                    all_committed &= link.state_revision == 1
+                        && link.last_synced_name == format!("Fanout updated {index}");
+                }
+                if all_committed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all nine exact-ID fanout operations commit after release");
+        assert_eq!(
+            successor_probe
+                .server_playlist_list_calls
+                .load(Ordering::Acquire),
+            1
+        );
+
+        observer_shutdown.cancel();
+        observer.await.expect("fanout observer exits cleanly");
+        coordinator.close();
+        coordinator_shutdown
+            .shutdown()
+            .await
+            .expect("coordinator drains fanout operations");
+        refresh.close();
         registry.shutdown().wait().await;
     }
 
