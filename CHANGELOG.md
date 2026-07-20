@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Last.fm now has a fail-closed protocol, credential-vault, and durable-queue foundation**
+  ([#50](https://github.com/jm2/tributary/issues/50)). This is an internal foundation, not yet a
+  user-visible scrobbling feature: playback observation, delivery-worker lifecycle, consent and
+  per-source settings, status UI, and localization remain follow-on work.
+
+  - **Bounded protocol client:** an HTTPS-only, redirect-safe Last.fm 2.0 client validates
+    build-injected 32-hex application credentials, signs desktop-auth, now-playing, and ordered
+    50-row scrobble forms, and returns only typed content-redacted outcomes. Independent connect,
+    operation, 1 MiB encoded-request, and 2 MiB response limits cover the provable maximum valid
+    percent-encoded and JSON-escaped batches. Unknown future provider errors and structurally
+    incoherent item mappings fail closed; only network failures and service codes 11/16 are
+    retryable, while code 9 requests reauthorization.
+  - **Native protected authority:** session keys, exact usernames, and random account UUIDs use
+    macOS Keychain, Windows Credential Manager, or Linux Secret Service with no plaintext fallback.
+    The versioned vault record requires an RFC 4122 v4 account UUID, nonblank control-free username,
+    and exact 32-hex session key. SQLite sees only a domain-separated SHA-256 account binding. Store
+    construction is retryable per operation rather than process-poisoning after a transient vault
+    failure, and the Flatpak permission policy narrowly allows only
+    `org.freedesktop.secrets` in addition to its existing reviewed grants.
+  - **Private offline FIFO:** migration 17 creates and revalidates a constrained queue containing
+    only bounded submission metadata, opaque occurrence/order identity, one-way account binding,
+    and saturated retry state. Atomic admission enforces a 10,000-row global cap, exact occurrence
+    idempotency, and one-account quarantine. Opaque receipts freeze the exact oldest prefix; terminal
+    settlement and retry rescheduling compare-and-swap the entire batch transactionally so stale or
+    partial receipts change nothing. Downgrade is refused while private rows remain.
+  - **Recovery and redaction:** normal account purge cannot erase a successor binding. A separate
+    missing/corrupt-vault recovery requires an opaque close-and-FIFO-drain capability and deletes
+    only the closed row-ID snapshot, including malformed non-positive identities, before a successor
+    can be created. Queue models, generated SeaORM `ActiveModel` values, client/vault values, errors,
+    and diagnostics redact credentials, account bindings, listening metadata, and start evidence.
+    Validation includes 38 focused Last.fm tests; locked debug and release suites each pass 20
+    library, 1,383 application, and 10 repository-metadata tests (1,413 total), alongside strict
+    debug/release Clippy, Rust 1.92 all-target compilation, Flatpak positive/negative permission
+    tests, and dependency auditing without public Last.fm network access.
 - **Rhythmbox profiles can now be migrated through a bounded, preview-first, transactional
   workflow** ([#57](https://github.com/jm2/tributary/issues/57),
   [#150](https://github.com/jm2/tributary/pull/150)):

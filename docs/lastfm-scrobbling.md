@@ -1,6 +1,6 @@
 # Last.fm scrobbling contract
 
-- Status: accepted P2.1 design; implementation pending
+- Status: accepted P2.1 design; protocol/vault/queue foundation implemented; playback/runtime/UI pending
 - Decision date: 2026-07-20
 - Tracking issue: [#50](https://github.com/jm2/tributary/issues/50)
 - Playback evidence foundation: [`playback-history.md`](playback-history.md)
@@ -9,6 +9,14 @@ This document defines when Tributary may send listening metadata to Last.fm, how
 is retained, and how qualified scrobbles survive offline operation. The feature is deliberately
 opt-in and fail-closed: loading a URI, selecting a row, or receiving unowned output progress is not
 permission to disclose listening activity.
+
+The implemented foundation includes the bounded signed HTTPS client, strict versioned native-vault
+record and one-way account binding, migration 17, atomic capped FIFO admission, exact batch
+settlement/rescheduling, binding-safe disconnect purge, and closed-and-drained missing-vault
+recovery. It is intentionally not exposed as a partial feature: playback evidence wiring, delivery
+and lifecycle ownership, consent/per-source policy, account and status UI, localization, and
+release-time production credentials remain. The countable P2.1 record stays open until those layers
+and their full acceptance matrix land.
 
 The central rule is:
 
@@ -148,6 +156,15 @@ until the exact record can be recovered. A missing record while preferences clai
 enabled is the same fail-closed state. Corrupt or oversized fields are rejected without including
 their contents in diagnostics.
 
+When a missing or corrupt vault record cannot be recovered, the settings surface may offer an
+explicit **Discard quarantined scrobbles** recovery action. It first closes occurrence and queue
+admission, drains every queue write admitted before that close through the same FIFO database
+barrier as normal disconnect, stops delivery, and prevents a successor account from being created;
+it then deletes the closed queue snapshot before resetting the disabled preference. The purge is
+bounded by the snapshot's maximum monotonic row identity, so any true successor row admitted only
+after that snapshot cannot be selected. Vault failure never triggers this destructive path without
+confirmation.
+
 The durable queue binds to a one-way account-binding digest derived from the vault-only random UUID
 with a fixed domain separator. The raw UUID and username are never copied into SQLite. A queue whose
 binding does not exactly match the current vault record is quarantined: no row is sent, reassigned,
@@ -177,9 +194,9 @@ audio output (local, AirPlay 1, Chromecast, or MPD) does not change the media ow
 Only fields already present in the structured `Track` snapshot may cross the boundary:
 
 - `artist_name` and `title` are required, must each contain non-whitespace text, and are limited to
-  1,024 UTF-8 bytes;
+  1,024 UTF-8 bytes; control characters are rejected;
 - `album_title` and `album_artist_name` are optional and, when present as non-whitespace text, are
-  each limited to 1,024 UTF-8 bytes;
+  each limited to 1,024 UTF-8 bytes and may not contain control characters;
 - `track_number` is optional;
 - `duration_secs` is required and must be greater than 30; and
 - the scrobble timestamp is the occurrence's captured UTC start evidence, converted to whole Unix
@@ -188,11 +205,11 @@ Only fields already present in the structured `Track` snapshot may cross the bou
 Accepted strings are sent byte-for-byte. Tributary does not trim, normalize, case-fold, split an
 artist field, parse a filename or URI, consult a server again, infer an album artist, or substitute
 display fallbacks. An empty optional field is omitted. An oversized field, absent required field,
-non-positive/unrepresentable start time, missing duration, or duration of 30 seconds or less makes
-that occurrence ineligible for both now-playing and scrobbling. No partial or truncated metadata is
-sent. `mbid`, `context`, `streamId`, and `chosenByUser` are omitted because the current `Track` and
-playback model does not own authoritative values for them; Last.fm consequently applies its
-documented default for `chosenByUser`.
+control-bearing field, non-positive/unrepresentable start time, missing duration, or duration of 30
+seconds or less makes that occurrence ineligible for both now-playing and scrobbling. No partial or
+truncated metadata is sent. `mbid`, `context`, `streamId`, and `chosenByUser` are omitted because the
+current `Track` and playback model does not own authoritative values for them; Last.fm consequently
+applies its documented default for `chosenByUser`.
 
 ## Playback occurrence and authoritative evidence
 

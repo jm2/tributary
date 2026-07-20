@@ -19,7 +19,10 @@ holistic-review documents are point-in-time findings, not active roadmaps.
 
 The current implementation focus is Last.fm [#50](https://github.com/jm2/tributary/issues/50).
 Its accepted [`lastfm-scrobbling.md`](lastfm-scrobbling.md) contract fixes the product, privacy,
-authority, offline queue, and lifecycle boundaries before schema, transport, or settings work.
+authority, offline queue, and lifecycle boundaries. The current foundation now supplies the
+bounded signed transport, native protected-session boundary, strict queue schema, and transactional
+offline FIFO; generation-owned playback observation, the delivery/lifecycle worker, and localized
+settings remain the next slices.
 
 ## Current baseline
 
@@ -106,11 +109,18 @@ authority, offline queue, and lifecycle boundaries before schema, transport, or 
   sources remain unsupported. Both column and smart-playlist rating sorts keep missing values last
   in either direction with deterministic ties. Smart filters provide validated 1–100 numeric/range
   predicates and capability-aware Is Rated/Is Unrated behavior, plus Highest/Lowest Rated limits.
-- Last.fm is not implemented yet. Its accepted [scrobbling contract](lastfm-scrobbling.md) selects
+- Last.fm is not user-facing yet. Its accepted [scrobbling contract](lastfm-scrobbling.md) selects
   desktop browser authorization and vault-only session storage, explicit consent, per-remote-source
   default-off policy, Radio-Browser exclusion, structured metadata limits, authoritative playback
   evidence, one-shot now-playing, a 10,000-row account-bound FIFO with 50-item batches and
-  at-least-once retry, disconnect purge, and a bounded shutdown drain. A production API account and
+  at-least-once retry, disconnect purge, and a bounded shutdown drain. The implemented foundation
+  includes an HTTPS-only redirect-safe signed client with provable request/response caps and typed
+  response policy; exact versioned native-vault credentials with only a one-way SQLite account
+  binding; migration 17's validated private queue; atomic capped admission; oldest-prefix receipts
+  with transactional settlement/rescheduling; binding-safe disconnect purge; closed-and-drained
+  missing-vault recovery; generated-model redaction; and narrowly reviewed Flatpak Secret Service
+  access. Playback evidence, worker/backoff/lifecycle integration, consent and source settings,
+  account/status UI, localization, and package injection remain. A production API account and
   build-time key/secret injection are external release prerequisites; their absence must leave an
   honest unavailable feature rather than a plaintext runtime fallback.
 
@@ -283,8 +293,13 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
 
 ### 2. Build migration and listening integrations
 
-1. **Last.fm scrobbling ([#50]).** Implement the accepted
-   [Last.fm contract](lastfm-scrobbling.md): latest-only desktop browser authorization with a
+1. **Last.fm scrobbling ([#50]).** Continue the accepted
+   [Last.fm contract](lastfm-scrobbling.md). The protocol/vault/queue foundation is implemented:
+   bounded latest-only-compatible desktop browser authorization calls, exact native-vault session
+   authority, strict private migration 17, and a capped transactional account FIFO with typed
+   response classification and recovery primitives. Next add the generation-owned playback
+   observer and lifecycle-owned delivery worker, followed by the localized consent, per-source,
+   account, and status UI. The complete target remains latest-only desktop browser authorization with a
    60-minute single-use token; session key, username, and opaque account UUID held only in the OS
    credential vault; explicit consent and separately opted-in authenticated remote sources;
    structured metadata only; and generation-owned now-playing/scrobble evidence. Qualified plays
@@ -348,7 +363,7 @@ not mistaken for work already underway.
 
 | Issue | Current implementation state | Likely implementation shape |
 |---|---|---|
-| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | Accepted [contract](lastfm-scrobbling.md); no client, schema, settings UI, or scrobble pipeline yet. | Browser authorization, vault-only account authority, opt-in source policy, authoritative playback evidence, and bounded durable FIFO/retry implementation. |
+| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | Accepted [contract](lastfm-scrobbling.md) plus bounded client, native-vault authority, migration 17, and transactional private FIFO foundation; no playback worker or settings UI yet. | Add authoritative playback evidence and lifecycle delivery/retry, then localized consent, source policy, account/status UI, and package credential injection. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |
