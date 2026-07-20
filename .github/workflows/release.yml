@@ -102,7 +102,7 @@ jobs:
       - name: Install Flatpak & Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y flatpak flatpak-builder elfutils ostree python3-pip
+          sudo apt-get install -y binutils flatpak flatpak-builder ostree python3-pip
 
           # Fix Polkit permission errors for headless bare-metal Flatpak
           sudo mkdir -p /etc/polkit-1/rules.d
@@ -421,7 +421,7 @@ jobs:
     steps:
       - name: Install system dependencies
         run: |
-          dnf install -y cpio elfutils gcc rpm-build gtk4-devel libadwaita-devel \
+          dnf install -y binutils cpio gcc rpm-build gtk4-devel libadwaita-devel \
             dbus-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel \
             pkgconf-pkg-config git curl

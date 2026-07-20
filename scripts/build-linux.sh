@@ -31,7 +31,7 @@ Quick-exit modes (run one task and exit):
 
 Packaging:
   --flatpak         Build a Flatpak bundle (requires flatpak, flatpak-builder,
-                    Python generator dependencies, ostree, readelf/eu-readelf,
+                    Python generator dependencies, ostree, GNU readelf,
                     and a user Flathub remote; does not require host Rust/GTK
                     development packages).
   --deb             Build a .deb package via cargo-deb (requires dpkg-deb).
@@ -39,8 +39,8 @@ Packaging:
                     rpm, rpm2cpio, and cpio).
   --arch-pkg        Build an Arch .pkg.tar.zst via makepkg (requires bsdtar).
 
-All native builds require readelf (binutils) or eu-readelf (elfutils) for the
-artifact compliance gate.
+All native builds require GNU readelf (binutils) for the artifact compliance
+gate. The elfutils variant does not resolve every dynamic reference we deny.
 
 Other:
   -h, --help        Show this help and exit.
@@ -86,8 +86,8 @@ require_validator_tool() {
 }
 
 require_elf_inspector() {
-  command -v readelf &>/dev/null || command -v eu-readelf &>/dev/null || \
-    error "readelf/eu-readelf not found. Install binutils or elfutils for artifact validation"
+  command -v readelf &>/dev/null || \
+    error "GNU readelf not found. Install binutils for artifact validation"
 }
 
 preflight_artifact_tools() {

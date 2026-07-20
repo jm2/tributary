@@ -401,10 +401,11 @@ active implementation.
 
 Any selected media or sender dependency must also preserve Tributary's
 [release component policy](release-component-policy.md): application artifacts omit dedicated
-copy-control circumvention components, unused optical-disc access stacks, and proprietary
-content-decryption modules. Ordinary authenticated protocol encryption and media decoding are not
-treated as circumvention by filename, but each new dependency still needs its own license,
-distribution, key-material provenance, and interoperability review.
+copy-control circumvention components, unused optical-disc playback plugins, and proprietary
+content-decryption modules. Ordinary authenticated protocol encryption, media decoding, and the
+non-decrypting `libbluray` access/navigation library required transitively by supported FFmpeg
+builds are not treated as circumvention by filename, but each new dependency still needs its own
+license, distribution, key-material provenance, and interoperability review.
 
 ## Other explicit follow-ups and accepted limits
 
@@ -421,8 +422,8 @@ distribution, key-material provenance, and interoperability review.
   allowlist and narrowing native Linux's broad plugin-package relationships after a cross-platform
   playback/output matrix can prove all supported containers, remote sources, local sinks, and
   any selected AirPlay sender. The current shared deny policy already blocks the known
-  optical-disc/decryption/CDM families in Tributary-owned payloads and fails closed at artifact
-  boundaries.
+  dedicated decrypt/CDM families and unused disc-playback plugins in Tributary-owned payloads and
+  fails closed at artifact boundaries.
 
 ### Deliberate current limitations, not scheduled commitments
 

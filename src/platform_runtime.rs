@@ -1513,14 +1513,15 @@ mod tests {
             "$gstScannerDest = Join-Path $DIST \"libexec\\gstreamer-1.0\\gst-plugin-scanner.exe\""
         ));
         let scanner_copy = script
-            .find("Copy-Item -LiteralPath $gstScannerSrc -Destination $gstScannerDest -Force")
+            .find("Copy-WindowsBundleFileForced $gstScannerSrc $gstScannerDest")
             .expect("unconditional scanner copy");
         let scanner_scan = script
             .find("$initialDllScanTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $DIST")
             .expect("whole-bundle dependency scan");
-        let executable_filter = script
+        let executable_filter = script[scanner_scan..]
             .find("$_.Extension -ieq '.dll' -or $_.Extension -ieq '.exe'")
-            .expect("scanner executable inclusion");
+            .map(|offset| scanner_scan + offset)
+            .expect("scanner executable inclusion in the normal dependency closure");
         let runtime_probe = script
             .find("Write-Info \"Running packaged Windows runtime probe...\"")
             .expect("packaged runtime probe");
@@ -1719,11 +1720,11 @@ mod tests {
         let invocations = production_invocations(script);
         assert_eq!(
             invocations.len(),
-            2,
+            3,
             "every production PE-import batch call must be covered"
         );
 
-        let expected_shared_bindings = [
+        let expected_closure_bindings = [
             ("-Inspector", "$peImportInspector"),
             ("-ClosureClock", "$peInspectorClosureClock"),
             ("-ClosureDeadlineMs", "$peInspectorClosureDeadlineMs"),
@@ -1734,7 +1735,16 @@ mod tests {
                 "$maxPeInspectorArgumentCharacters",
             ),
         ];
-        let mut target_bindings = std::collections::BTreeSet::new();
+        let expected_final_bindings = [
+            ("-Inspector", "$inspectorFull"),
+            ("-ClosureClock", "$validationClock"),
+            ("-ClosureDeadlineMs", "$validationDeadlineMs"),
+            ("-ProcessDeadlineMs", "$batchDeadlineMs"),
+            ("-OutputByteLimit", "$maxBatchOutputBytes"),
+            ("-ArgumentCharacterLimit", "$maxArgumentCharacters"),
+        ];
+        let mut closure_target_bindings = std::collections::BTreeSet::new();
+        let mut final_invocations = 0usize;
         for (invocation_index, invocation) in invocations.iter().enumerate() {
             let tokens: Vec<_> = invocation.split_whitespace().collect();
             assert_eq!(tokens.first(), Some(&"Invoke-BoundedPeImportBatch"));
@@ -1756,6 +1766,13 @@ mod tests {
                     pair[0]
                 );
             }
+            let expected_shared_bindings = match bindings.get("-Inspector").copied() {
+                Some("$peImportInspector") => &expected_closure_bindings,
+                Some("$inspectorFull") => &expected_final_bindings,
+                inspector => panic!(
+                    "invocation {invocation_index} uses an unknown inspector binding: {inspector:?}"
+                ),
+            };
             assert_eq!(
                 bindings.len(),
                 expected_shared_bindings.len() + 1,
@@ -1764,20 +1781,28 @@ mod tests {
             for (parameter, value) in expected_shared_bindings {
                 assert_eq!(
                     bindings.get(parameter),
-                    Some(&value),
+                    Some(value),
                     "invocation {invocation_index} must bind {parameter} explicitly"
                 );
             }
-            target_bindings.insert(
-                *bindings.get("-TargetBatch").unwrap_or_else(|| {
-                    panic!("invocation {invocation_index} must bind -TargetBatch")
-                }),
-            );
+            let target_binding = *bindings
+                .get("-TargetBatch")
+                .unwrap_or_else(|| panic!("invocation {invocation_index} must bind -TargetBatch"));
+            if bindings.get("-Inspector") == Some(&"$inspectorFull") {
+                assert_eq!(target_binding, "$batchTargets");
+                final_invocations += 1;
+            } else {
+                closure_target_bindings.insert(target_binding);
+            }
         }
         assert_eq!(
-            target_bindings,
+            closure_target_bindings,
             std::collections::BTreeSet::from(["$batchTargets", "$soupInspectorTargets"]),
             "the singleton Soup proof and closure batches must each bind their own exact typed list"
+        );
+        assert_eq!(
+            final_invocations, 1,
+            "the completed-tree verifier must contribute one bounded batch call site"
         );
         assert!(!script.contains("[string[]]$Paths"));
         assert!(!script.contains("-Paths @($requiredSoupPluginFull)"));
@@ -1790,7 +1815,7 @@ mod tests {
             .find("function Format-PeImportTargetForDiagnostic")
             .expect("bounded PE target formatter");
         let helpers_end = script[helpers_start..]
-            .find("function Add-PeImportDependencies")
+            .find("function Assert-WindowsBundlePeImportPolicy")
             .expect("PE target helper boundary")
             + helpers_start;
         let helpers = &script[helpers_start..helpers_end];
@@ -1960,6 +1985,7 @@ Assert-TargetFailure $newlineTarget "target #1 contains an unsupported quote or 
         assert!(create < resolve);
         assert!(resolve < soup_inspection);
         assert!(!script[resolve..soup_inspection].contains("$DIST = \"dist\\tributary-windows\""));
+        let resolved_closure = &script[resolve..soup_inspection];
         for fragment in [
             "$gstScannerDest = Join-Path $DIST \"gst-plugin-scanner.exe\"",
             "$requiredSoupPluginDest = Join-Path $DIST",
@@ -1967,13 +1993,10 @@ Assert-TargetFailure $newlineTarget "target #1 contains an unsupported quote or 
             "$_.Extension -ieq '.dll' -or $_.Extension -ieq '.exe'",
             "$requiredSoupRuntimeDest = Join-Path $DIST",
         ] {
-            let target = script
+            let target = resolved_closure
                 .find(fragment)
-                .unwrap_or_else(|| panic!("missing distribution-rooted PE target: {fragment}"));
-            assert!(
-                resolve < target,
-                "PE target was constructed before distribution resolution: {fragment}"
-            );
+                .unwrap_or_else(|| panic!("missing post-resolution PE target: {fragment}"));
+            assert!(target < resolved_closure.len());
         }
     }
 

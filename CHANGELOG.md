@@ -524,20 +524,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Release artifacts now reject unused optical-disc decryption and DRM components** — The Windows
   and macOS helpers previously copied the installed GStreamer plugin directory broadly and followed
   each plugin's native dependency closure. That could carry an unrelated host component such as the
-  observed `libdvdcss-2.dll` into Tributary even though Tributary has no DVD, Blu-ray, or protected
-  media feature. One shared, fail-closed filename policy now excludes unused DVD/Blu-ray access
-  plugins, dedicated CSS/AACS/BD+/MakeMKV-style decrypt bridges, conventional AACS key databases,
-  and proprietary content-decryption modules before traversal, rejects a denied transitive
-  dependency, and scans the finished payload before archive, installer, signing, or disk-image
-  creation. Link-based denied-component escapes and incomplete inspection paths fail closed;
-  Windows reopens the final ZIP and installer-only mode revalidates its existing tree so stale
-  incremental files cannot
-  bypass the gate. Native `.deb`, `.rpm`, Arch, and Flatpak application payloads receive
-  corresponding relationship, control/installer-script, direct-ELF, and final-content checks,
-  including the independent Packit/COPR RPM buildroot, without treating a separately delivered
-  system/Flatpak runtime as bundled by Tributary. Ordinary audio codecs, TLS, and general-purpose
+  observed `libdvdcss-2.dll` into Tributary even though Tributary has no DVD, Blu-ray, or
+  DRM-protected media feature. One shared, fail-closed filename policy now excludes unused
+  DVD/Blu-ray access plugins, dedicated CSS/AACS/BD+/MakeMKV-style decrypt bridges, the Debian
+  `libdvd-pkg` installer, conventional AACS key databases, and proprietary content-decryption
+  modules before traversal; it rejects denied transitive dependencies and recognizable path
+  references and scans the finished payload before archive, installer, signing, or disk-image
+  creation. Link-based denied-component escapes and incomplete inspection paths fail closed.
+  Windows validates forced-copy sources, performs a bounded hidden-inclusive final PE-import pass,
+  reopens the final ZIP, and repeats tree/import validation in installer-only mode so stale or
+  post-closure files cannot bypass the gate. macOS pins its canonical policy and inspection tools,
+  checks native plugin/dependency source paths and linked dependency, rpath, and load-command path
+  components under a fixed ASCII locale, and recognizes Mach-O files by magic even in nonstandard
+  locations without executable bits. Native `.deb`, `.rpm`, Arch, and Flatpak application payloads
+  receive corresponding relationship, control/installer-script, all-bracketed ELF dynamic metadata,
+  program-interpreter, and final-content checks—including the independent Packit/COPR RPM buildroot—
+  without treating a separately delivered system/Flatpak runtime as bundled by Tributary. The gate
+  requires GNU `readelf`, rather than the elfutils variant that leaves filtered-library names as
+  unresolved offsets, and failed ELF inspection cleans its private temporary state. Ordinary audio
+  codecs, TLS, and general-purpose
   cryptography remain supported and are explicitly distinguished from dedicated copy-control
-  bypass components in the documented release policy. The accompanying sender-provenance review
+  bypass components in the documented release policy. The generic `libbluray` navigation library
+  required by MSYS2's FFmpeg/libav build remains eligible because it does not itself provide DRM
+  decryption; the unused `gstbluray` plugin and separate AACS/BD+ libraries remain denied. The
+  accompanying sender-provenance review
   also confirmed that current official GStreamer, Homebrew, and MSYS2 packages do not provide the
   `raopsink` element previously claimed for AirPlay 1, so the ineffective instruction to install
   `gst-plugins-bad` is replaced by an honest unavailable-sender message. GStreamer's removed legacy

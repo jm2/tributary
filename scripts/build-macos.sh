@@ -59,6 +59,14 @@ MACOS_PACKAGE_POLICY_HELPER="${SCRIPT_DIR}/macos-package-policy.sh"
 # shellcheck source=macos-package-policy.sh
 source "$MACOS_PACKAGE_POLICY_HELPER"
 
+# Test-only policy hooks remain available to the sourced helper, but a release
+# build must use the repository policy and the platform inspection tools even
+# when its parent environment happens to define those hook names.
+readonly MACOS_BUNDLED_COMPONENT_POLICY="${SCRIPT_DIR}/../build-aux/packaging/forbidden-bundled-components.txt"
+readonly MACOS_FIND_COMMAND="/usr/bin/find"
+readonly MACOS_OTOOL_COMMAND="/usr/bin/otool"
+readonly MACOS_OD_COMMAND="/usr/bin/od"
+
 APP_NAME="Tributary"
 BUNDLE_ID="io.github.tributary.Tributary"
 BINARY="target/release/tributary"
@@ -128,10 +136,13 @@ if $COVERAGE; then
   exit 0
 fi
 
-if ! macos_package_policy_load; then
+for policy_tool in "$MACOS_FIND_COMMAND" "$MACOS_OTOOL_COMMAND" "$MACOS_OD_COMMAND"; do
+  [[ -x "$policy_tool" ]] || error "Required macOS package-policy tool is unavailable: ${policy_tool}"
+done
+if ! macos_package_policy_load "$MACOS_BUNDLED_COMPONENT_POLICY"; then
   error "$MACOS_PACKAGE_POLICY_REASON"
 fi
-info "Loaded ${#MACOS_FORBIDDEN_COMPONENT_TOKENS[@]} forbidden bundle filename tokens."
+info "Loaded ${MACOS_FORBIDDEN_COMPONENT_TOKEN_COUNT} forbidden bundle filename tokens."
 
 # ── Rust Build ───────────────────────────────────────────────────────────────
 info "Building Tributary (release)..."

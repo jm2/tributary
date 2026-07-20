@@ -2,11 +2,12 @@
 # Keep this focused on optical-disc copy-control and proprietary DRM support;
 # ordinary media codecs and general-purpose cryptography are not prohibited.
 dvdcss
+dvd-pkg
 dvdread
 dvdnav
 aacs
 bdplus
-bluray
+gstbluray
 mmbd
 makemkv
 decss

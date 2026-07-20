@@ -44,6 +44,7 @@ touch "$temp_dir/allowed/lib/gstreamer-1.0/libgstlibav.so"
 touch "$temp_dir/allowed/lib/libavcodec.so.62"
 touch "$temp_dir/allowed/lib/libcrypto.so.3"
 touch "$temp_dir/allowed/lib/libblurhash.so"
+touch "$temp_dir/allowed/lib/libbluray.so.2"
 "$validator" --tree "$temp_dir/allowed"
 
 mkdir -p "$temp_dir/rejected"
@@ -116,26 +117,66 @@ chmod +x "$temp_dir/tr-tools/tr"
 expect_status 1 env PATH="$temp_dir/tr-tools:$PATH" TEST_REAL_TR="$real_tr" \
     "$validator" --metadata "$temp_dir/allowed-metadata"
 
-# Drive ELF dependency parsing through a fixed fake inspector. This covers a
-# renamed payload whose basename is harmless but DT_NEEDED is prohibited.
+# Drive ELF reference parsing through a fixed fake inspector. This covers a
+# renamed payload whose basename is harmless but a dynamic tag or PT_INTERP
+# names a prohibited component.
 mkdir -p "$temp_dir/tools"
 printf '%s\n' \
     '#!/bin/sh' \
+    'mode=$1' \
     'last=' \
     'for argument in "$@"; do last=$argument; done' \
+    'if [ "$mode" = -l ]; then' \
+    '  case "$last" in' \
+    '    *rejected-elf-interpreter)' \
+    '      printf "      [Requesting program interpreter: /lib/%s.so.1]\\n" "$TEST_FORBIDDEN_TOKEN"' \
+    '      ;;' \
+    '    *) printf "Elf file type is DYN (Shared object file)\\n" ;;' \
+    '  esac' \
+    '  exit 0' \
+    'fi' \
     'case "$last" in' \
-    '  *rejected-elf) dependency=${TEST_FORBIDDEN_TOKEN}.so.1 ;;' \
-    '  *) dependency=libgstreamer-1.0.so.0 ;;' \
+    '  *rejected-elf-needed)' \
+    '    printf " 0x0000000000000001 (NEEDED) Shared library: [%s.so.1]\\n" "$TEST_FORBIDDEN_TOKEN"' \
+    '    ;;' \
+    '  *rejected-elf-filter)' \
+    '    printf " 0x000000007fffffff (FILTER) Filter library: [%s.so.1]\\n" "$TEST_FORBIDDEN_TOKEN"' \
+    '    ;;' \
+    '  *rejected-elf-audit)' \
+    '    printf " 0x000000006ffffefc (AUDIT) Audit library: [%s.so.1]\\n" "$TEST_FORBIDDEN_TOKEN"' \
+    '    ;;' \
+    '  *rejected-elf-runpath)' \
+    '    printf " 0x000000000000001d (RUNPATH) Library runpath: [/opt/%s/lib]\\n" "$TEST_FORBIDDEN_TOKEN"' \
+    '    ;;' \
+    '  *rejected-elf-soname)' \
+    '    printf " 0x000000000000000e (SONAME) Library soname: [lib%s-proxy.so]\\n" "$TEST_FORBIDDEN_TOKEN"' \
+    '    ;;' \
+    '  *)' \
+    '    printf " 0x0000000000000001 (NEEDED) Shared library: [libgstreamer-1.0.so.0]\\n"' \
+    '    ;;' \
     'esac' \
-    'printf " 0x0000000000000001 (NEEDED) Shared library: [%s]\\n" "$dependency"' \
     > "$temp_dir/tools/readelf"
 chmod +x "$temp_dir/tools/readelf"
 printf '\177ELFfixture' > "$temp_dir/allowed-elf"
-printf '\177ELFfixture' > "$temp_dir/rejected-elf"
 PATH="$temp_dir/tools:$PATH" TEST_FORBIDDEN_TOKEN="$first_token" \
     "$validator" --elf "$temp_dir/allowed-elf"
-expect_status 1 env PATH="$temp_dir/tools:$PATH" TEST_FORBIDDEN_TOKEN="$first_token" \
-    "$validator" --elf "$temp_dir/rejected-elf"
+for elf_reference in needed filter audit runpath soname interpreter; do
+    fixture="$temp_dir/rejected-elf-$elf_reference"
+    printf '\177ELFfixture' > "$fixture"
+    expect_status 1 env PATH="$temp_dir/tools:$PATH" \
+        TEST_FORBIDDEN_TOKEN="$first_token" "$validator" --elf "$fixture"
+done
+
+# A rejected ELF must clean its private inspection files even though the
+# policy failure exits from nested dependency-token validation.
+mkdir -p "$temp_dir/elf-cleanup-tmp"
+expect_status 1 env TMPDIR="$temp_dir/elf-cleanup-tmp" \
+    PATH="$temp_dir/tools:$PATH" TEST_FORBIDDEN_TOKEN="$first_token" \
+    "$validator" --elf "$temp_dir/rejected-elf-filter"
+if find "$temp_dir/elf-cleanup-tmp" -mindepth 1 -print -quit | grep -q .; then
+    echo "ELF validation leaked private inspection files" >&2
+    exit 1
+fi
 
 # Exercise each native archive boundary with deterministic fake package tools.
 # The validator must reject both a declared dependency and a file introduced
@@ -391,12 +432,12 @@ require_literal 'build-aux/linux/test-package-compliance.sh' "$ci_workflow"
 require_literal 'scripts/test-macos-package-policy.sh' "$ci_workflow"
 require_literal 'validate-package-compliance.sh --elf target/release/tributary' "$ci_workflow"
 require_literal 'command -v ostree' "$ci_workflow"
-require_literal 'command -v readelf || command -v eu-readelf' "$ci_workflow"
+require_literal 'command -v readelf' "$ci_workflow"
 assert_before 'name: Validate completed Flatpak bundle payload' \
     'name: Upload Flatpak bundle' "$ci_workflow"
 
-require_literal 'flatpak flatpak-builder elfutils ostree python3-pip' "$release_workflow"
-require_literal 'cpio elfutils gcc rpm-build' "$release_workflow"
+require_literal 'binutils flatpak flatpak-builder ostree python3-pip' "$release_workflow"
+require_literal 'binutils cpio gcc rpm-build' "$release_workflow"
 require_literal 'binutils git libarchive' "$release_workflow"
 require_literal 'validate-bundle-compliance.sh' "$release_workflow"
 require_literal 'validate-package-compliance.sh --deb' "$release_workflow"

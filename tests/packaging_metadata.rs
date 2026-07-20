@@ -157,11 +157,12 @@ fn bundled_component_policy_blocks_disc_decryption_without_hiding_codecs() {
 
     for required in [
         "dvdcss",
+        "dvd-pkg",
         "dvdread",
         "dvdnav",
         "aacs",
         "bdplus",
-        "bluray",
+        "gstbluray",
         "mmbd",
         "makemkv",
         "decss",
@@ -187,7 +188,7 @@ fn bundled_component_policy_blocks_disc_decryption_without_hiding_codecs() {
         "libbdplus-0.dll",
         "bdplus.dll",
         "prefix-libbdplus-0-suffix.dll",
-        "libbluray-2.dll",
+        "libgstbluray.dll",
         "libmmbd64.dll",
         "MakeMKVcon.exe",
         "libdecss.dll",
@@ -212,6 +213,7 @@ fn bundled_component_policy_blocks_disc_decryption_without_hiding_codecs() {
         "libgstaes.dll",
         "libgstdvdlpcmdec.dll",
         "libgstdvdsub.dll",
+        "libbluray-3.dll",
         "libsoup-3.0-0.dll",
         "libssl-3-x64.dll",
         "libcrypto-3-x64.dll",
@@ -275,7 +277,7 @@ fn windows_bundle_loads_policy_and_rejects_reparse_points() {
             && build_windows.contains(
                 "Refusing to copy filesystem reparse point into the Windows bundle"
             ),
-        "final artifacts and every recursive copy path must reject reparse points"
+        "final artifacts and every copy path must reject reparse points"
     );
     assert!(
         build_windows.contains(
@@ -298,11 +300,31 @@ fn windows_bundle_loads_policy_and_rejects_reparse_points() {
         .find("Assert-WindowsBundleComponentPolicy $DIST")
         .expect("the incremental dist tree must be validated");
     let executable_copy = build_windows
-        .find("Copy-Item $exePath $DIST -Force")
+        .find("Copy-WindowsBundleFileForced $exePath $exeBundleDest")
         .expect("the executable copy boundary must remain recognizable");
     assert!(
         first_dist_assertion < executable_copy,
         "an existing destination reparse point must fail before any bundle write"
+    );
+    let validated_source = build_windows
+        .find("function Get-ValidatedWindowsBundleCopySourceItem")
+        .expect("all Windows bundle copies must share a validated source boundary");
+    let forced_copy = build_windows
+        .find("function Copy-WindowsBundleFileForced")
+        .expect("unconditional Windows bundle copies must use a guarded helper");
+    let scanner_copy = build_windows
+        .find("Copy-WindowsBundleFileForced $gstScannerSrc $gstScannerDest")
+        .expect("the GStreamer scanner copy must use the guarded helper");
+    assert!(validated_source < forced_copy && forced_copy < executable_copy);
+    assert!(forced_copy < scanner_copy);
+    assert!(
+        build_windows
+            .contains("Refusing to overwrite filesystem reparse point in the Windows bundle")
+            && !build_windows.contains("Copy-Item $exePath $DIST -Force")
+            && !build_windows.contains(
+                "Copy-Item -LiteralPath $gstScannerSrc -Destination $gstScannerDest -Force"
+            ),
+        "the executable and scanner must not bypass source/destination reparse validation"
     );
 }
 
@@ -332,7 +354,12 @@ fn windows_bundle_applies_policy_at_copy_and_installer_boundaries() {
         .find("& $iscc")
         .map(|offset| installer_assertion + offset)
         .expect("the Inno compiler invocation must remain recognizable");
-    assert!(installer_assertion < installer_compile);
+    let installer_pe_assertion = build_windows[installer_assertion..]
+        .find("Assert-WindowsBundlePeImportPolicy $sourceDir $installerPeImportInspector")
+        .map(|offset| installer_assertion + offset)
+        .expect("installer-only mode must recheck every PE import in its stale source tree");
+    assert!(installer_assertion < installer_pe_assertion);
+    assert!(installer_pe_assertion < installer_compile);
     assert_eq!(
         build_windows
             .matches("Assert-WindowsBundleComponentPolicy $sourceDir")
@@ -348,6 +375,13 @@ fn windows_bundle_applies_policy_at_copy_and_installer_boundaries() {
         build_windows[..runtime_probe].ends_with("Assert-WindowsBundleComponentPolicy $DIST\n\n"),
         "the dist tree must pass policy immediately before the packaged executable is run"
     );
+    assert!(
+        build_windows.contains("if ([string]$line -notmatch '^\\s*Name\\s*:') { continue }")
+            && build_windows.contains(
+                "PE import inspector returned an unsupported dependency spelling for $SourceLabel"
+            ),
+        "the recursive closure must fail closed on an import spelling it cannot safely resolve"
+    );
 }
 
 #[test]
@@ -357,9 +391,20 @@ fn windows_bundle_validates_the_completed_zip_and_ci_parser() {
     let archive = build_windows
         .find("Write-Info \"Creating zip archive...\"")
         .expect("the Windows ZIP boundary must exist");
+    let archive_section = build_windows
+        .find("# ── Zip Archive")
+        .expect("the Windows ZIP section must exist");
+    let final_component_assertion = build_windows[archive_section..]
+        .find("Assert-WindowsBundleComponentPolicy $DIST")
+        .map(|offset| archive_section + offset)
+        .expect("the final dist tree must pass the filename/reparse policy");
+    let final_pe_assertion = build_windows[archive_section..]
+        .find("Assert-WindowsBundlePeImportPolicy $DIST $peImportInspector")
+        .map(|offset| archive_section + offset)
+        .expect("the final dist tree must pass a fresh PE import inspection");
     assert!(
-        build_windows[..archive].ends_with("Assert-WindowsBundleComponentPolicy $DIST\n"),
-        "the dist tree must pass policy immediately before ZIP creation"
+        final_component_assertion < final_pe_assertion && final_pe_assertion < archive,
+        "both final source-tree gates must run after the runtime probe and before ZIP creation"
     );
     let zip_creation = build_windows
         .find("Compress-Archive -Path $DIST -DestinationPath $zipPath")
@@ -372,6 +417,18 @@ fn windows_bundle_validates_the_completed_zip_and_ci_parser() {
             && build_windows.contains("[System.IO.Compression.ZipFile]::OpenRead")
             && build_windows.contains("Test-ForbiddenBundledRelativePath $entryPath"),
         "the completed ZIP entry names must pass the shared component policy"
+    );
+    assert!(
+        build_windows.contains("function Assert-WindowsBundlePeImportPolicy")
+            && build_windows.contains("$targetItems = @(Get-WindowsTreeMembersWithoutReparseTraversal $rootFull")
+            && build_windows.contains("$stream.ReadByte() -ne 0x4D")
+            && build_windows.contains("$stream.ReadByte() -ne 0x5A")
+            && build_windows.contains("Invoke-BoundedPeImportBatch")
+            && build_windows.contains(
+                "Final PE import inspector returned an unsupported dependency spelling"
+            )
+            && build_windows.contains("$targetSnapshot.ContainsKey($finalPath)"),
+        "the final gate must inspect every hidden DLL/EXE as bounded PE data, reject malformed imports, and detect a changing target set"
     );
     assert!(
         windows_ci.contains("name: Parse bundler with Windows PowerShell 5.1")

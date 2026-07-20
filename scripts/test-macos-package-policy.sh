@@ -72,11 +72,12 @@ assert_status 0 macos_package_policy_load "$POLICY_FILE"
 
 for prohibited in \
   'libDVDcss.2.dylib' \
+  'libdvd-pkg-installer' \
   'libdvdread.8.dylib' \
   'libdvdnav.4.dylib' \
   'libaacs.0.dylib' \
   'libbdplus.0.dylib' \
-  'libbluray.2.dylib' \
+  'libgstbluray.dylib' \
   'libmmbd64.dylib' \
   'libgstresindvd.dylib' \
   'WidevineCDM.framework' \
@@ -91,15 +92,23 @@ for ordinary_runtime in \
   'libgstaudioparsers.dylib' \
   'libgstdvdlpcmdec.dylib' \
   'libgstdvdsub.dylib' \
+  'libbluray.2.dylib' \
   'libsoup-3.0.dylib' \
   'libssl.3.dylib' \
   'libcrypto.3.dylib'; do
   assert_allowed_name "$ordinary_runtime"
 done
 
-# External dependency/source paths intentionally use leaf-only matching. A
-# formula directory name must not hide an otherwise ordinary codec library.
+# The generic, non-decrypting libbluray formula path remains allowed even when
+# every path component is checked; a denied source/dependency parent does not.
 assert_allowed_name '/opt/homebrew/Cellar/libbluray/1.3.4/lib/libgstlibav.dylib'
+if macos_copy_control_relative_path_is_prohibited \
+  '/opt/homebrew/Cellar/libbluray/1.3.4/lib/libgstlibav.dylib'; then
+  fail "generic libbluray formula path was overmatched"
+fi
+macos_copy_control_relative_path_is_prohibited \
+  '/opt/homebrew/Cellar/libdvdcss/1.4.3/lib/libinnocent.dylib' \
+  || fail "forbidden source parent path was not detected"
 macos_copy_control_relative_path_is_prohibited '../WidevineCDM/helper.dylib' \
   || fail "forbidden intermediate relative-path component was not detected"
 if macos_copy_control_relative_path_is_prohibited '../ordinary-codecs/helper.dylib'; then
@@ -109,9 +118,18 @@ fi
 FAKE_OTOOL="${TEST_ROOT}/fake-otool"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
+  'mode="${1:-}"' \
   'artifact=""' \
   'for argument in "$@"; do artifact="$argument"; done' \
   '[[ -e "${artifact}.otool-fail" ]] && exit 1' \
+  'if [[ "$mode" == -l ]]; then' \
+  '  if [[ -f "${artifact}.load-commands" ]]; then' \
+  '    cat "${artifact}.load-commands"' \
+  '  else' \
+  '    printf "Load command 0\\n      cmd LC_RPATH\\n     path /usr/lib (offset 12)\\n"' \
+  '  fi' \
+  '  exit 0' \
+  'fi' \
   'printf "%s:\n" "$artifact"' \
   'if [[ -f "${artifact}.deps" ]]; then' \
   '  while IFS= read -r dependency || [[ -n "$dependency" ]]; do' \
@@ -152,6 +170,36 @@ assert_status 0 macos_stage_gstreamer_plugin \
 [[ "$MACOS_PACKAGE_POLICY_RESULT" == excluded ]] || fail "decrypt-linked plugin was not excluded"
 [[ ! -e "${PLUGIN_DEST}/libgstinnocent.dylib" ]] || fail "decrypt-linked plugin reached staging"
 
+touch "${PLUGIN_SOURCE}/libgstinnocent-path.dylib"
+printf '%s\n' '@rpath/WidevineCDM/libinnocent.dylib' \
+  > "${PLUGIN_SOURCE}/libgstinnocent-path.dylib.deps"
+assert_status 0 macos_stage_gstreamer_plugin \
+  "${PLUGIN_SOURCE}/libgstinnocent-path.dylib" "$PLUGIN_DEST"
+[[ "$MACOS_PACKAGE_POLICY_RESULT" == excluded ]] \
+  || fail "plugin linked through a forbidden dependency path was not excluded"
+[[ ! -e "${PLUGIN_DEST}/libgstinnocent-path.dylib" ]] \
+  || fail "plugin linked through a forbidden dependency path reached staging"
+
+FORBIDDEN_PLUGIN_SOURCE="${TEST_ROOT}/libdvdcss-source/libgstsource-path.dylib"
+mkdir -p "$(dirname "$FORBIDDEN_PLUGIN_SOURCE")"
+touch "$FORBIDDEN_PLUGIN_SOURCE"
+assert_status 0 macos_stage_gstreamer_plugin \
+  "$FORBIDDEN_PLUGIN_SOURCE" "$PLUGIN_DEST"
+[[ "$MACOS_PACKAGE_POLICY_RESULT" == excluded ]] \
+  || fail "plugin from a forbidden source path was not excluded"
+
+touch "${PLUGIN_SOURCE}/libgstload-command.dylib"
+printf '%s\n' \
+  'Load command 1' \
+  '          cmd LC_RPATH' \
+  '      cmdsize 48' \
+  '         path @loader_path/../WidevineCDM (offset 12)' \
+  > "${PLUGIN_SOURCE}/libgstload-command.dylib.load-commands"
+assert_status 0 macos_stage_gstreamer_plugin \
+  "${PLUGIN_SOURCE}/libgstload-command.dylib" "$PLUGIN_DEST"
+[[ "$MACOS_PACKAGE_POLICY_RESULT" == excluded ]] \
+  || fail "plugin with a forbidden Mach-O load-command path was not excluded"
+
 touch "${PLUGIN_SOURCE}/libgstuninspectable.dylib"
 touch "${PLUGIN_SOURCE}/libgstuninspectable.dylib.otool-fail"
 assert_status 2 macos_stage_gstreamer_plugin \
@@ -177,6 +225,15 @@ touch "$SAFE_BUNDLE/Contents/Resources/ordinary-codecs/helper.dat"
 ln -s 'ordinary-codecs/helper.dat' \
   "$SAFE_BUNDLE/Contents/Resources/ordinary-runtime-link"
 assert_status 0 macos_validate_bundle_copy_control "$SAFE_BUNDLE"
+assert_no_policy_manifests
+
+# A checkout/build ancestor is not part of the shipped bundle. Source-copy
+# validation remains component-wise, while the final gate uses bundle-relative
+# member paths and must not overmatch an external parent directory name.
+SAFE_PARENT_BUNDLE="${TEST_ROOT}/libdvdcss-parent/SafeParent.app"
+make_bundle "$SAFE_PARENT_BUNDLE"
+touch "$SAFE_PARENT_BUNDLE/Contents/Frameworks/libgstlibav.dylib"
+assert_status 0 macos_validate_bundle_copy_control "$SAFE_PARENT_BUNDLE"
 assert_no_policy_manifests
 
 REAL_FIND_COMMAND="$(command -v find)"
@@ -234,6 +291,22 @@ printf '\xcf\xfa\xed\xfe' \
 printf '%s\n' '@rpath/libaacs.0.dylib' \
   > "$RESOURCE_MACHO_BUNDLE/Contents/Resources/allowed-helper.dat.deps"
 assert_status 1 macos_validate_bundle_copy_control "$RESOURCE_MACHO_BUNDLE"
+
+FRAMEWORK_MACHO_BUNDLE="${TEST_ROOT}/FrameworkMachO.app"
+make_bundle "$FRAMEWORK_MACHO_BUNDLE"
+printf '\xcf\xfa\xed\xfe' \
+  > "$FRAMEWORK_MACHO_BUNDLE/Contents/Frameworks/allowed-helper.dat"
+printf '%s\n' '@rpath/libbdplus.0.dylib' \
+  > "$FRAMEWORK_MACHO_BUNDLE/Contents/Frameworks/allowed-helper.dat.deps"
+assert_status 1 macos_validate_bundle_copy_control "$FRAMEWORK_MACHO_BUNDLE"
+
+WRAPPER_MACHO_BUNDLE="${TEST_ROOT}/WrapperMachO.app"
+make_bundle "$WRAPPER_MACHO_BUNDLE"
+printf '\xcf\xfa\xed\xfe' \
+  > "$WRAPPER_MACHO_BUNDLE/Contents/MacOS/WrapperMachO"
+printf '%s\n' '@rpath/libaacs.0.dylib' \
+  > "$WRAPPER_MACHO_BUNDLE/Contents/MacOS/WrapperMachO.deps"
+assert_status 1 macos_validate_bundle_copy_control "$WRAPPER_MACHO_BUNDLE"
 
 SYMLINK_BUNDLE="${TEST_ROOT}/Symlink.app"
 make_bundle "$SYMLINK_BUNDLE"

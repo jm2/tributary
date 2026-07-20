@@ -10,7 +10,7 @@ Source0:        https://github.com/jm2/tributary/archive/refs/tags/v%{version}.t
 BuildRequires:  rust
 BuildRequires:  cargo
 BuildRequires:  bash
-BuildRequires:  elfutils
+BuildRequires:  binutils
 BuildRequires:  gcc
 BuildRequires:  pkgconf-pkg-config
 BuildRequires:  libadwaita-devel

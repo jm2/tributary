@@ -302,13 +302,13 @@ This produces `dist/tributary-windows.zip` with the executable and all required 
 
 ### Release artifact component policy
 
-Tributary does not play DVDs, Blu-ray discs, or protected media. Its packaging helpers exclude and
+Tributary does not play DVDs, Blu-ray discs, or DRM-protected media. Its packaging helpers exclude and
 fail closed on dedicated optical-disc copy-control/decryption components, unused disc-access
 plugins that can introduce them transitively, and proprietary content-decryption modules. Windows
 and macOS validate their self-contained application trees; native Linux packages validate their
 own payload, package relationships, and installer metadata, while Flatpak validates its complete
 app-owned commit (`/app`, exports, and metadata) rather than the separately delivered shared
-runtime. Windows rejects filesystem links before copying and reopens the completed ZIP, while the
+runtime. Windows rejects filesystem reparse points before copying and reopens the completed ZIP, while the
 same final validation protects incremental and installer-only packaging from stale files.
 
 Ordinary audio codecs, TLS, and general-purpose cryptography are intentionally distinct from that

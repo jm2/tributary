@@ -135,14 +135,11 @@ check_dependency_text()
 
 elf_inspector()
 {
-    if command -v readelf >/dev/null 2>&1; then
-        printf '%s\n' readelf
-    elif command -v eu-readelf >/dev/null 2>&1; then
-        printf '%s\n' eu-readelf
-    else
-        echo "Linux package compliance validator requires readelf or eu-readelf" >&2
+    command -v readelf >/dev/null 2>&1 || {
+        echo "Linux package compliance validator requires GNU readelf (binutils)" >&2
         exit 2
-    fi
+    }
+    printf '%s\n' readelf
 }
 
 is_elf()
@@ -155,7 +152,7 @@ is_elf()
 }
 
 check_elf()
-{
+(
     file=$1
     required=${2:-false}
     if is_elf "$file"; then
@@ -168,16 +165,28 @@ check_elf()
     fi
 
     inspector=$(elf_inspector)
-    dynamic=$(mktemp)
+    inspection_dir=$(mktemp -d)
+    trap 'rm -rf "$inspection_dir"' EXIT HUP INT TERM
+    dynamic="$inspection_dir/dynamic"
+    program_headers="$inspection_dir/program-headers"
+    references="$inspection_dir/references"
     if ! LC_ALL=C "$inspector" -d -- "$file" > "$dynamic" 2>/dev/null; then
-        rm -f "$dynamic"
-        fail "could not inspect ELF dependencies: $file"
+        fail "could not inspect ELF dynamic section: $file"
     fi
-    dependencies=$(mktemp)
-    LC_ALL=C sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' "$dynamic" > "$dependencies"
-    check_dependency_text "$dependencies"
-    rm -f "$dynamic" "$dependencies"
-}
+    if ! LC_ALL=C "$inspector" -l -- "$file" > "$program_headers" 2>/dev/null; then
+        fail "could not inspect ELF program headers: $file"
+    fi
+    # DT_NEEDED is only one way an ELF can name another component. Inspect all
+    # bracket-valued dynamic metadata (including FILTER, AUXILIARY, AUDIT,
+    # DEPAUDIT, SONAME, and RUNPATH) plus PT_INTERP from program headers.
+    if ! LC_ALL=C sed -n 's/.*\[\([^]]*\)\].*/\1/p' "$dynamic" > "$references"; then
+        fail "could not parse ELF dynamic section: $file"
+    fi
+    if ! LC_ALL=C sed -n 's/.*\[\([^]]*\)\].*/\1/p' "$program_headers" >> "$references"; then
+        fail "could not parse ELF program headers: $file"
+    fi
+    check_dependency_text "$references"
+)
 
 check_entry()
 {
