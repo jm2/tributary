@@ -20,6 +20,7 @@ pub mod preferences;
 pub mod properties_dialog;
 pub mod radio;
 pub mod removable_media;
+mod rhythmbox_migration;
 pub mod root_trust;
 pub mod server_dialogs;
 mod server_playlist_recovery;

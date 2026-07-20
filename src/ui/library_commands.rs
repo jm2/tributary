@@ -1,10 +1,12 @@
-//! GTK-thread admission gate for serialized history, rating, and root-trust
-//! commands.
+//! GTK-thread admission gate for serialized history, rating, root-trust, and
+//! Rhythmbox-migration commands.
 //!
 //! Every producer of the admitted [`LibraryCommand`] variants shares this
 //! boundary. Normal shutdown closes admission and appends one terminal FIFO
-//! marker in the same synchronous operation, so no history, rating, or
-//! root-trust command can be queued behind that marker. Playlist CRUD and
+//! marker in the same synchronous operation, so no admitted mutation can be
+//! queued behind that marker. In particular, a Rhythmbox migration admitted
+//! before shutdown drains before `Flush`, while a preview or confirmation that
+//! finishes after admission closes is rejected. Playlist CRUD and
 //! filesystem-watcher mutations use separate boundaries and are not covered
 //! here.
 

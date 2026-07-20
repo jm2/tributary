@@ -6,13 +6,14 @@ This document explains the product and engineering work that remains **after** t
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
 remediation record is preserved separately in
 [`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **220/223 (98.7%)**, with only three
-real-environment validation records left. The feature backlog is now **13/38 (34.2%)** complete.
+real-environment validation records left. The feature backlog is now **14/38 (36.8%)** complete.
 Neither percentage estimates equal engineering effort, and the historical percentage is not a
 claim that Tributary has implemented every requested product feature.
 
-The entries below are candidates, not release promises. After
-[#149](https://github.com/jm2/tributary/pull/149) closes the completed server-playlist issue
-[#143](https://github.com/jm2/tributary/issues/143), 9 GitHub issues remain open. Candidates should
+The entries below are candidates, not release promises. With
+[#149](https://github.com/jm2/tributary/pull/149) having closed the completed server-playlist issue
+[#143](https://github.com/jm2/tributary/issues/143), and the completed Rhythmbox migration closing
+[#57](https://github.com/jm2/tributary/issues/57), 8 GitHub issues remain open. Candidates should
 receive acceptance criteria, dependencies, and a milestone before work starts. Historical
 holistic-review documents are point-in-time findings, not active roadmaps.
 
@@ -248,15 +249,30 @@ before starting large protocol or transfer subsystems.
    mutation, periodic polling, fuzzy matching, non-Subsonic authority, and native playlist IDs in
    GTK. Validation passes 92 focused server-playlist tests and locked 1,300-test debug and release
    suites.
+12. **Completed Rhythmbox profile migration
+   ([#57](https://github.com/jm2/tributary/issues/57),
+   [#150](https://github.com/jm2/tributary/pull/150)).** A preview-first local importer reads exact
+   `rhythmdb.xml` and optional `playlists.xml` profile children under explicit byte, structure, and
+   item limits. It rejects unsafe XML and locations, optionally replaces one exact path root, and
+   matches only exact current local-library paths—never titles, artists, albums, or similar names.
+   Ratings, monotonic play counts, optional last-played timestamps, static playlist ordering and
+   duplicates, and a deliberately narrow exact play-count/rating automatic-playlist subset are
+   planned against current database state. Nine independently capped report sections expose local
+   paths or playlist names only in the local preview, include exact omitted-detail counts, and gate
+   a safe-subset apply behind explicit acknowledgement. The retained private plan revalidates every
+   matched path, track value, and playlist-name presence inside one transaction; a current-state
+   difference from the preview evidence makes the request stale. Migration 16 stores only the
+   semantic source digest, importer version, and policy digest after all writes, making an exact
+   retry a no-op without retaining source content, paths, names, or timestamps. The feature
+   intentionally does not import queues, guess matches, support arbitrary Rhythmbox smart
+   queries/sorts/limits, or replace XSPF as interchange. Validation passes 75 focused tests, exact
+   13-catalog/125-key parity, and locked 1,375-test debug and release suites with strict Clippy.
 
-These contracts make Rhythmbox migration and Last.fm behavior much less ambiguous.
+The playback-history contract makes the remaining Last.fm behavior much less ambiguous.
 
 ### 2. Build migration and listening integrations
 
-1. **Rhythmbox migration ([#57]).** Import `rhythmdb.xml`, playlists, play counts, and ratings
-   transactionally and idempotently; match files without guessing; and report conflicts and
-   unmatched rows. Existing XSPF import is useful but is not automatic Rhythmbox migration.
-2. **Last.fm scrobbling ([#50]).** Design account authorization and secret storage, now-playing and
+1. **Last.fm scrobbling ([#50]).** Design account authorization and secret storage, now-playing and
    scrobble thresholds, a durable retry queue, offline behavior, privacy disclosure, and
    source-aware metadata. This should consume the same authoritative playback-history events.
 
@@ -313,7 +329,6 @@ not mistaken for work already underway.
 
 | Issue | Current implementation state | Likely implementation shape |
 |---|---|---|
-| [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus completed playback-history and rating contracts are foundations; XSPF deliberately transfers neither history nor ratings. | Build a separate transactional, idempotent migration with explicit metadata consent and conflict reporting. |
 | [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | No Last.fm client or scrobble pipeline. | Authorization, secret storage, authoritative thresholds, retry/offline queue, and privacy UX. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |

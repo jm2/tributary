@@ -112,6 +112,13 @@ pub enum LibraryEvent {
     /// internally but deliberately excluded from this UI-facing event so GTK
     /// can select fixed, localized copy without exposing database details.
     TrackRatingUpdateFailed { track_id: TrackId },
+    /// Closed, content-free result of one previewed Rhythmbox migration. The
+    /// detailed plan and database error never cross into GTK.
+    RhythmboxMigrationFinished {
+        request_id: Uuid,
+        outcome: super::rhythmbox_migration::RhythmboxMigrationCompletion,
+        summary: super::rhythmbox_migration::RhythmboxMigrationSummary,
+    },
     /// Complete, exact-configured roots which require an explicit user trust
     /// decision before their observed storage may become authoritative.
     RootTrustRequired(Vec<RootTrustRequest>),
@@ -301,7 +308,7 @@ impl std::fmt::Debug for RootTrustRequest {
 }
 
 /// Commands accepted by the single owner of local-library mutation state.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum LibraryCommand {
     ConfirmRootTrust(RootTrustRequest),
     /// Durably count one accepted playback occurrence for an exact local
@@ -316,6 +323,9 @@ pub enum LibraryCommand {
         track_id: TrackId,
         rating: Option<Rating>,
     },
+    /// Apply one opaque, exact-state Rhythmbox preview through the same FIFO
+    /// as app-owned history and rating mutations.
+    ApplyRhythmboxMigration(Box<super::rhythmbox_migration::RhythmboxMigrationRequest>),
     /// Acknowledge only after every command queued before this marker has
     /// finished. Normal application shutdown uses this FIFO barrier so an
     /// already-admitted playback-history or rating mutation cannot be lost
@@ -3314,6 +3324,94 @@ async fn process_library_command(
                         .await;
                 }
             }
+            return None;
+        }
+        LibraryCommand::ApplyRhythmboxMigration(request) => {
+            use super::rhythmbox_migration::{
+                RhythmboxMigrationCompletion, RhythmboxMigrationError, RhythmboxMigrationOutcome,
+            };
+
+            let request_id = request.request_id();
+            let summary = request.summary().clone();
+            let outcome =
+                match super::rhythmbox_migration::apply_rhythmbox_migration(db, &request).await {
+                    Ok(RhythmboxMigrationOutcome::Applied) => {
+                        info!(
+                            %request_id,
+                            matched_tracks = summary.matched_tracks,
+                            playlists = summary
+                                .static_playlists_to_create
+                                .saturating_add(summary.automatic_playlists_to_create),
+                            "Rhythmbox migration committed"
+                        );
+                        let snapshot = send_library_snapshot(db, tx).await;
+                        let projection_event_published = tx
+                            .send(LibraryEvent::PlaylistProjectionsInvalidated)
+                            .await
+                            .is_ok();
+                        let sidebar_refresh_requested = !matches!(
+                            playlist_sidebar_refresh.request(),
+                            PlaylistSidebarRefreshRequest::Closed
+                        );
+                        let publication_incomplete =
+                            !matches!(snapshot, LibrarySnapshotPublication::Published)
+                                || !projection_event_published
+                                || !sidebar_refresh_requested;
+                        if publication_incomplete {
+                            warn!(
+                                %request_id,
+                                snapshot = snapshot.category(),
+                                projection_event = if projection_event_published {
+                                    "published"
+                                } else {
+                                    "receiver-closed"
+                                },
+                                sidebar_refresh = if sidebar_refresh_requested {
+                                    "requested"
+                                } else {
+                                    "publisher-closed"
+                                },
+                                "Rhythmbox migration committed but publication was incomplete"
+                            );
+                        }
+
+                        // Failed would falsely claim that the committed transaction rolled
+                        // back. Preserve the distinct post-commit failure through the typed
+                        // completion while GTK still owns its event lane. A closed lane is
+                        // normal during teardown; the command owner must continue to the FIFO
+                        // shutdown barrier without trying to surface a late UI result.
+                        if publication_incomplete && !tx.is_closed() {
+                            RhythmboxMigrationCompletion::AppliedRefreshFailed
+                        } else {
+                            RhythmboxMigrationCompletion::Applied
+                        }
+                    }
+                    Ok(RhythmboxMigrationOutcome::AlreadyApplied) => {
+                        info!(%request_id, "Rhythmbox migration was already applied");
+                        RhythmboxMigrationCompletion::AlreadyApplied
+                    }
+                    Err(RhythmboxMigrationError::Stale) => {
+                        info!(%request_id, "Rhythmbox migration preview became stale");
+                        RhythmboxMigrationCompletion::Stale
+                    }
+                    Err(error) => {
+                        let category = match error {
+                            RhythmboxMigrationError::Stale => "stale",
+                            RhythmboxMigrationError::LimitExceeded => "limit",
+                            RhythmboxMigrationError::InvalidSnapshot => "invalid-snapshot",
+                            RhythmboxMigrationError::Storage(_) => "storage",
+                        };
+                        warn!(%request_id, category, "Rhythmbox migration failed");
+                        RhythmboxMigrationCompletion::Failed
+                    }
+                };
+            let _ = tx
+                .send(LibraryEvent::RhythmboxMigrationFinished {
+                    request_id,
+                    outcome,
+                    summary,
+                })
+                .await;
             return None;
         }
         LibraryCommand::Flush { completion } => {
@@ -6509,13 +6607,49 @@ where
 /// Bulk changes emit this instead of a per-row event storm: the receiving GTK
 /// thread rebuilds from a snapshot in one pass, and the playback queue
 /// re-resolves its items by their stable track IDs.
-async fn send_library_snapshot(db: &DatabaseConnection, tx: &async_channel::Sender<LibraryEvent>) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LibrarySnapshotPublication {
+    Published,
+    StorageUnavailable,
+    EventReceiverClosed,
+}
+
+impl LibrarySnapshotPublication {
+    const fn category(self) -> &'static str {
+        match self {
+            Self::Published => "published",
+            Self::StorageUnavailable => "storage",
+            Self::EventReceiverClosed => "receiver-closed",
+        }
+    }
+}
+
+async fn send_library_snapshot(
+    db: &DatabaseConnection,
+    tx: &async_channel::Sender<LibraryEvent>,
+) -> LibrarySnapshotPublication {
     let backend = super::backend::LocalBackend::new(db.clone());
     match crate::architecture::load_track_catalog(&backend).await {
         Ok(tracks) => {
-            let _ = tx.send(LibraryEvent::FullSync(tracks)).await;
+            if tx.send(LibraryEvent::FullSync(tracks)).await.is_ok() {
+                LibrarySnapshotPublication::Published
+            } else {
+                debug!(
+                    category = LibrarySnapshotPublication::EventReceiverClosed.category(),
+                    "Full library snapshot receiver closed"
+                );
+                LibrarySnapshotPublication::EventReceiverClosed
+            }
         }
-        Err(error) => warn!(%error, "Failed to load tracks for full sync"),
+        Err(_) => {
+            // Backend errors may contain private database values. Keep the
+            // engine diagnostic useful without copying that chain into logs.
+            warn!(
+                category = LibrarySnapshotPublication::StorageUnavailable.category(),
+                "Failed to load tracks for full sync"
+            );
+            LibrarySnapshotPublication::StorageUnavailable
+        }
     }
 }
 
@@ -7970,6 +8104,36 @@ mod tests {
         active.insert(db).await.expect("insert rename test track")
     }
 
+    async fn rhythmbox_history_import_fixture(
+        db: &DatabaseConnection,
+        track_id: &str,
+    ) -> super::super::rhythmbox_import::RhythmboxImport {
+        #[cfg(windows)]
+        let imported_path = PathBuf::from(format!(r"C:\history\{track_id}.flac"));
+        #[cfg(not(windows))]
+        let imported_path = PathBuf::from(format!("/history/{track_id}.flac"));
+        insert_rename_test_track(
+            db,
+            track_id,
+            imported_path.to_str().expect("Unicode fixture path"),
+            "Rhythmbox command",
+            2,
+        )
+        .await;
+        let location = url::Url::from_file_path(&imported_path)
+            .expect("absolute fixture path")
+            .to_string();
+        let xml = format!(
+            "<rhythmdb version=\"2.0\"><entry type=\"song\"><location>{location}</location><play-count>9</play-count></entry></rhythmdb>"
+        );
+        super::super::rhythmbox_import::parse_rhythmbox_documents(
+            xml.as_bytes(),
+            None,
+            super::super::rhythmbox_import::RhythmboxImportLimits::default(),
+        )
+        .expect("parse command fixture")
+    }
+
     async fn insert_playback_history_test_track(
         db: &DatabaseConnection,
         id: &str,
@@ -8179,6 +8343,236 @@ mod tests {
             .expect("rejected row exists");
         assert_eq!(rejected.play_count, 20);
         assert_eq!(rejected.last_played_at_ms, Some(2_000));
+    }
+
+    #[tokio::test]
+    async fn rhythmbox_migration_publishes_once_and_exact_retry_is_a_no_op_before_flush() {
+        let db = rename_test_database().await;
+        let import = rhythmbox_history_import_fixture(&db, "rhythmbox-command").await;
+        let repeated_request = super::super::rhythmbox_migration::prepare_rhythmbox_migration(
+            &db,
+            import.clone(),
+            super::super::rhythmbox_migration::RhythmboxMigrationPolicy::default(),
+        )
+        .await
+        .expect("prepare repeated command fixture");
+        let request = super::super::rhythmbox_migration::prepare_rhythmbox_migration(
+            &db,
+            import,
+            super::super::rhythmbox_migration::RhythmboxMigrationPolicy::default(),
+        )
+        .await
+        .expect("prepare command fixture");
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let (playlist_sidebar_refresh, _playlist_sidebar_refresh_rx) =
+            super::super::playlist_sidebar::playlist_sidebar_refresh_channel();
+        for request in [request, repeated_request] {
+            command_tx
+                .send(LibraryCommand::ApplyRhythmboxMigration(Box::new(request)))
+                .await
+                .expect("queue migration command");
+        }
+        let (flush_tx, flush_rx) = async_channel::bounded(1);
+        command_tx
+            .send(LibraryCommand::Flush {
+                completion: flush_tx,
+            })
+            .await
+            .expect("queue flush after migrations");
+        drop(command_tx);
+
+        let mut completed = HashMap::new();
+        process_library_commands_without_watcher(
+            &db,
+            &[],
+            &event_tx,
+            &command_rx,
+            &mut completed,
+            &playlist_sidebar_refresh,
+        )
+        .await;
+        flush_rx
+            .recv()
+            .await
+            .expect("flush follows both migration settlements");
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(&events[0], LibraryEvent::FullSync(tracks) if tracks.len() == 1));
+        assert!(matches!(
+            &events[1],
+            LibraryEvent::PlaylistProjectionsInvalidated
+        ));
+        assert!(matches!(
+            &events[2],
+            LibraryEvent::RhythmboxMigrationFinished {
+                outcome: super::super::rhythmbox_migration::RhythmboxMigrationCompletion::Applied,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &events[3],
+            LibraryEvent::RhythmboxMigrationFinished {
+                outcome:
+                    super::super::rhythmbox_migration::RhythmboxMigrationCompletion::AlreadyApplied,
+                ..
+            }
+        ));
+        let updated = track::Entity::find_by_id("rhythmbox-command")
+            .one(&db)
+            .await
+            .expect("query migrated track")
+            .expect("migrated track exists");
+        assert_eq!(updated.play_count, 9);
+        assert_eq!(
+            crate::db::entities::rhythmbox_import_receipt::Entity::find()
+                .all(&db)
+                .await
+                .expect("query exact receipts")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rhythmbox_migration_reports_incomplete_refresh_before_applied_completion() {
+        let db = rename_test_database().await;
+        let import = rhythmbox_history_import_fixture(&db, "rhythmbox-refresh-failure").await;
+        let request = super::super::rhythmbox_migration::prepare_rhythmbox_migration(
+            &db,
+            import,
+            super::super::rhythmbox_migration::RhythmboxMigrationPolicy::default(),
+        )
+        .await
+        .expect("prepare refresh-failure fixture");
+        let request_id = request.request_id();
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        command_tx
+            .send(LibraryCommand::ApplyRhythmboxMigration(Box::new(request)))
+            .await
+            .expect("queue migration command");
+        let (flush_tx, flush_rx) = async_channel::bounded(1);
+        command_tx
+            .send(LibraryCommand::Flush {
+                completion: flush_tx,
+            })
+            .await
+            .expect("queue flush after migration");
+        drop(command_tx);
+
+        let (playlist_sidebar_refresh, playlist_sidebar_refresh_rx) =
+            super::super::playlist_sidebar::playlist_sidebar_refresh_channel();
+        drop(playlist_sidebar_refresh_rx);
+        let mut completed = HashMap::new();
+        process_library_commands_without_watcher(
+            &db,
+            &[],
+            &event_tx,
+            &command_rx,
+            &mut completed,
+            &playlist_sidebar_refresh,
+        )
+        .await;
+        flush_rx
+            .recv()
+            .await
+            .expect("refresh failure does not bypass the FIFO flush");
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0], LibraryEvent::FullSync(tracks) if tracks.len() == 1));
+        assert!(matches!(
+            &events[1],
+            LibraryEvent::PlaylistProjectionsInvalidated
+        ));
+        assert!(matches!(
+            &events[2],
+            LibraryEvent::RhythmboxMigrationFinished {
+                request_id: finished_request_id,
+                outcome:
+                    super::super::rhythmbox_migration::RhythmboxMigrationCompletion::AppliedRefreshFailed,
+                ..
+            } if *finished_request_id == request_id
+        ));
+        let updated = track::Entity::find_by_id("rhythmbox-refresh-failure")
+            .one(&db)
+            .await
+            .expect("query committed migration after refresh failure")
+            .expect("migrated track survives refresh failure");
+        assert_eq!(updated.play_count, 9);
+        assert_eq!(
+            crate::db::entities::rhythmbox_import_receipt::Entity::find()
+                .all(&db)
+                .await
+                .expect("query committed refresh-failure receipt")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rhythmbox_migration_drains_to_flush_when_the_event_lane_closes_for_shutdown() {
+        let db = rename_test_database().await;
+        let import = rhythmbox_history_import_fixture(&db, "rhythmbox-closed-event-lane").await;
+        let request = super::super::rhythmbox_migration::prepare_rhythmbox_migration(
+            &db,
+            import,
+            super::super::rhythmbox_migration::RhythmboxMigrationPolicy::default(),
+        )
+        .await
+        .expect("prepare shutdown fixture");
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        drop(event_rx);
+        let (command_tx, command_rx) = async_channel::unbounded();
+        command_tx
+            .send(LibraryCommand::ApplyRhythmboxMigration(Box::new(request)))
+            .await
+            .expect("queue admitted migration during shutdown");
+        let (flush_tx, flush_rx) = async_channel::bounded(1);
+        command_tx
+            .send(LibraryCommand::Flush {
+                completion: flush_tx,
+            })
+            .await
+            .expect("queue shutdown flush");
+        drop(command_tx);
+
+        let (playlist_sidebar_refresh, _playlist_sidebar_refresh_rx) =
+            super::super::playlist_sidebar::playlist_sidebar_refresh_channel();
+        let mut completed = HashMap::new();
+        process_library_commands_without_watcher(
+            &db,
+            &[],
+            &event_tx,
+            &command_rx,
+            &mut completed,
+            &playlist_sidebar_refresh,
+        )
+        .await;
+        flush_rx
+            .recv()
+            .await
+            .expect("closed UI lane still permits the admitted command to settle");
+
+        let updated = track::Entity::find_by_id("rhythmbox-closed-event-lane")
+            .one(&db)
+            .await
+            .expect("query committed migration after UI shutdown")
+            .expect("migration committed before the shutdown barrier");
+        assert_eq!(updated.play_count, 9);
+        assert_eq!(
+            crate::db::entities::rhythmbox_import_receipt::Entity::find()
+                .all(&db)
+                .await
+                .expect("query committed shutdown receipt")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -45,7 +45,23 @@
 // ── i18n initialisation ─────────────────────────────────────────────────
 // Load translations from the `locales/` directory at compile time.
 // English is the fallback language; all missing keys resolve to English.
-rust_i18n::i18n!("locales", fallback = "en");
+// rust-i18n expands the complete 13-catalog literal map into one startup-only
+// initializer. The catalog is intentionally complete rather than relying on
+// fallback copy, so the generated initializer can exceed Clippy's conservative
+// per-closure frame threshold. `initialize_i18n_backend` runs it once on a
+// short-lived thread with an explicit stack before the first lookup.
+#[allow(clippy::large_stack_frames)]
+mod localization_catalog {
+    rust_i18n::i18n!("locales", fallback = "en");
+
+    // The parent performs the one-time force before any catalog lookup; this
+    // deliberately crosses the otherwise private module boundary.
+    #[allow(clippy::redundant_pub_crate)]
+    pub(super) fn initialize_backend() {
+        let _ = std::sync::LazyLock::force(&_RUST_I18N_BACKEND);
+    }
+}
+use localization_catalog::*;
 
 #[allow(dead_code)]
 mod architecture;
@@ -86,7 +102,7 @@ use std::thread;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use tracing::info;
+use tracing::{error, info};
 
 /// Reverse-DNS application identifier.
 const APP_ID: &str = "io.github.tributary.Tributary";
@@ -112,6 +128,22 @@ fn dispatch_application_quit<W, CloseWindow, QuitApplication>(
 
 fn request_application_quit(app: &adw::Application) {
     dispatch_application_quit(app.active_window(), |window| window.close(), || app.quit());
+}
+
+const I18N_INITIALIZER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn initialize_i18n_backend() -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("tributary-i18n-initializer".to_string())
+        .stack_size(I18N_INITIALIZER_STACK_BYTES)
+        .spawn(|| {
+            // Force rust-i18n's generated LazyLock before a translation lookup
+            // can initialize it on a platform's smaller main-thread stack.
+            localization_catalog::initialize_backend();
+        })
+        .map_err(|error| format!("failed to start localization initializer: {error}"))?
+        .join()
+        .map_err(|_| "localization initializer stopped unexpectedly".to_string())
 }
 
 fn main() {
@@ -188,6 +220,11 @@ fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // ── i18n: detect system locale ───────────────────────────────────
+    if let Err(error) = initialize_i18n_backend() {
+        error!(%error, "Could not initialize localization data");
+        std::process::exit(1);
+    }
+
     // Normalise the system locale for rust-i18n lookup:
     // - Unify underscore separators to hyphens ("zh_CN" → "zh-CN").
     // - Try the full locale first (e.g. "zh-CN", "pt-BR") to match

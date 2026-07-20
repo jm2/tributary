@@ -17,6 +17,7 @@ mod m20260719_000012_add_track_rating;
 mod m20260719_000013_source_scoped_playlist_entries;
 mod m20260719_000014_server_playlist_links;
 mod m20260720_000015_playlist_sidebar_revision;
+mod m20260720_000016_rhythmbox_import_receipts;
 
 pub struct Migrator;
 
@@ -39,6 +40,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260719_000013_source_scoped_playlist_entries::Migration),
             Box::new(m20260719_000014_server_playlist_links::Migration),
             Box::new(m20260720_000015_playlist_sidebar_revision::Migration),
+            Box::new(m20260720_000016_rhythmbox_import_receipts::Migration),
         ]
     }
 }
@@ -48,5 +50,6 @@ impl MigratorTrait for Migrator {
 pub async fn revalidate_critical_objects(
     db: &sea_orm_migration::sea_orm::DatabaseConnection,
 ) -> Result<(), DbErr> {
-    m20260720_000015_playlist_sidebar_revision::revalidate(db).await
+    m20260720_000015_playlist_sidebar_revision::revalidate(db).await?;
+    m20260720_000016_rhythmbox_import_receipts::revalidate(db).await
 }

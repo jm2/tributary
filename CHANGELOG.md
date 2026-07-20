@@ -8,6 +8,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Rhythmbox profiles can now be migrated through a bounded, preview-first, transactional
+  workflow** ([#57](https://github.com/jm2/tributary/issues/57),
+  [#150](https://github.com/jm2/tributary/pull/150)):
+
+  - **Exact, coherent input:** choose the profile folder containing the exact direct child
+    `rhythmdb.xml` and optional `playlists.xml`. Tributary rejects a linked/reparse profile folder,
+    stamps and revalidates its stable identity, retains and revalidates each present file handle around
+    bounded reads, uses the legacy stable Windows file identity when the newer API is unavailable,
+    denies child symlinks/reparse points and changed or incoherent captures, and
+    accepts only strict UTF-8 XML 1.0 without DTDs, custom entities, processing instructions,
+    prefixed names, illegal characters, or traversal-bearing/remote/credentialed file locations.
+    Independent byte, depth, scalar, song, playlist, entry, issue, per-path, aggregate mapped-path,
+    and automatic-query limits bound work; one global preview gate prevents superseded large jobs
+    from stacking.
+  - **Non-guessing migration policy:** source locations optionally receive one exact component-wise
+    root replacement whose raw spelling contains no normalizable `.`/`..` segment, and then match
+    the current local library by exact absolute path only. Ratings and monotonic play counts are
+    enabled by default; last-played timestamps and replacing a different existing rating require
+    explicit opt-in. Invalid individual metadata scalars are reported without discarding an
+    otherwise valid source row. No title, artist, album, filename, or fuzzy similarity participates
+    in matching.
+  - **Honest playlist scope:** static playlists preserve source order and duplicate occurrences;
+    each valid unmatched occurrence remains in that position as exact path-only intent that can
+    reconcile later rather than being guessed or discarded. Queues are skipped. Automatic
+    playlists are created only for a conservative flat
+    Rhythmbox song query whose supported play-count/rating predicates have exactly equivalent
+    Tributary semantics. Rhythmbox's validated `show-browser`, `browser-position`, and
+    `search-type` source-presentation attributes are ignored and excluded from semantic receipt
+    identity because they cannot affect membership; explicit sorts, active limits, nested/mixed
+    Boolean shapes, text rules, and other unsupported predicates or attributes are reported and
+    omitted.
+  - **Actionable bounded preview:** nine independently capped report sections retain up to 100
+    deterministic details apiece plus exact omitted counts for parser issues, unmatched tracks,
+    duplicate locations, rating resolutions, name conflicts, queues, unsupported playlists, and
+    invalid or unmatched static-playlist occurrences. Paths and names are escaped and shown only
+    in the local dialog, never diagnostics. Applying a safe subset with any reported omission,
+    conflict resolution, duplicate, or preserved path-only occurrence requires an explicit
+    acknowledgement; clean previews can be applied directly.
+  - **Atomic, stale-safe, idempotent apply:** the move-only private plan revalidates exact path
+    membership, track values, and playlist-name presence after starting one database transaction.
+    Any relevant current-state difference from the captured preview evidence rejects it as stale.
+    Track and playlist writes commit all-or-none, followed last by migration 16's exact receipt
+    containing only a canonical semantic snapshot digest, importer version, and policy digest. It
+    stores no path, playlist name, source content, user choice text, or timestamp. An exact
+    retry—including a concurrent retry recognized after rollback—is a no-op and emits no duplicate
+    refresh. A successful first apply independently attempts one complete library `FullSync`, one
+    playlist-projection invalidation, and one sidebar refresh request. If that durable commit
+    succeeds but any current-view refresh leg cannot finish, a typed localized completion reports
+    the committed state and asks the user to restart rather than falsely claiming that the
+    transaction failed.
+  - **Lifecycle and privacy:** preview reads and planning use a read-only connection; cancellation
+    stops bounded capture and discards superseded parser/planner results, while an already admitted
+    mutation drains before the shutdown flush. Applying state is bound to the exact request, and
+    stale completions are ignored. Parser, plan, report, receipt, engine, and UI diagnostics redact
+    source content, paths, names, track identity, and raw database errors, including error `Debug`
+    and post-commit refresh failures. Exact code/catalog/placeholder parity covers 125 keys in all
+    13 locales. Validation passes 75 focused Rhythmbox tests; locked debug and release suites each
+    pass 20 library, 1,345 application, and 10 repository-metadata tests (1,375 total), with strict
+    Clippy in both profiles and the declared Rust 1.92 all-target compile. The complete behavior and
+    intentional omissions are recorded in the
+    [Rhythmbox migration contract](docs/rhythmbox-migration.md).
 - **P1.5 server-native playlist import and pull-sync now have their complete visible GTK
   workflow** ([#149](https://github.com/jm2/tributary/pull/149)):
 

@@ -300,6 +300,8 @@ pub fn build_header_bar() -> HeaderBarWidgets {
     // Modern GNOME primary menu (Ptyxis-style)
     let menu = gtk::gio::Menu::new();
     let section1 = gtk::gio::Menu::new();
+    let migrate_label = rust_i18n::t!("rhythmbox_migration.menu_action");
+    section1.append(Some(migrate_label.as_ref()), Some("win.migrate-rhythmbox"));
     section1.append(Some("_Preferences"), Some("win.show-preferences"));
     section1.append(Some("_About Tributary"), Some("app.about"));
     menu.append_section(None, &section1);
