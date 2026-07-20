@@ -330,7 +330,11 @@ impl PlaylistManager {
             pull.source_id(),
             pull.snapshot(),
             fallback_name,
-            authorize,
+            || {
+                let authority = authorize()?;
+                pull.accepts_commit_authority(&authority)
+                    .then_some(authority)
+            },
         )
         .await
     }
@@ -385,7 +389,11 @@ impl PlaylistManager {
             pull.source_id(),
             pull.snapshot(),
             fallback_name,
-            authorize,
+            || {
+                let authority = authorize()?;
+                pull.accepts_commit_authority(&authority)
+                    .then_some(authority)
+            },
         )
         .await
     }
@@ -461,7 +469,11 @@ impl PlaylistManager {
             pull.source_id(),
             pull.snapshot(),
             policy,
-            authorize,
+            || {
+                let authority = authorize()?;
+                pull.accepts_commit_authority(&authority)
+                    .then_some(authority)
+            },
         )
         .await
     }
@@ -609,7 +621,12 @@ impl PlaylistManager {
             ticket,
             evidence.source_id(),
             evidence.native_id(),
-            authorize,
+            || {
+                let authority = authorize()?;
+                evidence
+                    .accepts_commit_authority(&authority)
+                    .then_some(authority)
+            },
         )
         .await
     }

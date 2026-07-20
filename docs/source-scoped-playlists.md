@@ -304,12 +304,14 @@ Import Copy and Keep Synced persistence now consume a current endpoint snapshot 
 canonical `(SourceId, TrackId)` occurrences under this document's schema. Import Copy commits with
 no link and is immediately editable. Keep Synced retains a dedicated migration-14 link outside
 `playlist_entries`, permits only one mirror per exact source/native playlist identity, and makes
-ordinary playlist mutations and reconciliation reject that mirror. Pull replacement still writes
-the regular entries all-or-none in exact server order, including duplicates and track IDs absent
-from the current catalogue. Neither mode persists an endpoint, credential, locator, route, lease,
-session epoch, or raw error, and neither metadata-matches a missing server track. The complete
-direction, revision, conflict, offline, server-deletion, and unlink policy is in the server-native
-contract.
+ordinary playlist mutations and reconciliation reject that mirror; reconciliation excludes all
+links with a zero-bind database subquery rather than one host parameter per mirror. Pull replacement
+still writes the regular entries all-or-none in exact server order, including duplicates and track
+IDs absent from the current catalogue. Neither mode persists an endpoint, credential, locator,
+route, lease, session epoch, or raw error. Final commit authority is sealed to the exact pull or
+absence result that minted it, so authority from another live operation cannot authorize this
+snapshot. Neither mode metadata-matches a missing server track. The complete direction, revision,
+conflict, offline, server-deletion, and unlink policy is in the server-native contract.
 
 ## Validation matrix
 

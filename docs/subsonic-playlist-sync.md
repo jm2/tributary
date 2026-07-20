@@ -216,6 +216,12 @@ cancelled, stale, oversized, or malformed pull changes neither the last complete
 the last-success metadata. Import Copy never inserts link state. Keep Synced publishes its new
 entries, link metadata, digest, timestamp, states, and revision in one commit.
 
+Final lifecycle admission is operation-bound as well as session-bound. The commit permit acquired
+from a successful detail pull or complete-list absence carries an opaque seal for that exact result,
+and persistence compares the seal before committing. A permit acquired from another pull, another
+source, or absence evidence cannot authorize staged data even when both operations still belong to
+current sessions.
+
 ## Conflict and local-drift policy
 
 The manager refuses ordinary Add, Remove, reorder, rename, delete, smart-rule mutation, and local

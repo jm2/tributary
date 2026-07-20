@@ -189,12 +189,13 @@ before starting large protocol or transfer subsystems.
    recognition and non-lossy downgrade refusal. Import Copy is detached; Keep Synced is read-only.
    A separately compared name, frozen ordered-membership digest, orthogonal local-conflict/server-
    presence state, last-success timestamp, and revision CAS preserve the last complete snapshot and
-   reject stale durable results. Successful list/detail receipts can acquire a session-only permit
-   only after SQL staging, so pre-admission staleness rolls back and invalidation after admission
-   waits for commit. Pull, conflict, explicit Replace, complete-list missing, Unlink, and explicit
-   removal are atomic; ordinary mutation and reconciliation reject linked mirrors. Localized UI,
-   reconnect/manual scheduling, recovery presentation, and the latest-request generation lane are
-   the remaining P1.5 Record E.
+   reject stale durable results. Successful list/detail receipts can acquire an operation-bound,
+   session-only permit only after SQL staging; persistence verifies that it was minted for the same
+   sealed pull or absence result, so pre-admission staleness rolls back and invalidation after
+   admission waits for commit. Pull, conflict, explicit Replace, complete-list missing, Unlink, and
+   explicit removal are atomic; ordinary mutation and reconciliation reject linked mirrors.
+   Localized UI, reconnect/manual scheduling, recovery presentation, and the latest-request
+   generation lane are the remaining P1.5 Record E.
 
 These contracts make Rhythmbox migration and Last.fm behavior much less ambiguous.
 

@@ -55,8 +55,10 @@ Server-native Subsonic playlists use a separate authority lane. Their accepted
 Copy from a read-only pull mirror. The read foundation resolves bounded list/detail
 operations only through the exact current authenticated Subsonic adapter, epoch, and session lease,
 with pre/post network revalidation. Successful list/detail results now carry weak exact-session
-receipts which can acquire a session-only permit at a final database commit boundary. Migration 14
-and the playlist manager consume that authority for detached imports and atomic pull mirrors. This
+receipts which can acquire a session-only permit at a final database commit boundary. Each permit
+is also sealed to the exact pull or absence result, and the playlist manager rejects substitution
+of authority minted for another current operation. Migration 14 and the playlist manager consume
+that authority for detached imports and atomic pull mirrors. This
 lane does not consult the accepted music catalogue and cannot turn a returned track ID into display,
 stream, artwork, rating, or history authority.
 
@@ -837,8 +839,10 @@ deferred policy.
     commits a detached editable regular playlist; Keep Synced creates a unique read-only mirror.
     Pull, explicit Replace, complete-list missing, Unlink, and explicit local removal are all-or-none,
     while ordinary mutations and reconciliation reject linked mirrors. Existing mirrors use pre-
-    network revision tickets to prevent late durable overwrite. Exact list/detail receipts acquire a session-only permit after
-    SQL staging and retain it through commit, closing the fetch-to-commit lifecycle race without
+    network revision tickets to prevent late durable overwrite. Exact list/detail receipts acquire
+    an operation-bound, session-only permit after SQL staging; persistence verifies it belongs to
+    the same sealed pull or absence evidence and retains it through commit, closing both authority-
+    substitution and fetch-to-commit lifecycle races without
     requiring catalogue membership. Record E retains only UI/localization, reconnect/manual refresh
     scheduling, recovery presentation, and latest-request operation generations.
 

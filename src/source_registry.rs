@@ -106,6 +106,26 @@ pub struct ServerPlaylistListing {
     playlists: Vec<ServerPlaylistSummary>,
 }
 
+/// Unforgeable in-process identity for one exact successful server-playlist
+/// read result.
+///
+/// This deliberately carries no source, native playlist, session, or adapter
+/// data. Pointer identity binds a commit authority back to the exact pull or
+/// absence evidence whose lifecycle receipt admitted it, without exposing
+/// any of those values at the persistence boundary.
+#[derive(Clone)]
+struct ServerPlaylistCommitBinding(Arc<()>);
+
+impl ServerPlaylistCommitBinding {
+    fn fresh() -> Self {
+        Self(Arc::new(()))
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 impl ServerPlaylistListing {
     pub const fn source_id(&self) -> SourceId {
@@ -143,6 +163,7 @@ impl ServerPlaylistListing {
                 source_id: self.source_id,
                 native_id: native_id.clone(),
                 receipt: self.receipt.clone(),
+                commit_binding: ServerPlaylistCommitBinding::fresh(),
             })
     }
 }
@@ -164,6 +185,7 @@ pub struct ServerPlaylistPull {
     source_id: SourceId,
     snapshot: ServerPlaylistSnapshot,
     receipt: SessionOperationReceipt<dyn ManagedSourceAdapter>,
+    commit_binding: ServerPlaylistCommitBinding,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -179,6 +201,13 @@ impl ServerPlaylistPull {
     pub fn snapshot(&self) -> &ServerPlaylistSnapshot {
         &self.snapshot
     }
+
+    pub(crate) fn accepts_commit_authority(
+        &self,
+        authority: &ServerPlaylistCommitAuthority,
+    ) -> bool {
+        self.commit_binding.matches(&authority.commit_binding)
+    }
 }
 
 /// Exact native identity absent from one successful complete list.
@@ -191,6 +220,7 @@ pub struct ServerPlaylistAbsenceEvidence {
     source_id: SourceId,
     native_id: NativePlaylistId,
     receipt: SessionOperationReceipt<dyn ManagedSourceAdapter>,
+    commit_binding: ServerPlaylistCommitBinding,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -201,6 +231,13 @@ impl ServerPlaylistAbsenceEvidence {
 
     pub fn native_id(&self) -> &NativePlaylistId {
         &self.native_id
+    }
+
+    pub(crate) fn accepts_commit_authority(
+        &self,
+        authority: &ServerPlaylistCommitAuthority,
+    ) -> bool {
+        self.commit_binding.matches(&authority.commit_binding)
     }
 }
 
@@ -1003,15 +1040,18 @@ impl RegularPlaylistCommitAuthority {
 /// through a database commit.
 ///
 /// This deliberately retains no native playlist identity and no catalogue
-/// authority. Server playlist entries may remain durable while absent from
-/// the accepted music catalogue. The lifecycle permit is declared before the
-/// registry owner so final-handle teardown cannot wait on a permit owned by
-/// the value being destroyed.
+/// authority. Its opaque binding can only be matched against the exact pull
+/// or absence evidence that minted it, so unrelated current-session authority
+/// cannot admit stale or mismatched persistence input. Server playlist entries
+/// may remain durable while absent from the accepted music catalogue. The
+/// lifecycle permit is declared before the registry owner so final-handle
+/// teardown cannot wait on a permit owned by the value being destroyed.
 #[must_use = "server-playlist commit authority must be retained through the database commit"]
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct ServerPlaylistCommitAuthority {
     #[allow(dead_code)] // Retention through Drop is the authority operation.
     authority: SessionCommitAuthority,
+    commit_binding: ServerPlaylistCommitBinding,
     _registry: Arc<SourceRegistryInner>,
 }
 
@@ -1675,6 +1715,7 @@ impl SourceRegistry {
             source_id,
             snapshot,
             receipt,
+            commit_binding: ServerPlaylistCommitBinding::fresh(),
         })
     }
 
@@ -1687,7 +1728,7 @@ impl SourceRegistry {
         &self,
         pull: &ServerPlaylistPull,
     ) -> Option<ServerPlaylistCommitAuthority> {
-        self.acquire_server_playlist_commit_authority(&pull.receipt)
+        self.acquire_server_playlist_commit_authority(&pull.receipt, &pull.commit_binding)
     }
 
     /// Acquire commit-scoped authority for exact absence proven by a
@@ -1698,12 +1739,13 @@ impl SourceRegistry {
         &self,
         evidence: &ServerPlaylistAbsenceEvidence,
     ) -> Option<ServerPlaylistCommitAuthority> {
-        self.acquire_server_playlist_commit_authority(&evidence.receipt)
+        self.acquire_server_playlist_commit_authority(&evidence.receipt, &evidence.commit_binding)
     }
 
     fn acquire_server_playlist_commit_authority(
         &self,
         receipt: &SessionOperationReceipt<dyn ManagedSourceAdapter>,
+        commit_binding: &ServerPlaylistCommitBinding,
     ) -> Option<ServerPlaylistCommitAuthority> {
         let authority =
             self.inner
@@ -1713,6 +1755,7 @@ impl SourceRegistry {
                 })?;
         Some(ServerPlaylistCommitAuthority {
             authority,
+            commit_binding: commit_binding.clone(),
             _registry: Arc::clone(&self.inner),
         })
     }
@@ -3338,6 +3381,262 @@ mod tests {
                 .len(),
             baseline_count + 1
         );
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn server_playlist_persistence_requires_authority_from_the_exact_read_result() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.server_playlist_adapter("binding-primary"),
+        )
+        .await;
+
+        let listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("list primary server playlists");
+        let native_id = listing.playlists()[0].native_id().clone();
+        let first_pull = registry
+            .get_server_playlist(
+                listing
+                    .select(&native_id)
+                    .expect("select first exact playlist"),
+            )
+            .await
+            .expect("fetch first exact pull");
+        let unrelated_pull = registry
+            .get_server_playlist(
+                listing
+                    .select(&native_id)
+                    .expect("select same playlist a second time"),
+            )
+            .await
+            .expect("fetch unrelated same-session pull");
+
+        let other_source_id = SourceId::random();
+        let other_probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            other_source_id,
+            other_probe.server_playlist_adapter("binding-other-source"),
+        )
+        .await;
+        let other_listing = registry
+            .list_server_playlists(other_source_id)
+            .await
+            .expect("list other source playlists");
+        let other_native_id = other_listing.playlists()[0].native_id().clone();
+        let other_source_pull = registry
+            .get_server_playlist(
+                other_listing
+                    .select(&other_native_id)
+                    .expect("select other source playlist"),
+            )
+            .await
+            .expect("fetch other source pull");
+
+        let (manager, _baseline_id) = playlist_manager_fixture("Binding baseline").await;
+        let baseline_count = manager
+            .list_playlists()
+            .await
+            .expect("list baseline playlists")
+            .len();
+
+        assert!(matches!(
+            manager
+                .import_server_playlist_copy_if_authorized(&first_pull, "Fallback", || {
+                    registry.acquire_server_playlist_pull_commit_authority(&unrelated_pull)
+                })
+                .await
+                .expect("mismatched import authority is a typed rejection"),
+            ServerPlaylistImportOutcome::Rejected
+        ));
+        assert!(matches!(
+            manager
+                .create_server_playlist_mirror_if_authorized(&first_pull, "Fallback", || {
+                    registry.acquire_server_playlist_pull_commit_authority(&unrelated_pull)
+                })
+                .await
+                .expect("mismatched mirror authority is a typed rejection"),
+            ServerPlaylistCreateOutcome::Rejected
+        ));
+        assert!(matches!(
+            manager
+                .import_server_playlist_copy_if_authorized(&first_pull, "Fallback", || {
+                    registry.acquire_server_playlist_pull_commit_authority(&other_source_pull)
+                })
+                .await
+                .expect("other-source authority is a typed rejection"),
+            ServerPlaylistImportOutcome::Rejected
+        ));
+        assert_eq!(
+            manager
+                .list_playlists()
+                .await
+                .expect("list after rejected creates")
+                .len(),
+            baseline_count,
+            "every mismatched create must roll its staged rows back"
+        );
+
+        let created = manager
+            .create_server_playlist_mirror_if_authorized(&first_pull, "Fallback", || {
+                registry.acquire_server_playlist_pull_commit_authority(&first_pull)
+            })
+            .await
+            .expect("exactly bound mirror authority");
+        let ServerPlaylistCreateOutcome::Committed { copy, link } = created else {
+            panic!("authority from the exact pull must commit");
+        };
+        let update_ticket = manager
+            .prepare_server_playlist_sync(copy.playlist_id())
+            .await
+            .expect("prepare bound pull")
+            .expect("mirror remains linked")
+            .into_parts()
+            .1;
+        assert!(matches!(
+            manager
+                .apply_server_playlist_pull_if_authorized(
+                    update_ticket,
+                    &first_pull,
+                    ServerPlaylistPullPolicy::ReplaceLocal,
+                    || registry.acquire_server_playlist_pull_commit_authority(&unrelated_pull),
+                )
+                .await
+                .expect("mismatched sync authority is a typed rejection"),
+            ServerPlaylistPullOutcome::Rejected
+        ));
+        assert_eq!(
+            manager
+                .get_server_playlist_link(copy.playlist_id())
+                .await
+                .expect("load link after rejected sync"),
+            Some(link.clone()),
+            "mismatched sync authority must roll the staged revision back"
+        );
+
+        registry
+            .disconnect(source_id)
+            .expect("disconnect primary source")
+            .wait()
+            .await;
+        let successor_probe = FakeProbe::new(true);
+        let successor = successor_probe.server_playlist_adapter("binding-successor");
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(successor) },
+            )
+            .expect("connect primary successor");
+        let _ = wait_for_catalogue(&registry, source_id).await;
+        let successor_listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("list successor playlists");
+        let successor_pull = registry
+            .get_server_playlist(
+                successor_listing
+                    .select(&native_id)
+                    .expect("select successor playlist"),
+            )
+            .await
+            .expect("fetch successor pull");
+        assert!(matches!(
+            manager
+                .import_server_playlist_copy_if_authorized(&first_pull, "Fallback", || {
+                    registry.acquire_server_playlist_pull_commit_authority(&successor_pull)
+                })
+                .await
+                .expect("stale pull paired with current authority is rejected"),
+            ServerPlaylistImportOutcome::Rejected
+        ));
+        assert_eq!(
+            manager
+                .list_playlists()
+                .await
+                .expect("list after rejected stale import")
+                .len(),
+            baseline_count + 1
+        );
+
+        registry
+            .disconnect(source_id)
+            .expect("disconnect successor")
+            .wait()
+            .await;
+        let absent_probe = FakeProbe::new(true);
+        let mut absent_adapter = absent_probe.server_playlist_adapter("binding-absence");
+        absent_adapter.server_playlists.clear();
+        absent_adapter.server_playlist_snapshot = None;
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(absent_adapter) },
+            )
+            .expect("connect absence session");
+        let _ = wait_for_catalogue(&registry, source_id).await;
+        let empty_listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("complete empty listing");
+        let exact_absence = empty_listing
+            .prove_absent(&native_id)
+            .expect("prove exact linked identity absent");
+        let unrelated_absent_id =
+            NativePlaylistId::new("unrelated-absent-playlist").expect("unrelated native ID");
+        let unrelated_absence = empty_listing
+            .prove_absent(&unrelated_absent_id)
+            .expect("prove unrelated identity absent");
+        let absence_ticket = manager
+            .prepare_server_playlist_sync(copy.playlist_id())
+            .await
+            .expect("prepare absence")
+            .expect("mirror remains linked")
+            .into_parts()
+            .1;
+        assert!(matches!(
+            manager
+                .mark_server_playlist_missing_if_authorized(absence_ticket, &exact_absence, || {
+                    registry.acquire_server_playlist_absence_commit_authority(&unrelated_absence)
+                },)
+                .await
+                .expect("mismatched absence authority is a typed rejection"),
+            ServerPlaylistMissingOutcome::Rejected
+        ));
+        assert_eq!(
+            manager
+                .get_server_playlist_link(copy.playlist_id())
+                .await
+                .expect("load link after rejected absence"),
+            Some(link),
+            "mismatched absence authority must roll the state change back"
+        );
+
+        let exact_ticket = manager
+            .prepare_server_playlist_sync(copy.playlist_id())
+            .await
+            .expect("prepare exact absence")
+            .expect("mirror remains linked")
+            .into_parts()
+            .1;
+        assert!(matches!(
+            manager
+                .mark_server_playlist_missing_if_authorized(exact_ticket, &exact_absence, || {
+                    registry.acquire_server_playlist_absence_commit_authority(&exact_absence)
+                },)
+                .await
+                .expect("exactly bound absence authority"),
+            ServerPlaylistMissingOutcome::Marked(_)
+        ));
 
         registry.shutdown().wait().await;
     }

@@ -739,16 +739,18 @@ read-only/unsupported capability and never gain mutation authority from playlist
 Smart playlists and XSPF import/export remain local-only. Mixed-source metadata export requires a
 separate no-locator policy. Subsonic server-native playlist integration now has a pull-only
 [accepted contract](docs/subsonic-playlist-sync.md): **Import Copy** is defined to create a detached
-editable snapshot, while **Keep Synced** is defined to create an opt-in read-only server-authoritative mirror. The
-internal foundation can read bounded `getPlaylists` and `getPlaylist` responses only through the
+editable snapshot, while **Keep Synced** is defined to create an opt-in read-only server-
+authoritative mirror. The internal foundation can read bounded `getPlaylists` and `getPlaylist`
+responses only through the
 exact current authenticated Subsonic session; order and duplicates are preserved, stale sessions
 are rejected, and playlist membership grants no playback authority. Migration 14 and the internal
 playlist manager now support detached atomic imports plus unique read-only pull mirrors with exact
 order/duplicates, local-drift conflicts, revision-CAS stale-result rejection, complete-list missing
-state, Replace, Unlink, and explicit local removal. Exact-session commit permits close the gap
-between fetching and committing without persisting live authority. These engine APIs are not yet
-exposed as user actions: no import/sync controls, localized recovery state, reconnect refresh, or
-automatic scheduling ships yet. See
+state, Replace, Unlink, and explicit local removal. Exact-session commit permits are sealed to the
+specific pull or absence result being committed, closing the gap between fetching and committing
+without persisting live authority or allowing authority from another current operation to be
+substituted. These engine APIs are not yet exposed as user actions: no import/sync controls,
+localized recovery state, reconnect refresh, or automatic scheduling ships yet. See
 [P1.5](docs/task.md#p15--persist-source-scoped-playlists), the
 [source-scoped regular-playlist contract](docs/source-scoped-playlists.md), and
 [#143](https://github.com/jm2/tributary/issues/143) for the remaining delivery stages.

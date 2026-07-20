@@ -34,11 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failures have no deletion or persistence path. Unlink retains an editable local copy; explicit
   Remove Local Copy deletes the playlist and link transactionally.
   Ordinary rename, delete, Add, Remove, reorder, smart-rule mutation, and reconciliation now reject
-  linked mirrors inside their write transaction. Successful list/detail operations carry opaque
-  weak exact-session receipts rather than exposed epochs or reusable guards. Immediately before a
-  database commit, `SourceRegistry` revalidates the exact registry incarnation, source, adapter,
-  session epoch, capability, and active lease and returns a session-only permit retained through
-  commit or rollback. A stale result rolls back; replacement, disconnect, or shutdown after
+  linked mirrors inside their write transaction; reconciliation uses a zero-bind link subquery, so
+  large mirror collections cannot exceed SQLite's host-parameter limit. Successful list/detail
+  operations carry opaque weak exact-session receipts rather than exposed epochs or reusable
+  guards. Immediately before a database commit, `SourceRegistry` revalidates the exact registry
+  incarnation, source, adapter, session epoch, capability, and active lease and returns a
+  session-only permit bound to that exact sealed pull or absence result. Persistence rejects an
+  authority minted for any other operation,
+  including another current source or pull, and retains a matching permit through commit or
+  rollback. A stale result rolls back; replacement, disconnect, or shutdown after
   admission waits. This authority neither depends on nor grants music-catalogue/playback authority.
   The new raw link entity and validated link, ticket, copy, preparation, and outcome diagnostics
   redact server-controlled native identity, synchronized names, and digests.

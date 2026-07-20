@@ -7,7 +7,8 @@
 use std::collections::{HashMap, HashSet};
 
 use sea_orm::prelude::*;
-use sea_orm::{ActiveValue::Set, DatabaseTransaction, QueryOrder, QuerySelect, TransactionTrait};
+use sea_orm::sea_query::Query;
+use sea_orm::{ActiveValue::Set, DatabaseTransaction, QueryOrder, TransactionTrait};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -991,20 +992,7 @@ impl PlaylistManager {
     /// Returns the number of entries re-linked.
     pub async fn reconcile_all(&self) -> Result<u32, DbErr> {
         let txn = self.db.begin().await?;
-        let linked_playlist_ids: Vec<String> = server_playlist_link::Entity::find()
-            .select_only()
-            .column(server_playlist_link::Column::PlaylistId)
-            .into_tuple()
-            .all(&txn)
-            .await?;
-        let mut orphan_query = playlist_entry::Entity::find()
-            .filter(playlist_entry::Column::SourceId.eq(SourceId::local().to_string()))
-            .filter(playlist_entry::Column::LocalTrackId.is_null());
-        if !linked_playlist_ids.is_empty() {
-            orphan_query = orphan_query
-                .filter(playlist_entry::Column::PlaylistId.is_not_in(linked_playlist_ids));
-        }
-        let orphans = orphan_query.all(&txn).await?;
+        let orphans = orphan_reconciliation_query().all(&txn).await?;
 
         if orphans.is_empty() {
             txn.commit().await?;
@@ -1130,6 +1118,23 @@ impl PlaylistManager {
         info!(count = created.len(), "Default smart playlists seeded");
         Ok(created)
     }
+}
+
+fn orphan_reconciliation_query() -> sea_orm::Select<playlist_entry::Entity> {
+    playlist_entry::Entity::find()
+        .filter(playlist_entry::Column::SourceId.eq(SourceId::local().to_string()))
+        .filter(playlist_entry::Column::LocalTrackId.is_null())
+        // Keep this exclusion inside SQLite. Binding every linked ID to one
+        // `NOT IN (...)` expression eventually exceeds SQLite's host-parameter
+        // limit for large server libraries.
+        .filter(
+            playlist_entry::Column::PlaylistId.not_in_subquery(
+                Query::select()
+                    .column(server_playlist_link::Column::PlaylistId)
+                    .from(server_playlist_link::Entity)
+                    .to_owned(),
+            ),
+        )
 }
 
 fn recently_played_default_rules() -> smart_rules::SmartRules {
@@ -1368,16 +1373,17 @@ fn now_rfc3339() -> String {
 mod tests {
     use sea_orm::{
         ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, Database,
-        DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
+        DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QueryTrait,
     };
     use sea_orm_migration::MigratorTrait;
 
     use super::{
-        recently_played_default_rules, top_25_most_played_default_rules, LocalPlaylistExport,
-        PlaylistEntryAddOutcome, PlaylistEntryInput, PlaylistManager, StoredPlaylistEntry,
+        orphan_reconciliation_query, recently_played_default_rules,
+        top_25_most_played_default_rules, LocalPlaylistExport, PlaylistEntryAddOutcome,
+        PlaylistEntryInput, PlaylistManager, StoredPlaylistEntry,
     };
     use crate::architecture::{MediaKey, SourceId, TrackId};
-    use crate::db::entities::{playlist, playlist_entry, track};
+    use crate::db::entities::{playlist, playlist_entry, server_playlist_link, track};
     use crate::db::migration::Migrator;
     use crate::local::playlist_io::ImportedTrack;
     use crate::local::smart_rules;
@@ -2746,6 +2752,107 @@ mod tests {
                 .await
                 .expect("repeat reconciliation"),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_scales_past_sqlite_bind_limit_and_skips_linked_playlists() {
+        const LINKED_PLAYLIST_COUNT: usize = 1_001;
+        const INSERT_BATCH_SIZE: usize = 40;
+        const REMOTE_SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+        let statement = orphan_reconciliation_query().build(DatabaseBackend::Sqlite);
+        assert_eq!(
+            statement.values.map_or(0, |values| values.0.len()),
+            1,
+            "link exclusion must add no host parameters beyond the local source filter"
+        );
+
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+
+        // Keep fixture writes below SQLite's historical 999-parameter limit;
+        // the production query itself must remain independent of link count.
+        for batch_start in (0..LINKED_PLAYLIST_COUNT).step_by(INSERT_BATCH_SIZE) {
+            let batch_end = (batch_start + INSERT_BATCH_SIZE).min(LINKED_PLAYLIST_COUNT);
+            let playlists = (batch_start..batch_end).map(|index| playlist::ActiveModel {
+                id: Set(format!("linked-playlist-{index}")),
+                name: Set(format!("Linked playlist {index}")),
+                is_smart: Set(false),
+                smart_rules_json: Set(None),
+                limit_enabled: Set(false),
+                limit_value: Set(None),
+                limit_unit: Set(None),
+                limit_sort: Set(None),
+                match_mode: Set("all".to_string()),
+                live_updating: Set(true),
+                created_at: Set("2026-07-20T00:00:00Z".to_string()),
+                updated_at: Set("2026-07-20T00:00:00Z".to_string()),
+            });
+            playlist::Entity::insert_many(playlists)
+                .exec(&db)
+                .await
+                .expect("insert linked playlist batch");
+
+            let links = (batch_start..batch_end).map(|index| server_playlist_link::ActiveModel {
+                playlist_id: Set(format!("linked-playlist-{index}")),
+                source_id: Set(REMOTE_SOURCE_ID.to_string()),
+                native_playlist_id: Set(format!("native-playlist-{index}")),
+                mode: Set(server_playlist_link::SERVER_PLAYLIST_LINK_MODE.to_string()),
+                last_synced_name: Set(format!("Linked playlist {index}")),
+                digest_version: Set(server_playlist_link::SERVER_PLAYLIST_DIGEST_VERSION),
+                membership_digest: Set(vec![0; server_playlist_link::SERVER_PLAYLIST_DIGEST_BYTES]),
+                last_success_at_ms: Set(0),
+                local_state: Set("clean".to_string()),
+                remote_state: Set("present".to_string()),
+                state_revision: Set(0),
+            });
+            server_playlist_link::Entity::insert_many(links)
+                .exec(&db)
+                .await
+                .expect("insert server-playlist link batch");
+        }
+
+        let ordinary = manager
+            .create_playlist("Ordinary orphan", false)
+            .await
+            .expect("create ordinary playlist");
+        insert_entry(&db, "linked-playlist-0", "linked-orphan", 0).await;
+        insert_entry(&db, &ordinary.id, "ordinary-orphan", 0).await;
+        let replacement = insert_track(
+            &db,
+            "replacement",
+            "/music/replacement.flac",
+            "placeholder",
+            "placeholder",
+            "",
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            manager
+                .reconcile_all()
+                .await
+                .expect("reconcile with more than 999 links"),
+            1
+        );
+        assert!(playlist_entry::Entity::find_by_id("linked-orphan")
+            .one(&db)
+            .await
+            .expect("load linked orphan")
+            .expect("linked orphan remains")
+            .local_track_id
+            .is_none());
+        assert_eq!(
+            playlist_entry::Entity::find_by_id("ordinary-orphan")
+                .one(&db)
+                .await
+                .expect("load ordinary orphan")
+                .expect("ordinary orphan remains")
+                .local_track_id
+                .as_deref(),
+            Some(replacement.id.as_str())
         );
     }
 
