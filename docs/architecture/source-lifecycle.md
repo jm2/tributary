@@ -8,9 +8,9 @@
   mixed-source Add/Remove/render/Play without reopening P3.1. P1.5 Record C separately adds a
   Subsonic-only, exact-session authority for bounded server-native playlist reads; it grants no
   catalogue or playback authority and persists nothing. Record D consumes sealed read authority
-  in atomic link persistence, while Record E now has a GTK-free latest-request coordinator,
-  exact-observed-session reconnect scheduling, post-staging joint admission, and shutdown drain.
-  Its browser and visible accessible action wiring remain open.
+  in atomic link persistence, while Record E completes the GTK-free latest-request coordinator,
+  exact-observed-session reconnect scheduling, post-staging joint admission, tokenized virtual
+  browser, visible accessible recovery wiring, and ordered shutdown drain.
 - Decision date: 2026-07-17
 - Historical tracker:
   [P3.1](../task-remediation-2026-07.md#p31-introduce-a-sourcesession-registry)
@@ -65,14 +65,18 @@ that authority for detached imports and atomic pull mirrors. This
 lane does not consult the accepted music catalogue and cannot turn a returned track ID into display,
 stream, artwork, rating, or history authority.
 
-The headless Record E lifecycle composes that lane without widening it. A typed coordinator orders
+The Record E lifecycle composes that lane without widening it. A typed coordinator orders
 source discovery, exact remote playlist, and durable local mirror work; same-key successors wait
 through admitted task and guard settlement while unrelated keys remain concurrent. Reconnect reads
 only through the session epoch captured in an atomic lifecycle baseline, schedules each accepted
 epoch once, prepares durable tickets before one indexed complete list, and bounds local fan-out to
 eight. Coordinator admission and exact registry authority meet only after SQL staging. Shutdown
 closes coordinator admission before source revocation and drains admitted work through a persistent
-barrier. All coordinator authority remains process-local and absent from GTK.
+barrier. A bounded latest-only browser broker separately retains native playlist identity, exact
+selections, receipts, and coordinator keys behind opaque one-shot GTK tokens. Its listing lane does
+not cancel reconnect discovery. The visible recovery controller retains only the already-published
+local playlist ID, uses targetless actions, and generation-gates inspection and completion state.
+All coordinator and exact-session authority remains process-local and absent from GTK.
 
 The implementation has now converged on this boundary. PR #120 implements stable identity, PR #121
 adds retained local file authority through output consumption, and PR #122 introduces the generic
@@ -784,10 +788,10 @@ transaction-local SQLite triggers and one coherent revisioned publisher cover sc
 ordinary CRUD, raw writes to those domain tables, cascades, and server-link changes; GTK consumes
 only complete strictly newer snapshots. The GTK-free latest-request coordinator, exact-epoch
 reconnect scheduler, indexed bounded fan-out, post-staging joint admission, redacted manual
-completion facade, and shutdown drain are now implemented. The virtualized browser, opaque Import
-Copy/Keep Synced tokens, visible accessible recovery controls, and their end-to-end GTK coverage
-remain the final deferred P1.5 work. Mixed-source XSPF metadata export remains a separate deferred
-policy.
+completion facade, and shutdown drain are now implemented. The virtualized latest-only browser,
+opaque revocable Import Copy/Keep Synced tokens, visible accessible recovery controls, reconciled
+source invalidation, stale-result rejection, and window/broker shutdown wiring complete P1.5 Record
+E. Mixed-source XSPF metadata export remains a separate deferred policy.
 
 ## Implementation sequence
 
@@ -904,19 +908,31 @@ policy.
     Post-staging coordinator admission and exact registry authority are retained together through
     detached commit. A redacted headless completion facade covers Sync/Retry/Replace/Unlink/Remove,
     and coordinator admission closes before source shutdown while a persistent barrier drains
-    admitted work. Record E remains open for the virtualized browser, opaque Import Copy/Keep
-    Synced tokens, and visible accessible GTK recovery wiring.
+    admitted work. At this delivery boundary, Record E still retained the virtualized browser,
+    opaque Import Copy/Keep Synced tokens, and visible accessible GTK recovery wiring.
+15. **Server-native browser and visible recovery complete:** the Playlists menu opens one
+    virtualized list over current `PullSnapshots` sources. An independent latest-only broker owns
+    exact native IDs, endpoint selections, session receipts, and coordinator keys; GTK receives
+    only bounded display hints and opaque, non-serializable session/action tokens. Reload, close,
+    lifecycle replacement, and shutdown make stale tokens fail closed; one-shot actions are consumed
+    only after bounded capacity accepts them, then re-enter the exact remote coordinator lane and final
+    registry/manager admission. Successful commits request the authoritative full sidebar snapshot
+    instead of patching GTK. The selected linked mirror exposes localized targetless Sync Now,
+    Retry, Replace, Unlink, and Remove actions by re-resolving the exact current local playlist ID,
+    with destructive confirmations, capability sensitivity, generation-gated results,
+    virtualization, accessible busy/focus state, and deterministic teardown. This remains pull-only:
+    it adds no server create, update, or delete operation and grants no catalogue/playback authority.
 
-The server-playlist coordinator/reconnect slice passes 71 focused server-playlist tests plus real
-empty-, one-, and nine-mirror coordinator/registry/database/sidebar integrations. Deterministic
-coverage pins atomic direct-request ordering against delayed fan-out, same-key admitted drain,
-displaced pending completion, zero-list behavior with no links, exact-session
-presence/detail-failure/absence handling, one shared listing, and a measured eight-operation limit
-that holds the ninth exact-ID mirror until a slot finishes. Locked debug and release suites each
-pass 20 library, 1,249 application, and 10 repository-contract tests (1,279 total). Strict
-all-target/all-feature Clippy passes in both profiles; Rust 1.92
-all-target checking, formatting, whitespace, and independent code/privacy/documentation review are
-also green.
+Both debug and release validation pass 92 focused server-playlist/browser/recovery tests, including
+real empty-, one-, and nine-mirror coordinator/registry/database/sidebar integrations.
+Deterministic coverage pins atomic direct-request ordering against delayed fan-out, same-key
+admitted drain, displaced pending completion, zero-list behavior with no links, exact-session
+presence/detail-failure/absence handling, one shared listing, the measured eight-operation limit,
+opaque-token revocation/consumption/capacity, same-name exact-ID isolation, stale GTK results,
+reconciled lifecycle presentation, visible recovery sensitivity, and shutdown drain. Locked debug
+and release suites each pass 1,300 tests. Strict all-target/all-feature Clippy passes in both
+profiles; Rust 1.92 all-target checking, formatting, whitespace, and independent
+code/privacy/accessibility/documentation review are also green.
 
 The authenticated-remote cutover's locked debug and release suites each passed 20 library, 865
 application, and 10 repository-metadata tests (895 total), with locked all-target/all-feature

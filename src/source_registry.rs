@@ -1636,6 +1636,28 @@ impl SourceRegistry {
         }
     }
 
+    /// Inspect the server-playlist capability of the exact current session.
+    ///
+    /// This is an in-memory capability gate only: it performs no adapter or
+    /// network operation and exposes neither the adapter nor its session
+    /// epoch. `None` means no exact active session is currently available.
+    pub(crate) fn current_server_playlist_session(
+        &self,
+        source_id: SourceId,
+    ) -> Option<(u64, ServerPlaylistCapability)> {
+        self.inner
+            .lifecycle
+            .inspect_active_session(source_id, ManagedSourceAdapter::server_playlist_capability)
+    }
+
+    pub(crate) fn current_server_playlist_capability(
+        &self,
+        source_id: SourceId,
+    ) -> Option<ServerPlaylistCapability> {
+        self.current_server_playlist_session(source_id)
+            .map(|(_, capability)| capability)
+    }
+
     /// List server-owned playlists through one exact active source session.
     ///
     /// Capability defaults to denied and is checked on the adapter captured
@@ -2268,6 +2290,7 @@ mod tests {
     use tokio::runtime::Handle;
     use tokio::sync::{oneshot, watch};
     use tokio::time::{timeout, Duration};
+    use tokio_util::sync::CancellationToken;
     use url::Url;
     use uuid::Uuid;
 
@@ -2280,6 +2303,11 @@ mod tests {
         PlaylistEntryAddOutcome, PlaylistEntryInput, PlaylistManager, ServerPlaylistCreateOutcome,
         ServerPlaylistImportOutcome, ServerPlaylistLocalState, ServerPlaylistMissingOutcome,
         ServerPlaylistPullOutcome, ServerPlaylistPullPolicy, ServerPlaylistRemoteState,
+    };
+    use crate::local::server_playlist_browser::{
+        run_server_playlist_browser, server_playlist_browser_channel, ServerPlaylistBrowseOutcome,
+        ServerPlaylistBrowserActionOutcome, ServerPlaylistBrowserRequestStatus,
+        MAX_SERVER_PLAYLIST_BROWSER_ACTIONS,
     };
     use crate::local::server_playlist_runtime::{
         run_server_playlist_reconnect_observer, ServerPlaylistOperationOutcome,
@@ -2925,6 +2953,31 @@ mod tests {
             )
             .expect("playlist fixture admitted");
         wait_for_catalogue(registry, source_id).await
+    }
+
+    fn browser_playlist_snapshot(
+        native_id: &str,
+        name: &str,
+        track_id: &str,
+    ) -> ServerPlaylistSnapshot {
+        ServerPlaylistSnapshot::new(
+            NativePlaylistId::new(native_id).expect("browser native playlist ID"),
+            Some(name.to_string()),
+            Some("browser fixture owner".to_string()),
+            Some(1),
+            vec![TrackId::remote(track_id).expect("browser track ID")],
+        )
+        .expect("browser playlist snapshot")
+    }
+
+    async fn wait_for_server_playlist_snapshot_calls(probe: &FakeProbe, expected: usize) {
+        timeout(Duration::from_secs(2), async {
+            while probe.server_playlist_snapshot_calls.load(Ordering::Acquire) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected server-playlist detail calls");
     }
 
     fn available(resolution: &RegularPlaylistTrackResolution) -> &RegularPlaylistTrack {
@@ -6584,5 +6637,497 @@ mod tests {
             .sources
             .into_iter()
             .all(|(_, snapshot)| !snapshot.provenance.contains(SourceProvenance::External)));
+    }
+
+    #[tokio::test]
+    async fn server_playlist_browser_binds_exact_ids_and_revokes_tokens() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect browser database");
+        Migrator::up(&database, None)
+            .await
+            .expect("migrate browser database");
+        let manager = PlaylistManager::new(database.clone());
+        let registry = registry();
+        let source_id = SourceId::random();
+        let probe = FakeProbe::new(true);
+        probe.server_playlist_release.send_replace(false);
+        let snapshots = vec![
+            browser_playlist_snapshot("native-a", "Same name", "track-a"),
+            browser_playlist_snapshot("native-b", "Same name", "track-b"),
+        ];
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.server_playlist_adapter_with_snapshots("browser-exact", snapshots),
+        )
+        .await;
+
+        let (refresh, _refresh_rx) =
+            crate::local::playlist_sidebar::playlist_sidebar_refresh_channel();
+        let (coordinator, coordinator_shutdown) =
+            crate::server_playlist_coordinator::spawn_server_playlist_coordinator();
+        let (browser, browser_rx) = server_playlist_browser_channel();
+        let browser_shutdown = CancellationToken::new();
+        let browser_owner = tokio::spawn(run_server_playlist_browser(
+            browser_rx,
+            database,
+            coordinator.clone(),
+            registry.clone(),
+            refresh.clone(),
+            browser_shutdown,
+        ));
+
+        let first_browse = browser.browse(source_id, "Fallback");
+        timeout(Duration::from_secs(2), async {
+            while probe.server_playlist_list_calls.load(Ordering::Acquire) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first browser listing starts");
+        // Keep B and C in one uninterrupted producer turn. This specifically
+        // proves replacement of an already-queued pending browse; a
+        // multi-thread runtime may otherwise let A's cancellation settle and
+        // legitimately start B in the instant between these two synchronous
+        // submissions.
+        let replaced_pending_browse = browser.browse(source_id, "Fallback");
+        let latest_browse = browser.browse(source_id, "Fallback");
+        assert!(matches!(
+            timeout(Duration::from_secs(2), replaced_pending_browse.completion())
+                .await
+                .expect("replaced pending browse settles"),
+            ServerPlaylistBrowseOutcome::Superseded
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(2), first_browse.completion())
+                .await
+                .expect("superseded browse settles"),
+            ServerPlaylistBrowseOutcome::Superseded
+        ));
+        probe.server_playlist_release.send_replace(true);
+        let ServerPlaylistBrowseOutcome::Ready(snapshot) = latest_browse.completion().await else {
+            panic!("latest browser listing should publish");
+        };
+        assert_eq!(
+            probe.server_playlist_list_calls.load(Ordering::Acquire),
+            2,
+            "queued B/C must leave one active listing and only the latest pending request"
+        );
+        assert_eq!(snapshot.entries().len(), 2);
+        let redacted = format!("{:?}", ServerPlaylistBrowseOutcome::Ready(snapshot.clone()));
+        assert!(!redacted.contains("Same name"));
+        assert!(!redacted.contains("browser fixture owner"));
+        assert!(!redacted.contains("native-a"));
+        assert!(!redacted.contains("native-b"));
+
+        let stale_unused = snapshot.entries()[0].action_token();
+        let imported = snapshot.entries()[1].action_token();
+        assert_eq!(
+            browser.import_copy(imported.clone()).completion().await,
+            ServerPlaylistBrowserActionOutcome::Imported
+        );
+        let playlists = manager
+            .list_playlists()
+            .await
+            .expect("list exact browser import");
+        assert_eq!(playlists.len(), 1);
+        let entries = manager
+            .get_playlist_entries(&playlists[0].id)
+            .await
+            .expect("load exact browser import");
+        assert_eq!(
+            entries[0].track_id.as_ref().map(TrackId::as_str),
+            Some("track-b"),
+            "the second same-name token must preserve its exact native identity"
+        );
+
+        let ServerPlaylistBrowseOutcome::Ready(relisted) =
+            browser.browse(source_id, "Fallback").completion().await
+        else {
+            panic!("relisting should publish fresh tokens");
+        };
+        assert_eq!(
+            browser.import_copy(stale_unused).completion().await,
+            ServerPlaylistBrowserActionOutcome::Rejected,
+            "relisting revokes unused predecessor tokens"
+        );
+        assert_eq!(
+            browser.import_copy(imported).completion().await,
+            ServerPlaylistBrowserActionOutcome::Rejected,
+            "accepted action tokens are one-shot"
+        );
+        assert_eq!(
+            browser
+                .import_copy(relisted.entries()[0].action_token())
+                .completion()
+                .await,
+            ServerPlaylistBrowserActionOutcome::Imported,
+            "relisting mints fresh usable tokens"
+        );
+        assert_eq!(
+            browser.close_session(relisted.session_token()),
+            ServerPlaylistBrowserRequestStatus::Queued
+        );
+        assert_eq!(
+            browser
+                .import_copy(relisted.entries()[1].action_token())
+                .completion()
+                .await,
+            ServerPlaylistBrowserActionOutcome::Rejected,
+            "closing the exact session revokes every remaining token"
+        );
+
+        browser.close();
+        timeout(Duration::from_secs(2), browser_owner)
+            .await
+            .expect("browser owner drains")
+            .expect("browser owner joins");
+        coordinator.close();
+        coordinator_shutdown
+            .shutdown()
+            .await
+            .expect("browser coordinator drains");
+        refresh.close();
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_playlist_browser_gates_capability_and_listing_size() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect browser gate database");
+        let registry = registry();
+        let unsupported_source = SourceId::random();
+        let unsupported_probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            unsupported_source,
+            unsupported_probe.adapter("browser-unsupported"),
+        )
+        .await;
+
+        let oversized_source = SourceId::random();
+        let oversized_probe = FakeProbe::new(true);
+        let mut oversized = oversized_probe.server_playlist_adapter("browser-oversized");
+        let summary = oversized.server_playlists[0].clone();
+        oversized.server_playlists =
+            vec![summary; crate::architecture::MAX_SERVER_PLAYLISTS_PER_LIST + 1];
+        connect_playlist_fixture(&registry, oversized_source, oversized).await;
+
+        let (refresh, _refresh_rx) =
+            crate::local::playlist_sidebar::playlist_sidebar_refresh_channel();
+        let (coordinator, coordinator_shutdown) =
+            crate::server_playlist_coordinator::spawn_server_playlist_coordinator();
+        let (browser, browser_rx) = server_playlist_browser_channel();
+        let browser_owner = tokio::spawn(run_server_playlist_browser(
+            browser_rx,
+            database,
+            coordinator.clone(),
+            registry.clone(),
+            refresh.clone(),
+            CancellationToken::new(),
+        ));
+
+        assert!(matches!(
+            browser
+                .browse(unsupported_source, "Fallback")
+                .completion()
+                .await,
+            ServerPlaylistBrowseOutcome::Unsupported
+        ));
+        assert_eq!(
+            unsupported_probe
+                .server_playlist_list_calls
+                .load(Ordering::Acquire),
+            0,
+            "the typed capability gate must reject before adapter work"
+        );
+        assert!(matches!(
+            browser
+                .browse(oversized_source, "Fallback")
+                .completion()
+                .await,
+            ServerPlaylistBrowseOutcome::Failed
+        ));
+        assert_eq!(
+            oversized_probe
+                .server_playlist_list_calls
+                .load(Ordering::Acquire),
+            1
+        );
+
+        browser.close();
+        timeout(Duration::from_secs(2), browser_owner)
+            .await
+            .expect("gate browser owner drains")
+            .expect("gate browser owner joins");
+        coordinator.close();
+        coordinator_shutdown
+            .shutdown()
+            .await
+            .expect("gate coordinator drains");
+        refresh.close();
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_playlist_browser_capacity_preserves_the_ninth_token() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect browser capacity database");
+        Migrator::up(&database, None)
+            .await
+            .expect("migrate browser capacity database");
+        let registry = registry();
+        let source_id = SourceId::random();
+        let probe = FakeProbe::new(true);
+        probe.server_playlist_snapshot_release.send_replace(false);
+        let snapshots = (0..=MAX_SERVER_PLAYLIST_BROWSER_ACTIONS)
+            .map(|index| {
+                browser_playlist_snapshot(
+                    &format!("capacity-native-{index}"),
+                    "Capacity",
+                    &format!("capacity-track-{index}"),
+                )
+            })
+            .collect();
+        let secret = "browser-detail-secret-must-not-escape".to_string();
+        let mut adapter =
+            probe.server_playlist_adapter_with_snapshots("browser-capacity", snapshots);
+        adapter.server_playlist_snapshot_failure = Some(secret.clone());
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+
+        let (refresh, _refresh_rx) =
+            crate::local::playlist_sidebar::playlist_sidebar_refresh_channel();
+        let (coordinator, coordinator_shutdown) =
+            crate::server_playlist_coordinator::spawn_server_playlist_coordinator();
+        let (browser, browser_rx) = server_playlist_browser_channel();
+        let browser_owner = tokio::spawn(run_server_playlist_browser(
+            browser_rx,
+            database,
+            coordinator.clone(),
+            registry.clone(),
+            refresh.clone(),
+            CancellationToken::new(),
+        ));
+        let ServerPlaylistBrowseOutcome::Ready(snapshot) =
+            browser.browse(source_id, "Fallback").completion().await
+        else {
+            panic!("capacity listing should publish");
+        };
+        let tokens = snapshot
+            .entries()
+            .iter()
+            .map(|entry| entry.action_token())
+            .collect::<Vec<_>>();
+        assert_eq!(tokens.len(), MAX_SERVER_PLAYLIST_BROWSER_ACTIONS + 1);
+
+        let mut admitted = Vec::with_capacity(MAX_SERVER_PLAYLIST_BROWSER_ACTIONS);
+        for token in tokens.iter().take(MAX_SERVER_PLAYLIST_BROWSER_ACTIONS) {
+            admitted.push(browser.import_copy(token.clone()));
+        }
+        wait_for_server_playlist_snapshot_calls(&probe, MAX_SERVER_PLAYLIST_BROWSER_ACTIONS).await;
+        let ninth = browser.import_copy(tokens[MAX_SERVER_PLAYLIST_BROWSER_ACTIONS].clone());
+        assert_eq!(ninth.status(), ServerPlaylistBrowserRequestStatus::Queued);
+        assert_eq!(
+            ninth.completion().await,
+            ServerPlaylistBrowserActionOutcome::Busy
+        );
+
+        probe.server_playlist_snapshot_release.send_replace(true);
+        for action in admitted {
+            let outcome = action.completion().await;
+            assert_eq!(outcome, ServerPlaylistBrowserActionOutcome::Failed);
+            assert!(!format!("{outcome:?}").contains(&secret));
+        }
+        assert_eq!(
+            browser
+                .import_copy(tokens[MAX_SERVER_PLAYLIST_BROWSER_ACTIONS].clone())
+                .completion()
+                .await,
+            ServerPlaylistBrowserActionOutcome::Failed,
+            "Busy must leave the ninth one-shot token available for retry"
+        );
+        assert_eq!(
+            probe.server_playlist_snapshot_calls.load(Ordering::Acquire),
+            MAX_SERVER_PLAYLIST_BROWSER_ACTIONS + 1
+        );
+
+        browser.close();
+        timeout(Duration::from_secs(2), browser_owner)
+            .await
+            .expect("capacity browser owner drains")
+            .expect("capacity browser owner joins");
+        coordinator.close();
+        coordinator_shutdown
+            .shutdown()
+            .await
+            .expect("capacity coordinator drains");
+        refresh.close();
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_playlist_browser_shutdown_cancels_and_drains_an_action() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect browser shutdown database");
+        Migrator::up(&database, None)
+            .await
+            .expect("migrate browser shutdown database");
+        let registry = registry();
+        let source_id = SourceId::random();
+        let probe = FakeProbe::new(true);
+        probe.server_playlist_snapshot_release.send_replace(false);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.server_playlist_adapter("browser-shutdown"),
+        )
+        .await;
+
+        let (refresh, _refresh_rx) =
+            crate::local::playlist_sidebar::playlist_sidebar_refresh_channel();
+        let (coordinator, coordinator_shutdown) =
+            crate::server_playlist_coordinator::spawn_server_playlist_coordinator();
+        let (browser, browser_rx) = server_playlist_browser_channel();
+        let browser_shutdown = CancellationToken::new();
+        let browser_owner = tokio::spawn(run_server_playlist_browser(
+            browser_rx,
+            database,
+            coordinator.clone(),
+            registry.clone(),
+            refresh.clone(),
+            browser_shutdown.clone(),
+        ));
+        let ServerPlaylistBrowseOutcome::Ready(snapshot) =
+            browser.browse(source_id, "Fallback").completion().await
+        else {
+            panic!("shutdown listing should publish");
+        };
+        let action = browser.import_copy(snapshot.entries()[0].action_token());
+        wait_for_server_playlist_snapshot_calls(&probe, 1).await;
+        browser_shutdown.cancel();
+        assert_eq!(
+            timeout(Duration::from_secs(2), action.completion())
+                .await
+                .expect("cancelled action settles"),
+            ServerPlaylistBrowserActionOutcome::Closed
+        );
+        timeout(Duration::from_secs(2), browser_owner)
+            .await
+            .expect("shutdown browser owner drains")
+            .expect("shutdown browser owner joins");
+        assert!(browser.is_closed());
+
+        coordinator.close();
+        coordinator_shutdown
+            .shutdown()
+            .await
+            .expect("shutdown coordinator drains");
+        refresh.close();
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_playlist_link_inspection_is_redacted_and_in_memory() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect inspection database");
+        Migrator::up(&database, None)
+            .await
+            .expect("migrate inspection database");
+        let manager = PlaylistManager::new(database.clone());
+        let registry = registry();
+        let source_id = SourceId::random();
+        let probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.server_playlist_adapter("browser-inspection"),
+        )
+        .await;
+
+        let (refresh, _refresh_rx) =
+            crate::local::playlist_sidebar::playlist_sidebar_refresh_channel();
+        let (coordinator, coordinator_shutdown) =
+            crate::server_playlist_coordinator::spawn_server_playlist_coordinator();
+        let operations = ServerPlaylistOperations::new(
+            database.clone(),
+            coordinator.clone(),
+            registry.clone(),
+            refresh.clone(),
+        );
+        assert_eq!(
+            operations.inspect_link("not-linked").await,
+            crate::local::server_playlist_runtime::ServerPlaylistLinkInspection::NotLinked
+        );
+
+        let (browser, browser_rx) = server_playlist_browser_channel();
+        let browser_owner = tokio::spawn(run_server_playlist_browser(
+            browser_rx,
+            database,
+            coordinator.clone(),
+            registry.clone(),
+            refresh.clone(),
+            CancellationToken::new(),
+        ));
+        let ServerPlaylistBrowseOutcome::Ready(snapshot) =
+            browser.browse(source_id, "Fallback").completion().await
+        else {
+            panic!("inspection listing should publish");
+        };
+        assert_eq!(
+            browser
+                .keep_synced(snapshot.entries()[0].action_token())
+                .completion()
+                .await,
+            ServerPlaylistBrowserActionOutcome::Linked
+        );
+        let links = manager
+            .list_server_playlist_links(source_id)
+            .await
+            .expect("load inspection link");
+        assert_eq!(links.len(), 1);
+        let playlist_id = links[0].playlist_id.clone();
+        assert_eq!(
+            operations.inspect_link(&playlist_id).await,
+            crate::local::server_playlist_runtime::ServerPlaylistLinkInspection::Linked {
+                available: true
+            }
+        );
+        let list_calls = probe.server_playlist_list_calls.load(Ordering::Acquire);
+        probe
+            .server_playlist_capability_enabled
+            .store(false, Ordering::Release);
+        assert_eq!(
+            operations.inspect_link(&playlist_id).await,
+            crate::local::server_playlist_runtime::ServerPlaylistLinkInspection::Linked {
+                available: false
+            }
+        );
+        assert_eq!(
+            probe.server_playlist_list_calls.load(Ordering::Acquire),
+            list_calls,
+            "link inspection must not issue a network listing"
+        );
+
+        browser.close();
+        timeout(Duration::from_secs(2), browser_owner)
+            .await
+            .expect("inspection browser owner drains")
+            .expect("inspection browser owner joins");
+        coordinator.close();
+        assert_eq!(
+            operations.inspect_link(&playlist_id).await,
+            crate::local::server_playlist_runtime::ServerPlaylistLinkInspection::Closed
+        );
+        coordinator_shutdown
+            .shutdown()
+            .await
+            .expect("inspection coordinator drains");
+        refresh.close();
+        registry.shutdown().wait().await;
     }
 }

@@ -23,35 +23,29 @@ state.
 - Do not treat the order below as a release promise. It is a dependency-aware starting order and
   can change as issues receive product decisions and milestones.
 
-Current status: **12/38 (31.6%)** active implementation records complete. This percentage measures
+Current status: **13/38 (34.2%)** active implementation records complete. This percentage measures
 checklist completion, not equal engineering effort: several P3 records are deliberately large
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
 ## Current focus
 
-P1.1, P1.2, all three P1.3 playback-history records, both P1.4 rating records, and P1.5 through
-server-native link persistence and the atomic pull-sync engine are complete. Record E is now being
-delivered in reviewable UI/lifecycle slices. Its structural groundwork replaces translated-label
-and backend-string identity with typed header/playlist state, prevents ordinary edit affordances
-from reaching linked mirrors, and reserves a separate localized, accessible footer shell for
-durable sync/recovery state instead of overloading the continually updated track-count label.
-Its follow-up durable revision lane makes every current playlist-sidebar mutation producer
-converge through strictly increasing complete joined snapshots rather than scan replacements plus
-partial CRUD callbacks. SQLite triggers cover parents, links, cascades, and raw writes to those
-tables; a lifecycle-owned publisher coalesces hints, polls for lost hints, and GTK rejects equal or
-older delivery. The latest lifecycle slice adds a GTK-free, same-key-serialized coordinator,
-exact-observed-session reconnect scheduling, bounded indexed fan-out, joint post-staging admission,
-a redacted manual completion facade, and shutdown drain without placing native identity in GTK.
+P1.1 through P1.5 are complete. Record E closes the source-scoped-playlist foundation with a
+localized virtualized server-playlist browser, opaque one-shot Import Copy/Keep Synced tokens, and
+visible Sync Now/conflict/missing/failure/offline recovery controls. Browser listing is independent
+of reconnect recovery, exact native identity remains Tokio-owned, manager writes still require
+post-staging coordinator and source-session authority, and committed changes converge through the
+durable full-sidebar publisher. Linked mirrors remain read-only; the accepted
+[`subsonic-playlist-sync.md`](subsonic-playlist-sync.md) contract remains pull-only and adds neither
+server mutation nor periodic polling.
 
-Continue with Record E's final virtualized Import Copy/Keep Synced browser and visible accessible
-Sync Now/conflict/missing/offline recovery wiring. The accepted
-[`subsonic-playlist-sync.md`](subsonic-playlist-sync.md) contract keeps this capability pull-only and
-separate from Tributary's ordinary mixed-source playlists. Smart playlists and XSPF import/export
-remain local-only, while mixed-source metadata export requires its own no-locator policy.
+Continue with P2.1's Rhythmbox migration contract and importer, the highest-priority unchecked
+record whose dependencies are satisfied. Last.fm follows as a separate listening integration.
+Smart playlists and XSPF import/export remain local-only, while mixed-source metadata export still
+requires its own no-locator policy.
 
 The independent Linux watcher correctness fix tracked in
-[#103](https://github.com/jm2/tributary/pull/103) does not change the **12/38** feature total.
+[#103](https://github.com/jm2/tributary/pull/103) does not change the **13/38** feature total.
 The salvaged scope rejects explicitly classified access/access-time noise before the bounded watcher
 queue without filtering real bootstrap mutations or backend errors, while retaining overflow
 evidence for authoritative reconciliation. It intentionally omits the original persistent
@@ -381,10 +375,12 @@ the 38-record feature backlog.
   localization, reconnect scheduling, and the in-memory latest-request generation lane; its first
   structural slice is recorded immediately below.
 
-- [ ] **Record E — Server-native playlist UI and lifecycle integration:** add localized Import Copy,
+- [x] **Record E — Server-native playlist UI and lifecycle integration:** add localized Import Copy,
   Keep Synced, Sync Now, conflict/missing/offline status, reconnect refresh, Retry, Replace Local
   with Server, Unlink, and Remove Local Copy flows with accessible end-to-end coverage. Do not make
-  linked mirrors editable or expose unsupported adapters/servers as writable playlist sources.
+  linked mirrors editable or expose unsupported adapters/servers as writable playlist sources
+  ([#149](https://github.com/jm2/tributary/pull/149), which closes
+  [#143](https://github.com/jm2/tributary/issues/143)).
 
   Structural groundwork is complete in
   [#146](https://github.com/jm2/tributary/pull/146) without claiming the Record E checkbox.
@@ -445,9 +441,45 @@ the 38-record feature backlog.
   which has not been admitted, and uses a persistent barrier to drain admitted tasks and guards.
   Durable revision CAS remains the restart and persistence-order backstop.
 
-  Record E remains open. The final slice must connect a virtualized server-playlist browser and
-  opaque Import Copy/Keep Synced action tokens, then wire the existing localized Sync Now, Retry,
-  Replace, Unlink, and Remove Local Copy plans into visible accessible GTK state.
+  The final browser and visible-action slice is complete. The Playlists header exposes a localized
+  **Server Playlists…** entry whose dialog uses a virtualized `GtkListView` and lists only current
+  sources whose exact active session advertises `PullSnapshots`. GTK retains the existing
+  `SourceId`, bounded localized name/owner hints, and broker-minted opaque tokens; native playlist
+  identity, exact selections, session receipts, coordinator keys, and commit authority remain
+  Tokio-owned. Browser listing has its own latest-only cancellation lane, so it cannot supersede
+  reconnect recovery. One active snapshot is bounded by the protocol's 10,000-playlist ceiling;
+  reload, source lifecycle change, dialog close, or shutdown revokes every unused predecessor
+  token.
+
+  Import Copy and Keep Synced atomically consume one exact token only after the browser's
+  eight-action capacity gate accepts it; a Busy settlement preserves the token for retry. Detail
+  fetch and persistence use the exact broker-held selection and remote-playlist coordinator lane.
+  Existing manager transactions stage SQL before jointly acquiring coordinator admission and
+  exact registry commit authority, and only a committed detached import or unique read-only mirror
+  requests the durable full-sidebar publisher. Same-name server playlists therefore remain exact
+  distinct identities, accepted tokens cannot be replayed, stale sessions write nothing, and
+  browser close/shutdown drains every admitted action without exposing server-controlled content
+  in completion values or diagnostics.
+
+  Selecting a pull mirror now renders the localized status shell from its typed durable
+  clean/conflict and present/missing state plus a content-redacted, in-memory inspection of current
+  pull authority. Inspection performs no server listing or health probe. Five targetless window
+  actions resolve the currently selected durable local playlist again at activation: Sync Now,
+  Retry, Replace Local with Server, Unlink, and Remove Local Copy. Network actions fail closed when
+  exact pull authority is unavailable, while Unlink and Remove Local Copy remain available
+  offline. Replace, Unlink, and Remove require localized confirmation. Selection, source lifecycle,
+  sidebar snapshot, inspection, and operation generations reject stale or exhausted work; action
+  sensitivity follows the same presentation plan as the visible controls, and focus moves to a
+  stable status or track-list target when a running, revoked, or removed state hides the focused
+  control.
+
+  This completion preserves the pull-only boundary: Tributary still performs no server-playlist
+  create, update, or delete call, no periodic server polling, no fuzzy title/artist merge, no
+  non-Subsonic server-playlist operation, and no native playlist-ID transfer into GTK. Accessible
+  end-to-end coverage is deliberately layered: real registry/coordinator/database/sidebar broker
+  flows are combined with deterministic GTK presentation, action-authority, localization,
+  recycled-state, generation, and focus-policy tests plus structural accessibility review. It does
+  not claim a live assistive-technology/display harness in CI.
 
   Structural-slice validation: the locked suite passes 20 library, 1,197 application, and 10
   repository-metadata tests (1,227 total). Strict all-target/all-feature Clippy is green in debug
@@ -471,6 +503,16 @@ the 38-record feature backlog.
   all-target/all-feature Clippy is green in debug and release profiles; Rust 1.92 all-target
   checking, formatting, whitespace checks, and independent code/privacy/documentation audits are
   also green.
+
+  Final Record E validation: 92 focused server-playlist tests pass, including capability gating,
+  independently cancelled latest-only listing, exact same-name identity, one-shot token replay and
+  session revocation, eight-action capacity with retryable Busy, shutdown drain, in-memory link
+  inspection, visible recovery priority/action authority, destructive-confirmation ABA rejection,
+  stale completion rejection, generation exhaustion, and focus-safe state replacement. All 13
+  catalogs contain the exact 40 server-playlist keys without English fallback. Locked debug and
+  release suites each pass 20 library, 1,270 application, and 10 repository-metadata tests (1,300
+  total). Formatting, whitespace checks, and independent implementation/privacy/documentation
+  review are green.
 
 ## P2 — User-facing integrations and bounded enhancements
 
@@ -592,6 +634,7 @@ the 38-record feature backlog.
 | 2026-07-19 | P1.5 Subsonic server-playlist contract and pull authority | [#144](https://github.com/jm2/tributary/pull/144) | Defined detached Import Copy and read-only pull-mirror semantics, including conflict, offline, deletion, unlink, privacy, and non-mutation boundaries. Added bounded/redacted native playlist identity and exact ordered snapshots, authenticated `getPlaylists`/`getPlaylist` reads, and a Subsonic-only default-deny capability whose opaque guard and pre/post lifecycle checks reject disconnect, replacement, retirement, shutdown, and successor-session reuse. At that delivery boundary no persistence, synchronization commit, or UI was included; Records D and E remained open. |
 | 2026-07-19 | P1.5 Subsonic link persistence and atomic pull engine | [#145](https://github.com/jm2/tributary/pull/145) | Added strict migration 14 and a redacted typed link with unique exact server identity, separate local-conflict/server-presence state, frozen membership digest, last-success metadata, and revision CAS. Import Copy stays detached; Keep Synced creates one read-only mirror. Exact-session pull/absence receipts acquire an operation-bound commit permit after SQL staging; persistence rejects a permit from any other pull or absence result, stale work rolls back, and invalidation waits for an admitted atomic commit. Reconciliation excludes mirrors through a zero-bind subquery that remains safe beyond SQLite's host-parameter limit. Pull, conflict, Replace, missing, unlink, explicit removal, ordinary-mutation denial, downgrade refusal, failure retention, and exact order/duplicate behavior are deterministic. UI, reconnect scheduling, localization, and latest-request operation generations remain Record E. |
 | 2026-07-19 | P1.5 server-playlist UI structural groundwork | [#146](https://github.com/jm2/tributary/pull/146) | Added typed/redacted joined sidebar identity, read-only/conflict/missing mirror presentation, ordinary-action exclusion with transactional revalidation, commit-only CRUD outcomes, atomic smart creation/rule updates, stale-load and recycled-row defenses, structural Local fallback, and a hidden accessible recovery shell with exact copy in all 13 catalogs. At that merge boundary, Record E still retained the globally ordered full-sidebar lane, headless exact-session coordinator, reconnect/browser/action wiring, and end-to-end coverage. |
-| 2026-07-20 | P1.5 durable playlist-sidebar publication | [#147](https://github.com/jm2/tributary/pull/147) | Added migration 15's exact singleton revision and six transactional triggers, startup schema revalidation, a coherent redacted full-snapshot publisher with coalesced hints and polling fallback, and a strictly ordered GTK reducer with selection-safe replacement and structural fallback. Partial CRUD/import patches were removed; at that merge boundary Record E remained open for the headless latest-request coordinator and reconnect/browser/recovery wiring. |
-| 2026-07-20 | P1.5 server-playlist coordinator and reconnect lifecycle | [#148](https://github.com/jm2/tributary/pull/148) | Added typed GTK-free source/remote/local lanes with global reconnect/manual ordering, monotonic generations, pre-admission supersession, same-key waiting through admitted task and guard settlement, and unrelated-key concurrency. Reconnect binds one sweep to each exact accepted epoch, prepares revisions before one indexed complete list, and bounds local detail/commit fan-out to eight; detail failure writes nothing and only proven complete-list absence marks missing. Pull/missing persistence retains coordinator plus source authority after SQL staging, local Unlink/Remove uses the same guarded lane, and shutdown closes admission before source revocation and drains admitted work. A redacted headless Sync/Retry/Replace/Unlink/Remove completion surface is ready for the final browser/visible-action slice; Record E remains open. |
+| 2026-07-20 | P1.5 durable playlist-sidebar publication | [#147](https://github.com/jm2/tributary/pull/147) | Added migration 15's exact singleton revision and six transactional triggers, startup schema revalidation, a coherent redacted full-snapshot publisher with coalesced hints and polling fallback, and a strictly ordered GTK reducer with selection-safe replacement and structural fallback. Partial CRUD/import patches were removed; the headless coordinator and final browser/recovery consumer were explicit follow-on work later completed by [#148](https://github.com/jm2/tributary/pull/148) and [#149](https://github.com/jm2/tributary/pull/149). |
+| 2026-07-20 | P1.5 server-playlist coordinator and reconnect lifecycle | [#148](https://github.com/jm2/tributary/pull/148) | Added typed GTK-free source/remote/local lanes with global reconnect/manual ordering, monotonic generations, pre-admission supersession, same-key waiting through admitted task and guard settlement, and unrelated-key concurrency. Reconnect binds one sweep to each exact accepted epoch, prepares revisions before one indexed complete list, and bounds local detail/commit fan-out to eight; detail failure writes nothing and only proven complete-list absence marks missing. Pull/missing persistence retains coordinator plus source authority after SQL staging, local Unlink/Remove uses the same guarded lane, and shutdown closes admission before source revocation and drains admitted work. At that merge boundary the redacted headless Sync/Retry/Replace/Unlink/Remove completion surface was ready; [#149](https://github.com/jm2/tributary/pull/149) adds its final browser and visible-action consumer. |
+| 2026-07-20 | P1.5 server-playlist browser and visible recovery UI | [#149](https://github.com/jm2/tributary/pull/149) | Added the capability-filtered virtualized browser, independently cancellable listing, bounded revocable opaque tokens, exact Import Copy/Keep Synced admission, visible generation-gated recovery controls, destructive confirmations, focus-safe accessibility behavior, and complete 13-catalog localization. This completes Record E and P1.5 and closes [#143](https://github.com/jm2/tributary/issues/143). |
 | 2026-07-18 | Linux watcher feedback-loop fix | [#103](https://github.com/jm2/tributary/pull/103) | Narrowed the external proposal to filter self-generated access events before queue admission without filtering genuine startup events or backend errors; bounded overflow still drives authoritative reconciliation. Persistent negative parse caching is deliberately excluded so failures remain retryable; this separate correctness fix does not advance the feature numerator. |

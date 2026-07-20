@@ -22,6 +22,8 @@ pub mod radio;
 pub mod removable_media;
 pub mod root_trust;
 pub mod server_dialogs;
+mod server_playlist_recovery;
+mod server_playlists;
 pub mod sidebar;
 pub mod source_connect;
 pub mod source_navigation;

@@ -6,6 +6,8 @@
 
 use adw::prelude::*;
 use gtk::glib;
+use std::cell::Cell;
+use std::rc::Rc;
 use tracing::{info, warn};
 
 use super::objects::{PlaylistSidebarKind, SourceObject};
@@ -55,6 +57,8 @@ fn request_playlist_sidebar_refresh(
 pub fn setup_playlist_actions(
     state: &WindowState,
     playlist_action_rx: async_channel::Receiver<sidebar::PlaylistAction>,
+    browse_server_playlists: Rc<dyn Fn()>,
+    window_closing: Rc<Cell<bool>>,
 ) {
     let sidebar_store = state.sidebar_store.clone();
     let rt_handle = state.rt_handle.clone();
@@ -63,6 +67,12 @@ pub fn setup_playlist_actions(
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(action) = playlist_action_rx.recv().await {
+            // Receiver closure still permits already-buffered values to be
+            // drained. Do not present a queued dialog after shutdown made the
+            // window inert.
+            if window_closing.get() {
+                break;
+            }
             match action {
                 sidebar::PlaylistAction::CreateRegular => {
                     handle_create_regular(&win, &rt_handle, &playlist_sidebar_refresh);
@@ -110,6 +120,10 @@ pub fn setup_playlist_actions(
 
                 sidebar::PlaylistAction::ImportPlaylist => {
                     handle_import_playlist(&win, &rt_handle, &playlist_sidebar_refresh);
+                }
+
+                sidebar::PlaylistAction::BrowseServerPlaylists => {
+                    browse_server_playlists();
                 }
 
                 sidebar::PlaylistAction::ExportPlaylist(playlist_id) => {

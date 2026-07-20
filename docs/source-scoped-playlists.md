@@ -42,11 +42,15 @@ are implemented without reusing or widening this regular-playlist authority. Rec
 typed read-only sidebar state, ordinary-action exclusion, commit-only local CRUD publication, and
 the localized recovery-shell plan. A follow-up durable SQLite revision and lifecycle-owned
 full-snapshot publisher now order scan seeding, ordinary CRUD, raw/cascade domain-table writes, and
-server-link changes; GTK rejects equal or older snapshots. A separate GTK-free coordinator now
-orders typed source/remote/local operations, serializes same-key work through admitted settlement,
-schedules bounded exact-session reconnect recovery, reports redacted manual completions, and drains
-admitted work during shutdown. The browser and visible server-playlist controls remain the final
-follow-on slice.
+server-link changes; GTK rejects equal or older snapshots. The GTK-free coordinator in
+[#148](https://github.com/jm2/tributary/pull/148) orders typed source/remote/local operations,
+serializes same-key work through admitted settlement, schedules bounded exact-session reconnect
+recovery, reports redacted manual completions, and drains admitted work during shutdown. Record E
+concludes with a virtualized server-playlist browser, opaque one-shot Import Copy/Keep Synced
+tokens, and visible localized recovery controls.
+Native playlist identity and exact session authority remain Tokio-owned, and successful mutations
+still enter this document's regular-playlist storage only through the existing atomic manager and
+authoritative full-snapshot publisher.
 
 Smart playlists are unaffected. They remain live queries over the local library rather than stored
 regular-playlist occurrences.
@@ -321,24 +325,38 @@ absence result that minted it, so authority from another live operation cannot a
 snapshot. Neither mode metadata-matches a missing server track. The complete direction, revision,
 conflict, offline, server-deletion, and unlink policy is in the server-native contract.
 
-The UI groundwork in [#146](https://github.com/jm2/tributary/pull/146) now consumes playlist
+The UI groundwork in [#146](https://github.com/jm2/tributary/pull/146) consumes playlist
 parents and optional links as one ordered typed snapshot. Link
 presence wins over the legacy smart flag, invalid link state rejects publication rather than
 falling back to an editable playlist, and only the local playlist ID plus durable presentation state
 cross into GTK. Structural header/playlist kinds replace translated-name and backend-string
 editability tests. Linked mirrors are visibly read-only or conflicted/missing and are omitted from
 ordinary Rename, Export, Delete, Edit Smart, Add, and Remove affordances; manager transactions still
-enforce the same boundary if presentation becomes stale. A separate localized footer shell is
-reserved for sync/recovery state, but remains hidden until user actions are connected. Coordinator
-stamps, generations, cancellation, admission guards, native identity, and observed epochs never
-enter GTK, and this separate lane grants no Record A catalogue, playback, rating, or history
-authority. Migration 15's exact singleton revision and six transaction-local triggers
-now cover playlist parents, links, raw writes to those tables, and cascades. One lifecycle-owned
+enforce the same boundary if presentation becomes stale. A separate localized footer is now visible
+for the currently selected, freshly inspected mirror. Its targetless Sync Now, Retry, Replace Local
+with Server, Unlink, and Remove Local Copy actions re-resolve the current local playlist and fail
+closed while inspection, selection, source lifecycle, or completion state is stale. Destructive
+recovery requires explicit confirmation, and source-independent Unlink/Remove remains available
+offline. Coordinator stamps, generations, cancellation, admission guards, native identity, and
+observed epochs never enter GTK, and this separate lane grants no Record A catalogue, playback,
+rating, or history authority. Migration 15's exact singleton revision and six transaction-local
+triggers now cover playlist parents, links, raw writes to those tables, and cascades. One lifecycle-owned
 publisher reads a coherent complete redacted join, coalesces post-commit hints, polls for lost
 hints, and publishes the first valid snapshot and thereafter only strictly newer snapshots; GTK
 replaces or retracts the entire section and ignores equal or older delivery. Partial post-commit
 row patches are gone, closing the former reversed scan/CRUD race. This publication lane performs
 no server operation and does not widen the storage or live-source authority described above.
+
+The Playlists menu also exposes a virtualized browser only for current `PullSnapshots` sources.
+GTK receives bounded display hints plus opaque session/action tokens; the broker retains every exact
+native playlist ID, endpoint selection, and current-session receipt. A latest-only listing lane is
+independent of reconnect scheduling. Reload/close invalidates the published session, accepted
+Import Copy/Keep Synced actions consume one token, and a capacity rejection preserves it for retry.
+After final coordinator and registry admission, a successful commit requests the same authoritative
+full sidebar snapshot rather than applying an optimistic GTK row patch. Import Copy therefore
+becomes an ordinary editable playlist under this document, while Keep Synced becomes the separately
+linked read-only mirror described above. Neither action performs fuzzy local-library matching or a
+server-side playlist mutation.
 
 ## Validation matrix
 
@@ -365,9 +383,11 @@ transaction, revision-CAS, lifecycle-permit, drift, missing, unlink/removal, and
 validation. Typed read-only sidebar presentation, the localized recovery-shell plan, and durable
 full-snapshot sidebar ordering, same-key coordinator, exact-session reconnect scheduler,
 post-staging joint admission, bounded fan-out, shutdown drain, and redacted manual completion
-facade are now implemented. The server-playlist browser, visible action consumer, accessibility
-coverage, and mixed-source XSPF metadata export remain explicitly deferred. Until
-a no-locator mixed-source export policy exists,
+facade are implemented. The virtualized tokenized browser, visible recovery action consumer,
+localization, accessibility, stale-result rejection, and window/broker shutdown coverage are also
+implemented. Both debug and release validation pass 92 focused server-playlist tests, and the
+locked complete suites each pass 1,300 tests. Mixed-source XSPF metadata export remains explicitly
+deferred. Until a no-locator mixed-source export policy exists,
 a regular playlist containing any remote or unresolved occurrence is refused all-or-none before
 XSPF touches its destination; the local-only compatibility projection is never exported as a
 truncated result.

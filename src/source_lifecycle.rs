@@ -2053,6 +2053,28 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             .flatten()
     }
 
+    /// Project a bounded property from the exact active adapter while the
+    /// lifecycle gate and session lease are observed under one lock.
+    ///
+    /// The adapter and lease never leave the registry. Callers should use
+    /// this only for cheap, synchronous capability inspection; operations
+    /// which can block belong on the exact-session async boundary instead.
+    pub(crate) fn inspect_active_session<T>(
+        &self,
+        source_id: SourceId,
+        inspect: impl FnOnce(&A) -> T,
+    ) -> Option<(u64, T)> {
+        let state = lock(&self.inner.state);
+        if state.gate != RegistryGate::Running {
+            return None;
+        }
+        let active = state.entries.get(&source_id)?.active.as_ref()?;
+        if !active.lease.is_active() {
+            return None;
+        }
+        Some((active.epoch, inspect(active.adapter.adapter.as_ref())))
+    }
+
     /// Select a contribution from the greatest-generation accepted view.
     ///
     /// The selector executes while the lifecycle state is locked and must be

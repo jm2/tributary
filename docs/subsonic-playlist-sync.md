@@ -1,8 +1,8 @@
 # Subsonic server-native playlist import and pull-sync contract
 
-- Status: Accepted; protocol/authority, persistence/engine, structural UI, durable sidebar
-  ordering, and GTK-free coordinator/reconnect lifecycle implemented; browser and visible GTK
-  action/recovery integration pending
+- Status: Accepted and implemented; protocol authority, persistence/engine, durable sidebar
+  ordering, latest-request/reconnect lifecycle, tokenized browser, and visible GTK recovery are
+  complete
 - Decision date: 2026-07-19
 - Tracking issue: [#143](https://github.com/jm2/tributary/issues/143)
 - Related regular-playlist work: [#140](https://github.com/jm2/tributary/pull/140),
@@ -10,6 +10,9 @@
   [#142](https://github.com/jm2/tributary/pull/142)
 - Server-native foundations: [#144](https://github.com/jm2/tributary/pull/144) and
   [#145](https://github.com/jm2/tributary/pull/145)
+- UI and lifecycle foundations: [#146](https://github.com/jm2/tributary/pull/146) and
+  [#148](https://github.com/jm2/tributary/pull/148)
+- Completed browser and visible recovery UI: [#149](https://github.com/jm2/tributary/pull/149)
 
 This document defines how Tributary may consume playlists owned by a Subsonic or OpenSubsonic
 server. It is deliberately separate from
@@ -34,7 +37,7 @@ The feature is split into three independently reviewable records:
 2. **Implemented — link persistence and atomic pull synchronization ([#145]).** Add the dedicated
    link schema and the manager operations for detached imports, read-only mirrors, conflict
    detection, successful atomic replacement, missing-server state, unlink, and removal.
-3. **In progress — UI, localization, and end-to-end behavior.** Structural header/playlist
+3. **Implemented — UI, localization, and end-to-end behavior.** Structural header/playlist
    identity, joined durable link presentation, ordinary-action exclusion, commit-only local CRUD,
    atomic smart creation, and the localized recovery-shell plan are implemented in
    [#146](https://github.com/jm2/tributary/pull/146). A follow-up migration and lifecycle-owned
@@ -42,9 +45,10 @@ The feature is split into three independently reviewable records:
    durable revisioned full-snapshot lane; GTK rejects equal or older delivery. The GTK-free
    coordinator/reconnect lifecycle is also implemented: exact observed sessions schedule bounded
    recovery, same-key intents serialize through admitted settlement, and shutdown drains admitted
-   work. The shell remains hidden and grants no authority. The final slice adds the virtualized
-   Import Copy/Keep Synced browser and visibly wires Sync Now and
-   Retry/Replace/Unlink/Remove recovery with deterministic end-to-end coverage.
+   work. Record E concludes with a virtualized, tokenized Import Copy/Keep Synced browser and
+   visible Sync Now plus Retry/Replace/Unlink/Remove recovery without exposing native playlist
+   identity to GTK. All controls fail closed against stale selection, source lifecycle, and operation
+   generations.
 
 No stage may infer permission from a backend label, source key, response shape, or persisted row.
 Each consumer uses only the authority implemented by its immediately preceding stage.
@@ -253,6 +257,35 @@ detached commit. The headless manual facade returns only fixed, content-free com
 Shutdown closes coordinator admission before source revocation and a persistent barrier drains
 admitted operation futures and guards; admitted work is never revoked.
 
+## Tokenized browser and visible recovery
+
+The Playlists menu opens one virtualized `GtkListView` over only currently accepted sources whose
+exact capability is `PullSnapshots`. Source lifecycle changes refresh this presentation only after
+the authoritative lifecycle reducer has reconciled the sidebar. Listing itself uses an independent
+latest-only lane, so browsing cannot cancel or reorder the reconnect coordinator's source lane.
+
+GTK retains only bounded name/owner hints and broker-minted opaque session/action tokens. The Tokio-
+owned broker retains every `NativePlaylistId`, exact presence selection, source-session receipt,
+and coordinator key. One browser session holds at most the protocol's 10,000 entries; reload,
+dialog close, and shutdown revoke its unused tokens. Source invalidation makes their exact-session
+authority unusable immediately and triggers a refreshed session after any already-admitted action
+settles. The command lane is bounded, at most eight browser actions may be accepted concurrently,
+and a capacity `Busy` result does not consume the selected one-shot token. Once accepted, Import
+Copy or Keep Synced consumes that token before network or database work, enters the exact remote-
+playlist coordinator lane, and must still pass manager staging plus final exact registry authority.
+A successful commit requests the authoritative full sidebar snapshot; GTK never patches a row
+optimistically.
+
+Selecting a typed pull mirror exposes the localized recovery footer only after a redacted lookup of
+its current durable local link. Its targetless window actions re-read the current local playlist ID
+at activation and never carry source/native identity in a GTK action target. Sync Now and Retry are
+available only with a current source; Replace Local with Server is shown for a current conflict;
+Unlink and Remove Local Copy remain source-independent. Replace, Unlink, and Remove require explicit
+confirmation. Pending inspections, running work, stale selections, and stale completions disable
+all affected actions, while generation checks prevent a late result from changing a newer
+selection. The virtual rows, status group, busy states, action labels, confirmations, and focus
+fallbacks are accessible and localized in all shipped catalogues.
+
 ## Conflict and local-drift policy
 
 The manager refuses ordinary Add, Remove, reorder, rename, delete, smart-rule mutation, and local
@@ -277,9 +310,9 @@ Removing the local copy is a separate explicit destructive action.
 
 An existing mirror retains its last successful complete snapshot when the source is disconnected,
 authentication expires, the server is offline, an endpoint is unsupported, a request times out, a
-response is malformed, authority becomes stale, or the operation is cancelled. The UI may show a
-localized fixed status and Retry/Sync Now action, but it must not replace the mirror with an empty
-list or partially parsed response.
+response is malformed, authority becomes stale, or the operation is cancelled. The visible footer
+shows a localized fixed offline/failure state and enables only actions whose current inspection
+grants them; it never replaces the mirror with an empty list or partially parsed response.
 
 A successful accepted source session is observed from one atomic lifecycle baseline and scheduled
 at most once per exact `(SourceId, session_epoch)`. The sweep prepares every linked mirror's exact
@@ -294,16 +327,17 @@ behind an admitted predecessor starts after that task and guard settle, so it pr
 durable revision rather than losing the latest intent to a harmless stale-CAS result. Lifecycle
 retirement separately invalidates exact-session network receipts and denies source commit authority.
 An admitted detached commit drains and cannot be cancelled.
-Record E's structural UI slice now carries authoritative linked/read-only and orthogonal
+Record E carries authoritative linked/read-only and orthogonal
 conflict/missing state into the sidebar without exposing native identity, excludes mirrors from
-ordinary mutation affordances, and defines a separate localized status/recovery shell. The shell is
-initially hidden and grants no operation authority. Migration 15 and the sidebar publisher now give
+ordinary mutation affordances, and drives a separate localized status/recovery shell. The shell is
+hidden outside a currently inspected mirror and grants no identity or operation authority of its
+own. Migration 15 and the sidebar publisher give
 scan seeding, ordinary CRUD, raw/cascade domain-table mutations, and server-link state one durable
 revisioned full-snapshot lane. Refresh hints coalesce, periodic revision polling recovers lost
 hints, and GTK ignores equal or older snapshots. The latest-request lane, exact-session reconnect
-scheduling, cancellation, and headless manual facade are now implemented. The browser and visible
-action wiring remain the final Record E slice. The initial sync version will not
-continuously poll the server and will not keep a session alive solely for sync.
+scheduling, cancellation, headless manual facade, tokenized browser, and visible recovery wiring
+are implemented. The initial sync version does not continuously poll the server and does not keep
+a session alive solely for sync.
 
 ## Server rename and deletion
 
@@ -339,8 +373,10 @@ including the warning for token authentication over HTTP.
 Coordinator request stamps, per-key generations, cancellation tokens, admission guards, and
 observed session epochs are process-memory authority only; none is persisted or placed in GTK.
 Coordinator and manual-completion diagnostics expose only key class, queue state, and fixed closed
-categories. They never expose source/local/native key contents. `NativePlaylistId` still does not
-cross into GTK; the final browser must retain it behind opaque action tokens.
+categories. They never expose source/local/native key contents. `NativePlaylistId` does not cross
+into GTK: the browser retains it behind opaque, non-serializable, content-redacted action tokens,
+while recovery presentation retains only an already-published local playlist ID and its GTK action
+targets carry no identity at all.
 
 Deterministic coverage is required across the staged implementation for:
 
@@ -353,13 +389,17 @@ Deterministic coverage is required across the staged implementation for:
 - one-time detached import and read-only linked behavior;
 - all-or-none pulls, drift conflicts, offline retention, exact-epoch reconnect/manual ordering,
   same-key admitted-drain serialization, indexed eight-wide fan-out, detail-failure retention,
-  server deletion, retry, unlink, explicit local removal, and redacted completion reporting; and
+  server deletion, retry, unlink, explicit local removal, and redacted completion reporting;
+- bounded/latest-only browsing, opaque token revocation and one-shot consumption, capacity retry,
+  exact-ID same-name isolation, stale GTK completion rejection, visible recovery sensitivity,
+  localization, virtualization, accessibility, and shutdown drain; and
 - diagnostic redaction of URLs, credentials, native IDs, server text, and response bodies.
 
 Real-server validation may confirm dialect interoperability later, but it cannot replace these
-bounded authority, persistence, and failure-path tests. The delivered headless lifecycle passes 71
-focused server-playlist tests plus real empty-, one-, and nine-mirror reconnect integrations. Zero
-mirrors issue no server listing; the larger case measures one shared exact-session list, eight
-blocked exact-ID detail/commit operations, a held ninth, and all nine commits after release. Locked
-debug and release suites each pass 1,279 tests, with strict Clippy in both profiles, the Rust 1.92
-all-target check, formatting, whitespace, and independent code/privacy review green.
+bounded authority, persistence, and failure-path tests. Both debug and release validation pass 92
+focused server-playlist/browser/recovery tests, including real empty-, one-, and nine-mirror
+reconnect integrations. Zero mirrors issue no server listing; the larger case measures one shared
+exact-session list, eight blocked exact-ID detail/commit operations, a held ninth, and all nine
+commits after release. The locked complete suites each pass 1,300 tests, with strict Clippy in both
+profiles, the Rust 1.92 all-target check, formatting, whitespace, and independent
+code/privacy/accessibility review green.
