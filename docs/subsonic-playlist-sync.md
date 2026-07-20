@@ -358,8 +358,8 @@ Deterministic coverage is required across the staged implementation for:
 
 Real-server validation may confirm dialect interoperability later, but it cannot replace these
 bounded authority, persistence, and failure-path tests. The delivered headless lifecycle passes 71
-focused server-playlist tests plus real one- and nine-mirror reconnect integrations. The larger
-case measures one shared exact-session list, eight blocked exact-ID detail/commit operations, a
-held ninth, and all nine commits after release. Locked debug and release suites each pass 1,278
-tests, with strict Clippy in both profiles, the Rust 1.92 all-target check, formatting, whitespace,
-and independent code/privacy review green.
+focused server-playlist tests plus real empty-, one-, and nine-mirror reconnect integrations. Zero
+mirrors issue no server listing; the larger case measures one shared exact-session list, eight
+blocked exact-ID detail/commit operations, a held ninth, and all nine commits after release. Locked
+debug and release suites each pass 1,279 tests, with strict Clippy in both profiles, the Rust 1.92
+all-target check, formatting, whitespace, and independent code/privacy review green.

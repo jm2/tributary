@@ -398,6 +398,9 @@ impl ServerPlaylistOperations {
                 }
             }
         }
+        if preparations.is_empty() {
+            return;
+        }
 
         let Some(Ok(listing)) = before_cancel(
             &context,
@@ -463,6 +466,18 @@ impl ServerPlaylistOperations {
                 return;
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_reconnect_sweep_for_test(
+        &self,
+        source_id: SourceId,
+        session_epoch: u64,
+        stamp: ServerPlaylistRequestStamp,
+        context: ServerPlaylistOperationContext,
+    ) {
+        self.run_reconnect_sweep(source_id, session_epoch, stamp, context)
+            .await;
     }
 
     async fn apply_reconnect_selection(

@@ -4046,6 +4046,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconnect_runtime_skips_server_listing_when_no_mirrors_are_linked() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect empty-mirror database");
+        Migrator::up(&database, None)
+            .await
+            .expect("migrate empty-mirror database");
+        let registry = registry();
+        let source_id = SourceId::random();
+        let probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.server_playlist_adapter("empty-mirror-runtime"),
+        )
+        .await;
+        let session_epoch = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.session_epoch)
+            .expect("connected empty-mirror session epoch");
+        assert_eq!(probe.server_playlist_list_calls.load(Ordering::Acquire), 0);
+
+        let (refresh, _refresh_rx) =
+            crate::local::playlist_sidebar::playlist_sidebar_refresh_channel();
+        let (coordinator, coordinator_shutdown) =
+            crate::server_playlist_coordinator::spawn_server_playlist_coordinator();
+        let operations = ServerPlaylistOperations::new(
+            database,
+            coordinator.clone(),
+            registry.clone(),
+            refresh.clone(),
+        );
+        let stamp = coordinator
+            .reserve_request_stamp()
+            .expect("reserve empty-mirror reconnect stamp");
+        let fanout_stamp = stamp.clone();
+        let (completed_tx, completed_rx) = oneshot::channel();
+        assert_eq!(
+            coordinator.begin_if_not_newer(
+                crate::server_playlist_coordinator::ServerPlaylistOperationKey::source(source_id),
+                &stamp,
+                move |context| async move {
+                    operations
+                        .run_reconnect_sweep_for_test(
+                            source_id,
+                            session_epoch,
+                            fanout_stamp,
+                            context,
+                        )
+                        .await;
+                    completed_tx
+                        .send(())
+                        .expect("report empty sweep completion");
+                },
+            ),
+            crate::server_playlist_coordinator::ServerPlaylistRequestStatus::Queued
+        );
+        completed_rx.await.expect("empty reconnect sweep finishes");
+        assert_eq!(
+            probe.server_playlist_list_calls.load(Ordering::Acquire),
+            0,
+            "a source with no linked mirrors must not issue a server-playlist listing"
+        );
+
+        coordinator.close();
+        coordinator_shutdown
+            .shutdown()
+            .await
+            .expect("empty-mirror coordinator drains");
+        refresh.close();
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reconnect_runtime_applies_exact_presence_reports_failures_and_marks_only_proven_absence(
     ) {
         let database = Database::connect("sqlite::memory:")

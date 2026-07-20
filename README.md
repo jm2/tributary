@@ -772,11 +772,12 @@ shares it across the delayed local fan-out. Direct requests reserve and enqueue 
 that stamped submission path, so a manual request begun later wins for an overlapping mirror.
 
 The lifecycle observer schedules one reconnect sweep for each accepted source session epoch and no
-more for catalogue-only invalidations in that session. A sweep captures the exact durable revision
-of every linked mirror before network I/O, obtains one complete listing from that exact observed
-session, uses indexed exact presence or sealed absence, and admits no more than eight local fan-out
-operations at once. It neither polls a server periodically nor infers deletion from an incomplete,
-failed, stale, or wrong-session response. Manual Sync Now, Retry, Replace Local with Server,
+more for catalogue-only invalidations in that session. A sweep with no linked mirror returns before
+server I/O. Otherwise it captures the exact durable revision of every linked mirror before network
+I/O, obtains one complete listing from that exact observed session, uses indexed exact presence or
+sealed absence, and admits no more than eight local fan-out operations at once. It neither polls a
+server periodically nor infers deletion from an incomplete, failed, stale, or wrong-session
+response. Manual Sync Now, Retry, Replace Local with Server,
 Unlink, and Remove Local Copy use the same local lane through a redacted internal completion facade;
 never-started displacement is distinct from unexpected interruption after start.
 

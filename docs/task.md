@@ -462,11 +462,12 @@ the 38-record feature backlog.
 
   Coordinator/reconnect-slice validation: 71 focused server-playlist tests pass, including
   deterministic same-key admitted-drain ordering, atomic direct-request ordering against delayed
-  reconnect fan-out, and pending-manual completion classification. Separate real
-  coordinator/registry/database/sidebar integrations prove exact presence, detail-failure
+  reconnect fan-out, and pending-manual completion classification. Separate real empty-, one-, and
+  nine-mirror coordinator/registry/database/sidebar integrations prove that an unlinked source
+  performs no server-playlist list, while linked sources preserve exact presence, detail-failure
   retention, complete-list absence, one shared listing, and a measured eight-operation cap that
   holds a ninth exact-ID mirror until one slot finishes. Locked debug and release suites each pass
-  20 library, 1,248 application, and 10 repository-metadata tests (1,278 total). Strict
+  20 library, 1,249 application, and 10 repository-metadata tests (1,279 total). Strict
   all-target/all-feature Clippy is green in debug and release profiles; Rust 1.92 all-target
   checking, formatting, whitespace checks, and independent code/privacy/documentation audits are
   also green.

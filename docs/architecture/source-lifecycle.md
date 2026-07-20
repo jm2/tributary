@@ -908,12 +908,13 @@ policy.
     Synced tokens, and visible accessible GTK recovery wiring.
 
 The server-playlist coordinator/reconnect slice passes 71 focused server-playlist tests plus real
-one- and nine-mirror coordinator/registry/database/sidebar integrations. Deterministic coverage
-pins atomic direct-request ordering against delayed fan-out, same-key admitted drain, displaced
-pending completion, exact-session presence/detail-failure/absence handling, one shared listing,
-and a measured eight-operation limit that holds the ninth exact-ID mirror until a slot finishes.
-Locked debug and release suites each pass 20 library, 1,248 application, and 10 repository-contract
-tests (1,278 total). Strict all-target/all-feature Clippy passes in both profiles; Rust 1.92
+empty-, one-, and nine-mirror coordinator/registry/database/sidebar integrations. Deterministic
+coverage pins atomic direct-request ordering against delayed fan-out, same-key admitted drain,
+displaced pending completion, zero-list behavior with no links, exact-session
+presence/detail-failure/absence handling, one shared listing, and a measured eight-operation limit
+that holds the ninth exact-ID mirror until a slot finishes. Locked debug and release suites each
+pass 20 library, 1,249 application, and 10 repository-contract tests (1,279 total). Strict
+all-target/all-feature Clippy passes in both profiles; Rust 1.92
 all-target checking, formatting, whitespace, and independent code/privacy/documentation review are
 also green.
 

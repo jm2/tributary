@@ -211,9 +211,10 @@ before starting large protocol or transfer subsystems.
    local mirrors. A global logical-request stamp orders reconnect discovery against newer manual
    work, with direct reserve-and-enqueue atomic against delayed stamped fan-out; same-key successors
    wait through admitted task and guard settlement while unrelated keys stay concurrent. Reconnect
-   observes exact accepted session epochs, prepares every durable ticket before one complete indexed
-   list, and runs at most eight detail/commit operations concurrently (measured with a held ninth).
-   Detail failure never becomes deletion evidence. Pull/missing persistence joins final coordinator
+   observes exact accepted session epochs, skips server I/O when no mirror is linked, prepares every
+   durable ticket before one complete indexed list, and runs at most eight detail/commit operations
+   concurrently (measured with a held ninth). Detail failure never becomes deletion evidence.
+   Pull/missing persistence joins final coordinator
    admission with exact registry authority after SQL staging, guarded local-only recovery uses the
    same lane, and shutdown closes admission before source revocation and drains admitted work. A
    redacted headless completion facade exists, but the virtualized browser, opaque Import Copy/Keep

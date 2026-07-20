@@ -21,9 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mirror cannot be overwritten by older reconnect work.
   The source-lifecycle observer schedules exactly one sweep for each newly accepted
   `(SourceId, session epoch)`, ignoring catalogue-only invalidations within that session. Each sweep
-  captures every durable link revision before network I/O, reads one complete listing from the
-  exact observed session, uses its indexed exact-presence or sealed-absence evidence, and fans out
-  at most eight local operations at once. Manual Sync Now, Retry, Replace Local with Server,
+  returns before server I/O when no durable mirror is linked; otherwise it captures every durable
+  link revision before network I/O, reads one complete listing from the exact observed session,
+  uses its indexed exact-presence or sealed-absence evidence, and fans out at most eight local
+  operations at once. Manual Sync Now, Retry, Replace Local with Server,
   Unlink, and Remove Local Copy enter those same local lanes through a completion facade whose
   status and diagnostics contain no playlist identity or server-controlled content. A pending
   operation displaced before it starts reports superseded, while a started task lost unexpectedly
@@ -39,10 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-Subsonic server-playlist authority, or native playlist IDs in GTK. P1.5 Record E remains open
   for the virtualized server-playlist browser, opaque Import Copy/Keep Synced action tokens, and
   visible localized, accessible GTK recovery/action wiring. Validation passes 71 focused
-  server-playlist tests plus real one- and nine-mirror reconnect integrations; the latter measures
-  one shared list, eight blocked exact-ID operations, a held ninth, and all nine commits after
-  release. Locked debug and release suites each pass 20 library, 1,248 application, and 10
-  repository-contract tests (1,278 total), with strict all-target/all-feature Clippy in both
+  server-playlist tests plus real empty-, one-, and nine-mirror reconnect integrations: zero
+  mirrors issue no server list, while the larger case measures one shared list, eight blocked
+  exact-ID operations, a held ninth, and all nine commits after release. Locked debug and release
+  suites each pass 20 library, 1,249 application, and 10 repository-contract tests (1,279 total),
+  with strict all-target/all-feature Clippy in both
   profiles, Rust 1.92 checking, formatting, whitespace, and independent code/privacy/documentation
   review green.
 - **Playlist sidebar publication is now durably ordered and full-snapshot only**
