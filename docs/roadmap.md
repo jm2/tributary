@@ -47,8 +47,13 @@ starts. Historical holistic-review documents are point-in-time findings, not act
   support, a default-deny exact-session registry boundary, strict migration-14 link persistence,
   and an atomic Import Copy/Keep Synced manager. Existing mirrors use pre-network revision tickets,
   exact-session commit permits, frozen membership digests, separate conflict/missing state, and
-  read-only mutation gates to protect pulls without persisting live authority. It deliberately has no reconnect scheduler,
-  localized recovery flow, or user-facing import/sync actions yet. See the regular-playlist
+  read-only mutation gates to protect pulls without persisting live authority. A GTK-free
+  source/remote/local coordinator now serializes same-key intent through admitted settlement,
+  schedules one exact-observed-session reconnect sweep per accepted epoch, indexes exact
+  presence/absence, bounds fan-out to eight local operations, joins coordinator and source
+  authority only after SQL staging, reports redacted manual completions, and drains admitted work
+  during shutdown. It deliberately has no visible recovery flow, server-playlist browser, or
+  user-facing import/sync actions yet. See the regular-playlist
   [storage contract](source-scoped-playlists.md).
 - XSPF v1 import/export is implemented with exact path and deterministic normalized-metadata
   matching. Apple/iTunes XML, Google Takeout CSV, M3U, service URLs, and fuzzy matching are not
@@ -199,9 +204,21 @@ before starting large protocol or transfer subsystems.
    out of ordinary mutation affordances, publishes ordinary CRUD only after commit, and reserves a
    separate localized recovery/status shell. A follow-up durable SQLite revision and
    lifecycle-owned full-snapshot publisher now order scan seeding, CRUD, raw/cascade domain-table
-   writes, and link-state mutations; GTK rejects equal or older delivery. The GTK-free
-   reconnect/manual coordinator, latest-request generation lane, virtualized browser, and wired
-   recovery actions remain.
+   writes, and link-state mutations; GTK rejects equal or older delivery.
+10. **Completed lifecycle slice: coordinate and schedule server-playlist operations
+    ([#148](https://github.com/jm2/tributary/pull/148)).** Three typed,
+   content-redacted lanes cover source-wide discovery, exact remote playlist actions, and durable
+   local mirrors. A global logical-request stamp orders reconnect discovery against newer manual
+   work, with direct reserve-and-enqueue atomic against delayed stamped fan-out; same-key successors
+   wait through admitted task and guard settlement while unrelated keys stay concurrent. Reconnect
+   observes exact accepted session epochs, skips server I/O when no mirror is linked, prepares every
+   durable ticket before one complete indexed list, and runs at most eight detail/commit operations
+   concurrently (measured with a held ninth). Detail failure never becomes deletion evidence.
+   Pull/missing persistence joins final coordinator
+   admission with exact registry authority after SQL staging, guarded local-only recovery uses the
+   same lane, and shutdown closes admission before source revocation and drains admitted work. A
+   redacted headless completion facade exists, but the virtualized browser, opaque Import Copy/Keep
+   Synced tokens, and visible accessible recovery actions remain the final Record E slice.
 
 These contracts make Rhythmbox migration and Last.fm behavior much less ambiguous.
 
@@ -270,7 +287,7 @@ mistaken for work already underway.
 | [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus completed playback-history and rating contracts are foundations; XSPF deliberately transfers neither history nor ratings. | Build a separate transactional, idempotent migration with explicit metadata consent and conflict reporting. |
 | [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | No Last.fm client or scrobble pipeline. | Authorization, secret storage, authoritative thresholds, retry/offline queue, and privacy UX. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
-| [#143 — Import and pull-sync server-native Subsonic playlists](https://github.com/jm2/tributary/issues/143) | Pull-only reads, non-secret link persistence, atomic mirror operations, conflict/missing evidence, and exact-session commit authority are implemented. Typed joined sidebar state, read-only/error presentation, a complete localized recovery-shell plan, and one durable revisioned full-snapshot lane across scan seeding, CRUD, raw/cascade writes to the two domain tables, and link state are also present. The shell remains hidden because no operation coordinator, browser, reconnect scheduler, or wired server-playlist action exists yet. | Add the GTK-free latest-request coordinator and shutdown/reconnect integration, then connect a virtualized Import Copy/Keep Synced browser and Sync Now/Retry/Replace/Unlink/Remove flows with deterministic end-to-end accessibility coverage. |
+| [#143 — Import and pull-sync server-native Subsonic playlists](https://github.com/jm2/tributary/issues/143) | Pull-only reads, non-secret link persistence, atomic mirror operations, conflict/missing evidence, exact-session commit authority, typed sidebar state, read-only/error presentation, and durable full-snapshot ordering are implemented. The GTK-free coordinator now adds same-key admitted-drain serialization, global reconnect/manual ordering, exact-epoch once-per-session scheduling, indexed and eight-wide bounded fan-out, post-staging joint admission, redacted manual completion, and shutdown drain. The localized shell remains hidden and unwired. | Connect a virtualized browser using opaque Import Copy/Keep Synced action tokens, then wire Sync Now/Retry/Replace/Unlink/Remove into visible accessible GTK state with deterministic end-to-end coverage. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |
 | [#29 — UI refinement](https://github.com/jm2/tributary/issues/29) | Requested separators/alignment changes are not implemented. | Split into independently reviewable visual changes after current-theme design review. |

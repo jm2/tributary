@@ -7,7 +7,10 @@
   Record A adds a default-deny live-catalogue authority boundary, and Record B consumes it in
   mixed-source Add/Remove/render/Play without reopening P3.1. P1.5 Record C separately adds a
   Subsonic-only, exact-session authority for bounded server-native playlist reads; it grants no
-  catalogue or playback authority and persists nothing.
+  catalogue or playback authority and persists nothing. Record D consumes sealed read authority
+  in atomic link persistence, while Record E now has a GTK-free latest-request coordinator,
+  exact-observed-session reconnect scheduling, post-staging joint admission, and shutdown drain.
+  Its browser and visible accessible action wiring remain open.
 - Decision date: 2026-07-17
 - Historical tracker:
   [P3.1](../task-remediation-2026-07.md#p31-introduce-a-sourcesession-registry)
@@ -61,6 +64,15 @@ of authority minted for another current operation. Migration 14 and the playlist
 that authority for detached imports and atomic pull mirrors. This
 lane does not consult the accepted music catalogue and cannot turn a returned track ID into display,
 stream, artwork, rating, or history authority.
+
+The headless Record E lifecycle composes that lane without widening it. A typed coordinator orders
+source discovery, exact remote playlist, and durable local mirror work; same-key successors wait
+through admitted task and guard settlement while unrelated keys remain concurrent. Reconnect reads
+only through the session epoch captured in an atomic lifecycle baseline, schedules each accepted
+epoch once, prepares durable tickets before one indexed complete list, and bounds local fan-out to
+eight. Coordinator admission and exact registry authority meet only after SQL staging. Shutdown
+closes coordinator admission before source revocation and drains admitted work through a persistent
+barrier. All coordinator authority remains process-local and absent from GTK.
 
 The implementation has now converged on this boundary. PR #120 implements stable identity, PR #121
 adds retained local file authority through output consumption, and PR #122 introduces the generic
@@ -592,6 +604,12 @@ queue can extend the same ephemeral-source rule explicitly.
   message, response body, or route.
   Endpoint membership is intentionally independent from accepted-catalogue membership and grants
   no playback authority.
+  Reconnect callers additionally bind listing to the exact epoch observed in an atomic lifecycle
+  baseline, so delayed predecessor work cannot silently adopt a successor session. A separate
+  content-redacted coordinator orders source, remote, and local keys; same-key work cannot prepare
+  behind an unsettled admitted predecessor. Final coordinator admission happens after SQL staging,
+  immediately before registry commit authority is acquired. Coordinator shutdown closes first and
+  its persistent barrier drains both admitted futures and move-only guards before teardown finishes.
   Catalogue selectors run against a captured immutable `Arc` outside the lifecycle mutex, followed
   by an exact pointer/source/epoch/generation/lease recheck before a value returns or adapter work
   starts. Selector-time refresh or teardown therefore denies stale work without making registry
@@ -764,9 +782,12 @@ playlist mutation, the localized recovery-shell state plan, and one durable full
 publication lane are now implemented without widening live authority. Migration 15's
 transaction-local SQLite triggers and one coherent revisioned publisher cover scan seeding,
 ordinary CRUD, raw writes to those domain tables, cascades, and server-link changes; GTK consumes
-only complete strictly newer snapshots. The GTK-free latest-request coordinator, reconnect
-scheduling, browser, and wired recovery actions remain the final deferred P1.5 record. Mixed-source
-XSPF metadata export remains a separate deferred policy.
+only complete strictly newer snapshots. The GTK-free latest-request coordinator, exact-epoch
+reconnect scheduler, indexed bounded fan-out, post-staging joint admission, redacted manual
+completion facade, and shutdown drain are now implemented. The virtualized browser, opaque Import
+Copy/Keep Synced tokens, visible accessible recovery controls, and their end-to-end GTK coverage
+remain the final deferred P1.5 work. Mixed-source XSPF metadata export remains a separate deferred
+policy.
 
 ## Implementation sequence
 
@@ -870,9 +891,32 @@ XSPF metadata export remains a separate deferred policy.
     newer snapshots, replacing the entire section and selecting structural Local when the active
     playlist disappears.
     Partial CRUD/import patches are removed, so reversed deliveries cannot erase a create/import,
-    revert a rename, resurrect a delete, or restore stale link state. Record E still retains the
-    GTK-free latest-request coordinator, exact-session reconnect/manual scheduling, virtualized
-    browser, wired recovery controls, and end-to-end lifecycle coverage.
+    revert a rename, resurrect a delete, or restore stale link state. At this delivery boundary,
+    Record E still retained the GTK-free lifecycle and final visible-action slices.
+14. **Server-native latest-request and reconnect lifecycle complete
+    ([#148](https://github.com/jm2/tributary/pull/148)):** one GTK-free owner provides
+    typed source, exact remote-playlist, and durable local-playlist lanes. A coordinator-global
+    stamp orders reconnect discovery against manual intent. Newer work cancels only pre-admission
+    work; same-key successors wait through admitted task and guard settlement, while unrelated keys
+    remain concurrent. Each exact accepted source epoch schedules once, prepares every durable
+    revision before one indexed complete list, and runs at most eight local operations at once.
+    Presence selects detail; only complete-list absence marks missing, and failures write nothing.
+    Post-staging coordinator admission and exact registry authority are retained together through
+    detached commit. A redacted headless completion facade covers Sync/Retry/Replace/Unlink/Remove,
+    and coordinator admission closes before source shutdown while a persistent barrier drains
+    admitted work. Record E remains open for the virtualized browser, opaque Import Copy/Keep
+    Synced tokens, and visible accessible GTK recovery wiring.
+
+The server-playlist coordinator/reconnect slice passes 71 focused server-playlist tests plus real
+empty-, one-, and nine-mirror coordinator/registry/database/sidebar integrations. Deterministic
+coverage pins atomic direct-request ordering against delayed fan-out, same-key admitted drain,
+displaced pending completion, zero-list behavior with no links, exact-session
+presence/detail-failure/absence handling, one shared listing, and a measured eight-operation limit
+that holds the ninth exact-ID mirror until a slot finishes. Locked debug and release suites each
+pass 20 library, 1,249 application, and 10 repository-contract tests (1,279 total). Strict
+all-target/all-feature Clippy passes in both profiles; Rust 1.92
+all-target checking, formatting, whitespace, and independent code/privacy/documentation review are
+also green.
 
 The authenticated-remote cutover's locked debug and release suites each passed 20 library, 865
 application, and 10 repository-metadata tests (895 total), with locked all-target/all-feature
@@ -960,6 +1004,16 @@ independent lifecycle systems must not become the permanent architecture.
 - **Use one undifferentiated generation counter for session and refresh.** Starting a harmless
   refresh would revoke valid playback. Session epochs and operation generations have different
   ownership meanings.
+- **Reserve a separate request order for each link after reconnect discovery.** A manual request
+  started while the complete list was loading could then appear older than delayed reconnect
+  fan-out. One stamp is reserved before discovery and reused across its local-key submissions.
+- **List through whichever source session is current when delayed work runs.** That could let a
+  predecessor observation adopt a successor adapter silently. Reconnect listing requires the exact
+  epoch captured in its atomic lifecycle baseline.
+- **Cancel an admitted database operation when a newer request or shutdown arrives.** Admission is
+  the irrevocable persistence edge. Revoking its guards before commit could deadlock source
+  retirement or leave durability ambiguous; admitted work drains, and the newest same-key
+  successor waits before preparing the resulting revision.
 
 ## Completion criteria
 

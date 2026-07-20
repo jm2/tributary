@@ -1,6 +1,6 @@
 //! Atomic persistence for detached and pull-synchronized server playlists.
 
-use std::fmt;
+use std::{fmt, future::Future};
 
 use chrono::Utc;
 use sea_orm::{
@@ -182,12 +182,14 @@ pub enum ServerPlaylistMissingOutcome {
 pub enum ServerPlaylistUnlinkOutcome {
     Unlinked(ServerPlaylistLocalCopy),
     Superseded,
+    Rejected,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServerPlaylistRemoveOutcome {
     Removed,
     Superseded,
+    Rejected,
 }
 
 macro_rules! redacted_outcome_debug {
@@ -243,6 +245,7 @@ fn unlink_debug(value: &ServerPlaylistUnlinkOutcome, name: &str) -> &'static str
     match value {
         ServerPlaylistUnlinkOutcome::Unlinked(_) => "ServerPlaylistUnlinkOutcome::Unlinked",
         ServerPlaylistUnlinkOutcome::Superseded => "ServerPlaylistUnlinkOutcome::Superseded",
+        ServerPlaylistUnlinkOutcome::Rejected => "ServerPlaylistUnlinkOutcome::Rejected",
     }
 }
 
@@ -326,14 +329,38 @@ impl PlaylistManager {
     where
         Authorize: FnOnce() -> Option<ServerPlaylistCommitAuthority>,
     {
-        self.import_server_playlist_copy_from_snapshot_if_authorized(
+        self.import_server_playlist_copy_if_admitted(pull, fallback_name, || {
+            std::future::ready(authorize().map(|authority| (authority, ())))
+        })
+        .await
+    }
+
+    /// Create a detached copy only after both the exact source session and an
+    /// independent caller-owned admission generation approve the staged write.
+    ///
+    /// `admit` runs after every SQL insert has been staged. Its opaque guard is
+    /// retained together with the registry authority by the detached commit
+    /// worker, so cancelling this future after admission cannot abort the
+    /// commit or release either guard early.
+    pub async fn import_server_playlist_copy_if_admitted<Guard, Admit, Admission>(
+        &self,
+        pull: &ServerPlaylistPull,
+        fallback_name: &str,
+        admit: Admit,
+    ) -> Result<ServerPlaylistImportOutcome, DbErr>
+    where
+        Admit: FnOnce() -> Admission,
+        Admission: Future<Output = Option<(ServerPlaylistCommitAuthority, Guard)>>,
+        Guard: Send + 'static,
+    {
+        self.import_server_playlist_copy_from_snapshot_if_admitted(
             pull.source_id(),
             pull.snapshot(),
             fallback_name,
-            || {
-                let authority = authorize()?;
+            || async {
+                let (authority, guard) = admit().await?;
                 pull.accepts_commit_authority(&authority)
-                    .then_some(authority)
+                    .then_some((authority, guard))
             },
         )
         .await
@@ -350,13 +377,34 @@ impl PlaylistManager {
         Authorize: FnOnce() -> Option<Authority>,
         Authority: Send + 'static,
     {
+        self.import_server_playlist_copy_from_snapshot_if_admitted(
+            source_id,
+            snapshot,
+            fallback_name,
+            || std::future::ready(authorize()),
+        )
+        .await
+    }
+
+    async fn import_server_playlist_copy_from_snapshot_if_admitted<Authority, Admit, Admission>(
+        &self,
+        source_id: SourceId,
+        snapshot: &ServerPlaylistSnapshot,
+        fallback_name: &str,
+        admit: Admit,
+    ) -> Result<ServerPlaylistImportOutcome, DbErr>
+    where
+        Admit: FnOnce() -> Admission,
+        Admission: Future<Output = Option<Authority>>,
+        Authority: Send + 'static,
+    {
         validate_snapshot_source(source_id, snapshot)?;
         let name = initial_snapshot_name(snapshot, fallback_name)?;
         let txn = self.db.begin().await?;
         let playlist = insert_regular_playlist(&txn, &name).await?;
         insert_server_snapshot_entries(&txn, &playlist.id, source_id, snapshot.track_ids()).await?;
 
-        let Some(authority) = authorize() else {
+        let Some(authority) = admit().await else {
             txn.rollback().await?;
             return Ok(ServerPlaylistImportOutcome::Rejected);
         };
@@ -385,14 +433,33 @@ impl PlaylistManager {
     where
         Authorize: FnOnce() -> Option<ServerPlaylistCommitAuthority>,
     {
-        self.create_server_playlist_mirror_from_snapshot_if_authorized(
+        self.create_server_playlist_mirror_if_admitted(pull, fallback_name, || {
+            std::future::ready(authorize().map(|authority| (authority, ())))
+        })
+        .await
+    }
+
+    /// Create one pull mirror only when both exact-session authority and the
+    /// caller's latest-request admission guard are available at commit time.
+    pub async fn create_server_playlist_mirror_if_admitted<Guard, Admit, Admission>(
+        &self,
+        pull: &ServerPlaylistPull,
+        fallback_name: &str,
+        admit: Admit,
+    ) -> Result<ServerPlaylistCreateOutcome, DbErr>
+    where
+        Admit: FnOnce() -> Admission,
+        Admission: Future<Output = Option<(ServerPlaylistCommitAuthority, Guard)>>,
+        Guard: Send + 'static,
+    {
+        self.create_server_playlist_mirror_from_snapshot_if_admitted(
             pull.source_id(),
             pull.snapshot(),
             fallback_name,
-            || {
-                let authority = authorize()?;
+            || async {
+                let (authority, guard) = admit().await?;
                 pull.accepts_commit_authority(&authority)
-                    .then_some(authority)
+                    .then_some((authority, guard))
             },
         )
         .await
@@ -407,6 +474,27 @@ impl PlaylistManager {
     ) -> Result<ServerPlaylistCreateOutcome, DbErr>
     where
         Authorize: FnOnce() -> Option<Authority>,
+        Authority: Send + 'static,
+    {
+        self.create_server_playlist_mirror_from_snapshot_if_admitted(
+            source_id,
+            snapshot,
+            fallback_name,
+            || std::future::ready(authorize()),
+        )
+        .await
+    }
+
+    async fn create_server_playlist_mirror_from_snapshot_if_admitted<Authority, Admit, Admission>(
+        &self,
+        source_id: SourceId,
+        snapshot: &ServerPlaylistSnapshot,
+        fallback_name: &str,
+        admit: Admit,
+    ) -> Result<ServerPlaylistCreateOutcome, DbErr>
+    where
+        Admit: FnOnce() -> Admission,
+        Admission: Future<Output = Option<Authority>>,
         Authority: Send + 'static,
     {
         validate_snapshot_source(source_id, snapshot)?;
@@ -438,7 +526,7 @@ impl PlaylistManager {
         .await?;
         let link = decode_link(row)?;
 
-        let Some(authority) = authorize() else {
+        let Some(authority) = admit().await else {
             txn.rollback().await?;
             return Ok(ServerPlaylistCreateOutcome::Rejected);
         };
@@ -464,15 +552,35 @@ impl PlaylistManager {
     where
         Authorize: FnOnce() -> Option<ServerPlaylistCommitAuthority>,
     {
-        self.apply_server_playlist_snapshot_if_authorized(
+        self.apply_server_playlist_pull_if_admitted(ticket, pull, policy, || {
+            std::future::ready(authorize().map(|authority| (authority, ())))
+        })
+        .await
+    }
+
+    /// Apply a pull only after exact-session authority and an independent
+    /// latest-request generation are both admitted at the staged commit edge.
+    pub async fn apply_server_playlist_pull_if_admitted<Guard, Admit, Admission>(
+        &self,
+        ticket: ServerPlaylistSyncTicket,
+        pull: &ServerPlaylistPull,
+        policy: ServerPlaylistPullPolicy,
+        admit: Admit,
+    ) -> Result<ServerPlaylistPullOutcome, DbErr>
+    where
+        Admit: FnOnce() -> Admission,
+        Admission: Future<Output = Option<(ServerPlaylistCommitAuthority, Guard)>>,
+        Guard: Send + 'static,
+    {
+        self.apply_server_playlist_snapshot_if_admitted(
             ticket,
             pull.source_id(),
             pull.snapshot(),
             policy,
-            || {
-                let authority = authorize()?;
+            || async {
+                let (authority, guard) = admit().await?;
                 pull.accepts_commit_authority(&authority)
-                    .then_some(authority)
+                    .then_some((authority, guard))
             },
         )
         .await
@@ -498,6 +606,28 @@ impl PlaylistManager {
         .await
     }
 
+    /// Replace a divergent local copy only after the caller's final admission
+    /// and the exact source session are jointly held through commit.
+    pub async fn replace_local_with_server_if_admitted<Guard, Admit, Admission>(
+        &self,
+        ticket: ServerPlaylistSyncTicket,
+        pull: &ServerPlaylistPull,
+        admit: Admit,
+    ) -> Result<ServerPlaylistPullOutcome, DbErr>
+    where
+        Admit: FnOnce() -> Admission,
+        Admission: Future<Output = Option<(ServerPlaylistCommitAuthority, Guard)>>,
+        Guard: Send + 'static,
+    {
+        self.apply_server_playlist_pull_if_admitted(
+            ticket,
+            pull,
+            ServerPlaylistPullPolicy::ReplaceLocal,
+            admit,
+        )
+        .await
+    }
+
     async fn apply_server_playlist_snapshot_if_authorized<Authority, Authorize>(
         &self,
         ticket: ServerPlaylistSyncTicket,
@@ -508,6 +638,25 @@ impl PlaylistManager {
     ) -> Result<ServerPlaylistPullOutcome, DbErr>
     where
         Authorize: FnOnce() -> Option<Authority>,
+        Authority: Send + 'static,
+    {
+        self.apply_server_playlist_snapshot_if_admitted(ticket, source_id, snapshot, policy, || {
+            std::future::ready(authorize())
+        })
+        .await
+    }
+
+    async fn apply_server_playlist_snapshot_if_admitted<Authority, Admit, Admission>(
+        &self,
+        ticket: ServerPlaylistSyncTicket,
+        source_id: SourceId,
+        snapshot: &ServerPlaylistSnapshot,
+        policy: ServerPlaylistPullPolicy,
+        admit: Admit,
+    ) -> Result<ServerPlaylistPullOutcome, DbErr>
+    where
+        Admit: FnOnce() -> Admission,
+        Admission: Future<Output = Option<Authority>>,
         Authority: Send + 'static,
     {
         validate_snapshot_source(source_id, snapshot)?;
@@ -543,7 +692,7 @@ impl PlaylistManager {
                 txn.rollback().await?;
                 return Ok(ServerPlaylistPullOutcome::Superseded);
             };
-            let Some(authority) = authorize() else {
+            let Some(authority) = admit().await else {
                 txn.rollback().await?;
                 return Ok(ServerPlaylistPullOutcome::Rejected);
             };
@@ -591,7 +740,7 @@ impl PlaylistManager {
             txn.rollback().await?;
             return Ok(ServerPlaylistPullOutcome::Superseded);
         };
-        let Some(authority) = authorize() else {
+        let Some(authority) = admit().await else {
             txn.rollback().await?;
             return Ok(ServerPlaylistPullOutcome::Rejected);
         };
@@ -617,15 +766,34 @@ impl PlaylistManager {
     where
         Authorize: FnOnce() -> Option<ServerPlaylistCommitAuthority>,
     {
-        self.mark_server_playlist_missing_identity_if_authorized(
+        self.mark_server_playlist_missing_if_admitted(ticket, evidence, || {
+            std::future::ready(authorize().map(|authority| (authority, ())))
+        })
+        .await
+    }
+
+    /// Mark exact-list absence only after exact-session authority and the
+    /// caller's latest-request generation are admitted together.
+    pub async fn mark_server_playlist_missing_if_admitted<Guard, Admit, Admission>(
+        &self,
+        ticket: ServerPlaylistSyncTicket,
+        evidence: &ServerPlaylistAbsenceEvidence,
+        admit: Admit,
+    ) -> Result<ServerPlaylistMissingOutcome, DbErr>
+    where
+        Admit: FnOnce() -> Admission,
+        Admission: Future<Output = Option<(ServerPlaylistCommitAuthority, Guard)>>,
+        Guard: Send + 'static,
+    {
+        self.mark_server_playlist_missing_identity_if_admitted(
             ticket,
             evidence.source_id(),
             evidence.native_id(),
-            || {
-                let authority = authorize()?;
+            || async {
+                let (authority, guard) = admit().await?;
                 evidence
                     .accepts_commit_authority(&authority)
-                    .then_some(authority)
+                    .then_some((authority, guard))
             },
         )
         .await
@@ -640,6 +808,24 @@ impl PlaylistManager {
     ) -> Result<ServerPlaylistMissingOutcome, DbErr>
     where
         Authorize: FnOnce() -> Option<Authority>,
+        Authority: Send + 'static,
+    {
+        self.mark_server_playlist_missing_identity_if_admitted(ticket, source_id, native_id, || {
+            std::future::ready(authorize())
+        })
+        .await
+    }
+
+    async fn mark_server_playlist_missing_identity_if_admitted<Authority, Admit, Admission>(
+        &self,
+        ticket: ServerPlaylistSyncTicket,
+        source_id: SourceId,
+        native_id: &NativePlaylistId,
+        admit: Admit,
+    ) -> Result<ServerPlaylistMissingOutcome, DbErr>
+    where
+        Admit: FnOnce() -> Admission,
+        Admission: Future<Output = Option<Authority>>,
         Authority: Send + 'static,
     {
         validate_ticket_identity(&ticket, source_id, native_id)?;
@@ -675,7 +861,7 @@ impl PlaylistManager {
             txn.rollback().await?;
             return Ok(ServerPlaylistMissingOutcome::Superseded);
         };
-        let Some(authority) = authorize() else {
+        let Some(authority) = admit().await else {
             txn.rollback().await?;
             return Ok(ServerPlaylistMissingOutcome::Rejected);
         };
@@ -689,6 +875,23 @@ impl PlaylistManager {
         &self,
         ticket: ServerPlaylistSyncTicket,
     ) -> Result<ServerPlaylistUnlinkOutcome, DbErr> {
+        self.unlink_server_playlist_if_admitted(ticket, || std::future::ready(Some(())))
+            .await
+    }
+
+    /// Remove a pull link only after the caller admits the fully staged
+    /// transaction. The returned opaque guard is retained by the detached
+    /// commit worker, making an admitted unlink drainable under cancellation.
+    pub async fn unlink_server_playlist_if_admitted<Guard, Admit, Admission>(
+        &self,
+        ticket: ServerPlaylistSyncTicket,
+        admit: Admit,
+    ) -> Result<ServerPlaylistUnlinkOutcome, DbErr>
+    where
+        Admit: FnOnce() -> Admission,
+        Admission: Future<Output = Option<Guard>>,
+        Guard: Send + 'static,
+    {
         let txn = self.db.begin().await?;
         if load_ticket_link(&txn, &ticket).await?.is_none() {
             txn.rollback().await?;
@@ -708,7 +911,11 @@ impl PlaylistManager {
             txn.rollback().await?;
             return Ok(ServerPlaylistUnlinkOutcome::Superseded);
         }
-        txn.commit().await?;
+        let Some(guard) = admit().await else {
+            txn.rollback().await?;
+            return Ok(ServerPlaylistUnlinkOutcome::Rejected);
+        };
+        commit_with_authority(txn, guard).await?;
         Ok(ServerPlaylistUnlinkOutcome::Unlinked(
             ServerPlaylistLocalCopy {
                 playlist_id: playlist.id,
@@ -724,6 +931,23 @@ impl PlaylistManager {
         &self,
         ticket: ServerPlaylistSyncTicket,
     ) -> Result<ServerPlaylistRemoveOutcome, DbErr> {
+        self.remove_local_server_playlist_if_admitted(ticket, || std::future::ready(Some(())))
+            .await
+    }
+
+    /// Delete a linked local copy only after the caller admits the fully
+    /// staged transaction. Admission rejection rolls back the link, playlist,
+    /// entries, and the durable sidebar revision as one unit.
+    pub async fn remove_local_server_playlist_if_admitted<Guard, Admit, Admission>(
+        &self,
+        ticket: ServerPlaylistSyncTicket,
+        admit: Admit,
+    ) -> Result<ServerPlaylistRemoveOutcome, DbErr>
+    where
+        Admit: FnOnce() -> Admission,
+        Admission: Future<Output = Option<Guard>>,
+        Guard: Send + 'static,
+    {
         let txn = self.db.begin().await?;
         if load_ticket_link(&txn, &ticket).await?.is_none() {
             txn.rollback().await?;
@@ -741,7 +965,11 @@ impl PlaylistManager {
                 "Linked playlist not found".to_string(),
             ));
         }
-        txn.commit().await?;
+        let Some(guard) = admit().await else {
+            txn.rollback().await?;
+            return Ok(ServerPlaylistRemoveOutcome::Rejected);
+        };
+        commit_with_authority(txn, guard).await?;
         Ok(ServerPlaylistRemoveOutcome::Removed)
     }
 }
@@ -1014,11 +1242,12 @@ fn digest_component(digest: &mut Sha256, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
 
     use sea_orm::{
         ActiveModelTrait, ActiveValue::Set, ConnectionTrait, Database, DatabaseConnection,
-        EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+        EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Statement,
     };
     use sea_orm_migration::MigratorTrait;
 
@@ -1105,6 +1334,28 @@ mod tests {
         let mut active: playlist::ActiveModel = model.into();
         active.name = Set(name.to_string());
         active.update(db).await.expect("bypass manager rename");
+    }
+
+    async fn sidebar_revision(db: &DatabaseConnection) -> i64 {
+        db.query_one(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT revision FROM playlist_sidebar_revision WHERE singleton = 1",
+        ))
+        .await
+        .expect("query sidebar revision")
+        .expect("sidebar revision singleton")
+        .try_get("", "revision")
+        .expect("valid sidebar revision")
+    }
+
+    struct TestAdmissionGuard;
+
+    fn admit_generation(
+        current: &Arc<AtomicU64>,
+        expected: u64,
+    ) -> impl Future<Output = Option<((), TestAdmissionGuard)>> {
+        let current = Arc::clone(current);
+        async move { (current.load(Ordering::Acquire) == expected).then_some(((), TestAdmissionGuard)) }
     }
 
     #[test]
@@ -1692,6 +1943,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_coordinator_generation_rejects_every_staged_server_mutation_without_invalidation(
+    ) {
+        let db = database().await;
+        let manager = PlaylistManager::new(db.clone());
+        let generation = Arc::new(AtomicU64::new(2));
+        let stale_generation = 1;
+
+        let detached = snapshot("stale-import", Some("Stale import"), &["detached"]);
+        let before_import = sidebar_revision(&db).await;
+        assert_eq!(
+            manager
+                .import_server_playlist_copy_from_snapshot_if_admitted(
+                    source_id(),
+                    &detached,
+                    "unused",
+                    || admit_generation(&generation, stale_generation),
+                )
+                .await
+                .unwrap(),
+            ServerPlaylistImportOutcome::Rejected
+        );
+        assert_eq!(sidebar_revision(&db).await, before_import);
+        assert_eq!(playlist::Entity::find().count(&db).await.unwrap(), 0);
+        assert_eq!(playlist_entry::Entity::find().count(&db).await.unwrap(), 0);
+
+        let initial = snapshot("stale-linked", Some("Baseline"), &["old-a", "old-b"]);
+        let (copy, baseline_link) = create_mirror(&manager, &initial).await;
+        let baseline_entries = entries(&db, copy.playlist_id()).await;
+        let baseline_revision = sidebar_revision(&db).await;
+
+        let duplicate = snapshot("stale-create", Some("Rejected create"), &["new"]);
+        assert_eq!(
+            manager
+                .create_server_playlist_mirror_from_snapshot_if_admitted(
+                    source_id(),
+                    &duplicate,
+                    "unused",
+                    || admit_generation(&generation, stale_generation),
+                )
+                .await
+                .unwrap(),
+            ServerPlaylistCreateOutcome::Rejected
+        );
+        assert_eq!(sidebar_revision(&db).await, baseline_revision);
+        assert_eq!(playlist::Entity::find().count(&db).await.unwrap(), 1);
+        assert_eq!(
+            server_playlist_link::Entity::find()
+                .count(&db)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let ticket = preparation(&manager, copy.playlist_id())
+            .await
+            .ticket()
+            .clone();
+        let incoming = snapshot("stale-linked", Some("Rejected pull"), &["replacement"]);
+        assert_eq!(
+            manager
+                .apply_server_playlist_snapshot_if_admitted(
+                    ticket.clone(),
+                    source_id(),
+                    &incoming,
+                    ServerPlaylistPullPolicy::ReplaceLocal,
+                    || admit_generation(&generation, stale_generation),
+                )
+                .await
+                .unwrap(),
+            ServerPlaylistPullOutcome::Rejected
+        );
+        assert_eq!(sidebar_revision(&db).await, baseline_revision);
+        assert_eq!(entries(&db, copy.playlist_id()).await, baseline_entries);
+        assert_eq!(
+            manager
+                .get_server_playlist_link(copy.playlist_id())
+                .await
+                .unwrap(),
+            Some(baseline_link.clone())
+        );
+
+        assert_eq!(
+            manager
+                .mark_server_playlist_missing_identity_if_admitted(
+                    ticket,
+                    source_id(),
+                    initial.native_id(),
+                    || admit_generation(&generation, stale_generation),
+                )
+                .await
+                .unwrap(),
+            ServerPlaylistMissingOutcome::Rejected
+        );
+        assert_eq!(sidebar_revision(&db).await, baseline_revision);
+        assert_eq!(
+            manager
+                .get_server_playlist_link(copy.playlist_id())
+                .await
+                .unwrap(),
+            Some(baseline_link)
+        );
+    }
+
+    #[tokio::test]
+    async fn unlink_and_remove_admission_rejection_rolls_back_rows_and_sidebar_invalidation() {
+        let db = database().await;
+        let manager = PlaylistManager::new(db.clone());
+
+        let unlink_snapshot = snapshot("guarded-unlink", Some("Guarded unlink"), &["a", "a"]);
+        let (unlink_copy, unlink_link) = create_mirror(&manager, &unlink_snapshot).await;
+        let unlink_ticket = preparation(&manager, unlink_copy.playlist_id())
+            .await
+            .ticket()
+            .clone();
+        let unlink_revision = sidebar_revision(&db).await;
+        let unlink_called = Arc::new(AtomicBool::new(false));
+        let called = Arc::clone(&unlink_called);
+        assert_eq!(
+            manager
+                .unlink_server_playlist_if_admitted(unlink_ticket.clone(), || async move {
+                    called.store(true, Ordering::Release);
+                    Option::<TestAdmissionGuard>::None
+                })
+                .await
+                .unwrap(),
+            ServerPlaylistUnlinkOutcome::Rejected
+        );
+        assert!(unlink_called.load(Ordering::Acquire));
+        assert_eq!(sidebar_revision(&db).await, unlink_revision);
+        assert_eq!(
+            manager
+                .get_server_playlist_link(unlink_copy.playlist_id())
+                .await
+                .unwrap(),
+            Some(unlink_link)
+        );
+        assert_eq!(entries(&db, unlink_copy.playlist_id()).await.len(), 2);
+        assert!(matches!(
+            manager
+                .unlink_server_playlist_if_admitted(unlink_ticket, || async {
+                    Some(TestAdmissionGuard)
+                })
+                .await
+                .unwrap(),
+            ServerPlaylistUnlinkOutcome::Unlinked(_)
+        ));
+
+        let remove_snapshot = snapshot("guarded-remove", Some("Guarded remove"), &["x"]);
+        let (remove_copy, remove_link) = create_mirror(&manager, &remove_snapshot).await;
+        let remove_ticket = preparation(&manager, remove_copy.playlist_id())
+            .await
+            .ticket()
+            .clone();
+        let remove_revision = sidebar_revision(&db).await;
+        let remove_called = Arc::new(AtomicBool::new(false));
+        let called = Arc::clone(&remove_called);
+        assert_eq!(
+            manager
+                .remove_local_server_playlist_if_admitted(remove_ticket.clone(), || async move {
+                    called.store(true, Ordering::Release);
+                    Option::<TestAdmissionGuard>::None
+                })
+                .await
+                .unwrap(),
+            ServerPlaylistRemoveOutcome::Rejected
+        );
+        assert!(remove_called.load(Ordering::Acquire));
+        assert_eq!(sidebar_revision(&db).await, remove_revision);
+        assert_eq!(
+            manager
+                .get_server_playlist_link(remove_copy.playlist_id())
+                .await
+                .unwrap(),
+            Some(remove_link)
+        );
+        assert!(playlist::Entity::find_by_id(remove_copy.playlist_id())
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(entries(&db, remove_copy.playlist_id()).await.len(), 1);
+        assert_eq!(
+            manager
+                .remove_local_server_playlist_if_admitted(remove_ticket, || async {
+                    Some(TestAdmissionGuard)
+                })
+                .await
+                .unwrap(),
+            ServerPlaylistRemoveOutcome::Removed
+        );
+    }
+
+    #[tokio::test]
     async fn unlink_and_explicit_remove_are_revision_checked_recovery_paths() {
         let db = database().await;
         let manager = PlaylistManager::new(db.clone());
@@ -1771,15 +2215,27 @@ mod tests {
         let (copy, link) = create_mirror(&manager, &snapshot).await;
         let prepared = preparation(&manager, copy.playlist_id()).await;
         let create = ServerPlaylistCreateOutcome::AlreadyLinked(link.clone());
+        let mismatched_native = NativePlaylistId::new("other-private-native").unwrap();
+        let mismatch = validate_ticket_identity(prepared.ticket(), source_id(), &mismatched_native)
+            .expect_err("mismatched admission identity");
         for diagnostic in [
             format!("{copy:?}"),
             format!("{link:?}"),
             format!("{:?}", prepared.ticket()),
             format!("{prepared:?}"),
             format!("{create:?}"),
+            format!("{:?}", ServerPlaylistImportOutcome::Rejected),
+            format!("{:?}", ServerPlaylistCreateOutcome::Rejected),
+            format!("{:?}", ServerPlaylistPullOutcome::Rejected),
+            format!("{:?}", ServerPlaylistMissingOutcome::Rejected),
+            format!("{:?}", ServerPlaylistUnlinkOutcome::Rejected),
+            format!("{:?}", ServerPlaylistRemoveOutcome::Rejected),
+            mismatch.to_string(),
         ] {
             assert!(
-                !diagnostic.contains(secret),
+                !diagnostic.contains(secret)
+                    && !diagnostic.contains(mismatched_native.as_str())
+                    && !diagnostic.contains(copy.playlist_id()),
                 "diagnostic leaked: {diagnostic}"
             );
         }
