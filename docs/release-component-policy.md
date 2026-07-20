@@ -44,10 +44,12 @@ apply the policy at the boundaries available to them:
   denied dependency discovered during that traversal, and recursively scan the finished portable
   application before archive, installer, signing, or disk-image creation. Windows rejects source
   and destination filesystem reparse points before bundle writes, performs a bounded final import
-  pass over every hidden-inclusive DLL/EXE, reopens the completed ZIP to validate every entry name,
-  and makes installer-only mode repeat both the tree and import gates so a stale incremental bundle
-  cannot bypass them. macOS release builds pin the repository policy and system inspection tools
-  instead of honoring the helper's test hooks; native plugin/dependency source paths and linked
+  pass over every hidden-inclusive DLL/DRV/EXE, accepts the legacy system `.drv` import-module form
+  used by current GTK packages without exempting a bundled DRV from inspection, reopens the
+  completed ZIP to validate every entry name, and makes installer-only mode repeat both the tree
+  and import gates so a stale incremental bundle cannot bypass them. macOS release builds pin the
+  repository policy and system inspection tools instead of honoring the helper's test hooks;
+  native plugin/dependency source paths and linked
   dependency, rpath, and load-command paths are checked component by component under a fixed ASCII
   locale, and Mach-O magic triggers import inspection even without an executable bit or conventional
   name.

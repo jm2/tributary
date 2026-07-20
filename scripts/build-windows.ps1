@@ -411,12 +411,14 @@ function Stop-ProbeProcessTree {
 #   Import {
 #     Name: libfoo.dll
 #   }
-# --coff-imports includes ordinary and delay-load imports. Reject path
-# separators and other invalid filename characters so inspector output can
-# never redirect a copy outside the selected MSYS2 architecture's bin folder.
+# Windows also exposes a small number of legacy system modules with a .drv
+# suffix, notably WINSPOOL.DRV imported by current GTK packages. --coff-imports includes
+# ordinary and delay-load imports. Reject every other suffix, path separator,
+# and invalid filename character so inspector output can never redirect a copy
+# outside the selected MSYS2 architecture's bin folder.
 function Get-PeImportDependencyName {
     param([string]$Line)
-    if ($Line -notmatch '^\s*Name:\s*([^\\/:*?"<>|\x00-\x1F]+\.dll)\s*$') { return $null }
+    if ($Line -notmatch '^\s*Name:\s*([^\\/:*?"<>|\x00-\x1F]+\.(?:dll|drv))\s*$') { return $null }
     return $matches[1]
 }
 
@@ -483,8 +485,9 @@ function ConvertTo-BoundedPeImportArgumentBatch {
             throw "PE import-inspection target #$targetNumber is not a valid filesystem path ($targetLabel)"
         }
         $extension = [System.IO.Path]::GetExtension($normalizedTarget)
-        if ($extension -ine ".dll" -and $extension -ine ".exe") {
-            throw "PE import-inspection target #$targetNumber is not a DLL or EXE ($targetLabel)"
+        if ($extension -ine ".dll" -and $extension -ine ".drv" -and
+            $extension -ine ".exe") {
+            throw "PE import-inspection target #$targetNumber is not a DLL, DRV, or EXE ($targetLabel)"
         }
         if (-not [System.IO.File]::Exists($normalizedTarget)) {
             throw "PE import-inspection target #$targetNumber is not an existing file ($targetLabel)"
@@ -650,11 +653,12 @@ function Assert-WindowsBundlePeImportPolicy {
     $targetItems = @(Get-WindowsTreeMembersWithoutReparseTraversal $rootFull | Where-Object {
         $isDirectory = ($_.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
         $isReparsePoint = ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
-        $isPeCandidate = $_.Extension -ieq '.dll' -or $_.Extension -ieq '.exe'
+        $isPeCandidate = $_.Extension -ieq '.dll' -or $_.Extension -ieq '.drv' -or
+            $_.Extension -ieq '.exe'
         -not $isDirectory -and -not $isReparsePoint -and $isPeCandidate
     } | Sort-Object FullName)
     if ($targetItems.Count -eq 0) {
-        throw "Windows bundle contains no DLL or EXE targets for final PE import validation"
+        throw "Windows bundle contains no DLL, DRV, or EXE targets for final PE import validation"
     }
 
     $maxTargets = 4096
@@ -750,7 +754,8 @@ function Assert-WindowsBundlePeImportPolicy {
     $finalTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $rootFull | Where-Object {
         $isDirectory = ($_.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
         $isReparsePoint = ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
-        $isPeCandidate = $_.Extension -ieq '.dll' -or $_.Extension -ieq '.exe'
+        $isPeCandidate = $_.Extension -ieq '.dll' -or $_.Extension -ieq '.drv' -or
+            $_.Extension -ieq '.exe'
         -not $isDirectory -and -not $isReparsePoint -and $isPeCandidate
     })
     if ($finalTargets.Count -ne $targetSnapshot.Count) {
@@ -1342,7 +1347,7 @@ if (-not [System.IO.Path]::IsPathRooted($peImportInspector) -or
 
 Write-Info "Resolving required DLLs for executable and plugins..."
 
-# Seed the dependency closure with every PE DLL and executable already present
+# Seed the dependency closure with every PE DLL, DRV, and executable already present
 # anywhere in the bundle, including hidden and stale incremental members. The
 # same hidden-inclusive enumerator used by the final policy scan avoids a
 # visible-lib-only gap. Every MSYS2 runtime DLL discovered below is copied to
@@ -1366,7 +1371,8 @@ $scannedDllTargets = @{}
 $initialDllScanTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $DIST | Where-Object {
     $isDirectory = ($_.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
     $isReparsePoint = ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
-    $isPeCandidate = $_.Extension -ieq '.dll' -or $_.Extension -ieq '.exe'
+    $isPeCandidate = $_.Extension -ieq '.dll' -or $_.Extension -ieq '.drv' -or
+        $_.Extension -ieq '.exe'
     -not $isDirectory -and -not $isReparsePoint -and $isPeCandidate
 } | Select-Object -ExpandProperty FullName)
 foreach ($bin in $initialDllScanTargets) {

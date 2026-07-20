@@ -532,9 +532,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   references and scans the finished payload before archive, installer, signing, or disk-image
   creation. Link-based denied-component escapes and incomplete inspection paths fail closed.
   Windows validates forced-copy sources, performs a bounded hidden-inclusive final PE-import pass,
-  reopens the final ZIP, and repeats tree/import validation in installer-only mode so stale or
-  post-closure files cannot bypass the gate. macOS pins its canonical policy and inspection tools,
-  checks native plugin/dependency source paths and linked dependency, rpath, and load-command path
+  recognizes the legacy system `.drv` module spelling used by current GTK packages while placing
+  any bundled DRV in the same inspected target set, reopens the final ZIP, and repeats tree/import
+  validation in installer-only mode so stale or post-closure files cannot bypass the gate. macOS
+  pins its canonical policy and inspection tools, checks native plugin/dependency source paths and
+  linked dependency, rpath, and load-command path
   components under a fixed ASCII locale, and recognizes Mach-O files by magic even in nonstandard
   locations without executable bits. Native `.deb`, `.rpm`, Arch, and Flatpak application payloads
   receive corresponding relationship, control/installer-script, all-bracketed ELF dynamic metadata,

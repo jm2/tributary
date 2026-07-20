@@ -282,9 +282,9 @@ fn windows_bundle_loads_policy_and_rejects_reparse_points() {
     assert!(
         build_windows.contains(
             "$initialDllScanTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $DIST"
-        ) && build_windows.contains("$_.Extension -ieq '.dll' -or $_.Extension -ieq '.exe'")
+        ) && build_windows.contains("$_.Extension -ieq '.dll' -or $_.Extension -ieq '.drv'")
             && !build_windows.contains("Get-ChildItem -Path \"$DIST\\lib\" -Recurse -Filter *.dll"),
-        "PE import scanning must seed every hidden-inclusive DLL/EXE in the complete bundle"
+        "PE import scanning must seed every hidden-inclusive DLL/DRV/EXE in the complete bundle"
     );
     let root_reparse_assertion = build_windows
         .find("Assert-WindowsBundleRootIsNotReparsePoint $DIST")
@@ -428,7 +428,7 @@ fn windows_bundle_validates_the_completed_zip_and_ci_parser() {
                 "Final PE import inspector returned an unsupported dependency spelling"
             )
             && build_windows.contains("$targetSnapshot.ContainsKey($finalPath)"),
-        "the final gate must inspect every hidden DLL/EXE as bounded PE data, reject malformed imports, and detect a changing target set"
+        "the final gate must inspect every hidden DLL/DRV/EXE as bounded PE data, reject malformed imports, and detect a changing target set"
     );
     assert!(
         windows_ci.contains("name: Parse bundler with Windows PowerShell 5.1")
