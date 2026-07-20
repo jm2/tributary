@@ -39,7 +39,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Tiered geo-location (geo-distance → state → country) | ✅ |
 | Column drag-and-drop reordering with persistence | ✅ |
 | Regular & smart playlists (iTunes-style rules engine) | ✅ Regular playlists mix local and authenticated Subsonic/Jellyfin/Plex/DAAP entries; smart playlists remain local-library queries ([#142](https://github.com/jm2/tributary/pull/142)) |
-| Subsonic server-native playlist import/sync | 🚧 Pull-only contract, bounded reads, strict link persistence, atomic sync, durable full-snapshot ordering, and the headless latest-request/reconnect coordinator are complete; the virtualized browser and visible accessible action/recovery wiring remain tracked in [#143](https://github.com/jm2/tributary/issues/143) |
+| Subsonic server-native playlist import/sync | ✅ Pull-only browser with detached Import Copy, read-only Keep Synced, reconnect/manual refresh, and visible conflict, missing, offline, retry, replace, unlink, and removal recovery ([#143](https://github.com/jm2/tributary/issues/143)) |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
 | Batch metadata editing (multi-select) | ✅ |
@@ -476,6 +476,7 @@ src/
 │   ├── mod.rs              # Local backend root
 │   ├── backend.rs          # MediaBackend impl (LocalBackend)
 │   ├── engine.rs           # Async scan + notify FS watcher + LibraryEvent channel
+│   ├── server_playlist_browser.rs # Opaque session/action-token broker for GTK browsing
 │   ├── server_playlist_runtime.rs # Exact-session reconnect and manual pull facade
 │   ├── playback_history.rs # Pure counted-play occurrence accounting
 │   ├── tag_parser.rs       # lofty audio tag extraction
@@ -520,6 +521,8 @@ src/
     ├── discovery_handler.rs# mDNS/DNS-SD event handler (sidebar + output list)
     ├── context_menu.rs     # Tracklist right-click menu (playlist ops + properties)
     ├── playlist_actions.rs # Playlist CRUD (create, rename, delete, reorder)
+    ├── server_playlists.rs  # Virtualized Import Copy/Keep Synced browser
+    ├── server_playlist_recovery.rs # Linked-mirror status and recovery controls
     ├── output_switch.rs    # Output selector click handler (local/MPD/AirPlay/Cast)
     ├── header_bar.rs       # Playback controls, now-playing, progress, volume
     ├── sidebar.rs          # Source list (local + remote + discovered + eject)
@@ -788,15 +791,34 @@ shutdown closes coordinator admission before source shutdown, cancels only pre-a
 uses a persistent barrier to drain admitted tasks and guards. Committed changes feed the durable
 full-snapshot publisher.
 
-A separate localized and accessible footer shell is still hidden. P1.5 Record E remains open for a
-virtualized server-playlist browser, opaque Import Copy/Keep Synced action tokens, and visible
-accessible GTK Sync/Retry/Replace/Unlink/Remove recovery wiring. This pull-only scope performs no
-server playlist creation/update/deletion, fuzzy metadata merge, or periodic server polling; only
-authenticated Subsonic has server-playlist read authority, and native playlist IDs never enter GTK.
-See
+The Playlists header's **Server Playlists…** action opens a virtualized browser over only current
+sources that advertise pull-snapshot authority—currently authenticated Subsonic. The source picker
+and Reload action publish bounded playlist name/owner hints while the headless broker retains the
+exact source session and native playlist identity. GTK receives only an opaque snapshot-session
+token and one-shot action token for each row. **Import Copy** creates a detached editable playlist;
+**Keep Synced** creates the read-only pull mirror described above. Capacity rejection leaves the
+row token retryable; every non-Busy settlement consumes it. Reload, source or runtime replacement,
+dialog close, shutdown, and stale browse completion revoke the applicable session; generation
+checks prevent an older browse or action result from changing current widgets.
+
+Selecting a linked mirror exposes its localized, accessible status and only the actions valid for
+its current state and exact-session availability: **Sync Now**, **Retry**, **Replace Local with
+Server**, **Unlink**, and **Remove Local Copy**. Network recovery is disabled while the source is
+unavailable; Unlink and Remove Local Copy remain source-independent. Replace, Unlink, and Remove
+require explicit confirmation. The targetless window actions re-read the selected typed mirror and
+generation immediately before dispatch, disable conflicting controls while work runs, and ignore
+stale inspection or completion results. Reconnect and durable full-sidebar publication then refresh
+the same visible state without partial row mutation.
+
+This completed P1.5 scope remains deliberately pull-only: it performs no server playlist
+creation/update/deletion, fuzzy metadata merge, mixed-source XSPF export, or periodic server
+polling. Only authenticated Subsonic has server-playlist read authority, and server-native playlist
+IDs, source-session receipts, credentials, routes, and raw backend content never enter GTK action
+targets, properties, or diagnostics. See
 [P1.5](docs/task.md#p15--persist-source-scoped-playlists), the
-[source-scoped regular-playlist contract](docs/source-scoped-playlists.md), and
-[#143](https://github.com/jm2/tributary/issues/143) for the remaining delivery stages.
+[source-scoped regular-playlist contract](docs/source-scoped-playlists.md), the
+[Subsonic pull-sync contract](docs/subsonic-playlist-sync.md), and
+[#143](https://github.com/jm2/tributary/issues/143) for the completed design boundary.
 
 #### Importing and exporting playlists
 
