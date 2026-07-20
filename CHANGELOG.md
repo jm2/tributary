@@ -9,36 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **P1.5 server-native playlist import and pull-sync now have their complete visible GTK
-  workflow** ([#149](https://github.com/jm2/tributary/pull/149)) — The Playlists-header menu now
-  opens one reusable, virtualized **Server Playlists…** dialog whose source picker exposes only
-  current `PullSnapshots` sources. The headless browser broker owns exact source sessions and
-  server-native playlist identity; GTK retains only existing `SourceId`, bounded name/owner hints,
-  an opaque session token, and one-shot opaque row actions. **Import Copy** creates a detached,
-  editable snapshot and **Keep Synced** creates the unique read-only pull mirror. Browser command
-  and action capacity are bounded. A capacity-busy action remains retryable; every non-Busy
-  settlement consumes its row token. Reload, source/runtime replacement, dialog close, shutdown,
-  and stale browse delivery revoke the applicable session and unused row tokens.
-  Checked UI generations discard stale browse, action, inspection, and recovery completion; an
-  exhausted generation fails closed.
-  Selecting a linked mirror now reveals the previously hidden localized, accessible footer. It
-  derives clean, syncing, failed, offline, conflict, missing, and combined conflict/missing states
-  from the exact selected typed row plus a fresh headless link inspection, then exposes only the
-  applicable **Sync Now**, **Retry**, **Replace Local with Server**, **Unlink**, and **Remove Local
-  Copy** controls. Source-independent Unlink and Remove remain available offline; destructive
-  Replace, Unlink, and Remove require confirmation. Targetless window actions re-read the selected
-  local playlist and inspection generation immediately before dispatch, become inert during
-  shutdown, disable conflicting controls while work runs, and cannot apply an older result after
-  selection, source, runtime, or sidebar-snapshot change. Reconnect and committed operations feed
-  the same durable full-snapshot publication path.
-  Virtualized rows clear recycled visible and accessibility state; loading/action busy state is
-  exposed to assistive technology, and focus is moved before a reload or action disables/removes
-  its current control. No GTK action carries a playlist identifier, and no native playlist ID,
-  exact session receipt, credential, locator, route, server-controlled diagnostic, or raw backend
-  error enters GTK properties or logs.
-  The completed feature remains pull-only and Subsonic-only: it adds no server mutation, periodic
-  polling, fuzzy metadata merge, or mixed-source XSPF export. Validation passes 92 focused
-  server-playlist tests. Locked debug and release suites each pass 20 library, 1,270 application,
-  and 10 repository-metadata tests (1,300 total).
+  workflow** ([#149](https://github.com/jm2/tributary/pull/149)):
+
+  - **Bounded browser:** the Playlists-header menu opens one reusable, virtualized **Server
+    Playlists…** dialog whose source picker exposes only current `PullSnapshots` sources. The
+    headless broker owns exact source sessions and server-native identity; GTK retains only the
+    existing `SourceId`, bounded name/owner hints, an opaque session token, and one-shot opaque row
+    actions. **Import Copy** creates a detached editable snapshot, while **Keep Synced** creates the
+    unique read-only pull mirror.
+  - **Revocable authority:** browser command and action capacity are bounded. Capacity-busy remains
+    retryable; every non-Busy settlement consumes its row token. Reload, source/runtime
+    replacement, dialog close, shutdown, and stale browse delivery revoke the applicable session
+    and unused tokens. Checked generations discard stale browse, action, inspection, and recovery
+    completion; exhaustion fails closed.
+  - **Visible recovery:** selecting a linked mirror reveals the localized, accessible footer. It
+    derives clean, syncing, failed, offline, conflict, missing, and combined conflict/missing states
+    from the exact typed row plus a fresh headless link inspection, then exposes only the applicable
+    **Sync Now**, **Retry**, **Replace Local with Server**, **Unlink**, and **Remove Local Copy**
+    controls. Unlink and Remove remain available offline; destructive Replace, Unlink, and Remove
+    require confirmation.
+  - **Stale-safe lifecycle and accessibility:** targetless actions re-read the selected local
+    playlist and inspection generation before dispatch, become inert during shutdown, disable
+    conflicting controls while work runs, and reject older results after selection, source,
+    runtime, or sidebar-snapshot change. Reconnect and committed operations use the durable
+    full-snapshot publication path. Virtualized rows clear recycled visible/accessibility state,
+    busy state is exposed to assistive technology, and focus moves before a control disappears.
+  - **Privacy, scope, and validation:** no GTK action carries a playlist identifier, and no native
+    playlist ID, exact session receipt, credential, locator, route, server-controlled diagnostic,
+    or raw backend error enters GTK properties or logs. The feature remains pull-only and
+    Subsonic-only: no server mutation, periodic polling, fuzzy metadata merge, or mixed-source XSPF
+    export. Validation passes 92 focused server-playlist tests; locked debug and release suites each
+    pass 20 library, 1,270 application, and 10 repository-metadata tests (1,300 total).
 - **Server-native playlist pulls now have a GTK-free latest-request coordinator and reconnect
   runtime** ([#148](https://github.com/jm2/tributary/pull/148)) — A lifecycle-owned owner serializes
   starts and final admission across three typed, content-redacted lanes: one source, one

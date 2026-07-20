@@ -791,24 +791,24 @@ shutdown closes coordinator admission before source shutdown, cancels only pre-a
 uses a persistent barrier to drain admitted tasks and guards. Committed changes feed the durable
 full-snapshot publisher.
 
-The Playlists header's **Server Playlists…** action opens a virtualized browser over only current
-sources that advertise pull-snapshot authority—currently authenticated Subsonic. The source picker
-and Reload action publish bounded playlist name/owner hints while the headless broker retains the
-exact source session and native playlist identity. GTK receives only an opaque snapshot-session
-token and one-shot action token for each row. **Import Copy** creates a detached editable playlist;
-**Keep Synced** creates the read-only pull mirror described above. Capacity rejection leaves the
-row token retryable; every non-Busy settlement consumes it. Reload, source or runtime replacement,
-dialog close, shutdown, and stale browse completion revoke the applicable session; generation
-checks prevent an older browse or action result from changing current widgets.
+The completed workflow has two visible surfaces:
 
-Selecting a linked mirror exposes its localized, accessible status and only the actions valid for
-its current state and exact-session availability: **Sync Now**, **Retry**, **Replace Local with
-Server**, **Unlink**, and **Remove Local Copy**. Network recovery is disabled while the source is
-unavailable; Unlink and Remove Local Copy remain source-independent. Replace, Unlink, and Remove
-require explicit confirmation. The targetless window actions re-read the selected typed mirror and
-generation immediately before dispatch, disable conflicting controls while work runs, and ignore
-stale inspection or completion results. Reconnect and durable full-sidebar publication then refresh
-the same visible state without partial row mutation.
+- **Browse and import:** the Playlists header's **Server Playlists…** action opens a virtualized
+  browser over current pull-snapshot sources—currently authenticated Subsonic. The source picker
+  and Reload action publish bounded name/owner hints while the headless broker retains the exact
+  source session and native playlist identity. GTK receives only opaque session and one-shot row
+  tokens. **Import Copy** creates a detached editable playlist; **Keep Synced** creates a read-only
+  pull mirror. Capacity rejection remains retryable, every non-Busy settlement consumes its row
+  token, and reload/source/runtime replacement, close, shutdown, or stale delivery revokes the
+  applicable session. Checked generations keep older results from changing current widgets.
+- **Inspect and recover:** selecting a linked mirror exposes its localized, accessible status and
+  only the actions valid for its state and exact-session availability: **Sync Now**, **Retry**,
+  **Replace Local with Server**, **Unlink**, and **Remove Local Copy**. Network recovery is disabled
+  while its source is unavailable; Unlink and Remove remain source-independent. Replace, Unlink,
+  and Remove require confirmation. Targetless actions re-read the selected typed mirror and
+  generation before dispatch, disable conflicting controls during work, and ignore stale inspection
+  or completion results. Reconnect and durable full-sidebar publication refresh the same state
+  without partial row mutation.
 
 This completed P1.5 scope remains deliberately pull-only: it performs no server playlist
 creation/update/deletion, fuzzy metadata merge, mixed-source XSPF export, or periodic server
