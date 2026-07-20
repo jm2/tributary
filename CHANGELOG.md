@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Last.fm now has a fail-closed protocol, credential-vault, and durable-queue foundation**
-  ([#50](https://github.com/jm2/tributary/issues/50)). This is an internal foundation, not yet a
+  ([#50](https://github.com/jm2/tributary/issues/50),
+  [#151](https://github.com/jm2/tributary/pull/151)). This is an internal foundation, not yet a
   user-visible scrobbling feature: playback observation, delivery-worker lifecycle, consent and
   per-source settings, status UI, and localization remain follow-on work.
 
