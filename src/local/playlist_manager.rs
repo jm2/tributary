@@ -7,14 +7,26 @@
 use std::collections::{HashMap, HashSet};
 
 use sea_orm::prelude::*;
-use sea_orm::{ActiveValue::Set, DatabaseTransaction, QueryOrder, TransactionTrait};
+use sea_orm::{ActiveValue::Set, DatabaseTransaction, QueryOrder, QuerySelect, TransactionTrait};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::playlist_io::{ImportedTrack, ImportedTrackMatchIndex};
 use super::smart_rules::{self, SmartRules};
 use crate::architecture::{MediaKey, SourceId, TrackId};
-use crate::db::entities::{playlist, playlist_entry, track};
+use crate::db::entities::{playlist, playlist_entry, server_playlist_link, track};
+
+mod server_playlist_sync;
+
+// Record E is the first production consumer of this complete engine surface.
+#[allow(unused_imports)]
+pub use server_playlist_sync::{
+    ServerPlaylistCreateOutcome, ServerPlaylistImportOutcome, ServerPlaylistLink,
+    ServerPlaylistLocalCopy, ServerPlaylistLocalState, ServerPlaylistMissingOutcome,
+    ServerPlaylistPullOutcome, ServerPlaylistPullPolicy, ServerPlaylistRemoteState,
+    ServerPlaylistRemoveOutcome, ServerPlaylistSyncPreparation, ServerPlaylistSyncTicket,
+    ServerPlaylistUnlinkOutcome,
+};
 
 /// Per-entry outcome counts for one committed playlist import.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -417,24 +429,33 @@ impl PlaylistManager {
 
     /// Delete a playlist and all its entries (cascade).
     pub async fn delete_playlist(&self, id: &str) -> Result<(), DbErr> {
-        playlist::Entity::delete_by_id(id.to_string())
-            .exec(&self.db)
+        let txn = self.db.begin().await?;
+        require_editable_playlist(&txn, id).await?;
+        let deleted = playlist::Entity::delete_by_id(id.to_string())
+            .exec(&txn)
             .await?;
+        if deleted.rows_affected != 1 {
+            return Err(DbErr::RecordNotFound("Playlist not found".to_string()));
+        }
+        txn.commit().await?;
         info!(id = %id, "Playlist deleted");
         Ok(())
     }
 
     /// Rename a playlist.
     pub async fn rename_playlist(&self, id: &str, new_name: &str) -> Result<(), DbErr> {
+        let txn = self.db.begin().await?;
+        require_editable_playlist(&txn, id).await?;
         let mut model: playlist::ActiveModel = playlist::Entity::find_by_id(id.to_string())
-            .one(&self.db)
+            .one(&txn)
             .await?
             .ok_or(DbErr::RecordNotFound(format!("Playlist {id} not found")))?
             .into();
 
         model.name = Set(new_name.to_string());
         model.updated_at = Set(now_rfc3339());
-        model.update(&self.db).await?;
+        model.update(&txn).await?;
+        txn.commit().await?;
         info!(id = %id, name = %new_name, "Playlist renamed");
         Ok(())
     }
@@ -511,7 +532,7 @@ impl PlaylistManager {
         Authority: Send + 'static,
     {
         let txn = self.db.begin().await?;
-        require_regular_playlist(&txn, playlist_id).await?;
+        require_editable_regular_playlist(&txn, playlist_id).await?;
         if inputs.is_empty() {
             let Some(authority) = authorize() else {
                 return Ok(PlaylistEntryAddOutcome::Rejected);
@@ -648,7 +669,7 @@ impl PlaylistManager {
         entry_ids: &[String],
     ) -> Result<(), DbErr> {
         let txn = self.db.begin().await?;
-        require_regular_playlist(&txn, playlist_id).await?;
+        require_editable_regular_playlist(&txn, playlist_id).await?;
         if entry_ids.is_empty() {
             txn.commit().await?;
             return Ok(());
@@ -707,7 +728,7 @@ impl PlaylistManager {
         entry_ids: &[String],
     ) -> Result<(), DbErr> {
         let txn = self.db.begin().await?;
-        require_regular_playlist(&txn, playlist_id).await?;
+        require_editable_regular_playlist(&txn, playlist_id).await?;
         let current = playlist_entry::Entity::find()
             .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
             .all(&txn)
@@ -868,9 +889,11 @@ impl PlaylistManager {
         let json = serde_json::to_string(rules)
             .map_err(|e| DbErr::Custom(format!("Failed to serialize rules: {e}")))?;
 
+        let txn = self.db.begin().await?;
+        require_editable_playlist(&txn, playlist_id).await?;
         let mut model: playlist::ActiveModel =
             playlist::Entity::find_by_id(playlist_id.to_string())
-                .one(&self.db)
+                .one(&txn)
                 .await?
                 .ok_or(DbErr::RecordNotFound(format!(
                     "Playlist {playlist_id} not found"
@@ -901,7 +924,8 @@ impl PlaylistManager {
         }
 
         model.updated_at = Set(now_rfc3339());
-        model.update(&self.db).await?;
+        model.update(&txn).await?;
+        txn.commit().await?;
         info!(id = %playlist_id, "Smart playlist rules updated");
         Ok(())
     }
@@ -966,13 +990,24 @@ impl PlaylistManager {
     ///
     /// Returns the number of entries re-linked.
     pub async fn reconcile_all(&self) -> Result<u32, DbErr> {
-        let orphans = playlist_entry::Entity::find()
-            .filter(playlist_entry::Column::SourceId.eq(SourceId::local().to_string()))
-            .filter(playlist_entry::Column::LocalTrackId.is_null())
-            .all(&self.db)
+        let txn = self.db.begin().await?;
+        let linked_playlist_ids: Vec<String> = server_playlist_link::Entity::find()
+            .select_only()
+            .column(server_playlist_link::Column::PlaylistId)
+            .into_tuple()
+            .all(&txn)
             .await?;
+        let mut orphan_query = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::SourceId.eq(SourceId::local().to_string()))
+            .filter(playlist_entry::Column::LocalTrackId.is_null());
+        if !linked_playlist_ids.is_empty() {
+            orphan_query = orphan_query
+                .filter(playlist_entry::Column::PlaylistId.is_not_in(linked_playlist_ids));
+        }
+        let orphans = orphan_query.all(&txn).await?;
 
         if orphans.is_empty() {
+            txn.commit().await?;
             return Ok(0);
         }
 
@@ -984,7 +1019,7 @@ impl PlaylistManager {
         // Load one track-table snapshot. The same pure path/fingerprint
         // resolver is used by import and reconciliation, keeping duration and
         // ambiguity behavior identical across both paths.
-        let all_tracks = track::Entity::find().all(&self.db).await?;
+        let all_tracks = track::Entity::find().all(&txn).await?;
         let match_index = ImportedTrackMatchIndex::new(&all_tracks);
 
         let mut relinked = 0u32;
@@ -1031,10 +1066,12 @@ impl PlaylistManager {
                 entry.match_artist = Set(match_artist);
                 entry.match_album = Set(match_album);
                 entry.match_duration_secs = Set(match_duration_secs);
-                entry.update(&self.db).await?;
+                entry.update(&txn).await?;
                 relinked += 1;
             }
         }
+
+        txn.commit().await?;
 
         info!(
             relinked = relinked,
@@ -1162,6 +1199,49 @@ where
         return Err(DbErr::Custom(format!(
             "Playlist {playlist_id} is smart and cannot store regular entries"
         )));
+    }
+    Ok(())
+}
+
+/// Require that an ordinary mutation targets a playlist which is not owned
+/// by a pull-only server link. The caller must pass its write transaction so
+/// the denial and mutation share one SQLite serialization boundary.
+async fn require_editable_playlist<C>(db: &C, playlist_id: &str) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if playlist::Entity::find_by_id(playlist_id.to_string())
+        .one(db)
+        .await?
+        .is_none()
+    {
+        return Err(DbErr::RecordNotFound("Playlist not found".to_string()));
+    }
+    if server_playlist_link::Entity::find_by_id(playlist_id.to_string())
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Err(DbErr::Custom(
+            "Linked server playlists are read-only".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn require_editable_regular_playlist<C>(db: &C, playlist_id: &str) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    require_regular_playlist(db, playlist_id).await?;
+    if server_playlist_link::Entity::find_by_id(playlist_id.to_string())
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Err(DbErr::Custom(
+            "Linked server playlists are read-only".to_string(),
+        ));
     }
     Ok(())
 }

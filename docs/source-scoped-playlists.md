@@ -36,8 +36,9 @@ integrates it into those user-facing behaviors without changing the durable sche
 metadata export still needs an explicit no-locator policy. Subsonic server-native playlist
 integration remains a separate capability with its own
 [`subsonic-playlist-sync.md`](subsonic-playlist-sync.md) contract. Its bounded read-only protocol and
-exact-session authority foundation are implemented, but its link persistence, atomic import/pull,
-conflict state, reconnect integration, and UI do not reuse or widen this regular-playlist record.
+exact-session read/commit authority, strict link persistence, and atomic import/pull/conflict engine
+are implemented without reusing or widening this regular-playlist authority. Reconnect scheduling,
+localized recovery, and user-facing controls remain the separate Record E.
 
 Smart playlists are unaffected. They remain live queries over the local library rather than stored
 regular-playlist occurrences.
@@ -299,12 +300,16 @@ current source adapter, session epoch, and revocable lease before and after netw
 require current music-catalogue membership and does not grant display, stream, artwork, rating, or
 history authority for the returned track IDs.
 
-Future Import Copy and Keep Synced persistence will consume a current endpoint snapshot and write
-ordinary canonical `(SourceId, TrackId)` occurrences under this document's schema. The former then
-detaches; the latter retains a dedicated non-secret link outside `playlist_entries` and remains
-read-only. Neither mode may persist an endpoint, credential, locator, route, lease, or session
-epoch, and neither may metadata-match a missing server track. The complete direction, conflict,
-offline, server-deletion, and unlink policy is in the server-native contract.
+Import Copy and Keep Synced persistence now consume a current endpoint snapshot and write ordinary
+canonical `(SourceId, TrackId)` occurrences under this document's schema. Import Copy commits with
+no link and is immediately editable. Keep Synced retains a dedicated migration-14 link outside
+`playlist_entries`, permits only one mirror per exact source/native playlist identity, and makes
+ordinary playlist mutations and reconciliation reject that mirror. Pull replacement still writes
+the regular entries all-or-none in exact server order, including duplicates and track IDs absent
+from the current catalogue. Neither mode persists an endpoint, credential, locator, route, lease,
+session epoch, or raw error, and neither metadata-matches a missing server track. The complete
+direction, revision, conflict, offline, server-deletion, and unlink policy is in the server-native
+contract.
 
 ## Validation matrix
 
@@ -326,10 +331,12 @@ The storage record is complete only when automated coverage demonstrates:
   accepted or serialized.
 
 The storage and authority foundation records do not retroactively claim their consumers. Native
-Subsonic link persistence/synchronization and mixed-source XSPF metadata export remain explicitly
-deferred and require their own validation. Until a no-locator mixed-source export policy exists, a regular
-playlist containing any remote or unresolved occurrence is refused all-or-none before XSPF touches
-its destination; the local-only compatibility projection is never exported as a truncated result.
+Subsonic link persistence and atomic synchronization now have their own strict migration,
+transaction, revision-CAS, lifecycle-permit, drift, missing, unlink/removal, and redaction
+validation. Their localized UI/reconnect consumer and mixed-source XSPF metadata export remain
+explicitly deferred. Until a no-locator mixed-source export policy exists, a regular playlist
+containing any remote or unresolved occurrence is refused all-or-none before XSPF touches its
+destination; the local-only compatibility projection is never exported as a truncated result.
 
 Record A additionally requires automated coverage for default-deny adapters, the four explicit
 authenticated opt-ins, Invalid playlist indexing for missing/duplicate catalogue-native identity,

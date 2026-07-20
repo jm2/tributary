@@ -1,6 +1,6 @@
 # Subsonic server-native playlist import and pull-sync contract
 
-- Status: Accepted for staged implementation
+- Status: Accepted; protocol/authority and persistence/engine stages implemented, UI stage pending
 - Decision date: 2026-07-19
 - Tracking issue: [#143](https://github.com/jm2/tributary/issues/143)
 - Related regular-playlist work: [#140](https://github.com/jm2/tributary/pull/140),
@@ -23,14 +23,14 @@ The central rule is:
 
 The feature is split into three independently reviewable records:
 
-1. **Contract, protocol, and exact-session authority.** Define bounded native-playlist identity and
+1. **Implemented — contract, protocol, and exact-session read authority ([#144]).** Define bounded native-playlist identity and
    snapshot types, implement the read-only Subsonic `getPlaylists` and `getPlaylist` endpoints, and
    expose them only through a default-deny current-session registry capability. This stage writes
    no playlist or link state and adds no UI.
-2. **Link persistence and atomic pull synchronization.** Add the dedicated link schema and the
+2. **Implemented — link persistence and atomic pull synchronization.** Add the dedicated link schema and the
    manager operations for detached imports, read-only mirrors, conflict detection, successful
    atomic replacement, missing-server state, unlink, and removal.
-3. **UI, localization, and end-to-end behavior.** Add explicit Import Copy and Keep Synced actions,
+3. **Planned — UI, localization, and end-to-end behavior.** Add explicit Import Copy and Keep Synced actions,
    Sync Now, status and conflict presentation, Retry/Unlink/Remove Local Copy recovery, reconnect
    refresh, and deterministic integration coverage.
 
@@ -89,14 +89,14 @@ alone does not reorder, pad, or truncate a snapshot.
 authenticated Subsonic adapter may advertise `PullSnapshots`; local, Jellyfin, Plex, DAAP,
 Radio-Browser, removable-media, external-file, and unknown adapters remain unsupported in this
 feature. Advertising the protocol capability means that Tributary may attempt the two read
-operations. In the foundation stage, an HTTP rejection or Subsonic failed envelope is a closed
+operations. An HTTP rejection or Subsonic failed envelope remains a closed
 backend failure and is never reinterpreted as an empty playlist list. Subsonic-family servers do
 not report unsupported endpoints and missing entities consistently enough for the generic client
-to infer either state from HTTP status or error code alone. Dialect-aware unsupported/missing
-classification belongs to the persistence stage, where a successful complete listing can provide
-stronger evidence; until then failure retains prior state and grants no capability.
+to infer either state from HTTP status or error code alone. Persistence therefore accepts only
+exact absence evidence minted from a successful complete listing; any rejected list/detail retains
+the previous local state and grants no capability.
 
-The first stage does not call create, update, or delete playlist endpoints. Adding those calls
+No implemented stage calls create, update, or delete playlist endpoints. Adding those calls
 would be a separate product and authority decision, not an incremental extension of
 `PullSnapshots`.
 
@@ -148,9 +148,19 @@ adapter. The registry admits an operation only when all of these remain true:
 5. the same source, adapter instance, epoch, and lease are current after adapter work completes.
 
 Disconnect, replacement, retirement, shutdown, final release, or cancellation rejects a stale
-result even when the server call itself succeeded. A guard from a predecessor session cannot be
-reused against its successor. Adapter work runs outside the lifecycle mutex, and revalidation never
-holds that mutex across network I/O or allows a selector to re-enter it.
+result even when the server call itself succeeded. A successful complete listing owns an opaque
+receipt and can derive only an exact presence selection or exact absence evidence. Detail consumes
+the presence selection and returns the snapshot with a fresh receipt; predecessor receipts cannot
+be reused against a successor or another registry incarnation. Adapter work runs outside the
+lifecycle mutex, and revalidation never holds that mutex across network I/O or allows a selector to
+re-enter it.
+
+Before a database commit, persistence presents the exact pull or absence receipt back to the same
+registry. The registry rechecks its incarnation, source, adapter pointer, epoch, capability, and
+active session lease under the lifecycle mutex, then returns an opaque session-only permit. If
+invalidation won first, the complete transaction rolls back. If admission won first, replacement,
+disconnect, or shutdown waits until commit or rollback drops the permit. The permit carries no
+native ID and deliberately does not consult or grant catalogue authority.
 
 An operation result distinguishes adapter-level unsupported authority and current
 unavailable/stale authority from a closed backend failure category. Neither variant includes an
@@ -162,37 +172,61 @@ unavailable for display/playback until the normal accepted-catalogue authority i
 contains that exact `(SourceId, TrackId)`. Conversely, an accepted catalogue does not authorize a
 server-playlist call.
 
-## Future persistence boundary
+## Persisted link and atomic manager boundary
 
-The persistence stage will use a dedicated link entity rather than overloading regular-playlist
-entries. One linked row may retain only the minimum non-secret synchronization identity and state:
+Migration 14 adds a dedicated `server_playlist_links` entity rather than overloading regular-
+playlist entries. At most one mirror may exist for one exact `(SourceId, NativePlaylistId)`; any
+number of detached Import Copies may coexist because they retain no link. One linked row stores only
+the minimum non-secret synchronization identity and state:
 
 - the local regular-playlist ID;
 - the exact owning `SourceId`;
 - the exact `NativePlaylistId`;
-- the pull direction and linked/read-only state;
-- the last successfully synchronized bounded name and ordered-membership digest;
-- the last-success timestamp and a closed current status such as current, conflict, or missing.
+- the fixed `pull_read_only_v1` direction and linked/read-only state;
+- the last successfully synchronized effective name and a versioned SHA-256 ordered-membership
+  digest;
+- the last-success UTC-millisecond timestamp;
+- orthogonal `clean|conflict` local state and `present|missing` server state; and
+- a non-negative monotonic state revision.
 
-The link must not store a server URL, endpoint path, username, credential, token, salt, stream or
+The link does not store a server URL, endpoint path, username, credential, token, salt, stream or
 artwork locator, source route, adapter object, lease, session epoch, or raw failure. The linked
 regular playlist continues to store each media occurrence as canonical `(SourceId, TrackId)` under
 the source-scoped storage contract.
 
+The digest format is frozen as `tributary:server-playlist-membership:v1\0`, followed by a
+big-endian `u64` occurrence count. Each ordered occurrence contributes a big-endian `u64` source-ID
+byte length and exact canonical source-ID bytes, then a one-byte track-presence marker; a present
+track contributes its big-endian `u64` byte length and exact native bytes. It excludes occurrence
+UUIDs, positions, locators, fingerprints, presentation metadata, and the separately compared
+synchronized name. Duplicate occurrences therefore remain significant while cache/reconciliation-
+only fields do not create false drift; a malformed legacy unmatched row cannot collide with a
+present empty identity.
+
+Every pull or absence check for an existing mirror starts by loading a typed ticket with the exact
+link revision. Pull, conflict, and missing updates compare-and-swap that pre-network revision and
+increment it; a late completion cannot reload and overwrite newer durable state. Initial detached
+import and mirror creation have no prior link revision. The UI-stage operation lane will add
+latest-request-start ordering, while the revision remains the crash/restart and persistence
+backstop. Downgrade refuses while any link row exists, preventing an older binary from silently
+turning a read-only mirror into an editable regular playlist.
+
 Creating an import or mirror and applying a pull are all-or-none database operations. A failed,
 cancelled, stale, oversized, or malformed pull changes neither the last complete entry snapshot nor
-the last-success metadata. Import Copy removes all provisional link state before its transaction
-commits. Keep Synced publishes its new entries, link metadata, digest, and status in one commit.
+the last-success metadata. Import Copy never inserts link state. Keep Synced publishes its new
+entries, link metadata, digest, timestamp, states, and revision in one commit.
 
 ## Conflict and local-drift policy
 
-The manager refuses ordinary Add, Remove, reorder, rename, and destructive entry edits while a
-playlist is linked. This makes the shipped UI read-only, but persistence still verifies a digest of
-the last synchronized name and exact ordered `(SourceId, TrackId)` occurrences before every pull.
-The digest detects edits from an older binary, direct database access, recovery tooling, or a bug.
+The manager refuses ordinary Add, Remove, reorder, rename, delete, smart-rule mutation, and local
+reconciliation while a playlist is linked. Persistence compares the effective synchronized name
+byte-for-byte and verifies the exact ordered `(SourceId, TrackId)` digest before every pull. This
+detects edits from an older binary, direct database access, recovery tooling, or a bug.
 
-If current local state differs from the last successful digest, the pull changes nothing and marks
-an explicit conflict. Resolution requires one deliberate action:
+If current local state differs from the last successful baseline, a normal pull changes neither
+name nor entries nor last-success metadata and marks an explicit conflict. Local conflict and
+server absence are orthogonal, so neither state erases the other. Resolution requires one
+deliberate action:
 
 - **Replace Local with Server** discards the divergent local mirror only after a fresh current
   snapshot is obtained and commits the complete replacement atomically; or
@@ -210,10 +244,12 @@ response is malformed, authority becomes stale, or the operation is cancelled. T
 localized fixed status and Retry/Sync Now action, but it must not replace the mirror with an empty
 list or partially parsed response.
 
-A successful reconnect schedules one bounded refresh per linked playlist after the accepted source
+A successful reconnect will schedule one bounded refresh per linked playlist after the accepted source
 session is current. A manual Sync Now shares the same deduplicated operation lane. A newer request
 or lifecycle retirement cancels older work; only the latest still-current generation may commit.
-The initial version does not continuously poll and does not keep a session alive solely for sync.
+That latest-request lane and cancellation are Record E UI/lifecycle work; Record D already rejects
+stale source receipts and stale persisted revisions. The initial version does not continuously poll
+and does not keep a session alive solely for sync.
 
 ## Server rename and deletion
 
@@ -221,7 +257,7 @@ For an imported copy, server rename or deletion is irrelevant because no link re
 mirror, a successful detail response with the same exact native ID may update the mirrored name
 along with its entries in the same atomic pull.
 
-A playlist absent from one successful complete current listing is marked **missing on server**
+A playlist absent from one successful complete current listing can be marked **missing on server**
 without deleting or emptying the local snapshot. A failed detail call alone is not deletion
 evidence because Subsonic dialects conflate missing, unsupported, and other failures; it retains the
 last snapshot as a closed failure until a complete listing or later dialect-aware mapping confirms
@@ -231,6 +267,8 @@ the state. The user is offered:
 - **Unlink**, which retains the last snapshot as an editable regular playlist; or
 - **Remove Local Copy**, which explicitly deletes the local playlist and link transactionally.
 
+The missing transaction preserves the last synchronized name, membership digest, entries, and
+last-success timestamp while independently recomputing whether local drift is clean or conflicting.
 Tributary does not find a replacement by name or contents. If the server later exposes the same
 exact native ID, Retry may restore the link to current state. A new ID remains a distinct remote
 playlist and requires a new import/link decision.

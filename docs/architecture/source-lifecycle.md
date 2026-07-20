@@ -52,10 +52,13 @@ resolution. The full boundary is specified in
 
 Server-native Subsonic playlists use a separate authority lane. Their accepted
 [`subsonic-playlist-sync.md`](../subsonic-playlist-sync.md) contract distinguishes one-time Import
-Copy from a future read-only pull mirror. The initial foundation resolves bounded list/detail
+Copy from a read-only pull mirror. The read foundation resolves bounded list/detail
 operations only through the exact current authenticated Subsonic adapter, epoch, and session lease,
-with pre/post network revalidation. It does not consult the accepted music catalogue and cannot
-turn a returned track ID into display, stream, artwork, rating, or history authority.
+with pre/post network revalidation. Successful list/detail results now carry weak exact-session
+receipts which can acquire a session-only permit at a final database commit boundary. Migration 14
+and the playlist manager consume that authority for detached imports and atomic pull mirrors. This
+lane does not consult the accepted music catalogue and cannot turn a returned track ID into display,
+stream, artwork, rating, or history authority.
 
 The implementation has now converged on this boundary. PR #120 implements stable identity, PR #121
 adds retained local file authority through output consumption, and PR #122 introduces the generic
@@ -576,8 +579,13 @@ queue can extend the same ephemeral-source rule explicitly.
   authenticated Subsonic opts into `PullSnapshots`; every other adapter remains `Unsupported`.
   `getPlaylists` and `getPlaylist` run outside the lifecycle mutex after capturing the exact
   adapter/session epoch/lease and return only if the same authority remains current afterward.
-  The list result carries an opaque transient guard; detail rejects that guard after replacement,
-  disconnect, retirement, shutdown, or final release. Fixed adapter-unsupported,
+  A successful complete list privately carries a weak exact-session receipt and can mint only an
+  exact presence selection or exact absence evidence. Detail consumes the selection and returns a
+  snapshot with a fresh receipt. At the database boundary, the registry verifies the same registry
+  incarnation, source, adapter pointer, epoch, capability, and active lease under the lifecycle
+  mutex, then acquires an opaque session-only permit retained through commit or rollback. Staleness
+  before admission rolls back; replacement, disconnect, or shutdown after admission waits. A
+  predecessor receipt is unusable against a successor or another registry incarnation. Fixed adapter-unsupported,
   lifecycle-unavailable, and closed backend failures expose no native ID, URL, credential, server
   message, response body, or route.
   Endpoint membership is intentionally independent from accepted-catalogue membership and grants
@@ -747,10 +755,11 @@ implementation details so long as one registry enforces this contract. A typed r
 authority for pathless removable Properties editing is deliberately deferred; the UI omits that
 action instead of reconstructing a path or weakening playback authority. Source-scoped regular-
 playlist storage, default-deny live-catalogue authority, and Add/Remove/render/Play consumer are
-specified separately and complete. The Subsonic-native pull contract plus bounded protocol and
-exact-session authority are also specified and complete; dedicated link persistence, atomic pull
-application, and UI/lifecycle integration remain deferred P1.5 records. Mixed-source XSPF metadata
-export remains a separate deferred policy.
+specified separately and complete. The Subsonic-native pull contract, bounded protocol,
+exact-session read/commit authority, dedicated link persistence, and atomic pull engine are also
+specified and complete; localized UI, reconnect scheduling, and latest-request operation ownership
+remain the final deferred P1.5 record. Mixed-source XSPF metadata export remains a separate
+deferred policy.
 
 ## Implementation sequence
 
@@ -810,15 +819,28 @@ export remains a separate deferred policy.
    separate.
 10. **Subsonic server-native playlist read authority complete
     ([#143](https://github.com/jm2/tributary/issues/143)):** an accepted pull-only contract separates
-    detached Import Copy from a future read-only Keep Synced mirror and fixes conflict, offline,
+    detached Import Copy from a read-only Keep Synced mirror and fixes conflict, offline,
     deletion, unlink, and no-server-mutation semantics before persistence. Bounded
     `getPlaylists`/`getPlaylist` operations preserve exact IDs, order, and duplicates. Only the
     authenticated Subsonic adapter opts into the default-deny `PullSnapshots` capability. The
     lifecycle captures exact adapter identity, epoch, and lease, performs network work unlocked,
-    and rejects the result if that same session is no longer current. An opaque list guard cannot
-    be reused against a successor session. Endpoint membership grants no catalogue/playback
-    authority. This step deliberately adds no database link, import/sync mutation, reconnect
-    scheduler, or UI; those are the next two P1.5 records.
+    and rejects the result if that same session is no longer current. The original opaque list
+    proof cannot be reused against a successor session; step 11 tightens it into sealed
+    presence/absence receipts and commit authority. Endpoint membership grants no catalogue/playback
+    authority. This step deliberately added no database link, import/sync mutation, reconnect
+    scheduler, or UI.
+11. **Subsonic server-native persistence and atomic pull engine complete:** migration 14 adds one
+    strict pull-only link per exact source/native playlist identity and refuses lossy downgrade
+    while any link remains. A frozen ordered-membership digest, separately compared synchronized
+    name, orthogonal local-conflict/server-presence state, last-success timestamp, and revision CAS
+    detect drift and stale durable work without persisting network authority or errors. Import Copy
+    commits a detached editable regular playlist; Keep Synced creates a unique read-only mirror.
+    Pull, explicit Replace, complete-list missing, Unlink, and explicit local removal are all-or-none,
+    while ordinary mutations and reconciliation reject linked mirrors. Existing mirrors use pre-
+    network revision tickets to prevent late durable overwrite. Exact list/detail receipts acquire a session-only permit after
+    SQL staging and retain it through commit, closing the fetch-to-commit lifecycle race without
+    requiring catalogue membership. Record E retains only UI/localization, reconnect/manual refresh
+    scheduling, recovery presentation, and latest-request operation generations.
 
 The authenticated-remote cutover's locked debug and release suites each passed 20 library, 865
 application, and 10 repository-metadata tests (895 total), with locked all-target/all-feature

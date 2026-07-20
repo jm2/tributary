@@ -35,8 +35,8 @@ use crate::source_lifecycle::{
     AdapterCloseFuture, AdapterStream, AdapterTaskResult, CatalogueCommitAuthority,
     CatalogueCommitRequest, CloseAuthority, ConstructionCancellationPolicy, FailureCategory,
     LifecycleAdapter, LifecycleBaseline, LifecycleSnapshot, ProvenanceClaimId, RefreshLane,
-    RefreshTaskResult, RetirementWaiter, SessionOperationError, ShutdownBarrier,
-    SourceLifecycleRegistry, SourceProvenance,
+    RefreshTaskResult, RetirementWaiter, SessionCommitAuthority, SessionOperationError,
+    SessionOperationReceipt, ShutdownBarrier, SourceLifecycleRegistry, SourceProvenance,
 };
 use url::Url;
 
@@ -93,44 +93,114 @@ pub enum ServerPlaylistCapability {
     PullSnapshots,
 }
 
-/// Opaque authority binding server-playlist reads to one adopted session.
+/// One complete server-playlist listing bound to its exact successful source
+/// session.
 ///
-/// The guard is transient and must never be persisted. Only a successful
-/// list operation can mint one; detail reads reject it after replacement,
-/// disconnect, retirement, or shutdown.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub struct ServerPlaylistSessionGuard {
-    source_id: SourceId,
-    session_epoch: u64,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl ServerPlaylistSessionGuard {
-    pub const fn source_id(self) -> SourceId {
-        self.source_id
-    }
-
-    pub const fn session_epoch(self) -> u64 {
-        self.session_epoch
-    }
-}
-
-/// One exact-session server-playlist listing.
+/// The receipt stays private and retains no lease or adapter. Callers can
+/// derive only a presence selection or exact absence evidence; they cannot
+/// extract an epoch or forge a commit admission from list contents.
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct ServerPlaylistListing {
-    guard: ServerPlaylistSessionGuard,
+    source_id: SourceId,
+    receipt: SessionOperationReceipt<dyn ManagedSourceAdapter>,
     playlists: Vec<ServerPlaylistSummary>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl ServerPlaylistListing {
-    pub const fn guard(&self) -> ServerPlaylistSessionGuard {
-        self.guard
+    pub const fn source_id(&self) -> SourceId {
+        self.source_id
     }
 
     pub fn playlists(&self) -> &[ServerPlaylistSummary] {
         &self.playlists
+    }
+
+    /// Select one exact native identity only when the complete list contains
+    /// it. Similar names, contents, casing, and whitespace never match.
+    pub fn select(&self, native_id: &NativePlaylistId) -> Option<ServerPlaylistSelection> {
+        self.playlists
+            .iter()
+            .any(|playlist| playlist.native_id() == native_id)
+            .then(|| ServerPlaylistSelection {
+                source_id: self.source_id,
+                native_id: native_id.clone(),
+                receipt: self.receipt.clone(),
+            })
+    }
+
+    /// Mint exact absence evidence only from this successful complete list.
+    /// Detail failures and partial/malformed list responses cannot construct
+    /// this type.
+    pub fn prove_absent(
+        &self,
+        native_id: &NativePlaylistId,
+    ) -> Option<ServerPlaylistAbsenceEvidence> {
+        self.playlists
+            .iter()
+            .all(|playlist| playlist.native_id() != native_id)
+            .then(|| ServerPlaylistAbsenceEvidence {
+                source_id: self.source_id,
+                native_id: native_id.clone(),
+                receipt: self.receipt.clone(),
+            })
+    }
+}
+
+/// Opaque proof that one exact native playlist was present in a successful
+/// complete listing. It is consumed by the detail request and has no public
+/// identity, epoch, adapter, or authority accessors.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ServerPlaylistSelection {
+    source_id: SourceId,
+    native_id: NativePlaylistId,
+    receipt: SessionOperationReceipt<dyn ManagedSourceAdapter>,
+}
+
+/// One successfully fetched detail snapshot with an exact-session receipt for
+/// final persistence admission.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ServerPlaylistPull {
+    source_id: SourceId,
+    snapshot: ServerPlaylistSnapshot,
+    receipt: SessionOperationReceipt<dyn ManagedSourceAdapter>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ServerPlaylistPull {
+    pub const fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
+    pub fn native_id(&self) -> &NativePlaylistId {
+        self.snapshot.native_id()
+    }
+
+    pub fn snapshot(&self) -> &ServerPlaylistSnapshot {
+        &self.snapshot
+    }
+}
+
+/// Exact native identity absent from one successful complete list.
+///
+/// This type deliberately has no `Debug` implementation: its typed native ID
+/// is exposed only to the persistence boundary that must compare and retain
+/// it, never to diagnostics or commit authority.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ServerPlaylistAbsenceEvidence {
+    source_id: SourceId,
+    native_id: NativePlaylistId,
+    receipt: SessionOperationReceipt<dyn ManagedSourceAdapter>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ServerPlaylistAbsenceEvidence {
+    pub const fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
+    pub fn native_id(&self) -> &NativePlaylistId {
+        &self.native_id
     }
 }
 
@@ -929,6 +999,29 @@ impl RegularPlaylistCommitAuthority {
     }
 }
 
+/// Opaque authority retaining one exact server-playlist source session
+/// through a database commit.
+///
+/// This deliberately retains no native playlist identity and no catalogue
+/// authority. Server playlist entries may remain durable while absent from
+/// the accepted music catalogue. The lifecycle permit is declared before the
+/// registry owner so final-handle teardown cannot wait on a permit owned by
+/// the value being destroyed.
+#[must_use = "server-playlist commit authority must be retained through the database commit"]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ServerPlaylistCommitAuthority {
+    #[allow(dead_code)] // Retention through Drop is the authority operation.
+    authority: SessionCommitAuthority,
+    _registry: Arc<SourceRegistryInner>,
+}
+
+impl ServerPlaylistCommitAuthority {
+    #[cfg(test)]
+    fn revocation_started(&self) -> bool {
+        self.authority.revocation_started()
+    }
+}
+
 /// Pathless identity and catalogue projection for one admitted OS-opened
 /// file. The registry retains all locator and provenance authority.
 #[derive(Clone)]
@@ -1522,7 +1615,7 @@ impl SourceRegistry {
             .lifecycle
             .active_session_epoch(source_id)
             .ok_or(ServerPlaylistError::Unavailable)?;
-        let playlists = self
+        let (playlists, receipt) = self
             .inner
             .lifecycle
             .run_exact_session_operation(source_id, session_epoch, move |adapter| async move {
@@ -1537,16 +1630,14 @@ impl SourceRegistry {
             .map_err(server_playlist_error)?;
 
         Ok(ServerPlaylistListing {
-            guard: ServerPlaylistSessionGuard {
-                source_id,
-                session_epoch,
-            },
+            source_id,
+            receipt,
             playlists,
         })
     }
 
-    /// Fetch one complete server-owned playlist through the exact session
-    /// guard minted by [`Self::list_server_playlists`].
+    /// Fetch one complete server-owned playlist selected from a successful
+    /// complete listing.
     ///
     /// The returned ordered native IDs are not compared with the accepted
     /// catalogue: endpoint membership is import/synchronization input, while
@@ -1555,35 +1646,75 @@ impl SourceRegistry {
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn get_server_playlist(
         &self,
-        guard: ServerPlaylistSessionGuard,
-        native_id: NativePlaylistId,
-    ) -> Result<ServerPlaylistSnapshot, ServerPlaylistError> {
+        selection: ServerPlaylistSelection,
+    ) -> Result<ServerPlaylistPull, ServerPlaylistError> {
+        let source_id = selection.source_id;
+        let native_id = selection.native_id;
         let expected_id = native_id.clone();
-        self.inner
+        let (snapshot, receipt) = self
+            .inner
             .lifecycle
-            .run_exact_session_operation(
-                guard.source_id,
-                guard.session_epoch,
-                move |adapter| async move {
-                    if adapter.server_playlist_capability()
-                        != ServerPlaylistCapability::PullSnapshots
-                    {
-                        return Err(BackendError::Unsupported {
-                            operation: "server playlist snapshot".to_string(),
-                        });
-                    }
-                    let snapshot = adapter.get_server_playlist(native_id).await?;
-                    if snapshot.native_id() != &expected_id {
-                        return Err(BackendError::ParseError {
-                            message: "server playlist snapshot identity mismatch".to_string(),
-                            source: None,
-                        });
-                    }
-                    Ok(snapshot)
-                },
-            )
+            .run_receipted_session_operation(&selection.receipt, move |adapter| async move {
+                if adapter.server_playlist_capability() != ServerPlaylistCapability::PullSnapshots {
+                    return Err(BackendError::Unsupported {
+                        operation: "server playlist snapshot".to_string(),
+                    });
+                }
+                let snapshot = adapter.get_server_playlist(native_id).await?;
+                if snapshot.native_id() != &expected_id {
+                    return Err(BackendError::ParseError {
+                        message: "server playlist snapshot identity mismatch".to_string(),
+                        source: None,
+                    });
+                }
+                Ok(snapshot)
+            })
             .await
-            .map_err(server_playlist_error)
+            .map_err(server_playlist_error)?;
+        Ok(ServerPlaylistPull {
+            source_id,
+            snapshot,
+            receipt,
+        })
+    }
+
+    /// Acquire commit-scoped authority for the exact session that returned a
+    /// successful detail snapshot. The pull remains the sole carrier of its
+    /// native identity; the returned authority contains only a session permit
+    /// and registry owner.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn acquire_server_playlist_pull_commit_authority(
+        &self,
+        pull: &ServerPlaylistPull,
+    ) -> Option<ServerPlaylistCommitAuthority> {
+        self.acquire_server_playlist_commit_authority(&pull.receipt)
+    }
+
+    /// Acquire commit-scoped authority for exact absence proven by a
+    /// successful complete listing. A detail/backend failure has no evidence
+    /// type and therefore cannot call this boundary.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn acquire_server_playlist_absence_commit_authority(
+        &self,
+        evidence: &ServerPlaylistAbsenceEvidence,
+    ) -> Option<ServerPlaylistCommitAuthority> {
+        self.acquire_server_playlist_commit_authority(&evidence.receipt)
+    }
+
+    fn acquire_server_playlist_commit_authority(
+        &self,
+        receipt: &SessionOperationReceipt<dyn ManagedSourceAdapter>,
+    ) -> Option<ServerPlaylistCommitAuthority> {
+        let authority =
+            self.inner
+                .lifecycle
+                .acquire_session_commit_authority_if(receipt, |adapter| {
+                    adapter.server_playlist_capability() == ServerPlaylistCapability::PullSnapshots
+                })?;
+        Some(ServerPlaylistCommitAuthority {
+            authority,
+            _registry: Arc::clone(&self.inner),
+        })
     }
 
     /// Resolve persisted source-scoped identities in their input order.
@@ -2069,7 +2200,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
 
     use async_trait::async_trait;
     use axum::http::{Method, StatusCode};
@@ -2087,7 +2218,9 @@ mod tests {
     use crate::db::migration::Migrator;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
     use crate::local::playlist_manager::{
-        PlaylistEntryAddOutcome, PlaylistEntryInput, PlaylistManager,
+        PlaylistEntryAddOutcome, PlaylistEntryInput, PlaylistManager, ServerPlaylistCreateOutcome,
+        ServerPlaylistImportOutcome, ServerPlaylistLocalState, ServerPlaylistMissingOutcome,
+        ServerPlaylistPullOutcome, ServerPlaylistPullPolicy, ServerPlaylistRemoteState,
     };
 
     use super::*;
@@ -2098,6 +2231,7 @@ mod tests {
         artwork_calls: AtomicUsize,
         server_playlist_list_calls: AtomicUsize,
         server_playlist_snapshot_calls: AtomicUsize,
+        server_playlist_capability_enabled: AtomicBool,
         close_release: watch::Sender<bool>,
         stream_release: watch::Sender<bool>,
         server_playlist_release: watch::Sender<bool>,
@@ -2120,6 +2254,7 @@ mod tests {
                 artwork_calls: AtomicUsize::new(0),
                 server_playlist_list_calls: AtomicUsize::new(0),
                 server_playlist_snapshot_calls: AtomicUsize::new(0),
+                server_playlist_capability_enabled: AtomicBool::new(true),
                 close_release,
                 stream_release,
                 server_playlist_release,
@@ -2147,7 +2282,8 @@ mod tests {
                 server_playlist_capability: ServerPlaylistCapability::Unsupported,
                 server_playlists: Vec::new(),
                 server_playlist_snapshot: None,
-                server_playlist_failure: None,
+                server_playlist_list_failure: None,
+                server_playlist_snapshot_failure: None,
                 stream_failure: None,
                 artwork_available: false,
             }
@@ -2167,7 +2303,8 @@ mod tests {
                 server_playlist_capability: ServerPlaylistCapability::Unsupported,
                 server_playlists: Vec::new(),
                 server_playlist_snapshot: None,
-                server_playlist_failure: None,
+                server_playlist_list_failure: None,
+                server_playlist_snapshot_failure: None,
                 stream_failure: None,
                 artwork_available: true,
             }
@@ -2200,7 +2337,8 @@ mod tests {
                 server_playlist_capability: ServerPlaylistCapability::PullSnapshots,
                 server_playlists: vec![summary],
                 server_playlist_snapshot: Some(snapshot),
-                server_playlist_failure: None,
+                server_playlist_list_failure: None,
+                server_playlist_snapshot_failure: None,
                 stream_failure: None,
                 artwork_available: true,
             }
@@ -2226,7 +2364,8 @@ mod tests {
         server_playlist_capability: ServerPlaylistCapability,
         server_playlists: Vec<ServerPlaylistSummary>,
         server_playlist_snapshot: Option<ServerPlaylistSnapshot>,
-        server_playlist_failure: Option<String>,
+        server_playlist_list_failure: Option<String>,
+        server_playlist_snapshot_failure: Option<String>,
         stream_failure: Option<String>,
         artwork_available: bool,
     }
@@ -2346,7 +2485,16 @@ mod tests {
         }
 
         fn server_playlist_capability(&self) -> ServerPlaylistCapability {
-            self.server_playlist_capability
+            if self.server_playlist_capability == ServerPlaylistCapability::PullSnapshots
+                && !self
+                    .probe
+                    .server_playlist_capability_enabled
+                    .load(Ordering::Acquire)
+            {
+                ServerPlaylistCapability::Unsupported
+            } else {
+                self.server_playlist_capability
+            }
         }
 
         fn list_server_playlists(self: Arc<Self>) -> ServerPlaylistListFuture {
@@ -2355,7 +2503,7 @@ mod tests {
                 .fetch_add(1, Ordering::AcqRel);
             let mut release = self.probe.server_playlist_release.subscribe();
             let playlists = self.server_playlists.clone();
-            let failure = self.server_playlist_failure.clone();
+            let failure = self.server_playlist_list_failure.clone();
             Box::pin(async move {
                 while !*release.borrow_and_update() {
                     if release.changed().await.is_err() {
@@ -2381,7 +2529,7 @@ mod tests {
                 .fetch_add(1, Ordering::AcqRel);
             let mut release = self.probe.server_playlist_release.subscribe();
             let snapshot = self.server_playlist_snapshot.clone();
-            let failure = self.server_playlist_failure.clone();
+            let failure = self.server_playlist_snapshot_failure.clone();
             Box::pin(async move {
                 while !*release.borrow_and_update() {
                     if release.changed().await.is_err() {
@@ -2752,14 +2900,27 @@ mod tests {
             .list_server_playlists(supported_source)
             .await
             .expect("server playlist listing");
-        assert_eq!(listing.guard().source_id(), supported_source);
-        assert_ne!(listing.guard().session_epoch(), 0);
+        assert_eq!(listing.source_id(), supported_source);
         assert_eq!(listing.playlists().len(), 1);
         let native_id = listing.playlists()[0].native_id().clone();
-        let snapshot = registry
-            .get_server_playlist(listing.guard(), native_id)
+        assert!(listing.prove_absent(&native_id).is_none());
+        let case_distinct = NativePlaylistId::new("Native-playlist").expect("distinct ID");
+        let absence = listing
+            .prove_absent(&case_distinct)
+            .expect("exact identity comparison preserves case");
+        assert_eq!(absence.source_id(), supported_source);
+        assert_eq!(absence.native_id(), &case_distinct);
+        assert!(listing.select(&case_distinct).is_none());
+        let selection = listing
+            .select(&native_id)
+            .expect("listed native identity is selectable");
+        let pull = registry
+            .get_server_playlist(selection)
             .await
             .expect("server playlist snapshot");
+        let snapshot = pull.snapshot();
+        assert_eq!(pull.source_id(), supported_source);
+        assert_eq!(pull.native_id(), &native_id);
         assert_eq!(snapshot.track_ids().len(), 2);
         assert_eq!(snapshot.track_ids()[0], snapshot.track_ids()[1]);
 
@@ -2786,7 +2947,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_playlist_guards_close_in_flight_and_successor_session_races() {
+    async fn server_playlist_receipts_close_in_flight_and_successor_session_races() {
         let registry = registry();
         let predecessor_probe = FakeProbe::new(true);
         let source_id = SourceId::random();
@@ -2800,17 +2961,19 @@ mod tests {
             .list_server_playlists(source_id)
             .await
             .expect("predecessor listing");
-        let old_guard = listing.guard();
         let native_id = listing.playlists()[0].native_id().clone();
+        let delayed_selection = listing.select(&native_id).expect("predecessor selection");
+        let stale_selection = listing
+            .select(&native_id)
+            .expect("second predecessor selection");
 
         predecessor_probe
             .server_playlist_release
             .send_replace(false);
         let delayed_registry = registry.clone();
-        let delayed_id = native_id.clone();
         let delayed = tokio::spawn(async move {
             delayed_registry
-                .get_server_playlist(old_guard, delayed_id)
+                .get_server_playlist(delayed_selection)
                 .await
         });
         timeout(Duration::from_secs(2), async {
@@ -2842,11 +3005,10 @@ mod tests {
                 move || async move { Ok(successor_adapter) },
             )
             .expect("successor connection admitted");
-        let (_, successor_epoch) = wait_for_catalogue(&registry, source_id).await;
-        assert_ne!(successor_epoch, old_guard.session_epoch());
+        let _ = wait_for_catalogue(&registry, source_id).await;
 
         assert!(matches!(
-            registry.get_server_playlist(old_guard, native_id).await,
+            registry.get_server_playlist(stale_selection).await,
             Err(ServerPlaylistError::Unavailable)
         ));
         assert_eq!(
@@ -2885,6 +3047,745 @@ mod tests {
         registry.shutdown().wait().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_playlist_pull_commit_authority_is_session_only_and_blocks_disconnect() {
+        let registry = registry();
+        let probe = FakeProbe::new(true);
+        let source_id = SourceId::random();
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.server_playlist_adapter("commit-session"),
+        )
+        .await;
+
+        let listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("complete listing");
+        let native_id = listing.playlists()[0].native_id().clone();
+        let selection = listing.select(&native_id).expect("present selection");
+        let pull = registry
+            .get_server_playlist(selection)
+            .await
+            .expect("detail pull");
+        let authority = registry
+            .acquire_server_playlist_pull_commit_authority(&pull)
+            .expect("current pull admitted at commit boundary");
+
+        // Server-native persistence is independent from the music catalogue.
+        // Replacing the same-session catalogue must neither reject nor wait on
+        // this session-only permit.
+        refresh_playlist_catalogue(
+            &registry,
+            source_id,
+            Vec::new(),
+            RegularPlaylistCapability::Unsupported,
+        )
+        .await;
+
+        let disconnecting = registry.clone();
+        let (waiter_tx, waiter_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let waiter = disconnecting
+                .disconnect(source_id)
+                .expect("disconnect admitted");
+            waiter_tx
+                .send(waiter)
+                .expect("disconnect waiter receiver alive");
+        });
+        timeout(Duration::from_secs(2), async {
+            while !authority.revocation_started() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect reached session revocation");
+        assert!(matches!(
+            waiter_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(authority);
+        let waiter = waiter_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("disconnect resumes after commit authority release");
+        worker.join().expect("disconnect worker");
+        waiter.wait().await;
+        assert!(registry
+            .acquire_server_playlist_pull_commit_authority(&pull)
+            .is_none());
+
+        let successor_probe = FakeProbe::new(true);
+        let successor = successor_probe.server_playlist_adapter("commit-successor");
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(successor) },
+            )
+            .expect("successor connection admitted");
+        let _ = wait_for_catalogue(&registry, source_id).await;
+        assert!(
+            registry
+                .acquire_server_playlist_pull_commit_authority(&pull)
+                .is_none(),
+            "a predecessor pull cannot gain authority from its successor session"
+        );
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_playlist_commit_authority_orders_replacement_publication() {
+        let registry = registry();
+        let predecessor_probe = FakeProbe::new(true);
+        let source_id = SourceId::random();
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            predecessor_probe.server_playlist_adapter("replacement-predecessor"),
+        )
+        .await;
+
+        let listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("predecessor listing");
+        let native_id = listing.playlists()[0].native_id().clone();
+        let pull = registry
+            .get_server_playlist(listing.select(&native_id).expect("present selection"))
+            .await
+            .expect("predecessor pull");
+        let authority = registry
+            .acquire_server_playlist_pull_commit_authority(&pull)
+            .expect("predecessor commit admitted");
+
+        let mut invalidations = registry.subscribe_invalidations();
+        let _ = invalidations.borrow_and_update();
+        let successor_probe = FakeProbe::new(true);
+        let successor = successor_probe.server_playlist_adapter("replacement-successor");
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(successor) },
+            )
+            .expect("replacement admitted");
+        timeout(Duration::from_secs(2), async {
+            while !authority.revocation_started() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement reached predecessor revocation");
+
+        // Clear ConnectStarted/Connecting changes that necessarily precede
+        // construction. SessionAdopted and successor catalogue publication
+        // are ordered after the retained permit.
+        let _ = invalidations.borrow_and_update();
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !invalidations
+                .has_changed()
+                .expect("invalidation sender alive"),
+            "successor publication cannot pass retained commit authority"
+        );
+
+        drop(authority);
+        timeout(Duration::from_secs(2), invalidations.changed())
+            .await
+            .expect("successor publishes after authority release")
+            .expect("invalidation sender alive");
+        let _ = wait_for_catalogue(&registry, source_id).await;
+        assert!(
+            registry
+                .acquire_server_playlist_pull_commit_authority(&pull)
+                .is_none(),
+            "the predecessor pull is stale once replacement publishes"
+        );
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_playlist_import_rolls_back_stale_and_orders_an_admitted_commit() {
+        let registry = registry();
+        let predecessor_probe = FakeProbe::new(true);
+        let source_id = SourceId::random();
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            predecessor_probe.server_playlist_adapter("import-predecessor"),
+        )
+        .await;
+        let listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("predecessor listing");
+        let native_id = listing.playlists()[0].native_id().clone();
+        let stale_pull = registry
+            .get_server_playlist(listing.select(&native_id).expect("present selection"))
+            .await
+            .expect("predecessor pull");
+
+        let (manager, _baseline_id) = playlist_manager_fixture("Import baseline").await;
+        let baseline_count = manager
+            .list_playlists()
+            .await
+            .expect("list baseline playlists")
+            .len();
+        let stale_waiter = Arc::new(Mutex::new(None));
+        let stale_waiter_slot = Arc::clone(&stale_waiter);
+        let rejected = manager
+            .import_server_playlist_copy_if_authorized(&stale_pull, "Fallback", || {
+                let waiter = registry
+                    .disconnect(source_id)
+                    .expect("disconnect before final admission");
+                *lock(&stale_waiter_slot) = Some(waiter);
+                registry.acquire_server_playlist_pull_commit_authority(&stale_pull)
+            })
+            .await
+            .expect("stale import is a typed rejection");
+        assert!(matches!(rejected, ServerPlaylistImportOutcome::Rejected));
+        assert_eq!(
+            manager
+                .list_playlists()
+                .await
+                .expect("list rolled-back playlists")
+                .len(),
+            baseline_count,
+            "stale authority rolls the staged playlist and every entry back"
+        );
+        let waiter = lock(&stale_waiter).take().expect("stale disconnect waiter");
+        waiter.wait().await;
+
+        let successor_probe = FakeProbe::new(true);
+        let successor = successor_probe.server_playlist_adapter("import-successor");
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(successor) },
+            )
+            .expect("successor connection admitted");
+        let _ = wait_for_catalogue(&registry, source_id).await;
+        let listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("successor listing");
+        let current_id = listing.playlists()[0].native_id().clone();
+        let current_pull = registry
+            .get_server_playlist(listing.select(&current_id).expect("successor selection"))
+            .await
+            .expect("successor pull");
+
+        let (waiter_tx, waiter_rx) = mpsc::sync_channel(1);
+        let committed = manager
+            .import_server_playlist_copy_if_authorized(&current_pull, "Fallback", || {
+                let authority = registry
+                    .acquire_server_playlist_pull_commit_authority(&current_pull)
+                    .expect("current pull admitted");
+                let disconnecting = registry.clone();
+                let _worker = std::thread::spawn(move || {
+                    let waiter = disconnecting
+                        .disconnect(source_id)
+                        .expect("disconnect after admission");
+                    waiter_tx
+                        .send(waiter)
+                        .expect("disconnect waiter receiver alive");
+                });
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !authority.revocation_started() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "disconnect reached retained session authority"
+                    );
+                    std::thread::yield_now();
+                }
+                Some(authority)
+            })
+            .await
+            .expect("admitted import commits");
+        let ServerPlaylistImportOutcome::Committed(copy) = committed else {
+            panic!("current import must commit");
+        };
+        let waiter = waiter_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("disconnect resumes after database commit");
+        waiter.wait().await;
+        assert_eq!(copy.entry_count(), 2);
+        assert_eq!(
+            manager
+                .get_playlist_entries(copy.playlist_id())
+                .await
+                .expect("load detached imported entries")
+                .len(),
+            2
+        );
+        assert!(manager
+            .get_server_playlist_link(copy.playlist_id())
+            .await
+            .expect("load detached link state")
+            .is_none());
+        assert_eq!(
+            manager
+                .list_playlists()
+                .await
+                .expect("list committed playlists")
+                .len(),
+            baseline_count + 1
+        );
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn server_playlist_commit_revalidates_capability_and_rolls_back_if_withdrawn() {
+        let registry = registry();
+        let probe = FakeProbe::new(true);
+        let source_id = SourceId::random();
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.server_playlist_adapter("capability-withdrawal"),
+        )
+        .await;
+        let listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("listing while pull capability is advertised");
+        let native_id = listing.playlists()[0].native_id().clone();
+        let pull = registry
+            .get_server_playlist(
+                listing
+                    .select(&native_id)
+                    .expect("select exact advertised playlist"),
+            )
+            .await
+            .expect("detail while pull capability is advertised");
+        assert_eq!(
+            probe.server_playlist_snapshot_calls.load(Ordering::Acquire),
+            1
+        );
+
+        let (manager, _baseline_id) = playlist_manager_fixture("Capability baseline").await;
+        let baseline_count = manager
+            .list_playlists()
+            .await
+            .expect("list baseline playlists")
+            .len();
+        let rejected = manager
+            .create_server_playlist_mirror_if_authorized(&pull, "Fallback", || {
+                // The manager invokes final admission only after staging the
+                // playlist, entries, and link in its transaction.
+                probe
+                    .server_playlist_capability_enabled
+                    .store(false, Ordering::Release);
+                let authority = registry.acquire_server_playlist_pull_commit_authority(&pull);
+                assert!(
+                    authority.is_none(),
+                    "final admission must revalidate the exact adapter capability"
+                );
+                authority
+            })
+            .await
+            .expect("capability withdrawal is a typed rejection");
+        assert!(matches!(rejected, ServerPlaylistCreateOutcome::Rejected));
+        assert_eq!(
+            manager
+                .list_playlists()
+                .await
+                .expect("list playlists after rejected commit")
+                .len(),
+            baseline_count,
+            "rejected authority rolls back the staged mirror and entries"
+        );
+        assert!(manager
+            .list_server_playlist_links(source_id)
+            .await
+            .expect("list links after rejected commit")
+            .is_empty());
+
+        // Nothing else about the receipt or lifecycle changed: restoring the
+        // fake's capability makes the same exact-session receipt admissible.
+        probe
+            .server_playlist_capability_enabled
+            .store(true, Ordering::Release);
+        assert!(registry
+            .acquire_server_playlist_pull_commit_authority(&pull)
+            .is_some());
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_playlist_public_pull_sync_and_absence_flow_is_end_to_end_authorized() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let initial_probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            initial_probe.server_playlist_adapter("sync-initial"),
+        )
+        .await;
+
+        let initial_listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("list initial server playlists");
+        let native_id = initial_listing.playlists()[0].native_id().clone();
+        let initial_pull = registry
+            .get_server_playlist(
+                initial_listing
+                    .select(&native_id)
+                    .expect("select exact initial playlist"),
+            )
+            .await
+            .expect("fetch initial server playlist");
+
+        let (manager, _baseline_id) = playlist_manager_fixture("Sync baseline").await;
+        let created = manager
+            .create_server_playlist_mirror_if_authorized(&initial_pull, "Fallback", || {
+                registry.acquire_server_playlist_pull_commit_authority(&initial_pull)
+            })
+            .await
+            .expect("create authorized pull-only mirror");
+        let ServerPlaylistCreateOutcome::Committed { copy, link } = created else {
+            panic!("current initial pull must create a mirror");
+        };
+        assert_eq!(copy.name(), "Server list");
+        assert_eq!(copy.entry_count(), 2);
+        assert_eq!(link.source_id, source_id);
+        assert_eq!(link.native_playlist_id, native_id);
+        assert_eq!(link.local_state, ServerPlaylistLocalState::Clean);
+        assert_eq!(link.remote_state, ServerPlaylistRemoteState::Present);
+        assert_eq!(link.state_revision, 0);
+        let initial_entries = manager
+            .get_playlist_entries(copy.playlist_id())
+            .await
+            .expect("load initial mirror entries");
+        assert_eq!(initial_entries.len(), 2);
+        assert_eq!(initial_entries[0].position, 0);
+        assert_eq!(initial_entries[1].position, 1);
+        assert_eq!(initial_entries[0].source_id, source_id);
+        assert_eq!(initial_entries[1].source_id, source_id);
+        assert_eq!(initial_entries[0].track_id, initial_entries[1].track_id);
+
+        // Capture the persisted revision before starting the next network
+        // operation. The completion must consume this exact ticket rather
+        // than loading a newer link revision after the request finishes.
+        let update_preparation = manager
+            .prepare_server_playlist_sync(copy.playlist_id())
+            .await
+            .expect("prepare update pull")
+            .expect("mirror remains linked");
+        assert_eq!(update_preparation.ticket().state_revision(), 0);
+        registry
+            .disconnect(source_id)
+            .expect("disconnect initial server session")
+            .wait()
+            .await;
+
+        let updated_probe = FakeProbe::new(true);
+        let mut updated_adapter = updated_probe.server_playlist_adapter("sync-updated");
+        let first = TrackId::remote("updated-first").expect("first updated track ID");
+        let second = TrackId::remote("updated-second").expect("second updated track ID");
+        updated_adapter.server_playlists = vec![ServerPlaylistSummary::new(
+            native_id.clone(),
+            Some("Updated server list".to_string()),
+            Some("fixture owner".to_string()),
+            Some(3),
+        )
+        .expect("updated playlist summary")];
+        updated_adapter.server_playlist_snapshot = Some(
+            ServerPlaylistSnapshot::new(
+                native_id.clone(),
+                Some("Updated server list".to_string()),
+                Some("fixture owner".to_string()),
+                Some(3),
+                vec![first.clone(), second.clone(), first.clone()],
+            )
+            .expect("updated playlist snapshot"),
+        );
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(updated_adapter) },
+            )
+            .expect("updated server session admitted");
+        let _ = wait_for_catalogue(&registry, source_id).await;
+        let updated_listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("list updated server playlists");
+        let updated_pull = registry
+            .get_server_playlist(
+                updated_listing
+                    .select(&native_id)
+                    .expect("select exact updated playlist"),
+            )
+            .await
+            .expect("fetch updated server playlist");
+
+        let (waiter_tx, waiter_rx) = mpsc::sync_channel(1);
+        let applied = manager
+            .apply_server_playlist_pull_if_authorized(
+                update_preparation.into_parts().1,
+                &updated_pull,
+                ServerPlaylistPullPolicy::ReplaceLocal,
+                || {
+                    let authority = registry
+                        .acquire_server_playlist_pull_commit_authority(&updated_pull)
+                        .expect("updated pull remains current at final admission");
+                    let disconnecting = registry.clone();
+                    let _worker = std::thread::spawn(move || {
+                        let waiter = disconnecting
+                            .disconnect(source_id)
+                            .expect("disconnect updated server session");
+                        waiter_tx
+                            .send(waiter)
+                            .expect("disconnect waiter receiver alive");
+                    });
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    while !authority.revocation_started() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "disconnect reaches retained commit authority"
+                        );
+                        std::thread::yield_now();
+                    }
+                    Some(authority)
+                },
+            )
+            .await
+            .expect("apply authorized updated pull");
+        let ServerPlaylistPullOutcome::Applied {
+            copy: updated_copy,
+            link: updated_link,
+        } = applied
+        else {
+            panic!("updated public pull must apply");
+        };
+        let waiter = waiter_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("disconnect resumes after pull commit");
+        waiter.wait().await;
+        assert_eq!(updated_copy.playlist_id(), copy.playlist_id());
+        assert_eq!(updated_copy.name(), "Updated server list");
+        assert_eq!(updated_copy.entry_count(), 3);
+        assert_eq!(updated_link.local_state, ServerPlaylistLocalState::Clean);
+        assert_eq!(
+            updated_link.remote_state,
+            ServerPlaylistRemoteState::Present
+        );
+        assert_eq!(updated_link.state_revision, 1);
+        let updated_entries = manager
+            .get_playlist_entries(copy.playlist_id())
+            .await
+            .expect("load updated mirror entries");
+        assert_eq!(
+            updated_entries
+                .iter()
+                .map(|entry| (entry.position, entry.source_id, entry.track_id.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, source_id, Some(first.clone())),
+                (1, source_id, Some(second)),
+                (2, source_id, Some(first)),
+            ]
+        );
+
+        let absence_preparation = manager
+            .prepare_server_playlist_sync(copy.playlist_id())
+            .await
+            .expect("prepare absence listing")
+            .expect("updated mirror remains linked");
+        assert_eq!(absence_preparation.ticket().state_revision(), 1);
+        let absent_probe = FakeProbe::new(true);
+        let mut absent_adapter = absent_probe.server_playlist_adapter("sync-absent");
+        absent_adapter.server_playlists.clear();
+        absent_adapter.server_playlist_snapshot = None;
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(absent_adapter) },
+            )
+            .expect("absence server session admitted");
+        let _ = wait_for_catalogue(&registry, source_id).await;
+        let empty_listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("complete empty server listing");
+        assert!(empty_listing.playlists().is_empty());
+        let absence = empty_listing
+            .prove_absent(&native_id)
+            .expect("seal exact complete-list absence evidence");
+        let missing = manager
+            .mark_server_playlist_missing_if_authorized(
+                absence_preparation.into_parts().1,
+                &absence,
+                || registry.acquire_server_playlist_absence_commit_authority(&absence),
+            )
+            .await
+            .expect("persist authorized absence");
+        let ServerPlaylistMissingOutcome::Marked(missing_link) = missing else {
+            panic!("complete current absence must mark the mirror missing");
+        };
+        assert_eq!(missing_link.playlist_id, copy.playlist_id());
+        assert_eq!(missing_link.source_id, source_id);
+        assert_eq!(missing_link.native_playlist_id, native_id);
+        assert_eq!(missing_link.local_state, ServerPlaylistLocalState::Clean);
+        assert_eq!(
+            missing_link.remote_state,
+            ServerPlaylistRemoteState::Missing
+        );
+        assert_eq!(missing_link.state_revision, 2);
+        assert_eq!(
+            manager
+                .get_playlist_entries(copy.playlist_id())
+                .await
+                .expect("absence preserves exact local mirror entries"),
+            updated_entries
+        );
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn complete_list_absence_authority_is_exact_stale_safe_and_registry_bound() {
+        let first = registry();
+        let second = registry();
+        let source_id = SourceId::random();
+
+        let first_probe = FakeProbe::new(true);
+        let mut empty_adapter = first_probe.server_playlist_adapter("empty-list");
+        empty_adapter.server_playlists.clear();
+        connect_playlist_fixture(&first, source_id, empty_adapter).await;
+
+        let second_probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &second,
+            source_id,
+            second_probe.server_playlist_adapter("same-epoch-other-registry"),
+        )
+        .await;
+        assert_eq!(
+            first.inner.lifecycle.active_session_epoch(source_id),
+            second.inner.lifecycle.active_session_epoch(source_id),
+            "both independent registries deliberately exercise the same first epoch"
+        );
+
+        let listing = first
+            .list_server_playlists(source_id)
+            .await
+            .expect("explicit complete empty list");
+        assert!(listing.playlists().is_empty());
+        let secret = format!("native-secret-{}", Uuid::new_v4());
+        let native_id = NativePlaylistId::new(secret.clone()).expect("native identity");
+        let evidence = listing
+            .prove_absent(&native_id)
+            .expect("complete empty list proves exact absence");
+        assert_eq!(evidence.source_id(), source_id);
+        assert_eq!(evidence.native_id().as_str(), secret.as_str());
+        assert!(!format!("{:?}", evidence.native_id()).contains(&secret));
+
+        let current = first
+            .acquire_server_playlist_absence_commit_authority(&evidence)
+            .expect("current complete-list evidence admitted");
+        drop(current);
+        assert!(
+            second
+                .acquire_server_playlist_absence_commit_authority(&evidence)
+                .is_none(),
+            "another registry with the same source and first epoch cannot reuse evidence"
+        );
+
+        first
+            .disconnect(source_id)
+            .expect("disconnect first registry")
+            .wait()
+            .await;
+        assert!(first
+            .acquire_server_playlist_absence_commit_authority(&evidence)
+            .is_none());
+
+        let successor_probe = FakeProbe::new(true);
+        let successor = successor_probe.server_playlist_adapter("absence-successor");
+        first
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(successor) },
+            )
+            .expect("successor connection admitted");
+        let _ = wait_for_catalogue(&first, source_id).await;
+        assert!(
+            first
+                .acquire_server_playlist_absence_commit_authority(&evidence)
+                .is_none(),
+            "predecessor absence evidence cannot authorize successor state"
+        );
+
+        first.shutdown().wait().await;
+        second.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_playlist_absence_commit_authority_blocks_shutdown_until_release() {
+        let registry = registry();
+        let probe = FakeProbe::new(true);
+        let source_id = SourceId::random();
+        let mut adapter = probe.server_playlist_adapter("shutdown-absence");
+        adapter.server_playlists.clear();
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+
+        let listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("complete empty list");
+        let native_id = NativePlaylistId::new("shutdown-absent").expect("native identity");
+        let evidence = listing.prove_absent(&native_id).expect("absence evidence");
+        let authority = registry
+            .acquire_server_playlist_absence_commit_authority(&evidence)
+            .expect("current evidence admitted");
+
+        let shutting_down = registry.clone();
+        let (barrier_tx, barrier_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let barrier = shutting_down.shutdown();
+            barrier_tx
+                .send(barrier)
+                .expect("shutdown barrier receiver alive");
+        });
+        timeout(Duration::from_secs(2), async {
+            while !authority.revocation_started() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown reached session revocation");
+        assert!(matches!(
+            barrier_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(authority);
+        let barrier = barrier_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown resumes after authority release");
+        worker.join().expect("shutdown worker");
+        assert!(registry
+            .acquire_server_playlist_absence_commit_authority(&evidence)
+            .is_none());
+        barrier.wait().await;
+    }
+
     #[tokio::test]
     async fn server_playlist_backend_failures_are_sanitized() {
         let registry = registry();
@@ -2892,7 +3793,7 @@ mod tests {
         let source_id = SourceId::random();
         let secret = format!("fixture-secret-{}", Uuid::new_v4());
         let mut adapter = probe.server_playlist_adapter("failing");
-        adapter.server_playlist_failure = Some(secret.clone());
+        adapter.server_playlist_list_failure = Some(secret.clone());
         connect_playlist_fixture(&registry, source_id, adapter).await;
 
         let Err(error) = registry.list_server_playlists(source_id).await else {
@@ -2905,6 +3806,40 @@ mod tests {
         let rendered = format!("{error:?} {error}");
         assert!(!rendered.contains(&secret));
         assert!(!rendered.contains("native-playlist"));
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn detail_failure_is_sanitized_and_cannot_become_absence_evidence() {
+        let registry = registry();
+        let probe = FakeProbe::new(true);
+        let source_id = SourceId::random();
+        let secret = format!("detail-secret-{}", Uuid::new_v4());
+        let mut adapter = probe.server_playlist_adapter("detail-failing");
+        adapter.server_playlist_snapshot_failure = Some(secret.clone());
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+
+        let listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("complete listing succeeds before detail failure");
+        let native_id = listing.playlists()[0].native_id().clone();
+        assert!(
+            listing.prove_absent(&native_id).is_none(),
+            "detail failure cannot change complete-list presence evidence"
+        );
+        let selection = listing.select(&native_id).expect("present selection");
+        let Err(error) = registry.get_server_playlist(selection).await else {
+            panic!("fixture detail must fail");
+        };
+        assert_eq!(
+            error,
+            ServerPlaylistError::BackendFailure(FailureCategory::Connection)
+        );
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(&secret));
+        assert!(!rendered.contains(native_id.as_str()));
 
         registry.shutdown().wait().await;
     }

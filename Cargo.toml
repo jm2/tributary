@@ -82,6 +82,7 @@ urlencoding = "2"
 # JSON value type (Jellyfin ImageTags parsing)
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 md-5 = "0.11"
+sha2 = "0.10"
 
 # mDNS service discovery (Subsonic/DAAP auto-detect)
 mdns-sd = "0.20"

@@ -17,7 +17,7 @@ use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use futures::FutureExt;
 use tokio::runtime::Handle;
@@ -57,6 +57,49 @@ pub enum CatalogueMediaResolveError {
 pub enum SessionOperationError {
     Unavailable,
     Backend(BackendError),
+}
+
+/// Opaque proof that one adapter operation completed through an exact live
+/// session.
+///
+/// The receipt is deliberately weaker than authority: it retains neither the
+/// registry, adapter, nor session lease and therefore cannot keep a source
+/// alive. A commit-scoped caller must present it back to this exact lifecycle
+/// registry for a final locked revalidation and permit acquisition.
+pub struct SessionOperationReceipt<A: ?Sized> {
+    incarnation: Uuid,
+    source_id: SourceId,
+    session_epoch: u64,
+    adapter: Weak<A>,
+}
+
+impl<A: ?Sized> Clone for SessionOperationReceipt<A> {
+    fn clone(&self) -> Self {
+        Self {
+            incarnation: self.incarnation,
+            source_id: self.source_id,
+            session_epoch: self.session_epoch,
+            adapter: self.adapter.clone(),
+        }
+    }
+}
+
+/// Opaque admission that orders one database commit before exact session
+/// invalidation can complete.
+///
+/// Dropping this value releases the sole in-flight permit. It contains no
+/// adapter, native identity, locator, credential, or public operation.
+#[must_use = "session commit authority must be retained through the database commit"]
+pub struct SessionCommitAuthority {
+    #[allow(dead_code)] // Retention through Drop is the authority operation.
+    permit: MediaLeasePermit,
+}
+
+impl SessionCommitAuthority {
+    #[cfg(test)]
+    pub(crate) fn revocation_started(&self) -> bool {
+        self.permit.revocation_started()
+    }
 }
 
 impl AdapterStream {
@@ -2520,14 +2563,16 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
     /// Unlike media resolution, this returns no lease to the caller. The
     /// adapter, epoch, and active lease are captured atomically, adapter work
     /// runs outside the lifecycle mutex, and the exact session is rechecked
-    /// after the future completes. Lifecycle replacement therefore wins over
-    /// either a successful result or a stale adapter error.
+    /// after the future completes. A successful value carries only a weak,
+    /// opaque receipt for later commit admission. Lifecycle replacement
+    /// therefore wins over either a successful result or a stale adapter
+    /// error.
     pub async fn run_exact_session_operation<R, F, Fut>(
         &self,
         source_id: SourceId,
         expected_session_epoch: u64,
         operation: F,
-    ) -> Result<R, SessionOperationError>
+    ) -> Result<(R, SessionOperationReceipt<A>), SessionOperationError>
     where
         S: Send + Sync,
         R: Send,
@@ -2559,7 +2604,132 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         if !remains_current {
             return Err(SessionOperationError::Unavailable);
         }
-        result.map_err(SessionOperationError::Backend)
+        let value = result.map_err(SessionOperationError::Backend)?;
+        Ok((
+            value,
+            SessionOperationReceipt {
+                incarnation: self.inner.incarnation,
+                source_id,
+                session_epoch: epoch,
+                adapter: Arc::downgrade(&expected_adapter),
+            },
+        ))
+    }
+
+    /// Run a follow-up adapter operation through the exact session captured
+    /// by a prior successful operation receipt.
+    ///
+    /// The receipt is validated against this registry incarnation and exact
+    /// adapter pointer before any adapter work. The same post-operation check
+    /// as [`Self::run_exact_session_operation`] then mints a fresh receipt.
+    pub async fn run_receipted_session_operation<R, F, Fut>(
+        &self,
+        receipt: &SessionOperationReceipt<A>,
+        operation: F,
+    ) -> Result<(R, SessionOperationReceipt<A>), SessionOperationError>
+    where
+        S: Send + Sync,
+        R: Send,
+        F: FnOnce(Arc<A>) -> Fut + Send,
+        Fut: Future<Output = BackendResult<R>> + Send,
+    {
+        let source_id = receipt.source_id;
+        let epoch = receipt.session_epoch;
+        let (adapter, lease) = {
+            let state = lock(&self.inner.state);
+            if receipt.incarnation != self.inner.incarnation || state.gate != RegistryGate::Running
+            {
+                return Err(SessionOperationError::Unavailable);
+            }
+            let expected_adapter = receipt
+                .adapter
+                .upgrade()
+                .ok_or(SessionOperationError::Unavailable)?;
+            let active = state
+                .entries
+                .get(&source_id)
+                .and_then(|entry| entry.active.as_ref())
+                .ok_or(SessionOperationError::Unavailable)?;
+            if active.epoch != epoch
+                || !active.lease.is_active()
+                || !Arc::ptr_eq(&active.adapter.adapter, &expected_adapter)
+            {
+                return Err(SessionOperationError::Unavailable);
+            }
+            (active.adapter.operational(), active.lease.clone())
+        };
+
+        let expected_adapter = Arc::clone(&adapter);
+        let result = operation(adapter).await;
+        let state = lock(&self.inner.state);
+        let remains_current = state.gate == RegistryGate::Running
+            && lease.is_active()
+            && state.entries.get(&source_id).is_some_and(|entry| {
+                entry.active.as_ref().is_some_and(|active| {
+                    active.epoch == epoch
+                        && Arc::ptr_eq(&active.adapter.operational(), &expected_adapter)
+                })
+            });
+        drop(state);
+
+        if !remains_current {
+            return Err(SessionOperationError::Unavailable);
+        }
+        let value = result.map_err(SessionOperationError::Backend)?;
+        Ok((
+            value,
+            SessionOperationReceipt {
+                incarnation: self.inner.incarnation,
+                source_id,
+                session_epoch: epoch,
+                adapter: Arc::downgrade(&expected_adapter),
+            },
+        ))
+    }
+
+    /// Atomically admit one commit section through the exact session that
+    /// minted `receipt`.
+    ///
+    /// Validation and permit acquisition share the lifecycle state lock. A
+    /// replacement, disconnect, or shutdown therefore either wins first and
+    /// rejects admission, or waits for the returned authority to be dropped.
+    /// The receipt's registry incarnation and adapter pointer prevent an
+    /// epoch collision in another registry from gaining authority. The
+    /// caller's non-reentrant predicate is evaluated against that exact
+    /// adapter under the same lock before the permit is acquired.
+    pub(crate) fn acquire_session_commit_authority_if<P>(
+        &self,
+        receipt: &SessionOperationReceipt<A>,
+        predicate: P,
+    ) -> Option<SessionCommitAuthority>
+    where
+        P: FnOnce(&A) -> bool,
+    {
+        let state = lock(&self.inner.state);
+        if receipt.incarnation != self.inner.incarnation || state.gate != RegistryGate::Running {
+            return None;
+        }
+
+        let expected_adapter = receipt.adapter.upgrade()?;
+        let active = state.entries.get(&receipt.source_id)?.active.as_ref()?;
+        if active.epoch != receipt.session_epoch
+            || !Arc::ptr_eq(&active.adapter.adapter, &expected_adapter)
+            || !active.lease.is_active()
+        {
+            return None;
+        }
+        // The predicate is deliberately synchronous and receives only the
+        // already-validated exact adapter. Callers must keep it to a local,
+        // non-blocking capability read and must not re-enter this lifecycle
+        // registry. Evaluating it while the state lock is retained makes the
+        // capability decision and permit acquisition one admission event.
+        if !predicate(active.adapter.adapter.as_ref()) {
+            return None;
+        }
+
+        Some(SessionCommitAuthority {
+            permit: active.lease.try_acquire()?,
+        })
     }
 
     /// Resolve one protected HTTP locator through the exact expected adapter
