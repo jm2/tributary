@@ -695,10 +695,16 @@ fn submission_result(item: &RawSubmission) -> Result<SubmissionResult, LastFmCli
 }
 
 fn parse_corrected(value: &RawText) -> Result<bool, LastFmClientError> {
-    match value.corrected.as_deref() {
-        Some("0") | None => Ok(false),
-        Some("1") => Ok(true),
-        Some(_) => Err(LastFmClientError::InvalidResponse),
+    match value.corrected.as_ref() {
+        None => Ok(false),
+        Some(StringOrNumber::String(value)) => match value.as_str() {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            _ => Err(LastFmClientError::InvalidResponse),
+        },
+        Some(StringOrNumber::Number(0)) => Ok(false),
+        Some(StringOrNumber::Number(1)) => Ok(true),
+        Some(StringOrNumber::Number(_)) => Err(LastFmClientError::InvalidResponse),
     }
 }
 
@@ -771,7 +777,7 @@ struct RawSubmission {
 #[derive(Deserialize)]
 struct RawText {
     #[serde(default)]
-    corrected: Option<String>,
+    corrected: Option<StringOrNumber>,
 }
 
 #[derive(Deserialize)]
@@ -849,6 +855,16 @@ mod tests {
         })
     }
 
+    fn accepted_submission_numeric(corrected: u16) -> serde_json::Value {
+        json!({
+            "track": {"corrected": corrected, "#text": "not retained"},
+            "artist": {"corrected": 0, "#text": "not retained"},
+            "album": {"corrected": 0, "#text": "not retained"},
+            "albumArtist": {"corrected": 0, "#text": "not retained"},
+            "ignoredMessage": {"code": 0, "#text": ""}
+        })
+    }
+
     fn ignored_submission(code: u16) -> serde_json::Value {
         json!({
             "track": {"corrected": "0", "#text": "not retained"},
@@ -876,6 +892,27 @@ mod tests {
                 .expect("parameters sign"),
             "829fe7fee1f9841377cc16c83389968a"
         );
+    }
+
+    #[test]
+    fn corrected_flags_accept_only_string_or_numeric_boolean_values() {
+        for (fixture, expected) in [
+            (json!({}), false),
+            (json!({"corrected": "0"}), false),
+            (json!({"corrected": "1"}), true),
+            (json!({"corrected": 0}), false),
+            (json!({"corrected": 1}), true),
+        ] {
+            let parsed: super::RawText = serde_json::from_value(fixture).unwrap();
+            assert_eq!(super::parse_corrected(&parsed).unwrap(), expected);
+        }
+        for invalid in [json!({"corrected": "2"}), json!({"corrected": 2})] {
+            let parsed: super::RawText = serde_json::from_value(invalid).unwrap();
+            assert_eq!(
+                super::parse_corrected(&parsed).unwrap_err(),
+                LastFmClientError::InvalidResponse
+            );
+        }
     }
 
     #[test]
@@ -1039,7 +1076,7 @@ mod tests {
     async fn now_playing_and_batch_scrobble_preserve_typed_ordered_results() {
         let service =
             MockHttpService::start(vec![MockRoute::new(Method::POST, "/2.0/").replies([
-                MockResponse::json(json!({"nowplaying": accepted_submission("1")})),
+                MockResponse::json(json!({"nowplaying": accepted_submission_numeric(1)})),
                 MockResponse::json(json!({
                     "scrobbles": {
                         "@attr": {"accepted": "1", "ignored": "1"},

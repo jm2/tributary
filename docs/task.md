@@ -628,8 +628,8 @@ the 38-record feature backlog.
     requires opaque proof of closed and FIFO-drained admission and deletes only the captured row-ID
     snapshot, including corrupt non-positive identities. The runtime coordinator must prove that
     lifecycle barrier before it can issue the capability.
-  - Current validation passes 38 focused Last.fm tests; locked debug and release suites each pass 20
-    library, 1,383 application, and 10 repository-metadata tests (1,413 total), alongside strict
+  - Current validation passes 39 focused Last.fm tests; locked debug and release suites each pass 20
+    library, 1,384 application, and 10 repository-metadata tests (1,414 total), alongside strict
     debug and release Clippy, the Rust 1.92 locked all-target check, Flatpak positive/negative
     permission tests, formatting/diff checks, and dependency audit. Playback observation, queue
     delivery/backoff, disconnect/shutdown orchestration, settings/consent UI, localization, and

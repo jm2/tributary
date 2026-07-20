@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     50-row scrobble forms, and returns only typed content-redacted outcomes. Independent connect,
     operation, 1 MiB encoded-request, and 2 MiB response limits cover the provable maximum valid
     percent-encoded and JSON-escaped batches. Unknown future provider errors and structurally
-    incoherent item mappings fail closed; only network failures and service codes 11/16 are
+    incoherent item mappings fail closed; the provider's inconsistent string-or-number corrected
+    flags accept only canonical 0/1 values. Only network failures and service codes 11/16 are
     retryable, while code 9 requests reauthorization.
   - **Native protected authority:** session keys, exact usernames, and random account UUIDs use
     macOS Keychain, Windows Credential Manager, or Linux Secret Service with no plaintext fallback.
@@ -39,8 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     only the closed row-ID snapshot, including malformed non-positive identities, before a successor
     can be created. Queue models, generated SeaORM `ActiveModel` values, client/vault values, errors,
     and diagnostics redact credentials, account bindings, listening metadata, and start evidence.
-    Validation includes 38 focused Last.fm tests; locked debug and release suites each pass 20
-    library, 1,383 application, and 10 repository-metadata tests (1,413 total), alongside strict
+    Validation includes 39 focused Last.fm tests; locked debug and release suites each pass 20
+    library, 1,384 application, and 10 repository-metadata tests (1,414 total), alongside strict
     debug/release Clippy, Rust 1.92 all-target compilation, Flatpak positive/negative permission
     tests, and dependency auditing without public Last.fm network access.
 - **Rhythmbox profiles can now be migrated through a bounded, preview-first, transactional
