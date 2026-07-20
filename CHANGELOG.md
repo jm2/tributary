@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Subsonic server-native playlists now have a pull-only contract and exact-session read
-  foundation** ([#143](https://github.com/jm2/tributary/issues/143)) — The accepted
+  foundation** ([#144](https://github.com/jm2/tributary/pull/144)) — The accepted
   [`docs/subsonic-playlist-sync.md`](docs/subsonic-playlist-sync.md) contract separates a future
   one-time detached, editable **Import Copy** from an opt-in read-only, server-authoritative
   **Keep Synced** mirror. It defines all-or-none application, local-drift conflicts, offline and
