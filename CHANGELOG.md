@@ -32,16 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Private offline FIFO:** migration 17 creates and revalidates a constrained queue containing
     only bounded submission metadata, opaque occurrence/order identity, one-way account binding,
     and saturated retry state. Atomic admission enforces a 10,000-row global cap, exact occurrence
-    idempotency, and one-account quarantine. Opaque receipts freeze the exact oldest prefix; terminal
-    settlement and retry rescheduling compare-and-swap the entire batch transactionally so stale or
-    partial receipts change nothing. Downgrade is refused while private rows remain.
+    idempotency, and one-account quarantine. An idempotent hit revalidates the complete stored row
+    before reporting durable success, so a malformed identity or retry state is retained for
+    explicit recovery and fails closed instead of returning a corrupt row ID. Opaque receipts freeze
+    the exact oldest prefix; terminal settlement and retry rescheduling compare-and-swap the entire
+    batch transactionally so stale or partial receipts change nothing. Downgrade is refused while
+    private rows remain.
   - **Recovery and redaction:** normal account purge cannot erase a successor binding. A separate
     missing/corrupt-vault recovery requires an opaque close-and-FIFO-drain capability and deletes
     only the closed row-ID snapshot, including malformed non-positive identities, before a successor
     can be created. Queue models, generated SeaORM `ActiveModel` values, client/vault values, errors,
     and diagnostics redact credentials, account bindings, listening metadata, and start evidence.
-    Validation includes 39 focused Last.fm tests; locked debug and release suites each pass 20
-    library, 1,384 application, and 10 repository-metadata tests (1,414 total), alongside strict
+    Validation includes 40 focused Last.fm tests; locked debug and release suites each pass 20
+    library, 1,385 application, and 10 repository-metadata tests (1,415 total), alongside strict
     debug/release Clippy, Rust 1.92 all-target compilation, Flatpak positive/negative permission
     tests, and dependency auditing without public Last.fm network access.
 - **Rhythmbox profiles can now be migrated through a bounded, preview-first, transactional

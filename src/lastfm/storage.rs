@@ -347,10 +347,11 @@ where
         .await
         .map_err(|_| LastFmQueueError::Storage)?
     {
+        let row_id = StoredLastFmScrobble::try_from(existing.clone())
+            .map_err(|_| LastFmQueueError::CorruptStorage)?
+            .id;
         return if same_payload(&existing, input) {
-            Ok(LastFmEnqueueOutcome::AlreadyQueued {
-                row_id: existing.id,
-            })
+            Ok(LastFmEnqueueOutcome::AlreadyQueued { row_id })
         } else {
             Err(LastFmQueueError::OccurrenceConflict)
         };
@@ -773,6 +774,37 @@ mod tests {
             LastFmQueueError::Full
         );
         assert_eq!(queue_len(&db).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn idempotent_enqueue_rejects_malformed_existing_row_identities() {
+        for malformed_id in [-1_i64, 0] {
+            let db = database().await;
+            let account = binding("listener");
+            let pending = input(account, "Corrupt retry");
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO lastfm_scrobble_queue (
+                     id, occurrence_id, account_binding, artist, track_title,
+                     album, track_number, duration_secs, started_at_unix_secs,
+                     attempt_count, next_attempt_at_ms
+                 ) VALUES (?, ?, ?, 'Artist', 'Corrupt retry', 'Album', 1, 60,
+                           1700000000, 0, 0)",
+                [
+                    malformed_id.into(),
+                    pending.occurrence_id.as_bytes().to_vec().into(),
+                    account.as_bytes().to_vec().into(),
+                ],
+            ))
+            .await
+            .unwrap();
+
+            assert_eq!(
+                enqueue(&db, &pending).await.unwrap_err(),
+                LastFmQueueError::CorruptStorage
+            );
+            assert_eq!(models(&db).await[0].id, malformed_id);
+        }
     }
 
     #[tokio::test]

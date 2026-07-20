@@ -620,7 +620,9 @@ the 38-record feature backlog.
     SQLite receives only the domain-separated SHA-256 account binding. Flatpak grants only the
     reviewed `org.freedesktop.secrets` session-bus name.
   - Added migration 17 and a strictly validated private FIFO. Atomic admission enforces one account,
-    exact occurrence idempotency, and the 10,000-row cap; opaque batch receipts make terminal
+    exact occurrence idempotency, and the 10,000-row cap. Every idempotent hit revalidates the
+    complete stored row before returning its identity, so malformed identities or retry state fail
+    closed and remain available to the explicit recovery path. Opaque batch receipts make terminal
     settlement and durable rescheduling all-or-none compare-and-swap operations over the exact
     oldest prefix. Generated SeaORM active models and worker-facing models cannot print private
     metadata. Downgrade refuses pending rows.
@@ -628,8 +630,8 @@ the 38-record feature backlog.
     requires opaque proof of closed and FIFO-drained admission and deletes only the captured row-ID
     snapshot, including corrupt non-positive identities. The runtime coordinator must prove that
     lifecycle barrier before it can issue the capability.
-  - Current validation passes 39 focused Last.fm tests; locked debug and release suites each pass 20
-    library, 1,384 application, and 10 repository-metadata tests (1,414 total), alongside strict
+  - Current validation passes 40 focused Last.fm tests; locked debug and release suites each pass 20
+    library, 1,385 application, and 10 repository-metadata tests (1,415 total), alongside strict
     debug and release Clippy, the Rust 1.92 locked all-target check, Flatpak positive/negative
     permission tests, formatting/diff checks, and dependency audit. Playback observation, queue
     delivery/backoff, disconnect/shutdown orchestration, settings/consent UI, localization, and
@@ -748,5 +750,5 @@ the 38-record feature backlog.
 | 2026-07-20 | P1.5 server-playlist coordinator and reconnect lifecycle | [#148](https://github.com/jm2/tributary/pull/148) | Added typed GTK-free source/remote/local lanes with global reconnect/manual ordering, monotonic generations, pre-admission supersession, same-key waiting through admitted task and guard settlement, and unrelated-key concurrency. Reconnect binds one sweep to each exact accepted epoch, prepares revisions before one indexed complete list, and bounds local detail/commit fan-out to eight; detail failure writes nothing and only proven complete-list absence marks missing. Pull/missing persistence retains coordinator plus source authority after SQL staging, local Unlink/Remove uses the same guarded lane, and shutdown closes admission before source revocation and drains admitted work. At that merge boundary the redacted headless Sync/Retry/Replace/Unlink/Remove completion surface was ready; [#149](https://github.com/jm2/tributary/pull/149) adds its final browser and visible-action consumer. |
 | 2026-07-20 | P1.5 server-playlist browser and visible recovery UI | [#149](https://github.com/jm2/tributary/pull/149) | Added the capability-filtered virtualized browser, independently cancellable listing, bounded revocable opaque tokens, exact Import Copy/Keep Synced admission, visible generation-gated recovery controls, destructive confirmations, focus-safe accessibility behavior, and complete 13-catalog localization. This completes Record E and P1.5 and closes [#143](https://github.com/jm2/tributary/issues/143). |
 | 2026-07-20 | P2.1 Rhythmbox profile migration | [#150](https://github.com/jm2/tributary/pull/150) | Added strict bounded profile capture/parsing, exact-path policy and conservative smart translation, nine-category acknowledged preview reporting, transactional stale-state revalidation, minimal semantic-digest receipts, one-shot publication, localized lifecycle UI, and end-to-end/idempotency/privacy regressions. This completes [#57](https://github.com/jm2/tributary/issues/57); Last.fm remains the next P2.1 record. |
-| 2026-07-20 | P2.1 Last.fm protocol/vault/queue foundation | [#151](https://github.com/jm2/tributary/pull/151) | Added the bounded signed client, strict native-vault record and retryable platform stores, migration 17, transactional one-account FIFO with exact batch receipts, narrowly reviewed Flatpak Secret Service access, closed/drained missing-vault recovery, and generated-model redaction. The top-level [#50](https://github.com/jm2/tributary/issues/50) record remains open for playback/runtime, delivery lifecycle, UI, localization, and package credential injection. |
+| 2026-07-20 | P2.1 Last.fm protocol/vault/queue foundation | [#151](https://github.com/jm2/tributary/pull/151) | Added the bounded signed client, strict native-vault record and retryable platform stores, migration 17, transactional one-account FIFO with full-row validation of idempotent hits and exact batch receipts, narrowly reviewed Flatpak Secret Service access, closed/drained missing-vault recovery, and generated-model redaction. The top-level [#50](https://github.com/jm2/tributary/issues/50) record remains open for playback/runtime, delivery lifecycle, UI, localization, and package credential injection. |
 | 2026-07-18 | Linux watcher feedback-loop fix | [#103](https://github.com/jm2/tributary/pull/103) | Narrowed the external proposal to filter self-generated access events before queue admission without filtering genuine startup events or backend errors; bounded overflow still drives authoritative reconciliation. Persistent negative parse caching is deliberately excluded so failures remain retryable; this separate correctness fix does not advance the feature numerator. |
