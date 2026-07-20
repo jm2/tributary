@@ -17,6 +17,10 @@ The entries below are candidates, not release promises. With
 receive acceptance criteria, dependencies, and a milestone before work starts. Historical
 holistic-review documents are point-in-time findings, not active roadmaps.
 
+The current implementation focus is Last.fm [#50](https://github.com/jm2/tributary/issues/50).
+Its accepted [`lastfm-scrobbling.md`](lastfm-scrobbling.md) contract fixes the product, privacy,
+authority, offline queue, and lifecycle boundaries before schema, transport, or settings work.
+
 ## Current baseline
 
 - The P0-P3 implementation remediation is complete. The remaining in-scope tracker records require
@@ -102,6 +106,13 @@ holistic-review documents are point-in-time findings, not active roadmaps.
   sources remain unsupported. Both column and smart-playlist rating sorts keep missing values last
   in either direction with deterministic ties. Smart filters provide validated 1–100 numeric/range
   predicates and capability-aware Is Rated/Is Unrated behavior, plus Highest/Lowest Rated limits.
+- Last.fm is not implemented yet. Its accepted [scrobbling contract](lastfm-scrobbling.md) selects
+  desktop browser authorization and vault-only session storage, explicit consent, per-remote-source
+  default-off policy, Radio-Browser exclusion, structured metadata limits, authoritative playback
+  evidence, one-shot now-playing, a 10,000-row account-bound FIFO with 50-item batches and
+  at-least-once retry, disconnect purge, and a bounded shutdown drain. A production API account and
+  build-time key/secret injection are external release prerequisites; their absence must leave an
+  honest unavailable feature rather than a plaintext runtime fallback.
 
 ## Proposed implementation order
 
@@ -272,9 +283,17 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
 
 ### 2. Build migration and listening integrations
 
-1. **Last.fm scrobbling ([#50]).** Design account authorization and secret storage, now-playing and
-   scrobble thresholds, a durable retry queue, offline behavior, privacy disclosure, and
-   source-aware metadata. This should consume the same authoritative playback-history events.
+1. **Last.fm scrobbling ([#50]).** Implement the accepted
+   [Last.fm contract](lastfm-scrobbling.md): latest-only desktop browser authorization with a
+   60-minute single-use token; session key, username, and opaque account UUID held only in the OS
+   credential vault; explicit consent and separately opted-in authenticated remote sources;
+   structured metadata only; and generation-owned now-playing/scrobble evidence. Qualified plays
+   enter a fail-visible, 10,000-row account-bound FIFO before network use, drain oldest-first in
+   batches of at most 50, retry only network failures and service codes 11/16, pause code 9 for
+   same-account reauthorization, and treat accepted/ignored/other errors as terminal without using
+   corrections. Disconnect purges the queue and vault record; shutdown drains admitted database
+   writes without waiting indefinitely on the network. Production API registration and
+   package-time key/secret injection remain external release prerequisites.
 
 ### 3. Add bounded library-management UX
 
@@ -329,7 +348,7 @@ not mistaken for work already underway.
 
 | Issue | Current implementation state | Likely implementation shape |
 |---|---|---|
-| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | No Last.fm client or scrobble pipeline. | Authorization, secret storage, authoritative thresholds, retry/offline queue, and privacy UX. |
+| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | Accepted [contract](lastfm-scrobbling.md); no client, schema, settings UI, or scrobble pipeline yet. | Browser authorization, vault-only account authority, opt-in source policy, authoritative playback evidence, and bounded durable FIFO/retry implementation. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |

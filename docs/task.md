@@ -38,9 +38,14 @@ transactional stale-state revalidation, and a content-free idempotency receipt. 
 cancellation, retry, and intentional-omission boundaries.
 
 Continue with P2.1's Last.fm integration, the highest-priority unchecked record whose dependencies
-are satisfied. Its authorization, secret storage, scrobble thresholds, durable offline retry, and
-privacy contract must be fixed before schema or UI work. Smart playlists and XSPF import/export
-remain local-only, while mixed-source metadata export still requires its own no-locator policy.
+are satisfied. The accepted [`lastfm-scrobbling.md`](lastfm-scrobbling.md) contract now fixes its
+desktop authorization, vault-only account authority, opt-in and per-source privacy policy,
+authoritative now-playing/scrobble evidence, 10,000-row account-bound FIFO, retry classification,
+disconnect purge, and shutdown boundary. Implementation must preserve those decisions; production
+API-key registration and package-time key/secret injection remain explicit external release
+prerequisites rather than reasons to weaken development behavior. Smart playlists and XSPF
+import/export remain local-only, while mixed-source metadata export still requires its own
+no-locator policy.
 
 The independent Linux watcher correctness fix tracked in
 [#103](https://github.com/jm2/tributary/pull/103) does not change the **14/38** feature total.
@@ -558,7 +563,45 @@ the 38-record feature backlog.
   check, and formatting/diff checks are clean.
 - [ ] Implement Last.fm authorization and protected secret storage, now-playing/scrobble thresholds,
   durable retry/offline behavior, privacy UX, and source-aware metadata on authoritative playback
-  events ([#50](https://github.com/jm2/tributary/issues/50)).
+  events ([contract](lastfm-scrobbling.md); [#50](https://github.com/jm2/tributary/issues/50)).
+
+  Acceptance criteria:
+
+  - Enable the feature only when a Last.fm API key and shared secret were injected at build time;
+    keep production registration/injection external, ship no placeholder or runtime credential
+    input, and show an honest unavailable capability when either build value is absent.
+  - Use Last.fm's desktop browser flow with a latest-only, in-memory, 60-minute request token and a
+    one-shot session exchange. Store only the returned session key and username plus one random
+    opaque account UUID in the operating-system credential vault, with no plaintext fallback;
+    vault failure disables all request and queue admission.
+  - Require explicit localized consent before authorization. Local, removable, and structured
+    external-file occurrences may participate after opt-in; each authenticated Subsonic,
+    Jellyfin, Plex, or DAAP source remains off until separately enabled, mixed playlists retain the
+    real source owner's policy, and Radio-Browser remains unconditionally excluded.
+  - Freeze only structured `Track` metadata: required artist/title and optional album/album artist
+    are independently capped at 1,024 UTF-8 bytes, duration must be known and greater than 30
+    seconds, and no filename, URI, fuzzy match, lookup, or Last.fm correction may change the
+    payload. Omit parameters for which Tributary has no authoritative value.
+  - Attempt now-playing exactly once at the first accepted generation-owned Playing evidence and
+    never retry it. Admit one scrobble only after observed forward playback reaches
+    `min(ceil(duration / 2), 240 seconds)`; pause, buffering, seeks, restarts, retries, stale events,
+    wall time, and natural end cannot manufacture credit.
+  - Commit qualified scrobbles before network use to one account-bound SQLite FIFO capped globally
+    at 10,000 rows. Persist only Last.fm payload fields plus opaque identity/order/binding and
+    bounded retry state; at capacity refuse the new row visibly without evicting old history.
+  - Send only the oldest rows, in batches of at most 50, with at-least-once semantics. Retry network
+    failures and service codes 11/16 with durable capped backoff; code 9 retains the queue and pauses
+    for same-account reauthorization; accepted, ignored, and every other recognized error are
+    terminal, and malformed item mapping quarantines rather than guesses. Never apply corrections.
+  - Disconnect closes admission, retires in-flight work, drains admitted database commands, purges
+    every queued row, and deletes the vault record. Normal shutdown drains admitted queue writes
+    but neither waits indefinitely for network I/O nor deletes a row without a committed terminal
+    result.
+  - Cover migration/downgrade, exact queue and metadata limits, authorization/vault failure,
+    source/session ownership, playback discontinuities, every response class, offline restart,
+    ambiguous at-least-once replay, disconnect/shutdown races, redaction, accessibility, and exact
+    key/placeholder parity across all 13 shipped locale catalogs without contacting public Last.fm
+    infrastructure in CI.
 
 ### P2.2 — Drag and drop
 
