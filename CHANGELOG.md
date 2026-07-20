@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Subsonic server-native playlists now have durable pull-only links and an atomic sync engine**
-  ([#143](https://github.com/jm2/tributary/issues/143)) — Migration 14 adds an exact-shape
+  ([#145](https://github.com/jm2/tributary/pull/145)) — Migration 14 adds an exact-shape
   `server_playlist_links` table with one unique mirror per canonical source/native playlist pair,
   a fixed read-only pull mode, bounded effective synchronized name, versioned 32-byte SHA-256
   ordered-membership digest, UTC-millisecond last-success timestamp, orthogonal clean/conflict and
