@@ -58,7 +58,7 @@ evidence for authoritative reconciliation. It intentionally omits the original p
 unparseable-file cache so transient parser and I/O failures remain retryable. It is tracked outside
 the 38-record feature backlog.
 
-The cross-platform release-component containment work prepared on 2026-07-20 likewise does not
+The cross-platform release-component containment work implemented in PR #152 on 2026-07-20 likewise does not
 change the feature total. It removes the observed path by which broad Windows/macOS GStreamer
 bundling could pull unused optical-disc access and decryption components into an artifact, adds a
 single reviewed deny policy, and makes Windows, macOS, native Linux, and Flatpak payload validation
@@ -751,7 +751,7 @@ selecting and validating a maintained AirPlay path.
 
 | Date | Task | PR | Result |
 |---|---|---|---|
-| 2026-07-20 | Cross-platform release-component containment | Pending | Replaced permissive disc-component bundling with one shared deny policy; filtered before native dependency traversal; rejected denied transitive dependencies; rejected link-based and incomplete-inspection escapes; and added final Windows ZIP, macOS, native Linux, Packit/COPR, and complete Flatpak app-commit gates, including stale-tree and installer-only paths. The dependency audit also removed false `gst-plugins-bad`/`raopsink` install guidance and folded maintained AirPlay sender selection into P2.4. Ordinary codecs and transport cryptography remain intentionally available. This distribution safeguard does not advance the 14/38 feature numerator. |
+| 2026-07-20 | Cross-platform release-component containment | [#152](https://github.com/jm2/tributary/pull/152) | Replaced permissive disc-component bundling with one shared deny policy; filtered before native dependency traversal; rejected denied transitive dependencies; rejected link-based and incomplete-inspection escapes; and added final Windows ZIP, macOS, native Linux, Packit/COPR, and complete Flatpak app-commit gates, including stale-tree and installer-only paths. The dependency audit also removed false `gst-plugins-bad`/`raopsink` install guidance and folded maintained AirPlay sender selection into P2.4. Ordinary codecs and transport cryptography remain intentionally available. This distribution safeguard does not advance the 14/38 feature numerator. |
 | 2026-07-18 | Backlog reset | — | Archived the holistic-review tracker and established the audited feature backlog; no implementation record completed. |
 | 2026-07-18 | P1.1 bounded shuffle history | [#132](https://github.com/jm2/tributary/pull/132) | Retained ten real prior occurrences, fixed forward traversal and complete Repeat All cycles, unified Previous dispatch, made toggle/reset semantics explicit, and added lifecycle/rollback regressions. |
 | 2026-07-18 | P1.2 honest unsupported playlist actions | [#133](https://github.com/jm2/tributary/pull/133) | Refused non-local Add to Playlist actions with an all-or-none localized dialog before database work, localized the existing context-menu labels, and regressed the fail-closed source policy plus every shipped catalog. |
