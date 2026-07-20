@@ -4756,6 +4756,7 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
+ "sha2",
  "souvlaki",
  "sys-locale",
  "tempfile",
