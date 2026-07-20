@@ -39,7 +39,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Tiered geo-location (geo-distance → state → country) | ✅ |
 | Column drag-and-drop reordering with persistence | ✅ |
 | Regular & smart playlists (iTunes-style rules engine) | ✅ Regular playlists mix local and authenticated Subsonic/Jellyfin/Plex/DAAP entries; smart playlists remain local-library queries ([#142](https://github.com/jm2/tributary/pull/142)) |
-| Subsonic server-native playlist import/sync | ✅ Pull-only browser with detached Import Copy, read-only Keep Synced, reconnect/manual refresh, and visible conflict, missing, offline, retry, replace, unlink, and removal recovery ([#143](https://github.com/jm2/tributary/issues/143)) |
+| Subsonic server-native playlist import/sync | ✅ Pull-only browser with detached Import Copy, read-only Keep Synced, reconnect/manual refresh, and visible conflict, missing, offline, retry, replace, unlink, and removal recovery ([#149](https://github.com/jm2/tributary/pull/149)) |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
 | Batch metadata editing (multi-select) | ✅ |
@@ -818,7 +818,7 @@ targets, properties, or diagnostics. See
 [P1.5](docs/task.md#p15--persist-source-scoped-playlists), the
 [source-scoped regular-playlist contract](docs/source-scoped-playlists.md), the
 [Subsonic pull-sync contract](docs/subsonic-playlist-sync.md), and
-[#143](https://github.com/jm2/tributary/issues/143) for the completed design boundary.
+[#149](https://github.com/jm2/tributary/pull/149) for the completed implementation.
 
 #### Importing and exporting playlists
 

@@ -10,11 +10,10 @@ real-environment validation records left. The feature backlog is now **13/38 (34
 Neither percentage estimates equal engineering effort, and the historical percentage is not a
 claim that Tributary has implemented every requested product feature.
 
-The entries below are candidates, not release promises. As of this audit, 10 GitHub issues remain
-open. Server-playlist issue [#143](https://github.com/jm2/tributary/issues/143) has completed
-implementation in the current PR pending creation and is expected to close from that PR body on
-merge; it is retained in the live table until GitHub records that transition. Other candidates
-should receive acceptance criteria, dependencies, and a milestone before work starts. Historical
+The entries below are candidates, not release promises. After
+[#149](https://github.com/jm2/tributary/pull/149) closes the completed server-playlist issue
+[#143](https://github.com/jm2/tributary/issues/143), 9 GitHub issues remain open. Candidates should
+receive acceptance criteria, dependencies, and a milestone before work starts. Historical
 holistic-review documents are point-in-time findings, not active roadmaps.
 
 ## Current baseline
@@ -231,8 +230,9 @@ before starting large protocol or transfer subsystems.
    redacted headless completion facade exists. At [#148](https://github.com/jm2/tributary/pull/148)'s
    merge boundary, the virtualized browser, opaque Import Copy/Keep Synced tokens, and visible
    recovery consumer remained for the following completed slice.
-11. **Completed final server-playlist UI and recovery slice (current implementation PR pending
-    creation; closes [#143](https://github.com/jm2/tributary/issues/143) on merge).** The Playlists
+11. **Completed final server-playlist UI and recovery slice
+    ([#149](https://github.com/jm2/tributary/pull/149), closing
+    [#143](https://github.com/jm2/tributary/issues/143)).** The Playlists
    header opens a localized virtualized browser containing only sources with exact current
    `PullSnapshots` capability. A separate latest-only list lane cannot cancel reconnect recovery;
    one bounded active session owns opaque action tokens whose reload, lifecycle, close, and
@@ -316,7 +316,6 @@ not mistaken for work already underway.
 | [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus completed playback-history and rating contracts are foundations; XSPF deliberately transfers neither history nor ratings. | Build a separate transactional, idempotent migration with explicit metadata consent and conflict reporting. |
 | [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | No Last.fm client or scrobble pipeline. | Authorization, secret storage, authoritative thresholds, retry/offline queue, and privacy UX. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
-| [#143 — Import and pull-sync server-native Subsonic playlists](https://github.com/jm2/tributary/issues/143) | Implementation is complete in the current PR pending creation: pull-only reads, exact-session authority, link persistence, atomic mirrors, durable sidebar ordering, reconnect coordination, capability-filtered virtualized browsing, opaque Import Copy/Keep Synced tokens, and visible localized recovery controls all pass their deterministic validation. GitHub still reports the issue open before that PR is created and merged. | Open and merge the current implementation PR with `Closes #143`. Later real-server field validation may identify dialect-specific bugs, but no additional planned implementation record remains for this accepted scope. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |
 | [#29 — UI refinement](https://github.com/jm2/tributary/issues/29) | Requested separators/alignment changes are not implemented. | Split into independently reviewable visual changes after current-theme design review. |

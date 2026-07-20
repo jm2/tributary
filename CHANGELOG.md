@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **P1.5 server-native playlist import and pull-sync now have their complete visible GTK
-  workflow** ([#143](https://github.com/jm2/tributary/issues/143)) — The Playlists-header menu now
+  workflow** ([#149](https://github.com/jm2/tributary/pull/149)) — The Playlists-header menu now
   opens one reusable, virtualized **Server Playlists…** dialog whose source picker exposes only
   current `PullSnapshots` sources. The headless browser broker owns exact source sessions and
   server-native playlist identity; GTK retains only existing `SourceId`, bounded name/owner hints,

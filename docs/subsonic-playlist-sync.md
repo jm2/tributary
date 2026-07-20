@@ -12,6 +12,7 @@
   [#145](https://github.com/jm2/tributary/pull/145)
 - UI and lifecycle foundations: [#146](https://github.com/jm2/tributary/pull/146) and
   [#148](https://github.com/jm2/tributary/pull/148)
+- Completed browser and visible recovery UI: [#149](https://github.com/jm2/tributary/pull/149)
 
 This document defines how Tributary may consume playlists owned by a Subsonic or OpenSubsonic
 server. It is deliberately separate from
