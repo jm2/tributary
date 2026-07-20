@@ -18,8 +18,8 @@ use sea_orm::{
 use uuid::{Uuid, Variant, Version};
 
 use crate::db::entities::lastfm_scrobble::{
-    self, StoredLastFmScrobble, MAX_LASTFM_ATTEMPT_COUNT, MAX_LASTFM_METADATA_BYTES,
-    MAX_LASTFM_RETRY_AT_MS, MAX_LASTFM_STARTED_AT_SECS,
+    self, StoredLastFmScrobble, StoredMetadataText, MAX_LASTFM_ATTEMPT_COUNT,
+    MAX_LASTFM_METADATA_BYTES, MAX_LASTFM_RETRY_AT_MS, MAX_LASTFM_STARTED_AT_SECS,
 };
 
 use super::credentials::LastFmAccountBinding;
@@ -230,6 +230,28 @@ impl fmt::Display for LastFmQueueError {
 
 impl std::error::Error for LastFmQueueError {}
 
+/// Capability issued only after Last.fm queue admission is closed and every
+/// write admitted before that close has crossed the lifecycle FIFO barrier.
+///
+/// The future runtime coordinator owns issuance. Keeping construction inside
+/// the `lastfm` module makes the destructive recovery primitive unavailable to
+/// unrelated application code.
+pub struct LastFmClosedAndDrainedQueue {
+    _private: (),
+}
+
+impl LastFmClosedAndDrainedQueue {
+    pub(in crate::lastfm) const fn issue_after_barrier() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl fmt::Debug for LastFmClosedAndDrainedQueue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LastFmClosedAndDrainedQueue")
+    }
+}
+
 /// Atomically persist a scrobble before any network submission.
 pub async fn enqueue(
     db: &DatabaseConnection,
@@ -246,6 +268,30 @@ async fn enqueue_with_cap(
     if cap == 0 || cap > i64::MAX as u64 {
         return Err(LastFmQueueError::InvalidInput);
     }
+    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    match enqueue_in_transaction(&transaction, input, cap).await {
+        Ok(outcome) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| LastFmQueueError::Storage)?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+async fn enqueue_in_transaction<C>(
+    db: &C,
+    input: &PendingLastFmScrobble,
+    cap: u64,
+) -> Result<LastFmEnqueueOutcome, LastFmQueueError>
+where
+    C: ConnectionTrait,
+{
     let result = db
         .execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
@@ -477,6 +523,57 @@ pub async fn purge_account(
     Ok(result.rows_affected)
 }
 
+/// Purge the queue snapshot retained when the native vault cannot identify it.
+///
+/// This recovery path is intentionally separate from [`purge_account`]. The
+/// lifecycle coordinator may issue `authority` only after closing queue
+/// admission, draining every previously admitted queue write, stopping the
+/// delivery worker, and preventing creation of a successor account until this
+/// transaction commits. It snapshots the current maximum row identity and
+/// deletes only through that boundary, so a successor row admitted after the
+/// snapshot is never selected for deletion.
+pub async fn purge_quarantined_after_admission_closed(
+    db: &DatabaseConnection,
+    _authority: &LastFmClosedAndDrainedQueue,
+) -> Result<u64, LastFmQueueError> {
+    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let cutoff = lastfm_scrobble::Entity::find()
+        .select_only()
+        .column(lastfm_scrobble::Column::Id)
+        .order_by_desc(lastfm_scrobble::Column::Id)
+        .into_tuple::<i64>()
+        .one(&transaction)
+        .await
+        .map_err(|_| LastFmQueueError::Storage);
+    let cutoff = match cutoff {
+        Ok(Some(cutoff)) => cutoff,
+        Ok(None) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| LastFmQueueError::Storage)?;
+            return Ok(0);
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+    };
+
+    let deleted = match purge_through_cutoff(&transaction, cutoff).await {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+    };
+    transaction
+        .commit()
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
+    Ok(deleted)
+}
+
 /// Number of private rows retained in the single-account queue.
 pub async fn queue_len(db: &DatabaseConnection) -> Result<u64, LastFmQueueError> {
     lastfm_scrobble::Entity::find()
@@ -521,14 +618,15 @@ where
 }
 
 fn same_payload(model: &lastfm_scrobble::Model, input: &PendingLastFmScrobble) -> bool {
-    model.account_binding == input.account_binding.as_bytes()
-        && model.artist == input.artist
-        && model.track_title == input.track_title
-        && model.album == input.album
-        && model.album_artist == input.album_artist
+    model.account_binding.as_slice() == input.account_binding.as_bytes()
+        && model.artist.as_str() == input.artist
+        && model.track_title.as_str() == input.track_title
+        && model.album.as_ref().map(StoredMetadataText::as_str) == input.album.as_deref()
+        && model.album_artist.as_ref().map(StoredMetadataText::as_str)
+            == input.album_artist.as_deref()
         && model.track_number == input.track_number
         && model.duration_secs == input.duration_secs
-        && model.started_at_unix_secs == input.started_at_unix_secs
+        && model.started_at_unix_secs.get() == input.started_at_unix_secs
 }
 
 async fn queue_has_other_binding<C>(
@@ -546,6 +644,18 @@ where
         .map_err(|_| LastFmQueueError::Storage)
 }
 
+async fn purge_through_cutoff<C>(db: &C, cutoff: i64) -> Result<u64, LastFmQueueError>
+where
+    C: ConnectionTrait,
+{
+    lastfm_scrobble::Entity::delete_many()
+        .filter(lastfm_scrobble::Column::Id.lte(cutoff))
+        .exec(db)
+        .await
+        .map(|result| result.rows_affected)
+        .map_err(|_| LastFmQueueError::Storage)
+}
+
 fn is_random_uuid(uuid: Uuid) -> bool {
     uuid.get_variant() == Variant::RFC4122 && uuid.get_version() == Some(Version::Random)
 }
@@ -553,13 +663,18 @@ fn is_random_uuid(uuid: Uuid) -> bool {
 fn valid_required_text(value: &str) -> bool {
     value.len() <= MAX_LASTFM_METADATA_BYTES
         && value.chars().any(|character| !character.is_whitespace())
+        && !value.chars().any(char::is_control)
 }
 
 fn canonical_optional_text(value: Option<String>) -> Result<Option<String>, LastFmQueueError> {
     match value {
         None => Ok(None),
         Some(value) if !value.chars().any(|character| !character.is_whitespace()) => Ok(None),
-        Some(value) if value.len() <= MAX_LASTFM_METADATA_BYTES => Ok(Some(value)),
+        Some(value)
+            if value.len() <= MAX_LASTFM_METADATA_BYTES && !value.chars().any(char::is_control) =>
+        {
+            Ok(Some(value))
+        }
         Some(_) => Err(LastFmQueueError::InvalidInput),
     }
 }
@@ -574,6 +689,8 @@ mod tests {
     use crate::db::migration::Migrator;
     use crate::lastfm::credentials::{ProtectedString, StoredSession};
 
+    const SESSION_KEY: &str = "0123456789abcdef0123456789abcdef";
+
     async fn database() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
@@ -581,7 +698,7 @@ mod tests {
     }
 
     fn binding(username: &str) -> LastFmAccountBinding {
-        StoredSession::new(username, ProtectedString::new("session-key"))
+        StoredSession::new(username, ProtectedString::new(SESSION_KEY))
             .unwrap()
             .account_binding()
     }
@@ -723,8 +840,80 @@ mod tests {
             purge_account(&db, first_account).await.unwrap_err(),
             LastFmQueueError::AccountMismatch
         );
-        assert_eq!(models(&db).await[0].track_title, "Successor private row");
+        assert_eq!(
+            models(&db).await[0].track_title.as_str(),
+            "Successor private row"
+        );
         assert_eq!(purge_account(&db, second_account).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_vault_recovery_purges_only_its_closed_snapshot() {
+        let db = database().await;
+        let retired_account = binding("retired-listener");
+        let successor_account = binding("successor-listener");
+        let retired = enqueue(&db, &input(retired_account, "Retired private row"))
+            .await
+            .unwrap();
+        let LastFmEnqueueOutcome::Inserted { row_id: cutoff } = retired else {
+            panic!("retired row must be inserted");
+        };
+
+        // Model a successor admitted strictly after a recovery snapshot. The
+        // private helper's ID predicate is the same one used transactionally
+        // by the public closed-admission operation.
+        purge_through_cutoff(&db, cutoff).await.unwrap();
+        enqueue(&db, &input(successor_account, "Successor private row"))
+            .await
+            .unwrap();
+        assert_eq!(purge_through_cutoff(&db, cutoff).await.unwrap(), 0);
+        assert_eq!(
+            models(&db).await[0].track_title.as_str(),
+            "Successor private row"
+        );
+
+        assert_eq!(purge_account(&db, successor_account).await.unwrap(), 1);
+        enqueue(&db, &input(retired_account, "Unrecoverable private row"))
+            .await
+            .unwrap();
+
+        // A real recovery snapshots and purges all rows that exist while
+        // admission is closed, including a binding that cannot be recreated
+        // because its vault record is missing or corrupt.
+        let authority = LastFmClosedAndDrainedQueue::issue_after_barrier();
+        assert_eq!(
+            purge_quarantined_after_admission_closed(&db, &authority)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(queue_len(&db).await.unwrap(), 0);
+
+        // Recovery remains destructive for malformed private rows that normal
+        // delivery correctly refuses, including an explicitly injected
+        // non-positive SQLite row identity.
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO lastfm_scrobble_queue (
+                 id, occurrence_id, account_binding, artist, track_title,
+                 duration_secs, started_at_unix_secs, attempt_count,
+                 next_attempt_at_ms
+             ) VALUES (-1, ?, ?, 'Artist', 'Track', 60, 1, 0, 0)",
+            [
+                Uuid::new_v4().as_bytes().to_vec().into(),
+                retired_account.as_bytes().to_vec().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        let authority = LastFmClosedAndDrainedQueue::issue_after_barrier();
+        assert_eq!(
+            purge_quarantined_after_admission_closed(&db, &authority)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(queue_len(&db).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -781,6 +970,22 @@ mod tests {
         .unwrap();
         assert_eq!(exact.album(), Some(" Album "));
         assert_eq!(exact.album_artist(), Some(" Album Artist "));
+
+        assert_eq!(
+            PendingLastFmScrobble::try_new(
+                Uuid::new_v4(),
+                account,
+                "Artist\0".to_owned(),
+                "Track".to_owned(),
+                None,
+                None,
+                None,
+                31,
+                1,
+            )
+            .unwrap_err(),
+            LastFmQueueError::InvalidInput
+        );
     }
 
     #[tokio::test]

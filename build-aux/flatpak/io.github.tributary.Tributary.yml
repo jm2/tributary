@@ -29,6 +29,10 @@ finish-args:
   # consumes only cached native mount metadata; xdg-run/gvfs{,d} grants are
   # intentionally omitted, and file access uses the mounts above.
   - --talk-name=org.gtk.vfs.*
+  # Last.fm session keys use the desktop Secret Service. If this reviewed
+  # service is absent, locked, or denied, Tributary fails closed rather than
+  # falling back to its plaintext settings or SQLite database.
+  - --talk-name=org.freedesktop.secrets
   # D-Bus ownership for MPRIS media keys
   - --own-name=org.mpris.MediaPlayer2.tributary
   # System theme / icon access

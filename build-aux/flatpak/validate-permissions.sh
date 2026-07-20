@@ -76,6 +76,7 @@ require_once "--filesystem=/media:ro"
 require_once "--filesystem=/run/media:ro"
 require_once "--filesystem=/mnt:ro"
 require_once "--talk-name=org.gtk.vfs.*"
+require_once "--talk-name=org.freedesktop.secrets"
 require_once "--own-name=org.mpris.MediaPlayer2.tributary"
 require_once "--filesystem=xdg-data/themes:ro"
 require_once "--filesystem=xdg-data/icons:ro"
@@ -96,6 +97,7 @@ for entry in $finish_args; do
         "--filesystem=/run/media:ro" | \
         "--filesystem=/mnt:ro" | \
         "--talk-name=org.gtk.vfs.*" | \
+        "--talk-name=org.freedesktop.secrets" | \
         "--own-name=org.mpris.MediaPlayer2.tributary" | \
         "--filesystem=xdg-data/themes:ro" | \
         "--filesystem=xdg-data/icons:ro")
@@ -107,6 +109,6 @@ for entry in $finish_args; do
     esac
 done
 
-[ "$entry_count" -eq 13 ] || fail "expected exactly 13 reviewed finish arguments (found $entry_count)"
+[ "$entry_count" -eq 14 ] || fail "expected exactly 14 reviewed finish arguments (found $entry_count)"
 
 echo "Flatpak permission policy is valid: $manifest"
