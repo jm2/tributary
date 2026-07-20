@@ -25,15 +25,18 @@ use crate::architecture::media::{
     ResolvedHttpRequest, ResolvedPublicHttpRequest,
 };
 use crate::architecture::models::{RatingCapability, Track};
-use crate::architecture::{MediaKey, SourceId, TrackId, ViewOrigin};
+use crate::architecture::{
+    MediaKey, NativePlaylistId, ServerPlaylistSnapshot, ServerPlaylistSummary, SourceId, TrackId,
+    ViewOrigin,
+};
 use crate::external_file::{ExternalFileCandidate, ExternalFileHint};
 use crate::local::resolver::ResolvedFileMedia;
 use crate::source_lifecycle::{
     AdapterCloseFuture, AdapterStream, AdapterTaskResult, CatalogueCommitAuthority,
     CatalogueCommitRequest, CloseAuthority, ConstructionCancellationPolicy, FailureCategory,
     LifecycleAdapter, LifecycleBaseline, LifecycleSnapshot, ProvenanceClaimId, RefreshLane,
-    RefreshTaskResult, RetirementWaiter, ShutdownBarrier, SourceLifecycleRegistry,
-    SourceProvenance,
+    RefreshTaskResult, RetirementWaiter, SessionOperationError, ShutdownBarrier,
+    SourceLifecycleRegistry, SourceProvenance,
 };
 use url::Url;
 
@@ -44,6 +47,14 @@ pub type StreamFuture =
     Pin<Box<dyn Future<Output = BackendResult<AdapterStream>> + Send + 'static>>;
 type ArtworkFuture =
     Pin<Box<dyn Future<Output = BackendResult<Option<ResolvedHttpRequest>>> + Send + 'static>>;
+// Record C intentionally stops at an internally tested authority foundation;
+// Record D is the first non-test caller of the server-playlist surface.
+#[cfg_attr(not(test), allow(dead_code))]
+pub type ServerPlaylistListFuture =
+    Pin<Box<dyn Future<Output = BackendResult<Vec<ServerPlaylistSummary>>> + Send + 'static>>;
+#[cfg_attr(not(test), allow(dead_code))]
+pub type ServerPlaylistSnapshotFuture =
+    Pin<Box<dyn Future<Output = BackendResult<ServerPlaylistSnapshot>> + Send + 'static>>;
 
 /// At-use stream resolved through the centralized source authority.
 ///
@@ -66,6 +77,76 @@ pub enum RegularPlaylistCapability {
     #[default]
     Unsupported,
     SourceScopedEntries,
+}
+
+/// Whether an adopted adapter can read server-owned playlist snapshots.
+///
+/// This is deliberately independent from [`RegularPlaylistCapability`]. A
+/// server-native snapshot can preserve an exact track ID that the current
+/// catalogue does not publish, but it never grants playlist membership or
+/// playback authority by itself.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum ServerPlaylistCapability {
+    #[default]
+    Unsupported,
+    PullSnapshots,
+}
+
+/// Opaque authority binding server-playlist reads to one adopted session.
+///
+/// The guard is transient and must never be persisted. Only a successful
+/// list operation can mint one; detail reads reject it after replacement,
+/// disconnect, retirement, or shutdown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ServerPlaylistSessionGuard {
+    source_id: SourceId,
+    session_epoch: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ServerPlaylistSessionGuard {
+    pub const fn source_id(self) -> SourceId {
+        self.source_id
+    }
+
+    pub const fn session_epoch(self) -> u64 {
+        self.session_epoch
+    }
+}
+
+/// One exact-session server-playlist listing.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ServerPlaylistListing {
+    guard: ServerPlaylistSessionGuard,
+    playlists: Vec<ServerPlaylistSummary>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ServerPlaylistListing {
+    pub const fn guard(&self) -> ServerPlaylistSessionGuard {
+        self.guard
+    }
+
+    pub fn playlists(&self) -> &[ServerPlaylistSummary] {
+        &self.playlists
+    }
+}
+
+/// Closed result for server-native playlist reads.
+///
+/// Raw adapter errors, response bodies, credentials, locators, and native
+/// identities never cross this boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum ServerPlaylistError {
+    #[error("server playlists are unsupported for this source")]
+    UnsupportedSource,
+    #[error("server playlist authority is unavailable")]
+    Unavailable,
+    #[error("server playlist backend failed")]
+    BackendFailure(FailureCategory),
 }
 
 /// Transient identity of one exact accepted catalogue.
@@ -516,6 +597,35 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
         RegularPlaylistCapability::Unsupported
     }
 
+    /// Explicit opt-in for pull-only server-native playlist snapshots.
+    /// Implementations remain denied unless their protocol adapter is
+    /// reviewed for bounded exact native IDs and read-only request semantics.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn server_playlist_capability(&self) -> ServerPlaylistCapability {
+        ServerPlaylistCapability::Unsupported
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn list_server_playlists(self: Arc<Self>) -> ServerPlaylistListFuture {
+        Box::pin(async {
+            Err(BackendError::Unsupported {
+                operation: "server playlist listing".to_string(),
+            })
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn get_server_playlist(
+        self: Arc<Self>,
+        _native_id: NativePlaylistId,
+    ) -> ServerPlaylistSnapshotFuture {
+        Box::pin(async {
+            Err(BackendError::Unsupported {
+                operation: "server playlist snapshot".to_string(),
+            })
+        })
+    }
+
     /// Load the first complete catalogue after construction is staged.
     fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture;
 
@@ -550,6 +660,19 @@ where
     A: source_scoped_playlist_sealed::Adapter,
 {
     RegularPlaylistCapability::SourceScopedEntries
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod server_playlist_sealed {
+    pub trait Adapter {}
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn server_playlist_capability<A>() -> ServerPlaylistCapability
+where
+    A: server_playlist_sealed::Adapter,
+{
+    ServerPlaylistCapability::PullSnapshots
 }
 
 macro_rules! standard_remote_adapter {
@@ -589,10 +712,55 @@ macro_rules! standard_remote_adapter {
 }
 
 impl source_scoped_playlist_sealed::Adapter for crate::subsonic::SubsonicBackend {}
-standard_remote_adapter!(
-    crate::subsonic::SubsonicBackend,
-    source_scoped_playlist_capability::<crate::subsonic::SubsonicBackend>()
-);
+impl server_playlist_sealed::Adapter for crate::subsonic::SubsonicBackend {}
+
+// Subsonic is deliberately spelled out rather than inheriting the standard
+// remote macro: it is the only shipping adapter reviewed and opted in for
+// pull-only server-native playlist snapshots.
+impl LifecycleAdapter for crate::subsonic::SubsonicBackend {
+    fn close(self: Arc<Self>, _authority: CloseAuthority) -> AdapterCloseFuture {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl ManagedSourceAdapter for crate::subsonic::SubsonicBackend {
+    fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
+        source_scoped_playlist_capability::<Self>()
+    }
+
+    fn server_playlist_capability(&self) -> ServerPlaylistCapability {
+        server_playlist_capability::<Self>()
+    }
+
+    fn list_server_playlists(self: Arc<Self>) -> ServerPlaylistListFuture {
+        Box::pin(async move { Self::list_server_playlists(self.as_ref()).await })
+    }
+
+    fn get_server_playlist(
+        self: Arc<Self>,
+        native_id: NativePlaylistId,
+    ) -> ServerPlaylistSnapshotFuture {
+        Box::pin(async move { Self::get_server_playlist(self.as_ref(), &native_id).await })
+    }
+
+    fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
+        Box::pin(async move { crate::architecture::load_track_catalog(self.as_ref()).await })
+    }
+
+    fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
+        Box::pin(async move {
+            RemoteMediaResolver::resolve_stream(self.as_ref(), &track_id)
+                .await
+                .map(|request| AdapterStream::ProtectedHttp(Box::new(request)))
+        })
+    }
+
+    fn resolve_artwork(self: Arc<Self>, track_id: TrackId) -> ArtworkFuture {
+        Box::pin(
+            async move { RemoteMediaResolver::resolve_artwork(self.as_ref(), &track_id).await },
+        )
+    }
+}
 // Plex's legacy auth token is a durable credential, not a revocable server
 // session: its documented revocation mechanisms are account/device-wide, so
 // Tributary has no safe per-adapter close authority. Constructors may therefore
@@ -1338,6 +1506,86 @@ impl SourceRegistry {
         }
     }
 
+    /// List server-owned playlists through one exact active source session.
+    ///
+    /// Capability defaults to denied and is checked on the adapter captured
+    /// with the session epoch. A replacement, disconnect, retirement, or
+    /// shutdown completed while the request is in flight discards either its
+    /// value or its backend error and reports unavailable authority.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn list_server_playlists(
+        &self,
+        source_id: SourceId,
+    ) -> Result<ServerPlaylistListing, ServerPlaylistError> {
+        let session_epoch = self
+            .inner
+            .lifecycle
+            .active_session_epoch(source_id)
+            .ok_or(ServerPlaylistError::Unavailable)?;
+        let playlists = self
+            .inner
+            .lifecycle
+            .run_exact_session_operation(source_id, session_epoch, move |adapter| async move {
+                if adapter.server_playlist_capability() != ServerPlaylistCapability::PullSnapshots {
+                    return Err(BackendError::Unsupported {
+                        operation: "server playlist listing".to_string(),
+                    });
+                }
+                adapter.list_server_playlists().await
+            })
+            .await
+            .map_err(server_playlist_error)?;
+
+        Ok(ServerPlaylistListing {
+            guard: ServerPlaylistSessionGuard {
+                source_id,
+                session_epoch,
+            },
+            playlists,
+        })
+    }
+
+    /// Fetch one complete server-owned playlist through the exact session
+    /// guard minted by [`Self::list_server_playlists`].
+    ///
+    /// The returned ordered native IDs are not compared with the accepted
+    /// catalogue: endpoint membership is import/synchronization input, while
+    /// regular-playlist projection and playback retain their independent
+    /// catalogue authority checks.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn get_server_playlist(
+        &self,
+        guard: ServerPlaylistSessionGuard,
+        native_id: NativePlaylistId,
+    ) -> Result<ServerPlaylistSnapshot, ServerPlaylistError> {
+        let expected_id = native_id.clone();
+        self.inner
+            .lifecycle
+            .run_exact_session_operation(
+                guard.source_id,
+                guard.session_epoch,
+                move |adapter| async move {
+                    if adapter.server_playlist_capability()
+                        != ServerPlaylistCapability::PullSnapshots
+                    {
+                        return Err(BackendError::Unsupported {
+                            operation: "server playlist snapshot".to_string(),
+                        });
+                    }
+                    let snapshot = adapter.get_server_playlist(native_id).await?;
+                    if snapshot.native_id() != &expected_id {
+                        return Err(BackendError::ParseError {
+                            message: "server playlist snapshot identity mismatch".to_string(),
+                            source: None,
+                        });
+                    }
+                    Ok(snapshot)
+                },
+            )
+            .await
+            .map_err(server_playlist_error)
+    }
+
     /// Resolve persisted source-scoped identities in their input order.
     ///
     /// Every requested occurrence receives exactly one result. Sources are
@@ -1663,6 +1911,19 @@ fn regular_playlist_media_error(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn server_playlist_error(error: SessionOperationError) -> ServerPlaylistError {
+    match error {
+        SessionOperationError::Unavailable => ServerPlaylistError::Unavailable,
+        SessionOperationError::Backend(BackendError::Unsupported { .. }) => {
+            ServerPlaylistError::UnsupportedSource
+        }
+        SessionOperationError::Backend(error) => {
+            ServerPlaylistError::BackendFailure(failure_category(&error))
+        }
+    }
+}
+
 /// Convert one concrete backend into the task result accepted by the
 /// heterogeneous lifecycle registry.
 fn constructed_adapter<A>(adapter: A) -> AdapterTaskResult<dyn ManagedSourceAdapter>
@@ -1835,8 +2096,11 @@ mod tests {
         close_calls: AtomicUsize,
         stream_calls: AtomicUsize,
         artwork_calls: AtomicUsize,
+        server_playlist_list_calls: AtomicUsize,
+        server_playlist_snapshot_calls: AtomicUsize,
         close_release: watch::Sender<bool>,
         stream_release: watch::Sender<bool>,
+        server_playlist_release: watch::Sender<bool>,
         view_specs: Mutex<HashMap<ViewOrigin, VecDeque<ViewSpec>>>,
     }
 
@@ -1849,12 +2113,16 @@ mod tests {
         fn new(close_released: bool) -> Arc<Self> {
             let (close_release, _receiver) = watch::channel(close_released);
             let (stream_release, _receiver) = watch::channel(true);
+            let (server_playlist_release, _receiver) = watch::channel(true);
             Arc::new(Self {
                 close_calls: AtomicUsize::new(0),
                 stream_calls: AtomicUsize::new(0),
                 artwork_calls: AtomicUsize::new(0),
+                server_playlist_list_calls: AtomicUsize::new(0),
+                server_playlist_snapshot_calls: AtomicUsize::new(0),
                 close_release,
                 stream_release,
+                server_playlist_release,
                 view_specs: Mutex::new(HashMap::new()),
             })
         }
@@ -1876,6 +2144,10 @@ mod tests {
                 close_release: self.close_release.subscribe(),
                 catalogue: Vec::new(),
                 regular_playlist_capability: RegularPlaylistCapability::Unsupported,
+                server_playlist_capability: ServerPlaylistCapability::Unsupported,
+                server_playlists: Vec::new(),
+                server_playlist_snapshot: None,
+                server_playlist_failure: None,
                 stream_failure: None,
                 artwork_available: false,
             }
@@ -1892,6 +2164,43 @@ mod tests {
                 close_release: self.close_release.subscribe(),
                 catalogue,
                 regular_playlist_capability: RegularPlaylistCapability::SourceScopedEntries,
+                server_playlist_capability: ServerPlaylistCapability::Unsupported,
+                server_playlists: Vec::new(),
+                server_playlist_snapshot: None,
+                server_playlist_failure: None,
+                stream_failure: None,
+                artwork_available: true,
+            }
+        }
+
+        fn server_playlist_adapter(self: &Arc<Self>, label: &'static str) -> FakeAdapter {
+            let native_id = NativePlaylistId::new("native-playlist").expect("playlist ID");
+            let repeated = TrackId::remote("not-in-catalogue").expect("track ID");
+            let summary = ServerPlaylistSummary::new(
+                native_id.clone(),
+                Some("Server list".to_string()),
+                Some("fixture owner".to_string()),
+                Some(2),
+            )
+            .expect("playlist summary");
+            let snapshot = ServerPlaylistSnapshot::new(
+                native_id,
+                Some("Server list".to_string()),
+                Some("fixture owner".to_string()),
+                Some(2),
+                vec![repeated.clone(), repeated],
+            )
+            .expect("playlist snapshot");
+            FakeAdapter {
+                label,
+                probe: Arc::clone(self),
+                close_release: self.close_release.subscribe(),
+                catalogue: Vec::new(),
+                regular_playlist_capability: RegularPlaylistCapability::SourceScopedEntries,
+                server_playlist_capability: ServerPlaylistCapability::PullSnapshots,
+                server_playlists: vec![summary],
+                server_playlist_snapshot: Some(snapshot),
+                server_playlist_failure: None,
                 stream_failure: None,
                 artwork_available: true,
             }
@@ -1914,6 +2223,10 @@ mod tests {
         close_release: watch::Receiver<bool>,
         catalogue: Vec<Track>,
         regular_playlist_capability: RegularPlaylistCapability,
+        server_playlist_capability: ServerPlaylistCapability,
+        server_playlists: Vec<ServerPlaylistSummary>,
+        server_playlist_snapshot: Option<ServerPlaylistSnapshot>,
+        server_playlist_failure: Option<String>,
         stream_failure: Option<String>,
         artwork_available: bool,
     }
@@ -2030,6 +2343,62 @@ mod tests {
     impl ManagedSourceAdapter for FakeAdapter {
         fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
             self.regular_playlist_capability
+        }
+
+        fn server_playlist_capability(&self) -> ServerPlaylistCapability {
+            self.server_playlist_capability
+        }
+
+        fn list_server_playlists(self: Arc<Self>) -> ServerPlaylistListFuture {
+            self.probe
+                .server_playlist_list_calls
+                .fetch_add(1, Ordering::AcqRel);
+            let mut release = self.probe.server_playlist_release.subscribe();
+            let playlists = self.server_playlists.clone();
+            let failure = self.server_playlist_failure.clone();
+            Box::pin(async move {
+                while !*release.borrow_and_update() {
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+                if let Some(message) = failure {
+                    return Err(BackendError::ConnectionFailed {
+                        message,
+                        source: None,
+                    });
+                }
+                Ok(playlists)
+            })
+        }
+
+        fn get_server_playlist(
+            self: Arc<Self>,
+            _native_id: NativePlaylistId,
+        ) -> ServerPlaylistSnapshotFuture {
+            self.probe
+                .server_playlist_snapshot_calls
+                .fetch_add(1, Ordering::AcqRel);
+            let mut release = self.probe.server_playlist_release.subscribe();
+            let snapshot = self.server_playlist_snapshot.clone();
+            let failure = self.server_playlist_failure.clone();
+            Box::pin(async move {
+                while !*release.borrow_and_update() {
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+                if let Some(message) = failure {
+                    return Err(BackendError::ConnectionFailed {
+                        message,
+                        source: None,
+                    });
+                }
+                snapshot.ok_or_else(|| BackendError::ParseError {
+                    message: "fixture server playlist snapshot missing".to_string(),
+                    source: None,
+                })
+            })
         }
 
         fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
@@ -2203,6 +2572,21 @@ mod tests {
         assert_source_scoped::<crate::jellyfin::JellyfinBackend>();
         assert_source_scoped::<crate::plex::PlexBackend>();
         assert_source_scoped::<crate::daap::DaapBackend>();
+
+        fn assert_server_playlist_pull<A>()
+        where
+            A: server_playlist_sealed::Adapter,
+        {
+            assert_eq!(
+                server_playlist_capability::<A>(),
+                ServerPlaylistCapability::PullSnapshots
+            );
+        }
+
+        // Only Subsonic implements the sealed server-playlist marker. The
+        // trait default keeps Jellyfin, Plex, DAAP, radio, removable, and
+        // external adapters denied.
+        assert_server_playlist_pull::<crate::subsonic::SubsonicBackend>();
     }
 
     async fn wait_for_catalogue(registry: &SourceRegistry, source_id: SourceId) -> (u64, u64) {
@@ -2329,6 +2713,200 @@ mod tests {
         .await
         .expect("catalogue refresh accepted");
         generation
+    }
+
+    #[tokio::test]
+    async fn server_playlist_reads_default_deny_and_do_not_grant_catalogue_authority() {
+        let registry = registry();
+
+        let unsupported_probe = FakeProbe::new(true);
+        let unsupported_source = SourceId::random();
+        connect_playlist_fixture(
+            &registry,
+            unsupported_source,
+            unsupported_probe.adapter("unsupported"),
+        )
+        .await;
+        assert!(matches!(
+            registry.list_server_playlists(unsupported_source).await,
+            Err(ServerPlaylistError::UnsupportedSource)
+        ));
+        assert_eq!(
+            unsupported_probe
+                .server_playlist_list_calls
+                .load(Ordering::Acquire),
+            0,
+            "default-denied adapters must not receive a playlist request"
+        );
+
+        let supported_probe = FakeProbe::new(true);
+        let supported_source = SourceId::random();
+        connect_playlist_fixture(
+            &registry,
+            supported_source,
+            supported_probe.server_playlist_adapter("server-playlists"),
+        )
+        .await;
+
+        let listing = registry
+            .list_server_playlists(supported_source)
+            .await
+            .expect("server playlist listing");
+        assert_eq!(listing.guard().source_id(), supported_source);
+        assert_ne!(listing.guard().session_epoch(), 0);
+        assert_eq!(listing.playlists().len(), 1);
+        let native_id = listing.playlists()[0].native_id().clone();
+        let snapshot = registry
+            .get_server_playlist(listing.guard(), native_id)
+            .await
+            .expect("server playlist snapshot");
+        assert_eq!(snapshot.track_ids().len(), 2);
+        assert_eq!(snapshot.track_ids()[0], snapshot.track_ids()[1]);
+
+        let endpoint_identity = MediaKey::new(supported_source, snapshot.track_ids()[0].clone());
+        assert_eq!(
+            unavailable_reason(&registry.resolve_regular_playlist_tracks(&[endpoint_identity])[0]),
+            RegularPlaylistUnavailableReason::TrackMissing,
+            "native playlist membership must not become catalogue/playback authority"
+        );
+        assert_eq!(
+            supported_probe
+                .server_playlist_list_calls
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            supported_probe
+                .server_playlist_snapshot_calls
+                .load(Ordering::Acquire),
+            1
+        );
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn server_playlist_guards_close_in_flight_and_successor_session_races() {
+        let registry = registry();
+        let predecessor_probe = FakeProbe::new(true);
+        let source_id = SourceId::random();
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            predecessor_probe.server_playlist_adapter("predecessor"),
+        )
+        .await;
+        let listing = registry
+            .list_server_playlists(source_id)
+            .await
+            .expect("predecessor listing");
+        let old_guard = listing.guard();
+        let native_id = listing.playlists()[0].native_id().clone();
+
+        predecessor_probe
+            .server_playlist_release
+            .send_replace(false);
+        let delayed_registry = registry.clone();
+        let delayed_id = native_id.clone();
+        let delayed = tokio::spawn(async move {
+            delayed_registry
+                .get_server_playlist(old_guard, delayed_id)
+                .await
+        });
+        timeout(Duration::from_secs(2), async {
+            while predecessor_probe
+                .server_playlist_snapshot_calls
+                .load(Ordering::Acquire)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("snapshot request started");
+
+        let disconnect = registry.disconnect(source_id).expect("disconnect source");
+        predecessor_probe.server_playlist_release.send_replace(true);
+        assert!(matches!(
+            delayed.await.expect("snapshot task"),
+            Err(ServerPlaylistError::Unavailable)
+        ));
+        disconnect.wait().await;
+
+        let successor_probe = FakeProbe::new(true);
+        let successor_adapter = successor_probe.server_playlist_adapter("successor");
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(successor_adapter) },
+            )
+            .expect("successor connection admitted");
+        let (_, successor_epoch) = wait_for_catalogue(&registry, source_id).await;
+        assert_ne!(successor_epoch, old_guard.session_epoch());
+
+        assert!(matches!(
+            registry.get_server_playlist(old_guard, native_id).await,
+            Err(ServerPlaylistError::Unavailable)
+        ));
+        assert_eq!(
+            successor_probe
+                .server_playlist_snapshot_calls
+                .load(Ordering::Acquire),
+            0,
+            "an old guard must be rejected before successor adapter work"
+        );
+
+        successor_probe.server_playlist_release.send_replace(false);
+        let delayed_registry = registry.clone();
+        let delayed_listing =
+            tokio::spawn(async move { delayed_registry.list_server_playlists(source_id).await });
+        timeout(Duration::from_secs(2), async {
+            while successor_probe
+                .server_playlist_list_calls
+                .load(Ordering::Acquire)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listing request started");
+        let successor_disconnect = registry
+            .disconnect(source_id)
+            .expect("disconnect successor");
+        successor_probe.server_playlist_release.send_replace(true);
+        assert!(matches!(
+            delayed_listing.await.expect("listing task"),
+            Err(ServerPlaylistError::Unavailable)
+        ));
+        successor_disconnect.wait().await;
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn server_playlist_backend_failures_are_sanitized() {
+        let registry = registry();
+        let probe = FakeProbe::new(true);
+        let source_id = SourceId::random();
+        let secret = format!("fixture-secret-{}", Uuid::new_v4());
+        let mut adapter = probe.server_playlist_adapter("failing");
+        adapter.server_playlist_failure = Some(secret.clone());
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+
+        let Err(error) = registry.list_server_playlists(source_id).await else {
+            panic!("fixture listing must fail");
+        };
+        assert_eq!(
+            error,
+            ServerPlaylistError::BackendFailure(FailureCategory::Connection)
+        );
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(&secret));
+        assert!(!rendered.contains("native-playlist"));
+
+        registry.shutdown().wait().await;
     }
 
     fn consume_public(request: ResolvedSourceStream) -> BackendResult<Url> {

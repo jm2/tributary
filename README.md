@@ -38,7 +38,8 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Internet Radio (Top Clicked, Top Voted, Stations Near Me) | ✅ |
 | Tiered geo-location (geo-distance → state → country) | ✅ |
 | Column drag-and-drop reordering with persistence | ✅ |
-| Regular & smart playlists (iTunes-style rules engine) | ✅ Regular playlists mix local and authenticated Subsonic/Jellyfin/Plex/DAAP entries; smart playlists remain local-library queries ([#47](https://github.com/jm2/tributary/issues/47)) |
+| Regular & smart playlists (iTunes-style rules engine) | ✅ Regular playlists mix local and authenticated Subsonic/Jellyfin/Plex/DAAP entries; smart playlists remain local-library queries ([#142](https://github.com/jm2/tributary/pull/142)) |
+| Subsonic server-native playlist import/sync | 🚧 Pull-only contract, bounded endpoint reads, and exact-session authority are complete; persistence and UI remain tracked in [#143](https://github.com/jm2/tributary/issues/143) |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
 | Batch metadata editing (multi-select) | ✅ |
@@ -736,10 +737,16 @@ occurrence can update Tributary's local playback history. Remote ratings keep th
 read-only/unsupported capability and never gain mutation authority from playlist membership.
 
 Smart playlists and XSPF import/export remain local-only. Mixed-source metadata export requires a
-separate no-locator policy, and Subsonic server-native playlist import/synchronization still needs
-direction, conflict, offline, deletion, and feature semantics. See
-[P1.5](docs/task.md#p15--persist-source-scoped-playlists) and the
-[source-scoped playlist storage contract](docs/source-scoped-playlists.md) for the exact boundary.
+separate no-locator policy. Subsonic server-native playlist integration now has a pull-only
+[accepted contract](docs/subsonic-playlist-sync.md): **Import Copy** will create a detached editable
+snapshot, while **Keep Synced** will create an opt-in read-only server-authoritative mirror. The
+internal foundation can read bounded `getPlaylists` and `getPlaylist` responses only through the
+exact current authenticated Subsonic session; order and duplicates are preserved, stale sessions
+are rejected, and playlist membership grants no playback authority. No import, link persistence,
+automatic refresh, or user-facing sync action ships yet. See
+[P1.5](docs/task.md#p15--persist-source-scoped-playlists), the
+[source-scoped regular-playlist contract](docs/source-scoped-playlists.md), and
+[#143](https://github.com/jm2/tributary/issues/143) for the remaining delivery stages.
 
 #### Importing and exporting playlists
 

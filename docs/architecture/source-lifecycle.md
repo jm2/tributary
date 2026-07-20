@@ -5,7 +5,9 @@
   packaged Windows DAAP/Subsonic playback validation remain tracked field work outside this
   decision. P1.5 migration 13 extends the same identity boundary into regular-playlist storage,
   Record A adds a default-deny live-catalogue authority boundary, and Record B consumes it in
-  mixed-source Add/Remove/render/Play without reopening P3.1.
+  mixed-source Add/Remove/render/Play without reopening P3.1. P1.5 Record C separately adds a
+  Subsonic-only, exact-session authority for bounded server-native playlist reads; it grants no
+  catalogue or playback authority and persists nothing.
 - Decision date: 2026-07-17
 - Historical tracker:
   [P3.1](../task-remediation-2026-07.md#p31-introduce-a-sourcesession-registry)
@@ -47,6 +49,13 @@ non-local authority for regular-playlist Add and rendering, retains exact durabl
 for Remove, and carries each available row's closed guard into at-use stream and artwork
 resolution. The full boundary is specified in
 [`source-scoped-playlists.md`](../source-scoped-playlists.md).
+
+Server-native Subsonic playlists use a separate authority lane. Their accepted
+[`subsonic-playlist-sync.md`](../subsonic-playlist-sync.md) contract distinguishes one-time Import
+Copy from a future read-only pull mirror. The initial foundation resolves bounded list/detail
+operations only through the exact current authenticated Subsonic adapter, epoch, and session lease,
+with pre/post network revalidation. It does not consult the accepted music catalogue and cannot
+turn a returned track ID into display, stream, artwork, rating, or history authority.
 
 The implementation has now converged on this boundary. PR #120 implements stable identity, PR #121
 adds retained local file authority through output consumption, and PR #122 introduces the generic
@@ -563,6 +572,16 @@ queue can extend the same ephemeral-source rule explicitly.
   successful replacement or same-session refresh invalidates old guards, while disconnect,
   shutdown, and final release deny synchronously. None of these internal APIs enables
   Add/Remove/render/Play UI behavior.
+- Server-native playlist authority is independently default-deny on `ManagedSourceAdapter`. Only
+  authenticated Subsonic opts into `PullSnapshots`; every other adapter remains `Unsupported`.
+  `getPlaylists` and `getPlaylist` run outside the lifecycle mutex after capturing the exact
+  adapter/session epoch/lease and return only if the same authority remains current afterward.
+  The list result carries an opaque transient guard; detail rejects that guard after replacement,
+  disconnect, retirement, shutdown, or final release. Fixed adapter-unsupported,
+  lifecycle-unavailable, and closed backend failures expose no native ID, URL, credential, server
+  message, response body, or route.
+  Endpoint membership is intentionally independent from accepted-catalogue membership and grants
+  no playback authority.
   Catalogue selectors run against a captured immutable `Arc` outside the lifecycle mutex, followed
   by an exact pointer/source/epoch/generation/lease recheck before a value returns or adapter work
   starts. Selector-time refresh or teardown therefore denies stale work without making registry
@@ -728,8 +747,10 @@ implementation details so long as one registry enforces this contract. A typed r
 authority for pathless removable Properties editing is deliberately deferred; the UI omits that
 action instead of reconstructing a path or weakening playback authority. Source-scoped regular-
 playlist storage, default-deny live-catalogue authority, and Add/Remove/render/Play consumer are
-specified separately and complete. Subsonic-native playlist synchronization and mixed-source XSPF
-metadata export remain explicitly deferred P1.5 policies.
+specified separately and complete. The Subsonic-native pull contract plus bounded protocol and
+exact-session authority are also specified and complete; dedicated link persistence, atomic pull
+application, and UI/lifecycle integration remain deferred P1.5 records. Mixed-source XSPF metadata
+export remains a separate deferred policy.
 
 ## Implementation sequence
 
@@ -787,6 +808,17 @@ metadata export remain explicitly deferred P1.5 policies.
    playlist with any remote or unresolved occurrence is refused before XSPF export can touch its
    destination. Mixed-source metadata export and Subsonic-native playlist synchronization remain
    separate.
+10. **Subsonic server-native playlist read authority complete
+    ([#143](https://github.com/jm2/tributary/issues/143)):** an accepted pull-only contract separates
+    detached Import Copy from a future read-only Keep Synced mirror and fixes conflict, offline,
+    deletion, unlink, and no-server-mutation semantics before persistence. Bounded
+    `getPlaylists`/`getPlaylist` operations preserve exact IDs, order, and duplicates. Only the
+    authenticated Subsonic adapter opts into the default-deny `PullSnapshots` capability. The
+    lifecycle captures exact adapter identity, epoch, and lease, performs network work unlocked,
+    and rejects the result if that same session is no longer current. An opaque list guard cannot
+    be reused against a successor session. Endpoint membership grants no catalogue/playback
+    authority. This step deliberately adds no database link, import/sync mutation, reconnect
+    scheduler, or UI; those are the next two P1.5 records.
 
 The authenticated-remote cutover's locked debug and release suites each passed 20 library, 865
 application, and 10 repository-metadata tests (895 total), with locked all-target/all-feature
@@ -852,6 +884,11 @@ independent lifecycle systems must not become the permanent architecture.
   playlist. Only the same live source, accepted session/catalogue generation, explicit adapter
   capability, and exact native track can restore authority; metadata and endpoint similarity are
   never substitutes.
+- A server-native endpoint snapshot may preserve an exact track ID that the accepted catalogue
+  does not currently contain, but it remains only import/sync identity. The exact current catalogue
+  must independently authorize display and playback. Conversely, catalogue membership cannot
+  authorize a server-playlist list/detail request; that operation requires its own exact Subsonic
+  session capability and guard.
 
 ## Rejected alternatives
 

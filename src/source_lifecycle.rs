@@ -46,6 +46,19 @@ pub enum CatalogueMediaResolveError {
     Backend(BackendError),
 }
 
+/// Closed lifecycle result for an adapter operation bound to one exact
+/// adopted session.
+///
+/// The caller can distinguish lifecycle staleness from an adapter failure
+/// without receiving the active lease or adapter. Backend details remain
+/// private to the higher-level registry that owns the public error policy.
+// Plain `pub` is still crate-internal because `source_lifecycle` is private at
+// the crate root; it also lets the sibling registry name the closed result.
+pub enum SessionOperationError {
+    Unavailable,
+    Backend(BackendError),
+}
+
 impl AdapterStream {
     fn with_lease(self, lease: MediaLease) -> Self {
         match self {
@@ -2500,6 +2513,53 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             ));
         }
         Ok((request, lease))
+    }
+
+    /// Run one read-only adapter operation through an exact current session.
+    ///
+    /// Unlike media resolution, this returns no lease to the caller. The
+    /// adapter, epoch, and active lease are captured atomically, adapter work
+    /// runs outside the lifecycle mutex, and the exact session is rechecked
+    /// after the future completes. Lifecycle replacement therefore wins over
+    /// either a successful result or a stale adapter error.
+    pub async fn run_exact_session_operation<R, F, Fut>(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        operation: F,
+    ) -> Result<R, SessionOperationError>
+    where
+        S: Send + Sync,
+        R: Send,
+        F: FnOnce(Arc<A>) -> Fut + Send,
+        Fut: Future<Output = BackendResult<R>> + Send,
+    {
+        let session = self
+            .session(source_id)
+            .ok_or(SessionOperationError::Unavailable)?;
+        if session.session_epoch != expected_session_epoch {
+            return Err(SessionOperationError::Unavailable);
+        }
+
+        let epoch = session.session_epoch;
+        let lease = session.lease.clone();
+        let expected_adapter = Arc::clone(&session.adapter);
+        let result = operation(session.adapter).await;
+        let state = lock(&self.inner.state);
+        let remains_current = state.gate == RegistryGate::Running
+            && lease.is_active()
+            && state.entries.get(&source_id).is_some_and(|entry| {
+                entry.active.as_ref().is_some_and(|active| {
+                    active.epoch == epoch
+                        && Arc::ptr_eq(&active.adapter.operational(), &expected_adapter)
+                })
+            });
+        drop(state);
+
+        if !remains_current {
+            return Err(SessionOperationError::Unavailable);
+        }
+        result.map_err(SessionOperationError::Backend)
     }
 
     /// Resolve one protected HTTP locator through the exact expected adapter
@@ -5670,6 +5730,112 @@ mod tests {
         predecessor.allow_close();
         predecessor.probe.wait_for_completions(1).await;
         shutdown_immediate(&registry).await;
+    }
+
+    #[tokio::test]
+    async fn exact_session_operations_close_epoch_races_and_preserve_backend_category() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        claim(&registry, source_id, SourceProvenance::Saved);
+        let mut predecessor = AdapterFixture::held();
+        let (predecessor_epoch, _) = adopt(&registry, source_id, &mut predecessor, Vec::new());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stale_calls = Arc::clone(&calls);
+        assert!(matches!(
+            registry
+                .run_exact_session_operation(
+                    source_id,
+                    predecessor_epoch.wrapping_add(1),
+                    move |_| async move {
+                        stale_calls.fetch_add(1, Ordering::AcqRel);
+                        Ok(())
+                    },
+                )
+                .await,
+            Err(SessionOperationError::Unavailable)
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        let delayed_registry = registry.clone();
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let delayed = tokio::spawn(async move {
+            delayed_registry
+                .run_exact_session_operation(source_id, predecessor_epoch, move |_| async move {
+                    let _ = started.send(());
+                    let _ = release_rx.await;
+                    Err::<(), _>(BackendError::ConnectionFailed {
+                        message: "stale replacement detail".to_string(),
+                        source: None,
+                    })
+                })
+                .await
+        });
+        started_rx.await.expect("session operation started");
+
+        let mut successor = AdapterFixture::immediate();
+        let successor_epoch = match registry
+            .begin_connect(source_id)
+            .expect("replace")
+            .submit_constructed(successor.take(), Vec::new())
+        {
+            ConnectSubmission::Adopted { session_epoch, .. } => session_epoch,
+            ConnectSubmission::Rejected => panic!("successor rejected"),
+        };
+        release.send(()).expect("release session operation");
+        assert!(matches!(
+            delayed.await.expect("session operation task"),
+            Err(SessionOperationError::Unavailable)
+        ));
+
+        let backend = registry
+            .run_exact_session_operation(source_id, successor_epoch, |_| async {
+                Err::<(), _>(BackendError::ConnectionFailed {
+                    message: "fixture detail".to_string(),
+                    source: None,
+                })
+            })
+            .await;
+        assert!(matches!(
+            backend,
+            Err(SessionOperationError::Backend(
+                BackendError::ConnectionFailed { .. }
+            ))
+        ));
+
+        let shutdown_registry = registry.clone();
+        let (shutdown_started, shutdown_started_rx) = oneshot::channel();
+        let (release_shutdown, release_shutdown_rx) = oneshot::channel();
+        let during_shutdown = tokio::spawn(async move {
+            shutdown_registry
+                .run_exact_session_operation(source_id, successor_epoch, move |_| async move {
+                    let _ = shutdown_started.send(());
+                    let _ = release_shutdown_rx.await;
+                    Err::<(), _>(BackendError::ConnectionFailed {
+                        message: "stale shutdown detail".to_string(),
+                        source: None,
+                    })
+                })
+                .await
+        });
+        shutdown_started_rx
+            .await
+            .expect("shutdown operation started");
+        let shutdown = registry.shutdown();
+        release_shutdown
+            .send(())
+            .expect("release shutdown operation");
+        assert!(matches!(
+            during_shutdown.await.expect("shutdown operation task"),
+            Err(SessionOperationError::Unavailable)
+        ));
+
+        predecessor.allow_close();
+        predecessor.probe.wait_for_completions(1).await;
+        timeout(Duration::from_secs(2), shutdown.wait())
+            .await
+            .expect("shutdown completed");
     }
 
     #[tokio::test]

@@ -21,29 +21,29 @@ state.
 - Do not treat the order below as a release promise. It is a dependency-aware starting order and
   can change as issues receive product decisions and milestones.
 
-Current status: **10/36 (27.8%)** active implementation records complete. This percentage measures
+Current status: **11/38 (28.9%)** active implementation records complete. This percentage measures
 checklist completion, not equal engineering effort: several P3 records are deliberately large
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
 ## Current focus
 
-P1.1, P1.2, all three P1.3 playback-history records, both P1.4 rating records, and P1.5's three
-source-scoped storage, authority, and mixed-source UI records are complete. Continue with
-the remaining P1.5 record: define Subsonic server-native playlist import/synchronization direction,
-conflict, offline, deletion, and feature semantics before implementing it. This native-server slice
-must remain separate from Tributary's regular playlists, whose exact local plus authenticated
-Subsonic/Jellyfin/Plex/DAAP Add/Remove/render/Play path now consumes the default-deny registry
-authority without persisting locators or credentials. Smart playlists and XSPF import/export remain
-local-only, while mixed-source metadata export requires its own no-locator policy.
+P1.1, P1.2, all three P1.3 playback-history records, both P1.4 rating records, and P1.5's
+source-scoped storage, catalogue authority, mixed-source UI, and server-native pull-authority
+foundation are complete. Continue with P1.5 Record D: implement detached Subsonic Import Copy and
+persist explicit Keep Synced link state, then apply complete current pull snapshots atomically with
+conflict, offline, cancellation, and server-deletion safety. The accepted
+[`subsonic-playlist-sync.md`](subsonic-playlist-sync.md) contract keeps this capability pull-only and
+separate from Tributary's ordinary mixed-source playlists. Smart playlists and XSPF import/export
+remain local-only, while mixed-source metadata export requires its own no-locator policy.
 
 The independent Linux watcher correctness fix tracked in
-[#103](https://github.com/jm2/tributary/pull/103) does not change the **10/36** feature total.
+[#103](https://github.com/jm2/tributary/pull/103) does not change the **11/38** feature total.
 The salvaged scope rejects explicitly classified access/access-time noise before the bounded watcher
 queue without filtering real bootstrap mutations or backend errors, while retaining overflow
 evidence for authoritative reconciliation. It intentionally omits the original persistent
 unparseable-file cache so transient parser and I/O failures remain retryable. It is tracked outside
-the 36-record feature backlog.
+the 38-record feature backlog.
 
 ## P1 — Correctness and shared feature foundations
 
@@ -305,11 +305,40 @@ the 36-record feature backlog.
   refused all-or-none before the destination is touched. Mixed-source metadata export and
   Subsonic server-native synchronization remain separate policy records.
 
-- [ ] Treat Subsonic server-native playlist import/synchronization as a separate capability slice,
-  with direction, conflict, offline, deletion, and server-feature semantics documented first.
+- [x] **Record C — Server-native contract, protocol, and pull authority:** define Subsonic native
+  playlist direction, identity, conflict, offline, deletion, unsupported-feature, and unlink
+  semantics; implement bounded `getPlaylists`/`getPlaylist` reads; and expose them only through an
+  exact-current-session, default-deny registry capability
+  ([contract](subsonic-playlist-sync.md); [#143](https://github.com/jm2/tributary/issues/143)).
 
-  No Subsonic playlist endpoint, origin mapping, import, or synchronization behavior is part of the
-  storage migration, authority foundation, or mixed-source interaction record.
+  Implemented foundation: Import Copy is a future one-time detached editable snapshot, while Keep
+  Synced is a future opt-in read-only, server-authoritative pull mirror. The contract excludes
+  server create/update/delete calls and periodic polling. Exact native playlist IDs use a
+  content-redacted 4 KiB identity; names and owners are bounded presentation hints, advertised
+  counts are non-authoritative, and detail snapshots preserve exact ordered track IDs including
+  duplicates. List/detail response bodies and element counts are bounded and reject malformed,
+  oversized, duplicate-playlist-ID, or detail-ID-mismatch responses all-or-none.
+
+  `ManagedSourceAdapter` defaults the capability to `Unsupported`; only an authenticated Subsonic
+  adapter opts into `PullSnapshots`. Registry list/detail calls capture the exact source session,
+  run network work outside the lifecycle lock, and recheck adapter identity, epoch, and revocable
+  lease afterward. Disconnect, replacement, retirement, shutdown, or guard reuse against a
+  successor session rejects stale results. Returned errors are fixed adapter-unsupported,
+  lifecycle-unavailable, or closed backend categories and expose no URL, credential, server text,
+  response body, or native ID. Playlist endpoint membership deliberately grants no catalogue or
+  playback authority. This
+  record adds no migration, playlist/link write, sync scheduler, or UI.
+
+- [ ] **Record D — Link persistence and atomic pull synchronization:** add dedicated non-secret
+  native-playlist link state plus detached Import Copy and read-only Keep Synced manager operations.
+  Preserve exact order and duplicates; apply each current pull all-or-none; detect local drift
+  before overwrite; retain the last successful snapshot on offline, parse, auth, cancellation, or
+  stale-session failure; and represent server deletion without cascading local data.
+
+- [ ] **Record E — Server-native playlist UI and lifecycle integration:** add localized Import Copy,
+  Keep Synced, Sync Now, conflict/missing/offline status, reconnect refresh, Retry, Replace Local
+  with Server, Unlink, and Remove Local Copy flows with accessible end-to-end coverage. Do not make
+  linked mirrors editable or expose unsupported adapters/servers as writable playlist sources.
 
 ## P2 — User-facing integrations and bounded enhancements
 
@@ -428,4 +457,5 @@ the 36-record feature backlog.
 | 2026-07-19 | P1.5 source-scoped regular-playlist storage | [#140](https://github.com/jm2/tributary/pull/140) | Added migration 13 and typed atomic storage around exact `(SourceId, TrackId)` occurrence identity, a separate nullable local foreign-key cache, exact schema/index recognition, lossless-or-refused downgrade, local compatibility, and explicit no-locator/no-credential boundaries. It intentionally reserved live authority, mixed-source UI, and Subsonic-native synchronization for separate records. |
 | 2026-07-19 | P1.5 live-catalogue playlist authority | [#141](https://github.com/jm2/tributary/pull/141) | Added default-deny adapter capability, exact ordered catalogue lookup with invalid-catalogue rejection and sanitized metadata, transient epoch/generation guards, closed media errors, and lifecycle-owned generation leases revoked independently of retained snapshots. It intentionally reserved Add/Remove/render/Play consumption for Record B. |
 | 2026-07-19 | P1.5 mixed-source regular-playlist UI | [#142](https://github.com/jm2/tributary/pull/142) | Integrated exact local and authenticated Subsonic/Jellyfin/Plex/DAAP entries through all-or-none Add, durable-occurrence Remove, ordered duplicate-preserving projection with explicit removable unavailable rows, and per-source guarded Play/artwork. Add revalidates after staging SQL, rolls back a stale result, and retains exact session/catalogue permits through an admitted commit or rollback. Current closed unavailable reasons render honestly; stale projection results are discarded/reprojected and stale guards are denied. Local history and remote rating ownership remain unchanged. Smart playlists and XSPF remain local-only; mixed/unresolved XSPF export refuses all-or-none instead of truncating, while mixed-source metadata export and Subsonic-native synchronization remain separate. |
+| 2026-07-19 | P1.5 Subsonic server-playlist contract and pull authority | [#143](https://github.com/jm2/tributary/issues/143) | Defined detached Import Copy and read-only pull-mirror semantics, including conflict, offline, deletion, unlink, privacy, and non-mutation boundaries. Added bounded/redacted native playlist identity and exact ordered snapshots, authenticated `getPlaylists`/`getPlaylist` reads, and a Subsonic-only default-deny capability whose opaque guard and pre/post lifecycle checks reject disconnect, replacement, retirement, shutdown, and successor-session reuse. No persistence, synchronization commit, or UI is included; Records D and E remain open. |
 | 2026-07-18 | Linux watcher feedback-loop fix | [#103](https://github.com/jm2/tributary/pull/103) | Narrowed the external proposal to filter self-generated access events before queue admission without filtering genuine startup events or backend errors; bounded overflow still drives authoritative reconciliation. Persistent negative parse caching is deliberately excluded so failures remain retryable; this separate correctness fix does not advance the feature numerator. |

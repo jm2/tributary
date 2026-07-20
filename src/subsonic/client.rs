@@ -40,6 +40,40 @@ const MAX_API_BODY_BYTES: u64 = 256 * 1024 * 1024;
 /// End-to-end and body-phase deadline for finite API requests.
 const API_RESPONSE_DEADLINE: Duration = Duration::from_mins(2);
 
+#[derive(Clone, Copy)]
+enum RequestLogPolicy {
+    RedactedUrl,
+    /// A fixed label for requests whose non-authentication query values are
+    /// themselves private native identities.
+    FixedOperation(&'static str),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RequestDiagnostic {
+    RedactedUrl(String),
+    FixedOperation(&'static str),
+}
+
+fn request_diagnostic(url: &Url, policy: RequestLogPolicy) -> RequestDiagnostic {
+    match policy {
+        RequestLogPolicy::RedactedUrl => {
+            RequestDiagnostic::RedactedUrl(redact_url_secrets(url.as_str()))
+        }
+        RequestLogPolicy::FixedOperation(operation) => RequestDiagnostic::FixedOperation(operation),
+    }
+}
+
+fn log_request(url: &Url, policy: RequestLogPolicy) {
+    match request_diagnostic(url, policy) {
+        RequestDiagnostic::RedactedUrl(url) => {
+            debug!(url = %url, "Subsonic request");
+        }
+        RequestDiagnostic::FixedOperation(operation) => {
+            debug!(operation, "Subsonic request");
+        }
+    }
+}
+
 /// Authentication mode used for API requests.
 #[derive(Clone)]
 enum AuthMode {
@@ -254,6 +288,42 @@ impl SubsonicClient {
         endpoint: &str,
         params: &[(&str, &str)],
     ) -> BackendResult<SubsonicEnvelope> {
+        self.get_with_params_inner(
+            endpoint,
+            params,
+            MAX_API_BODY_BYTES,
+            RequestLogPolicy::RedactedUrl,
+        )
+        .await
+    }
+
+    /// Issue a finite API GET with a response-body ceiling chosen for the
+    /// endpoint's data shape. Authentication, transport redaction, status
+    /// handling, and envelope validation remain identical to ordinary API
+    /// requests.
+    pub(crate) async fn get_with_params_bounded(
+        &self,
+        endpoint: &str,
+        params: &[(&str, &str)],
+        max_body_bytes: u64,
+        operation: &'static str,
+    ) -> BackendResult<SubsonicEnvelope> {
+        self.get_with_params_inner(
+            endpoint,
+            params,
+            max_body_bytes,
+            RequestLogPolicy::FixedOperation(operation),
+        )
+        .await
+    }
+
+    async fn get_with_params_inner(
+        &self,
+        endpoint: &str,
+        params: &[(&str, &str)],
+        max_body_bytes: u64,
+        log_policy: RequestLogPolicy,
+    ) -> BackendResult<SubsonicEnvelope> {
         let mut url = self.api_url(endpoint);
         {
             let mut q = url.query_pairs_mut();
@@ -262,7 +332,7 @@ impl SubsonicClient {
             }
         }
 
-        debug!(url = %redact_url_secrets(url.as_str()), "Subsonic request");
+        log_request(&url, log_policy);
 
         let resp = self
             .http
@@ -290,7 +360,7 @@ impl SubsonicClient {
             });
         }
 
-        let body = read_limited(resp, MAX_API_BODY_BYTES, API_RESPONSE_DEADLINE)
+        let body = read_limited(resp, max_body_bytes, API_RESPONSE_DEADLINE)
             .await
             .map_err(|error| response_body_error("Failed to parse Subsonic JSON", error))?;
 
@@ -539,6 +609,42 @@ mod tests {
             );
             assert!(!client.api_url("ping.view").as_str().contains("%252F"));
         }
+    }
+
+    #[test]
+    fn fixed_operation_diagnostics_never_derive_fields_from_request_queries() {
+        let username = uuid::Uuid::new_v4().to_string();
+        let password = uuid::Uuid::new_v4().to_string();
+        let native_playlist_id = uuid::Uuid::new_v4().to_string();
+        let client = SubsonicClient::new(
+            "https://music.example.test/reverse-proxy",
+            &username,
+            &password,
+        )
+        .expect("client");
+        let mut url = client.api_url("getPlaylist.view");
+        url.query_pairs_mut().append_pair("id", &native_playlist_id);
+
+        let diagnostic = request_diagnostic(
+            &url,
+            RequestLogPolicy::FixedOperation("server-playlist-detail"),
+        );
+        assert_eq!(
+            diagnostic,
+            RequestDiagnostic::FixedOperation("server-playlist-detail")
+        );
+        let rendered = format!("{diagnostic:?}");
+        for private_value in [
+            native_playlist_id.as_str(),
+            username.as_str(),
+            password.as_str(),
+            url.as_str(),
+            "getPlaylist.view",
+            "reverse-proxy",
+        ] {
+            assert!(!rendered.contains(private_value));
+        }
+        assert!(!rendered.contains('?'));
     }
 
     #[tokio::test]

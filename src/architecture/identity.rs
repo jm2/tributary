@@ -25,6 +25,12 @@ pub const MAX_TRACK_ID_BYTES: usize = 256 * 1024;
 /// Upper bound for a server-controlled backend-native track identifier.
 pub const MAX_REMOTE_TRACK_ID_BYTES: usize = 4 * 1024;
 
+/// Upper bound for a server-controlled backend-native playlist identifier.
+///
+/// Native playlist and track identities cross the same untrusted adapter
+/// boundary, so neither may exceed the shared 4 KiB network ceiling.
+pub const MAX_NATIVE_PLAYLIST_ID_BYTES: usize = MAX_REMOTE_TRACK_ID_BYTES;
+
 const MAX_VIEW_ORIGIN_BYTES: usize = 4 * 1024;
 
 /// Opaque identity of one logical media source.
@@ -360,6 +366,50 @@ impl<'de> Deserialize<'de> for TrackId {
     }
 }
 
+/// Exact non-empty playlist identifier assigned by one remote source.
+///
+/// This value is authoritative only together with its owning [`SourceId`].
+/// It deliberately carries no endpoint, credential, session, or catalogue
+/// authority, and its diagnostics never reveal the server-controlled value.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct NativePlaylistId(String);
+
+impl NativePlaylistId {
+    /// Validate one server-controlled playlist identifier without changing
+    /// its case, whitespace, Unicode, or other identity-significant bytes.
+    pub fn new(value: impl Into<String>) -> Result<Self, IdentityError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > MAX_NATIVE_PLAYLIST_ID_BYTES {
+            return Err(IdentityError::NativePlaylist);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for NativePlaylistId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativePlaylistId")
+            .field("byte_len", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'de> Deserialize<'de> for NativePlaylistId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Complete application identity of one playable media item.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct MediaKey {
@@ -429,6 +479,8 @@ pub enum IdentityError {
     Source,
     #[error("invalid track identity")]
     Track,
+    #[error("invalid native playlist identity")]
+    NativePlaylist,
     #[error("invalid view identity")]
     View,
     #[error("invalid remote base URL")]
@@ -572,6 +624,33 @@ mod tests {
         assert!(TrackId::remote("x".repeat(MAX_REMOTE_TRACK_ID_BYTES + 1)).is_err());
         assert!(TrackId::new("x".repeat(MAX_TRACK_ID_BYTES)).is_ok());
         assert!(TrackId::new("x".repeat(MAX_TRACK_ID_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn native_playlist_ids_are_exact_bounded_and_redacted() {
+        let exact =
+            NativePlaylistId::new(" Case/Sensitive + Unicode ☃").expect("native playlist ID");
+        assert_eq!(exact.as_str(), " Case/Sensitive + Unicode ☃");
+        let debug = format!("{exact:?}");
+        assert!(!debug.contains("Sensitive"));
+        assert!(debug.contains("byte_len"));
+
+        assert!(NativePlaylistId::new("").is_err());
+        assert!(NativePlaylistId::new("x".repeat(MAX_NATIVE_PLAYLIST_ID_BYTES)).is_ok());
+        let oversized = "secret".repeat(MAX_NATIVE_PLAYLIST_ID_BYTES);
+        let error = NativePlaylistId::new(oversized).expect_err("oversized ID must fail");
+        assert_eq!(error, IdentityError::NativePlaylist);
+        assert!(!format!("{error:?} {error}").contains("secret"));
+    }
+
+    #[test]
+    fn native_playlist_id_deserialization_preserves_the_network_bound() {
+        let exact: NativePlaylistId =
+            serde_json::from_str(r#""native-id""#).expect("bounded native playlist ID");
+        assert_eq!(exact.as_str(), "native-id");
+        assert!(serde_json::from_str::<NativePlaylistId>(r#""""#).is_err());
+        let oversized = serde_json::Value::String("x".repeat(MAX_NATIVE_PLAYLIST_ID_BYTES + 1));
+        assert!(serde_json::from_value::<NativePlaylistId>(oversized).is_err());
     }
 
     #[test]

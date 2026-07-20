@@ -40,6 +40,14 @@ pub struct SubsonicResponse {
     // search3.view
     #[serde(default, rename = "searchResult3")]
     pub search_result3: Option<SearchResult3>,
+
+    // getPlaylists.view
+    #[serde(default)]
+    pub playlists: Option<PlaylistsWrapper>,
+
+    // getPlaylist.view
+    #[serde(default)]
+    pub playlist: Option<PlaylistDetail>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,6 +193,45 @@ pub struct SearchResult3 {
     pub album: Vec<AlbumEntry>,
     #[serde(default)]
     pub song: Vec<SongEntry>,
+}
+
+// ── getPlaylists / getPlaylist ──────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct PlaylistsWrapper {
+    #[serde(default)]
+    pub playlist: Vec<PlaylistSummary>,
+}
+
+/// Metadata common to Subsonic's playlist listing and detail responses.
+///
+/// `songCount` is deliberately optional and remains a presentation hint:
+/// servers disagree on whether it is present and it may race with a detail
+/// fetch.  The detail endpoint's ordered `entry` array is authoritative.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistSummary {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub song_count: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistDetail {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub song_count: Option<u64>,
+    #[serde(default)]
+    pub entry: Vec<SongEntry>,
 }
 
 #[cfg(test)]
