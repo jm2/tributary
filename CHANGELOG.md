@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Playlist sidebar publication is now durably ordered and full-snapshot only** — Migration 15
+- **Playlist sidebar publication is now durably ordered and full-snapshot only**
+  ([#147](https://github.com/jm2/tributary/pull/147)) — Migration 15
   adds one exact singleton SQLite revision and six guarded triggers over playlist parents and
   server-playlist links. Effective inserts, updates, deletes, foreign-key cascades, and raw SQL
   against either domain table advance the revision inside the writer's transaction; no-op updates
