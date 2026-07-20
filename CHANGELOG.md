@@ -8,6 +8,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Subsonic server-native playlists now have durable pull-only links and an atomic sync engine**
+  ([#145](https://github.com/jm2/tributary/pull/145)) — Migration 14 adds an exact-shape
+  `server_playlist_links` table with one unique mirror per canonical source/native playlist pair,
+  a fixed read-only pull mode, bounded effective synchronized name, versioned 32-byte SHA-256
+  ordered-membership digest, UTC-millisecond last-success timestamp, orthogonal clean/conflict and
+  present/missing state, and a monotonic revision. It stores no endpoint, path, username,
+  credential, token, locator, source route, owner, advertised count, raw failure, adapter, epoch,
+  lease, or operation generation. Existing regular playlists and entries are unchanged; parent
+  deletion cascades the link, while downgrade refuses until every link is explicitly removed so an
+  older binary cannot silently make mirrors editable.
+  Import Copy atomically creates an ordinary editable regular playlist and never writes a link.
+  Keep Synced creates one read-only mirror with exact server order, duplicate occurrences, and
+  source-scoped track IDs even when current catalogue membership is absent. Pull applies a fresh
+  name and membership all-or-none, preserves occurrence IDs for a name-only update, clears current
+  state on success, and retains the previous snapshot on every rejected/failed operation. Before
+  network work on an existing mirror, callers capture a typed link revision; pull, conflict, and
+  complete-list missing updates compare-and-swap and increment that exact revision so a late result
+  cannot overwrite newer durable state. Initial import/mirror creation has no prior revision. A
+  frozen membership digest plus a separate byte-exact synchronized-name
+  comparison detects local drift. Normal pull records conflict without overwriting; Replace Local
+  deliberately applies a fresh server snapshot. Server absence requires sealed evidence from a
+  successful complete list, preserves entries/name/digest/last-success metadata, and can coexist
+  with local conflict. Detail, transport, authentication, parsing, cancellation, and stale-session
+  failures have no deletion or persistence path. Unlink retains an editable local copy; explicit
+  Remove Local Copy deletes the playlist and link transactionally.
+  Ordinary rename, delete, Add, Remove, reorder, smart-rule mutation, and reconciliation now reject
+  linked mirrors inside their write transaction; reconciliation uses a zero-bind link subquery, so
+  large mirror collections cannot exceed SQLite's host-parameter limit. Successful list/detail
+  operations carry opaque weak exact-session receipts rather than exposed epochs or reusable
+  guards. Immediately before a database commit, `SourceRegistry` revalidates the exact registry
+  incarnation, source, adapter, session epoch, capability, and active lease and returns a
+  session-only permit bound to that exact sealed pull or absence result. Persistence rejects an
+  authority minted for any other operation,
+  including another current source or pull, and retains a matching permit through commit or
+  rollback. A stale result rolls back; replacement, disconnect, or shutdown after
+  admission waits. This authority neither depends on nor grants music-catalogue/playback authority.
+  The new raw link entity and validated link, ticket, copy, preparation, and outcome diagnostics
+  redact server-controlled native identity, synchronized names, and digests.
+  User-facing Import Copy/Keep Synced/Sync Now actions, reconnect scheduling, localized
+  conflict/missing/offline recovery, and latest-request operation generations remain the next
+  staged record; this engine still performs no server playlist mutation or periodic polling.
 - **Subsonic server-native playlists now have a pull-only contract and exact-session read
   foundation** ([#144](https://github.com/jm2/tributary/pull/144)) — The accepted
   [`docs/subsonic-playlist-sync.md`](docs/subsonic-playlist-sync.md) contract separates a future
@@ -30,18 +71,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expose fixed categories and safe sizes/counts rather than URLs, credentials, server text,
   response bodies, or native IDs.
   Because Subsonic dialects conflate unsupported endpoints and missing entities, an HTTP or failed-
-  envelope rejection remains a closed backend failure in this stage and is never treated as an
-  empty successful list; dialect-aware missing/unsupported classification is reserved for the
-  persistence stage and complete-list evidence.
+  envelope rejection remains a closed backend failure and is never treated as an empty successful
+  list. The persistence engine above accepts missing state only from exact absence in a successful
+  complete list.
   `ManagedSourceAdapter` defaults server-native playlists to `Unsupported`; only authenticated
   Subsonic opts into `PullSnapshots`. Registry list/detail operations capture the exact adapter,
   session epoch, and revocable lease, perform network I/O outside the lifecycle mutex, and recheck
   the same authority afterward. Disconnect, replacement, retirement, shutdown, final release, or
-  reuse of an opaque list guard against a successor session rejects the result. Playlist endpoint
+  reuse of predecessor list/detail proof against a successor session rejects the result. The
+  persistence engine above tightens this proof into sealed presence/absence receipts and final
+  commit authority. Playlist endpoint
   membership does not require accepted music-catalogue membership and deliberately grants no
-  display, stream, artwork, rating, or history authority. This foundation adds no database
-  migration, playlist/link write, synchronization scheduler, or UI; those remain the next two
-  staged records.
+  display, stream, artwork, rating, or history authority. At that delivery boundary the foundation
+  added no database migration, playlist/link write, synchronization scheduler, or UI. Persistence
+  and the atomic engine are now documented above; scheduler and UI remain the final staged record.
 - **Regular playlists now have a source-scoped storage foundation**
   ([#140](https://github.com/jm2/tributary/pull/140)) — Migration 13 makes the exact
   `(source_id, track_id)` pair canonical for each durable regular-playlist occurrence while keeping
@@ -70,7 +113,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   storage slice's delivery boundary the UI deliberately remained local-only; the live authority
   and mixed-source UI records below now consume the schema without widening what it may persist.
   Mixed-source XSPF metadata export remains separately designed. The server-native Subsonic pull
-  contract and read authority are documented above; link persistence and UI remain separate.
+  contract, read authority, and separate link persistence are documented above; user-facing
+  server-native playlist UI remains staged separately.
   The complete boundary and validation matrix are in
   [`docs/source-scoped-playlists.md`](docs/source-scoped-playlists.md).
 - **Regular playlists now have default-deny live-catalogue authority**
@@ -104,7 +148,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release synchronously deny new authority before asynchronous teardown completes.
   This PR's delivery boundary was an internal authority foundation rather than a UI authorization;
   the mixed-source record immediately below is its reviewed consumer. Mixed-source XSPF export
-  remains separately tracked, as do server-native Subsonic link persistence and UI.
+  remains separately tracked, as does server-native Subsonic UI/reconnect integration.
 - **Regular playlists now integrate exact mixed-source entries end to end**
   ([#142](https://github.com/jm2/tributary/pull/142)) — Add to Playlist now accepts exact local
   tracks plus rows from current authenticated Subsonic, Jellyfin, Plex, and DAAP catalogues. One
