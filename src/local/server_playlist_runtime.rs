@@ -51,6 +51,20 @@ pub enum ServerPlaylistOperationOutcome {
     Interrupted,
 }
 
+/// Redacted recovery availability for one durable local playlist identity.
+///
+/// The owning source and its native playlist identity never leave this
+/// facade. Availability is an atomic in-memory observation of an exact active
+/// session which currently opts into pull snapshots; it is not a network
+/// health probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServerPlaylistLinkInspection {
+    NotLinked,
+    Linked { available: bool },
+    Failed,
+    Closed,
+}
+
 /// Immediate queue status plus a private, redacted completion receiver.
 #[must_use = "manual server-playlist submissions should be observed"]
 pub struct ServerPlaylistSubmission {
@@ -179,6 +193,29 @@ impl ServerPlaylistOperations {
         self.submit_local(Arc::clone(&playlist_id), move |context| async move {
             operations.run_remove(playlist_id, context).await
         })
+    }
+
+    /// Inspect whether one local playlist is linked and whether its exact
+    /// source currently has pull-snapshot authority.
+    pub async fn inspect_link(&self, playlist_id: impl AsRef<str>) -> ServerPlaylistLinkInspection {
+        if self.coordinator.is_closed() {
+            return ServerPlaylistLinkInspection::Closed;
+        }
+        let manager = PlaylistManager::new(self.database.clone());
+        let Ok(link) = manager.get_server_playlist_link(playlist_id.as_ref()).await else {
+            return ServerPlaylistLinkInspection::Failed;
+        };
+        if self.coordinator.is_closed() {
+            return ServerPlaylistLinkInspection::Closed;
+        }
+        let Some(link) = link else {
+            return ServerPlaylistLinkInspection::NotLinked;
+        };
+        let available = self
+            .source_registry
+            .current_server_playlist_capability(link.source_id)
+            == Some(crate::source_registry::ServerPlaylistCapability::PullSnapshots);
+        ServerPlaylistLinkInspection::Linked { available }
     }
 
     fn request_pull(

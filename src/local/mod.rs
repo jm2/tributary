@@ -8,6 +8,7 @@ pub mod playlist_manager;
 pub mod playlist_sidebar;
 pub mod resolver;
 mod root_authority;
+pub mod server_playlist_browser;
 pub mod server_playlist_runtime;
 pub mod smart_rules;
 pub mod tag_parser;
