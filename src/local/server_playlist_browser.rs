@@ -453,7 +453,7 @@ pub fn server_playlist_browser_channel(
     )
 }
 
-/// Cloneable facade intended for the eventual GTK handoff.
+/// Cloneable facade for the GTK browser and recovery handoff.
 ///
 /// The grouped value keeps browse/action tokens and durable-link recovery on
 /// one redacted surface without granting presentation direct database,

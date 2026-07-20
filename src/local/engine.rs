@@ -93,6 +93,10 @@ pub enum LibraryEvent {
     /// Playlists and their authoritative editability/link presentation loaded
     /// from one joined database snapshot.
     PlaylistsLoaded(PlaylistSidebarSnapshot),
+    /// Database-backed, content-redacted server-playlist controls are ready.
+    /// The facade exposes only opaque browser tokens and local-link recovery;
+    /// source/native playlist identity remains Tokio-owned.
+    ServerPlaylistRuntimeReady(super::server_playlist_browser::ServerPlaylistUiRuntime),
     /// Persisted track changes and any resulting playlist reconciliation have
     /// settled, so active playlist projections should be loaded again.
     PlaylistProjectionsInvalidated,
@@ -417,9 +421,31 @@ impl LibraryEngine {
             super::server_playlist_runtime::ServerPlaylistOperations::new(
                 db.as_ref().clone(),
                 server_playlist_coordinator.clone(),
-                source_registry,
+                source_registry.clone(),
                 playlist_sidebar_refresh.clone(),
             );
+        let (server_playlist_browser, server_playlist_browser_rx) =
+            super::server_playlist_browser::server_playlist_browser_channel();
+        let server_playlist_browser_shutdown = CancellationToken::new();
+        let server_playlist_browser_owner =
+            tokio::spawn(super::server_playlist_browser::run_server_playlist_browser(
+                server_playlist_browser_rx,
+                db.as_ref().clone(),
+                server_playlist_coordinator.clone(),
+                source_registry,
+                playlist_sidebar_refresh.clone(),
+                server_playlist_browser_shutdown.clone(),
+            ));
+        let server_playlist_ui_runtime =
+            super::server_playlist_browser::ServerPlaylistUiRuntime::new(
+                server_playlist_operations.clone(),
+                server_playlist_browser.clone(),
+            );
+        let _ = tx
+            .send(LibraryEvent::ServerPlaylistRuntimeReady(
+                server_playlist_ui_runtime,
+            ))
+            .await;
         let server_playlist_observer_shutdown = CancellationToken::new();
         let server_playlist_observer = tokio::spawn(
             super::server_playlist_runtime::run_server_playlist_reconnect_observer(
@@ -528,6 +554,15 @@ impl LibraryEngine {
         )
         .await;
 
+        server_playlist_browser.close();
+        server_playlist_browser_shutdown.cancel();
+        if let Err(error) = server_playlist_browser_owner.await {
+            warn!(
+                cancelled = error.is_cancelled(),
+                panicked = error.is_panic(),
+                "Server playlist browser owner task failed"
+            );
+        }
         server_playlist_observer_shutdown.cancel();
         if let Err(error) = server_playlist_observer.await {
             warn!(

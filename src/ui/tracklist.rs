@@ -29,7 +29,6 @@ struct RatingCellPresentation {
 pub(super) enum ServerPlaylistScope {
     #[default]
     Hidden,
-    #[allow(dead_code)] // Constructed when the playlist-sync coordinator wires the shell.
     Linked,
 }
 
@@ -216,8 +215,8 @@ impl ServerPlaylistStatusPlan {
 
 /// Persistent footer shell for server-backed playlist state.
 ///
-/// It is deliberately created hidden and exposes only an internal render API;
-/// the playlist-sync coordinator owns the later action and state wiring.
+/// It is created hidden; the window-scoped recovery controller renders only
+/// the currently selected linked playlist and owns its targetless actions.
 #[derive(Clone)]
 pub(super) struct ServerPlaylistStatusShell {
     container: gtk::Box,
@@ -226,10 +225,11 @@ pub(super) struct ServerPlaylistStatusShell {
     status_label: gtk::Label,
     primary_button: gtk::Button,
     overflow_button: gtk::MenuButton,
+    focus_fallback: gtk::ColumnView,
 }
 
 impl ServerPlaylistStatusShell {
-    fn new() -> Self {
+    fn new(focus_fallback: &gtk::ColumnView) -> Self {
         let icon = gtk::Image::builder().visible(false).build();
         icon.set_accessible_role(gtk::AccessibleRole::Presentation);
         let spinner = gtk::Spinner::builder().visible(false).build();
@@ -276,6 +276,7 @@ impl ServerPlaylistStatusShell {
             status_label,
             primary_button,
             overflow_button,
+            focus_fallback: focus_fallback.clone(),
         }
     }
 
@@ -313,11 +314,16 @@ impl ServerPlaylistStatusShell {
             .reset_property(gtk::AccessibleProperty::HasPopup);
     }
 
-    #[allow(dead_code)] // Used when the playlist-sync coordinator lands.
     pub(super) fn render(&self, state: ServerPlaylistStatusState, locale: &str) {
+        let primary_had_focus = self.primary_button.has_focus();
+        let overflow_had_focus = self.overflow_button.has_focus();
+        let container_had_focus = self.container.has_focus();
         self.reset();
         let plan = ServerPlaylistStatusPlan::for_state(state);
         let Some(status_key) = plan.status_key else {
+            if primary_had_focus || overflow_had_focus || container_had_focus {
+                self.focus_fallback.grab_focus();
+            }
             return;
         };
 
@@ -374,6 +380,27 @@ impl ServerPlaylistStatusShell {
         }
 
         self.container.set_visible(true);
+        if plan.show_spinner && (primary_had_focus || overflow_had_focus) {
+            // Activating a recovery control immediately replaces it with the
+            // running state. Preserve keyboard/assistive-technology focus on
+            // the still-visible status group instead of dropping it when the
+            // focused button disappears.
+            self.container.set_focusable(true);
+            self.container.grab_focus();
+        } else if container_had_focus {
+            // When the operation settles, return focus to the newly exposed
+            // primary action when it is usable; otherwise keep it on the
+            // visible status group.
+            if self.primary_button.is_visible() && self.primary_button.is_sensitive() {
+                self.primary_button.grab_focus();
+                self.container.set_focusable(false);
+            } else {
+                self.container.set_focusable(true);
+                self.container.grab_focus();
+            }
+        } else {
+            self.container.set_focusable(false);
+        }
     }
 }
 
@@ -603,7 +630,7 @@ pub(super) fn build_tracklist(
         .build();
 
     // ── Status bar ───────────────────────────────────────────────────
-    let server_playlist_status_shell = ServerPlaylistStatusShell::new();
+    let server_playlist_status_shell = ServerPlaylistStatusShell::new(&column_view);
     let status_label = gtk::Label::builder()
         .halign(gtk::Align::End)
         .hexpand(true)

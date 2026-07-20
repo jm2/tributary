@@ -1123,6 +1123,8 @@ fn setup_source_lifecycle_reducer(
     mut invalidations: tokio::sync::watch::Receiver<u64>,
     invalidate_source_playback: SourcePlaybackInvalidator,
     invalidate_playlist_playback: PlaylistPlaybackInvalidator,
+    server_playlist_recovery: super::server_playlist_recovery::ServerPlaylistRecoveryController,
+    server_playlist_browser: super::server_playlists::ServerPlaylistBrowserController,
 ) {
     let context = SourceReducerContext::from_window(
         state,
@@ -1135,6 +1137,8 @@ fn setup_source_lifecycle_reducer(
         let mut revision = baseline.revision;
         let shutting_down = baseline.shutting_down;
         reconcile_source_baseline(&context, &mut reducer, baseline);
+        server_playlist_recovery.source_lifecycle_changed();
+        server_playlist_browser.source_lifecycle_changed();
         if shutting_down {
             return;
         }
@@ -1153,6 +1157,12 @@ fn setup_source_lifecycle_reducer(
             revision = baseline.revision;
             let shutting_down = baseline.shutting_down;
             reconcile_source_baseline(&context, &mut reducer, baseline);
+            // Reconcile the authoritative sidebar first. The browser derives
+            // its source choices from that store, so an independent watch
+            // listener could otherwise observe a newly accepted session
+            // before its row exists and remain stale until another revision.
+            server_playlist_recovery.source_lifecycle_changed();
+            server_playlist_browser.source_lifecycle_changed();
             if shutting_down {
                 return;
             }
@@ -1399,7 +1409,7 @@ pub fn build_window(
         status_label,
         column_view,
         sort_model,
-        _server_playlist_status_shell,
+        server_playlist_status_shell,
     ) = tracklist::build_tracklist(&empty_tracks, library_commands.clone());
 
     // ── Shared playback state ────────────────────────────────────────
@@ -1592,6 +1602,20 @@ pub fn build_window(
         .content(&toast_overlay)
         .build();
 
+    let server_playlist_recovery =
+        super::server_playlist_recovery::ServerPlaylistRecoveryController::new(
+            &window,
+            &sidebar_selection,
+            server_playlist_status_shell,
+            rt_handle.clone(),
+        );
+    let server_playlist_browser = super::server_playlists::ServerPlaylistBrowserController::new(
+        &window,
+        &sidebar_store,
+        source_registry.clone(),
+        rt_handle.clone(),
+    );
+
     if saved_geo.is_some_and(|g| g.is_maximized) {
         window.maximize();
     }
@@ -1602,9 +1626,13 @@ pub fn build_window(
     let shutdown_playback = playback_session.clone();
     let shutdown_output_slot = active_output_slot.clone();
     let shutdown_library_commands = library_commands.clone();
+    let shutdown_library_events = engine_rx.clone();
+    let shutdown_playlist_actions = playlist_action_rx.clone();
     let shutdown_server_playlists = server_playlist_coordinator.clone();
     let shutdown_server_playlist_barrier = server_playlist_coordinator_barrier.clone();
+    let shutdown_server_playlist_browser = server_playlist_browser.clone();
     let shutdown_started = Rc::new(Cell::new(false));
+    let shutdown_started_for_close = shutdown_started.clone();
     let shutdown_complete = Rc::new(Cell::new(false));
     window.connect_close_request(move |w| {
         save_window_geometry(w);
@@ -1612,7 +1640,13 @@ pub fn build_window(
             return glib::Propagation::Proceed;
         }
 
-        if !shutdown_started.replace(true) {
+        if !shutdown_started_for_close.replace(true) {
+            // End the two window-scoped receiver loops even though their
+            // application-side senders can outlive this native window. This
+            // releases the controllers and window captures deterministically.
+            shutdown_library_events.close();
+            shutdown_playlist_actions.close();
+            shutdown_server_playlist_browser.close_dialog();
             // Close server-playlist admission before source revocation. A
             // mutation already admitted at the coordinator edge retains both
             // guards through its database commit and is drained below.
@@ -1969,6 +2003,23 @@ pub fn build_window(
         source_invalidations,
         invalidate_source_playback.clone(),
         invalidate_playlist_playback,
+        server_playlist_recovery.clone(),
+        server_playlist_browser.clone(),
+    );
+
+    // Playlist management, including the server-playlist browser, remains
+    // usable when audio construction fails. Install these actions before the
+    // playback-only early return below instead of coupling library management
+    // to a working local audio pipeline.
+    let browser_for_playlist_action = server_playlist_browser.clone();
+    let browse_server_playlists: Rc<dyn Fn()> = Rc::new(move || {
+        browser_for_playlist_action.show();
+    });
+    super::playlist_actions::setup_playlist_actions(
+        &source_connection_state,
+        playlist_action_rx,
+        browse_server_playlists,
+        shutdown_started.clone(),
     );
 
     // ═══════════════════════════════════════════════════════════════════
@@ -2015,6 +2066,9 @@ pub fn build_window(
                 playback_session.clone(),
                 root_trust_prompts.clone(),
                 app_config.clone(),
+                server_playlist_recovery.clone(),
+                server_playlist_browser.clone(),
+                shutdown_started.clone(),
             );
             return;
         }
@@ -3012,36 +3066,6 @@ pub fn build_window(
     }
     app.set_accels_for_action("win.focus-search", &["<primary>f"]);
 
-    // ── Handle playlist context menu actions ─────────────────────────
-    super::playlist_actions::setup_playlist_actions(
-        &WindowState {
-            window: window.clone(),
-            rt_handle: rt_handle.clone(),
-            engine_tx: engine_tx.clone(),
-            playlist_sidebar_refresh: playlist_sidebar_refresh.clone(),
-            source_registry: source_registry.clone(),
-            remote_provenance: remote_provenance.clone(),
-            track_store: track_store.clone(),
-            master_tracks: master_tracks.clone(),
-            source_tracks: source_tracks.clone(),
-            active_source_key: active_source_key.clone(),
-            source_navigation: source_navigation.clone(),
-            near_me_consent_request: near_me_consent_request.clone(),
-            sidebar_store: sidebar_store_for_events.clone(),
-            sidebar_selection: sidebar_sel_for_events.clone(),
-            playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
-            browser_widget: browser_widget.clone(),
-            browser_state: browser_state.clone(),
-            status_label: status_label.clone(),
-            column_view: column_view.clone(),
-            sort_model: sort_model.clone(),
-            app_config: app_config.clone(),
-            pending_connection: pending_connection_for_events.clone(),
-            pre_connect_selection: pre_connect_selection_for_events.clone(),
-        },
-        playlist_action_rx,
-    );
-
     // ── Receive LibraryEvents on GTK main thread ─────────────────────
     setup_library_events(
         engine_rx,
@@ -3064,6 +3088,9 @@ pub fn build_window(
         playback_session,
         root_trust_prompts,
         app_config,
+        server_playlist_recovery,
+        server_playlist_browser,
+        shutdown_started,
     );
 }
 
@@ -3331,6 +3358,9 @@ fn setup_library_events(
     playback_session: Rc<RefCell<PlaybackSession>>,
     root_trust_prompts: root_trust::RootTrustPromptController,
     app_config: Rc<RefCell<preferences::AppConfig>>,
+    server_playlist_recovery: super::server_playlist_recovery::ServerPlaylistRecoveryController,
+    server_playlist_browser: super::server_playlists::ServerPlaylistBrowserController,
+    window_closing: Rc<Cell<bool>>,
 ) {
     let browser_widget = browser_widget.clone();
     let column_view = column_view.clone();
@@ -3345,6 +3375,12 @@ fn setup_library_events(
     glib::MainContext::default().spawn_local(async move {
         let mut playlist_sidebar_reducer = PlaylistSidebarUiReducer::default();
         while let Ok(event) = engine_rx.recv().await {
+            // `Receiver::close` wakes this loop but still exposes buffered
+            // values. Once close starts, discard those values rather than
+            // mutating or reopening UI on an inert window.
+            if window_closing.get() {
+                break;
+            }
             match event {
                 LibraryEvent::FullSync(tracks) => {
                     info!(count = tracks.len(), "Received full library sync");
@@ -3639,6 +3675,11 @@ fn setup_library_events(
                     );
                 }
 
+                LibraryEvent::ServerPlaylistRuntimeReady(runtime) => {
+                    server_playlist_recovery.set_operations(runtime.operations());
+                    server_playlist_browser.set_runtime(runtime);
+                }
+
                 LibraryEvent::PlaylistsLoaded(snapshot) => {
                     let revision = snapshot.revision();
                     if !playlist_sidebar_reducer.apply(snapshot) {
@@ -3678,6 +3719,7 @@ fn setup_library_events(
                         playlist_sidebar_reducer.entries(),
                         active_playlist_id.as_deref(),
                     );
+                    server_playlist_recovery.playlist_snapshot_changed();
                 }
 
                 LibraryEvent::RootTrustRequired(requests) => {
