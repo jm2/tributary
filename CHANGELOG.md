@@ -46,7 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Validation includes 40 focused Last.fm tests; locked debug and release suites each pass 20
     library, 1,385 application, and 10 repository-metadata tests (1,415 total), alongside strict
     debug/release Clippy, Rust 1.92 all-target compilation, Flatpak positive/negative permission
-    tests, and dependency auditing without public Last.fm network access.
+    tests, locked fuzz-workspace formatting/Clippy with the same target-scoped vault dependency
+    graph, and dependency auditing without public Last.fm network access.
 - **Rhythmbox profiles can now be migrated through a bounded, preview-first, transactional
   workflow** ([#57](https://github.com/jm2/tributary/issues/57),
   [#150](https://github.com/jm2/tributary/pull/150)):

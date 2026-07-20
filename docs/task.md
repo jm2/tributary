@@ -633,7 +633,8 @@ the 38-record feature backlog.
   - Current validation passes 40 focused Last.fm tests; locked debug and release suites each pass 20
     library, 1,385 application, and 10 repository-metadata tests (1,415 total), alongside strict
     debug and release Clippy, the Rust 1.92 locked all-target check, Flatpak positive/negative
-    permission tests, formatting/diff checks, and dependency audit. Playback observation, queue
+    permission tests, locked fuzz-workspace formatting/Clippy against its synchronized vault
+    dependency graph, formatting/diff checks, and dependency audit. Playback observation, queue
     delivery/backoff, disconnect/shutdown orchestration, settings/consent UI, localization, and
     package credential injection remain.
 
