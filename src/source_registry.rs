@@ -6639,7 +6639,7 @@ mod tests {
             .all(|(_, snapshot)| !snapshot.provenance.contains(SourceProvenance::External)));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn server_playlist_browser_binds_exact_ids_and_revokes_tokens() {
         let database = Database::connect("sqlite::memory:")
             .await
@@ -6686,6 +6686,11 @@ mod tests {
         })
         .await
         .expect("first browser listing starts");
+        // Keep B and C in one uninterrupted producer turn. This specifically
+        // proves replacement of an already-queued pending browse; a
+        // multi-thread runtime may otherwise let A's cancellation settle and
+        // legitimately start B in the instant between these two synchronous
+        // submissions.
         let replaced_pending_browse = browser.browse(source_id, "Fallback");
         let latest_browse = browser.browse(source_id, "Fallback");
         assert!(matches!(
@@ -6707,7 +6712,7 @@ mod tests {
         assert_eq!(
             probe.server_playlist_list_calls.load(Ordering::Acquire),
             2,
-            "one active listing and one replaceable pending request must spawn only A and C"
+            "queued B/C must leave one active listing and only the latest pending request"
         );
         assert_eq!(snapshot.entries().len(), 2);
         let redacted = format!("{:?}", ServerPlaylistBrowseOutcome::Ready(snapshot.clone()));
