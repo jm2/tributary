@@ -242,6 +242,29 @@ smart_playlist:
   remove_rule: "刪除規則"
   limit_to: "限制為"
 
+# ── 伺服器播放列表 ──────────────────────────────────────────────────
+server_playlists:
+  controls_accessible_label: "伺服器播放列表同步控制項"
+  status_linked_read_only: "已連結至伺服器 — 唯讀"
+  status_syncing: "正在同步伺服器播放列表…"
+  status_offline: "伺服器無法使用 — 已保留儲存的副本"
+  status_failed: "同步失敗 — 已保留儲存的副本"
+  status_conflict: "本機變更與伺服器衝突"
+  status_missing: "伺服器上缺少此播放列表"
+  status_conflict_missing: "本機變更發生衝突；伺服器上缺少此播放列表"
+  action_sync_now: "立即同步"
+  action_retry: "重試"
+  action_replace_local_with_server: "以伺服器版本取代本機版本"
+  action_more: "更多播放列表操作"
+  action_unlink: "取消連結"
+  action_remove_local_copy: "移除本機副本"
+  replace_heading: "取代本機播放列表？"
+  replace_body: "這會捨棄本機變更，並以伺服器上的新副本取代播放列表。"
+  unlink_heading: "取消連結伺服器播放列表？"
+  unlink_body: "目前歌曲會保留為可編輯的本機播放列表，並且不再同步。"
+  remove_heading: "移除本機副本？"
+  remove_body: "這會刪除本機播放列表及其同步連結。伺服器播放列表不會變更。"
+
 # ── 使用者可見的錯誤 ──────────────────────────────────────────────
 errors:
   remote:

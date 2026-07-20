@@ -275,6 +275,29 @@ smart_playlist:
   remove_rule: "Remove rule"
   limit_to: "Limit to"
 
+# ── Server playlists ───────────────────────────────────────────────
+server_playlists:
+  controls_accessible_label: "Server playlist synchronization controls"
+  status_linked_read_only: "Linked to server — read-only"
+  status_syncing: "Syncing server playlist…"
+  status_offline: "Server unavailable — saved copy retained"
+  status_failed: "Sync failed — saved copy retained"
+  status_conflict: "Local changes conflict with the server"
+  status_missing: "Playlist is missing from the server"
+  status_conflict_missing: "Local changes conflict; playlist is missing from the server"
+  action_sync_now: "Sync Now"
+  action_retry: "Retry"
+  action_replace_local_with_server: "Replace Local with Server"
+  action_more: "More playlist actions"
+  action_unlink: "Unlink"
+  action_remove_local_copy: "Remove Local Copy"
+  replace_heading: "Replace Local Playlist?"
+  replace_body: "This discards local changes and replaces the playlist with a fresh server copy."
+  unlink_heading: "Unlink Server Playlist?"
+  unlink_body: "The current songs are retained as an editable local playlist and will no longer sync."
+  remove_heading: "Remove Local Copy?"
+  remove_body: "This deletes the local playlist and its sync link. The server playlist is not changed."
+
 # ── User-facing errors ─────────────────────────────────────────────
 errors:
   remote:

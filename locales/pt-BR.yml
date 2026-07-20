@@ -242,6 +242,29 @@ smart_playlist:
   remove_rule: "Remover regra"
   limit_to: "Limitar a"
 
+# ── Playlists do servidor ──────────────────────────────────────────
+server_playlists:
+  controls_accessible_label: "Controles de sincronização de playlists do servidor"
+  status_linked_read_only: "Vinculada ao servidor — somente leitura"
+  status_syncing: "Sincronizando a playlist do servidor…"
+  status_offline: "Servidor indisponível — cópia salva mantida"
+  status_failed: "Falha na sincronização — cópia salva mantida"
+  status_conflict: "As alterações locais estão em conflito com o servidor"
+  status_missing: "A playlist não existe no servidor"
+  status_conflict_missing: "As alterações locais estão em conflito; a playlist não existe no servidor"
+  action_sync_now: "Sincronizar agora"
+  action_retry: "Tentar novamente"
+  action_replace_local_with_server: "Substituir local pela versão do servidor"
+  action_more: "Mais ações da playlist"
+  action_unlink: "Desvincular"
+  action_remove_local_copy: "Remover cópia local"
+  replace_heading: "Substituir a playlist local?"
+  replace_body: "Isso descarta as alterações locais e substitui a playlist por uma nova cópia do servidor."
+  unlink_heading: "Desvincular a playlist do servidor?"
+  unlink_body: "As músicas atuais serão mantidas em uma playlist local editável que não será mais sincronizada."
+  remove_heading: "Remover a cópia local?"
+  remove_body: "Isso exclui a playlist local e seu vínculo de sincronização. A playlist do servidor não é alterada."
+
 # ── Erros exibidos ao usuário ──────────────────────────────────────
 errors:
   remote:

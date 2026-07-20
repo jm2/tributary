@@ -242,6 +242,29 @@ smart_playlist:
   remove_rule: "ルールを削除"
   limit_to: "制限"
 
+# ── サーバープレイリスト ──────────────────────────────────────────
+server_playlists:
+  controls_accessible_label: "サーバープレイリストの同期コントロール"
+  status_linked_read_only: "サーバーにリンク済み — 読み取り専用"
+  status_syncing: "サーバープレイリストを同期しています…"
+  status_offline: "サーバーを利用できません — 保存済みコピーを保持しています"
+  status_failed: "同期に失敗しました — 保存済みコピーを保持しています"
+  status_conflict: "ローカルの変更がサーバーと競合しています"
+  status_missing: "サーバーにプレイリストがありません"
+  status_conflict_missing: "ローカルの変更が競合し、サーバーにプレイリストがありません"
+  action_sync_now: "今すぐ同期"
+  action_retry: "再試行"
+  action_replace_local_with_server: "ローカルをサーバー版で置き換える"
+  action_more: "その他のプレイリスト操作"
+  action_unlink: "リンクを解除"
+  action_remove_local_copy: "ローカルコピーを削除"
+  replace_heading: "ローカルプレイリストを置き換えますか？"
+  replace_body: "ローカルの変更を破棄し、プレイリストをサーバーの新しいコピーで置き換えます。"
+  unlink_heading: "サーバープレイリストのリンクを解除しますか？"
+  unlink_body: "現在の曲は編集可能なローカルプレイリストとして保持され、以後は同期されません。"
+  remove_heading: "ローカルコピーを削除しますか？"
+  remove_body: "ローカルプレイリストと同期リンクを削除します。サーバーのプレイリストは変更されません。"
+
 # ── ユーザー向けエラー ────────────────────────────────────────────
 errors:
   remote:

@@ -194,8 +194,13 @@ before starting large protocol or transfer subsystems.
    sealed pull or absence result, so pre-admission staleness rolls back and invalidation after
    admission waits for commit. Pull, conflict, explicit Replace, complete-list missing, Unlink, and
    explicit removal are atomic; ordinary mutation and reconciliation reject linked mirrors.
-   Localized UI, reconnect/manual scheduling, recovery presentation, and the latest-request
-   generation lane are the remaining P1.5 Record E.
+   Record E structural UI groundwork ([#146](https://github.com/jm2/tributary/pull/146)) now
+   publishes typed joined link/sidebar state, keeps mirrors
+   out of ordinary mutation affordances, publishes ordinary CRUD only after commit, and reserves a
+   separate localized recovery/status shell. The GTK-free reconnect/manual coordinator,
+   latest-request generation lane, one monotonic or serialized full-sidebar publication owner,
+   virtualized browser, and wired recovery actions remain; until then, an engine scan snapshot and
+   a concurrent post-commit CRUD callback have no shared ordering token.
 
 These contracts make Rhythmbox migration and Last.fm behavior much less ambiguous.
 
@@ -264,7 +269,7 @@ mistaken for work already underway.
 | [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus completed playback-history and rating contracts are foundations; XSPF deliberately transfers neither history nor ratings. | Build a separate transactional, idempotent migration with explicit metadata consent and conflict reporting. |
 | [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | No Last.fm client or scrobble pipeline. | Authorization, secret storage, authoritative thresholds, retry/offline queue, and privacy UX. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
-| [#143 — Import and pull-sync server-native Subsonic playlists](https://github.com/jm2/tributary/issues/143) | Pull-only direction and bounded endpoint reads are implemented, along with strict non-secret link persistence, detached import/read-only mirror manager operations, drift/revision conflict protection, complete-list missing evidence, and exact-session commit authority. No user-facing action, reconnect scheduler, localized status/recovery UI, or latest-request operation lane exists yet. | Integrate localized Import Copy/Keep Synced/Sync Now, reconnect refresh, conflict/missing/offline recovery, Retry/Replace/Unlink/Remove, accessibility, and deterministic end-to-end lifecycle coverage. |
+| [#143 — Import and pull-sync server-native Subsonic playlists](https://github.com/jm2/tributary/issues/143) | Pull-only reads, non-secret link persistence, atomic mirror operations, conflict/missing evidence, and exact-session commit authority are implemented. Typed joined sidebar state, read-only/error presentation, commit-only ordinary CRUD publication, and a complete localized recovery-shell plan are also present. The shell remains hidden, and scan snapshots versus concurrent CRUD callbacks still lack one monotonic publication lane, because no operation coordinator, browser, reconnect scheduler, or wired server-playlist action exists yet. | Add the GTK-free latest-request coordinator, one serialized or versioned full-sidebar publication owner, and shutdown/reconnect integration, then connect a virtualized Import Copy/Keep Synced browser and Sync Now/Retry/Replace/Unlink/Remove flows with deterministic end-to-end accessibility coverage. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |
 | [#29 — UI refinement](https://github.com/jm2/tributary/issues/29) | Requested separators/alignment changes are not implemented. | Split into independently reviewable visual changes after current-theme design review. |

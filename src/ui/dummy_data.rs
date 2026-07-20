@@ -4,7 +4,7 @@
 //! Generates realistic-looking sources, browser items, and tracks so
 //! every pane has content to display and filtering can be tested.
 
-use super::objects::{BrowserItem, SourceObject, TrackObject};
+use super::objects::{BrowserItem, HeaderKind, SourceObject, TrackObject};
 
 /// All dummy track data as a flat Vec of tuples for easy iteration.
 /// (track#, title, dur_secs, artist, album, genre, composer, year, date_modified,
@@ -667,14 +667,17 @@ const TRACKS: &[TrackTuple] = &[
 /// when servers are discovered or configured — see `window.rs`.
 pub fn build_sources() -> Vec<SourceObject> {
     vec![
-        SourceObject::header(rust_i18n::t!("sidebar.local").as_ref()),
+        SourceObject::header(rust_i18n::t!("sidebar.local").as_ref(), HeaderKind::Local),
         SourceObject::source(
             rust_i18n::t!("sidebar.local_filesystem").as_ref(),
             "local",
             "drive-harddisk-symbolic",
         ),
         // Internet Radio sources (always present).
-        SourceObject::header(rust_i18n::t!("sidebar.internet_radio").as_ref()),
+        SourceObject::header(
+            rust_i18n::t!("sidebar.internet_radio").as_ref(),
+            HeaderKind::InternetRadio,
+        ),
         SourceObject::source(
             rust_i18n::t!("sidebar.top_clicked").as_ref(),
             "radio-topclick",
@@ -691,7 +694,10 @@ pub fn build_sources() -> Vec<SourceObject> {
             "network-wireless-symbolic",
         ),
         // Playlists section (entries populated dynamically after DB load).
-        SourceObject::header(rust_i18n::t!("sidebar.playlists").as_ref()),
+        SourceObject::header(
+            rust_i18n::t!("sidebar.playlists").as_ref(),
+            HeaderKind::Playlists,
+        ),
     ]
 }
 

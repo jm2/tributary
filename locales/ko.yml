@@ -242,6 +242,29 @@ smart_playlist:
   remove_rule: "규칙 제거"
   limit_to: "제한"
 
+# ── 서버 재생목록 ──────────────────────────────────────────────────
+server_playlists:
+  controls_accessible_label: "서버 재생목록 동기화 컨트롤"
+  status_linked_read_only: "서버에 연결됨 — 읽기 전용"
+  status_syncing: "서버 재생목록을 동기화하는 중…"
+  status_offline: "서버를 사용할 수 없음 — 저장된 복사본 유지"
+  status_failed: "동기화 실패 — 저장된 복사본 유지"
+  status_conflict: "로컬 변경 사항이 서버와 충돌함"
+  status_missing: "서버에 재생목록이 없음"
+  status_conflict_missing: "로컬 변경 사항이 충돌하며 서버에 재생목록이 없음"
+  action_sync_now: "지금 동기화"
+  action_retry: "다시 시도"
+  action_replace_local_with_server: "로컬을 서버 버전으로 교체"
+  action_more: "기타 재생목록 작업"
+  action_unlink: "연결 해제"
+  action_remove_local_copy: "로컬 복사본 제거"
+  replace_heading: "로컬 재생목록을 교체할까요?"
+  replace_body: "로컬 변경 사항을 버리고 재생목록을 서버의 새 복사본으로 교체합니다."
+  unlink_heading: "서버 재생목록 연결을 해제할까요?"
+  unlink_body: "현재 곡은 편집 가능한 로컬 재생목록으로 유지되며 더 이상 동기화되지 않습니다."
+  remove_heading: "로컬 복사본을 제거할까요?"
+  remove_body: "로컬 재생목록과 동기화 연결을 삭제합니다. 서버 재생목록은 변경되지 않습니다."
+
 # ── 사용자 대상 오류 ──────────────────────────────────────────────
 errors:
   remote:

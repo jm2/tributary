@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set, Statement, TransactionTrait,
+    QueryOrder, Set, Statement, TransactionTrait,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -31,7 +31,14 @@ use crate::architecture::{
     models::{Rating, Track, TrackRating},
     TrackId,
 };
-use crate::db::entities::{library_root, playlist_entry, root_reauthorization_receipt, track};
+use crate::db::entities::server_playlist_link::{
+    ServerPlaylistLocalState, ServerPlaylistRemoteState, StoredServerPlaylistLink,
+    MAX_SERVER_PLAYLIST_LINK_NAME_BYTES,
+};
+use crate::db::entities::{
+    library_root, playlist, playlist_entry, root_reauthorization_receipt, server_playlist_link,
+    track,
+};
 
 /// Frozen namespace for projecting a legacy non-UUID SQLite track key into
 /// compatibility APIs that have not yet migrated from `Uuid`.
@@ -46,6 +53,170 @@ const LOCAL_TRACK_COMPAT_NAMESPACE: Uuid =
 // LibraryEvent — messages sent to GTK main thread
 // ---------------------------------------------------------------------------
 
+/// Authoritative mutability and link-state presentation for one playlist row.
+///
+/// A pull mirror remains a regular-playlist navigation target, but this typed
+/// value prevents UI code from inferring editability from its compatible
+/// `"playlist"` backend string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaylistSidebarKind {
+    EditableRegular,
+    EditableSmart,
+    PullMirror {
+        local_state: ServerPlaylistLocalState,
+        remote_state: ServerPlaylistRemoteState,
+    },
+}
+
+/// One playlist sidebar row published from a single joined database read.
+///
+/// Native server-playlist identity is intentionally absent. The local ID and
+/// effective display name remain private fields, and diagnostics expose only
+/// their lengths so a server-supplied mirrored name cannot reach logs through
+/// `LibraryEvent`'s derived `Debug` implementation.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PlaylistSidebarEntry {
+    playlist_id: String,
+    name: String,
+    kind: PlaylistSidebarKind,
+}
+
+impl PlaylistSidebarEntry {
+    pub fn new(
+        playlist_id: impl Into<String>,
+        name: impl Into<String>,
+        kind: PlaylistSidebarKind,
+    ) -> Self {
+        Self {
+            playlist_id: playlist_id.into(),
+            name: name.into(),
+            kind,
+        }
+    }
+
+    pub fn playlist_id(&self) -> &str {
+        &self.playlist_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn kind(&self) -> PlaylistSidebarKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Debug for PlaylistSidebarEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PlaylistSidebarEntry")
+            .field("playlist_id_byte_len", &self.playlist_id.len())
+            .field("name_byte_len", &self.name.len())
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+/// Load playlist rows and optional pull links in one ordered query.
+///
+/// Link presence is evaluated before the legacy `is_smart` flag. A damaged
+/// parent row therefore cannot expose a linked mirror as editable. Invalid
+/// link storage rejects the complete publication instead of falling back to
+/// an editable row.
+async fn load_playlist_sidebar_entries<C>(
+    db: &C,
+) -> Result<Vec<PlaylistSidebarEntry>, sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    let rows = playlist::Entity::find()
+        .find_also_related(server_playlist_link::Entity)
+        .order_by_asc(playlist::Column::CreatedAt)
+        .order_by_asc(playlist::Column::Id)
+        .all(db)
+        .await?;
+
+    rows.into_iter()
+        .map(|(playlist, link)| {
+            let kind = if let Some(link) = link {
+                let link = StoredServerPlaylistLink::try_from(link).map_err(|error| {
+                    sea_orm::DbErr::Custom(format!(
+                        "Invalid server-playlist link in sidebar snapshot: {error}"
+                    ))
+                })?;
+                if playlist.name.len() > MAX_SERVER_PLAYLIST_LINK_NAME_BYTES {
+                    return Err(sea_orm::DbErr::Custom(
+                        "Linked playlist display name exceeds the byte limit".to_string(),
+                    ));
+                }
+                PlaylistSidebarKind::PullMirror {
+                    local_state: link.local_state,
+                    remote_state: link.remote_state,
+                }
+            } else if playlist.is_smart {
+                PlaylistSidebarKind::EditableSmart
+            } else {
+                PlaylistSidebarKind::EditableRegular
+            };
+            Ok(PlaylistSidebarEntry::new(playlist.id, playlist.name, kind))
+        })
+        .collect()
+}
+
+/// Publish one authoritative playlist-sidebar snapshot.
+///
+/// A joined-row decode failure is itself authoritative negative evidence for
+/// presentation: publishing an empty typed snapshot removes any older editable
+/// rows instead of leaving stale actions available after persistence has become
+/// unreadable. The warning is content-free because link decoding exposes only
+/// closed validation categories.
+async fn publish_playlist_sidebar_snapshot<C>(db: &C, tx: &async_channel::Sender<LibraryEvent>)
+where
+    C: ConnectionTrait,
+{
+    let entries = match load_playlist_sidebar_entries(db).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(%error, "Failed to load authoritative playlist sidebar state");
+            Vec::new()
+        }
+    };
+    if !entries.is_empty() {
+        info!(count = entries.len(), "Sending playlists to UI");
+    }
+    let _ = tx.send(LibraryEvent::PlaylistsLoaded(entries)).await;
+}
+
+/// Seed an empty playlist table when possible, then always attempt one
+/// authoritative joined publication.
+///
+/// The publication deliberately sits outside the seed-decision result: even a
+/// failed preliminary list query must retract stale GTK rows if the joined
+/// state is also unreadable.
+async fn seed_default_playlists_and_publish(
+    db: &DatabaseConnection,
+    playlist_manager: &super::playlist_manager::PlaylistManager,
+    tx: &async_channel::Sender<LibraryEvent>,
+) {
+    match playlist_manager.list_playlists().await {
+        Ok(playlists) if playlists.is_empty() => {
+            info!("No playlists found — seeding defaults");
+            if let Err(error) = playlist_manager.seed_defaults().await {
+                warn!(%error, "Failed to seed default playlists");
+            }
+        }
+        Ok(_) => {}
+        Err(error) => warn!(%error, "Failed to load playlists before default seeding"),
+    }
+
+    // Re-read playlists together with their optional pull links in one query
+    // after any seeding commit. Link presence, rather than the legacy parent
+    // smart flag, is the authoritative read-only classification exposed to
+    // GTK. Failure publishes an empty typed snapshot.
+    publish_playlist_sidebar_snapshot(db, tx).await;
+}
+
 /// Events sent from the background engine to the GTK main thread.
 #[derive(Debug, Clone)]
 pub enum LibraryEvent {
@@ -59,9 +230,9 @@ pub enum LibraryEvent {
     ScanProgress(u64, u64),
     /// Initial scan complete.
     ScanComplete,
-    /// Playlists loaded from the database.
-    /// Vec of (id, name, is_smart).
-    PlaylistsLoaded(Vec<(String, String, bool)>),
+    /// Playlists and their authoritative editability/link presentation loaded
+    /// from one joined database snapshot.
+    PlaylistsLoaded(Vec<PlaylistSidebarEntry>),
     /// Persisted track changes and any resulting playlist reconciliation have
     /// settled, so active playlist projections should be loaded again.
     PlaylistProjectionsInvalidated,
@@ -3892,34 +4063,10 @@ async fn initial_scan_with_root_trust_guards(
         Err(e) => warn!(error = %e, "Playlist reconciliation failed"),
     }
 
-    // Send playlist list to UI thread for sidebar population.
-    // If no playlists exist yet, seed the default smart playlists.
-    match playlist_mgr.list_playlists().await {
-        Ok(playlists) => {
-            let playlists = if playlists.is_empty() {
-                info!("No playlists found — seeding defaults");
-                match playlist_mgr.seed_defaults().await {
-                    Ok(defaults) => defaults,
-                    Err(e) => {
-                        warn!(error = %e, "Failed to seed default playlists");
-                        Vec::new()
-                    }
-                }
-            } else {
-                playlists
-            };
-
-            let entries: Vec<(String, String, bool)> = playlists
-                .iter()
-                .map(|p| (p.id.clone(), p.name.clone(), p.is_smart))
-                .collect();
-            if !entries.is_empty() {
-                info!(count = entries.len(), "Sending playlists to UI");
-            }
-            let _ = tx.send(LibraryEvent::PlaylistsLoaded(entries)).await;
-        }
-        Err(e) => warn!(error = %e, "Failed to load playlists"),
-    }
+    // Send one authoritative playlist list to the UI after the best-effort
+    // default-seeding decision. Publication itself always runs so a database
+    // failure cannot leave stale editable sidebar rows in place.
+    seed_default_playlists_and_publish(db, &playlist_mgr, tx).await;
     let _ = tx.send(LibraryEvent::PlaylistProjectionsInvalidated).await;
 
     if !trust_requests.is_empty() {
@@ -6423,6 +6570,264 @@ mod tests {
         format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4())
     }
 
+    async fn insert_sidebar_playlist(
+        db: &DatabaseConnection,
+        id: &str,
+        name: &str,
+        is_smart: bool,
+        created_at: &str,
+    ) {
+        playlist::ActiveModel {
+            id: Set(id.to_string()),
+            name: Set(name.to_string()),
+            is_smart: Set(is_smart),
+            smart_rules_json: Set(None),
+            limit_enabled: Set(false),
+            limit_value: Set(None),
+            limit_unit: Set(None),
+            limit_sort: Set(None),
+            match_mode: Set("all".to_string()),
+            live_updating: Set(true),
+            created_at: Set(created_at.to_string()),
+            updated_at: Set(created_at.to_string()),
+        }
+        .insert(db)
+        .await
+        .expect("insert sidebar playlist");
+    }
+
+    #[tokio::test]
+    async fn playlist_sidebar_snapshot_is_typed_redacted_and_link_presence_wins() {
+        use sea_orm::Database;
+        use sea_orm_migration::MigratorTrait;
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("open sidebar database");
+        crate::db::migration::Migrator::up(&db, None)
+            .await
+            .expect("run sidebar migrations");
+
+        insert_sidebar_playlist(
+            &db,
+            "regular-id",
+            "Editable regular",
+            false,
+            "2026-07-20T00:00:00Z",
+        )
+        .await;
+        insert_sidebar_playlist(
+            &db,
+            "smart-id",
+            "Editable smart",
+            true,
+            "2026-07-20T00:00:01Z",
+        )
+        .await;
+        // This parent deliberately has the corrupt legacy combination
+        // `is_smart = true` plus a pull link. Presence of the link must win so
+        // no ordinary smart-playlist mutation is exposed.
+        insert_sidebar_playlist(
+            &db,
+            "linked-smart-id",
+            "secret mirrored name",
+            true,
+            "2026-07-20T00:00:02Z",
+        )
+        .await;
+        server_playlist_link::ActiveModel {
+            playlist_id: Set("linked-smart-id".to_string()),
+            source_id: Set(crate::architecture::SourceId::random().to_string()),
+            native_playlist_id: Set("secret-native-playlist-id".to_string()),
+            mode: Set("pull_read_only_v1".to_string()),
+            last_synced_name: Set("secret mirrored name".to_string()),
+            digest_version: Set(1),
+            membership_digest: Set(vec![0; 32]),
+            last_success_at_ms: Set(1),
+            local_state: Set("conflict".to_string()),
+            remote_state: Set("missing".to_string()),
+            state_revision: Set(4),
+        }
+        .insert(&db)
+        .await
+        .expect("insert sidebar pull link");
+
+        let entries = load_playlist_sidebar_entries(&db)
+            .await
+            .expect("load typed sidebar snapshot");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].kind(), PlaylistSidebarKind::EditableRegular);
+        assert_eq!(entries[1].kind(), PlaylistSidebarKind::EditableSmart);
+        assert_eq!(
+            entries[2].kind(),
+            PlaylistSidebarKind::PullMirror {
+                local_state: ServerPlaylistLocalState::Conflict,
+                remote_state: ServerPlaylistRemoteState::Missing,
+            }
+        );
+
+        let diagnostic = format!("{:?}", LibraryEvent::PlaylistsLoaded(entries));
+        assert!(!diagnostic.contains("secret-native-playlist-id"));
+        assert!(!diagnostic.contains("secret mirrored name"));
+        assert!(diagnostic.contains("PullMirror"));
+    }
+
+    #[tokio::test]
+    async fn malformed_link_publishes_an_empty_fail_closed_sidebar_snapshot() {
+        use sea_orm::{ConnectionTrait, Database};
+        use sea_orm_migration::MigratorTrait;
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("open sidebar database");
+        crate::db::migration::Migrator::up(&db, None)
+            .await
+            .expect("run sidebar migrations");
+        insert_sidebar_playlist(
+            &db,
+            "previously-editable-id",
+            "Previously editable",
+            false,
+            "2026-07-20T00:00:00Z",
+        )
+        .await;
+
+        // Migration 14 rejects this state. Bypass its check only to prove a
+        // damaged or externally modified database actively retracts every
+        // prior editable row rather than leaving stale GTK authority behind.
+        db.execute_unprepared("PRAGMA ignore_check_constraints = ON")
+            .await
+            .expect("disable checks for corrupt fixture");
+        server_playlist_link::ActiveModel {
+            playlist_id: Set("previously-editable-id".to_string()),
+            source_id: Set(crate::architecture::SourceId::random().to_string()),
+            native_playlist_id: Set("private-native-id".to_string()),
+            mode: Set("pull_read_only_v1".to_string()),
+            last_synced_name: Set("Private server name".to_string()),
+            digest_version: Set(1),
+            membership_digest: Set(vec![0; 32]),
+            last_success_at_ms: Set(1),
+            local_state: Set("invalid-local-state".to_string()),
+            remote_state: Set("present".to_string()),
+            state_revision: Set(0),
+        }
+        .insert(&db)
+        .await
+        .expect("insert corrupt sidebar link");
+        db.execute_unprepared("PRAGMA ignore_check_constraints = OFF")
+            .await
+            .expect("restore link checks");
+
+        let (tx, rx) = async_channel::bounded(1);
+        publish_playlist_sidebar_snapshot(&db, &tx).await;
+        let event = rx.recv().await.expect("one fail-closed publication");
+        let LibraryEvent::PlaylistsLoaded(entries) = event else {
+            panic!("expected typed playlist snapshot");
+        };
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn linked_sidebar_name_accepts_the_limit_and_retracts_an_oversized_parent() {
+        use sea_orm::Database;
+        use sea_orm_migration::MigratorTrait;
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("open sidebar database");
+        crate::db::migration::Migrator::up(&db, None)
+            .await
+            .expect("run sidebar migrations");
+        let maximum_name = "x".repeat(MAX_SERVER_PLAYLIST_LINK_NAME_BYTES);
+        insert_sidebar_playlist(
+            &db,
+            "linked-name-boundary",
+            &maximum_name,
+            false,
+            "2026-07-20T00:00:00Z",
+        )
+        .await;
+        server_playlist_link::ActiveModel {
+            playlist_id: Set("linked-name-boundary".to_string()),
+            source_id: Set(crate::architecture::SourceId::random().to_string()),
+            native_playlist_id: Set("private-native-id".to_string()),
+            mode: Set("pull_read_only_v1".to_string()),
+            last_synced_name: Set("bounded synchronized name".to_string()),
+            digest_version: Set(1),
+            membership_digest: Set(vec![0; 32]),
+            last_success_at_ms: Set(1),
+            local_state: Set("clean".to_string()),
+            remote_state: Set("present".to_string()),
+            state_revision: Set(0),
+        }
+        .insert(&db)
+        .await
+        .expect("insert sidebar pull link");
+
+        let entries = load_playlist_sidebar_entries(&db)
+            .await
+            .expect("maximum-length linked name remains displayable");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name().len(), MAX_SERVER_PLAYLIST_LINK_NAME_BYTES);
+
+        let parent = playlist::Entity::find_by_id("linked-name-boundary")
+            .one(&db)
+            .await
+            .expect("load linked parent")
+            .expect("linked parent exists");
+        let mut parent: playlist::ActiveModel = parent.into();
+        parent.name = Set(format!(
+            "private-server-name-{}",
+            "x".repeat(MAX_SERVER_PLAYLIST_LINK_NAME_BYTES)
+        ));
+        parent
+            .update(&db)
+            .await
+            .expect("corrupt linked parent name");
+
+        let error = load_playlist_sidebar_entries(&db)
+            .await
+            .expect_err("oversized linked parent must fail closed");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("Linked playlist display name exceeds the byte limit"));
+        assert!(!diagnostic.contains("private-server-name"));
+
+        let (tx, rx) = async_channel::bounded(1);
+        publish_playlist_sidebar_snapshot(&db, &tx).await;
+        let LibraryEvent::PlaylistsLoaded(entries) =
+            rx.recv().await.expect("one fail-closed publication")
+        else {
+            panic!("expected typed playlist snapshot");
+        };
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_seed_probe_still_publishes_an_empty_authoritative_snapshot() {
+        use sea_orm::{ConnectionTrait, Database};
+        use sea_orm_migration::MigratorTrait;
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("open sidebar database");
+        crate::db::migration::Migrator::up(&db, None)
+            .await
+            .expect("run sidebar migrations");
+        db.execute_unprepared("DROP TABLE playlists")
+            .await
+            .expect("remove playlist table for failed seed probe");
+
+        let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
+        let (tx, rx) = async_channel::bounded(1);
+        seed_default_playlists_and_publish(&db, &manager, &tx).await;
+        let LibraryEvent::PlaylistsLoaded(entries) =
+            rx.recv().await.expect("one fail-closed publication")
+        else {
+            panic!("expected typed playlist snapshot");
+        };
+        assert!(entries.is_empty());
+    }
+
     async fn insert_reauthorization_root(
         db: &DatabaseConnection,
         path: &Path,
@@ -6495,7 +6900,7 @@ mod tests {
 
         let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Remembered playlist", false)
+            .create_regular_playlist("Remembered playlist")
             .await
             .expect("create playlist");
         manager
@@ -6583,7 +6988,7 @@ mod tests {
         let stored_root = insert_reauthorization_root(&db, &old_root, &marker, true).await;
         let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Corrupt remote path evidence", false)
+            .create_regular_playlist("Corrupt remote path evidence")
             .await
             .expect("create playlist");
         let remote_match_path = old_root.join("Remote").join("song.flac");
@@ -6786,7 +7191,7 @@ mod tests {
         .await;
         let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Unsafe match", false)
+            .create_regular_playlist("Unsafe match")
             .await
             .expect("create playlist");
         manager
@@ -7114,7 +7519,7 @@ mod tests {
         // that the earlier atomic relocation was partial.
         let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Imported after relocation", false)
+            .create_regular_playlist("Imported after relocation")
             .await
             .expect("create later playlist");
         playlist_entry::ActiveModel {
@@ -8203,7 +8608,7 @@ mod tests {
         let db = rename_test_database().await;
         let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Guarded delete", false)
+            .create_regular_playlist("Guarded delete")
             .await
             .expect("create playlist");
         let existing = insert_rename_test_track(
@@ -8311,7 +8716,7 @@ mod tests {
         let db = rename_test_database().await;
         let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Rename", false)
+            .create_regular_playlist("Rename")
             .await
             .expect("create playlist");
         let source = insert_rename_test_track(
@@ -8388,7 +8793,7 @@ mod tests {
         let db = rename_test_database().await;
         let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Overwrite", false)
+            .create_regular_playlist("Overwrite")
             .await
             .expect("create playlist");
         let source =
@@ -8511,7 +8916,7 @@ mod tests {
         let db = rename_test_database().await;
         let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Rollback", false)
+            .create_regular_playlist("Rollback")
             .await
             .expect("create playlist");
         let source = insert_rename_test_track(
@@ -9076,7 +9481,7 @@ mod tests {
         let db = rename_test_database().await;
         let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Album", false)
+            .create_regular_playlist("Album")
             .await
             .expect("create playlist");
 

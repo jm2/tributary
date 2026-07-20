@@ -15,8 +15,8 @@ use crate::local::engine::LibraryEvent;
 use crate::source_registry::RegularPlaylistTrackResolution;
 
 use super::objects::{
-    PlaylistOccurrenceBinding, PlaylistOccurrenceState, PlaylistRowUnavailableReason, SourceObject,
-    TrackObject,
+    PlaylistOccurrenceBinding, PlaylistOccurrenceState, PlaylistRowUnavailableReason,
+    PlaylistSidebarKind, SourceObject, TrackObject,
 };
 use super::playback::refresh_projected_library_uris;
 use super::playlist_projection::{project_playlist_rows, PlaylistRowContent, PlaylistRowSpec};
@@ -192,6 +192,58 @@ fn resolve_source_key(
     } else {
         backend_type.to_string()
     }
+}
+
+fn playlist_navigation_id(source: &SourceObject) -> Option<String> {
+    source
+        .is_playlist()
+        .then(|| source.playlist_id())
+        .filter(|playlist_id| !playlist_id.is_empty())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaylistLoadKind {
+    EditableRegular,
+    EditableSmart,
+    PullMirror,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaylistProjection {
+    StoredEntries,
+    SmartRules,
+}
+
+impl PlaylistLoadKind {
+    const fn from_sidebar_kind(kind: PlaylistSidebarKind) -> Self {
+        match kind {
+            PlaylistSidebarKind::EditableRegular => Self::EditableRegular,
+            PlaylistSidebarKind::EditableSmart => Self::EditableSmart,
+            PlaylistSidebarKind::PullMirror { .. } => Self::PullMirror,
+        }
+    }
+
+    const fn projection(self) -> PlaylistProjection {
+        match self {
+            Self::EditableRegular | Self::PullMirror => PlaylistProjection::StoredEntries,
+            Self::EditableSmart => PlaylistProjection::SmartRules,
+        }
+    }
+}
+
+fn playlist_load_kind_for_id(
+    sidebar_store: &gtk::gio::ListStore,
+    playlist_id: &str,
+) -> Option<PlaylistLoadKind> {
+    (0..sidebar_store.n_items()).find_map(|position| {
+        let source = sidebar_store
+            .item(position)
+            .and_downcast::<SourceObject>()?;
+        (source.playlist_id() == playlist_id)
+            .then(|| source.playlist_kind())
+            .flatten()
+            .map(PlaylistLoadKind::from_sidebar_kind)
+    })
 }
 
 /// Admit one authentication-dialog submission against the exact live intent.
@@ -416,6 +468,7 @@ pub(super) fn playlist_row_to_object(spec: PlaylistRowSpec) -> TrackObject {
 pub(super) fn load_playlist_source(
     rt_handle: tokio::runtime::Handle,
     source_registry: crate::source_registry::SourceRegistry,
+    sidebar_store: gtk::gio::ListStore,
     playlist_id: String,
     request: SourceRequest,
     navigation: Rc<RefCell<SourceNavigation>>,
@@ -428,17 +481,28 @@ pub(super) fn load_playlist_source(
     status_label: gtk::Label,
     column_view: gtk::ColumnView,
 ) {
+    let Some(load_kind) = playlist_load_kind_for_id(&sidebar_store, &playlist_id) else {
+        tracing::debug!(
+            playlist_id_byte_len = playlist_id.len(),
+            "Skipping playlist load without a current typed sidebar identity"
+        );
+        return;
+    };
     let (tracks_tx, tracks_rx) = async_channel::bounded::<PlaylistLoadOutcome>(1);
     let registry_for_load = source_registry.clone();
+    let playlist_id_for_load = playlist_id.clone();
 
     rt_handle.spawn(async move {
         let outcome = match crate::db::connection::init_db().await {
             Ok(db) => {
                 let manager = crate::local::playlist_manager::PlaylistManager::new(db);
-                match manager.get_playlist(&playlist_id).await {
-                    Ok(Some(playlist)) => {
-                        if playlist.is_smart {
-                            match manager.evaluate_smart_playlist(&playlist_id).await {
+                match manager.get_playlist(&playlist_id_for_load).await {
+                    Ok(Some(_)) => {
+                        if load_kind.projection() == PlaylistProjection::SmartRules {
+                            match manager
+                                .evaluate_smart_playlist(&playlist_id_for_load)
+                                .await
+                            {
                                 Ok(models) => PlaylistLoadOutcome::Smart(
                                     models
                                         .iter()
@@ -451,7 +515,7 @@ pub(super) fn load_playlist_source(
                                 }
                             }
                         } else {
-                            match manager.load_playlist_entries(&playlist_id).await {
+                            match manager.load_playlist_entries(&playlist_id_for_load).await {
                                 Ok(entries) => {
                                     let remote_keys = entries
                                         .iter()
@@ -510,6 +574,14 @@ pub(super) fn load_playlist_source(
         let Ok(outcome) = tracks_rx.recv().await else {
             return;
         };
+        if playlist_load_kind_for_id(&sidebar_store, &playlist_id) != Some(load_kind) {
+            tracing::debug!(
+                playlist_id_byte_len = playlist_id.len(),
+                generation = request.generation(),
+                "Discarding playlist result after its typed sidebar identity changed"
+            );
+            return;
+        }
         let objects = match outcome {
             PlaylistLoadOutcome::Smart(tracks) => {
                 tracks.iter().map(arch_track_to_object).collect::<Vec<_>>()
@@ -517,7 +589,7 @@ pub(super) fn load_playlist_source(
             PlaylistLoadOutcome::Regular { rows, authority } => {
                 if !source_registry.are_regular_playlist_tracks_current(&authority) {
                     tracing::debug!(
-                        source = %request.source_key(),
+                        playlist_id_byte_len = playlist_id.len(),
                         generation = request.generation(),
                         "Discarding playlist rows whose catalogue authority changed before publication"
                     );
@@ -578,7 +650,7 @@ pub(super) fn load_playlist_source(
             );
         } else {
             tracing::debug!(
-                source = %request.source_key(),
+                playlist_id_byte_len = playlist_id.len(),
                 generation = request.generation(),
                 "Playlist result cached or ignored without rendering"
             );
@@ -675,9 +747,12 @@ pub fn setup_source_connect(state: &WindowState) {
         let stable_source_id = src.source_id().map(|id| id.to_string()).unwrap_or_default();
         let url = src.server_url();
         let key = resolve_source_key(&explicit_key, &stable_source_id, &url, &backend_type);
+        let playlist_id = playlist_navigation_id(src);
 
         // ── Local source: switch to local view ───────────────────
-        if key == "local" {
+        // Typed playlist identity wins even if a malformed compatibility
+        // backend string happens to resolve to the built-in Local key.
+        if playlist_id.is_none() && key == "local" {
             source_navigation.borrow_mut().select("local");
             *active_source_key.borrow_mut() = "local".to_string();
             pre_connect_selection.set(sel.selected());
@@ -704,12 +779,7 @@ pub fn setup_source_connect(state: &WindowState) {
         }
 
         // ── Playlist source: fetch playlist tracks ───────────────
-        if backend_type == "playlist" || backend_type == "smart-playlist" {
-            let playlist_id = src.playlist_id();
-            if playlist_id.is_empty() {
-                return;
-            }
-
+        if let Some(playlist_id) = playlist_id {
             let playlist_source_key =
                 format!("{}{playlist_id}", super::playback::PLAYLIST_SOURCE_PREFIX);
             let request = source_navigation
@@ -741,6 +811,7 @@ pub fn setup_source_connect(state: &WindowState) {
             load_playlist_source(
                 rt_handle.clone(),
                 source_registry.clone(),
+                sidebar_store.clone(),
                 playlist_id,
                 request,
                 source_navigation.clone(),
@@ -1209,14 +1280,16 @@ mod tests {
     use url::Url;
 
     use super::{
-        cache_source_completion, evict_source_completion,
-        playlist_unavailable_reason_text_for_locale, prepare_remote_auth_submission,
-        remote_failure_category, resolve_source_key, retained_removable_connect_failure,
-        with_active_source_key_snapshot, PendingConnection, PlaylistRowUnavailableReason,
-        RemoteFailureCategory, SourceNavigation, TrackObject,
+        cache_source_completion, evict_source_completion, playlist_load_kind_for_id,
+        playlist_navigation_id, playlist_unavailable_reason_text_for_locale,
+        prepare_remote_auth_submission, remote_failure_category, resolve_source_key,
+        retained_removable_connect_failure, with_active_source_key_snapshot, PendingConnection,
+        PlaylistLoadKind, PlaylistProjection, PlaylistRowUnavailableReason, RemoteFailureCategory,
+        SourceNavigation, SourceObject, TrackObject,
     };
     use crate::architecture::error::BackendError;
     use crate::architecture::AdvertisedHttpRoute;
+    use crate::local::engine::{PlaylistSidebarEntry, PlaylistSidebarKind};
 
     fn projected_track(label: &str) -> TrackObject {
         TrackObject::new(
@@ -1258,6 +1331,76 @@ mod tests {
         );
         assert_eq!(resolve_source_key("", "stable-id", "", "local"), "local");
         assert_eq!(resolve_source_key("", "", "", ""), "local");
+    }
+
+    #[test]
+    fn playlist_connect_routing_uses_typed_identity_not_compatibility_backend() {
+        let playlist = SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "typed-id",
+            "Typed",
+            PlaylistSidebarKind::EditableSmart,
+        ));
+        for compatibility_backend in ["unexpected-legacy-value", "local"] {
+            playlist.set_compatibility_backend_type_for_test(compatibility_backend);
+            assert_eq!(
+                playlist_navigation_id(&playlist).as_deref(),
+                Some("typed-id")
+            );
+        }
+
+        let impostor = SourceObject::source("Impostor", "playlist", "view-list-symbolic");
+        assert_eq!(playlist_navigation_id(&impostor), None);
+    }
+
+    #[test]
+    fn linked_smart_parent_corruption_uses_mirror_projection_and_stale_kind_fails_closed() {
+        use crate::db::entities::server_playlist_link::{
+            ServerPlaylistLocalState, ServerPlaylistRemoteState,
+        };
+
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        let mirror = SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "typed-id",
+            "Mirror",
+            PlaylistSidebarKind::PullMirror {
+                local_state: ServerPlaylistLocalState::Clean,
+                remote_state: ServerPlaylistRemoteState::Present,
+            },
+        ));
+        store.append(&mirror);
+
+        // Link presence already won over a corrupt parent `is_smart` bit when
+        // the engine published this typed row. The loader never consults that
+        // compatibility bit and must therefore choose stored mirror entries.
+        let captured = playlist_load_kind_for_id(&store, "typed-id");
+        assert_eq!(captured, Some(PlaylistLoadKind::PullMirror));
+        assert_eq!(
+            captured.expect("typed mirror").projection(),
+            PlaylistProjection::StoredEntries
+        );
+
+        store.remove(0);
+        store.append(&SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "typed-id",
+            "Now smart",
+            PlaylistSidebarKind::EditableSmart,
+        )));
+        assert_ne!(playlist_load_kind_for_id(&store, "typed-id"), captured);
+
+        store.remove(0);
+        store.append(&SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "typed-id",
+            "Mirror with new state",
+            PlaylistSidebarKind::PullMirror {
+                local_state: ServerPlaylistLocalState::Conflict,
+                remote_state: ServerPlaylistRemoteState::Missing,
+            },
+        )));
+        assert_eq!(
+            playlist_load_kind_for_id(&store, "typed-id"),
+            captured,
+            "durable status changes do not change the mirror projection class"
+        );
     }
 
     #[test]

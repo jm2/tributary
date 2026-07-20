@@ -242,6 +242,29 @@ smart_playlist:
   remove_rule: "Regel verwijderen"
   limit_to: "Beperken tot"
 
+# ── Serverafspeellijsten ───────────────────────────────────────────
+server_playlists:
+  controls_accessible_label: "Bediening voor synchronisatie van serverafspeellijsten"
+  status_linked_read_only: "Gekoppeld aan server — alleen-lezen"
+  status_syncing: "Serverafspeellijst wordt gesynchroniseerd…"
+  status_offline: "Server niet beschikbaar — opgeslagen kopie blijft behouden"
+  status_failed: "Synchronisatie mislukt — opgeslagen kopie blijft behouden"
+  status_conflict: "Lokale wijzigingen conflicteren met de server"
+  status_missing: "Afspeellijst ontbreekt op de server"
+  status_conflict_missing: "Lokale wijzigingen conflicteren; de afspeellijst ontbreekt op de server"
+  action_sync_now: "Nu synchroniseren"
+  action_retry: "Opnieuw proberen"
+  action_replace_local_with_server: "Lokale versie vervangen door serverversie"
+  action_more: "Meer afspeellijstacties"
+  action_unlink: "Ontkoppelen"
+  action_remove_local_copy: "Lokale kopie verwijderen"
+  replace_heading: "Lokale afspeellijst vervangen?"
+  replace_body: "Hiermee worden lokale wijzigingen verwijderd en wordt de afspeellijst vervangen door een nieuwe serverkopie."
+  unlink_heading: "Serverafspeellijst ontkoppelen?"
+  unlink_body: "De huidige nummers blijven behouden als een bewerkbare lokale afspeellijst en worden niet meer gesynchroniseerd."
+  remove_heading: "Lokale kopie verwijderen?"
+  remove_body: "Hiermee worden de lokale afspeellijst en de synchronisatiekoppeling verwijderd. De serverafspeellijst blijft ongewijzigd."
+
 # ── Foutmeldingen voor gebruikers ──────────────────────────────────
 errors:
   remote:
