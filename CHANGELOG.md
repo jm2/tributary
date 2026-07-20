@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Server-native playlist pulls now have a GTK-free latest-request coordinator and reconnect
-  runtime** — A lifecycle-owned owner serializes starts and final admission across three typed,
-  content-redacted lanes: one source, one source/native remote playlist, or one durable local
-  playlist. A newer request cancels a same-key predecessor only before admission. If the
+  runtime** ([#148](https://github.com/jm2/tributary/pull/148)) — A lifecycle-owned owner serializes
+  starts and final admission across three typed, content-redacted lanes: one source, one
+  source/native remote playlist, or one durable local playlist. A newer request cancels a same-key
+  predecessor only before admission. If the
   predecessor is already admitted, its successor waits until both the operation task and its
   move-only admission guard settle; unrelated keys continue concurrently. Checked per-key
   generations fail closed on exhaustion. A separate coordinator-global request stamp is reserved

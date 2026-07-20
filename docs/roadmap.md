@@ -205,7 +205,8 @@ before starting large protocol or transfer subsystems.
    separate localized recovery/status shell. A follow-up durable SQLite revision and
    lifecycle-owned full-snapshot publisher now order scan seeding, CRUD, raw/cascade domain-table
    writes, and link-state mutations; GTK rejects equal or older delivery.
-10. **Completed lifecycle slice: coordinate and schedule server-playlist operations.** Three typed,
+10. **Completed lifecycle slice: coordinate and schedule server-playlist operations
+    ([#148](https://github.com/jm2/tributary/pull/148)).** Three typed,
    content-redacted lanes cover source-wide discovery, exact remote playlist actions, and durable
    local mirrors. A global logical-request stamp orders reconnect discovery against newer manual
    work, with direct reserve-and-enqueue atomic against delayed stamped fan-out; same-key successors

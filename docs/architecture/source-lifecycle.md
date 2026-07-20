@@ -893,7 +893,8 @@ policy.
     Partial CRUD/import patches are removed, so reversed deliveries cannot erase a create/import,
     revert a rename, resurrect a delete, or restore stale link state. At this delivery boundary,
     Record E still retained the GTK-free lifecycle and final visible-action slices.
-14. **Server-native latest-request and reconnect lifecycle complete:** one GTK-free owner provides
+14. **Server-native latest-request and reconnect lifecycle complete
+    ([#148](https://github.com/jm2/tributary/pull/148)):** one GTK-free owner provides
     typed source, exact remote-playlist, and durable local-playlist lanes. A coordinator-global
     stamp orders reconnect discovery against manual intent. Newer work cancels only pre-admission
     work; same-key successors wait through admitted task and guard settlement, while unrelated keys
