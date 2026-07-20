@@ -9,7 +9,7 @@ use sea_orm_migration::MigratorTrait;
 use tokio::sync::OnceCell;
 use tracing::info;
 
-use super::migration::Migrator;
+use super::migration::{self, Migrator};
 
 /// How long a statement waits for a competing writer before failing busy.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -55,6 +55,7 @@ async fn connect_and_migrate(db_path: &Path) -> Result<DatabaseConnection, DbErr
 
     info!("Running pending migrations");
     Migrator::up(&db, None).await?;
+    migration::revalidate_critical_objects(&db).await?;
 
     Ok(db)
 }
@@ -194,6 +195,28 @@ mod tests {
         for transaction in transactions {
             transaction.rollback().await.expect("rollback transaction");
         }
+    }
+
+    /// A current migration ledger is not proof that mutable critical SQLite
+    /// objects still exist. Every process startup must validate them after
+    /// the migrator's otherwise-no-op ledger check.
+    #[tokio::test]
+    async fn startup_revalidates_critical_objects_with_a_current_ledger() {
+        let file = TestDatabase::new("critical-revalidation");
+        let db = connect_and_migrate(file.path())
+            .await
+            .expect("open canonical database");
+        db.execute_unprepared(
+            "DROP TRIGGER trg_playlist_sidebar_revision_server_playlist_links_update",
+        )
+        .await
+        .expect("simulate deleted critical trigger");
+        db.close().await.expect("close first database pool");
+
+        let error = connect_and_migrate(file.path())
+            .await
+            .expect_err("startup must reject a current but damaged migration installation");
+        assert!(error.to_string().contains("trigger object"));
     }
 
     /// P1.5's guarantee, asserted end to end against a real pool: deleting a

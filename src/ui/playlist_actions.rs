@@ -6,39 +6,11 @@
 
 use adw::prelude::*;
 use gtk::glib;
-use tracing::info;
+use tracing::{info, warn};
 
-use super::objects::{PlaylistSidebarEntry, PlaylistSidebarKind, SourceObject};
+use super::objects::{PlaylistSidebarKind, SourceObject};
 use super::sidebar;
 use super::window_state::WindowState;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommittedPlaylist {
-    id: String,
-    name: String,
-    is_smart: bool,
-}
-
-impl From<crate::db::entities::playlist::Model> for CommittedPlaylist {
-    fn from(playlist: crate::db::entities::playlist::Model) -> Self {
-        Self {
-            id: playlist.id,
-            name: playlist.name,
-            is_smart: playlist.is_smart,
-        }
-    }
-}
-
-impl CommittedPlaylist {
-    fn into_sidebar_entry(self) -> PlaylistSidebarEntry {
-        let kind = if self.is_smart {
-            PlaylistSidebarKind::EditableSmart
-        } else {
-            PlaylistSidebarKind::EditableRegular
-        };
-        PlaylistSidebarEntry::new(self.id, self.name, kind)
-    }
-}
 
 /// Closed worker result: GTK may publish a mutation only after the database
 /// operation reports a successful commit. A dropped worker is also treated as
@@ -47,6 +19,32 @@ impl CommittedPlaylist {
 enum PlaylistCrudOutcome<T> {
     Committed(T),
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaylistSidebarPublicationEffect {
+    RequestFullSnapshot,
+    LeavePublishedSnapshot,
+}
+
+fn playlist_sidebar_publication_effect<T>(
+    outcome: &PlaylistCrudOutcome<T>,
+) -> PlaylistSidebarPublicationEffect {
+    match outcome {
+        PlaylistCrudOutcome::Committed(_) => PlaylistSidebarPublicationEffect::RequestFullSnapshot,
+        PlaylistCrudOutcome::Failed => PlaylistSidebarPublicationEffect::LeavePublishedSnapshot,
+    }
+}
+
+fn request_playlist_sidebar_refresh(
+    refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,
+) {
+    if matches!(
+        refresh.request(),
+        crate::local::playlist_sidebar::PlaylistSidebarRefreshRequest::Closed
+    ) {
+        warn!("Playlist sidebar publisher stopped before committed mutation refresh");
+    }
 }
 
 /// Wire the playlist action receiver to the sidebar store.
@@ -59,19 +57,19 @@ pub fn setup_playlist_actions(
     playlist_action_rx: async_channel::Receiver<sidebar::PlaylistAction>,
 ) {
     let sidebar_store = state.sidebar_store.clone();
-    let sidebar_selection = state.sidebar_selection.clone();
     let rt_handle = state.rt_handle.clone();
     let win = state.window.clone();
+    let playlist_sidebar_refresh = state.playlist_sidebar_refresh.clone();
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(action) = playlist_action_rx.recv().await {
             match action {
                 sidebar::PlaylistAction::CreateRegular => {
-                    handle_create_regular(&win, &sidebar_store, &rt_handle);
+                    handle_create_regular(&win, &rt_handle, &playlist_sidebar_refresh);
                 }
 
                 sidebar::PlaylistAction::CreateSmart => {
-                    handle_create_smart(&win, &sidebar_store, &rt_handle);
+                    handle_create_smart(&win, &rt_handle, &playlist_sidebar_refresh);
                 }
 
                 sidebar::PlaylistAction::Rename(playlist_id) => {
@@ -79,8 +77,8 @@ pub fn setup_playlist_actions(
                         handle_rename(
                             &win,
                             &sidebar_store,
-                            &sidebar_selection,
                             &rt_handle,
+                            &playlist_sidebar_refresh,
                             &playlist_id,
                         );
                     }
@@ -91,8 +89,8 @@ pub fn setup_playlist_actions(
                         handle_delete(
                             &win,
                             &sidebar_store,
-                            &sidebar_selection,
                             &rt_handle,
+                            &playlist_sidebar_refresh,
                             &playlist_id,
                         );
                     }
@@ -100,12 +98,18 @@ pub fn setup_playlist_actions(
 
                 sidebar::PlaylistAction::EditSmart(playlist_id) => {
                     if playlist_is_editable_smart(&sidebar_store, &playlist_id) {
-                        handle_edit_smart(&win, &sidebar_store, &rt_handle, &playlist_id);
+                        handle_edit_smart(
+                            &win,
+                            &sidebar_store,
+                            &rt_handle,
+                            &playlist_sidebar_refresh,
+                            &playlist_id,
+                        );
                     }
                 }
 
                 sidebar::PlaylistAction::ImportPlaylist => {
-                    handle_import_playlist(&win, &sidebar_store, &rt_handle);
+                    handle_import_playlist(&win, &rt_handle, &playlist_sidebar_refresh);
                 }
 
                 sidebar::PlaylistAction::ExportPlaylist(playlist_id) => {
@@ -125,13 +129,13 @@ pub fn setup_playlist_actions(
 /// Show a name dialog and create a new regular playlist.
 fn handle_create_regular(
     win: &adw::ApplicationWindow,
-    sidebar_store: &gtk::gio::ListStore,
     rt_handle: &tokio::runtime::Handle,
+    playlist_sidebar_refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,
 ) {
     info!("Creating new regular playlist");
-    let sidebar_store = sidebar_store.clone();
     let rt_handle = rt_handle.clone();
     let win_for_result = win.clone();
+    let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
 
     let dialog = adw::AlertDialog::builder()
         .heading(rust_i18n::t!("dialogs.new_playlist_heading").as_ref())
@@ -157,17 +161,16 @@ fn handle_create_regular(
             return;
         }
 
-        let sidebar_store = sidebar_store.clone();
         let win = win_for_result.clone();
-        let (result_tx, result_rx) =
-            async_channel::bounded::<PlaylistCrudOutcome<CommittedPlaylist>>(1);
+        let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
+        let (result_tx, result_rx) = async_channel::bounded::<PlaylistCrudOutcome<()>>(1);
 
         rt_handle.spawn(async move {
             let outcome = match crate::db::connection::init_db().await {
                 Ok(db) => {
                     let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
                     match mgr.create_regular_playlist(&name).await {
-                        Ok(playlist) => PlaylistCrudOutcome::Committed(playlist.into()),
+                        Ok(_) => PlaylistCrudOutcome::Committed(()),
                         Err(e) => {
                             tracing::error!(error = %e, "Failed to create playlist");
                             PlaylistCrudOutcome::Failed
@@ -184,10 +187,13 @@ fn handle_create_regular(
 
         glib::MainContext::default().spawn_local(async move {
             match result_rx.recv().await {
-                Ok(PlaylistCrudOutcome::Committed(playlist)) => {
-                    insert_playlist_into_sidebar(&sidebar_store, &playlist.into_sidebar_entry());
+                Ok(outcome)
+                    if playlist_sidebar_publication_effect(&outcome)
+                        == PlaylistSidebarPublicationEffect::RequestFullSnapshot =>
+                {
+                    request_playlist_sidebar_refresh(&playlist_sidebar_refresh);
                 }
-                Ok(PlaylistCrudOutcome::Failed) | Err(_) => show_playlist_mutation_failed(&win),
+                Ok(_) | Err(_) => show_playlist_mutation_failed(&win),
             }
         });
     });
@@ -198,29 +204,28 @@ fn handle_create_regular(
 /// Open the smart playlist editor and create a new smart playlist.
 fn handle_create_smart(
     win: &adw::ApplicationWindow,
-    sidebar_store: &gtk::gio::ListStore,
     rt_handle: &tokio::runtime::Handle,
+    playlist_sidebar_refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,
 ) {
     info!("Creating new smart playlist");
-    let sidebar_store = sidebar_store.clone();
     let rt_handle = rt_handle.clone();
     let win_for_result = win.clone();
+    let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
     let default_name = rust_i18n::t!("smart_playlist.new_title").into_owned();
     let default_name_for_commit = default_name.clone();
 
     super::playlist_editor::show_smart_playlist_editor(win, &default_name, None, move |rules| {
-        let sidebar_store = sidebar_store.clone();
         let win = win_for_result.clone();
+        let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
         let default_name = default_name_for_commit.clone();
-        let (result_tx, result_rx) =
-            async_channel::bounded::<PlaylistCrudOutcome<CommittedPlaylist>>(1);
+        let (result_tx, result_rx) = async_channel::bounded::<PlaylistCrudOutcome<()>>(1);
 
         rt_handle.spawn(async move {
             let outcome = match crate::db::connection::init_db().await {
                 Ok(db) => {
                     let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
                     match mgr.create_smart_playlist(&default_name, &rules).await {
-                        Ok(playlist) => PlaylistCrudOutcome::Committed(playlist.into()),
+                        Ok(_) => PlaylistCrudOutcome::Committed(()),
                         Err(e) => {
                             tracing::error!(error = %e, "Failed to create smart playlist");
                             PlaylistCrudOutcome::Failed
@@ -237,10 +242,13 @@ fn handle_create_smart(
 
         glib::MainContext::default().spawn_local(async move {
             match result_rx.recv().await {
-                Ok(PlaylistCrudOutcome::Committed(playlist)) => {
-                    insert_playlist_into_sidebar(&sidebar_store, &playlist.into_sidebar_entry());
+                Ok(outcome)
+                    if playlist_sidebar_publication_effect(&outcome)
+                        == PlaylistSidebarPublicationEffect::RequestFullSnapshot =>
+                {
+                    request_playlist_sidebar_refresh(&playlist_sidebar_refresh);
                 }
-                Ok(PlaylistCrudOutcome::Failed) | Err(_) => show_playlist_mutation_failed(&win),
+                Ok(_) | Err(_) => show_playlist_mutation_failed(&win),
             }
         });
     });
@@ -250,14 +258,14 @@ fn handle_create_smart(
 fn handle_rename(
     win: &adw::ApplicationWindow,
     sidebar_store: &gtk::gio::ListStore,
-    sidebar_selection: &gtk::SingleSelection,
     rt_handle: &tokio::runtime::Handle,
+    playlist_sidebar_refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,
     playlist_id: &str,
 ) {
     info!(id = %playlist_id, "Renaming playlist");
     let sidebar_store = sidebar_store.clone();
-    let sidebar_selection = sidebar_selection.clone();
     let rt_handle = rt_handle.clone();
+    let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
     let pid = playlist_id.to_string();
     let win_for_result = win.clone();
 
@@ -292,12 +300,9 @@ fn handle_rename(
             return;
         }
 
-        let sidebar_store = sidebar_store.clone();
-        let sidebar_selection = sidebar_selection.clone();
         let win = win_for_result.clone();
+        let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
         let pid_for_db = pid.clone();
-        let pid_for_ui = pid.clone();
-        let new_name_for_ui = new_name.clone();
         let (result_tx, result_rx) = async_channel::bounded::<PlaylistCrudOutcome<()>>(1);
 
         rt_handle.spawn(async move {
@@ -322,15 +327,13 @@ fn handle_rename(
 
         glib::MainContext::default().spawn_local(async move {
             match result_rx.recv().await {
-                Ok(PlaylistCrudOutcome::Committed(())) => {
-                    rename_playlist_in_sidebar(
-                        &sidebar_store,
-                        &sidebar_selection,
-                        &pid_for_ui,
-                        &new_name_for_ui,
-                    );
+                Ok(outcome)
+                    if playlist_sidebar_publication_effect(&outcome)
+                        == PlaylistSidebarPublicationEffect::RequestFullSnapshot =>
+                {
+                    request_playlist_sidebar_refresh(&playlist_sidebar_refresh);
                 }
-                Ok(PlaylistCrudOutcome::Failed) | Err(_) => show_playlist_mutation_failed(&win),
+                Ok(_) | Err(_) => show_playlist_mutation_failed(&win),
             }
         });
     });
@@ -342,13 +345,13 @@ fn handle_rename(
 fn handle_delete(
     win: &adw::ApplicationWindow,
     sidebar_store: &gtk::gio::ListStore,
-    sidebar_selection: &gtk::SingleSelection,
     rt_handle: &tokio::runtime::Handle,
+    playlist_sidebar_refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,
     playlist_id: &str,
 ) {
     info!(id = %playlist_id, "Deleting playlist");
     let sidebar_store = sidebar_store.clone();
-    let sidebar_selection = sidebar_selection.clone();
+    let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
     let win = win.clone();
     let pid = playlist_id.to_string();
 
@@ -378,13 +381,15 @@ fn handle_delete(
         let _ = result_tx.send(outcome).await;
     });
 
-    let pid = playlist_id.to_string();
     glib::MainContext::default().spawn_local(async move {
         match result_rx.recv().await {
-            Ok(PlaylistCrudOutcome::Committed(())) => {
-                remove_playlist_from_sidebar(&sidebar_store, &sidebar_selection, &pid);
+            Ok(outcome)
+                if playlist_sidebar_publication_effect(&outcome)
+                    == PlaylistSidebarPublicationEffect::RequestFullSnapshot =>
+            {
+                request_playlist_sidebar_refresh(&playlist_sidebar_refresh);
             }
-            Ok(PlaylistCrudOutcome::Failed) | Err(_) => show_playlist_mutation_failed(&win),
+            Ok(_) | Err(_) => show_playlist_mutation_failed(&win),
         }
     });
 }
@@ -394,11 +399,13 @@ fn handle_edit_smart(
     win: &adw::ApplicationWindow,
     sidebar_store: &gtk::gio::ListStore,
     rt_handle: &tokio::runtime::Handle,
+    playlist_sidebar_refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,
     playlist_id: &str,
 ) {
     info!(id = %playlist_id, "Editing smart playlist rules");
     let sidebar_store = sidebar_store.clone();
     let rt_handle = rt_handle.clone();
+    let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
     let pid = playlist_id.to_string();
     let win = win.clone();
 
@@ -452,6 +459,7 @@ fn handle_edit_smart(
                 let pid = pid.clone();
                 let sidebar_store = sidebar_store.clone();
                 let win_for_result = win.clone();
+                let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
 
                 super::playlist_editor::show_smart_playlist_editor(
                     &win,
@@ -464,6 +472,7 @@ fn handle_edit_smart(
                         }
                         let pid = pid.clone();
                         let win = win_for_result.clone();
+                        let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
                         let (result_tx, result_rx) =
                             async_channel::bounded::<PlaylistCrudOutcome<()>>(1);
                         rt_handle.spawn(async move {
@@ -491,8 +500,13 @@ fn handle_edit_smart(
                         });
                         glib::MainContext::default().spawn_local(async move {
                             match result_rx.recv().await {
-                                Ok(PlaylistCrudOutcome::Committed(())) => {}
-                                Ok(PlaylistCrudOutcome::Failed) | Err(_) => {
+                                Ok(outcome)
+                                    if playlist_sidebar_publication_effect(&outcome)
+                                        == PlaylistSidebarPublicationEffect::RequestFullSnapshot =>
+                                {
+                                    request_playlist_sidebar_refresh(&playlist_sidebar_refresh);
+                                }
+                                Ok(_) | Err(_) => {
                                     show_playlist_mutation_failed(&win);
                                 }
                             }
@@ -543,123 +557,6 @@ fn playlist_is_editable_smart(sidebar_store: &gtk::gio::ListStore, playlist_id: 
     })
 }
 
-/// Rebind the same object after a committed rename. Keeping the object, its
-/// typed playlist kind, and the selected position avoids silently downgrading
-/// a smart or linked row to a generic regular row.
-fn rename_playlist_in_sidebar(
-    sidebar_store: &gtk::gio::ListStore,
-    sidebar_selection: &gtk::SingleSelection,
-    playlist_id: &str,
-    new_name: &str,
-) -> bool {
-    let selected_before = sidebar_selection.selected();
-    let renamed_position = rebind_renamed_playlist(sidebar_store, playlist_id, new_name);
-    if let Some(position) = selection_to_restore(selected_before, renamed_position) {
-        sidebar_selection.set_selected(position);
-    }
-    renamed_position.is_some()
-}
-
-fn rebind_renamed_playlist(
-    sidebar_store: &gtk::gio::ListStore,
-    playlist_id: &str,
-    new_name: &str,
-) -> Option<u32> {
-    let (position, source) = playlist_source(sidebar_store, playlist_id)?;
-    source.set_name(new_name);
-    sidebar_store.remove(position);
-    sidebar_store.insert(position, &source);
-    Some(position)
-}
-
-fn selection_to_restore(selected_before: u32, renamed_position: Option<u32>) -> Option<u32> {
-    renamed_position.filter(|position| *position == selected_before)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PlaylistDeleteSidebarPlan {
-    remove_position: u32,
-    select_local_before_remove: Option<u32>,
-}
-
-fn playlist_delete_sidebar_plan(
-    sidebar_store: &gtk::gio::ListStore,
-    selected_before: u32,
-    playlist_id: &str,
-) -> Option<PlaylistDeleteSidebarPlan> {
-    let (remove_position, _) = playlist_source(sidebar_store, playlist_id)?;
-    let select_local_before_remove = if selected_before == remove_position {
-        (0..sidebar_store.n_items()).find(|position| {
-            sidebar_store
-                .item(*position)
-                .and_downcast::<SourceObject>()
-                .is_some_and(|source| {
-                    !source.is_header()
-                        && source.source_id() == Some(crate::architecture::SourceId::local())
-                })
-        })
-    } else {
-        None
-    };
-    Some(PlaylistDeleteSidebarPlan {
-        remove_position,
-        select_local_before_remove,
-    })
-}
-
-fn remove_playlist_from_sidebar(
-    sidebar_store: &gtk::gio::ListStore,
-    sidebar_selection: &gtk::SingleSelection,
-    playlist_id: &str,
-) -> bool {
-    let Some(plan) =
-        playlist_delete_sidebar_plan(sidebar_store, sidebar_selection.selected(), playlist_id)
-    else {
-        return false;
-    };
-    if let Some(local_position) = plan.select_local_before_remove {
-        // Navigate away while the Local row is still resolvable. The normal
-        // selection handler invalidates the deleted playlist projection.
-        sidebar_selection.set_selected(local_position);
-    } else if sidebar_selection.selected() == plan.remove_position {
-        tracing::warn!("Committed playlist deletion could not find the structural Local source");
-        sidebar_selection.set_selected(gtk::INVALID_LIST_POSITION);
-    }
-    sidebar_store.remove(plan.remove_position);
-    true
-}
-
-/// Insert a new typed playlist entry under the structural playlist header, at
-/// the end of the contiguous playlist section.
-fn insert_playlist_into_sidebar(sidebar_store: &gtk::gio::ListStore, entry: &PlaylistSidebarEntry) {
-    let src = SourceObject::playlist_entry(entry);
-    let n = sidebar_store.n_items();
-    for i in 0..n {
-        if let Some(s) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-            if s.is_playlist_header() {
-                // Find end of playlists section.
-                let mut pos = i + 1;
-                while pos < sidebar_store.n_items() {
-                    if let Some(next) = sidebar_store.item(pos).and_downcast_ref::<SourceObject>() {
-                        if next.is_header() {
-                            break;
-                        }
-                        if next.is_playlist() {
-                            pos += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                sidebar_store.insert(pos, &src);
-                break;
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlaylistMutationFailedCopy {
     heading: String,
@@ -705,11 +602,11 @@ fn local_only_export_unsupported_body(locale: &str) -> String {
 /// sidebar together with an explicit outcome summary.
 fn handle_import_playlist(
     win: &adw::ApplicationWindow,
-    sidebar_store: &gtk::gio::ListStore,
     rt_handle: &tokio::runtime::Handle,
+    playlist_sidebar_refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,
 ) {
-    let sidebar_store = sidebar_store.clone();
     let rt = rt_handle.clone();
+    let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
 
     let xspf_filter = gtk::FileFilter::new();
     xspf_filter.set_name(Some(rust_i18n::t!("playlist_io.import_filter").as_ref()));
@@ -763,14 +660,7 @@ fn handle_import_playlist(
             // Carry an explicit committed result or a user-visible error back
             // to GTK. A dropped sender is handled as a failure too.
             let (result_tx, result_rx) = tokio::sync::oneshot::channel::<
-                Result<
-                    (
-                        String,
-                        String,
-                        crate::local::playlist_manager::PlaylistImportCounts,
-                    ),
-                    String,
-                >,
+                Result<(String, crate::local::playlist_manager::PlaylistImportCounts), String>,
             >();
 
             let path_clone = path.clone();
@@ -802,7 +692,7 @@ fn handle_import_playlist(
                                 .into_owned()
                         })?;
 
-                    Ok((result.playlist.name, result.playlist.id, result.counts))
+                    Ok((result.playlist.name, result.counts))
                 }
                 .await;
 
@@ -813,11 +703,12 @@ fn handle_import_playlist(
             });
 
             // Receive the committed result on the GTK main thread. Only this
-            // success branch is allowed to expose a new sidebar row.
+            // success branch requests a complete authoritative replacement.
             let win = win.clone();
+            let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
             glib::MainContext::default().spawn_local(async move {
                 match result_rx.await {
-                    Ok(Ok((pname, pid, counts))) => {
+                    Ok(Ok((pname, counts))) => {
                         info!(
                             name = %pname,
                             matched = counts.matched,
@@ -838,13 +729,9 @@ fn handle_import_playlist(
                             rust_i18n::t!("playlist_io.import_warning_heading")
                         };
                         // The manager returned only after the playlist and
-                        // all retained entries committed together.
-                        let entry = PlaylistSidebarEntry::new(
-                            pid,
-                            pname,
-                            PlaylistSidebarKind::EditableRegular,
-                        );
-                        insert_playlist_into_sidebar(&sidebar_store, &entry);
+                        // all retained entries committed together. The new row
+                        // still comes only from the engine-owned publication.
+                        request_playlist_sidebar_refresh(&playlist_sidebar_refresh);
                         show_playlist_alert(&win, heading.as_ref(), body.as_ref());
                     }
                     Ok(Err(error)) => show_playlist_alert(
@@ -1037,112 +924,22 @@ mod tests {
     use crate::db::entities::server_playlist_link::{
         ServerPlaylistLocalState, ServerPlaylistRemoteState,
     };
-    use crate::ui::objects::HeaderKind;
+    use crate::local::playlist_sidebar::PlaylistSidebarEntry;
 
     fn playlist_source_for_test(id: &str, name: &str, kind: PlaylistSidebarKind) -> SourceObject {
         SourceObject::playlist_entry(&PlaylistSidebarEntry::new(id, name, kind))
     }
 
     #[test]
-    fn rename_rebind_preserves_playlist_kind_object_and_selection() {
-        let store = gtk::gio::ListStore::new::<SourceObject>();
-        store.append(&SourceObject::header(
-            "Localized heading",
-            HeaderKind::Playlists,
-        ));
-        let source =
-            playlist_source_for_test("smart-id", "Before", PlaylistSidebarKind::EditableSmart);
-        store.append(&source);
-        let renamed_position = rebind_renamed_playlist(&store, "smart-id", "After");
-
-        let rebound = store
-            .item(1)
-            .and_downcast::<SourceObject>()
-            .expect("renamed row");
-        assert!(rebound == source, "rename must rebind the same GObject");
-        assert_eq!(rebound.name(), "After");
+    fn failed_or_dropped_mutation_has_no_optimistic_sidebar_rollback_effect() {
         assert_eq!(
-            rebound.playlist_kind(),
-            Some(PlaylistSidebarKind::EditableSmart)
-        );
-        assert_eq!(renamed_position, Some(1));
-        assert_eq!(selection_to_restore(1, renamed_position), Some(1));
-        assert_eq!(selection_to_restore(0, renamed_position), None);
-    }
-
-    #[test]
-    fn deleting_selected_playlist_targets_structural_local_source_before_removal() {
-        let store = gtk::gio::ListStore::new::<SourceObject>();
-        store.append(&SourceObject::header(
-            "Localized local heading",
-            HeaderKind::Local,
-        ));
-        // Display text is not identity: this similarly named row must not be
-        // selected as the deletion fallback.
-        store.append(&SourceObject::source(
-            "Local",
-            "radio-search",
-            "network-workgroup-symbolic",
-        ));
-        store.append(&SourceObject::source(
-            "Bibliothek",
-            "local",
-            "folder-music-symbolic",
-        ));
-        store.append(&playlist_source_for_test(
-            "playlist-id",
-            "Selected",
-            PlaylistSidebarKind::EditableRegular,
-        ));
-
-        assert_eq!(
-            playlist_delete_sidebar_plan(&store, 3, "playlist-id"),
-            Some(PlaylistDeleteSidebarPlan {
-                remove_position: 3,
-                select_local_before_remove: Some(2),
-            })
+            playlist_sidebar_publication_effect(&PlaylistCrudOutcome::<()>::Failed),
+            PlaylistSidebarPublicationEffect::LeavePublishedSnapshot
         );
         assert_eq!(
-            playlist_delete_sidebar_plan(&store, 2, "playlist-id"),
-            Some(PlaylistDeleteSidebarPlan {
-                remove_position: 3,
-                select_local_before_remove: None,
-            })
+            playlist_sidebar_publication_effect(&PlaylistCrudOutcome::Committed(())),
+            PlaylistSidebarPublicationEffect::RequestFullSnapshot
         );
-        assert_eq!(playlist_delete_sidebar_plan(&store, 3, "missing-id"), None);
-    }
-
-    #[test]
-    fn typed_insertion_uses_structural_header_and_keeps_linked_rows_in_section() {
-        let store = gtk::gio::ListStore::new::<SourceObject>();
-        store.append(&SourceObject::header(
-            "Nicht Playlists",
-            HeaderKind::Playlists,
-        ));
-        store.append(&playlist_source_for_test(
-            "mirror-id",
-            "Mirror",
-            PlaylistSidebarKind::PullMirror {
-                local_state: ServerPlaylistLocalState::Clean,
-                remote_state: ServerPlaylistRemoteState::Present,
-            },
-        ));
-        store.append(&SourceObject::header("Radio", HeaderKind::InternetRadio));
-
-        let entry =
-            PlaylistSidebarEntry::new("new-id", "New", PlaylistSidebarKind::EditableRegular);
-        insert_playlist_into_sidebar(&store, &entry);
-
-        let inserted = store
-            .item(2)
-            .and_downcast::<SourceObject>()
-            .expect("inserted playlist");
-        assert_eq!(inserted.playlist_id(), "new-id");
-        assert!(inserted.is_editable_regular_playlist());
-        assert!(store
-            .item(3)
-            .and_downcast::<SourceObject>()
-            .is_some_and(|source| source.header_kind() == Some(HeaderKind::InternetRadio)));
     }
 
     #[test]

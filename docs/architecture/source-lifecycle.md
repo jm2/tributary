@@ -760,12 +760,13 @@ playlist storage, default-deny live-catalogue authority, and Add/Remove/render/P
 specified separately and complete. The Subsonic-native pull contract, bounded protocol,
 exact-session read/commit authority, dedicated link persistence, and atomic pull engine are also
 specified and complete. Structural UI identity, read-only mirror presentation, commit-only ordinary
-playlist publication, and the localized recovery-shell state plan are now implemented without
-widening live authority. The GTK-free latest-request coordinator, one monotonic or serialized
-full-sidebar publication owner, reconnect scheduling, browser, and wired recovery actions remain
-the final deferred P1.5 record. The current scan snapshot and direct post-commit CRUD callback paths
-are commit-safe individually but do not yet carry a shared ordering token. Mixed-source XSPF
-metadata export remains a separate deferred policy.
+playlist mutation, the localized recovery-shell state plan, and one durable full-sidebar
+publication lane are now implemented without widening live authority. Migration 15's
+transaction-local SQLite triggers and one coherent revisioned publisher cover scan seeding,
+ordinary CRUD, raw writes to those domain tables, cascades, and server-link changes; GTK consumes
+only complete strictly newer snapshots. The GTK-free latest-request coordinator, reconnect
+scheduling, browser, and wired recovery actions remain the final deferred P1.5 record. Mixed-source
+XSPF metadata export remains a separate deferred policy.
 
 ## Implementation sequence
 
@@ -856,11 +857,22 @@ metadata export remains a separate deferred policy.
     Create, Rename, Delete, and smart-rule sidebar updates require a closed committed database
     result, and smart creation stores its complete validated rules atomically. A separate hidden
     footer shell has deterministic localized sync/recovery plans and leaves track counts
-    independent. Record E still retains the GTK-free latest-request coordinator, a monotonic or
-    serialized full-sidebar publication owner spanning scans/CRUD/link changes, exact-session
-    reconnect/manual scheduling, virtualized browser, wired recovery controls, and end-to-end
-    lifecycle coverage. Until that owner lands, reversed scan-snapshot and direct post-commit CRUD
-    delivery is explicitly not claimed to converge.
+    independent.
+13. **Durable playlist-sidebar publication complete:** migration 15 owns one nonnegative singleton
+    revision and exactly six guarded SQLite triggers over playlist parents and server-playlist
+    links. Effective writes, raw SQL against either domain table, and cascades advance in the writer
+    transaction, while no-op updates and rollback cannot publish an increment. Startup recognizes
+    the exact table, row,
+    indexes, trigger definitions, and trigger ownership. A lifecycle-owned publisher reads revision
+    plus the complete redacted join inside one transaction, coalesces post-commit hints, polls for
+    lost hints, retries infrastructure failures without advancing, and emits a versioned closed
+    unavailable state for malformed joined models. GTK accepts the first and then only strictly
+    newer snapshots, replacing the entire section and selecting structural Local when the active
+    playlist disappears.
+    Partial CRUD/import patches are removed, so reversed deliveries cannot erase a create/import,
+    revert a rename, resurrect a delete, or restore stale link state. Record E still retains the
+    GTK-free latest-request coordinator, exact-session reconnect/manual scheduling, virtualized
+    browser, wired recovery controls, and end-to-end lifecycle coverage.
 
 The authenticated-remote cutover's locked debug and release suites each passed 20 library, 865
 application, and 10 repository-metadata tests (895 total), with locked all-target/all-feature

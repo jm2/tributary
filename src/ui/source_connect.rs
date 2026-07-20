@@ -684,8 +684,12 @@ pub fn setup_source_connect(state: &WindowState) {
     let pending_connection = state.pending_connection.clone();
     let pre_connect_selection = state.pre_connect_selection.clone();
     let source_registry = state.source_registry.clone();
+    let playlist_sidebar_replacing = state.playlist_sidebar_replacing.clone();
 
     sel.connect_selection_changed(move |sel, _, _| {
+        if playlist_sidebar_replacing.get() {
+            return;
+        }
         let Some(item) = sel.selected_item() else {
             return;
         };
@@ -1289,7 +1293,7 @@ mod tests {
     };
     use crate::architecture::error::BackendError;
     use crate::architecture::AdvertisedHttpRoute;
-    use crate::local::engine::{PlaylistSidebarEntry, PlaylistSidebarKind};
+    use crate::local::playlist_sidebar::{PlaylistSidebarEntry, PlaylistSidebarKind};
 
     fn projected_track(label: &str) -> TrackObject {
         TrackObject::new(

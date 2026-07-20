@@ -14,7 +14,7 @@ use gtk::glib;
 use gtk::subclass::prelude::*;
 
 use crate::architecture::{AdvertisedHttpRoute, SourceId};
-pub use crate::local::engine::{PlaylistSidebarEntry, PlaylistSidebarKind};
+pub use crate::local::playlist_sidebar::{PlaylistSidebarEntry, PlaylistSidebarKind};
 
 /// Structural identity of a non-selectable sidebar section header.
 ///

@@ -20,6 +20,9 @@ use crate::local::engine::{
     LibraryCommand, LibraryEngine, LibraryEvent, RootReauthorizationOutcome,
     RootReauthorizationRequest,
 };
+use crate::local::playlist_sidebar::{
+    PlaylistSidebarEntry, PlaylistSidebarRevision, PlaylistSidebarSnapshot, PlaylistSidebarState,
+};
 use crate::ui::header_bar::RepeatMode;
 
 use super::browser;
@@ -1366,6 +1369,17 @@ pub fn build_window(
     // normal shutdown wait for every earlier admitted command to finish.
     let (library_commands, library_command_rx) =
         super::library_commands::LibraryCommandAdmission::channel();
+    let (playlist_sidebar_refresh, playlist_sidebar_refresh_rx) =
+        crate::local::playlist_sidebar::playlist_sidebar_refresh_channel();
+    let playlist_sidebar_replacing = Rc::new(Cell::new(false));
+    // Subscribe/request before the engine owns its database so a fast GTK
+    // construction cannot miss the initial authoritative publication.
+    if matches!(
+        playlist_sidebar_refresh.request(),
+        crate::local::playlist_sidebar::PlaylistSidebarRefreshRequest::Closed
+    ) {
+        warn!("Playlist sidebar refresh lane closed during window construction");
+    }
 
     // ── Tracklist (starts empty — populated by FullSync) ──────────────
     let empty_tracks: Vec<TrackObject> = Vec::new();
@@ -1661,6 +1675,7 @@ pub fn build_window(
     };
 
     let engine_tx_clone = engine_tx.clone();
+    let engine_playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
     rt_handle.spawn(async move {
         match crate::db::connection::init_db().await {
             Ok(db) => {
@@ -1670,6 +1685,8 @@ pub fn build_window(
                     pending_root_reauthorizations,
                     engine_tx_clone,
                     library_command_rx,
+                    engine_playlist_sidebar_refresh,
+                    playlist_sidebar_refresh_rx,
                 );
                 engine.run().await;
             }
@@ -1773,6 +1790,7 @@ pub fn build_window(
             window: window.clone(),
             rt_handle: rt_handle.clone(),
             engine_tx: engine_tx.clone(),
+            playlist_sidebar_refresh: playlist_sidebar_refresh.clone(),
             source_registry: source_registry.clone(),
             remote_provenance: remote_provenance.clone(),
             track_store: track_store.clone(),
@@ -1783,6 +1801,7 @@ pub fn build_window(
             near_me_consent_request: near_me_consent_request.clone(),
             sidebar_store: sidebar_store.clone(),
             sidebar_selection: sidebar_selection.clone(),
+            playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
             browser_widget: browser_widget.clone(),
             browser_state: browser_state.clone(),
             status_label: status_label.clone(),
@@ -1893,6 +1912,7 @@ pub fn build_window(
         window: window.clone(),
         rt_handle: rt_handle.clone(),
         engine_tx: engine_tx.clone(),
+        playlist_sidebar_refresh: playlist_sidebar_refresh.clone(),
         source_registry: source_registry.clone(),
         remote_provenance: remote_provenance.clone(),
         track_store: track_store.clone(),
@@ -1903,6 +1923,7 @@ pub fn build_window(
         near_me_consent_request: near_me_consent_request.clone(),
         sidebar_store: sidebar_store.clone(),
         sidebar_selection: sidebar_selection.clone(),
+        playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
         browser_widget: browser_widget.clone(),
         browser_state: browser_state.clone(),
         status_label: status_label.clone(),
@@ -1958,6 +1979,7 @@ pub fn build_window(
                 &column_view,
                 sidebar_store_for_events,
                 sidebar_sel_for_events,
+                playlist_sidebar_replacing.clone(),
                 scan_spinner,
                 pending_connection_for_events.clone(),
                 playback_session.clone(),
@@ -2412,6 +2434,7 @@ pub fn build_window(
         window: window.clone(),
         rt_handle: rt_handle.clone(),
         engine_tx: engine_tx.clone(),
+        playlist_sidebar_refresh: playlist_sidebar_refresh.clone(),
         source_registry: source_registry.clone(),
         remote_provenance: remote_provenance.clone(),
         track_store: track_store.clone(),
@@ -2422,6 +2445,7 @@ pub fn build_window(
         near_me_consent_request: near_me_consent_request.clone(),
         sidebar_store: sidebar_store_for_events.clone(),
         sidebar_selection: sidebar_sel_for_events.clone(),
+        playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
         browser_widget: browser_widget.clone(),
         browser_state: browser_state.clone(),
         status_label: status_label.clone(),
@@ -2964,6 +2988,7 @@ pub fn build_window(
             window: window.clone(),
             rt_handle: rt_handle.clone(),
             engine_tx: engine_tx.clone(),
+            playlist_sidebar_refresh: playlist_sidebar_refresh.clone(),
             source_registry: source_registry.clone(),
             remote_provenance: remote_provenance.clone(),
             track_store: track_store.clone(),
@@ -2974,6 +2999,7 @@ pub fn build_window(
             near_me_consent_request: near_me_consent_request.clone(),
             sidebar_store: sidebar_store_for_events.clone(),
             sidebar_selection: sidebar_sel_for_events.clone(),
+            playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
             browser_widget: browser_widget.clone(),
             browser_state: browser_state.clone(),
             status_label: status_label.clone(),
@@ -3002,6 +3028,7 @@ pub fn build_window(
         &column_view,
         sidebar_store_for_events,
         sidebar_sel_for_events,
+        playlist_sidebar_replacing,
         scan_spinner,
         pending_connection_for_events,
         playback_session,
@@ -3119,6 +3146,66 @@ fn replace_existing_local_track(rows: &mut [TrackObject], replacement: &TrackObj
     true
 }
 
+/// Pure GTK-side acceptance state for the authoritative sidebar stream.
+///
+/// A full snapshot replaces the prior projection only when its durable
+/// revision is strictly newer. This makes delayed delivery harmless without
+/// inventing optimistic rollback patches in GTK.
+#[derive(Debug, Default)]
+struct PlaylistSidebarUiReducer {
+    last_revision: Option<PlaylistSidebarRevision>,
+    entries: Vec<PlaylistSidebarEntry>,
+    available: bool,
+}
+
+impl PlaylistSidebarUiReducer {
+    fn apply(&mut self, snapshot: PlaylistSidebarSnapshot) -> bool {
+        let revision = snapshot.revision();
+        if self
+            .last_revision
+            .is_some_and(|last_revision| revision <= last_revision)
+        {
+            return false;
+        }
+
+        self.last_revision = Some(revision);
+        match snapshot.into_state() {
+            PlaylistSidebarState::Ready(entries) => {
+                self.entries = entries;
+                self.available = true;
+            }
+            PlaylistSidebarState::Unavailable => {
+                self.entries.clear();
+                self.available = false;
+            }
+        }
+        true
+    }
+
+    fn entries(&self) -> &[PlaylistSidebarEntry] {
+        &self.entries
+    }
+
+    #[cfg(test)]
+    fn revision(&self) -> Option<PlaylistSidebarRevision> {
+        self.last_revision
+    }
+
+    fn is_available(&self) -> bool {
+        self.available
+    }
+
+    fn contains(&self, playlist_id: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.playlist_id() == playlist_id)
+    }
+
+    fn requires_active_fallback(&self, active_playlist_id: Option<&str>) -> bool {
+        active_playlist_id.is_some_and(|playlist_id| !self.contains(playlist_id))
+    }
+}
+
 /// Retire every cached playlist projection and reload the active one.
 ///
 /// A playback-history or rating commit can change smart-playlist membership
@@ -3208,6 +3295,7 @@ fn setup_library_events(
     column_view: &gtk::ColumnView,
     sidebar_store: gtk::gio::ListStore,
     sidebar_selection: gtk::SingleSelection,
+    playlist_sidebar_replacing: Rc<Cell<bool>>,
     scan_spinner: gtk::Spinner,
     pending_connection: Rc<RefCell<Option<PendingConnection>>>,
     playback_session: Rc<RefCell<PlaybackSession>>,
@@ -3225,6 +3313,7 @@ fn setup_library_events(
     let browser_rebuild_gen: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
     glib::MainContext::default().spawn_local(async move {
+        let mut playlist_sidebar_reducer = PlaylistSidebarUiReducer::default();
         while let Ok(event) = engine_rx.recv().await {
             match event {
                 LibraryEvent::FullSync(tracks) => {
@@ -3520,8 +3609,21 @@ fn setup_library_events(
                     );
                 }
 
-                LibraryEvent::PlaylistsLoaded(playlists) => {
-                    info!(count = playlists.len(), "Populating sidebar with playlists");
+                LibraryEvent::PlaylistsLoaded(snapshot) => {
+                    let revision = snapshot.revision();
+                    if !playlist_sidebar_reducer.apply(snapshot) {
+                        tracing::debug!(
+                            revision = revision.value(),
+                            "Ignoring stale playlist sidebar snapshot"
+                        );
+                        continue;
+                    }
+                    info!(
+                        count = playlist_sidebar_reducer.entries().len(),
+                        revision = revision.value(),
+                        available = playlist_sidebar_reducer.is_available(),
+                        "Applying playlist sidebar snapshot"
+                    );
                     let active_key = active_source_key.borrow().clone();
                     let active_playlist_id = source_navigation
                         .borrow()
@@ -3533,10 +3635,17 @@ fn setup_library_events(
                         })
                         .flatten();
 
+                    if playlist_sidebar_reducer
+                        .requires_active_fallback(active_playlist_id.as_deref())
+                    {
+                        info!("Active playlist disappeared from authoritative sidebar snapshot");
+                    }
+
                     replace_playlist_sidebar_snapshot(
                         &sidebar_store,
                         &sidebar_selection,
-                        &playlists,
+                        &playlist_sidebar_replacing,
+                        playlist_sidebar_reducer.entries(),
                         active_playlist_id.as_deref(),
                     );
                 }
@@ -3926,13 +4035,39 @@ enum PlaylistSidebarSelectionTarget {
     Unselect,
 }
 
+struct PlaylistSidebarReplacementGuard<'a> {
+    replacing: &'a Cell<bool>,
+    previous: bool,
+}
+
+impl<'a> PlaylistSidebarReplacementGuard<'a> {
+    fn enter(replacing: &'a Cell<bool>) -> Self {
+        let previous = replacing.replace(true);
+        Self {
+            replacing,
+            previous,
+        }
+    }
+}
+
+impl Drop for PlaylistSidebarReplacementGuard<'_> {
+    fn drop(&mut self) {
+        self.replacing.set(self.previous);
+    }
+}
+
 fn replace_playlist_sidebar_snapshot(
     sidebar_store: &gtk::gio::ListStore,
     sidebar_selection: &gtk::SingleSelection,
-    playlists: &[crate::local::engine::PlaylistSidebarEntry],
+    playlist_sidebar_replacing: &Cell<bool>,
+    playlists: &[crate::local::playlist_sidebar::PlaylistSidebarEntry],
     active_playlist_id: Option<&str>,
 ) {
-    match replace_playlist_sidebar_rows(sidebar_store, playlists, active_playlist_id) {
+    let target = {
+        let _replacement = PlaylistSidebarReplacementGuard::enter(playlist_sidebar_replacing);
+        replace_playlist_sidebar_rows(sidebar_store, playlists, active_playlist_id)
+    };
+    match target {
         PlaylistSidebarSelectionTarget::Unchanged => {}
         PlaylistSidebarSelectionTarget::Position(position) => {
             sidebar_selection.set_selected(position);
@@ -3954,7 +4089,7 @@ fn replace_playlist_sidebar_snapshot(
 /// display connection.
 fn replace_playlist_sidebar_rows(
     sidebar_store: &gtk::gio::ListStore,
-    playlists: &[crate::local::engine::PlaylistSidebarEntry],
+    playlists: &[crate::local::playlist_sidebar::PlaylistSidebarEntry],
     active_playlist_id: Option<&str>,
 ) -> PlaylistSidebarSelectionTarget {
     let playlist_header_pos = (0..sidebar_store.n_items()).find(|position| {
@@ -4150,7 +4285,7 @@ mod identity_tests {
         models::{Rating, Track, TrackRating},
         SourceId,
     };
-    use crate::local::engine::{PlaylistSidebarEntry, PlaylistSidebarKind};
+    use crate::local::playlist_sidebar::{PlaylistSidebarEntry, PlaylistSidebarKind};
 
     fn local_history_row(track_id: &str, uri: &str, play_count: u32) -> TrackObject {
         let row = TrackObject::new(
@@ -4173,6 +4308,133 @@ mod identity_tests {
         row
     }
 
+    fn sidebar_entry(id: &str, name: &str, kind: PlaylistSidebarKind) -> PlaylistSidebarEntry {
+        PlaylistSidebarEntry::new(id, name, kind)
+    }
+
+    fn sidebar_snapshot(
+        revision: i64,
+        entries: Vec<PlaylistSidebarEntry>,
+    ) -> PlaylistSidebarSnapshot {
+        PlaylistSidebarSnapshot::new(
+            PlaylistSidebarRevision::new(revision).expect("valid test revision"),
+            PlaylistSidebarState::Ready(entries),
+        )
+    }
+
+    #[test]
+    fn reversed_create_and_import_snapshots_cannot_erase_rows() {
+        let mut reducer = PlaylistSidebarUiReducer::default();
+        let created = sidebar_entry(
+            "created-id",
+            "Created",
+            PlaylistSidebarKind::EditableRegular,
+        );
+        let imported = sidebar_entry(
+            "imported-id",
+            "Imported",
+            PlaylistSidebarKind::EditableRegular,
+        );
+
+        assert!(reducer.apply(sidebar_snapshot(2, vec![created.clone(), imported.clone()],)));
+        assert!(!reducer.apply(sidebar_snapshot(1, Vec::new())));
+        assert_eq!(reducer.entries(), &[created, imported]);
+    }
+
+    #[test]
+    fn reversed_rename_and_delete_snapshots_cannot_revert_or_resurrect() {
+        let mut renamed = PlaylistSidebarUiReducer::default();
+        let after = sidebar_entry("playlist-id", "After", PlaylistSidebarKind::EditableRegular);
+        assert!(renamed.apply(sidebar_snapshot(9, vec![after.clone()])));
+        assert!(!renamed.apply(sidebar_snapshot(
+            8,
+            vec![sidebar_entry(
+                "playlist-id",
+                "Before",
+                PlaylistSidebarKind::EditableRegular,
+            )],
+        )));
+        assert_eq!(renamed.entries(), &[after]);
+
+        let mut deleted = PlaylistSidebarUiReducer::default();
+        assert!(deleted.apply(sidebar_snapshot(11, Vec::new())));
+        assert!(!deleted.apply(sidebar_snapshot(
+            10,
+            vec![sidebar_entry(
+                "deleted-id",
+                "Deleted",
+                PlaylistSidebarKind::EditableRegular,
+            )],
+        )));
+        assert!(deleted.entries().is_empty());
+    }
+
+    #[test]
+    fn reversed_linked_kind_and_equal_revision_snapshots_are_ignored() {
+        use crate::db::entities::server_playlist_link::{
+            ServerPlaylistLocalState, ServerPlaylistRemoteState,
+        };
+
+        let mut reducer = PlaylistSidebarUiReducer::default();
+        let linked = sidebar_entry(
+            "mirror-id",
+            "Mirror",
+            PlaylistSidebarKind::PullMirror {
+                local_state: ServerPlaylistLocalState::Clean,
+                remote_state: ServerPlaylistRemoteState::Present,
+            },
+        );
+        assert!(reducer.apply(sidebar_snapshot(4, vec![linked.clone()])));
+        assert!(!reducer.apply(sidebar_snapshot(
+            3,
+            vec![sidebar_entry(
+                "mirror-id",
+                "Mirror",
+                PlaylistSidebarKind::EditableRegular,
+            )],
+        )));
+        assert!(!reducer.apply(sidebar_snapshot(4, Vec::new())));
+        assert_eq!(reducer.entries(), &[linked]);
+    }
+
+    #[test]
+    fn first_revision_zero_and_fresh_reducer_restart_are_accepted() {
+        let entry = sidebar_entry("zero-id", "Zero", PlaylistSidebarKind::EditableRegular);
+        for mut reducer in [
+            PlaylistSidebarUiReducer::default(),
+            PlaylistSidebarUiReducer::default(),
+        ] {
+            assert!(reducer.apply(sidebar_snapshot(0, vec![entry.clone()])));
+            assert_eq!(
+                reducer.revision(),
+                Some(PlaylistSidebarRevision::new(0).unwrap())
+            );
+            assert!(reducer.contains("zero-id"));
+        }
+    }
+
+    #[test]
+    fn unavailable_snapshot_clears_rows_and_requires_active_fallback() {
+        let mut reducer = PlaylistSidebarUiReducer::default();
+        assert!(reducer.apply(sidebar_snapshot(
+            0,
+            vec![sidebar_entry(
+                "active-id",
+                "Active",
+                PlaylistSidebarKind::EditableRegular,
+            )],
+        )));
+        assert!(reducer.contains("active-id"));
+        assert!(reducer.apply(PlaylistSidebarSnapshot::new(
+            PlaylistSidebarRevision::new(1).unwrap(),
+            PlaylistSidebarState::Unavailable,
+        )));
+        assert!(!reducer.is_available());
+        assert!(!reducer.contains("active-id"));
+        assert!(reducer.requires_active_fallback(Some("active-id")));
+        assert!(reducer.entries().is_empty());
+    }
+
     #[test]
     fn missing_active_playlist_snapshot_selects_the_structural_local_source() {
         let store = gtk::gio::ListStore::new::<SourceObject>();
@@ -4193,10 +4455,10 @@ mod identity_tests {
             HeaderKind::Playlists,
         ));
         store.append(&SourceObject::playlist_entry(
-            &crate::local::engine::PlaylistSidebarEntry::new(
+            &crate::local::playlist_sidebar::PlaylistSidebarEntry::new(
                 "removed-playlist-id",
                 "Removed",
-                crate::local::engine::PlaylistSidebarKind::EditableRegular,
+                crate::local::playlist_sidebar::PlaylistSidebarKind::EditableRegular,
             ),
         ));
         store.append(&SourceObject::header(
@@ -4218,6 +4480,29 @@ mod identity_tests {
                 .and_downcast::<SourceObject>()
                 .is_some_and(|source| !source.is_playlist())
         }));
+    }
+
+    #[test]
+    fn replacement_guard_spans_model_mutation_and_restores_prior_state() {
+        let replacing = Cell::new(false);
+        {
+            let _replacement = PlaylistSidebarReplacementGuard::enter(&replacing);
+            assert!(
+                replacing.get(),
+                "intermediate selection signals must be suppressed"
+            );
+        }
+        assert!(!replacing.get());
+
+        replacing.set(true);
+        {
+            let _nested = PlaylistSidebarReplacementGuard::enter(&replacing);
+            assert!(replacing.get());
+        }
+        assert!(
+            replacing.get(),
+            "a nested guard must preserve its caller's suppression"
+        );
     }
 
     #[test]

@@ -1168,7 +1168,8 @@ mod tests {
         use crate::db::entities::server_playlist_link::{
             ServerPlaylistLocalState, ServerPlaylistRemoteState,
         };
-        use crate::ui::objects::{PlaylistSidebarEntry, PlaylistSidebarKind};
+        use crate::local::playlist_sidebar::PlaylistSidebarEntry;
+        use crate::ui::objects::PlaylistSidebarKind;
 
         let store = gtk::gio::ListStore::new::<SourceObject>();
         for entry in [
