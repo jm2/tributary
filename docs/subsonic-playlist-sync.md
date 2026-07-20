@@ -35,7 +35,8 @@ The feature is split into three independently reviewable records:
    detection, successful atomic replacement, missing-server state, unlink, and removal.
 3. **In progress — UI, localization, and end-to-end behavior.** Structural header/playlist
    identity, joined durable link presentation, ordinary-action exclusion, commit-only local CRUD,
-   atomic smart creation, and the localized recovery-shell plan are implemented. The shell is
+   atomic smart creation, and the localized recovery-shell plan are implemented in
+   [#146](https://github.com/jm2/tributary/pull/146). The shell is
    initially hidden and grants no authority. Follow-on slices add the exact-session latest-request
    coordinator, one monotonic or serialized full-sidebar publication owner, reconnect/shutdown
    integration, virtualized Import Copy/Keep Synced browser, Sync Now, and

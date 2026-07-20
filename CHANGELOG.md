@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Server-native playlist UI now has fail-closed structural and localization groundwork** —
+- **Server-native playlist UI now has fail-closed structural and localization groundwork**
+  ([#146](https://github.com/jm2/tributary/pull/146)) —
   Sidebar sections and playlists carry typed identities instead of treating translated labels or
   compatibility backend strings as authority. The library engine publishes playlists and optional
   pull links from one deterministic joined snapshot; a valid link always wins over the parent

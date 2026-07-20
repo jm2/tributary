@@ -37,7 +37,8 @@ metadata export still needs an explicit no-locator policy. Subsonic server-nativ
 integration remains a separate capability with its own
 [`subsonic-playlist-sync.md`](subsonic-playlist-sync.md) contract. Its bounded read-only protocol and
 exact-session read/commit authority, strict link persistence, and atomic import/pull/conflict engine
-are implemented without reusing or widening this regular-playlist authority. Record E now also has
+are implemented without reusing or widening this regular-playlist authority. Record E
+[#146](https://github.com/jm2/tributary/pull/146) now also has
 typed read-only sidebar state, ordinary-action exclusion, commit-only local CRUD publication, and
 the localized recovery-shell plan. Its coordinator, one ordered full-sidebar publication lane,
 reconnect scheduling, browser, and wired server-playlist controls remain separate follow-on slices.
@@ -315,7 +316,8 @@ absence result that minted it, so authority from another live operation cannot a
 snapshot. Neither mode metadata-matches a missing server track. The complete direction, revision,
 conflict, offline, server-deletion, and unlink policy is in the server-native contract.
 
-The UI now consumes playlist parents and optional links as one ordered typed snapshot. Link
+The UI groundwork in [#146](https://github.com/jm2/tributary/pull/146) now consumes playlist
+parents and optional links as one ordered typed snapshot. Link
 presence wins over the legacy smart flag, invalid link state rejects publication rather than
 falling back to an editable playlist, and only the local playlist ID plus durable presentation state
 cross into GTK. Structural header/playlist kinds replace translated-name and backend-string

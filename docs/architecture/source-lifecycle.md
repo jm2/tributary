@@ -847,7 +847,8 @@ metadata export remains a separate deferred policy.
     an operation-bound, session-only permit after SQL staging; persistence verifies it belongs to
     the same sealed pull or absence evidence and retains it through commit, closing both authority-
     substitution and fetch-to-commit lifecycle races without requiring catalogue membership.
-12. **Server-native UI structural groundwork complete:** the library publishes one deterministic
+12. **Server-native UI structural groundwork complete
+    ([#146](https://github.com/jm2/tributary/pull/146)):** the library publishes one deterministic
     playlist/link join whose typed row state makes link presence win over legacy smart flags.
     Translated header labels and compatibility backend strings no longer decide playlist section
     membership or editability. GTK retains no native playlist ID; clean, conflict, present, and

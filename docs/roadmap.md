@@ -194,7 +194,8 @@ before starting large protocol or transfer subsystems.
    sealed pull or absence result, so pre-admission staleness rolls back and invalidation after
    admission waits for commit. Pull, conflict, explicit Replace, complete-list missing, Unlink, and
    explicit removal are atomic; ordinary mutation and reconciliation reject linked mirrors.
-   Record E structural UI groundwork now publishes typed joined link/sidebar state, keeps mirrors
+   Record E structural UI groundwork ([#146](https://github.com/jm2/tributary/pull/146)) now
+   publishes typed joined link/sidebar state, keeps mirrors
    out of ordinary mutation affordances, publishes ordinary CRUD only after commit, and reserves a
    separate localized recovery/status shell. The GTK-free reconnect/manual coordinator,
    latest-request generation lane, one monotonic or serialized full-sidebar publication owner,
