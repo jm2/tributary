@@ -35,6 +35,12 @@ pub struct WindowState {
     /// Used by: source_connect (RemoteSync after auth).
     pub engine_tx: async_channel::Sender<LibraryEvent>,
 
+    /// Coalescing request handle for the engine-owned, versioned playlist
+    /// sidebar publisher. Playlist mutations request a complete replacement;
+    /// GTK never patches individual playlist rows optimistically.
+    /// Used by: playlist_actions.
+    pub playlist_sidebar_refresh: crate::local::playlist_sidebar::PlaylistSidebarRefresh,
+
     /// Sole lifecycle/media authority for source-owned media.
     pub source_registry: crate::source_registry::SourceRegistry,
 
@@ -79,6 +85,12 @@ pub struct WindowState {
     /// Sidebar selection model.
     /// Used by: discovery_handler, source_connect, window.
     pub sidebar_selection: gtk::SingleSelection,
+
+    /// True only while the authoritative playlist snapshot is replacing
+    /// model rows. Source navigation ignores the intermediate GTK selection
+    /// signals; the replacement publishes its one final target afterward.
+    /// Used by: source_connect, window.
+    pub playlist_sidebar_replacing: Rc<Cell<bool>>,
 
     // ── Browser + tracklist widgets ─────────────────────────────────
     /// The 3-pane genre/artist/album browser widget.

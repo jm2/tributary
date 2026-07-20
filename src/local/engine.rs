@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, Set, Statement, TransactionTrait,
+    Set, Statement, TransactionTrait,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -31,13 +31,11 @@ use crate::architecture::{
     models::{Rating, Track, TrackRating},
     TrackId,
 };
-use crate::db::entities::server_playlist_link::{
-    ServerPlaylistLocalState, ServerPlaylistRemoteState, StoredServerPlaylistLink,
-    MAX_SERVER_PLAYLIST_LINK_NAME_BYTES,
-};
-use crate::db::entities::{
-    library_root, playlist, playlist_entry, root_reauthorization_receipt, server_playlist_link,
-    track,
+use crate::db::entities::{library_root, playlist_entry, root_reauthorization_receipt, track};
+
+use super::playlist_sidebar::{
+    PlaylistSidebarRefresh, PlaylistSidebarRefreshReceiver, PlaylistSidebarRefreshRequest,
+    PlaylistSidebarSnapshot,
 };
 
 /// Frozen namespace for projecting a legacy non-UUID SQLite track key into
@@ -53,151 +51,11 @@ const LOCAL_TRACK_COMPAT_NAMESPACE: Uuid =
 // LibraryEvent — messages sent to GTK main thread
 // ---------------------------------------------------------------------------
 
-/// Authoritative mutability and link-state presentation for one playlist row.
-///
-/// A pull mirror remains a regular-playlist navigation target, but this typed
-/// value prevents UI code from inferring editability from its compatible
-/// `"playlist"` backend string.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PlaylistSidebarKind {
-    EditableRegular,
-    EditableSmart,
-    PullMirror {
-        local_state: ServerPlaylistLocalState,
-        remote_state: ServerPlaylistRemoteState,
-    },
-}
-
-/// One playlist sidebar row published from a single joined database read.
-///
-/// Native server-playlist identity is intentionally absent. The local ID and
-/// effective display name remain private fields, and diagnostics expose only
-/// their lengths so a server-supplied mirrored name cannot reach logs through
-/// `LibraryEvent`'s derived `Debug` implementation.
-#[derive(Clone, Eq, PartialEq)]
-pub struct PlaylistSidebarEntry {
-    playlist_id: String,
-    name: String,
-    kind: PlaylistSidebarKind,
-}
-
-impl PlaylistSidebarEntry {
-    pub fn new(
-        playlist_id: impl Into<String>,
-        name: impl Into<String>,
-        kind: PlaylistSidebarKind,
-    ) -> Self {
-        Self {
-            playlist_id: playlist_id.into(),
-            name: name.into(),
-            kind,
-        }
-    }
-
-    pub fn playlist_id(&self) -> &str {
-        &self.playlist_id
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub const fn kind(&self) -> PlaylistSidebarKind {
-        self.kind
-    }
-}
-
-impl std::fmt::Debug for PlaylistSidebarEntry {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PlaylistSidebarEntry")
-            .field("playlist_id_byte_len", &self.playlist_id.len())
-            .field("name_byte_len", &self.name.len())
-            .field("kind", &self.kind)
-            .finish()
-    }
-}
-
-/// Load playlist rows and optional pull links in one ordered query.
-///
-/// Link presence is evaluated before the legacy `is_smart` flag. A damaged
-/// parent row therefore cannot expose a linked mirror as editable. Invalid
-/// link storage rejects the complete publication instead of falling back to
-/// an editable row.
-async fn load_playlist_sidebar_entries<C>(
-    db: &C,
-) -> Result<Vec<PlaylistSidebarEntry>, sea_orm::DbErr>
-where
-    C: ConnectionTrait,
-{
-    let rows = playlist::Entity::find()
-        .find_also_related(server_playlist_link::Entity)
-        .order_by_asc(playlist::Column::CreatedAt)
-        .order_by_asc(playlist::Column::Id)
-        .all(db)
-        .await?;
-
-    rows.into_iter()
-        .map(|(playlist, link)| {
-            let kind = if let Some(link) = link {
-                let link = StoredServerPlaylistLink::try_from(link).map_err(|error| {
-                    sea_orm::DbErr::Custom(format!(
-                        "Invalid server-playlist link in sidebar snapshot: {error}"
-                    ))
-                })?;
-                if playlist.name.len() > MAX_SERVER_PLAYLIST_LINK_NAME_BYTES {
-                    return Err(sea_orm::DbErr::Custom(
-                        "Linked playlist display name exceeds the byte limit".to_string(),
-                    ));
-                }
-                PlaylistSidebarKind::PullMirror {
-                    local_state: link.local_state,
-                    remote_state: link.remote_state,
-                }
-            } else if playlist.is_smart {
-                PlaylistSidebarKind::EditableSmart
-            } else {
-                PlaylistSidebarKind::EditableRegular
-            };
-            Ok(PlaylistSidebarEntry::new(playlist.id, playlist.name, kind))
-        })
-        .collect()
-}
-
-/// Publish one authoritative playlist-sidebar snapshot.
-///
-/// A joined-row decode failure is itself authoritative negative evidence for
-/// presentation: publishing an empty typed snapshot removes any older editable
-/// rows instead of leaving stale actions available after persistence has become
-/// unreadable. The warning is content-free because link decoding exposes only
-/// closed validation categories.
-async fn publish_playlist_sidebar_snapshot<C>(db: &C, tx: &async_channel::Sender<LibraryEvent>)
-where
-    C: ConnectionTrait,
-{
-    let entries = match load_playlist_sidebar_entries(db).await {
-        Ok(entries) => entries,
-        Err(error) => {
-            warn!(%error, "Failed to load authoritative playlist sidebar state");
-            Vec::new()
-        }
-    };
-    if !entries.is_empty() {
-        info!(count = entries.len(), "Sending playlists to UI");
-    }
-    let _ = tx.send(LibraryEvent::PlaylistsLoaded(entries)).await;
-}
-
 /// Seed an empty playlist table when possible, then always attempt one
-/// authoritative joined publication.
-///
-/// The publication deliberately sits outside the seed-decision result: even a
-/// failed preliminary list query must retract stale GTK rows if the joined
-/// state is also unreadable.
-async fn seed_default_playlists_and_publish(
-    db: &DatabaseConnection,
+/// versioned publication through the engine-owned publisher.
+async fn seed_default_playlists_and_request(
     playlist_manager: &super::playlist_manager::PlaylistManager,
-    tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
 ) {
     match playlist_manager.list_playlists().await {
         Ok(playlists) if playlists.is_empty() => {
@@ -210,11 +68,12 @@ async fn seed_default_playlists_and_publish(
         Err(error) => warn!(%error, "Failed to load playlists before default seeding"),
     }
 
-    // Re-read playlists together with their optional pull links in one query
-    // after any seeding commit. Link presence, rather than the legacy parent
-    // smart flag, is the authoritative read-only classification exposed to
-    // GTK. Failure publishes an empty typed snapshot.
-    publish_playlist_sidebar_snapshot(db, tx).await;
+    if matches!(
+        playlist_sidebar_refresh.request(),
+        PlaylistSidebarRefreshRequest::Closed
+    ) {
+        warn!("Playlist sidebar publisher stopped before scan refresh");
+    }
 }
 
 /// Events sent from the background engine to the GTK main thread.
@@ -232,7 +91,7 @@ pub enum LibraryEvent {
     ScanComplete,
     /// Playlists and their authoritative editability/link presentation loaded
     /// from one joined database snapshot.
-    PlaylistsLoaded(Vec<PlaylistSidebarEntry>),
+    PlaylistsLoaded(PlaylistSidebarSnapshot),
     /// Persisted track changes and any resulting playlist reconciliation have
     /// settled, so active playlist projections should be loaded again.
     PlaylistProjectionsInvalidated,
@@ -472,6 +331,8 @@ pub struct LibraryEngine {
     pending_root_reauthorizations: Vec<RootReauthorizationRequest>,
     tx: async_channel::Sender<LibraryEvent>,
     command_rx: async_channel::Receiver<LibraryCommand>,
+    playlist_sidebar_refresh: PlaylistSidebarRefresh,
+    playlist_sidebar_refresh_rx: PlaylistSidebarRefreshReceiver,
 }
 
 impl LibraryEngine {
@@ -484,6 +345,8 @@ impl LibraryEngine {
         pending_root_reauthorizations: Vec<RootReauthorizationRequest>,
         tx: async_channel::Sender<LibraryEvent>,
         command_rx: async_channel::Receiver<LibraryCommand>,
+        playlist_sidebar_refresh: PlaylistSidebarRefresh,
+        playlist_sidebar_refresh_rx: PlaylistSidebarRefreshReceiver,
     ) -> Self {
         Self {
             db,
@@ -491,6 +354,8 @@ impl LibraryEngine {
             pending_root_reauthorizations,
             tx,
             command_rx,
+            playlist_sidebar_refresh,
+            playlist_sidebar_refresh_rx,
         }
     }
 
@@ -503,8 +368,33 @@ impl LibraryEngine {
             pending_root_reauthorizations,
             tx,
             command_rx,
+            playlist_sidebar_refresh,
+            playlist_sidebar_refresh_rx,
         } = self;
         let db = Arc::new(db);
+
+        // This engine instance is the sole owner of both the database-backed
+        // publisher and its event bridge. The refresh signal can be requested
+        // before startup and coalesces while the database owner is busy.
+        let (playlist_snapshot_tx, playlist_snapshot_rx) = async_channel::bounded(1);
+        let playlist_publisher =
+            tokio::spawn(super::playlist_sidebar::run_playlist_sidebar_publisher(
+                db.as_ref().clone(),
+                playlist_sidebar_refresh_rx,
+                playlist_snapshot_tx,
+            ));
+        let playlist_event_tx = tx.clone();
+        let playlist_bridge = tokio::spawn(async move {
+            while let Ok(snapshot) = playlist_snapshot_rx.recv().await {
+                if playlist_event_tx
+                    .send(LibraryEvent::PlaylistsLoaded(snapshot))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
 
         // Resolve explicit old→new identity transfers before either path can
         // be watched or scanned. A rejected request keeps only the old path;
@@ -533,7 +423,7 @@ impl LibraryEngine {
         for dir in &music_dirs {
             info!(dir = %dir.display(), "Starting initial library scan");
         }
-        if let Err(e) = initial_scan(&db, &music_dirs, &tx).await {
+        if let Err(e) = initial_scan(&db, &music_dirs, &tx, &playlist_sidebar_refresh).await {
             error!(error = %e, "Initial scan failed");
             let _ = tx.send(LibraryEvent::Error(e.to_string())).await;
         }
@@ -560,6 +450,7 @@ impl LibraryEngine {
                 &command_rx,
                 &mut completed_commands,
                 watcher,
+                &playlist_sidebar_refresh,
             )
             .await
             {
@@ -577,8 +468,17 @@ impl LibraryEngine {
             &tx,
             &command_rx,
             &mut completed_commands,
+            &playlist_sidebar_refresh,
         )
         .await;
+
+        playlist_sidebar_refresh.close();
+        if let Err(error) = playlist_publisher.await {
+            warn!(%error, "Playlist sidebar publisher task failed");
+        }
+        if let Err(error) = playlist_bridge.await {
+            warn!(%error, "Playlist sidebar event bridge task failed");
+        }
     }
 }
 
@@ -2987,6 +2887,7 @@ async fn begin_root_trust_command(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     request: &RootTrustRequest,
 ) -> Result<RootTrustCommandStart, RootTrustError> {
     let marker_identity = stage_root_trust(db, music_dirs, request).await?;
@@ -3014,6 +2915,7 @@ async fn begin_root_trust_command(
         &forced_conversions,
         &authority_guards,
         &evidence_refreshes,
+        playlist_sidebar_refresh,
     )
     .await
     {
@@ -3052,6 +2954,7 @@ async fn complete_root_trust_scan(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     pending: &PendingRootTrustScan,
 ) -> RootTrustOutcome {
     match gate_root_trust_authoritative_scan(db, pending).await {
@@ -3083,6 +2986,7 @@ async fn complete_root_trust_scan(
         &forced_conversions,
         &authority_guards,
         &evidence_refreshes,
+        playlist_sidebar_refresh,
     )
     .await
     {
@@ -3141,12 +3045,13 @@ async fn refresh_root_trust_evidence(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
 ) {
     // A legacy confirmation can create its random marker immediately before
     // a database failure. The marker is deliberately not treated as proof of
     // the earlier command: rescan it as new evidence and require a fresh
     // adoption request instead.
-    if let Err(error) = initial_scan(db, music_dirs, tx).await {
+    if let Err(error) = initial_scan(db, music_dirs, tx, playlist_sidebar_refresh).await {
         warn!(%error, "Could not refresh library root trust evidence after a rejected command");
     }
 }
@@ -3155,6 +3060,7 @@ async fn refresh_unavailable_root_trust_evidence(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     refresh: RootTrustEvidenceRefresh,
 ) {
     // A staged command can finish unavailable without producing a watcher
@@ -3172,6 +3078,7 @@ async fn refresh_unavailable_root_trust_evidence(
         &forced_conversions,
         &authority_guards,
         &evidence_refreshes,
+        playlist_sidebar_refresh,
     )
     .await
     {
@@ -3258,6 +3165,7 @@ async fn process_library_command(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
     command: LibraryCommand,
 ) -> Option<PendingRootTrustScan> {
@@ -3323,7 +3231,7 @@ async fn process_library_command(
         return None;
     }
 
-    match begin_root_trust_command(db, music_dirs, tx, &request).await {
+    match begin_root_trust_command(db, music_dirs, tx, playlist_sidebar_refresh, &request).await {
         Ok(RootTrustCommandStart::Pending(pending)) => Some(pending),
         Ok(RootTrustCommandStart::Unavailable(refresh)) => {
             finish_root_trust_command(
@@ -3337,7 +3245,14 @@ async fn process_library_command(
                 },
             )
             .await;
-            refresh_unavailable_root_trust_evidence(db, music_dirs, tx, refresh).await;
+            refresh_unavailable_root_trust_evidence(
+                db,
+                music_dirs,
+                tx,
+                playlist_sidebar_refresh,
+                refresh,
+            )
+            .await;
             None
         }
         Err(RootTrustError::Stale(message)) => {
@@ -3358,7 +3273,7 @@ async fn process_library_command(
                 },
             )
             .await;
-            refresh_root_trust_evidence(db, music_dirs, tx).await;
+            refresh_root_trust_evidence(db, music_dirs, tx, playlist_sidebar_refresh).await;
             None
         }
         Err(RootTrustError::Failed(error)) => {
@@ -3379,7 +3294,7 @@ async fn process_library_command(
                 },
             )
             .await;
-            refresh_root_trust_evidence(db, music_dirs, tx).await;
+            refresh_root_trust_evidence(db, music_dirs, tx, playlist_sidebar_refresh).await;
             None
         }
     }
@@ -3389,10 +3304,12 @@ async fn finish_pending_root_trust_scan(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
     pending: PendingRootTrustScan,
 ) {
-    let outcome = complete_root_trust_scan(db, music_dirs, tx, &pending).await;
+    let outcome =
+        complete_root_trust_scan(db, music_dirs, tx, playlist_sidebar_refresh, &pending).await;
     finish_root_trust_command(
         tx,
         completed_commands,
@@ -3412,6 +3329,7 @@ async fn process_library_commands_without_watcher(
     tx: &async_channel::Sender<LibraryEvent>,
     command_rx: &async_channel::Receiver<LibraryCommand>,
     completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
 ) {
     let mut pending_trust_scan = None;
     loop {
@@ -3420,15 +3338,30 @@ async fn process_library_commands_without_watcher(
         // point where the newly confirmed marker may authorize content writes
         // and stale deletion.
         if let Some(pending) = pending_trust_scan.take() {
-            finish_pending_root_trust_scan(db, music_dirs, tx, completed_commands, pending).await;
+            finish_pending_root_trust_scan(
+                db,
+                music_dirs,
+                tx,
+                playlist_sidebar_refresh,
+                completed_commands,
+                pending,
+            )
+            .await;
             continue;
         }
 
         let Ok(command) = command_rx.recv().await else {
             break;
         };
-        pending_trust_scan =
-            process_library_command(db, music_dirs, tx, completed_commands, command).await;
+        pending_trust_scan = process_library_command(
+            db,
+            music_dirs,
+            tx,
+            playlist_sidebar_refresh,
+            completed_commands,
+            command,
+        )
+        .await;
     }
 }
 
@@ -3436,6 +3369,7 @@ async fn initial_scan(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
 ) -> anyhow::Result<()> {
     let forced_conversions = HashMap::new();
     let authority_guards = HashMap::new();
@@ -3447,6 +3381,7 @@ async fn initial_scan(
         &forced_conversions,
         &authority_guards,
         &evidence_refreshes,
+        playlist_sidebar_refresh,
     )
     .await
 }
@@ -3458,6 +3393,7 @@ async fn initial_scan_with_root_trust_guards(
     forced_conversions: &HashMap<PathBuf, ForcedRootTrustConversion>,
     authority_guards: &HashMap<PathBuf, RootTrustAuthorityGuard>,
     evidence_refreshes: &HashMap<PathBuf, RootTrustEvidenceRefresh>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
 ) -> anyhow::Result<()> {
     // The explicit conversion pass establishes only root identity. Track
     // upserts and deletions are reserved for the separate ordinary scan that
@@ -4063,10 +3999,9 @@ async fn initial_scan_with_root_trust_guards(
         Err(e) => warn!(error = %e, "Playlist reconciliation failed"),
     }
 
-    // Send one authoritative playlist list to the UI after the best-effort
-    // default-seeding decision. Publication itself always runs so a database
-    // failure cannot leave stale editable sidebar rows in place.
-    seed_default_playlists_and_publish(db, &playlist_mgr, tx).await;
+    // Seed first, then ask the sole versioned publisher to re-read the complete
+    // joined projection. Repeated scans use the same coalescing path.
+    seed_default_playlists_and_request(&playlist_mgr, playlist_sidebar_refresh).await;
     let _ = tx.send(LibraryEvent::PlaylistProjectionsInvalidated).await;
 
     if !trust_requests.is_empty() {
@@ -5189,6 +5124,7 @@ async fn reconcile_unreliable_watcher_stream(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     rx: &mut mpsc::Receiver<notify::Result<notify::Event>>,
 ) -> bool {
     // The queued backlog belongs to the same stream gap and cannot be applied
@@ -5198,7 +5134,7 @@ async fn reconcile_unreliable_watcher_stream(
     // loop iteration.
     discard_watcher_backlog(rx);
     info!("Reconciling library after filesystem watcher stream loss");
-    match initial_scan(db, music_dirs, tx).await {
+    match initial_scan(db, music_dirs, tx, playlist_sidebar_refresh).await {
         Ok(()) => true,
         Err(error) => {
             warn!(%error, "Watcher stream reconciliation failed; retry remains pending");
@@ -5211,6 +5147,7 @@ async fn reconcile_root_marker_mutations(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     roots: &HashSet<PathBuf>,
 ) -> bool {
     // Invalidate persisted authorization before any asynchronous traversal.
@@ -5220,7 +5157,7 @@ async fn reconcile_root_marker_mutations(
         mark_root_path_unavailable(db, root).await;
     }
     info!("Reconciling library after library root marker mutation");
-    match initial_scan(db, music_dirs, tx).await {
+    match initial_scan(db, music_dirs, tx, playlist_sidebar_refresh).await {
         Ok(()) => true,
         Err(error) => {
             warn!(%error, "Library root marker reconciliation failed; retry remains pending");
@@ -5236,6 +5173,7 @@ async fn process_directory_events(
     command_rx: &async_channel::Receiver<LibraryCommand>,
     completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
     mut watcher: DirectoryWatcher,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
 ) -> anyhow::Result<()> {
     // ── Debounced event processing ──────────────────────────────
     // Collect filesystem events for a short window, deduplicate by
@@ -5256,6 +5194,7 @@ async fn process_directory_events(
                 db.as_ref(),
                 music_dirs,
                 tx,
+                playlist_sidebar_refresh,
                 completed_commands,
                 pending,
             )
@@ -5272,6 +5211,7 @@ async fn process_directory_events(
                         db.as_ref(),
                         music_dirs,
                         tx,
+                        playlist_sidebar_refresh,
                         completed_commands,
                         command,
                     )
@@ -5288,9 +5228,14 @@ async fn process_directory_events(
             if overflowed {
                 warn!("Filesystem watcher ingress overflowed");
             }
-            reconciliation_pending =
-                !reconcile_unreliable_watcher_stream(db.as_ref(), music_dirs, tx, &mut watcher.rx)
-                    .await;
+            reconciliation_pending = !reconcile_unreliable_watcher_stream(
+                db.as_ref(),
+                music_dirs,
+                tx,
+                playlist_sidebar_refresh,
+                &mut watcher.rx,
+            )
+            .await;
             if reconciliation_pending {
                 tokio::time::sleep(Duration::from_millis(WATCHER_RECONCILIATION_RETRY_MS)).await;
             }
@@ -5309,6 +5254,7 @@ async fn process_directory_events(
                                 db.as_ref(),
                                 music_dirs,
                                 tx,
+                                playlist_sidebar_refresh,
                                 completed_commands,
                                 command,
                             ).await;
@@ -5367,6 +5313,7 @@ async fn process_directory_events(
                 db.as_ref(),
                 music_dirs,
                 tx,
+                playlist_sidebar_refresh,
                 &batch.identity_changed_roots,
             )
             .await;
@@ -6038,7 +5985,9 @@ async fn process_directory_events(
         reconciliation_required |= root_cache.authority_was_lost();
         if reconciliation_required {
             info!("Reconciling library after unpaired or unclaimed watcher changes");
-            if let Err(error) = initial_scan(db.as_ref(), music_dirs, tx).await {
+            if let Err(error) =
+                initial_scan(db.as_ref(), music_dirs, tx, playlist_sidebar_refresh).await
+            {
                 warn!(%error, "Watcher-triggered library reconciliation failed");
             }
             continue;
@@ -6570,262 +6519,10 @@ mod tests {
         format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4())
     }
 
-    async fn insert_sidebar_playlist(
-        db: &DatabaseConnection,
-        id: &str,
-        name: &str,
-        is_smart: bool,
-        created_at: &str,
-    ) {
-        playlist::ActiveModel {
-            id: Set(id.to_string()),
-            name: Set(name.to_string()),
-            is_smart: Set(is_smart),
-            smart_rules_json: Set(None),
-            limit_enabled: Set(false),
-            limit_value: Set(None),
-            limit_unit: Set(None),
-            limit_sort: Set(None),
-            match_mode: Set("all".to_string()),
-            live_updating: Set(true),
-            created_at: Set(created_at.to_string()),
-            updated_at: Set(created_at.to_string()),
-        }
-        .insert(db)
-        .await
-        .expect("insert sidebar playlist");
-    }
-
-    #[tokio::test]
-    async fn playlist_sidebar_snapshot_is_typed_redacted_and_link_presence_wins() {
-        use sea_orm::Database;
-        use sea_orm_migration::MigratorTrait;
-
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("open sidebar database");
-        crate::db::migration::Migrator::up(&db, None)
-            .await
-            .expect("run sidebar migrations");
-
-        insert_sidebar_playlist(
-            &db,
-            "regular-id",
-            "Editable regular",
-            false,
-            "2026-07-20T00:00:00Z",
-        )
-        .await;
-        insert_sidebar_playlist(
-            &db,
-            "smart-id",
-            "Editable smart",
-            true,
-            "2026-07-20T00:00:01Z",
-        )
-        .await;
-        // This parent deliberately has the corrupt legacy combination
-        // `is_smart = true` plus a pull link. Presence of the link must win so
-        // no ordinary smart-playlist mutation is exposed.
-        insert_sidebar_playlist(
-            &db,
-            "linked-smart-id",
-            "secret mirrored name",
-            true,
-            "2026-07-20T00:00:02Z",
-        )
-        .await;
-        server_playlist_link::ActiveModel {
-            playlist_id: Set("linked-smart-id".to_string()),
-            source_id: Set(crate::architecture::SourceId::random().to_string()),
-            native_playlist_id: Set("secret-native-playlist-id".to_string()),
-            mode: Set("pull_read_only_v1".to_string()),
-            last_synced_name: Set("secret mirrored name".to_string()),
-            digest_version: Set(1),
-            membership_digest: Set(vec![0; 32]),
-            last_success_at_ms: Set(1),
-            local_state: Set("conflict".to_string()),
-            remote_state: Set("missing".to_string()),
-            state_revision: Set(4),
-        }
-        .insert(&db)
-        .await
-        .expect("insert sidebar pull link");
-
-        let entries = load_playlist_sidebar_entries(&db)
-            .await
-            .expect("load typed sidebar snapshot");
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].kind(), PlaylistSidebarKind::EditableRegular);
-        assert_eq!(entries[1].kind(), PlaylistSidebarKind::EditableSmart);
-        assert_eq!(
-            entries[2].kind(),
-            PlaylistSidebarKind::PullMirror {
-                local_state: ServerPlaylistLocalState::Conflict,
-                remote_state: ServerPlaylistRemoteState::Missing,
-            }
-        );
-
-        let diagnostic = format!("{:?}", LibraryEvent::PlaylistsLoaded(entries));
-        assert!(!diagnostic.contains("secret-native-playlist-id"));
-        assert!(!diagnostic.contains("secret mirrored name"));
-        assert!(diagnostic.contains("PullMirror"));
-    }
-
-    #[tokio::test]
-    async fn malformed_link_publishes_an_empty_fail_closed_sidebar_snapshot() {
-        use sea_orm::{ConnectionTrait, Database};
-        use sea_orm_migration::MigratorTrait;
-
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("open sidebar database");
-        crate::db::migration::Migrator::up(&db, None)
-            .await
-            .expect("run sidebar migrations");
-        insert_sidebar_playlist(
-            &db,
-            "previously-editable-id",
-            "Previously editable",
-            false,
-            "2026-07-20T00:00:00Z",
-        )
-        .await;
-
-        // Migration 14 rejects this state. Bypass its check only to prove a
-        // damaged or externally modified database actively retracts every
-        // prior editable row rather than leaving stale GTK authority behind.
-        db.execute_unprepared("PRAGMA ignore_check_constraints = ON")
-            .await
-            .expect("disable checks for corrupt fixture");
-        server_playlist_link::ActiveModel {
-            playlist_id: Set("previously-editable-id".to_string()),
-            source_id: Set(crate::architecture::SourceId::random().to_string()),
-            native_playlist_id: Set("private-native-id".to_string()),
-            mode: Set("pull_read_only_v1".to_string()),
-            last_synced_name: Set("Private server name".to_string()),
-            digest_version: Set(1),
-            membership_digest: Set(vec![0; 32]),
-            last_success_at_ms: Set(1),
-            local_state: Set("invalid-local-state".to_string()),
-            remote_state: Set("present".to_string()),
-            state_revision: Set(0),
-        }
-        .insert(&db)
-        .await
-        .expect("insert corrupt sidebar link");
-        db.execute_unprepared("PRAGMA ignore_check_constraints = OFF")
-            .await
-            .expect("restore link checks");
-
-        let (tx, rx) = async_channel::bounded(1);
-        publish_playlist_sidebar_snapshot(&db, &tx).await;
-        let event = rx.recv().await.expect("one fail-closed publication");
-        let LibraryEvent::PlaylistsLoaded(entries) = event else {
-            panic!("expected typed playlist snapshot");
-        };
-        assert!(entries.is_empty());
-    }
-
-    #[tokio::test]
-    async fn linked_sidebar_name_accepts_the_limit_and_retracts_an_oversized_parent() {
-        use sea_orm::Database;
-        use sea_orm_migration::MigratorTrait;
-
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("open sidebar database");
-        crate::db::migration::Migrator::up(&db, None)
-            .await
-            .expect("run sidebar migrations");
-        let maximum_name = "x".repeat(MAX_SERVER_PLAYLIST_LINK_NAME_BYTES);
-        insert_sidebar_playlist(
-            &db,
-            "linked-name-boundary",
-            &maximum_name,
-            false,
-            "2026-07-20T00:00:00Z",
-        )
-        .await;
-        server_playlist_link::ActiveModel {
-            playlist_id: Set("linked-name-boundary".to_string()),
-            source_id: Set(crate::architecture::SourceId::random().to_string()),
-            native_playlist_id: Set("private-native-id".to_string()),
-            mode: Set("pull_read_only_v1".to_string()),
-            last_synced_name: Set("bounded synchronized name".to_string()),
-            digest_version: Set(1),
-            membership_digest: Set(vec![0; 32]),
-            last_success_at_ms: Set(1),
-            local_state: Set("clean".to_string()),
-            remote_state: Set("present".to_string()),
-            state_revision: Set(0),
-        }
-        .insert(&db)
-        .await
-        .expect("insert sidebar pull link");
-
-        let entries = load_playlist_sidebar_entries(&db)
-            .await
-            .expect("maximum-length linked name remains displayable");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name().len(), MAX_SERVER_PLAYLIST_LINK_NAME_BYTES);
-
-        let parent = playlist::Entity::find_by_id("linked-name-boundary")
-            .one(&db)
-            .await
-            .expect("load linked parent")
-            .expect("linked parent exists");
-        let mut parent: playlist::ActiveModel = parent.into();
-        parent.name = Set(format!(
-            "private-server-name-{}",
-            "x".repeat(MAX_SERVER_PLAYLIST_LINK_NAME_BYTES)
-        ));
-        parent
-            .update(&db)
-            .await
-            .expect("corrupt linked parent name");
-
-        let error = load_playlist_sidebar_entries(&db)
-            .await
-            .expect_err("oversized linked parent must fail closed");
-        let diagnostic = error.to_string();
-        assert!(diagnostic.contains("Linked playlist display name exceeds the byte limit"));
-        assert!(!diagnostic.contains("private-server-name"));
-
-        let (tx, rx) = async_channel::bounded(1);
-        publish_playlist_sidebar_snapshot(&db, &tx).await;
-        let LibraryEvent::PlaylistsLoaded(entries) =
-            rx.recv().await.expect("one fail-closed publication")
-        else {
-            panic!("expected typed playlist snapshot");
-        };
-        assert!(entries.is_empty());
-    }
-
-    #[tokio::test]
-    async fn failed_seed_probe_still_publishes_an_empty_authoritative_snapshot() {
-        use sea_orm::{ConnectionTrait, Database};
-        use sea_orm_migration::MigratorTrait;
-
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("open sidebar database");
-        crate::db::migration::Migrator::up(&db, None)
-            .await
-            .expect("run sidebar migrations");
-        db.execute_unprepared("DROP TABLE playlists")
-            .await
-            .expect("remove playlist table for failed seed probe");
-
-        let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
-        let (tx, rx) = async_channel::bounded(1);
-        seed_default_playlists_and_publish(&db, &manager, &tx).await;
-        let LibraryEvent::PlaylistsLoaded(entries) =
-            rx.recv().await.expect("one fail-closed publication")
-        else {
-            panic!("expected typed playlist snapshot");
-        };
-        assert!(entries.is_empty());
+    fn test_playlist_sidebar_refresh() -> PlaylistSidebarRefresh {
+        let (refresh, _receiver) =
+            super::super::playlist_sidebar::playlist_sidebar_refresh_channel();
+        refresh
     }
 
     async fn insert_reauthorization_root(
@@ -8332,8 +8029,15 @@ mod tests {
         drop(command_tx);
 
         let mut completed = HashMap::new();
-        process_library_commands_without_watcher(&db, &[], &event_tx, &command_rx, &mut completed)
-            .await;
+        process_library_commands_without_watcher(
+            &db,
+            &[],
+            &event_tx,
+            &command_rx,
+            &mut completed,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await;
         flush_rx
             .recv()
             .await
@@ -8431,8 +8135,15 @@ mod tests {
         drop(command_tx);
 
         let mut completed = HashMap::new();
-        process_library_commands_without_watcher(&db, &[], &event_tx, &command_rx, &mut completed)
-            .await;
+        process_library_commands_without_watcher(
+            &db,
+            &[],
+            &event_tx,
+            &command_rx,
+            &mut completed,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await;
         flush_rx
             .recv()
             .await
@@ -9120,29 +8831,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_scan_invalidates_playlist_projections_before_scan_complete() {
+    async fn initial_scan_requests_sidebar_refresh_and_invalidates_before_scan_complete() {
         let db = rename_test_database().await;
         let (event_tx, event_rx) = async_channel::unbounded();
+        let (playlist_sidebar_refresh, _playlist_sidebar_refresh_rx) =
+            super::super::playlist_sidebar::playlist_sidebar_refresh_channel();
 
-        initial_scan(&db, &[], &event_tx)
+        initial_scan(&db, &[], &event_tx, &playlist_sidebar_refresh)
             .await
             .expect("run empty initial scan");
+
+        assert_eq!(
+            playlist_sidebar_refresh.request(),
+            PlaylistSidebarRefreshRequest::Coalesced,
+            "the scan leaves one publisher refresh request pending"
+        );
 
         let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
         let invalidation_index = events
             .iter()
             .position(|event| matches!(event, LibraryEvent::PlaylistProjectionsInvalidated))
             .expect("initial scan invalidates playlist projections");
-        let playlists_loaded_index = events
-            .iter()
-            .position(|event| matches!(event, LibraryEvent::PlaylistsLoaded(_)))
-            .expect("initial scan publishes playlist rows");
         let completion_index = events
             .iter()
             .position(|event| matches!(event, LibraryEvent::ScanComplete))
             .expect("initial scan completes");
-        assert!(playlists_loaded_index < invalidation_index);
         assert!(invalidation_index < completion_index);
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, LibraryEvent::PlaylistsLoaded(_))));
         assert_eq!(
             events
                 .iter()
@@ -10369,11 +10086,15 @@ mod tests {
 
         let (event_tx, _event_rx) = async_channel::unbounded();
         let music_dirs = vec![target.path().to_path_buf(), other.path().to_path_buf()];
-        let RootTrustCommandStart::Pending(pending) =
-            begin_root_trust_command(&db, &music_dirs, &event_tx, &request)
-                .await
-                .expect("run forced conversion")
-        else {
+        let RootTrustCommandStart::Pending(pending) = begin_root_trust_command(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+            &request,
+        )
+        .await
+        .expect("run forced conversion") else {
             panic!("queue ordinary follow-up");
         };
 
@@ -10405,7 +10126,14 @@ mod tests {
         assert!(converted.last_scan_complete);
 
         assert_eq!(
-            complete_root_trust_scan(&db, &music_dirs, &event_tx, &pending).await,
+            complete_root_trust_scan(
+                &db,
+                &music_dirs,
+                &event_tx,
+                &test_playlist_sidebar_refresh(),
+                &pending,
+            )
+            .await,
             RootTrustOutcome::Active
         );
         assert!(track::Entity::find_by_id("conversion-target-track")
@@ -10453,9 +10181,15 @@ mod tests {
 
         let (event_tx, event_rx) = async_channel::unbounded();
         assert!(matches!(
-            begin_root_trust_command(&db, &[directory.path().to_path_buf()], &event_tx, &request,)
-                .await
-                .expect("run guarded conversion"),
+            begin_root_trust_command(
+                &db,
+                &[directory.path().to_path_buf()],
+                &event_tx,
+                &test_playlist_sidebar_refresh(),
+                &request,
+            )
+            .await
+            .expect("run guarded conversion"),
             RootTrustCommandStart::Unavailable(_)
         ));
         assert!(track::Entity::find_by_id("nonempty-to-empty-track")
@@ -10516,9 +10250,15 @@ mod tests {
 
         let (event_tx, event_rx) = async_channel::unbounded();
         assert!(matches!(
-            begin_root_trust_command(&db, &[directory.path().to_path_buf()], &event_tx, &request,)
-                .await
-                .expect("run guarded conversion"),
+            begin_root_trust_command(
+                &db,
+                &[directory.path().to_path_buf()],
+                &event_tx,
+                &test_playlist_sidebar_refresh(),
+                &request,
+            )
+            .await
+            .expect("run guarded conversion"),
             RootTrustCommandStart::Unavailable(_)
         ));
         assert!(track::Entity::find_by_id("empty-to-nonempty-track")
@@ -10610,6 +10350,7 @@ mod tests {
             &forced,
             &authority_guards,
             &evidence_refreshes,
+            &test_playlist_sidebar_refresh(),
         )
         .await
         .expect("run guarded conversion");
@@ -10671,9 +10412,15 @@ mod tests {
 
         let (event_tx, event_rx) = async_channel::unbounded();
         assert!(matches!(
-            begin_root_trust_command(&db, &[directory.path().to_path_buf()], &event_tx, &request,)
-                .await
-                .expect("run guarded replacement conversion"),
+            begin_root_trust_command(
+                &db,
+                &[directory.path().to_path_buf()],
+                &event_tx,
+                &test_playlist_sidebar_refresh(),
+                &request,
+            )
+            .await
+            .expect("run guarded replacement conversion"),
             RootTrustCommandStart::Unavailable(_)
         ));
 
@@ -10728,11 +10475,15 @@ mod tests {
         .await;
         let (event_tx, _event_rx) = async_channel::unbounded();
         let music_dirs = vec![directory.path().to_path_buf()];
-        let RootTrustCommandStart::Pending(pending) =
-            begin_root_trust_command(&db, &music_dirs, &event_tx, &request)
-                .await
-                .expect("convert root")
-        else {
+        let RootTrustCommandStart::Pending(pending) = begin_root_trust_command(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+            &request,
+        )
+        .await
+        .expect("convert root") else {
             panic!("queue follow-up");
         };
 
@@ -10750,7 +10501,14 @@ mod tests {
             .expect("inject conflicting active state");
 
         assert_eq!(
-            complete_root_trust_scan(&db, &music_dirs, &event_tx, &pending).await,
+            complete_root_trust_scan(
+                &db,
+                &music_dirs,
+                &event_tx,
+                &test_playlist_sidebar_refresh(),
+                &pending,
+            )
+            .await,
             RootTrustOutcome::TrustedButUnavailable
         );
         assert!(track::Entity::find_by_id("authority-gate-track")
@@ -10789,17 +10547,28 @@ mod tests {
         .await;
         let (event_tx, event_rx) = async_channel::unbounded();
         let music_dirs = vec![directory.path().to_path_buf()];
-        let RootTrustCommandStart::Pending(mut pending) =
-            begin_root_trust_command(&db, &music_dirs, &event_tx, &request)
-                .await
-                .expect("convert root")
-        else {
+        let RootTrustCommandStart::Pending(mut pending) = begin_root_trust_command(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+            &request,
+        )
+        .await
+        .expect("convert root") else {
             panic!("queue guarded follow-up");
         };
         pending.expected_mount_generation = pending.expected_mount_generation.wrapping_add(1);
 
         assert_eq!(
-            complete_root_trust_scan(&db, &music_dirs, &event_tx, &pending).await,
+            complete_root_trust_scan(
+                &db,
+                &music_dirs,
+                &event_tx,
+                &test_playlist_sidebar_refresh(),
+                &pending,
+            )
+            .await,
             RootTrustOutcome::TrustedButUnavailable
         );
         assert!(track::Entity::find_by_id("authority-mount-change-track")
@@ -10831,9 +10600,14 @@ mod tests {
             LibraryEvent::TrackRemoved(path) if path == remembered_path.to_string_lossy().as_ref()
         )));
 
-        initial_scan(&db, &music_dirs, &event_tx)
-            .await
-            .expect("run later ordinary scan");
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("run later ordinary scan");
         assert!(track::Entity::find_by_id("authority-mount-change-track")
             .one(&db)
             .await
@@ -10872,18 +10646,29 @@ mod tests {
         .await;
         let (event_tx, event_rx) = async_channel::unbounded();
         let music_dirs = vec![directory.path().to_path_buf()];
-        let RootTrustCommandStart::Pending(pending) =
-            begin_root_trust_command(&db, &music_dirs, &event_tx, &request)
-                .await
-                .expect("convert root")
-        else {
+        let RootTrustCommandStart::Pending(pending) = begin_root_trust_command(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+            &request,
+        )
+        .await
+        .expect("convert root") else {
             panic!("queue guarded follow-up");
         };
         let parked = directory.path().with_extension("temporarily-unavailable");
         std::fs::rename(directory.path(), &parked).expect("hide root before follow-up");
 
         assert_eq!(
-            complete_root_trust_scan(&db, &music_dirs, &event_tx, &pending).await,
+            complete_root_trust_scan(
+                &db,
+                &music_dirs,
+                &event_tx,
+                &test_playlist_sidebar_refresh(),
+                &pending,
+            )
+            .await,
             RootTrustOutcome::TrustedButUnavailable
         );
         let incomplete =
@@ -10906,9 +10691,14 @@ mod tests {
             .any(|event| matches!(event, LibraryEvent::RootTrustRequired(_))));
 
         std::fs::rename(&parked, directory.path()).expect("restore root after transient failure");
-        initial_scan(&db, &music_dirs, &event_tx)
-            .await
-            .expect("rescan restored root");
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("rescan restored root");
         let restored =
             library_root::Entity::find_by_id(directory.path().to_string_lossy().into_owned())
                 .one(&db)
@@ -10952,6 +10742,7 @@ mod tests {
             &db,
             &[directory.path().to_path_buf()],
             &event_tx,
+            &test_playlist_sidebar_refresh(),
             &mut completed,
             LibraryCommand::ConfirmRootTrust(request),
         )
@@ -11049,9 +10840,14 @@ mod tests {
             .await
             .expect("drop failure trigger");
         let (event_tx, event_rx) = async_channel::unbounded();
-        initial_scan(&db, &[directory.path().to_path_buf()], &event_tx)
-            .await
-            .expect("rescan orphan marker");
+        initial_scan(
+            &db,
+            &[directory.path().to_path_buf()],
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("rescan orphan marker");
         let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
         let fresh = events
             .iter()
@@ -11083,6 +10879,7 @@ mod tests {
             &db,
             &[directory.path().to_path_buf()],
             &event_tx,
+            &test_playlist_sidebar_refresh(),
             &mut completed,
             LibraryCommand::ConfirmRootTrust(request),
         )
@@ -11140,6 +10937,7 @@ mod tests {
             &event_tx,
             &command_rx,
             &mut completed,
+            &test_playlist_sidebar_refresh(),
         )
         .await;
 
@@ -11192,6 +10990,7 @@ mod tests {
             &db,
             &[directory.path().to_path_buf()],
             &event_tx,
+            &test_playlist_sidebar_refresh(),
             &mut completed,
             LibraryCommand::ConfirmRootTrust(request.clone()),
         )
@@ -11209,6 +11008,7 @@ mod tests {
             &db,
             &[directory.path().to_path_buf()],
             &event_tx,
+            &test_playlist_sidebar_refresh(),
             &mut completed,
             LibraryCommand::ConfirmRootTrust(request),
         )
@@ -11218,6 +11018,7 @@ mod tests {
             &db,
             &[directory.path().to_path_buf()],
             &event_tx,
+            &test_playlist_sidebar_refresh(),
             &mut completed,
             pending,
         )

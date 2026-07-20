@@ -39,7 +39,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Tiered geo-location (geo-distance → state → country) | ✅ |
 | Column drag-and-drop reordering with persistence | ✅ |
 | Regular & smart playlists (iTunes-style rules engine) | ✅ Regular playlists mix local and authenticated Subsonic/Jellyfin/Plex/DAAP entries; smart playlists remain local-library queries ([#142](https://github.com/jm2/tributary/pull/142)) |
-| Subsonic server-native playlist import/sync | 🚧 Pull-only contract, bounded reads, strict link persistence, atomic sync, typed read-only sidebar state, and localized recovery-shell groundwork are complete; the coordinator and user-facing actions/reconnect UX remain tracked in [#143](https://github.com/jm2/tributary/issues/143) |
+| Subsonic server-native playlist import/sync | 🚧 Pull-only contract, bounded reads, strict link persistence, atomic sync, typed read-only sidebar state, durable full-snapshot ordering, and localized recovery-shell groundwork are complete; the coordinator and user-facing actions/reconnect UX remain tracked in [#143](https://github.com/jm2/tributary/issues/143) |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
 | Batch metadata editing (multi-select) | ✅ |
@@ -758,10 +758,12 @@ Ordinary playlist sidebar changes now appear only after database commit, includi
 smart-playlist creation. A separate localized and accessible footer shell is reserved for sync and
 recovery status so the track-count label remains truthful. The shell is initially hidden: the
 engine APIs are not yet connected to user actions, and no server-playlist browser, manual/reconnect
-coordinator, or automatic scheduling ships yet. That coordinator will also give engine snapshots,
-ordinary CRUD, and future server-link changes one versioned or serialized full-sidebar publication
-lane; the current commit-only callbacks do not yet order themselves against a concurrent scan
-snapshot. See
+coordinator, or automatic scheduling ships yet. Migration 15 and a lifecycle-owned publisher now
+give scan seeding, ordinary CRUD, raw/cascade writes to the two domain tables, and server-link
+changes one durable revisioned full-sidebar lane. It reads each revision and complete redacted join
+coherently,
+coalesces refresh hints, polls for lost hints, and makes GTK ignore equal or older delivery instead
+of applying partial row callbacks. See
 [P1.5](docs/task.md#p15--persist-source-scoped-playlists), the
 [source-scoped regular-playlist contract](docs/source-scoped-playlists.md), and
 [#143](https://github.com/jm2/tributary/issues/143) for the remaining delivery stages.

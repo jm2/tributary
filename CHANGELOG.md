@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Playlist sidebar publication is now durably ordered and full-snapshot only** — Migration 15
+  adds one exact singleton SQLite revision and six guarded triggers over playlist parents and
+  server-playlist links. Effective inserts, updates, deletes, foreign-key cascades, and raw SQL
+  against either domain table advance the revision inside the writer's transaction; no-op updates
+  do not, and rollback cannot leak an increment. Startup revalidates the exact derived table and
+  trigger set so a missing, replaced, or extra trigger fails closed instead of silently weakening
+  ordering.
+  A lifecycle-owned publisher reads the revision and complete redacted playlist/link join in one
+  read transaction, coalesces explicit post-commit refresh hints, and periodically polls the
+  durable revision to recover from lost hints and non-UI writers. Read/schema failures retain the
+  last applicable snapshot for retry; a valid revision with malformed joined model data publishes
+  a versioned unavailable state instead of retaining stale editable rows. The first valid snapshot
+  is published; thereafter only strictly newer snapshots leave the publisher.
+  GTK now accepts its first versioned snapshot and then only a strictly newer one. A ready snapshot
+  replaces the whole playlist section; unavailable state clears it and selects structural Local
+  when the active playlist disappears. Intermediate selection signals are suppressed during row
+  replacement, then only the final retained playlist or structural fallback may navigate. Equal or
+  older delivery is ignored. Committed Create, Import, Rename, Delete, smart creation, and smart-rule
+  updates request a complete refresh; scan/default-seeding hints remain revision-gated even when no
+  write committed.
+  The former partial row insertion/rebind/removal callbacks are gone, so a delayed scan can no
+  longer erase a create/import, revert a rename, resurrect a delete, or roll back a mirror-state
+  classification. This slice performs no server listing, pull scheduling, browser work, or
+  recovery action; those remain in P1.5 Record E.
 - **Server-native playlist UI now has fail-closed structural and localization groundwork**
   ([#146](https://github.com/jm2/tributary/pull/146)) —
   Sidebar sections and playlists carry typed identities instead of treating translated labels or
@@ -32,11 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offline Retry; resets recycled action/accessibility state; and never presents a last-success time
   as freshness. All 13 locale catalogs provide the exact visible, confirmation, tooltip, and
   accessibility keys with tests that reject missing or English-fallback values. The shell remains
-  unwired and hidden until the next Record E coordinator/browser slices. That coordinator also
-  remains responsible for one versioned or serialized full-snapshot publication lane: the current
-  engine scan snapshot and direct post-commit CRUD callbacks do not yet share a monotonic ordering,
-  so this groundwork does not claim convergence for those concurrent deliveries. This change
-  performs no server listing, pull, reconnect scheduling, polling, or mutation.
+  unwired and hidden until the next Record E coordinator/browser slices. A follow-up durable
+  revision lane now orders complete joined snapshots across scans, CRUD, cascades, and link-state
+  writers; this structural change itself performs no server listing, pull, reconnect scheduling,
+  polling, or mutation.
 - **Subsonic server-native playlists now have durable pull-only links and an atomic sync engine**
   ([#145](https://github.com/jm2/tributary/pull/145)) — Migration 14 adds an exact-shape
   `server_playlist_links` table with one unique mirror per canonical source/native playlist pair,

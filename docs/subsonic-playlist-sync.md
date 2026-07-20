@@ -1,7 +1,7 @@
 # Subsonic server-native playlist import and pull-sync contract
 
-- Status: Accepted; protocol/authority, persistence/engine, and structural UI groundwork
-  implemented; coordinator/browser integration pending
+- Status: Accepted; protocol/authority, persistence/engine, structural UI groundwork, and durable
+  full-sidebar ordering implemented; coordinator/browser integration pending
 - Decision date: 2026-07-19
 - Tracking issue: [#143](https://github.com/jm2/tributary/issues/143)
 - Related regular-playlist work: [#140](https://github.com/jm2/tributary/pull/140),
@@ -36,11 +36,12 @@ The feature is split into three independently reviewable records:
 3. **In progress — UI, localization, and end-to-end behavior.** Structural header/playlist
    identity, joined durable link presentation, ordinary-action exclusion, commit-only local CRUD,
    atomic smart creation, and the localized recovery-shell plan are implemented in
-   [#146](https://github.com/jm2/tributary/pull/146). The shell is
+   [#146](https://github.com/jm2/tributary/pull/146). A follow-up migration and lifecycle-owned
+   publisher give scan seeding, CRUD, raw/cascade domain-table writes, and server-link state one
+   durable revisioned full-snapshot lane; GTK rejects equal or older delivery. The shell is
    initially hidden and grants no authority. Follow-on slices add the exact-session latest-request
-   coordinator, one monotonic or serialized full-sidebar publication owner, reconnect/shutdown
-   integration, virtualized Import Copy/Keep Synced browser, Sync Now, and
-   Retry/Replace/Unlink/Remove recovery with deterministic end-to-end coverage.
+   coordinator, reconnect/shutdown integration, virtualized Import Copy/Keep Synced browser, Sync
+   Now, and Retry/Replace/Unlink/Remove recovery with deterministic end-to-end coverage.
 
 No stage may infer permission from a backend label, source key, response shape, or persisted row.
 Each consumer uses only the authority implemented by its immediately preceding stage.
@@ -264,12 +265,13 @@ or lifecycle retirement cancels older work; only the latest still-current genera
 Record E's structural UI slice now carries authoritative linked/read-only and orthogonal
 conflict/missing state into the sidebar without exposing native identity, excludes mirrors from
 ordinary mutation affordances, and defines a separate localized status/recovery shell. The shell is
-initially hidden and grants no operation authority. The latest-request lane, exact-session
-reconnect scheduling, cancellation, one ordered full-sidebar publication lane, and action wiring
-remain the next Record E slices; Record D already rejects stale source receipts and stale persisted
-revisions. Until that publication lane lands, an engine scan snapshot and a concurrent direct
-post-commit CRUD callback have no shared ordering token. The initial version does not continuously
-poll and does not keep a session alive solely for sync.
+initially hidden and grants no operation authority. Migration 15 and the sidebar publisher now give
+scan seeding, ordinary CRUD, raw/cascade domain-table mutations, and server-link state one durable
+revisioned full-snapshot lane. Refresh hints coalesce, periodic revision polling recovers lost
+hints, and GTK ignores equal or older snapshots. The latest-request lane, exact-session reconnect
+scheduling, cancellation, and action wiring remain the next Record E slices; Record D already
+rejects stale source receipts and stale persisted revisions. The initial sync version will not
+continuously poll the server and will not keep a session alive solely for sync.
 
 ## Server rename and deletion
 

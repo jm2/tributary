@@ -1,6 +1,6 @@
 # Tributary active implementation backlog
 
-Last audited: 2026-07-19
+Last audited: 2026-07-20
 
 This is the executable backlog for feature fixes and additions. It replaces the completed
 holistic-review tracker, which is preserved as
@@ -33,14 +33,16 @@ real-environment validation, not missing implementation.
 P1.1, P1.2, all three P1.3 playback-history records, both P1.4 rating records, and P1.5 through
 server-native link persistence and the atomic pull-sync engine are complete. Record E is now being
 delivered in reviewable UI/lifecycle slices. Its structural groundwork replaces translated-label
-and backend-string identity with typed header/playlist state, publishes linked mirrors from one
-joined database snapshot, prevents ordinary edit affordances from reaching those mirrors, and
-makes ordinary playlist sidebar changes depend on a committed database result. It also reserves a
-separate localized, accessible footer shell for durable sync/recovery state instead of overloading
-the continually updated track-count label.
+and backend-string identity with typed header/playlist state, prevents ordinary edit affordances
+from reaching linked mirrors, and reserves a separate localized, accessible footer shell for
+durable sync/recovery state instead of overloading the continually updated track-count label.
+Its follow-up durable revision lane makes every current playlist-sidebar mutation producer
+converge through strictly increasing complete joined snapshots rather than scan replacements plus
+partial CRUD callbacks. SQLite triggers cover parents, links, cascades, and raw writes to those
+tables; a lifecycle-owned publisher coalesces hints, polls for lost hints, and GTK rejects equal or
+older delivery.
 
-Continue with Record E's headless latest-request operation coordinator and one monotonic or
-serialized full-sidebar publication lane, then the virtualized
+Continue with Record E's headless latest-request operation coordinator, then the virtualized
 Import Copy/Keep Synced browser and Sync Now/conflict/missing/offline recovery flows. The accepted
 [`subsonic-playlist-sync.md`](subsonic-playlist-sync.md) contract keeps this capability pull-only and
 separate from Tributary's ordinary mixed-source playlists. Smart playlists and XSPF import/export
@@ -400,26 +402,39 @@ the 38-record feature backlog.
   non-fallback copy in all 13 catalogs; the existing count/duration label remains independent and
   no timestamp is presented as proof of freshness.
 
-  This slice deliberately performs no listing, pull, reconnect scheduling, or server mutation. The
-  engine's scan snapshot and direct post-commit CRUD callbacks also remain unversioned relative to
-  one another; commit-only callback publication is not a claim that reversed concurrent deliveries
-  converge. The next slice is a GTK-free source/remote/local-keyed coordinator with exact-session
-  capability, generation, cancellation, final-admission, retirement, shutdown-drain coverage, and
-  one monotonic or serialized full-snapshot owner spanning scans, ordinary CRUD, and server-link
-  state. That design must cover every production mutation producer rather than adding a UI-only
-  token, replace partial Create/Rename/Delete/Import row patches with complete redacted joined
-  snapshots, and reject reversed older delivery. Regressions must cover create/import erasure,
-  rename reversion, delete resurrection, link classification/state changes, equal-version
-  idempotence, malformed joined data, restart, rollback/exhaustion, and whichever non-UI/cascade
-  paths the chosen durable-revision or single-owner design admits. The final
-  slice then connects that coordinator to a virtualized browser and the Import Copy, Keep Synced,
-  Sync Now, Retry, Replace, Unlink, and Remove Local Copy controls before Record E can be checked.
+  This slice deliberately performs no listing, pull, reconnect scheduling, or server mutation. Its
+  follow-up publication slice adds migration 15's exact singleton revision and six SQLite triggers
+  over playlist parents and server-playlist links. Effective inserts, updates, deletes, cascades,
+  and raw writes to either domain table advance inside their own transaction; no-op updates and
+  rollbacks do not. Startup revalidates the exact derived table and trigger ownership. One
+  lifecycle-owned publisher reads
+  revision plus the complete redacted join in a coherent transaction, coalesces post-commit hints,
+  polls the durable revision for lost hints, and emits the first valid Ready or versioned
+  Unavailable snapshot and thereafter only a strictly newer one. GTK applies its first snapshot and
+  then only a newer one, replacing or retracting the whole section, suppressing intermediate
+  selection navigation, and selecting structural Local when the active playlist disappears.
+  Partial Create/Rename/Delete/Import row patches are removed. Reversed delivery, equal-version
+  idempotence, malformed joined state, restart, raw domain-table SQL, cascades, rollback,
+  exhaustion, and publisher owner-close and blocked-output cancellation are covered, closing
+  create/import erasure, rename reversion, delete resurrection, and stale link-classification
+  races.
+
+  The next slice is a GTK-free source/remote/local-keyed coordinator with exact-session capability,
+  latest-request generation, cancellation, final admission, reconnect deduplication, retirement,
+  and shutdown-drain coverage. The final slice then connects that coordinator to a virtualized
+  browser and the Import Copy, Keep Synced, Sync Now, Retry, Replace, Unlink, and Remove Local Copy
+  controls before Record E can be checked.
 
   Structural-slice validation: the locked suite passes 20 library, 1,197 application, and 10
   repository-metadata tests (1,227 total). Strict all-target/all-feature Clippy is green in debug
   and release profiles; Rust 1.92 all-target checking, formatting, whitespace checks, exact
   13-catalog/20-key locale parity, typed-identity scans, and an independent privacy/documentation
   audit are also green.
+
+  Publication-slice validation: the locked suite passes 20 library, 1,223 application, and 10
+  repository-metadata tests (1,253 total). Strict all-target/all-feature Clippy is green in debug
+  and release profiles; Rust 1.92 all-target checking, formatting, whitespace checks, focused
+  migration/projection coverage, and independent code/privacy/documentation audits are also green.
 
 ## P2 — User-facing integrations and bounded enhancements
 
@@ -540,5 +555,6 @@ the 38-record feature backlog.
 | 2026-07-19 | P1.5 mixed-source regular-playlist UI | [#142](https://github.com/jm2/tributary/pull/142) | Integrated exact local and authenticated Subsonic/Jellyfin/Plex/DAAP entries through all-or-none Add, durable-occurrence Remove, ordered duplicate-preserving projection with explicit removable unavailable rows, and per-source guarded Play/artwork. Add revalidates after staging SQL, rolls back a stale result, and retains exact session/catalogue permits through an admitted commit or rollback. Current closed unavailable reasons render honestly; stale projection results are discarded/reprojected and stale guards are denied. Local history and remote rating ownership remain unchanged. Smart playlists and XSPF remain local-only; mixed/unresolved XSPF export refuses all-or-none instead of truncating, while mixed-source metadata export and Subsonic-native synchronization remain separate. |
 | 2026-07-19 | P1.5 Subsonic server-playlist contract and pull authority | [#144](https://github.com/jm2/tributary/pull/144) | Defined detached Import Copy and read-only pull-mirror semantics, including conflict, offline, deletion, unlink, privacy, and non-mutation boundaries. Added bounded/redacted native playlist identity and exact ordered snapshots, authenticated `getPlaylists`/`getPlaylist` reads, and a Subsonic-only default-deny capability whose opaque guard and pre/post lifecycle checks reject disconnect, replacement, retirement, shutdown, and successor-session reuse. At that delivery boundary no persistence, synchronization commit, or UI was included; Records D and E remained open. |
 | 2026-07-19 | P1.5 Subsonic link persistence and atomic pull engine | [#145](https://github.com/jm2/tributary/pull/145) | Added strict migration 14 and a redacted typed link with unique exact server identity, separate local-conflict/server-presence state, frozen membership digest, last-success metadata, and revision CAS. Import Copy stays detached; Keep Synced creates one read-only mirror. Exact-session pull/absence receipts acquire an operation-bound commit permit after SQL staging; persistence rejects a permit from any other pull or absence result, stale work rolls back, and invalidation waits for an admitted atomic commit. Reconciliation excludes mirrors through a zero-bind subquery that remains safe beyond SQLite's host-parameter limit. Pull, conflict, Replace, missing, unlink, explicit removal, ordinary-mutation denial, downgrade refusal, failure retention, and exact order/duplicate behavior are deterministic. UI, reconnect scheduling, localization, and latest-request operation generations remain Record E. |
-| 2026-07-19 | P1.5 server-playlist UI structural groundwork | [#146](https://github.com/jm2/tributary/pull/146) | Added typed/redacted joined sidebar identity, read-only/conflict/missing mirror presentation, ordinary-action exclusion with transactional revalidation, commit-only CRUD outcomes, atomic smart creation/rule updates, stale-load and recycled-row defenses, structural Local fallback, and a hidden accessible recovery shell with exact copy in all 13 catalogs. Record E remains open for one globally ordered full-sidebar publication lane, the headless exact-session coordinator, reconnect/browser/action wiring, and end-to-end coverage. |
+| 2026-07-19 | P1.5 server-playlist UI structural groundwork | [#146](https://github.com/jm2/tributary/pull/146) | Added typed/redacted joined sidebar identity, read-only/conflict/missing mirror presentation, ordinary-action exclusion with transactional revalidation, commit-only CRUD outcomes, atomic smart creation/rule updates, stale-load and recycled-row defenses, structural Local fallback, and a hidden accessible recovery shell with exact copy in all 13 catalogs. At that merge boundary, Record E still retained the globally ordered full-sidebar lane, headless exact-session coordinator, reconnect/browser/action wiring, and end-to-end coverage. |
+| 2026-07-20 | P1.5 durable playlist-sidebar publication | Pending PR | Added migration 15's exact singleton revision and six transactional triggers, startup schema revalidation, a coherent redacted full-snapshot publisher with coalesced hints and polling fallback, and a strictly ordered GTK reducer with selection-safe replacement and structural fallback. Partial CRUD/import patches are removed; Record E remains open for the headless latest-request coordinator and reconnect/browser/recovery wiring. |
 | 2026-07-18 | Linux watcher feedback-loop fix | [#103](https://github.com/jm2/tributary/pull/103) | Narrowed the external proposal to filter self-generated access events before queue admission without filtering genuine startup events or backend errors; bounded overflow still drives authoritative reconciliation. Persistent negative parse caching is deliberately excluded so failures remain retryable; this separate correctness fix does not advance the feature numerator. |

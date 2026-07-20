@@ -5,6 +5,7 @@ pub mod engine;
 pub mod playback_history;
 pub mod playlist_io;
 pub mod playlist_manager;
+pub mod playlist_sidebar;
 pub mod resolver;
 mod root_authority;
 pub mod smart_rules;
