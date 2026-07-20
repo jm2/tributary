@@ -38,9 +38,17 @@ transactional stale-state revalidation, and a content-free idempotency receipt. 
 cancellation, retry, and intentional-omission boundaries.
 
 Continue with P2.1's Last.fm integration, the highest-priority unchecked record whose dependencies
-are satisfied. Its authorization, secret storage, scrobble thresholds, durable offline retry, and
-privacy contract must be fixed before schema or UI work. Smart playlists and XSPF import/export
-remain local-only, while mixed-source metadata export still requires its own no-locator policy.
+are satisfied. The accepted [`lastfm-scrobbling.md`](lastfm-scrobbling.md) contract now fixes its
+desktop authorization, vault-only account authority, opt-in and per-source privacy policy,
+authoritative now-playing/scrobble evidence, 10,000-row account-bound FIFO, retry classification,
+disconnect purge, and shutdown boundary. The current foundation slice implements the bounded
+Last.fm protocol client, retryable native-vault boundary, strict migration 17, transactional
+account-bound FIFO, and missing-vault recovery authority without exposing an incomplete setting.
+Continue with generation-owned playback evidence and the lifecycle worker/shutdown path, then the
+localized consent, per-source policy, status, and account-management UI. Production API-key
+registration and package-time key/secret injection remain explicit external release prerequisites
+rather than reasons to weaken development behavior. Smart playlists and XSPF import/export remain
+local-only, while mixed-source metadata export still requires its own no-locator policy.
 
 The independent Linux watcher correctness fix tracked in
 [#103](https://github.com/jm2/tributary/pull/103) does not change the **14/38** feature total.
@@ -558,7 +566,77 @@ the 38-record feature backlog.
   check, and formatting/diff checks are clean.
 - [ ] Implement Last.fm authorization and protected secret storage, now-playing/scrobble thresholds,
   durable retry/offline behavior, privacy UX, and source-aware metadata on authoritative playback
-  events ([#50](https://github.com/jm2/tributary/issues/50)).
+  events ([contract](lastfm-scrobbling.md); [#50](https://github.com/jm2/tributary/issues/50);
+  [foundation #151](https://github.com/jm2/tributary/pull/151)).
+
+  Acceptance criteria:
+
+  - Enable the feature only when a Last.fm API key and shared secret were injected at build time;
+    keep production registration/injection external, ship no placeholder or runtime credential
+    input, and show an honest unavailable capability when either build value is absent.
+  - Use Last.fm's desktop browser flow with a latest-only, in-memory, 60-minute request token and a
+    one-shot session exchange. Store only the returned session key and username plus one random
+    opaque account UUID in the operating-system credential vault, with no plaintext fallback;
+    vault failure disables all request and queue admission.
+  - Require explicit localized consent before authorization. Local, removable, and structured
+    external-file occurrences may participate after opt-in; each authenticated Subsonic,
+    Jellyfin, Plex, or DAAP source remains off until separately enabled, mixed playlists retain the
+    real source owner's policy, and Radio-Browser remains unconditionally excluded.
+  - Freeze only structured `Track` metadata: required artist/title and optional album/album artist
+    are independently capped at 1,024 UTF-8 bytes and control-free, duration must be known and
+    greater than 30 seconds, and no filename, URI, fuzzy match, lookup, or Last.fm correction may
+    change the payload. Omit parameters for which Tributary has no authoritative value.
+  - Attempt now-playing exactly once at the first accepted generation-owned Playing evidence and
+    never retry it. Admit one scrobble only after observed forward playback reaches
+    `min(ceil(duration / 2), 240 seconds)`; pause, buffering, seeks, restarts, retries, stale events,
+    wall time, and natural end cannot manufacture credit.
+  - Commit qualified scrobbles before network use to one account-bound SQLite FIFO capped globally
+    at 10,000 rows. Persist only Last.fm payload fields plus opaque identity/order/binding and
+    bounded retry state; at capacity refuse the new row visibly without evicting old history.
+  - Send only the oldest rows, in batches of at most 50, with at-least-once semantics. Retry network
+    failures and service codes 11/16 with durable capped backoff; code 9 retains the queue and pauses
+    for same-account reauthorization; accepted, ignored, and every other recognized error are
+    terminal, and malformed item mapping quarantines rather than guesses. Never apply corrections.
+  - Disconnect closes admission, retires in-flight work, drains admitted database commands, purges
+    every queued row, and deletes the vault record. Normal shutdown drains admitted queue writes
+    but neither waits indefinitely for network I/O nor deletes a row without a committed terminal
+    result.
+  - Cover migration/downgrade, exact queue and metadata limits, authorization/vault failure,
+    source/session ownership, playback discontinuities, every response class, offline restart,
+    ambiguous at-least-once replay, disconnect/shutdown races, redaction, accessibility, and exact
+    key/placeholder parity across all 13 shipped locale catalogs without contacting public Last.fm
+    infrastructure in CI.
+
+  Current foundation slice (the countable record intentionally remains open):
+
+  - Added an HTTPS-only, redirect-safe signed client for desktop token/session exchange,
+    now-playing, and ordered 50-row scrobble requests. Typed response classification is
+    content-free; unknown provider codes and incoherent item mappings quarantine rather than
+    guess. Provable worst-case form and JSON-echo fixtures pin 1 MiB request and 2 MiB response
+    caps.
+  - Added a versioned native-vault record with exact RFC 4122 v4 account UUID, nonblank control-free
+    username, and 32-hex session validation. Secret Service, Keychain, and Credential Manager are
+    selected explicitly per operation with no plaintext fallback or sticky failed initializer;
+    SQLite receives only the domain-separated SHA-256 account binding. Flatpak grants only the
+    reviewed `org.freedesktop.secrets` session-bus name.
+  - Added migration 17 and a strictly validated private FIFO. Atomic admission enforces one account,
+    exact occurrence idempotency, and the 10,000-row cap. Every idempotent hit revalidates the
+    complete stored row before returning its identity, so malformed identities or retry state fail
+    closed and remain available to the explicit recovery path. Opaque batch receipts make terminal
+    settlement and durable rescheduling all-or-none compare-and-swap operations over the exact
+    oldest prefix. Generated SeaORM active models and worker-facing models cannot print private
+    metadata. Downgrade refuses pending rows.
+  - Added normal binding-scoped purge plus a separate missing/corrupt-vault recovery primitive that
+    requires opaque proof of closed and FIFO-drained admission and deletes only the captured row-ID
+    snapshot, including corrupt non-positive identities. The runtime coordinator must prove that
+    lifecycle barrier before it can issue the capability.
+  - Current validation passes 40 focused Last.fm tests; locked debug and release suites each pass 20
+    library, 1,385 application, and 10 repository-metadata tests (1,415 total), alongside strict
+    debug and release Clippy, the Rust 1.92 locked all-target check, Flatpak positive/negative
+    permission tests, locked fuzz-workspace formatting/Clippy against its synchronized vault
+    dependency graph, formatting/diff checks, and dependency audit. Playback observation, queue
+    delivery/backoff, disconnect/shutdown orchestration, settings/consent UI, localization, and
+    package credential injection remain.
 
 ### P2.2 — Drag and drop
 
@@ -673,4 +751,5 @@ the 38-record feature backlog.
 | 2026-07-20 | P1.5 server-playlist coordinator and reconnect lifecycle | [#148](https://github.com/jm2/tributary/pull/148) | Added typed GTK-free source/remote/local lanes with global reconnect/manual ordering, monotonic generations, pre-admission supersession, same-key waiting through admitted task and guard settlement, and unrelated-key concurrency. Reconnect binds one sweep to each exact accepted epoch, prepares revisions before one indexed complete list, and bounds local detail/commit fan-out to eight; detail failure writes nothing and only proven complete-list absence marks missing. Pull/missing persistence retains coordinator plus source authority after SQL staging, local Unlink/Remove uses the same guarded lane, and shutdown closes admission before source revocation and drains admitted work. At that merge boundary the redacted headless Sync/Retry/Replace/Unlink/Remove completion surface was ready; [#149](https://github.com/jm2/tributary/pull/149) adds its final browser and visible-action consumer. |
 | 2026-07-20 | P1.5 server-playlist browser and visible recovery UI | [#149](https://github.com/jm2/tributary/pull/149) | Added the capability-filtered virtualized browser, independently cancellable listing, bounded revocable opaque tokens, exact Import Copy/Keep Synced admission, visible generation-gated recovery controls, destructive confirmations, focus-safe accessibility behavior, and complete 13-catalog localization. This completes Record E and P1.5 and closes [#143](https://github.com/jm2/tributary/issues/143). |
 | 2026-07-20 | P2.1 Rhythmbox profile migration | [#150](https://github.com/jm2/tributary/pull/150) | Added strict bounded profile capture/parsing, exact-path policy and conservative smart translation, nine-category acknowledged preview reporting, transactional stale-state revalidation, minimal semantic-digest receipts, one-shot publication, localized lifecycle UI, and end-to-end/idempotency/privacy regressions. This completes [#57](https://github.com/jm2/tributary/issues/57); Last.fm remains the next P2.1 record. |
+| 2026-07-20 | P2.1 Last.fm protocol/vault/queue foundation | [#151](https://github.com/jm2/tributary/pull/151) | Added the bounded signed client, strict native-vault record and retryable platform stores, migration 17, transactional one-account FIFO with full-row validation of idempotent hits and exact batch receipts, narrowly reviewed Flatpak Secret Service access, closed/drained missing-vault recovery, and generated-model redaction. The top-level [#50](https://github.com/jm2/tributary/issues/50) record remains open for playback/runtime, delivery lifecycle, UI, localization, and package credential injection. |
 | 2026-07-18 | Linux watcher feedback-loop fix | [#103](https://github.com/jm2/tributary/pull/103) | Narrowed the external proposal to filter self-generated access events before queue admission without filtering genuine startup events or backend errors; bounded overflow still drives authoritative reconciliation. Persistent negative parse caching is deliberately excluded so failures remain retryable; this separate correctness fix does not advance the feature numerator. |

@@ -83,6 +83,11 @@ urlencoding = "2"
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 md-5 = "0.11"
 sha2 = "0.10"
+zeroize = "1"
+
+# Last.fm sessions are stored only in native protected credential stores:
+# Keychain Services, Windows Credential Manager, or Secret Service.
+keyring-core = "1"
 
 # mDNS service discovery (Subsonic/DAAP auto-detect)
 mdns-sd = "0.20"
@@ -113,9 +118,14 @@ souvlaki = "0.8"
 [target.'cfg(target_os = "windows")'.dependencies]
 gdk4-win32 = "0.11"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
+windows-native-keyring-store = "1.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gdk-pixbuf = "0.22"
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", default-features = false, features = ["crypto-rust"] }
 
 # Stable filesystem IDs for removable/network library-root safety.
 [target.'cfg(unix)'.dependencies]

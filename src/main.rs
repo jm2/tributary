@@ -82,6 +82,8 @@ pub(crate) mod http_test_service;
 #[allow(dead_code)]
 mod jellyfin;
 #[allow(dead_code)]
+pub(crate) mod lastfm;
+#[allow(dead_code)]
 mod local;
 mod platform_runtime;
 #[allow(dead_code)]
