@@ -37,8 +37,10 @@ metadata export still needs an explicit no-locator policy. Subsonic server-nativ
 integration remains a separate capability with its own
 [`subsonic-playlist-sync.md`](subsonic-playlist-sync.md) contract. Its bounded read-only protocol and
 exact-session read/commit authority, strict link persistence, and atomic import/pull/conflict engine
-are implemented without reusing or widening this regular-playlist authority. Reconnect scheduling,
-localized recovery, and user-facing controls remain the separate Record E.
+are implemented without reusing or widening this regular-playlist authority. Record E now also has
+typed read-only sidebar state, ordinary-action exclusion, commit-only local CRUD publication, and
+the localized recovery-shell plan. Its coordinator, one ordered full-sidebar publication lane,
+reconnect scheduling, browser, and wired server-playlist controls remain separate follow-on slices.
 
 Smart playlists are unaffected. They remain live queries over the local library rather than stored
 regular-playlist occurrences.
@@ -313,6 +315,19 @@ absence result that minted it, so authority from another live operation cannot a
 snapshot. Neither mode metadata-matches a missing server track. The complete direction, revision,
 conflict, offline, server-deletion, and unlink policy is in the server-native contract.
 
+The UI now consumes playlist parents and optional links as one ordered typed snapshot. Link
+presence wins over the legacy smart flag, invalid link state rejects publication rather than
+falling back to an editable playlist, and only the local playlist ID plus durable presentation state
+cross into GTK. Structural header/playlist kinds replace translated-name and backend-string
+editability tests. Linked mirrors are visibly read-only or conflicted/missing and are omitted from
+ordinary Rename, Export, Delete, Edit Smart, Add, and Remove affordances; manager transactions still
+enforce the same boundary if presentation becomes stale. A separate localized footer shell is
+reserved for sync/recovery state, but remains hidden until the exact-session coordinator and user
+actions are connected. The same coordinator must serialize or version scan snapshots, direct
+post-commit CRUD callbacks, and server-link changes; the current independent scan/CRUD delivery
+paths do not yet claim reversed-order convergence. This groundwork performs no server operation and
+does not widen the storage or live-source authority described above.
+
 ## Validation matrix
 
 The storage record is complete only when automated coverage demonstrates:
@@ -335,10 +350,12 @@ The storage record is complete only when automated coverage demonstrates:
 The storage and authority foundation records do not retroactively claim their consumers. Native
 Subsonic link persistence and atomic synchronization now have their own strict migration,
 transaction, revision-CAS, lifecycle-permit, drift, missing, unlink/removal, and redaction
-validation. Their localized UI/reconnect consumer and mixed-source XSPF metadata export remain
-explicitly deferred. Until a no-locator mixed-source export policy exists, a regular playlist
-containing any remote or unresolved occurrence is refused all-or-none before XSPF touches its
-destination; the local-only compatibility projection is never exported as a truncated result.
+validation. Typed read-only sidebar presentation and the localized recovery-shell plan are now
+implemented; their operation coordinator, browser, reconnect/action consumer, and mixed-source XSPF
+metadata export remain explicitly deferred. Until a no-locator mixed-source export policy exists,
+a regular playlist containing any remote or unresolved occurrence is refused all-or-none before
+XSPF touches its destination; the local-only compatibility projection is never exported as a
+truncated result.
 
 Record A additionally requires automated coverage for default-deny adapters, the four explicit
 authenticated opt-ins, Invalid playlist indexing for missing/duplicate catalogue-native identity,

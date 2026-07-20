@@ -8,7 +8,7 @@ mod source_object;
 mod track_object;
 
 pub use browser_item::BrowserItem;
-pub use source_object::SourceObject;
+pub use source_object::{HeaderKind, PlaylistSidebarEntry, PlaylistSidebarKind, SourceObject};
 pub use track_object::TrackObject;
 pub use track_object::{
     PlaylistOccurrenceBinding, PlaylistOccurrenceState, PlaylistRowUnavailableReason,

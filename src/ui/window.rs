@@ -24,7 +24,7 @@ use crate::ui::header_bar::RepeatMode;
 
 use super::browser;
 use super::header_bar;
-use super::objects::{SourceObject, TrackObject};
+use super::objects::{HeaderKind, SourceObject, TrackObject};
 use super::output_dialogs::{load_saved_outputs, show_add_output_dialog};
 use super::persistence::{
     extract_hwnd, load_css, load_repeat_mode, load_shuffle, load_window_geometry,
@@ -393,18 +393,18 @@ pub(super) fn rebind_sidebar_source(
 }
 
 fn source_matches_navigation_key(source: &SourceObject, key: &str) -> bool {
+    if source.is_playlist() {
+        return format!(
+            "{}{}",
+            super::playback::PLAYLIST_SOURCE_PREFIX,
+            source.playlist_id()
+        ) == key;
+    }
     if source.source_id().is_some_and(|id| id.to_string() == key) || source.source_key() == key {
         return true;
     }
     let backend = source.backend_type();
-    (backend == "local" && key == "local")
-        || (backend.starts_with("radio-") && backend == key)
-        || (matches!(backend.as_str(), "playlist" | "smart-playlist")
-            && format!(
-                "{}{}",
-                super::playback::PLAYLIST_SOURCE_PREFIX,
-                source.playlist_id()
-            ) == key)
+    (backend == "local" && key == "local") || (backend.starts_with("radio-") && backend == key)
 }
 
 /// Restore a selection by stable navigation identity rather than a list
@@ -1087,7 +1087,7 @@ fn reconcile_source_baseline(
         }
         context.sidebar_store.remove(index);
         clear_remote_projection(context, source_id);
-        remove_empty_category_header(&context.sidebar_store, category_for_backend(&backend));
+        remove_empty_category_header(&context.sidebar_store, header_kind_for_backend(&backend));
     }
 
     if baseline.shutting_down {
@@ -1101,6 +1101,7 @@ fn reconcile_source_baseline(
         invalidate_playlist_projections(
             &context.rt_handle,
             &context.source_registry,
+            &context.sidebar_store,
             &context.source_navigation,
             &context.source_tracks,
             &context.active_source_key,
@@ -1368,8 +1369,14 @@ pub fn build_window(
 
     // ── Tracklist (starts empty — populated by FullSync) ──────────────
     let empty_tracks: Vec<TrackObject> = Vec::new();
-    let (tracklist_widget, track_store, status_label, column_view, sort_model) =
-        tracklist::build_tracklist(&empty_tracks, library_commands.clone());
+    let (
+        tracklist_widget,
+        track_store,
+        status_label,
+        column_view,
+        sort_model,
+        _server_playlist_status_shell,
+    ) = tracklist::build_tracklist(&empty_tracks, library_commands.clone());
 
     // ── Shared playback state ────────────────────────────────────────
     let master_tracks: Rc<RefCell<Vec<TrackObject>>> = Rc::new(RefCell::new(Vec::new()));
@@ -3122,6 +3129,7 @@ fn replace_existing_local_track(rows: &mut [TrackObject], replacement: &TrackObj
 fn invalidate_playlist_projections(
     rt_handle: &tokio::runtime::Handle,
     source_registry: &crate::source_registry::SourceRegistry,
+    sidebar_store: &gtk::gio::ListStore,
     source_navigation: &Rc<RefCell<SourceNavigation>>,
     source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
     active_source_key: &Rc<RefCell<String>>,
@@ -3167,6 +3175,7 @@ fn invalidate_playlist_projections(
         super::source_connect::load_playlist_source(
             rt_handle.clone(),
             source_registry.clone(),
+            sidebar_store.clone(),
             playlist_id,
             request,
             source_navigation.clone(),
@@ -3476,6 +3485,7 @@ fn setup_library_events(
                     invalidate_playlist_projections(
                         &rt_handle,
                         &source_registry,
+                        &sidebar_store,
                         &source_navigation,
                         &source_tracks,
                         &active_source_key,
@@ -3497,6 +3507,7 @@ fn setup_library_events(
                     invalidate_playlist_projections(
                         &rt_handle,
                         &source_registry,
+                        &sidebar_store,
                         &source_navigation,
                         &source_tracks,
                         &active_source_key,
@@ -3522,61 +3533,12 @@ fn setup_library_events(
                         })
                         .flatten();
 
-                    // Find the "Playlists" header position in sidebar.
-                    let mut playlist_header_pos = None;
-                    let n = sidebar_store.n_items();
-                    for i in 0..n {
-                        if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>()
-                        {
-                            if src.is_header() && src.name() == "Playlists" {
-                                playlist_header_pos = Some(i);
-                                break;
-                            }
-                        }
-                    }
-
-                    if let Some(header_pos) = playlist_header_pos {
-                        // Remove old playlist entries (between Playlists header
-                        // and the next header).
-                        let insert_pos = header_pos + 1;
-                        while insert_pos < sidebar_store.n_items() {
-                            if let Some(src) = sidebar_store
-                                .item(insert_pos)
-                                .and_downcast_ref::<SourceObject>()
-                            {
-                                if src.is_header() {
-                                    break; // Hit next section header.
-                                }
-                                let bt = src.backend_type();
-                                if bt == "playlist" || bt == "smart-playlist" {
-                                    sidebar_store.remove(insert_pos);
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-
-                        // Insert new playlist entries.
-                        let mut active_position = None;
-                        for (idx, (id, name, is_smart)) in playlists.iter().enumerate() {
-                            let src = SourceObject::playlist(name, id, *is_smart);
-                            let position = insert_pos + idx as u32;
-                            sidebar_store.insert(position, &src);
-                            if active_playlist_id.as_deref() == Some(id.as_str()) {
-                                active_position = Some(position);
-                            }
-                        }
-
-                        // Rebuilding the rows invalidates GtkSingleSelection's
-                        // selected object. Restore the row that corresponds to
-                        // the still-active playlist so sidebar and content do
-                        // not diverge during watcher fallback scans.
-                        if let Some(position) = active_position {
-                            sidebar_selection.set_selected(position);
-                        }
-                    }
+                    replace_playlist_sidebar_snapshot(
+                        &sidebar_store,
+                        &sidebar_selection,
+                        &playlists,
+                        active_playlist_id.as_deref(),
+                    );
                 }
 
                 LibraryEvent::RootTrustRequired(requests) => {
@@ -3951,17 +3913,124 @@ fn track_to_object(
     obj
 }
 
+/// Replace the contiguous playlist section from one authoritative snapshot.
+///
+/// If the currently displayed playlist no longer exists, selection moves to
+/// the structural Local source. This drives the ordinary selection handler so
+/// stale playlist contents and navigation authority are retired together with
+/// the row, without relying on localized labels or backend strings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaylistSidebarSelectionTarget {
+    Unchanged,
+    Position(u32),
+    Unselect,
+}
+
+fn replace_playlist_sidebar_snapshot(
+    sidebar_store: &gtk::gio::ListStore,
+    sidebar_selection: &gtk::SingleSelection,
+    playlists: &[crate::local::engine::PlaylistSidebarEntry],
+    active_playlist_id: Option<&str>,
+) {
+    match replace_playlist_sidebar_rows(sidebar_store, playlists, active_playlist_id) {
+        PlaylistSidebarSelectionTarget::Unchanged => {}
+        PlaylistSidebarSelectionTarget::Position(position) => {
+            sidebar_selection.set_selected(position);
+        }
+        PlaylistSidebarSelectionTarget::Unselect => {
+            warn!(
+                playlist_id_byte_len = active_playlist_id.map_or(0, str::len),
+                "Active playlist disappeared and structural Local source was unavailable"
+            );
+            sidebar_selection.set_selected(gtk::INVALID_LIST_POSITION);
+        }
+    }
+}
+
+/// Replace playlist rows and return the structurally derived selection target.
+///
+/// Keeping the model mutation separate from `GtkSingleSelection` makes the
+/// fail-closed navigation decision deterministic and testable without a GTK
+/// display connection.
+fn replace_playlist_sidebar_rows(
+    sidebar_store: &gtk::gio::ListStore,
+    playlists: &[crate::local::engine::PlaylistSidebarEntry],
+    active_playlist_id: Option<&str>,
+) -> PlaylistSidebarSelectionTarget {
+    let playlist_header_pos = (0..sidebar_store.n_items()).find(|position| {
+        sidebar_store
+            .item(*position)
+            .and_downcast::<SourceObject>()
+            .is_some_and(|source| source.is_playlist_header())
+    });
+
+    let mut active_position = None;
+    if let Some(header_pos) = playlist_header_pos {
+        let insert_pos = header_pos + 1;
+        while insert_pos < sidebar_store.n_items() {
+            let Some(source) = sidebar_store
+                .item(insert_pos)
+                .and_downcast::<SourceObject>()
+            else {
+                break;
+            };
+            if source.is_header() || !source.is_playlist() {
+                break;
+            }
+            sidebar_store.remove(insert_pos);
+        }
+
+        for (offset, entry) in playlists.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let position = insert_pos + offset as u32;
+            sidebar_store.insert(position, &SourceObject::playlist_entry(entry));
+            if active_playlist_id == Some(entry.playlist_id()) {
+                active_position = Some(position);
+            }
+        }
+    }
+
+    if active_playlist_id.is_none() {
+        return PlaylistSidebarSelectionTarget::Unchanged;
+    }
+    let target = active_position.or_else(|| {
+        (0..sidebar_store.n_items()).find(|position| {
+            sidebar_store
+                .item(*position)
+                .and_downcast::<SourceObject>()
+                .is_some_and(|source| {
+                    !source.is_header()
+                        && source.source_id() == Some(crate::architecture::SourceId::local())
+                })
+        })
+    });
+    target.map_or(
+        PlaylistSidebarSelectionTarget::Unselect,
+        PlaylistSidebarSelectionTarget::Position,
+    )
+}
+
 // ── Sidebar category management ─────────────────────────────────────
 
 /// The fixed ordering of sidebar category headers.
-const CATEGORY_ORDER: &[&str] = &[
-    "Local",
-    "DAAP",
-    "Subsonic",
-    "Jellyfin",
-    "Plex",
-    "Internet Radio",
+const CATEGORY_ORDER: &[HeaderKind] = &[
+    HeaderKind::Local,
+    HeaderKind::Daap,
+    HeaderKind::Subsonic,
+    HeaderKind::Jellyfin,
+    HeaderKind::Plex,
+    HeaderKind::InternetRadio,
 ];
+
+fn header_kind_for_backend(backend_type: &str) -> HeaderKind {
+    match backend_type {
+        "subsonic" => HeaderKind::Subsonic,
+        "jellyfin" => HeaderKind::Jellyfin,
+        "plex" => HeaderKind::Plex,
+        "daap" => HeaderKind::Daap,
+        _ => HeaderKind::Subsonic,
+    }
+}
 
 /// Map a backend type string to its sidebar category header name.
 pub fn category_for_backend(backend_type: &str) -> &'static str {
@@ -3978,11 +4047,12 @@ pub fn category_for_backend(backend_type: &str) -> &'static str {
 /// (used during initial source list construction before the ListStore is built).
 fn ensure_category_header_vec(sources: &mut Vec<SourceObject>, backend_type: &str) {
     let category = category_for_backend(backend_type);
+    let header_kind = header_kind_for_backend(backend_type);
     let already_exists = sources
         .iter()
-        .any(|s| s.is_header() && s.name() == category);
+        .any(|source| source.header_kind() == Some(header_kind));
     if !already_exists {
-        sources.push(SourceObject::header(category));
+        sources.push(SourceObject::header(category, header_kind));
     }
 }
 
@@ -3992,15 +4062,16 @@ fn ensure_category_header_vec(sources: &mut Vec<SourceObject>, backend_type: &st
 /// if the category is empty).
 pub fn ensure_category_header_store(store: &gtk::gio::ListStore, backend_type: &str) -> u32 {
     let category = category_for_backend(backend_type);
+    let header_kind = header_kind_for_backend(backend_type);
     let cat_order = CATEGORY_ORDER
         .iter()
-        .position(|&c| c == category)
+        .position(|kind| *kind == header_kind)
         .unwrap_or(CATEGORY_ORDER.len());
 
     // Check if the header already exists.
     for i in 0..store.n_items() {
         if let Some(src) = store.item(i).and_downcast_ref::<SourceObject>() {
-            if src.is_header() && src.name() == category {
+            if src.header_kind() == Some(header_kind) {
                 // Header exists — find the end of this category
                 // (next header or end of list).
                 let mut insert_pos = i + 1;
@@ -4024,9 +4095,13 @@ pub fn ensure_category_header_store(store: &gtk::gio::ListStore, backend_type: &
     for i in 0..store.n_items() {
         if let Some(src) = store.item(i).and_downcast_ref::<SourceObject>() {
             if src.is_header() {
-                let other_order = CATEGORY_ORDER
-                    .iter()
-                    .position(|&c| c == src.name().as_str())
+                let other_order = src
+                    .header_kind()
+                    .and_then(|kind| {
+                        CATEGORY_ORDER
+                            .iter()
+                            .position(|candidate| *candidate == kind)
+                    })
                     .unwrap_or(CATEGORY_ORDER.len());
                 if other_order > cat_order {
                     insert_at = i;
@@ -4037,17 +4112,17 @@ pub fn ensure_category_header_store(store: &gtk::gio::ListStore, backend_type: &
     }
 
     // Insert the header.
-    let header = SourceObject::header(category);
+    let header = SourceObject::header(category, header_kind);
     store.insert(insert_at, &header);
     insert_at + 1 // return position right after the new header
 }
 
 /// Remove a category header from the store if it has no remaining
 /// non-header children (i.e., the category is now empty).
-pub fn remove_empty_category_header(store: &gtk::gio::ListStore, category: &str) {
+pub fn remove_empty_category_header(store: &gtk::gio::ListStore, header_kind: HeaderKind) {
     for i in 0..store.n_items() {
         if let Some(src) = store.item(i).and_downcast_ref::<SourceObject>() {
-            if src.is_header() && src.name() == category {
+            if src.header_kind() == Some(header_kind) {
                 // Check if the next item is another header or end of list.
                 let next_is_header_or_end = if i + 1 >= store.n_items() {
                     true
@@ -4075,6 +4150,7 @@ mod identity_tests {
         models::{Rating, Track, TrackRating},
         SourceId,
     };
+    use crate::local::engine::{PlaylistSidebarEntry, PlaylistSidebarKind};
 
     fn local_history_row(track_id: &str, uri: &str, play_count: u32) -> TrackObject {
         let row = TrackObject::new(
@@ -4095,6 +4171,53 @@ mod identity_tests {
         );
         row.set_track_id(track_id);
         row
+    }
+
+    #[test]
+    fn missing_active_playlist_snapshot_selects_the_structural_local_source() {
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        store.append(&SourceObject::header("Lokal", HeaderKind::Local));
+        // A display-name decoy must not become the fallback authority.
+        store.append(&SourceObject::source(
+            "Local",
+            "radio-search",
+            "network-workgroup-symbolic",
+        ));
+        store.append(&SourceObject::source(
+            "Bibliothek",
+            "local",
+            "folder-music-symbolic",
+        ));
+        store.append(&SourceObject::header(
+            "Wiedergabelisten",
+            HeaderKind::Playlists,
+        ));
+        store.append(&SourceObject::playlist_entry(
+            &crate::local::engine::PlaylistSidebarEntry::new(
+                "removed-playlist-id",
+                "Removed",
+                crate::local::engine::PlaylistSidebarKind::EditableRegular,
+            ),
+        ));
+        store.append(&SourceObject::header(
+            "Internetradio",
+            HeaderKind::InternetRadio,
+        ));
+        let target = replace_playlist_sidebar_rows(&store, &[], Some("removed-playlist-id"));
+
+        assert_eq!(target, PlaylistSidebarSelectionTarget::Position(2));
+        assert!(store
+            .item(2)
+            .and_downcast::<SourceObject>()
+            .is_some_and(|source| {
+                source.source_id() == Some(crate::architecture::SourceId::local())
+            }));
+        assert!((0..store.n_items()).all(|position| {
+            store
+                .item(position)
+                .and_downcast::<SourceObject>()
+                .is_some_and(|source| !source.is_playlist())
+        }));
     }
 
     #[test]
@@ -4204,7 +4327,7 @@ mod identity_tests {
     fn saved_and_environment_startup_share_the_persisted_source_owner() {
         let persisted = SourceId::random();
         let mut sources = vec![
-            SourceObject::header("Subsonic"),
+            SourceObject::header("Subsonic", HeaderKind::Subsonic),
             SourceObject::manual(
                 "Saved",
                 "subsonic",
@@ -4248,7 +4371,10 @@ mod identity_tests {
             persisted,
         );
         saved.set_connected(true);
-        let mut sources = vec![SourceObject::header("Subsonic"), saved.clone()];
+        let mut sources = vec![
+            SourceObject::header("Subsonic", HeaderKind::Subsonic),
+            saved.clone(),
+        ];
 
         let connection_attempt = upsert_environment_source(
             &mut sources,
@@ -4296,7 +4422,7 @@ mod identity_tests {
         other.set_connecting_generation(81);
 
         let store = gtk::gio::ListStore::new::<SourceObject>();
-        store.append(&SourceObject::header("Subsonic"));
+        store.append(&SourceObject::header("Subsonic", HeaderKind::Subsonic));
         store.append(&saved);
         store.append(&other);
 
@@ -4379,6 +4505,30 @@ mod identity_tests {
             &remote.source_id().expect("remote identity").to_string()
         ));
         assert!(!source_matches_navigation_key(&remote, "local"));
+    }
+
+    #[test]
+    fn playlist_navigation_matching_uses_typed_identity_not_compatibility_backend() {
+        let playlist = SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "typed-id",
+            "Typed",
+            PlaylistSidebarKind::EditableRegular,
+        ));
+        // Even malformed compatibility fields cannot override the closed
+        // playlist navigation namespace once typed identity is present.
+        playlist.set_source_id(SourceId::local());
+        for compatibility_backend in ["unexpected-legacy-value", "local", "radio-topvote"] {
+            playlist.set_compatibility_backend_type_for_test(compatibility_backend);
+            assert!(source_matches_navigation_key(
+                &playlist,
+                "playlist:typed-id"
+            ));
+            assert!(!source_matches_navigation_key(&playlist, "local"));
+            assert!(!source_matches_navigation_key(&playlist, "radio-topvote"));
+        }
+
+        let impostor = SourceObject::source("Impostor", "playlist", "view-list-symbolic");
+        assert!(!source_matches_navigation_key(&impostor, "playlist:"));
     }
 
     #[test]

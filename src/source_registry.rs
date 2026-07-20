@@ -2654,7 +2654,7 @@ mod tests {
         Migrator::up(&db, None).await.expect("run migrations");
         let manager = PlaylistManager::new(db);
         let playlist = manager
-            .create_playlist(name, false)
+            .create_regular_playlist(name)
             .await
             .expect("create regular playlist");
         (manager, playlist.id)

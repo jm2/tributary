@@ -25,9 +25,362 @@ struct RatingCellPresentation {
     input_value: u8,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ServerPlaylistScope {
+    #[default]
+    Hidden,
+    #[allow(dead_code)] // Constructed when the playlist-sync coordinator wires the shell.
+    Linked,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ServerPlaylistActivity {
+    #[default]
+    Idle,
+    Running,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ServerPlaylistAvailability {
+    #[default]
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ServerPlaylistStatusState {
+    pub(super) scope: ServerPlaylistScope,
+    pub(super) activity: ServerPlaylistActivity,
+    pub(super) conflict: bool,
+    pub(super) missing: bool,
+    pub(super) availability: ServerPlaylistAvailability,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerPlaylistStatusKind {
+    Hidden,
+    Running,
+    ConflictMissing,
+    Missing,
+    Conflict,
+    Failed,
+    Unavailable,
+    Clean,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerPlaylistAction {
+    SyncNow,
+    Retry,
+    ReplaceLocalWithServer,
+    Unlink,
+    RemoveLocalCopy,
+}
+
+impl ServerPlaylistAction {
+    const fn translation_key(self) -> &'static str {
+        match self {
+            Self::SyncNow => "server_playlists.action_sync_now",
+            Self::Retry => "server_playlists.action_retry",
+            Self::ReplaceLocalWithServer => "server_playlists.action_replace_local_with_server",
+            Self::Unlink => "server_playlists.action_unlink",
+            Self::RemoveLocalCopy => "server_playlists.action_remove_local_copy",
+        }
+    }
+
+    const fn action_name(self) -> &'static str {
+        match self {
+            Self::SyncNow => "win.server-playlist-sync-now",
+            Self::Retry => "win.server-playlist-retry",
+            Self::ReplaceLocalWithServer => "win.server-playlist-replace-local",
+            Self::Unlink => "win.server-playlist-unlink",
+            Self::RemoveLocalCopy => "win.server-playlist-remove-local-copy",
+        }
+    }
+}
+
+const SERVER_PLAYLIST_RECOVERY_ACTIONS: &[ServerPlaylistAction] = &[
+    ServerPlaylistAction::Unlink,
+    ServerPlaylistAction::RemoveLocalCopy,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServerPlaylistStatusPlan {
+    kind: ServerPlaylistStatusKind,
+    icon_name: Option<&'static str>,
+    status_key: Option<&'static str>,
+    primary_action: Option<ServerPlaylistAction>,
+    primary_sensitive: bool,
+    overflow_actions: &'static [ServerPlaylistAction],
+    show_spinner: bool,
+}
+
+impl ServerPlaylistStatusPlan {
+    fn for_state(state: ServerPlaylistStatusState) -> Self {
+        let network_actions_sensitive = state.availability == ServerPlaylistAvailability::Available;
+        let kind = if state.scope == ServerPlaylistScope::Hidden {
+            ServerPlaylistStatusKind::Hidden
+        } else if state.activity == ServerPlaylistActivity::Running {
+            ServerPlaylistStatusKind::Running
+        } else if state.conflict && state.missing {
+            ServerPlaylistStatusKind::ConflictMissing
+        } else if state.missing {
+            ServerPlaylistStatusKind::Missing
+        } else if state.conflict {
+            ServerPlaylistStatusKind::Conflict
+        } else if state.activity == ServerPlaylistActivity::Failed {
+            ServerPlaylistStatusKind::Failed
+        } else if state.availability == ServerPlaylistAvailability::Unavailable {
+            ServerPlaylistStatusKind::Unavailable
+        } else {
+            ServerPlaylistStatusKind::Clean
+        };
+
+        match kind {
+            ServerPlaylistStatusKind::Hidden => Self {
+                kind,
+                icon_name: None,
+                status_key: None,
+                primary_action: None,
+                primary_sensitive: true,
+                overflow_actions: &[],
+                show_spinner: false,
+            },
+            ServerPlaylistStatusKind::Running => Self {
+                kind,
+                icon_name: None,
+                status_key: Some("server_playlists.status_syncing"),
+                primary_action: None,
+                primary_sensitive: true,
+                overflow_actions: &[],
+                show_spinner: true,
+            },
+            ServerPlaylistStatusKind::ConflictMissing => Self {
+                kind,
+                icon_name: Some("dialog-warning-symbolic"),
+                status_key: Some("server_playlists.status_conflict_missing"),
+                primary_action: Some(ServerPlaylistAction::Retry),
+                primary_sensitive: network_actions_sensitive,
+                overflow_actions: SERVER_PLAYLIST_RECOVERY_ACTIONS,
+                show_spinner: false,
+            },
+            ServerPlaylistStatusKind::Missing => Self {
+                kind,
+                icon_name: Some("dialog-warning-symbolic"),
+                status_key: Some("server_playlists.status_missing"),
+                primary_action: Some(ServerPlaylistAction::Retry),
+                primary_sensitive: network_actions_sensitive,
+                overflow_actions: SERVER_PLAYLIST_RECOVERY_ACTIONS,
+                show_spinner: false,
+            },
+            ServerPlaylistStatusKind::Conflict => Self {
+                kind,
+                icon_name: Some("dialog-warning-symbolic"),
+                status_key: Some("server_playlists.status_conflict"),
+                primary_action: Some(ServerPlaylistAction::ReplaceLocalWithServer),
+                primary_sensitive: network_actions_sensitive,
+                overflow_actions: SERVER_PLAYLIST_RECOVERY_ACTIONS,
+                show_spinner: false,
+            },
+            ServerPlaylistStatusKind::Failed => Self {
+                kind,
+                icon_name: Some("dialog-error-symbolic"),
+                status_key: Some("server_playlists.status_failed"),
+                primary_action: Some(ServerPlaylistAction::Retry),
+                primary_sensitive: network_actions_sensitive,
+                overflow_actions: SERVER_PLAYLIST_RECOVERY_ACTIONS,
+                show_spinner: false,
+            },
+            ServerPlaylistStatusKind::Unavailable => Self {
+                kind,
+                icon_name: Some("network-offline-symbolic"),
+                status_key: Some("server_playlists.status_offline"),
+                primary_action: Some(ServerPlaylistAction::Retry),
+                primary_sensitive: false,
+                overflow_actions: SERVER_PLAYLIST_RECOVERY_ACTIONS,
+                show_spinner: false,
+            },
+            ServerPlaylistStatusKind::Clean => Self {
+                kind,
+                icon_name: Some("emblem-readonly-symbolic"),
+                status_key: Some("server_playlists.status_linked_read_only"),
+                primary_action: Some(ServerPlaylistAction::SyncNow),
+                primary_sensitive: network_actions_sensitive,
+                overflow_actions: SERVER_PLAYLIST_RECOVERY_ACTIONS,
+                show_spinner: false,
+            },
+        }
+    }
+}
+
+/// Persistent footer shell for server-backed playlist state.
+///
+/// It is deliberately created hidden and exposes only an internal render API;
+/// the playlist-sync coordinator owns the later action and state wiring.
+#[derive(Clone)]
+pub(super) struct ServerPlaylistStatusShell {
+    container: gtk::Box,
+    icon: gtk::Image,
+    spinner: gtk::Spinner,
+    status_label: gtk::Label,
+    primary_button: gtk::Button,
+    overflow_button: gtk::MenuButton,
+}
+
+impl ServerPlaylistStatusShell {
+    fn new() -> Self {
+        let icon = gtk::Image::builder().visible(false).build();
+        icon.set_accessible_role(gtk::AccessibleRole::Presentation);
+        let spinner = gtk::Spinner::builder().visible(false).build();
+        spinner.set_accessible_role(gtk::AccessibleRole::Presentation);
+        let status_label = gtk::Label::builder()
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .single_line_mode(true)
+            .max_width_chars(48)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        status_label.set_accessible_role(gtk::AccessibleRole::Status);
+        let primary_button = gtk::Button::builder()
+            .visible(false)
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        let overflow_button = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .visible(false)
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "circular"])
+            .build();
+        let container = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .hexpand(true)
+            .halign(gtk::Align::Fill)
+            .visible(false)
+            .build();
+        container.set_accessible_role(gtk::AccessibleRole::Group);
+        container.append(&icon);
+        container.append(&spinner);
+        container.append(&status_label);
+        container.append(&primary_button);
+        container.append(&overflow_button);
+
+        Self {
+            container,
+            icon,
+            spinner,
+            status_label,
+            primary_button,
+            overflow_button,
+        }
+    }
+
+    fn widget(&self) -> &gtk::Box {
+        &self.container
+    }
+
+    fn reset(&self) {
+        self.container.set_visible(false);
+        self.container
+            .reset_property(gtk::AccessibleProperty::Label);
+        self.container.reset_state(gtk::AccessibleState::Busy);
+        self.icon.set_visible(false);
+        self.icon.set_icon_name(None);
+        self.spinner.stop();
+        self.spinner.set_visible(false);
+        self.status_label.set_text("");
+        self.status_label.set_tooltip_text(None);
+        self.status_label
+            .reset_property(gtk::AccessibleProperty::Label);
+        self.primary_button.set_visible(false);
+        self.primary_button.set_label("");
+        self.primary_button.set_action_name(None);
+        self.primary_button.set_sensitive(true);
+        self.primary_button.set_tooltip_text(None);
+        self.primary_button
+            .reset_property(gtk::AccessibleProperty::Label);
+        self.overflow_button.popdown();
+        self.overflow_button.set_visible(false);
+        self.overflow_button.set_menu_model(None::<&gio::MenuModel>);
+        self.overflow_button.set_tooltip_text(None);
+        self.overflow_button
+            .reset_property(gtk::AccessibleProperty::Label);
+        self.overflow_button
+            .reset_property(gtk::AccessibleProperty::HasPopup);
+    }
+
+    #[allow(dead_code)] // Used when the playlist-sync coordinator lands.
+    pub(super) fn render(&self, state: ServerPlaylistStatusState, locale: &str) {
+        self.reset();
+        let plan = ServerPlaylistStatusPlan::for_state(state);
+        let Some(status_key) = plan.status_key else {
+            return;
+        };
+
+        let controls_label = rust_i18n::t!(
+            "server_playlists.controls_accessible_label",
+            locale = locale
+        )
+        .into_owned();
+        let status = rust_i18n::t!(status_key, locale = locale).into_owned();
+        self.container
+            .update_property(&[gtk::accessible::Property::Label(&controls_label)]);
+        self.status_label.set_text(&status);
+        self.status_label.set_tooltip_text(Some(&status));
+        self.status_label
+            .update_property(&[gtk::accessible::Property::Label(&status)]);
+
+        if plan.show_spinner {
+            self.container
+                .update_state(&[gtk::accessible::State::Busy(true)]);
+            self.spinner.set_visible(true);
+            self.spinner.start();
+        } else if let Some(icon_name) = plan.icon_name {
+            self.icon.set_icon_name(Some(icon_name));
+            self.icon.set_visible(true);
+        }
+
+        if let Some(action) = plan.primary_action {
+            let label = rust_i18n::t!(action.translation_key(), locale = locale).into_owned();
+            self.primary_button.set_label(&label);
+            self.primary_button
+                .set_action_name(Some(action.action_name()));
+            self.primary_button.set_sensitive(plan.primary_sensitive);
+            self.primary_button.set_tooltip_text(Some(&label));
+            self.primary_button
+                .update_property(&[gtk::accessible::Property::Label(&label)]);
+            self.primary_button.set_visible(true);
+        }
+
+        if !plan.overflow_actions.is_empty() {
+            let menu = gio::Menu::new();
+            for action in plan.overflow_actions {
+                let label = rust_i18n::t!(action.translation_key(), locale = locale).into_owned();
+                menu.append(Some(&label), Some(action.action_name()));
+            }
+            let more_label =
+                rust_i18n::t!("server_playlists.action_more", locale = locale).into_owned();
+            self.overflow_button.set_menu_model(Some(&menu));
+            self.overflow_button.set_tooltip_text(Some(&more_label));
+            self.overflow_button.update_property(&[
+                gtk::accessible::Property::Label(&more_label),
+                gtk::accessible::Property::HasPopup(true),
+            ]);
+            self.overflow_button.set_visible(true);
+        }
+
+        self.container.set_visible(true);
+    }
+}
+
 /// Build the tracklist view.
 ///
-/// Returns `(outer_box, track_store, status_label, column_view, sort_model)`.
+/// Returns `(outer_box, track_store, status_label, column_view, sort_model,
+/// server_playlist_status_shell)`.
 /// The caller uses `track_store` for mutation (add/remove) and `sort_model`
 /// for position lookups (playback, next/prev) since positions in the
 /// ColumnView correspond to the sorted order, not the raw store order.
@@ -40,6 +393,7 @@ pub(super) fn build_tracklist(
     gtk::Label,
     gtk::ColumnView,
     gtk::SortListModel,
+    ServerPlaylistStatusShell,
 ) {
     let store = gio::ListStore::new::<TrackObject>();
     for t in initial_tracks {
@@ -249,23 +603,41 @@ pub(super) fn build_tracklist(
         .build();
 
     // ── Status bar ───────────────────────────────────────────────────
+    let server_playlist_status_shell = ServerPlaylistStatusShell::new();
     let status_label = gtk::Label::builder()
         .halign(gtk::Align::End)
+        .hexpand(true)
         .margin_start(8)
         .margin_end(12)
-        .margin_top(4)
-        .margin_bottom(4)
         .css_classes(["dim-label", "caption"])
         .build();
     update_status(&status_label, initial_tracks);
+
+    let status_bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(8)
+        .margin_top(4)
+        .margin_bottom(4)
+        .css_classes(["statusbar-box"])
+        .build();
+    status_bar.append(server_playlist_status_shell.widget());
+    status_bar.append(&status_label);
 
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
     outer.append(&scrolled);
-    outer.append(&status_label);
+    outer.append(&status_bar);
 
-    (outer, store, status_label, column_view, sort_model)
+    (
+        outer,
+        store,
+        status_label,
+        column_view,
+        sort_model,
+        server_playlist_status_shell,
+    )
 }
 
 /// Recompute and set the status label text from the current tracks.
@@ -695,6 +1067,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
     use serde::Deserialize;
@@ -724,6 +1097,235 @@ mod tests {
         apply: String,
         clear: String,
         update_failed: String,
+    }
+
+    const SERVER_PLAYLIST_KEYS: [&str; 20] = [
+        "controls_accessible_label",
+        "status_linked_read_only",
+        "status_syncing",
+        "status_offline",
+        "status_failed",
+        "status_conflict",
+        "status_missing",
+        "status_conflict_missing",
+        "action_sync_now",
+        "action_retry",
+        "action_replace_local_with_server",
+        "action_more",
+        "action_unlink",
+        "action_remove_local_copy",
+        "replace_heading",
+        "replace_body",
+        "unlink_heading",
+        "unlink_body",
+        "remove_heading",
+        "remove_body",
+    ];
+
+    fn server_playlist_catalog(locale: &str) -> BTreeMap<String, String> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("locales")
+            .join(format!("{locale}.yml"));
+        let yaml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let root: serde_yaml::Value = serde_yaml::from_str(&yaml)
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        let section = root
+            .get("server_playlists")
+            .and_then(serde_yaml::Value::as_mapping)
+            .unwrap_or_else(|| panic!("{} has no server_playlists map", path.display()));
+
+        section
+            .iter()
+            .map(|(key, value)| {
+                let key = key
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{} has a non-string key", path.display()));
+                let value = value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{locale}.server_playlists.{key} is not text"));
+                (key.to_owned(), value.to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn server_playlist_status_priority_is_deterministic() {
+        let all_conditions = ServerPlaylistStatusState {
+            scope: ServerPlaylistScope::Linked,
+            activity: ServerPlaylistActivity::Running,
+            conflict: true,
+            missing: true,
+            availability: ServerPlaylistAvailability::Unavailable,
+        };
+
+        assert_eq!(
+            ServerPlaylistStatusPlan::for_state(ServerPlaylistStatusState {
+                scope: ServerPlaylistScope::Hidden,
+                ..all_conditions
+            })
+            .kind,
+            ServerPlaylistStatusKind::Hidden
+        );
+        assert_eq!(
+            ServerPlaylistStatusPlan::for_state(all_conditions).kind,
+            ServerPlaylistStatusKind::Running
+        );
+        assert_eq!(
+            ServerPlaylistStatusPlan::for_state(ServerPlaylistStatusState {
+                activity: ServerPlaylistActivity::Failed,
+                ..all_conditions
+            })
+            .kind,
+            ServerPlaylistStatusKind::ConflictMissing
+        );
+        assert_eq!(
+            ServerPlaylistStatusPlan::for_state(ServerPlaylistStatusState {
+                activity: ServerPlaylistActivity::Failed,
+                conflict: false,
+                ..all_conditions
+            })
+            .kind,
+            ServerPlaylistStatusKind::Missing
+        );
+        assert_eq!(
+            ServerPlaylistStatusPlan::for_state(ServerPlaylistStatusState {
+                activity: ServerPlaylistActivity::Failed,
+                missing: false,
+                ..all_conditions
+            })
+            .kind,
+            ServerPlaylistStatusKind::Conflict
+        );
+        assert_eq!(
+            ServerPlaylistStatusPlan::for_state(ServerPlaylistStatusState {
+                activity: ServerPlaylistActivity::Failed,
+                conflict: false,
+                missing: false,
+                ..all_conditions
+            })
+            .kind,
+            ServerPlaylistStatusKind::Failed
+        );
+        assert_eq!(
+            ServerPlaylistStatusPlan::for_state(ServerPlaylistStatusState {
+                activity: ServerPlaylistActivity::Idle,
+                conflict: false,
+                missing: false,
+                ..all_conditions
+            })
+            .kind,
+            ServerPlaylistStatusKind::Unavailable
+        );
+        assert_eq!(
+            ServerPlaylistStatusPlan::for_state(ServerPlaylistStatusState {
+                scope: ServerPlaylistScope::Linked,
+                ..ServerPlaylistStatusState::default()
+            })
+            .kind,
+            ServerPlaylistStatusKind::Clean
+        );
+    }
+
+    #[test]
+    fn server_playlist_status_plans_keep_count_and_freshness_out_of_sync_copy() {
+        let clean = ServerPlaylistStatusPlan::for_state(ServerPlaylistStatusState {
+            scope: ServerPlaylistScope::Linked,
+            ..ServerPlaylistStatusState::default()
+        });
+        assert_eq!(
+            clean.status_key,
+            Some("server_playlists.status_linked_read_only")
+        );
+        assert_eq!(clean.primary_action, Some(ServerPlaylistAction::SyncNow));
+        assert_eq!(clean.overflow_actions, SERVER_PLAYLIST_RECOVERY_ACTIONS);
+
+        let running = ServerPlaylistStatusPlan::for_state(ServerPlaylistStatusState {
+            scope: ServerPlaylistScope::Linked,
+            activity: ServerPlaylistActivity::Running,
+            ..ServerPlaylistStatusState::default()
+        });
+        assert!(running.show_spinner);
+        assert_eq!(running.primary_action, None);
+        assert!(running.overflow_actions.is_empty());
+
+        let unavailable = ServerPlaylistStatusPlan::for_state(ServerPlaylistStatusState {
+            scope: ServerPlaylistScope::Linked,
+            availability: ServerPlaylistAvailability::Unavailable,
+            ..ServerPlaylistStatusState::default()
+        });
+        assert_eq!(
+            unavailable.primary_action,
+            Some(ServerPlaylistAction::Retry)
+        );
+        assert!(!unavailable.primary_sensitive);
+
+        // Track count remains the existing, separately updated label. Sync
+        // state intentionally exposes no count or time/freshness placeholders.
+        for locale in rust_i18n::available_locales!() {
+            let catalog = server_playlist_catalog(locale.as_ref());
+            for value in catalog.values() {
+                assert!(!value.contains("%{count}"), "locale {locale}");
+                assert!(!value.contains("%{time}"), "locale {locale}");
+                assert!(!value.contains("%{updated}"), "locale {locale}");
+            }
+        }
+    }
+
+    #[test]
+    fn server_playlist_offline_matrix_disables_network_primary_but_keeps_local_recovery() {
+        for activity in [ServerPlaylistActivity::Idle, ServerPlaylistActivity::Failed] {
+            for conflict in [false, true] {
+                for missing in [false, true] {
+                    let plan = ServerPlaylistStatusPlan::for_state(ServerPlaylistStatusState {
+                        scope: ServerPlaylistScope::Linked,
+                        activity,
+                        conflict,
+                        missing,
+                        availability: ServerPlaylistAvailability::Unavailable,
+                    });
+
+                    assert!(plan.primary_action.is_some());
+                    assert!(
+                        !plan.primary_sensitive,
+                        "offline primary remained sensitive for {activity:?}, conflict={conflict}, missing={missing}"
+                    );
+                    assert_eq!(
+                        plan.overflow_actions, SERVER_PLAYLIST_RECOVERY_ACTIONS,
+                        "offline local recovery changed for {activity:?}, conflict={conflict}, missing={missing}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn server_playlist_catalogs_are_exact_complete_and_do_not_fall_back_to_english() {
+        let expected: BTreeSet<_> = SERVER_PLAYLIST_KEYS.into_iter().collect();
+        let english = server_playlist_catalog("en");
+
+        for locale in rust_i18n::available_locales!() {
+            let catalog = server_playlist_catalog(locale.as_ref());
+            let actual: BTreeSet<_> = catalog.keys().map(String::as_str).collect();
+            assert_eq!(actual, expected, "locale {locale}");
+
+            for key in SERVER_PLAYLIST_KEYS {
+                let value = &catalog[key];
+                assert!(!value.trim().is_empty(), "{locale}.server_playlists.{key}");
+                let translation_key = format!("server_playlists.{key}");
+                assert_eq!(
+                    rust_i18n::t!(&translation_key, locale = locale).as_ref(),
+                    value,
+                    "locale {locale}, key {key}"
+                );
+                if locale.as_ref() != "en" {
+                    assert_ne!(
+                        value, &english[key],
+                        "{locale}.server_playlists.{key} fell back to English"
+                    );
+                }
+            }
+        }
     }
 
     fn track(id: &str, rating: TrackRating) -> TrackObject {

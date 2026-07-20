@@ -242,6 +242,29 @@ smart_playlist:
   remove_rule: "Usuń regułę"
   limit_to: "Ogranicz do"
 
+# ── Playlisty serwera ──────────────────────────────────────────────
+server_playlists:
+  controls_accessible_label: "Elementy sterujące synchronizacją playlisty z serwerem"
+  status_linked_read_only: "Połączono z serwerem — tylko do odczytu"
+  status_syncing: "Synchronizowanie playlisty z serwerem…"
+  status_offline: "Serwer jest niedostępny — zachowano zapisaną kopię"
+  status_failed: "Synchronizacja nie powiodła się — zachowano zapisaną kopię"
+  status_conflict: "Lokalne zmiany są w konflikcie z serwerem"
+  status_missing: "Brak playlisty na serwerze"
+  status_conflict_missing: "Lokalne zmiany są w konflikcie; brak playlisty na serwerze"
+  action_sync_now: "Synchronizuj teraz"
+  action_retry: "Spróbuj ponownie"
+  action_replace_local_with_server: "Zastąp wersję lokalną wersją z serwera"
+  action_more: "Więcej działań playlisty"
+  action_unlink: "Odłącz"
+  action_remove_local_copy: "Usuń lokalną kopię"
+  replace_heading: "Zastąpić lokalną playlistę?"
+  replace_body: "Spowoduje to odrzucenie lokalnych zmian i zastąpienie playlisty świeżą kopią z serwera."
+  unlink_heading: "Odłączyć playlistę serwera?"
+  unlink_body: "Bieżące utwory pozostaną w edytowalnej lokalnej playliście, która nie będzie już synchronizowana."
+  remove_heading: "Usunąć lokalną kopię?"
+  remove_body: "Spowoduje to usunięcie lokalnej playlisty i jej łącza synchronizacji. Playlista na serwerze nie zostanie zmieniona."
+
 # ── Komunikaty o błędach ───────────────────────────────────────────
 errors:
   remote:

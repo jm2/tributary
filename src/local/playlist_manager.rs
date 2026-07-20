@@ -15,6 +15,7 @@ use uuid::Uuid;
 use super::playlist_io::{ImportedTrack, ImportedTrackMatchIndex};
 use super::smart_rules::{self, SmartRules};
 use crate::architecture::{MediaKey, SourceId, TrackId};
+use crate::db::entities::server_playlist_link::StoredServerPlaylistLink;
 use crate::db::entities::{playlist, playlist_entry, server_playlist_link, track};
 
 mod server_playlist_sync;
@@ -277,6 +278,50 @@ pub struct PlaylistManager {
     db: DatabaseConnection,
 }
 
+struct SmartRulesStorage {
+    json: String,
+    match_mode: String,
+    limit_enabled: bool,
+    limit_value: Option<i32>,
+    limit_unit: Option<String>,
+    limit_sort: Option<String>,
+}
+
+fn smart_rules_storage(rules: &SmartRules) -> Result<SmartRulesStorage, DbErr> {
+    let json = serde_json::to_string(rules)
+        .map_err(|error| DbErr::Custom(format!("Failed to serialize rules: {error}")))?;
+    let match_mode = match rules.match_mode {
+        smart_rules::MatchMode::All => "all".to_string(),
+        smart_rules::MatchMode::Any => "any".to_string(),
+    };
+    let (limit_enabled, limit_value, limit_unit, limit_sort) = match &rules.limit {
+        Some(limit) => {
+            let value = i32::try_from(limit.value)
+                .map_err(|_| DbErr::Custom("Smart playlist limit is too large".to_string()))?;
+            let unit = serde_json::to_string(&limit.unit).map_err(|error| {
+                DbErr::Custom(format!(
+                    "Failed to serialize smart playlist limit unit: {error}"
+                ))
+            })?;
+            let sort = serde_json::to_string(&limit.selected_by).map_err(|error| {
+                DbErr::Custom(format!(
+                    "Failed to serialize smart playlist limit sort: {error}"
+                ))
+            })?;
+            (true, Some(value), Some(unit), Some(sort))
+        }
+        None => (false, None, None, None),
+    };
+    Ok(SmartRulesStorage {
+        json,
+        match_mode,
+        limit_enabled,
+        limit_value,
+        limit_unit,
+        limit_sort,
+    })
+}
+
 impl PlaylistManager {
     pub fn new(db: DatabaseConnection) -> Self {
         Self { db }
@@ -284,17 +329,16 @@ impl PlaylistManager {
 
     // ── CRUD ─────────────────────────────────────────────────────────
 
-    /// Create a new playlist (regular or smart).
-    pub async fn create_playlist(
-        &self,
-        name: &str,
-        is_smart: bool,
-    ) -> Result<playlist::Model, DbErr> {
+    /// Create a new editable regular playlist.
+    ///
+    /// Smart playlists must use [`Self::create_smart_playlist`] so no public
+    /// production path can persist an intermediate rule-less smart row.
+    pub async fn create_regular_playlist(&self, name: &str) -> Result<playlist::Model, DbErr> {
         let now = now_rfc3339();
         let model = playlist::ActiveModel {
             id: Set(Uuid::new_v4().to_string()),
             name: Set(name.to_string()),
-            is_smart: Set(is_smart),
+            is_smart: Set(false),
             smart_rules_json: Set(None),
             limit_enabled: Set(false),
             limit_value: Set(None),
@@ -307,6 +351,40 @@ impl PlaylistManager {
         };
         let result = model.insert(&self.db).await?;
         info!(id = %result.id, name = %result.name, "Playlist created");
+        Ok(result)
+    }
+
+    /// Create one fully configured smart playlist in a single transaction.
+    ///
+    /// Rules and every legacy compatibility column are validated and encoded
+    /// before the row exists. Callers therefore never need to publish, repair,
+    /// or compensate for an intermediate smart playlist with missing rules.
+    pub async fn create_smart_playlist(
+        &self,
+        name: &str,
+        rules: &SmartRules,
+    ) -> Result<playlist::Model, DbErr> {
+        let storage = smart_rules_storage(rules)?;
+        let now = now_rfc3339();
+        let txn = self.db.begin().await?;
+        let result = playlist::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            name: Set(name.to_string()),
+            is_smart: Set(true),
+            smart_rules_json: Set(Some(storage.json)),
+            limit_enabled: Set(storage.limit_enabled),
+            limit_value: Set(storage.limit_value),
+            limit_unit: Set(storage.limit_unit),
+            limit_sort: Set(storage.limit_sort),
+            match_mode: Set(storage.match_mode),
+            live_updating: Set(true),
+            created_at: Set(now.clone()),
+            updated_at: Set(now),
+        }
+        .insert(&txn)
+        .await?;
+        txn.commit().await?;
+        info!(id = %result.id, "Smart playlist created");
         Ok(result)
     }
 
@@ -756,16 +834,19 @@ impl PlaylistManager {
         &self,
         playlist_id: &str,
     ) -> Result<Vec<StoredPlaylistEntry>, DbErr> {
-        require_regular_playlist(&self.db, playlist_id).await?;
+        let txn = self.db.begin().await?;
+        require_regular_playlist(&txn, playlist_id).await?;
         let entries = playlist_entry::Entity::find()
             .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
             .order_by_asc(playlist_entry::Column::Position)
-            .all(&self.db)
+            .all(&txn)
             .await?;
-        entries
+        let entries = entries
             .into_iter()
             .map(StoredPlaylistEntry::from_model)
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        txn.commit().await?;
+        Ok(entries)
     }
 
     /// Load every durable regular-playlist occurrence in stored order and
@@ -781,29 +862,24 @@ impl PlaylistManager {
     ) -> Result<Vec<LoadedPlaylistEntry>, DbErr> {
         let txn = self.db.begin().await?;
         require_regular_playlist(&txn, playlist_id).await?;
-        let rows = playlist_entry::Entity::find()
-            .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
-            .order_by_asc(playlist_entry::Column::Position)
-            .find_also_related(track::Entity)
-            .all(&txn)
-            .await?;
+        let loaded = load_playlist_entries_from(&txn, playlist_id).await?;
+        txn.commit().await?;
+        Ok(loaded)
+    }
 
-        let mut loaded = Vec::with_capacity(rows.len());
-        for (entry, local_track) in rows {
-            let stored = StoredPlaylistEntry::from_model(entry)?;
-            let local_track = if stored.source_id == SourceId::local() {
-                local_track
-            } else {
-                // Typed decoding rejects a non-local foreign-key cache. Keep
-                // the projection fail-closed as well if a future relation or
-                // schema change ever produces an unexpected joined row.
-                None
-            };
-            loaded.push(LoadedPlaylistEntry {
-                stored,
-                local_track,
-            });
-        }
+    /// Load an export snapshot only while the target is still an editable,
+    /// unlinked regular playlist.
+    ///
+    /// The authority check and ordered entry read share one database snapshot,
+    /// providing the final defense when a chooser was opened for an ordinary
+    /// playlist but that parent became a pull mirror before export began.
+    async fn load_editable_playlist_entries_for_export(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<LoadedPlaylistEntry>, DbErr> {
+        let txn = self.db.begin().await?;
+        require_editable_regular_playlist(&txn, playlist_id).await?;
+        let loaded = load_playlist_entries_from(&txn, playlist_id).await?;
         txn.commit().await?;
         Ok(loaded)
     }
@@ -818,7 +894,9 @@ impl PlaylistManager {
         &self,
         playlist_id: &str,
     ) -> Result<LocalPlaylistExport, DbErr> {
-        let entries = self.load_playlist_entries(playlist_id).await?;
+        let entries = self
+            .load_editable_playlist_entries_for_export(playlist_id)
+            .await?;
         if entries
             .iter()
             .any(|entry| entry.stored.source_id != SourceId::local() || entry.local_track.is_none())
@@ -844,39 +922,12 @@ impl PlaylistManager {
     /// entries with a valid local foreign-key cache and excludes remote or
     /// unresolved occurrences until mixed-source UI projection lands.
     pub async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<track::Model>, DbErr> {
-        let entries = playlist_entry::Entity::find()
-            .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
-            .filter(playlist_entry::Column::SourceId.eq(SourceId::local().to_string()))
-            .filter(playlist_entry::Column::LocalTrackId.is_not_null())
-            .order_by_asc(playlist_entry::Column::Position)
-            .all(&self.db)
-            .await?;
-
-        // Collect the linked track IDs in playlist order.
-        let track_ids: Vec<String> = entries
-            .iter()
-            .filter_map(|entry| entry.local_track_id.clone())
-            .collect();
-        if track_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Fetch all referenced tracks in a single query (instead of N+1
-        // `find_by_id` round-trips), then re-order them to match entry
-        // positions. Duplicate entries for the same track are preserved.
-        let by_id: HashMap<String, track::Model> = track::Entity::find()
-            .filter(track::Column::Id.is_in(track_ids.iter().map(String::as_str)))
-            .all(&self.db)
+        Ok(self
+            .load_playlist_entries(playlist_id)
             .await?
             .into_iter()
-            .map(|t| (t.id.clone(), t))
-            .collect();
-
-        let tracks = track_ids
-            .iter()
-            .filter_map(|id| by_id.get(id).cloned())
-            .collect();
-        Ok(tracks)
+            .filter_map(|entry| entry.local_track)
+            .collect())
     }
 
     // ── Smart playlist management ────────────────────────────────────
@@ -887,42 +938,22 @@ impl PlaylistManager {
         playlist_id: &str,
         rules: &SmartRules,
     ) -> Result<(), DbErr> {
-        let json = serde_json::to_string(rules)
-            .map_err(|e| DbErr::Custom(format!("Failed to serialize rules: {e}")))?;
+        let storage = smart_rules_storage(rules)?;
 
         let txn = self.db.begin().await?;
-        require_editable_playlist(&txn, playlist_id).await?;
-        let mut model: playlist::ActiveModel =
-            playlist::Entity::find_by_id(playlist_id.to_string())
-                .one(&txn)
-                .await?
-                .ok_or(DbErr::RecordNotFound(format!(
-                    "Playlist {playlist_id} not found"
-                )))?
-                .into();
+        let mut model: playlist::ActiveModel = load_editable_smart_playlist(&txn, playlist_id)
+            .await?
+            .into();
 
-        model.smart_rules_json = Set(Some(json));
-        model.match_mode = Set(match rules.match_mode {
-            smart_rules::MatchMode::All => "all".to_string(),
-            smart_rules::MatchMode::Any => "any".to_string(),
-        });
+        model.smart_rules_json = Set(Some(storage.json));
+        model.match_mode = Set(storage.match_mode);
         // Kept only for compatibility with the historical NOT NULL column.
         // Smart playlists are always evaluated against the current library.
         model.live_updating = Set(true);
-
-        if let Some(limit) = &rules.limit {
-            model.limit_enabled = Set(true);
-            model.limit_value = Set(Some(limit.value as i32));
-            model.limit_unit = Set(Some(serde_json::to_string(&limit.unit).unwrap_or_default()));
-            model.limit_sort = Set(Some(
-                serde_json::to_string(&limit.selected_by).unwrap_or_default(),
-            ));
-        } else {
-            model.limit_enabled = Set(false);
-            model.limit_value = Set(None);
-            model.limit_unit = Set(None);
-            model.limit_sort = Set(None);
-        }
+        model.limit_enabled = Set(storage.limit_enabled);
+        model.limit_value = Set(storage.limit_value);
+        model.limit_unit = Set(storage.limit_unit);
+        model.limit_sort = Set(storage.limit_sort);
 
         model.updated_at = Set(now_rfc3339());
         model.update(&txn).await?;
@@ -936,12 +967,8 @@ impl PlaylistManager {
         &self,
         playlist_id: &str,
     ) -> Result<Vec<track::Model>, DbErr> {
-        let playlist = playlist::Entity::find_by_id(playlist_id.to_string())
-            .one(&self.db)
-            .await?
-            .ok_or(DbErr::RecordNotFound(format!(
-                "Playlist {playlist_id} not found"
-            )))?;
+        let txn = self.db.begin().await?;
+        let playlist = load_editable_smart_playlist(&txn, playlist_id).await?;
 
         // A playlist with no rules configured yet (`smart_rules_json` is None)
         // defaults to "match all". But a *parse failure* of stored JSON
@@ -957,6 +984,7 @@ impl PlaylistManager {
                         error = %e,
                         "Failed to parse smart_rules_json; returning no tracks instead of matching all"
                     );
+                    txn.commit().await?;
                     return Ok(Vec::new());
                 }
             },
@@ -973,7 +1001,8 @@ impl PlaylistManager {
         // `TrackObject`s), so the predicates can't all be expressed in SQL.
         // The per-comparison allocation cost of the compound sort is mitigated
         // in `smart_rules::apply_compound_sort` (decorate-sort-undecorate).
-        let all_tracks = track::Entity::find().all(&self.db).await?;
+        let all_tracks = track::Entity::find().all(&txn).await?;
+        txn.commit().await?;
         let results = smart_rules::evaluate(&rules, &all_tracks);
         Ok(results)
     }
@@ -1094,30 +1123,69 @@ impl PlaylistManager {
                 direction: smart_rules::SortDirection::Descending,
             }],
         };
-        let pl = self.create_playlist("Recently Added", true).await?;
-        self.set_smart_rules(&pl.id, &rules_recently_added).await?;
+        let pl = self
+            .create_smart_playlist("Recently Added", &rules_recently_added)
+            .await?;
         info!(id = %pl.id, "Seeded: Recently Added");
         created.push(pl);
 
         // 2. Recently Played — authoritative playback time in the inclusive
         // last-14-day window, newest first with stable TrackId ties.
         let rules_recently_played = recently_played_default_rules();
-        let pl = self.create_playlist("Recently Played", true).await?;
-        self.set_smart_rules(&pl.id, &rules_recently_played).await?;
+        let pl = self
+            .create_smart_playlist("Recently Played", &rules_recently_played)
+            .await?;
         info!(id = %pl.id, "Seeded: Recently Played");
         created.push(pl);
 
         // 3. Top 25 Most Played — positive counts only, then count descending,
         // playback time descending (unknown last), and stable TrackId ties.
         let rules_top25 = top_25_most_played_default_rules();
-        let pl = self.create_playlist("Top 25 Most Played", true).await?;
-        self.set_smart_rules(&pl.id, &rules_top25).await?;
+        let pl = self
+            .create_smart_playlist("Top 25 Most Played", &rules_top25)
+            .await?;
         info!(id = %pl.id, "Seeded: Top 25 Most Played");
         created.push(pl);
 
         info!(count = created.len(), "Default smart playlists seeded");
         Ok(created)
     }
+}
+
+/// Decode the ordered regular-playlist rows visible through one caller-owned
+/// database snapshot. The caller establishes the required read or edit
+/// authority before invoking this helper.
+async fn load_playlist_entries_from<C>(
+    db: &C,
+    playlist_id: &str,
+) -> Result<Vec<LoadedPlaylistEntry>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let rows = playlist_entry::Entity::find()
+        .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
+        .order_by_asc(playlist_entry::Column::Position)
+        .find_also_related(track::Entity)
+        .all(db)
+        .await?;
+
+    let mut loaded = Vec::with_capacity(rows.len());
+    for (entry, local_track) in rows {
+        let stored = StoredPlaylistEntry::from_model(entry)?;
+        let local_track = if stored.source_id == SourceId::local() {
+            local_track
+        } else {
+            // Typed decoding rejects a non-local foreign-key cache. Keep the
+            // projection fail-closed as well if a future relation or schema
+            // change ever produces an unexpected joined row.
+            None
+        };
+        loaded.push(LoadedPlaylistEntry {
+            stored,
+            local_track,
+        });
+    }
+    Ok(loaded)
 }
 
 fn orphan_reconciliation_query() -> sea_orm::Select<playlist_entry::Entity> {
@@ -1196,10 +1264,21 @@ async fn require_regular_playlist<C>(db: &C, playlist_id: &str) -> Result<(), Db
 where
     C: ConnectionTrait,
 {
-    let playlist = playlist::Entity::find_by_id(playlist_id.to_string())
+    let (playlist, link) = playlist::Entity::find_by_id(playlist_id.to_string())
+        .find_also_related(server_playlist_link::Entity)
         .one(db)
         .await?
         .ok_or_else(|| DbErr::RecordNotFound(format!("Playlist {playlist_id} not found")))?;
+
+    // A validated pull link is the authoritative projection kind. This keeps
+    // a damaged legacy `is_smart` flag from hiding mirror occurrences, while
+    // malformed link storage still fails closed instead of granting either
+    // regular or smart authority.
+    if let Some(link) = link {
+        StoredServerPlaylistLink::try_from(link)
+            .map_err(|error| DbErr::Custom(format!("Invalid server-playlist link: {error}")))?;
+        return Ok(());
+    }
     if playlist.is_smart {
         return Err(DbErr::Custom(format!(
             "Playlist {playlist_id} is smart and cannot store regular entries"
@@ -1249,6 +1328,34 @@ where
         ));
     }
     Ok(())
+}
+
+async fn load_editable_smart_playlist<C>(
+    db: &C,
+    playlist_id: &str,
+) -> Result<playlist::Model, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let playlist = playlist::Entity::find_by_id(playlist_id.to_string())
+        .one(db)
+        .await?
+        .ok_or_else(|| DbErr::RecordNotFound("Playlist not found".to_string()))?;
+    if !playlist.is_smart {
+        return Err(DbErr::Custom(
+            "Regular playlists cannot store smart rules".to_string(),
+        ));
+    }
+    if server_playlist_link::Entity::find_by_id(playlist_id.to_string())
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Err(DbErr::Custom(
+            "Linked server playlists are read-only".to_string(),
+        ));
+    }
+    Ok(playlist)
 }
 
 /// Assign one exact occurrence order without ever violating the unique
@@ -1400,6 +1507,115 @@ mod tests {
         db
     }
 
+    #[tokio::test]
+    async fn smart_playlist_creation_persists_rules_and_compatibility_columns_atomically() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let rules = smart_rules::SmartRules {
+            match_mode: smart_rules::MatchMode::Any,
+            rules: vec![smart_rules::SmartRule {
+                field: smart_rules::RuleField::Artist,
+                operator: smart_rules::RuleOperator::Contains,
+                value: smart_rules::RuleValue::Text("Quartet".to_string()),
+            }],
+            limit: Some(smart_rules::SmartLimit {
+                value: 25,
+                unit: smart_rules::LimitUnit::Items,
+                selected_by: smart_rules::LimitSort::MostPlayed,
+            }),
+            sort_order: Vec::new(),
+        };
+
+        let created = manager
+            .create_smart_playlist("Atomic smart", &rules)
+            .await
+            .expect("create fully configured smart playlist");
+        assert!(created.is_smart);
+        assert_eq!(created.match_mode, "any");
+        assert!(created.live_updating);
+        assert!(created.limit_enabled);
+        assert_eq!(created.limit_value, Some(25));
+        assert_eq!(created.limit_unit.as_deref(), Some("\"Items\""));
+        assert_eq!(created.limit_sort.as_deref(), Some("\"MostPlayed\""));
+        let expected_json = serde_json::to_string(&rules).expect("serialize expected rules");
+        assert_eq!(
+            created.smart_rules_json.as_deref(),
+            Some(expected_json.as_str())
+        );
+
+        let rows = playlist::Entity::find()
+            .all(&db)
+            .await
+            .expect("reload smart playlists");
+        assert_eq!(rows, vec![created]);
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_smart_limit_creates_no_partial_playlist() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let rules = smart_rules::SmartRules {
+            match_mode: smart_rules::MatchMode::All,
+            rules: Vec::new(),
+            limit: Some(smart_rules::SmartLimit {
+                value: u32::MAX,
+                unit: smart_rules::LimitUnit::Items,
+                selected_by: smart_rules::LimitSort::Random,
+            }),
+            sort_order: Vec::new(),
+        };
+
+        manager
+            .create_smart_playlist("Must not appear", &rules)
+            .await
+            .expect_err("unrepresentable compatibility value must fail before insert");
+        assert!(playlist::Entity::find()
+            .all(&db)
+            .await
+            .expect("query playlists after rejection")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn regular_playlist_rejects_smart_rules_without_mutation() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let regular = manager
+            .create_regular_playlist("Definitely regular")
+            .await
+            .expect("create regular playlist");
+        assert!(!regular.is_smart);
+        assert!(regular.smart_rules_json.is_none());
+
+        let rules = smart_rules::SmartRules {
+            match_mode: smart_rules::MatchMode::All,
+            rules: Vec::new(),
+            limit: None,
+            sort_order: Vec::new(),
+        };
+        let error = manager
+            .set_smart_rules(&regular.id, &rules)
+            .await
+            .expect_err("regular playlist must reject smart rules");
+        assert!(error
+            .to_string()
+            .contains("Regular playlists cannot store smart rules"));
+        let evaluation_error = manager
+            .evaluate_smart_playlist(&regular.id)
+            .await
+            .expect_err("regular playlist must reject smart evaluation");
+        assert!(evaluation_error
+            .to_string()
+            .contains("Regular playlists cannot store smart rules"));
+
+        let reloaded = playlist::Entity::find_by_id(regular.id.clone())
+            .one(&db)
+            .await
+            .expect("reload regular playlist")
+            .expect("regular playlist remains present");
+        assert_eq!(reloaded, regular);
+    }
+
     async fn insert_entry(db: &DatabaseConnection, playlist_id: &str, id: &str, position: i32) {
         playlist_entry::ActiveModel {
             id: Set(id.to_string()),
@@ -1417,6 +1633,63 @@ mod tests {
         .insert(db)
         .await
         .expect("insert entry");
+    }
+
+    async fn insert_test_pull_link(db: &DatabaseConnection, playlist_id: &str) {
+        server_playlist_link::ActiveModel {
+            playlist_id: Set(playlist_id.to_string()),
+            source_id: Set(SourceId::random().to_string()),
+            native_playlist_id: Set(format!("native-{playlist_id}")),
+            mode: Set(server_playlist_link::SERVER_PLAYLIST_LINK_MODE.to_string()),
+            last_synced_name: Set("Bounded linked name".to_string()),
+            digest_version: Set(server_playlist_link::SERVER_PLAYLIST_DIGEST_VERSION),
+            membership_digest: Set(vec![0; server_playlist_link::SERVER_PLAYLIST_DIGEST_BYTES]),
+            last_success_at_ms: Set(0),
+            local_state: Set("clean".to_string()),
+            remote_state: Set("present".to_string()),
+            state_revision: Set(0),
+        }
+        .insert(db)
+        .await
+        .expect("insert test pull link");
+    }
+
+    #[tokio::test]
+    async fn validated_pull_link_overrides_corrupt_smart_flag_for_projection_only() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let rules = smart_rules::SmartRules {
+            match_mode: smart_rules::MatchMode::All,
+            rules: Vec::new(),
+            limit: None,
+            sort_order: Vec::new(),
+        };
+        let parent = manager
+            .create_smart_playlist("Corrupt linked parent", &rules)
+            .await
+            .expect("create smart parent fixture");
+        insert_entry(&db, &parent.id, "linked-occurrence", 0).await;
+
+        manager
+            .load_playlist_entries(&parent.id)
+            .await
+            .expect_err("unlinked smart parent must reject regular projection");
+
+        insert_test_pull_link(&db, &parent.id).await;
+        let projected = manager
+            .load_playlist_entries(&parent.id)
+            .await
+            .expect("validated pull link must win over corrupt smart flag");
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].stored.id, "linked-occurrence");
+
+        let error = manager
+            .evaluate_smart_playlist(&parent.id)
+            .await
+            .expect_err("linked parent must reject smart evaluation");
+        assert!(error
+            .to_string()
+            .contains("Linked server playlists are read-only"));
     }
 
     async fn insert_track(
@@ -1704,10 +1977,6 @@ mod tests {
             active.update(&db).await.expect("persist test rating");
         }
 
-        let playlist = manager
-            .create_playlist("Highest rated", true)
-            .await
-            .expect("create smart playlist");
         let highest = smart_rules::SmartRules {
             match_mode: smart_rules::MatchMode::All,
             rules: vec![smart_rules::SmartRule {
@@ -1725,10 +1994,10 @@ mod tests {
                 direction: smart_rules::SortDirection::Descending,
             }],
         };
-        manager
-            .set_smart_rules(&playlist.id, &highest)
+        let playlist = manager
+            .create_smart_playlist("Highest rated", &highest)
             .await
-            .expect("save rating rules");
+            .expect("create smart playlist");
         let highest_ids: Vec<_> = manager
             .evaluate_smart_playlist(&playlist.id)
             .await
@@ -1991,12 +2260,6 @@ mod tests {
     async fn legacy_live_updating_false_still_reevaluates_and_is_canonicalized_on_save() {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
-        let created = manager
-            .create_playlist("Legacy smart playlist", true)
-            .await
-            .expect("create smart playlist");
-        let playlist_id = created.id.clone();
-
         // Older releases persisted this option in both the rules JSON and a
         // NOT NULL table column. It never changed evaluation semantics: smart
         // playlists are evaluated from the current track table on every load.
@@ -2011,6 +2274,12 @@ mod tests {
             "live_updating":false,
             "sort_order":[]
         }"#;
+        let rules = serde_json::from_str(legacy_json).expect("parse legacy rules JSON");
+        let created = manager
+            .create_smart_playlist("Legacy smart playlist", &rules)
+            .await
+            .expect("create smart playlist");
+        let playlist_id = created.id.clone();
         let mut legacy: playlist::ActiveModel = created.into();
         legacy.smart_rules_json = Set(Some(legacy_json.to_string()));
         legacy.live_updating = Set(false);
@@ -2054,7 +2323,6 @@ mod tests {
             2
         );
 
-        let rules = serde_json::from_str(legacy_json).expect("parse legacy rules JSON");
         manager
             .set_smart_rules(&playlist_id, &rules)
             .await
@@ -2076,7 +2344,7 @@ mod tests {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Mixed storage fixture", false)
+            .create_regular_playlist("Mixed storage fixture")
             .await
             .expect("create playlist");
         let local = insert_track(
@@ -2201,7 +2469,7 @@ mod tests {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Commit authority rollback", false)
+            .create_regular_playlist("Commit authority rollback")
             .await
             .expect("create playlist");
         let input = PlaylistEntryInput::new(
@@ -2243,7 +2511,7 @@ mod tests {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Aligned mixed load", false)
+            .create_regular_playlist("Aligned mixed load")
             .await
             .expect("create playlist");
         let local = insert_track(
@@ -2355,7 +2623,7 @@ mod tests {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Local-only export boundary", false)
+            .create_regular_playlist("Local-only export boundary")
             .await
             .expect("create playlist");
 
@@ -2446,11 +2714,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_rechecks_unlinked_authority_after_a_stale_ui_precheck() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_regular_playlist("Became linked while chooser was open")
+            .await
+            .expect("create ordinary playlist");
+
+        // This successful read represents the UI authority used to open the
+        // file chooser. A link committed afterward must still be caught by the
+        // manager's final transaction rather than exporting a mirror.
+        assert!(matches!(
+            manager
+                .local_playlist_export(&playlist.id)
+                .await
+                .expect("ordinary empty playlist remains exportable"),
+            LocalPlaylistExport::Ready(tracks) if tracks.is_empty()
+        ));
+        insert_test_pull_link(&db, &playlist.id).await;
+
+        let error = manager
+            .local_playlist_export(&playlist.id)
+            .await
+            .expect_err("linked mirror must reject stale export action");
+        assert!(error
+            .to_string()
+            .contains("Linked server playlists are read-only"));
+    }
+
+    #[tokio::test]
     async fn source_scoped_batch_rejects_invalid_input_without_partial_writes_or_id_leaks() {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Atomic batch", false)
+            .create_regular_playlist("Atomic batch")
             .await
             .expect("create playlist");
         let oversized_secret = format!("private-track-id-{}", "x".repeat(4096));
@@ -2515,8 +2813,14 @@ mod tests {
         assert!(!error.to_string().contains("missing-private-local-id"));
         assert!(playlist_entries(&db, &playlist.id).await.is_empty());
 
+        let empty_rules = smart_rules::SmartRules {
+            match_mode: smart_rules::MatchMode::All,
+            rules: Vec::new(),
+            limit: None,
+            sort_order: Vec::new(),
+        };
         let smart = manager
-            .create_playlist("Smart", true)
+            .create_smart_playlist("Smart", &empty_rules)
             .await
             .expect("create smart playlist");
         let valid_remote = PlaylistEntryInput::new(
@@ -2541,7 +2845,7 @@ mod tests {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Position overflow", false)
+            .create_regular_playlist("Position overflow")
             .await
             .expect("create playlist");
         insert_entry(&db, &playlist.id, "maximum-position", i32::MAX).await;
@@ -2569,7 +2873,7 @@ mod tests {
         let manager = PlaylistManager::new(db.clone());
 
         let playlist = manager
-            .create_playlist("Test", false)
+            .create_regular_playlist("Test")
             .await
             .expect("create playlist");
 
@@ -2615,7 +2919,7 @@ mod tests {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Exact mutations", false)
+            .create_regular_playlist("Exact mutations")
             .await
             .expect("create playlist");
         for (position, id) in ["first", "second", "third"].into_iter().enumerate() {
@@ -2683,7 +2987,7 @@ mod tests {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Rename fallback", false)
+            .create_regular_playlist("Rename fallback")
             .await
             .expect("create playlist");
         let original = insert_track(
@@ -2814,7 +3118,7 @@ mod tests {
         }
 
         let ordinary = manager
-            .create_playlist("Ordinary orphan", false)
+            .create_regular_playlist("Ordinary orphan")
             .await
             .expect("create ordinary playlist");
         insert_entry(&db, "linked-playlist-0", "linked-orphan", 0).await;
@@ -2861,7 +3165,7 @@ mod tests {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Reused path", false)
+            .create_regular_playlist("Reused path")
             .await
             .expect("create playlist");
         let original = insert_track(
@@ -2965,7 +3269,7 @@ mod tests {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Invalid duration evidence", false)
+            .create_regular_playlist("Invalid duration evidence")
             .await
             .expect("create playlist");
         let negative = insert_track(
@@ -3073,7 +3377,7 @@ mod tests {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Full rebuild", false)
+            .create_regular_playlist("Full rebuild")
             .await
             .expect("create playlist");
         let first = insert_track(
@@ -3165,7 +3469,7 @@ mod tests {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Ambiguous", false)
+            .create_regular_playlist("Ambiguous")
             .await
             .expect("create playlist");
         let original = insert_track(
@@ -3224,7 +3528,7 @@ mod tests {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
-            .create_playlist("Duration", false)
+            .create_regular_playlist("Duration")
             .await
             .expect("create playlist");
         let original = insert_track(

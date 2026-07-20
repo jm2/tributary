@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Server-native playlist UI now has fail-closed structural and localization groundwork** —
+  Sidebar sections and playlists carry typed identities instead of treating translated labels or
+  compatibility backend strings as authority. The library engine publishes playlists and optional
+  pull links from one deterministic joined snapshot; a valid link always wins over the parent
+  smart flag, malformed link state rejects the complete publication, and diagnostics redact both
+  mirrored names and native identities. GTK retains only the local playlist ID, durable
+  clean/conflict and present/missing state, and bounded display text. Linked mirrors render as
+  read-only or warning rows and expose none of the ordinary Rename, Export, Delete, Edit Smart,
+  Add, or Remove affordances; activation-time checks and the existing transactional manager guards
+  remain authoritative if a cached row changes.
+  Playlist Create, Rename, Delete, and smart-rule UI workers now return a closed committed/failed
+  outcome. A sidebar row is inserted, rebound, or removed only after its database transaction
+  commits, while every failure uses fixed localized copy and leaves the visible model unchanged.
+  Smart-playlist creation serializes and validates the complete rule/limit representation before
+  inserting it in one transaction, so a process failure cannot leave a published rule-less smart
+  playlist. Default smart-playlist seeding uses the same atomic path.
+  The existing track-count footer is now a real status-bar row with a separate initially hidden
+  server-playlist status shell. Its pure priority plan distinguishes syncing, combined
+  conflict/missing, missing, conflict, failure, offline, and clean read-only states; reserves
+  Sync Now, Retry, Replace Local with Server, Unlink, and Remove Local Copy controls; disables an
+  offline Retry; resets recycled action/accessibility state; and never presents a last-success time
+  as freshness. All 13 locale catalogs provide the exact visible, confirmation, tooltip, and
+  accessibility keys with tests that reject missing or English-fallback values. The shell remains
+  unwired and hidden until the next Record E coordinator/browser slices. That coordinator also
+  remains responsible for one versioned or serialized full-snapshot publication lane: the current
+  engine scan snapshot and direct post-commit CRUD callbacks do not yet share a monotonic ordering,
+  so this groundwork does not claim convergence for those concurrent deliveries. This change
+  performs no server listing, pull, reconnect scheduling, polling, or mutation.
 - **Subsonic server-native playlists now have durable pull-only links and an atomic sync engine**
   ([#145](https://github.com/jm2/tributary/pull/145)) — Migration 14 adds an exact-shape
   `server_playlist_links` table with one unique mirror per canonical source/native playlist pair,

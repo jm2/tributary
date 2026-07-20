@@ -105,6 +105,7 @@ struct PlaylistMutationContext {
     window: gtk::glib::WeakRef<adw::ApplicationWindow>,
     rt_handle: tokio::runtime::Handle,
     source_registry: SourceRegistry,
+    sidebar_store: gtk::gio::ListStore,
     track_store: gtk::gio::ListStore,
     master_tracks: std::rc::Rc<std::cell::RefCell<Vec<TrackObject>>>,
     source_tracks:
@@ -123,6 +124,7 @@ impl PlaylistMutationContext {
             window: state.window.downgrade(),
             rt_handle: state.rt_handle.clone(),
             source_registry: state.source_registry.clone(),
+            sidebar_store: state.sidebar_store.clone(),
             track_store: state.track_store.clone(),
             master_tracks: state.master_tracks.clone(),
             source_tracks: state.source_tracks.clone(),
@@ -194,6 +196,7 @@ impl PlaylistMutationContext {
         super::source_connect::load_playlist_source(
             self.rt_handle.clone(),
             self.source_registry.clone(),
+            self.sidebar_store.clone(),
             playlist_id.to_string(),
             request,
             self.source_navigation.clone(),
@@ -466,6 +469,9 @@ fn build_remove_from_playlist_action(
     else {
         return;
     };
+    if !playlist_is_editable_regular(&context.sidebar_store, &playlist_id) {
+        return;
+    }
     let Some(entry_ids) = collect_selected_playlist_entry_ids(sm, selection) else {
         // Smart-playlist and malformed rows do not carry durable occurrence
         // bindings. Hiding the action avoids pretending a live query can be
@@ -481,6 +487,10 @@ fn build_remove_from_playlist_action(
             return;
         };
         if !context.owns_request(request) {
+            return;
+        }
+        if !playlist_is_editable_regular(&context.sidebar_store, &playlist_id) {
+            context.show_mutation_failed();
             return;
         }
 
@@ -546,7 +556,7 @@ fn build_add_to_playlist_actions(
     let n = sidebar_store.n_items();
     for i in 0..n {
         if let Some(src) = sidebar_store.item(i).and_downcast_ref::<SourceObject>() {
-            if src.backend_type() == "playlist" {
+            if src.is_editable_regular_playlist() {
                 // Add the "Add to Playlist" header on first playlist found.
                 if !has_playlists {
                     has_playlists = true;
@@ -568,12 +578,17 @@ fn build_add_to_playlist_actions(
                 let interaction_request = interaction_request.cloned();
                 let candidates = candidates.clone();
                 let context = context.clone();
+                let sidebar_store = sidebar_store.clone();
                 add_action.connect_activate(move |_, _| {
                     let Some(request) = interaction_request.as_ref() else {
                         context.show_unsupported();
                         return;
                     };
                     if !context.owns_request(request) {
+                        context.show_unsupported();
+                        return;
+                    }
+                    if !playlist_is_editable_regular(&sidebar_store, &pid) {
                         context.show_unsupported();
                         return;
                     }
@@ -888,6 +903,17 @@ fn build_properties_action(
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════
 
+fn playlist_is_editable_regular(sidebar_store: &gtk::gio::ListStore, playlist_id: &str) -> bool {
+    (0..sidebar_store.n_items()).any(|position| {
+        sidebar_store
+            .item(position)
+            .and_downcast::<SourceObject>()
+            .is_some_and(|source| {
+                source.playlist_id() == playlist_id && source.is_editable_regular_playlist()
+            })
+    })
+}
+
 fn local_file_path(uri: &str) -> Option<std::path::PathBuf> {
     let url = url::Url::parse(uri).ok()?;
     (url.scheme() == "file")
@@ -1135,6 +1161,39 @@ mod tests {
             exact_playlist_entry_ids([Some(unavailable)]),
             Some(vec!["missing-entry".to_string()])
         );
+    }
+
+    #[test]
+    fn add_and_remove_targets_exclude_smart_and_pull_mirror_playlists() {
+        use crate::db::entities::server_playlist_link::{
+            ServerPlaylistLocalState, ServerPlaylistRemoteState,
+        };
+        use crate::ui::objects::{PlaylistSidebarEntry, PlaylistSidebarKind};
+
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        for entry in [
+            PlaylistSidebarEntry::new(
+                "regular-id",
+                "Regular",
+                PlaylistSidebarKind::EditableRegular,
+            ),
+            PlaylistSidebarEntry::new("smart-id", "Smart", PlaylistSidebarKind::EditableSmart),
+            PlaylistSidebarEntry::new(
+                "mirror-id",
+                "Mirror",
+                PlaylistSidebarKind::PullMirror {
+                    local_state: ServerPlaylistLocalState::Conflict,
+                    remote_state: ServerPlaylistRemoteState::Present,
+                },
+            ),
+        ] {
+            store.append(&SourceObject::playlist_entry(&entry));
+        }
+
+        assert!(playlist_is_editable_regular(&store, "regular-id"));
+        assert!(!playlist_is_editable_regular(&store, "smart-id"));
+        assert!(!playlist_is_editable_regular(&store, "mirror-id"));
+        assert!(!playlist_is_editable_regular(&store, "missing-id"));
     }
 
     #[test]

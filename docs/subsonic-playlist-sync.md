@@ -1,11 +1,14 @@
 # Subsonic server-native playlist import and pull-sync contract
 
-- Status: Accepted; protocol/authority and persistence/engine stages implemented, UI stage pending
+- Status: Accepted; protocol/authority, persistence/engine, and structural UI groundwork
+  implemented; coordinator/browser integration pending
 - Decision date: 2026-07-19
 - Tracking issue: [#143](https://github.com/jm2/tributary/issues/143)
 - Related regular-playlist work: [#140](https://github.com/jm2/tributary/pull/140),
   [#141](https://github.com/jm2/tributary/pull/141), and
   [#142](https://github.com/jm2/tributary/pull/142)
+- Server-native foundations: [#144](https://github.com/jm2/tributary/pull/144) and
+  [#145](https://github.com/jm2/tributary/pull/145)
 
 This document defines how Tributary may consume playlists owned by a Subsonic or OpenSubsonic
 server. It is deliberately separate from
@@ -27,12 +30,16 @@ The feature is split into three independently reviewable records:
    snapshot types, implement the read-only Subsonic `getPlaylists` and `getPlaylist` endpoints, and
    expose them only through a default-deny current-session registry capability. This stage writes
    no playlist or link state and adds no UI.
-2. **Implemented — link persistence and atomic pull synchronization.** Add the dedicated link schema and the
-   manager operations for detached imports, read-only mirrors, conflict detection, successful
-   atomic replacement, missing-server state, unlink, and removal.
-3. **Planned — UI, localization, and end-to-end behavior.** Add explicit Import Copy and Keep Synced actions,
-   Sync Now, status and conflict presentation, Retry/Unlink/Remove Local Copy recovery, reconnect
-   refresh, and deterministic integration coverage.
+2. **Implemented — link persistence and atomic pull synchronization ([#145]).** Add the dedicated
+   link schema and the manager operations for detached imports, read-only mirrors, conflict
+   detection, successful atomic replacement, missing-server state, unlink, and removal.
+3. **In progress — UI, localization, and end-to-end behavior.** Structural header/playlist
+   identity, joined durable link presentation, ordinary-action exclusion, commit-only local CRUD,
+   atomic smart creation, and the localized recovery-shell plan are implemented. The shell is
+   initially hidden and grants no authority. Follow-on slices add the exact-session latest-request
+   coordinator, one monotonic or serialized full-sidebar publication owner, reconnect/shutdown
+   integration, virtualized Import Copy/Keep Synced browser, Sync Now, and
+   Retry/Replace/Unlink/Remove recovery with deterministic end-to-end coverage.
 
 No stage may infer permission from a backend label, source key, response shape, or persisted row.
 Each consumer uses only the authority implemented by its immediately preceding stage.
@@ -253,9 +260,15 @@ list or partially parsed response.
 A successful reconnect will schedule one bounded refresh per linked playlist after the accepted source
 session is current. A manual Sync Now shares the same deduplicated operation lane. A newer request
 or lifecycle retirement cancels older work; only the latest still-current generation may commit.
-That latest-request lane and cancellation are Record E UI/lifecycle work; Record D already rejects
-stale source receipts and stale persisted revisions. The initial version does not continuously poll
-and does not keep a session alive solely for sync.
+Record E's structural UI slice now carries authoritative linked/read-only and orthogonal
+conflict/missing state into the sidebar without exposing native identity, excludes mirrors from
+ordinary mutation affordances, and defines a separate localized status/recovery shell. The shell is
+initially hidden and grants no operation authority. The latest-request lane, exact-session
+reconnect scheduling, cancellation, one ordered full-sidebar publication lane, and action wiring
+remain the next Record E slices; Record D already rejects stale source receipts and stale persisted
+revisions. Until that publication lane lands, an engine scan snapshot and a concurrent direct
+post-commit CRUD callback have no shared ordering token. The initial version does not continuously
+poll and does not keep a session alive solely for sync.
 
 ## Server rename and deletion
 

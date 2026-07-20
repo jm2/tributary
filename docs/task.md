@@ -14,8 +14,10 @@ state.
 - A top-level checkbox is one countable implementation record. Check it only after the behavior,
   tests, user documentation, and `CHANGELOG.md` entry are merged.
 - Add the implementing PR beside a completed item and record it in the implementation log.
-- Split a record before implementation if it cannot be reviewed safely in one PR. Keep the
-  numerator and denominator synchronized with the literal top-level checkboxes.
+- Deliver a large record through explicitly documented, reviewable PR slices when needed, but keep
+  its checkbox open until the complete acceptance contract lands. Split the checklist record only
+  when the resulting parts are independently complete and countable. Keep the numerator and
+  denominator synchronized with the literal top-level checkboxes.
 - Scope protocol, schema, authority, cross-output, and privacy decisions in a design document or
   refined GitHub issue before committing to an implementation.
 - Do not treat the order below as a release promise. It is a dependency-aware starting order and
@@ -29,13 +31,20 @@ real-environment validation, not missing implementation.
 ## Current focus
 
 P1.1, P1.2, all three P1.3 playback-history records, both P1.4 rating records, and P1.5 through
-server-native link persistence and the atomic pull-sync engine are complete. Continue with P1.5
-Record E: add the localized Import Copy, Keep Synced, Sync Now, conflict/missing/offline recovery,
-reconnect refresh, and latest-request operation lane which consume the completed manager and exact-
-session authority. The accepted [`subsonic-playlist-sync.md`](subsonic-playlist-sync.md) contract
-keeps this capability pull-only and separate from Tributary's ordinary mixed-source playlists.
-Smart playlists and XSPF import/export remain local-only, while mixed-source metadata export
-requires its own no-locator policy.
+server-native link persistence and the atomic pull-sync engine are complete. Record E is now being
+delivered in reviewable UI/lifecycle slices. Its structural groundwork replaces translated-label
+and backend-string identity with typed header/playlist state, publishes linked mirrors from one
+joined database snapshot, prevents ordinary edit affordances from reaching those mirrors, and
+makes ordinary playlist sidebar changes depend on a committed database result. It also reserves a
+separate localized, accessible footer shell for durable sync/recovery state instead of overloading
+the continually updated track-count label.
+
+Continue with Record E's headless latest-request operation coordinator and one monotonic or
+serialized full-sidebar publication lane, then the virtualized
+Import Copy/Keep Synced browser and Sync Now/conflict/missing/offline recovery flows. The accepted
+[`subsonic-playlist-sync.md`](subsonic-playlist-sync.md) contract keeps this capability pull-only and
+separate from Tributary's ordinary mixed-source playlists. Smart playlists and XSPF import/export
+remain local-only, while mixed-source metadata export requires its own no-locator policy.
 
 The independent Linux watcher correctness fix tracked in
 [#103](https://github.com/jm2/tributary/pull/103) does not change the **12/38** feature total.
@@ -364,13 +373,52 @@ the 38-record feature backlog.
   authority. Reconciliation excludes linked mirrors with a zero-bind subquery instead of one SQLite
   host parameter per link. Staleness before admission rolls back; replacement,
   disconnect, or shutdown after admission waits. This authority deliberately does not require or
-  grant catalogue/playback membership. Record E still owns UI, localization, reconnect scheduling,
-  and the in-memory latest-request generation lane.
+  grant catalogue/playback membership. At the Record D delivery boundary, Record E still owned UI,
+  localization, reconnect scheduling, and the in-memory latest-request generation lane; its first
+  structural slice is recorded immediately below.
 
 - [ ] **Record E — Server-native playlist UI and lifecycle integration:** add localized Import Copy,
   Keep Synced, Sync Now, conflict/missing/offline status, reconnect refresh, Retry, Replace Local
   with Server, Unlink, and Remove Local Copy flows with accessible end-to-end coverage. Do not make
   linked mirrors editable or expose unsupported adapters/servers as writable playlist sources.
+
+  Structural groundwork is complete in the current delivery slice without claiming the Record E
+  checkbox. Sidebar section and playlist identity are typed rather than inferred from localized
+  display text or compatibility backend strings. A single ordered playlist/link snapshot makes
+  link presence win even over a damaged smart-playlist flag, rejects malformed link state instead
+  of exposing an editable row, and keeps native playlist identity out of GTK objects, actions, and
+  diagnostics. Pull mirrors receive explicit read-only/conflict/missing presentation and are
+  excluded from Rename, Export, Delete, Edit Smart Rules, Add, and Remove paths; persistence remains
+  the final defense.
+
+  Ordinary Create, Rename, Delete, and smart-rule operations now publish sidebar changes only for
+  a closed committed result and show fixed localized failure copy otherwise. Smart-playlist
+  creation writes its validated rule payload and compatibility columns atomically, eliminating the
+  intermediate rule-less row. The track footer now has a distinct initially hidden status shell
+  with deterministic state priority, recovery-action slots, recycled-state reset, and complete
+  non-fallback copy in all 13 catalogs; the existing count/duration label remains independent and
+  no timestamp is presented as proof of freshness.
+
+  This slice deliberately performs no listing, pull, reconnect scheduling, or server mutation. The
+  engine's scan snapshot and direct post-commit CRUD callbacks also remain unversioned relative to
+  one another; commit-only callback publication is not a claim that reversed concurrent deliveries
+  converge. The next slice is a GTK-free source/remote/local-keyed coordinator with exact-session
+  capability, generation, cancellation, final-admission, retirement, shutdown-drain coverage, and
+  one monotonic or serialized full-snapshot owner spanning scans, ordinary CRUD, and server-link
+  state. That design must cover every production mutation producer rather than adding a UI-only
+  token, replace partial Create/Rename/Delete/Import row patches with complete redacted joined
+  snapshots, and reject reversed older delivery. Regressions must cover create/import erasure,
+  rename reversion, delete resurrection, link classification/state changes, equal-version
+  idempotence, malformed joined data, restart, rollback/exhaustion, and whichever non-UI/cascade
+  paths the chosen durable-revision or single-owner design admits. The final
+  slice then connects that coordinator to a virtualized browser and the Import Copy, Keep Synced,
+  Sync Now, Retry, Replace, Unlink, and Remove Local Copy controls before Record E can be checked.
+
+  Structural-slice validation: the locked suite passes 20 library, 1,197 application, and 10
+  repository-metadata tests (1,227 total). Strict all-target/all-feature Clippy is green in debug
+  and release profiles; Rust 1.92 all-target checking, formatting, whitespace checks, exact
+  13-catalog/20-key locale parity, typed-identity scans, and an independent privacy/documentation
+  audit are also green.
 
 ## P2 — User-facing integrations and bounded enhancements
 

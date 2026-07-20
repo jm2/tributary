@@ -242,6 +242,29 @@ smart_playlist:
   remove_rule: "Supprimer la règle"
   limit_to: "Limiter à"
 
+# ── Listes du serveur ──────────────────────────────────────────────
+server_playlists:
+  controls_accessible_label: "Commandes de synchronisation des listes du serveur"
+  status_linked_read_only: "Liée au serveur — lecture seule"
+  status_syncing: "Synchronisation de la liste du serveur…"
+  status_offline: "Serveur indisponible — copie enregistrée conservée"
+  status_failed: "Échec de la synchronisation — copie enregistrée conservée"
+  status_conflict: "Les modifications locales sont en conflit avec le serveur"
+  status_missing: "La liste est absente du serveur"
+  status_conflict_missing: "Les modifications locales sont en conflit ; la liste est absente du serveur"
+  action_sync_now: "Synchroniser maintenant"
+  action_retry: "Réessayer"
+  action_replace_local_with_server: "Remplacer la version locale par celle du serveur"
+  action_more: "Autres actions sur la liste"
+  action_unlink: "Dissocier"
+  action_remove_local_copy: "Supprimer la copie locale"
+  replace_heading: "Remplacer la liste locale ?"
+  replace_body: "Cette action abandonne les modifications locales et remplace la liste par une nouvelle copie du serveur."
+  unlink_heading: "Dissocier la liste du serveur ?"
+  unlink_body: "Les morceaux actuels seront conservés dans une liste locale modifiable qui ne sera plus synchronisée."
+  remove_heading: "Supprimer la copie locale ?"
+  remove_body: "Cette action supprime la liste locale et son lien de synchronisation. La liste du serveur n'est pas modifiée."
+
 # ── Erreurs affichées ──────────────────────────────────────────────
 errors:
   remote:

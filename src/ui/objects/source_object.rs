@@ -14,6 +14,64 @@ use gtk::glib;
 use gtk::subclass::prelude::*;
 
 use crate::architecture::{AdvertisedHttpRoute, SourceId};
+pub use crate::local::engine::{PlaylistSidebarEntry, PlaylistSidebarKind};
+
+/// Structural identity of a non-selectable sidebar section header.
+///
+/// Display text is localized presentation and must never be used to decide
+/// which controls or rows belong to a section.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeaderKind {
+    Local,
+    Daap,
+    Subsonic,
+    Jellyfin,
+    Plex,
+    InternetRadio,
+    Playlists,
+    RemovableDevices,
+}
+
+fn linked_playlist_icon_name(kind: PlaylistSidebarKind) -> Option<&'static str> {
+    use crate::db::entities::server_playlist_link::{
+        ServerPlaylistLocalState, ServerPlaylistRemoteState,
+    };
+
+    match kind {
+        PlaylistSidebarKind::PullMirror {
+            local_state: ServerPlaylistLocalState::Clean,
+            remote_state: ServerPlaylistRemoteState::Present,
+        } => Some("emblem-readonly-symbolic"),
+        PlaylistSidebarKind::PullMirror { .. } => Some("dialog-warning-symbolic"),
+        PlaylistSidebarKind::EditableRegular | PlaylistSidebarKind::EditableSmart => None,
+    }
+}
+
+fn linked_playlist_status_key(kind: PlaylistSidebarKind) -> Option<&'static str> {
+    use crate::db::entities::server_playlist_link::{
+        ServerPlaylistLocalState, ServerPlaylistRemoteState,
+    };
+
+    match kind {
+        PlaylistSidebarKind::PullMirror {
+            local_state: ServerPlaylistLocalState::Clean,
+            remote_state: ServerPlaylistRemoteState::Present,
+        } => Some("server_playlists.status_linked_read_only"),
+        PlaylistSidebarKind::PullMirror {
+            local_state: ServerPlaylistLocalState::Conflict,
+            remote_state: ServerPlaylistRemoteState::Present,
+        } => Some("server_playlists.status_conflict"),
+        PlaylistSidebarKind::PullMirror {
+            local_state: ServerPlaylistLocalState::Clean,
+            remote_state: ServerPlaylistRemoteState::Missing,
+        } => Some("server_playlists.status_missing"),
+        PlaylistSidebarKind::PullMirror {
+            local_state: ServerPlaylistLocalState::Conflict,
+            remote_state: ServerPlaylistRemoteState::Missing,
+        } => Some("server_playlists.status_conflict_missing"),
+        PlaylistSidebarKind::EditableRegular | PlaylistSidebarKind::EditableSmart => None,
+    }
+}
 
 mod imp {
     use super::*;
@@ -23,7 +81,8 @@ mod imp {
         pub name: RefCell<String>,
         pub backend_type: RefCell<String>,
         pub icon_name: RefCell<String>,
-        pub is_header: Cell<bool>,
+        pub header_kind: Cell<Option<HeaderKind>>,
+        pub playlist_kind: Cell<Option<PlaylistSidebarKind>>,
         /// Base URL for remote servers (e.g. `https://music.example.com`).
         pub server_url: RefCell<String>,
         /// Stable logical source identity. This is independent from the
@@ -72,10 +131,10 @@ glib::wrapper! {
 
 impl SourceObject {
     /// Create a non-selectable category header row.
-    pub fn header(name: &str) -> Self {
+    pub fn header(name: &str, kind: HeaderKind) -> Self {
         let obj: Self = glib::Object::builder().build();
         obj.imp().name.replace(name.to_string());
-        obj.imp().is_header.set(true);
+        obj.imp().header_kind.set(Some(kind));
         obj
     }
 
@@ -85,7 +144,6 @@ impl SourceObject {
         obj.imp().name.replace(name.to_string());
         obj.imp().backend_type.replace(backend_type.to_string());
         obj.imp().icon_name.replace(icon_name.to_string());
-        obj.imp().is_header.set(false);
         obj.imp().connected.set(true); // local sources are always "connected"
         if backend_type == "local" {
             obj.imp().source_id.replace(SourceId::local().to_string());
@@ -111,7 +169,6 @@ impl SourceObject {
                 obj.imp().source_id.replace(source_id.to_string());
             }
         }
-        obj.imp().is_header.set(false);
         obj.imp().connected.set(false);
         // Assume open until probed. forked-daapd / OwnTone / iTunes shares
         // default to no password; defaulting `true` here caused a race where
@@ -126,7 +183,7 @@ impl SourceObject {
 
     /// Create the non-selectable heading for removable-device rows.
     pub fn device_header(name: &str) -> Self {
-        let obj = Self::header(name);
+        let obj = Self::header(name, HeaderKind::RemovableDevices);
         obj.imp()
             .backend_type
             .replace("usb-device-header".to_string());
@@ -146,7 +203,6 @@ impl SourceObject {
             obj.imp().source_id.replace(source_id.to_string());
         }
         obj.imp().device_mount_point.replace(Some(mount_point));
-        obj.imp().is_header.set(false);
         obj.imp().connected.set(true);
         obj.imp().requires_password.set(false);
         obj
@@ -164,7 +220,13 @@ impl SourceObject {
         self.imp().icon_name.borrow().clone()
     }
     pub fn is_header(&self) -> bool {
-        self.imp().is_header.get()
+        self.imp().header_kind.get().is_some()
+    }
+    pub fn header_kind(&self) -> Option<HeaderKind> {
+        self.imp().header_kind.get()
+    }
+    pub fn is_playlist_header(&self) -> bool {
+        self.header_kind() == Some(HeaderKind::Playlists)
     }
     pub fn server_url(&self) -> String {
         self.imp().server_url.borrow().clone()
@@ -205,6 +267,11 @@ impl SourceObject {
 
     pub fn set_icon_name(&self, name: &str) {
         self.imp().icon_name.replace(name.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_compatibility_backend_type_for_test(&self, backend_type: &str) {
+        self.imp().backend_type.replace(backend_type.to_string());
     }
 
     pub(crate) fn set_advertised_route(&self, route: Option<AdvertisedHttpRoute>) {
@@ -258,25 +325,64 @@ impl SourceObject {
         self.imp().playlist_id.borrow().clone()
     }
 
-    /// Create a playlist sidebar entry.
-    pub fn playlist(name: &str, playlist_id: &str, is_smart: bool) -> Self {
+    pub fn playlist_kind(&self) -> Option<PlaylistSidebarKind> {
+        self.imp().playlist_kind.get()
+    }
+
+    pub fn is_playlist(&self) -> bool {
+        self.playlist_kind().is_some()
+    }
+
+    pub fn is_editable_regular_playlist(&self) -> bool {
+        self.playlist_kind() == Some(PlaylistSidebarKind::EditableRegular)
+    }
+
+    pub fn is_editable_smart_playlist(&self) -> bool {
+        self.playlist_kind() == Some(PlaylistSidebarKind::EditableSmart)
+    }
+
+    pub fn is_linked_playlist(&self) -> bool {
+        matches!(
+            self.playlist_kind(),
+            Some(PlaylistSidebarKind::PullMirror { .. })
+        )
+    }
+
+    /// Localized presentation key for a linked playlist's durable state.
+    ///
+    /// Native server identity is intentionally absent from this UI object;
+    /// the sidebar needs only the validated state published by the engine.
+    pub(crate) fn linked_playlist_status_key(&self) -> Option<&'static str> {
+        self.playlist_kind().and_then(linked_playlist_status_key)
+    }
+
+    /// Create a playlist row from one authoritative engine publication.
+    pub fn playlist_entry(entry: &PlaylistSidebarEntry) -> Self {
+        Self::playlist_with_kind(entry.name(), entry.playlist_id(), entry.kind())
+    }
+
+    fn playlist_with_kind(name: &str, playlist_id: &str, kind: PlaylistSidebarKind) -> Self {
         let obj: Self = glib::Object::builder().build();
         obj.imp().name.replace(name.to_string());
-        let bt = if is_smart {
-            "smart-playlist"
-        } else {
-            "playlist"
+        let (backend_type, icon_name) = match kind {
+            PlaylistSidebarKind::EditableSmart => ("smart-playlist", "emblem-system-symbolic"),
+            PlaylistSidebarKind::EditableRegular => ("playlist", "view-list-symbolic"),
+            PlaylistSidebarKind::PullMirror { .. } => {
+                // Linked mirrors retain the existing regular-playlist
+                // navigation/projection key. Editability is carried only by
+                // the typed sidebar kind, never a new backend string.
+                (
+                    "playlist",
+                    linked_playlist_icon_name(kind)
+                        .expect("pull mirrors always have a durable-state icon"),
+                )
+            }
         };
-        obj.imp().backend_type.replace(bt.to_string());
-        let icon = if is_smart {
-            "emblem-system-symbolic"
-        } else {
-            "view-list-symbolic"
-        };
-        obj.imp().icon_name.replace(icon.to_string());
-        obj.imp().is_header.set(false);
+        obj.imp().backend_type.replace(backend_type.to_string());
+        obj.imp().icon_name.replace(icon_name.to_string());
         obj.imp().connected.set(true);
         obj.imp().playlist_id.replace(playlist_id.to_string());
+        obj.imp().playlist_kind.set(Some(kind));
         obj
     }
 
@@ -298,8 +404,11 @@ mod tests {
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
-    use super::SourceObject;
+    use super::{HeaderKind, PlaylistSidebarEntry, PlaylistSidebarKind, SourceObject};
     use crate::architecture::{AdvertisedHttpRoute, SourceId};
+    use crate::db::entities::server_playlist_link::{
+        ServerPlaylistLocalState, ServerPlaylistRemoteState,
+    };
 
     #[test]
     fn discovered_route_is_ephemeral_and_does_not_change_source_identity() {
@@ -378,8 +487,94 @@ mod tests {
         assert_eq!(header.name(), "Devices");
         assert_eq!(header.backend_type(), "usb-device-header");
         assert!(header.is_header());
+        assert_eq!(header.header_kind(), Some(HeaderKind::RemovableDevices));
+        assert!(!header.is_playlist_header());
         assert!(header.source_key().is_empty());
         assert_eq!(header.device_mount_point(), None);
+    }
+
+    #[test]
+    fn playlist_header_identity_is_independent_of_localized_display_text() {
+        let header = SourceObject::header("Wiedergabelisten", HeaderKind::Playlists);
+
+        assert!(header.is_header());
+        assert!(header.is_playlist_header());
+        assert_eq!(header.header_kind(), Some(HeaderKind::Playlists));
+        assert_eq!(header.name(), "Wiedergabelisten");
+    }
+
+    #[test]
+    fn pull_mirror_keeps_regular_navigation_backend_but_is_not_editable() {
+        let entry = PlaylistSidebarEntry::new(
+            "local-playlist-id",
+            "Mirrored name",
+            PlaylistSidebarKind::PullMirror {
+                local_state: ServerPlaylistLocalState::Conflict,
+                remote_state: ServerPlaylistRemoteState::Missing,
+            },
+        );
+        let source = SourceObject::playlist_entry(&entry);
+
+        assert!(source.is_playlist());
+        assert!(source.is_linked_playlist());
+        assert!(!source.is_editable_regular_playlist());
+        assert!(!source.is_editable_smart_playlist());
+        assert_eq!(source.playlist_kind(), Some(entry.kind()));
+        assert_eq!(source.backend_type(), "playlist");
+        assert_eq!(source.icon_name(), "dialog-warning-symbolic");
+        assert_eq!(
+            source.linked_playlist_status_key(),
+            Some("server_playlists.status_conflict_missing")
+        );
+        assert_eq!(source.playlist_id(), "local-playlist-id");
+    }
+
+    #[test]
+    fn pull_mirror_presentation_covers_every_durable_state_pair() {
+        use ServerPlaylistLocalState::{Clean, Conflict};
+        use ServerPlaylistRemoteState::{Missing, Present};
+
+        let cases = [
+            (
+                Clean,
+                Present,
+                "emblem-readonly-symbolic",
+                "server_playlists.status_linked_read_only",
+            ),
+            (
+                Conflict,
+                Present,
+                "dialog-warning-symbolic",
+                "server_playlists.status_conflict",
+            ),
+            (
+                Clean,
+                Missing,
+                "dialog-warning-symbolic",
+                "server_playlists.status_missing",
+            ),
+            (
+                Conflict,
+                Missing,
+                "dialog-warning-symbolic",
+                "server_playlists.status_conflict_missing",
+            ),
+        ];
+
+        for (local_state, remote_state, icon_name, status_key) in cases {
+            let entry = PlaylistSidebarEntry::new(
+                "local-playlist-id",
+                "Mirrored name",
+                PlaylistSidebarKind::PullMirror {
+                    local_state,
+                    remote_state,
+                },
+            );
+            let source = SourceObject::playlist_entry(&entry);
+
+            assert_eq!(source.icon_name(), icon_name);
+            assert_eq!(source.linked_playlist_status_key(), Some(status_key));
+        }
     }
 
     #[cfg(unix)]

@@ -10,8 +10,17 @@ use gtk::glib::variant::{FromVariant, ToVariant};
 use gtk::prelude::*;
 use gtk::{gio, glib};
 
-use super::objects::SourceObject;
+use super::objects::{PlaylistSidebarKind, SourceObject};
 use tracing::debug;
+
+const PLAYLIST_POPUP_ACTION_GROUP: &str = "playlist";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaylistPopupActionOwner {
+    Popover,
+}
+
+const PLAYLIST_POPUP_ACTION_OWNER: PlaylistPopupActionOwner = PlaylistPopupActionOwner::Popover;
 
 /// Playlist action emitted from the sidebar context menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +56,9 @@ enum SidebarButtonAction {
 /// remove/reinsert to refresh a row.
 fn sidebar_button_action(source: &SourceObject) -> Option<SidebarButtonAction> {
     if source.is_header() {
-        return (source.name() == "Playlists").then_some(SidebarButtonAction::OpenPlaylistMenu);
+        return source
+            .is_playlist_header()
+            .then_some(SidebarButtonAction::OpenPlaylistMenu);
     }
 
     if source.connecting() {
@@ -73,7 +84,7 @@ fn configure_action_button(button: &gtk::Button, action: Option<&SidebarButtonAc
     match action {
         Some(SidebarButtonAction::OpenPlaylistMenu) => {
             button.set_icon_name("list-add-symbolic");
-            button.set_tooltip_text(Some("New playlist"));
+            button.set_tooltip_text(Some(rust_i18n::t!("sidebar.new_playlist_menu").as_ref()));
             button.set_visible(true);
         }
         Some(SidebarButtonAction::Disconnect(_)) => {
@@ -87,6 +98,7 @@ fn configure_action_button(button: &gtk::Button, action: Option<&SidebarButtonAc
             button.set_visible(true);
         }
         None => {
+            button.set_icon_name("");
             button.set_tooltip_text(None);
             button.set_visible(false);
         }
@@ -168,8 +180,14 @@ fn sidebar_row_action(
 
 fn playlist_creation_menu() -> gio::Menu {
     let menu = gio::Menu::new();
-    menu.append(Some("New Playlist"), Some("pl-add.create-regular"));
-    menu.append(Some("New Smart Playlist"), Some("pl-add.create-smart"));
+    menu.append(
+        Some(rust_i18n::t!("sidebar.new_playlist_menu").as_ref()),
+        Some("pl-add.create-regular"),
+    );
+    menu.append(
+        Some(rust_i18n::t!("sidebar.new_smart_playlist_menu").as_ref()),
+        Some("pl-add.create-smart"),
+    );
     menu.append(
         Some(rust_i18n::t!("playlist_io.import_menu").as_ref()),
         Some("pl-add.import"),
@@ -202,6 +220,55 @@ fn playlist_creation_action_group(
         let _ = tx_import.try_send(PlaylistAction::ImportPlaylist);
     });
     action_group.add_action(&import);
+
+    action_group
+}
+
+/// Build one immutable action snapshot for a playlist context-menu popover.
+///
+/// A `GtkListItem` and its row widget may be rebound while the menu remains
+/// open, so the actions must capture the target ID once and be owned by the
+/// one-shot popover rather than by the recycled row.
+fn playlist_popup_action_group(
+    tx: &async_channel::Sender<PlaylistAction>,
+    playlist_id: Option<&str>,
+) -> gio::SimpleActionGroup {
+    let action_group = playlist_creation_action_group(tx);
+    let Some(playlist_id) = playlist_id else {
+        return action_group;
+    };
+    let playlist_id = playlist_id.to_string();
+
+    let tx_rename = tx.clone();
+    let pid = playlist_id.clone();
+    let rename = gio::SimpleAction::new("rename", None);
+    rename.connect_activate(move |_, _| {
+        let _ = tx_rename.try_send(PlaylistAction::Rename(pid.clone()));
+    });
+    action_group.add_action(&rename);
+
+    let tx_delete = tx.clone();
+    let pid = playlist_id.clone();
+    let delete = gio::SimpleAction::new("delete", None);
+    delete.connect_activate(move |_, _| {
+        let _ = tx_delete.try_send(PlaylistAction::Delete(pid.clone()));
+    });
+    action_group.add_action(&delete);
+
+    let tx_edit = tx.clone();
+    let pid = playlist_id.clone();
+    let edit_smart = gio::SimpleAction::new("edit-smart", None);
+    edit_smart.connect_activate(move |_, _| {
+        let _ = tx_edit.try_send(PlaylistAction::EditSmart(pid.clone()));
+    });
+    action_group.add_action(&edit_smart);
+
+    let tx_export = tx.clone();
+    let export = gio::SimpleAction::new("export", None);
+    export.connect_activate(move |_, _| {
+        let _ = tx_export.try_send(PlaylistAction::ExportPlaylist(playlist_id.clone()));
+    });
+    action_group.add_action(&export);
 
     action_group
 }
@@ -338,77 +405,71 @@ pub fn build_sidebar(
                     return;
                 };
 
-                let bt = src.backend_type();
-                let is_playlist = bt == "playlist" || bt == "smart-playlist";
-                let is_playlist_header = src.is_header() && src.name() == "Playlists";
+                let playlist_kind = src.playlist_kind();
+                let is_playlist = src.is_playlist();
+                let is_playlist_header = src.is_playlist_header();
                 if !is_playlist && !is_playlist_header {
                     return;
                 }
 
                 let menu = gtk::gio::Menu::new();
                 if is_playlist_header {
-                    menu.append(Some("New Playlist"), Some("playlist.create-regular"));
-                    menu.append(Some("New Smart Playlist"), Some("playlist.create-smart"));
+                    menu.append(
+                        Some(rust_i18n::t!("sidebar.new_playlist_menu").as_ref()),
+                        Some("playlist.create-regular"),
+                    );
+                    menu.append(
+                        Some(rust_i18n::t!("sidebar.new_smart_playlist_menu").as_ref()),
+                        Some("playlist.create-smart"),
+                    );
                     menu.append(
                         Some(rust_i18n::t!("playlist_io.import_menu").as_ref()),
                         Some("playlist.import"),
                     );
-                } else if is_playlist {
-                    menu.append(Some("Rename"), Some("playlist.rename"));
+                } else if matches!(
+                    playlist_kind,
+                    Some(PlaylistSidebarKind::EditableRegular | PlaylistSidebarKind::EditableSmart)
+                ) {
+                    menu.append(
+                        Some(rust_i18n::t!("sidebar.rename").as_ref()),
+                        Some("playlist.rename"),
+                    );
                     menu.append(
                         Some(rust_i18n::t!("playlist_io.export_menu").as_ref()),
                         Some("playlist.export"),
                     );
-                    menu.append(Some("Delete"), Some("playlist.delete"));
-                    if bt == "smart-playlist" {
+                    menu.append(
+                        Some(rust_i18n::t!("sidebar.delete").as_ref()),
+                        Some("playlist.delete"),
+                    );
+                    if playlist_kind == Some(PlaylistSidebarKind::EditableSmart) {
                         menu.append(
-                            Some("Edit Smart Playlist\u{2026}"),
+                            Some(rust_i18n::t!("sidebar.edit_smart_playlist").as_ref()),
                             Some("playlist.edit-smart"),
                         );
                     }
+                } else {
+                    // Pull mirrors deliberately have no ordinary rename,
+                    // export, delete, or smart-rule action. Record E adds
+                    // their dedicated synchronization/recovery actions.
+                    return;
                 }
 
-                let action_group = playlist_creation_action_group(&tx_for_gesture);
                 let pid = src.playlist_id();
-
-                let tx = tx_for_gesture.clone();
-                let pid_clone = pid.clone();
-                let rename = gtk::gio::SimpleAction::new("rename", None);
-                rename.connect_activate(move |_, _| {
-                    let _ = tx.try_send(PlaylistAction::Rename(pid_clone.clone()));
-                });
-                action_group.add_action(&rename);
-
-                let tx = tx_for_gesture.clone();
-                let pid_clone = pid.clone();
-                let delete = gtk::gio::SimpleAction::new("delete", None);
-                delete.connect_activate(move |_, _| {
-                    let _ = tx.try_send(PlaylistAction::Delete(pid_clone.clone()));
-                });
-                action_group.add_action(&delete);
-
-                let tx = tx_for_gesture.clone();
-                let pid_clone = pid.clone();
-                let edit_smart = gtk::gio::SimpleAction::new("edit-smart", None);
-                edit_smart.connect_activate(move |_, _| {
-                    let _ = tx.try_send(PlaylistAction::EditSmart(pid_clone.clone()));
-                });
-                action_group.add_action(&edit_smart);
-
-                let tx = tx_for_gesture.clone();
-                let pid_clone = pid.clone();
-                let export = gtk::gio::SimpleAction::new("export", None);
-                export.connect_activate(move |_, _| {
-                    let _ = tx.try_send(PlaylistAction::ExportPlaylist(pid_clone.clone()));
-                });
-                action_group.add_action(&export);
-
-                row_box_for_gesture.insert_action_group("playlist", Some(&action_group));
+                let action_group = playlist_popup_action_group(
+                    &tx_for_gesture,
+                    is_playlist.then_some(pid.as_str()),
+                );
 
                 let popover = gtk::PopoverMenu::from_model(Some(&menu));
                 popover.set_parent(&row_box_for_gesture);
+                match PLAYLIST_POPUP_ACTION_OWNER {
+                    PlaylistPopupActionOwner::Popover => popover
+                        .insert_action_group(PLAYLIST_POPUP_ACTION_GROUP, Some(&action_group)),
+                }
                 #[allow(clippy::cast_possible_truncation)]
                 popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                popover.connect_closed(|popover| popover.unparent());
                 popover.popup();
             });
             row_box.add_controller(gesture);
@@ -445,6 +506,27 @@ pub fn build_sidebar(
                 .next_sibling()
                 .and_downcast::<gtk::Button>()
                 .expect("Button expected");
+
+            // Every property which varies by binding is initialized before
+            // applying the new object. GtkListItem and its child widgets are
+            // recycled, so hidden header/playlist/connection state must not
+            // survive from the prior row.
+            icon.set_icon_name(None::<&str>);
+            icon.set_visible(false);
+            icon.set_tooltip_text(None);
+            icon.reset_property(gtk::AccessibleProperty::Label);
+            spinner.set_visible(false);
+            label.set_text("");
+            label.reset_property(gtk::AccessibleProperty::Description);
+            label.remove_css_class("heading");
+            label.remove_css_class("dim-label");
+            label.set_margin_top(0);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            list_item.set_activatable(false);
+            list_item.set_selectable(false);
+            row_box.set_tooltip_text(None);
+            action_btn.set_action_target_value(Some(&sidebar_button_action_target(None)));
+            configure_action_button(&action_btn, None);
 
             if obj.is_header() {
                 icon.set_visible(false);
@@ -489,6 +571,16 @@ pub fn build_sidebar(
                     spinner.set_visible(false);
                     label.remove_css_class("dim-label");
                 }
+
+                if let Some(status_key) = obj.linked_playlist_status_key() {
+                    let status = rust_i18n::t!(status_key).into_owned();
+                    // The whole row exposes hover help, while the visible
+                    // playlist name carries the state as its accessible
+                    // description. Both are cleared before every bind and
+                    // again on unbind so recycled rows cannot leak state.
+                    row_box.set_tooltip_text(Some(&status));
+                    label.update_property(&[gtk::accessible::Property::Description(&status)]);
+                }
             }
 
             let action = sidebar_button_action(&obj);
@@ -505,12 +597,37 @@ pub fn build_sidebar(
             .downcast_ref::<gtk::ListItem>()
             .expect("ListItem expected");
         if let Some(row_box) = list_item.child().and_downcast::<gtk::Box>() {
-            if let Some(btn) = row_box.last_child().and_downcast::<gtk::Button>() {
-                btn.set_action_target_value(Some(&sidebar_button_action_target(None)));
-                configure_action_button(&btn, None);
-                btn.set_visible(false);
+            if let Some(icon) = row_box.first_child().and_downcast::<gtk::Image>() {
+                icon.set_icon_name(None::<&str>);
+                icon.set_visible(false);
+                icon.set_tooltip_text(None);
+                icon.reset_property(gtk::AccessibleProperty::Label);
+                if let Some(spinner) = icon.next_sibling().and_downcast::<gtk::Spinner>() {
+                    spinner.set_visible(false);
+                    if let Some(label) = spinner.next_sibling().and_downcast::<gtk::Label>() {
+                        label.set_text("");
+                        label.reset_property(gtk::AccessibleProperty::Description);
+                        label.remove_css_class("heading");
+                        label.remove_css_class("dim-label");
+                        label.set_margin_top(0);
+                        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                        // Resolve the setup-owned action button from the
+                        // fixed icon -> spinner -> label -> button chain.
+                        // A transient popover is also parented to the row and
+                        // can therefore be its last child while open; using
+                        // `last_child()` would leave the old target live when
+                        // that row is unbound.
+                        if let Some(btn) = label.next_sibling().and_downcast::<gtk::Button>() {
+                            btn.set_action_target_value(Some(&sidebar_button_action_target(None)));
+                            configure_action_button(&btn, None);
+                        }
+                    }
+                }
             }
+            row_box.set_tooltip_text(None);
         }
+        list_item.set_activatable(false);
+        list_item.set_selectable(false);
     });
 
     // Log selection changes
@@ -580,6 +697,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::ui::objects::HeaderKind;
 
     fn assert_empty<T>(receiver: &async_channel::Receiver<T>) {
         assert!(
@@ -655,7 +773,10 @@ mod tests {
 
         // Recycle once more for the Playlists header. The click opens its
         // menu and emits no server action.
-        activate(Some(&SourceObject::header("Playlists")));
+        activate(Some(&SourceObject::header(
+            "Localized playlist heading",
+            HeaderKind::Playlists,
+        )));
         assert_eq!(opened.get(), 1);
         assert_empty(&disconnect_rx);
         assert_empty(&delete_rx);
@@ -676,6 +797,32 @@ mod tests {
 
         group.activate_action("import", None);
         assert_eq!(rx.try_recv().unwrap(), PlaylistAction::ImportPlaylist);
+        assert_empty(&rx);
+    }
+
+    #[test]
+    fn playlist_popup_actions_are_popover_owned_immutable_snapshots() {
+        assert_eq!(
+            PLAYLIST_POPUP_ACTION_OWNER,
+            PlaylistPopupActionOwner::Popover
+        );
+
+        let (tx, rx) = async_channel::unbounded();
+        let first_popup = playlist_popup_action_group(&tx, Some("first-playlist"));
+        let rebound_popup = playlist_popup_action_group(&tx, Some("rebound-playlist"));
+
+        // Creating the action snapshot for a rebound row cannot retarget the
+        // already-open popover's immutable snapshot.
+        rebound_popup.activate_action("rename", None);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            PlaylistAction::Rename("rebound-playlist".to_string())
+        );
+        first_popup.activate_action("rename", None);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            PlaylistAction::Rename("first-playlist".to_string())
+        );
         assert_empty(&rx);
     }
 }

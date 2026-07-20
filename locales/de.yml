@@ -242,6 +242,29 @@ smart_playlist:
   remove_rule: "Regel entfernen"
   limit_to: "Begrenzen auf"
 
+# ── Server-Wiedergabelisten ────────────────────────────────────────
+server_playlists:
+  controls_accessible_label: "Steuerelemente zur Synchronisierung von Server-Wiedergabelisten"
+  status_linked_read_only: "Mit dem Server verknüpft — schreibgeschützt"
+  status_syncing: "Server-Wiedergabeliste wird synchronisiert…"
+  status_offline: "Server nicht verfügbar — gespeicherte Kopie bleibt erhalten"
+  status_failed: "Synchronisierung fehlgeschlagen — gespeicherte Kopie bleibt erhalten"
+  status_conflict: "Lokale Änderungen stehen im Konflikt mit dem Server"
+  status_missing: "Die Wiedergabeliste fehlt auf dem Server"
+  status_conflict_missing: "Lokale Änderungen stehen im Konflikt; die Wiedergabeliste fehlt auf dem Server"
+  action_sync_now: "Jetzt synchronisieren"
+  action_retry: "Erneut versuchen"
+  action_replace_local_with_server: "Lokale Version durch Serverversion ersetzen"
+  action_more: "Weitere Wiedergabelistenaktionen"
+  action_unlink: "Verknüpfung aufheben"
+  action_remove_local_copy: "Lokale Kopie entfernen"
+  replace_heading: "Lokale Wiedergabeliste ersetzen?"
+  replace_body: "Dadurch werden lokale Änderungen verworfen und die Wiedergabeliste durch eine neue Serverkopie ersetzt."
+  unlink_heading: "Verknüpfung der Server-Wiedergabeliste aufheben?"
+  unlink_body: "Die aktuellen Titel bleiben als bearbeitbare lokale Wiedergabeliste erhalten und werden nicht mehr synchronisiert."
+  remove_heading: "Lokale Kopie entfernen?"
+  remove_body: "Dadurch werden die lokale Wiedergabeliste und ihre Synchronisierungsverknüpfung gelöscht. Die Server-Wiedergabeliste bleibt unverändert."
+
 # ── Benutzerfehler ─────────────────────────────────────────────────
 errors:
   remote:

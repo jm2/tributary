@@ -759,9 +759,13 @@ action instead of reconstructing a path or weakening playback authority. Source-
 playlist storage, default-deny live-catalogue authority, and Add/Remove/render/Play consumer are
 specified separately and complete. The Subsonic-native pull contract, bounded protocol,
 exact-session read/commit authority, dedicated link persistence, and atomic pull engine are also
-specified and complete; localized UI, reconnect scheduling, and latest-request operation ownership
-remain the final deferred P1.5 record. Mixed-source XSPF metadata export remains a separate
-deferred policy.
+specified and complete. Structural UI identity, read-only mirror presentation, commit-only ordinary
+playlist publication, and the localized recovery-shell state plan are now implemented without
+widening live authority. The GTK-free latest-request coordinator, one monotonic or serialized
+full-sidebar publication owner, reconnect scheduling, browser, and wired recovery actions remain
+the final deferred P1.5 record. The current scan snapshot and direct post-commit CRUD callback paths
+are commit-safe individually but do not yet carry a shared ordering token. Mixed-source XSPF
+metadata export remains a separate deferred policy.
 
 ## Implementation sequence
 
@@ -842,9 +846,20 @@ deferred policy.
     network revision tickets to prevent late durable overwrite. Exact list/detail receipts acquire
     an operation-bound, session-only permit after SQL staging; persistence verifies it belongs to
     the same sealed pull or absence evidence and retains it through commit, closing both authority-
-    substitution and fetch-to-commit lifecycle races without
-    requiring catalogue membership. Record E retains only UI/localization, reconnect/manual refresh
-    scheduling, recovery presentation, and latest-request operation generations.
+    substitution and fetch-to-commit lifecycle races without requiring catalogue membership.
+12. **Server-native UI structural groundwork complete:** the library publishes one deterministic
+    playlist/link join whose typed row state makes link presence win over legacy smart flags.
+    Translated header labels and compatibility backend strings no longer decide playlist section
+    membership or editability. GTK retains no native playlist ID; clean, conflict, present, and
+    missing mirror state controls read-only/warning presentation and ordinary mutation exclusion.
+    Create, Rename, Delete, and smart-rule sidebar updates require a closed committed database
+    result, and smart creation stores its complete validated rules atomically. A separate hidden
+    footer shell has deterministic localized sync/recovery plans and leaves track counts
+    independent. Record E still retains the GTK-free latest-request coordinator, a monotonic or
+    serialized full-sidebar publication owner spanning scans/CRUD/link changes, exact-session
+    reconnect/manual scheduling, virtualized browser, wired recovery controls, and end-to-end
+    lifecycle coverage. Until that owner lands, reversed scan-snapshot and direct post-commit CRUD
+    delivery is explicitly not claimed to converge.
 
 The authenticated-remote cutover's locked debug and release suites each passed 20 library, 865
 application, and 10 repository-metadata tests (895 total), with locked all-target/all-feature

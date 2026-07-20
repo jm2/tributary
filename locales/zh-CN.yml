@@ -242,6 +242,29 @@ smart_playlist:
   remove_rule: "删除规则"
   limit_to: "限制为"
 
+# ── 服务器播放列表 ──────────────────────────────────────────────────
+server_playlists:
+  controls_accessible_label: "服务器播放列表同步控件"
+  status_linked_read_only: "已链接到服务器 — 只读"
+  status_syncing: "正在同步服务器播放列表…"
+  status_offline: "服务器不可用 — 已保留保存的副本"
+  status_failed: "同步失败 — 已保留保存的副本"
+  status_conflict: "本地更改与服务器冲突"
+  status_missing: "服务器上缺少此播放列表"
+  status_conflict_missing: "本地更改存在冲突；服务器上缺少此播放列表"
+  action_sync_now: "立即同步"
+  action_retry: "重试"
+  action_replace_local_with_server: "用服务器版本替换本地版本"
+  action_more: "更多播放列表操作"
+  action_unlink: "取消链接"
+  action_remove_local_copy: "删除本地副本"
+  replace_heading: "替换本地播放列表？"
+  replace_body: "这将丢弃本地更改，并使用服务器上的新副本替换播放列表。"
+  unlink_heading: "取消链接服务器播放列表？"
+  unlink_body: "当前歌曲将保留为可编辑的本地播放列表，并且不再同步。"
+  remove_heading: "删除本地副本？"
+  remove_body: "这将删除本地播放列表及其同步链接。服务器播放列表不会更改。"
+
 # ── 面向用户的错误 ────────────────────────────────────────────────
 errors:
   remote:
