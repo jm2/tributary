@@ -6,6 +6,8 @@
 //! and rejects the complete playlist when any source construct falls outside
 //! it. It never drops an unknown predicate or approximates a query.
 
+use std::sync::OnceLock;
+
 use thiserror::Error;
 
 use super::rhythmbox_import::{
@@ -414,14 +416,26 @@ fn parse_rating(value: &str) -> Result<f64, RhythmboxSmartPlaylistUnsupported> {
 }
 
 fn exact_canonical_rating(value: f64) -> Result<i64, RhythmboxSmartPlaylistUnsupported> {
-    // Compare the source's exact binary value with each canonical twentieth.
-    // A multiply-then-round check can retain excess intermediate precision on
-    // some Windows targets, which made a neighboring double such as
-    // 0.30000000000000004 look canonical in release builds. Materializing the
-    // candidate through `to_bits` makes grid membership target-independent and
-    // still rejects every neighboring value without an epsilon.
-    (1_i64..=100)
-        .find(|canonical| ((*canonical as f64) / 20.0).to_bits() == value.to_bits())
+    // Build the canonical binary values from exact decimal spellings once.
+    // Some Windows release targets retain excess precision for arithmetic
+    // expressions, so deriving the grid with floating-point division can make
+    // a non-grid source value compare equal. Rust's decimal parser produces a
+    // fully materialized IEEE-754 value without target floating-point math.
+    static GRID: OnceLock<[u64; 100]> = OnceLock::new();
+    let grid = GRID.get_or_init(|| {
+        std::array::from_fn(|index| {
+            let twentieths = index + 1;
+            let whole = twentieths / 20;
+            let hundredths = (twentieths % 20) * 5;
+            format!("{whole}.{hundredths:02}")
+                .parse::<f64>()
+                .expect("canonical Rhythmbox rating literal")
+                .to_bits()
+        })
+    });
+    grid.iter()
+        .position(|bits| *bits == value.to_bits())
+        .and_then(|index| i64::try_from(index + 1).ok())
         .ok_or(RhythmboxSmartPlaylistUnsupported::RatingGrid)
 }
 
@@ -914,8 +928,18 @@ mod tests {
     #[test]
     fn source_rating_grid_is_checked_for_numeric_rating_queries() {
         for canonical in 1_i64..=100 {
-            let native = canonical as f64 / 20.0;
+            let whole = canonical / 20;
+            let hundredths = (canonical % 20) * 5;
+            let native = format!("{whole}.{hundredths:02}").parse::<f64>().unwrap();
             assert_eq!(exact_canonical_rating(native), Ok(canonical));
+            assert_eq!(
+                exact_canonical_rating(f64::from_bits(native.to_bits() - 1)).unwrap_err(),
+                RhythmboxSmartPlaylistUnsupported::RatingGrid
+            );
+            assert_eq!(
+                exact_canonical_rating(f64::from_bits(native.to_bits() + 1)).unwrap_err(),
+                RhythmboxSmartPlaylistUnsupported::RatingGrid
+            );
         }
 
         let source = automatic(vec![node("equals", "rating", "4")], Vec::new());
