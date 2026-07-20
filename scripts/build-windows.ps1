@@ -88,6 +88,209 @@ function Write-Info { Write-Host "[tributary] $args" -ForegroundColor Green }
 function Write-Warn { Write-Host "[tributary] $args" -ForegroundColor Yellow }
 function Write-Err { Write-Host "[tributary] $args" -ForegroundColor Red; exit 1 }
 
+# Tributary does not play encrypted optical discs or proprietary DRM media.
+# Load the shared filename-token policy once and apply it at every Windows copy
+# boundary. Ordinary codecs, TLS libraries, and generic cryptography remain
+# eligible for the bundle.
+function Import-ForbiddenBundledComponentPolicy {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Write-Err "Required bundled-component policy is missing: $Path"
+    }
+
+    $tokens = [System.Collections.Generic.List[string]]::new()
+    $known = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        $token = $line.Trim()
+        if (-not $token -or $token.StartsWith('#')) { continue }
+        if ($token -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') {
+            Write-Err "Bundled-component policy contains an invalid filename token: '$token'"
+        }
+        if (-not $known.Add($token)) {
+            Write-Err "Bundled-component policy contains a duplicate filename token: '$token'"
+        }
+        $tokens.Add($token)
+    }
+    if ($tokens.Count -eq 0) {
+        Write-Err "Bundled-component policy contains no filename tokens: $Path"
+    }
+    return @($tokens)
+}
+
+$RepositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
+$ForbiddenBundledComponentPolicyPath = Join-Path $RepositoryRoot 'build-aux\packaging\forbidden-bundled-components.txt'
+$ForbiddenBundledComponentTokens = @(Import-ForbiddenBundledComponentPolicy $ForbiddenBundledComponentPolicyPath)
+
+function Test-ForbiddenBundledComponentName {
+    param([AllowNull()][string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    $fileName = [System.IO.Path]::GetFileName($Name)
+    foreach ($token in $ForbiddenBundledComponentTokens) {
+        if ($fileName.IndexOf($token, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-ForbiddenBundledRelativePath {
+    param([AllowNull()][string]$RelativePath)
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) { return $false }
+    foreach ($component in @($RelativePath -split '[\\/]')) {
+        if ($component -and (Test-ForbiddenBundledComponentName $component)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# Enumerate a filesystem tree ourselves so PowerShell 5.1 and 7 use the same
+# rule: include hidden files and directories, report reparse points as bundle
+# members, but never recurse through a junction/symlink into an external tree.
+function Get-WindowsTreeMembersWithoutReparseTraversal {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return @() }
+
+    $members = [System.Collections.Generic.List[System.IO.FileSystemInfo]]::new()
+    $pendingDirectories = [System.Collections.Queue]::new()
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    $rootIsReparsePoint = ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    if ($rootIsReparsePoint) {
+        $members.Add($rootItem)
+        return @($members)
+    }
+    $pendingDirectories.Enqueue($rootItem.FullName)
+    while ($pendingDirectories.Count -gt 0) {
+        $directory = [string]$pendingDirectories.Dequeue()
+        foreach ($member in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+            $members.Add($member)
+            $isDirectory = ($member.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+            $isReparsePoint = ($member.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+            if ($isDirectory -and -not $isReparsePoint) {
+                $pendingDirectories.Enqueue($member.FullName)
+            }
+        }
+    }
+    return @($members)
+}
+
+function Get-ForbiddenWindowsBundleMembers {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return @() }
+
+    $rootFull = (Get-Item -LiteralPath $Root -Force -ErrorAction Stop).FullName.TrimEnd(
+        [char[]]@('\', '/')
+    )
+    return @(Get-WindowsTreeMembersWithoutReparseTraversal $rootFull | Where-Object {
+        $relativePath = $_.FullName.Substring($rootFull.Length).TrimStart([char[]]@('\', '/'))
+        Test-ForbiddenBundledRelativePath $relativePath
+    })
+}
+
+function Get-WindowsBundleReparsePointMembers {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return @() }
+    return @(Get-WindowsTreeMembersWithoutReparseTraversal $Root | Where-Object {
+        ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    })
+}
+
+function Assert-WindowsBundleRootIsNotReparsePoint {
+    param([string]$Root)
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Write-Err "Windows bundle root must not be a filesystem reparse point: $($rootItem.FullName)"
+    }
+}
+
+# Delete selected entries deepest-first and non-recursively. DirectoryInfo's
+# zero-argument Delete removes a directory or reparse-point link itself; it
+# cannot walk into a junction target. Every real descendant was enumerated and
+# selected separately because its relative path inherits the forbidden parent.
+function Remove-ForbiddenWindowsBundleMembers {
+    param([string]$Root)
+    $forbiddenMembers = @(Get-ForbiddenWindowsBundleMembers $Root | Sort-Object `
+        @{ Expression = { $_.FullName.Length }; Descending = $true })
+    foreach ($member in $forbiddenMembers) {
+        try {
+            if (($member.Attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
+                $member.Attributes = $member.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
+            }
+            $member.Delete()
+        }
+        catch [System.IO.FileNotFoundException] { }
+        catch [System.IO.DirectoryNotFoundException] { }
+        catch {
+            throw "Could not safely remove forbidden bundle member '$($member.FullName)': $($_.Exception.Message)"
+        }
+    }
+    return $forbiddenMembers.Count
+}
+
+function Assert-WindowsBundleComponentPolicy {
+    param([string]$Root)
+    $forbiddenMembers = @(Get-ForbiddenWindowsBundleMembers $Root)
+    $reparsePointMembers = @(Get-WindowsBundleReparsePointMembers $Root)
+    if ($forbiddenMembers.Count -eq 0 -and $reparsePointMembers.Count -eq 0) { return }
+
+    $forbiddenSample = @($forbiddenMembers | Select-Object -First 8 | ForEach-Object {
+        $relativePath = $_.FullName.Substring($Root.Length).TrimStart('\', '/')
+        if ($relativePath) { $relativePath } else { '<bundle-root>' }
+    }) -join ', '
+    if ($forbiddenMembers.Count -gt 8) { $forbiddenSample += ', ...' }
+    $reparseSample = @($reparsePointMembers | Select-Object -First 8 | ForEach-Object {
+        $relativePath = $_.FullName.Substring($Root.Length).TrimStart('\', '/')
+        if ($relativePath) { $relativePath } else { '<bundle-root>' }
+    }) -join ', '
+    if ($reparsePointMembers.Count -gt 8) { $reparseSample += ', ...' }
+
+    $details = [System.Collections.Generic.List[string]]::new()
+    if ($forbiddenMembers.Count -gt 0) {
+        $details.Add("$($forbiddenMembers.Count) forbidden component(s): $forbiddenSample")
+    }
+    if ($reparsePointMembers.Count -gt 0) {
+        $details.Add("$($reparsePointMembers.Count) filesystem reparse point(s): $reparseSample")
+    }
+    Write-Err "Windows bundle violates the bundled-component policy ($($details -join '; '))"
+}
+
+function Assert-WindowsZipComponentPolicy {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Write-Err "Completed Windows ZIP was not found for policy validation: $Path"
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $archive = [System.IO.Compression.ZipFile]::OpenRead(
+        (Resolve-Path -LiteralPath $Path).ProviderPath
+    )
+    $forbiddenEntryCount = 0
+    $forbiddenEntrySample = [System.Collections.Generic.List[string]]::new()
+    try {
+        foreach ($entry in $archive.Entries) {
+            $entryPath = $entry.FullName.TrimEnd([char[]]@('\', '/'))
+            if ($entryPath -and (Test-ForbiddenBundledRelativePath $entryPath)) {
+                $forbiddenEntryCount++
+                if ($forbiddenEntrySample.Count -lt 8) {
+                    $forbiddenEntrySample.Add($entry.FullName)
+                }
+            }
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+
+    if ($forbiddenEntryCount -gt 0) {
+        $sample = $forbiddenEntrySample -join ', '
+        if ($forbiddenEntryCount -gt $forbiddenEntrySample.Count) { $sample += ', ...' }
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        Write-Err "Completed Windows ZIP contains $forbiddenEntryCount forbidden entry name(s): $sample"
+    }
+}
+
 function Get-BoundedProbeDiagnostic {
     param(
         [string]$Path,
@@ -231,8 +434,9 @@ $DIST = "dist\tributary-windows"
 
 # ── Inno Setup only mode ─────────────────────────────────────────────────────
 # When -InnoSetup is passed with -SkipBundle, use an existing, already-probed
-# dist tree and skip straight to installer creation. This intentionally does
-# not claim to validate a tree that may have been changed since its bundle run.
+# dist tree and skip straight to installer creation. The runtime probe is not
+# repeated, but the existing tree still crosses the component-policy gate
+# immediately before the installer compiler runs.
 if ($InnoSetup -and $SkipBundle) {
     Write-Info "Building Inno Setup installer from the existing dist tree (bundle/runtime probe skipped)..."
 
@@ -262,6 +466,7 @@ if ($InnoSetup -and $SkipBundle) {
     $issFile = "build-aux\inno\tributary.iss"
     $sourceDir = (Resolve-Path $DIST).Path
     $outputDir = (Resolve-Path "dist").Path
+    Assert-WindowsBundleComponentPolicy $sourceDir
 
     Write-Info "Running Inno Setup compiler..."
     & $iscc /DAppVersion="$CargoVersion" /DSourceDir="$sourceDir" /DOutputDir="$outputDir" /DTargetArch="$InnoArch" $issFile
@@ -511,14 +716,21 @@ Write-Info "Bundling GTK4 DLLs and resources into $DIST ..."
 # every build, saving significant time on incremental rebuilds.
 function Copy-IfNewer {
     param([string]$Src, [string]$Dst)
+    $sourceItem = Get-Item -LiteralPath $Src -Force -ErrorAction Stop
+    if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to copy filesystem reparse point into the Windows bundle: $($sourceItem.FullName)"
+    }
+    if (Test-ForbiddenBundledComponentName $sourceItem.Name) {
+        throw "Refusing to copy forbidden bundled component: $($sourceItem.Name)"
+    }
     if (-not (Test-Path $Dst)) {
-        Copy-Item $Src $Dst
+        Copy-Item $sourceItem.FullName $Dst
         return $true
     }
-    $srcTime = (Get-Item $Src).LastWriteTimeUtc
+    $srcTime = $sourceItem.LastWriteTimeUtc
     $dstTime = (Get-Item $Dst).LastWriteTimeUtc
     if ($srcTime -gt $dstTime) {
-        Copy-Item $Src $Dst -Force
+        Copy-Item $sourceItem.FullName $Dst -Force
         return $true
     }
     return $false
@@ -526,14 +738,49 @@ function Copy-IfNewer {
 
 # Helper: recursively sync a directory tree, copying only newer files.
 function Sync-Directory {
-    param([string]$SrcDir, [string]$DstDir)
+    param(
+        [string]$SrcDir,
+        [string]$DstDir,
+        [switch]$SkipForbiddenComponents
+    )
     $copied = 0
-    Get-ChildItem -Path $SrcDir -Recurse -File | ForEach-Object {
-        $relPath = $_.FullName.Substring($SrcDir.Length)
+    $sourceRoot = (Get-Item -LiteralPath $SrcDir -Force -ErrorAction Stop).FullName.TrimEnd(
+        [char[]]@('\', '/')
+    )
+    if ($SkipForbiddenComponents -and
+        (Test-Path -LiteralPath $DstDir -PathType Container)) {
+        $null = Remove-ForbiddenWindowsBundleMembers $DstDir
+    }
+    if (Test-Path -LiteralPath $DstDir -PathType Container) {
+        $destinationReparsePoints = @(Get-WindowsBundleReparsePointMembers $DstDir)
+        if ($destinationReparsePoints.Count -gt 0) {
+            throw "Refusing to sync into a Windows destination tree containing a filesystem reparse point: $($destinationReparsePoints[0].FullName)"
+        }
+    }
+    foreach ($sourceMember in @(Get-WindowsTreeMembersWithoutReparseTraversal $sourceRoot)) {
+        $relPath = $sourceMember.FullName.Substring($sourceRoot.Length).TrimStart(
+            [char[]]@('\', '/')
+        )
+        $isDirectory = ($sourceMember.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+        $isReparsePoint = ($sourceMember.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        if ($isReparsePoint) {
+            throw "Refusing to sync filesystem reparse point into the Windows bundle: $relPath"
+        }
+        if ($isDirectory) { continue }
+
+        $sourceFile = $sourceMember
         $destFile = Join-Path $DstDir $relPath
+        if (Test-ForbiddenBundledRelativePath $relPath) {
+            if (-not $SkipForbiddenComponents) {
+                throw "Refusing to sync forbidden bundled relative path: $relPath"
+            }
+            # Incremental bundles may retain a component copied by an older
+            # version of this script; the destination tree was purged above.
+            continue
+        }
         $destDir = Split-Path $destFile
         if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Force $destDir | Out-Null }
-        if (Copy-IfNewer $_.FullName $destFile) { $copied++ }
+        if (Copy-IfNewer $sourceFile.FullName $destFile) { $copied++ }
     }
     return $copied
 }
@@ -790,6 +1037,14 @@ function Add-PeImportDependencies {
         $dllName = Get-PeImportDependencyName ([string]$line)
         if (-not $dllName) { continue }
 
+        # Never satisfy an import with a prohibited copy-control/DRM runtime.
+        # Failing here, rather than silently omitting the DLL, preserves the
+        # bundle's strict dependency-closure contract and identifies the
+        # remaining importer that must be excluded.
+        if (Test-ForbiddenBundledComponentName $dllName) {
+            throw "Forbidden bundled dependency $dllName reported for $SourceLabel"
+        }
+
         # Copy only exact imports that exist in the selected architecture's
         # bin directory. Imports provided by Windows itself are intentionally
         # not bundled; API-set contract names need not have a physical file.
@@ -823,7 +1078,19 @@ New-Item -ItemType Directory -Force $DIST | Out-Null
 # ProviderPath returns the physical path even when $PWD uses a custom
 # FileSystem PSDrive; repository paths containing spaces remain intact.
 $DIST = (Resolve-Path -LiteralPath $DIST).ProviderPath
+Assert-WindowsBundleRootIsNotReparsePoint $DIST
 New-Item -ItemType Directory -Force "$DIST\lib" | Out-Null
+
+# Remove policy members left by an older incremental bundle before copying or
+# inspecting anything. The same policy is asserted again after all copy paths,
+# so this cleanup cannot hide a newly introduced forbidden dependency.
+$staleForbiddenMemberCount = Remove-ForbiddenWindowsBundleMembers $DIST
+if ($staleForbiddenMemberCount -gt 0) {
+    Write-Info "Removed $staleForbiddenMemberCount forbidden component(s) from the incremental Windows bundle."
+}
+# Reject allowed-named reparse points before any incremental copy can write
+# through a junction into an external destination.
+Assert-WindowsBundleComponentPolicy $DIST
 
 # Always copy the executable (just built).
 Copy-Item $exePath $DIST -Force
@@ -834,13 +1101,15 @@ $totalCopied = 0
 
 $loadersSrc = Join-Path $MsysPath "lib\gdk-pixbuf-2.0"
 if (Test-Path $loadersSrc) {
-    $n = Sync-Directory $loadersSrc (Join-Path $DIST "lib\gdk-pixbuf-2.0")
+    $n = Sync-Directory $loadersSrc (Join-Path $DIST "lib\gdk-pixbuf-2.0") `
+        -SkipForbiddenComponents
     $totalCopied += $n
 }
 
 $gstPluginSrc = Join-Path $MsysPath "lib\gstreamer-1.0"
 if (Test-Path $gstPluginSrc) {
-    $n = Sync-Directory $gstPluginSrc (Join-Path $DIST "lib\gstreamer-1.0")
+    $n = Sync-Directory $gstPluginSrc (Join-Path $DIST "lib\gstreamer-1.0") `
+        -SkipForbiddenComponents
     $totalCopied += $n
 }
 
@@ -873,9 +1142,12 @@ if (-not [System.IO.Path]::IsPathRooted($peImportInspector) -or
 
 Write-Info "Resolving required DLLs for executable and plugins..."
 
-# Seed the dependency closure with Tributary, every copied plugin, and the
-# exact scanner. Every MSYS2 runtime DLL discovered below is copied to the
-# bundle root and enqueued in turn, so transitive dependencies reach closure.
+# Seed the dependency closure with every PE DLL and executable already present
+# anywhere in the bundle, including hidden and stale incremental members. The
+# same hidden-inclusive enumerator used by the final policy scan avoids a
+# visible-lib-only gap. Every MSYS2 runtime DLL discovered below is copied to
+# the bundle root and enqueued in turn, so transitive dependencies reach
+# closure.
 $requiredSoupPluginDest = Join-Path $DIST "lib\gstreamer-1.0\$requiredSoupPluginName"
 if (-not (Test-Path -LiteralPath $requiredSoupPluginDest -PathType Leaf)) {
     Write-Err "Required souphttpsrc plugin was not copied into the Windows bundle."
@@ -891,9 +1163,12 @@ $peInspectorClosureDeadlineMs = 300000
 $dllScanQueue = [System.Collections.Queue]::new()
 $knownDllScanTargets = @{}
 $scannedDllTargets = @{}
-$initialDllScanTargets = @(Join-Path $DIST (Split-Path $exePath -Leaf))
-$initialDllScanTargets += Get-ChildItem -Path "$DIST\lib" -Recurse -Filter *.dll | Select-Object -ExpandProperty FullName
-$initialDllScanTargets += $gstScannerDest
+$initialDllScanTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $DIST | Where-Object {
+    $isDirectory = ($_.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+    $isReparsePoint = ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    $isPeCandidate = $_.Extension -ieq '.dll' -or $_.Extension -ieq '.exe'
+    -not $isDirectory -and -not $isReparsePoint -and $isPeCandidate
+} | Select-Object -ExpandProperty FullName)
 foreach ($bin in $initialDllScanTargets) {
     Add-DllScanTarget $dllScanQueue $knownDllScanTargets $bin $maxDllScanTargets
 }
@@ -1033,7 +1308,7 @@ foreach ($theme in @("hicolor", "Adwaita")) {
     $src = Join-Path $MsysPath "share\icons\$theme"
     $dest = Join-Path $DIST   "share\icons\$theme"
     if (Test-Path $src) {
-        $n = Sync-Directory $src $dest
+        $n = Sync-Directory $src $dest -SkipForbiddenComponents
         $totalCopied += $n
     }
 }
@@ -1042,7 +1317,8 @@ foreach ($theme in @("hicolor", "Adwaita")) {
 $appIconsSrc = "data\icons\hicolor"
 if (Test-Path $appIconsSrc) {
     $appIconsDest = Join-Path $DIST "share\icons\hicolor"
-    $n = Sync-Directory (Resolve-Path $appIconsSrc).Path $appIconsDest
+    $n = Sync-Directory (Resolve-Path $appIconsSrc).Path $appIconsDest `
+        -SkipForbiddenComponents
     $totalCopied += $n
     Write-Info "Bundled app icons: $n file(s) synced."
 
@@ -1074,6 +1350,10 @@ if (Test-Path $schemasSrc) {
 }
 
 Write-Info "Total incremental sync: $totalCopied file(s) updated."
+
+# Do not execute a bundle that violated the shared packaging policy. This also
+# catches stale or indirectly copied files outside the GStreamer plugin tree.
+Assert-WindowsBundleComponentPolicy $DIST
 
 # ── Packaged Runtime Probe ──────────────────────────────────────────────────
 # Run the bundled executable itself before archiving it. The child receives no
@@ -1249,10 +1529,14 @@ if ($probeFailure) { Write-Err "Packaged Windows runtime probe failed: $probeFai
 Write-Info "Packaged Windows runtime probe passed."
 
 # ── Zip Archive ──────────────────────────────────────────────────────────────
+# Recheck immediately before archiving so the emitted artifact, rather than
+# merely the earlier dependency-closure snapshot, is covered by the policy.
+Assert-WindowsBundleComponentPolicy $DIST
 Write-Info "Creating zip archive..."
 $zipPath = "dist\tributary-windows.zip"
 Remove-Item $zipPath -ErrorAction SilentlyContinue
 Compress-Archive -Path $DIST -DestinationPath $zipPath
+Assert-WindowsZipComponentPolicy $zipPath
 Write-Info "Archive created: $((Get-Item $zipPath).FullName)"
 
 # ── Inno Setup Installer (optional) ─────────────────────────────────────────
@@ -1285,6 +1569,7 @@ if ($InnoSetup) {
     $issFile = "build-aux\inno\tributary.iss"
     $sourceDir = (Resolve-Path $DIST).Path
     $outputDir = (Resolve-Path "dist").Path
+    Assert-WindowsBundleComponentPolicy $sourceDir
 
     Write-Info "Running Inno Setup compiler..."
     & $iscc /DAppVersion="$CargoVersion" /DSourceDir="$sourceDir" /DOutputDir="$outputDir" /DTargetArch="$InnoArch" $issFile

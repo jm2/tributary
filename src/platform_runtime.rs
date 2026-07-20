@@ -1516,8 +1516,11 @@ mod tests {
             .find("Copy-Item -LiteralPath $gstScannerSrc -Destination $gstScannerDest -Force")
             .expect("unconditional scanner copy");
         let scanner_scan = script
-            .find("$initialDllScanTargets += $gstScannerDest")
-            .expect("scanner dependency scan");
+            .find("$initialDllScanTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $DIST")
+            .expect("whole-bundle dependency scan");
+        let executable_filter = script
+            .find("$_.Extension -ieq '.dll' -or $_.Extension -ieq '.exe'")
+            .expect("scanner executable inclusion");
         let runtime_probe = script
             .find("Write-Info \"Running packaged Windows runtime probe...\"")
             .expect("packaged runtime probe");
@@ -1525,7 +1528,8 @@ mod tests {
             .find("Write-Info \"Creating zip archive...\"")
             .expect("zip creation");
         assert!(scanner_copy < scanner_scan);
-        assert!(scanner_scan < runtime_probe);
+        assert!(scanner_scan < executable_filter);
+        assert!(executable_filter < runtime_probe);
         assert!(runtime_probe < archive);
         assert!(!script.contains("Copy-IfNewer $gstScannerSrc"));
         assert!(script.contains(
@@ -1959,8 +1963,8 @@ Assert-TargetFailure $newlineTarget "target #1 contains an unsupported quote or 
         for fragment in [
             "$gstScannerDest = Join-Path $DIST \"gst-plugin-scanner.exe\"",
             "$requiredSoupPluginDest = Join-Path $DIST",
-            "$initialDllScanTargets = @(Join-Path $DIST",
-            "$initialDllScanTargets += Get-ChildItem -Path \"$DIST\\lib\"",
+            "$initialDllScanTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $DIST",
+            "$_.Extension -ieq '.dll' -or $_.Extension -ieq '.exe'",
             "$requiredSoupRuntimeDest = Join-Path $DIST",
         ] {
             let target = script

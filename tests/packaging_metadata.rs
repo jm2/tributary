@@ -10,6 +10,8 @@ const README: &str = include_str!("../README.md");
 const BUILD_LINUX: &str = include_str!("../scripts/build-linux.sh");
 const BUILD_MACOS: &str = include_str!("../scripts/build-macos.sh");
 const BUILD_WINDOWS: &str = include_str!("../scripts/build-windows.ps1");
+const FORBIDDEN_BUNDLED_COMPONENTS: &str =
+    include_str!("../build-aux/packaging/forbidden-bundled-components.txt");
 
 fn manifest() -> Value {
     toml::from_str(MANIFEST).expect("Cargo.toml must parse")
@@ -105,6 +107,280 @@ fn workflow_job<'a>(source: &'a str, name: &str) -> &'a str {
 
     let start = body_start.unwrap_or_else(|| panic!("workflow job {name} must exist"));
     &source[start..]
+}
+
+fn forbidden_bundle_tokens() -> Vec<&'static str> {
+    FORBIDDEN_BUNDLED_COMPONENTS
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
+}
+
+fn bundle_policy_matches(filename: &str, tokens: &[&str]) -> bool {
+    let filename = filename.to_ascii_lowercase();
+    tokens
+        .iter()
+        .any(|token| filename.contains(&token.to_ascii_lowercase()))
+}
+
+fn bundle_policy_matches_relative_path(path: &str, tokens: &[&str]) -> bool {
+    path.split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .any(|component| bundle_policy_matches(component, tokens))
+}
+
+#[test]
+fn bundled_component_policy_blocks_disc_decryption_without_hiding_codecs() {
+    let tokens = forbidden_bundle_tokens();
+    assert!(
+        !tokens.is_empty(),
+        "the shared bundle policy must not be empty"
+    );
+
+    let mut unique = std::collections::HashSet::new();
+    for token in &tokens {
+        assert_eq!(
+            *token,
+            token.to_ascii_lowercase(),
+            "policy tokens must use a canonical lowercase spelling"
+        );
+        assert!(
+            token
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric()
+                    || matches!(character, '.' | '_' | '+' | '-')),
+            "policy token contains a character rejected by the packaging scripts: {token}"
+        );
+        assert!(unique.insert(*token), "duplicate policy token: {token}");
+    }
+
+    for required in [
+        "dvdcss",
+        "dvdread",
+        "dvdnav",
+        "aacs",
+        "bdplus",
+        "bluray",
+        "mmbd",
+        "makemkv",
+        "decss",
+        "dvdcpxm",
+        "resindvd",
+        "dvdspu",
+        "widevinecdm",
+        "playready",
+        "fairplay",
+        "keydb.cfg",
+    ] {
+        assert!(tokens.contains(&required), "policy is missing {required}");
+    }
+
+    for forbidden in [
+        "libdvdcss-2.dll",
+        "LIBDVDCSS-2.DLL",
+        "libdvdread-8.dll",
+        "libdvdnav-4.dll",
+        "libaacs-0.dll",
+        "aacs.dll",
+        "vendor-AaCs-runtime-helper.dll",
+        "libbdplus-0.dll",
+        "bdplus.dll",
+        "prefix-libbdplus-0-suffix.dll",
+        "libbluray-2.dll",
+        "libmmbd64.dll",
+        "MakeMKVcon.exe",
+        "libdecss.dll",
+        "libdvdcpxm.dll",
+        "libgstresindvd.dll",
+        "libgstdvdspu.dll",
+        "widevinecdm.dll",
+        "playready.dll",
+        "FairPlayRuntime.dll",
+        "KEYDB.CFG",
+    ] {
+        assert!(
+            bundle_policy_matches(forbidden, &tokens),
+            "forbidden component escaped the filename policy: {forbidden}"
+        );
+    }
+
+    for ordinary_runtime in [
+        "libgstlibav.dll",
+        "libgstfdkaac.dll",
+        "libgstaudioparsers.dll",
+        "libgstaes.dll",
+        "libgstdvdlpcmdec.dll",
+        "libgstdvdsub.dll",
+        "libsoup-3.0-0.dll",
+        "libssl-3-x64.dll",
+        "libcrypto-3-x64.dll",
+    ] {
+        assert!(
+            !bundle_policy_matches(ordinary_runtime, &tokens),
+            "ordinary codec/runtime is overmatched by the policy: {ordinary_runtime}"
+        );
+    }
+    assert!(
+        bundle_policy_matches_relative_path(r"plugins\WidevineCDM\helper.dll", &tokens),
+        "an innocuous leaf beneath a forbidden directory must still be rejected"
+    );
+    assert!(
+        !bundle_policy_matches_relative_path(r"plugins\audio\helper.dll", &tokens),
+        "ordinary relative path components must remain eligible"
+    );
+}
+
+#[test]
+fn windows_bundle_loads_policy_and_rejects_reparse_points() {
+    let build_windows = BUILD_WINDOWS.replace("\r\n", "\n");
+    assert!(
+        build_windows.contains("build-aux\\packaging\\forbidden-bundled-components.txt")
+            && build_windows.contains("Required bundled-component policy is missing")
+            && build_windows.contains("Bundled-component policy contains no filename tokens")
+            && build_windows
+                .contains("Bundled-component policy contains an invalid filename token")
+            && build_windows
+                .contains("Bundled-component policy contains a duplicate filename token")
+            && build_windows.contains("[System.StringComparison]::OrdinalIgnoreCase"),
+        "Windows packaging must load the shared policy fail-closed and match it case-insensitively"
+    );
+    assert!(
+        build_windows.contains("-SkipForbiddenComponents")
+            && build_windows.contains("Test-ForbiddenBundledRelativePath $relPath")
+            && build_windows.contains("Remove-ForbiddenWindowsBundleMembers $DstDir")
+            && build_windows.contains("Remove-ForbiddenWindowsBundleMembers $DIST"),
+        "the plugin sync must reject forbidden relative components and purge stale destinations"
+    );
+    assert!(
+        build_windows.contains("Get-WindowsTreeMembersWithoutReparseTraversal")
+            && build_windows.contains("Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop")
+            && build_windows.contains("[System.IO.FileAttributes]::ReparsePoint")
+            && build_windows.contains("Sort-Object")
+            && build_windows.contains("$_.FullName.Length")
+            && build_windows.contains("$member.Delete()"),
+        "stale/final scans must include directories and hidden members, avoid reparse traversal, and delete deepest-first without recursion"
+    );
+    assert!(
+        build_windows.contains("Get-WindowsBundleReparsePointMembers")
+            && build_windows.contains("$reparsePointMembers")
+            && build_windows.contains("$rootIsReparsePoint")
+            && build_windows.contains("filesystem reparse point(s)")
+            && build_windows.contains(
+                "Refusing to sync filesystem reparse point into the Windows bundle"
+            )
+            && build_windows.contains(
+                "Refusing to sync into a Windows destination tree containing a filesystem reparse point"
+            )
+            && build_windows.contains(
+                "Refusing to copy filesystem reparse point into the Windows bundle"
+            ),
+        "final artifacts and every recursive copy path must reject reparse points"
+    );
+    assert!(
+        build_windows.contains(
+            "$initialDllScanTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $DIST"
+        ) && build_windows.contains("$_.Extension -ieq '.dll' -or $_.Extension -ieq '.exe'")
+            && !build_windows.contains("Get-ChildItem -Path \"$DIST\\lib\" -Recurse -Filter *.dll"),
+        "PE import scanning must seed every hidden-inclusive DLL/EXE in the complete bundle"
+    );
+    let root_reparse_assertion = build_windows
+        .find("Assert-WindowsBundleRootIsNotReparsePoint $DIST")
+        .expect("the bundle root must receive an early reparse check");
+    let lib_directory_creation = build_windows
+        .find("New-Item -ItemType Directory -Force \"$DIST\\lib\"")
+        .expect("the first bundle child-directory write must remain recognizable");
+    assert!(
+        root_reparse_assertion < lib_directory_creation,
+        "the bundle root must be rejected before creating its first child"
+    );
+    let first_dist_assertion = build_windows
+        .find("Assert-WindowsBundleComponentPolicy $DIST")
+        .expect("the incremental dist tree must be validated");
+    let executable_copy = build_windows
+        .find("Copy-Item $exePath $DIST -Force")
+        .expect("the executable copy boundary must remain recognizable");
+    assert!(
+        first_dist_assertion < executable_copy,
+        "an existing destination reparse point must fail before any bundle write"
+    );
+}
+
+#[test]
+fn windows_bundle_applies_policy_at_copy_and_installer_boundaries() {
+    let build_windows = BUILD_WINDOWS.replace("\r\n", "\n");
+    let closure_rejection = build_windows
+        .find("if (Test-ForbiddenBundledComponentName $dllName)")
+        .expect("the recursive PE closure must reject a forbidden import");
+    let closure_copy = build_windows[closure_rejection..]
+        .find("$srcPath = Join-Path $ArchitectureBin $dllName")
+        .map(|offset| closure_rejection + offset)
+        .expect("the PE closure copy boundary must remain recognizable");
+    assert!(
+        closure_rejection < closure_copy,
+        "the closure must reject a forbidden DLL before resolving or copying it"
+    );
+
+    let installer_only = build_windows
+        .find("# ── Inno Setup only mode")
+        .expect("the installer-only path must exist");
+    let installer_assertion = build_windows[installer_only..]
+        .find("Assert-WindowsBundleComponentPolicy $sourceDir")
+        .map(|offset| installer_only + offset)
+        .expect("the installer-only path must validate its existing dist tree");
+    let installer_compile = build_windows[installer_assertion..]
+        .find("& $iscc")
+        .map(|offset| installer_assertion + offset)
+        .expect("the Inno compiler invocation must remain recognizable");
+    assert!(installer_assertion < installer_compile);
+    assert_eq!(
+        build_windows
+            .matches("Assert-WindowsBundleComponentPolicy $sourceDir")
+            .count(),
+        2,
+        "both installer-only and normal Inno paths must validate their source tree"
+    );
+
+    let runtime_probe = build_windows
+        .find("# ── Packaged Runtime Probe")
+        .expect("the packaged runtime probe must exist");
+    assert!(
+        build_windows[..runtime_probe].ends_with("Assert-WindowsBundleComponentPolicy $DIST\n\n"),
+        "the dist tree must pass policy immediately before the packaged executable is run"
+    );
+}
+
+#[test]
+fn windows_bundle_validates_the_completed_zip_and_ci_parser() {
+    let build_windows = BUILD_WINDOWS.replace("\r\n", "\n");
+    let windows_ci = workflow_job(CI_WORKFLOW, "build-windows");
+    let archive = build_windows
+        .find("Write-Info \"Creating zip archive...\"")
+        .expect("the Windows ZIP boundary must exist");
+    assert!(
+        build_windows[..archive].ends_with("Assert-WindowsBundleComponentPolicy $DIST\n"),
+        "the dist tree must pass policy immediately before ZIP creation"
+    );
+    let zip_creation = build_windows
+        .find("Compress-Archive -Path $DIST -DestinationPath $zipPath")
+        .expect("the ZIP creation call must remain recognizable");
+    let zip_validation = build_windows
+        .find("Assert-WindowsZipComponentPolicy $zipPath")
+        .expect("the completed ZIP must be reopened for validation");
+    assert!(
+        zip_creation < zip_validation
+            && build_windows.contains("[System.IO.Compression.ZipFile]::OpenRead")
+            && build_windows.contains("Test-ForbiddenBundledRelativePath $entryPath"),
+        "the completed ZIP entry names must pass the shared component policy"
+    );
+    assert!(
+        windows_ci.contains("name: Parse bundler with Windows PowerShell 5.1")
+            && windows_ci.contains("if: matrix.arch == 'x86_64'")
+            && windows_ci.contains("shell: powershell")
+            && windows_ci.contains("System.Management.Automation.Language.Parser]::ParseFile")
+            && windows_ci.contains("if (@($parseErrors).Count -gt 0)"),
+        "Windows CI must prove that the bundler parses under inbox Windows PowerShell 5.1"
+    );
 }
 
 #[test]

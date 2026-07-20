@@ -84,10 +84,12 @@ known-duration media.
   evidence.
 - Replaying content after a backward seek may earn new observed listening time, but the occurrence's
   one-shot latch still permits at most one count.
-- Local GStreamer, MPD, Chromecast, and AirPlay 1 feed the shared generation-scoped event contract.
-  AirPlay's dedicated RAOP pipeline samples position and duration every 500 ms only while Playing;
-  its weak session reference stops the timer at teardown, and a delayed old-generation sample is
-  rejected rather than credited to a replacement load.
+- Local GStreamer, MPD, and Chromecast feed the shared generation-scoped event contract. The gated
+  AirPlay 1 seam does the same only when an external compatible `raopsink` sender is registered;
+  supported packages do not currently provide one. Its dedicated RAOP pipeline samples position
+  and duration every 500 ms only while Playing; its weak session reference stops the timer at
+  teardown, and a delayed old-generation sample is rejected rather than credited to a replacement
+  load.
 - Progress accounting uses positions and monotonic sequencing, never elapsed UTC time. The UTC
   clock is sampled only when the one-shot threshold decision is emitted—whether by a position
   crossing, late duration acceptance, or qualifying unknown-duration natural end.
@@ -158,8 +160,8 @@ The production pipeline now implements the schema and progress contract end to e
 5. The UI replaces the exact existing local row by stable ID, allowing a Plays-sorted view to
    reorder immediately, and invalidates active and cached regular/smart-playlist projections. It
    never URI-matches or appends a row that disappeared concurrently.
-6. AirPlay 1 now publishes the same accepted position evidence as the other implemented outputs
-   through a generation-scoped 500 ms timer.
+6. The gated AirPlay 1 seam publishes the same accepted position evidence through a
+   generation-scoped 500 ms timer only when an external compatible sender is registered.
 
 This pipeline also drives the seeded Recently Played and Top 25 rules. Every committed history
 event invalidates cached playlist projections before reloading an active playlist; the navigation

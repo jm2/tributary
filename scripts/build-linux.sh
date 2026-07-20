@@ -6,6 +6,9 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+PACKAGE_VALIDATOR="${REPO_ROOT}/build-aux/linux/validate-package-compliance.sh"
+PACKAGE_METADATA_VALIDATOR="${REPO_ROOT}/build-aux/linux/validate-package-metadata.sh"
+FLATPAK_BUNDLE_VALIDATOR="${REPO_ROOT}/build-aux/flatpak/validate-bundle-compliance.sh"
 
 print_usage() {
   cat <<'EOF'
@@ -28,11 +31,16 @@ Quick-exit modes (run one task and exit):
 
 Packaging:
   --flatpak         Build a Flatpak bundle (requires flatpak, flatpak-builder,
-                    Python generator dependencies, and a user Flathub remote;
-                    does not require host Rust/GTK development packages).
-  --deb             Build a .deb package via cargo-deb.
-  --rpm             Build an .rpm package via cargo-generate-rpm.
-  --arch-pkg        Build an Arch .pkg.tar.zst via makepkg.
+                    Python generator dependencies, ostree, readelf/eu-readelf,
+                    and a user Flathub remote; does not require host Rust/GTK
+                    development packages).
+  --deb             Build a .deb package via cargo-deb (requires dpkg-deb).
+  --rpm             Build an .rpm package via cargo-generate-rpm (requires
+                    rpm, rpm2cpio, and cpio).
+  --arch-pkg        Build an Arch .pkg.tar.zst via makepkg (requires bsdtar).
+
+All native builds require readelf (binutils) or eu-readelf (elfutils) for the
+artifact compliance gate.
 
 Other:
   -h, --help        Show this help and exit.
@@ -73,15 +81,50 @@ if { $CHECK || $FMT || $CLIPPY || $COVERAGE; } && \
   error "Quick-exit and packaging modes cannot be combined"
 fi
 
+require_validator_tool() {
+  command -v "$1" &>/dev/null || error "$1 not found (required for artifact validation)"
+}
+
+require_elf_inspector() {
+  command -v readelf &>/dev/null || command -v eu-readelf &>/dev/null || \
+    error "readelf/eu-readelf not found. Install binutils or elfutils for artifact validation"
+}
+
+preflight_artifact_tools() {
+  # Formatting, static checks, and coverage do not produce a release artifact.
+  if $CHECK || $FMT || $CLIPPY || $COVERAGE; then
+    return
+  fi
+
+  require_elf_inspector
+  if $FLATPAK; then
+    require_validator_tool flatpak
+    require_validator_tool flatpak-builder
+    require_validator_tool python3
+    require_validator_tool ostree
+  fi
+  if $DEB; then
+    require_validator_tool dpkg-deb
+  fi
+  if $RPM; then
+    require_validator_tool rpm
+    require_validator_tool rpm2cpio
+    require_validator_tool cpio
+  fi
+  if $ARCH_PKG; then
+    require_validator_tool bsdtar
+  fi
+}
+
+preflight_artifact_tools # fail before build work
+
 build_flatpak() {
-  command -v flatpak         &>/dev/null || error "flatpak not found. Install: sudo apt install flatpak"
-  command -v flatpak-builder &>/dev/null || error "flatpak-builder not found. Install: sudo apt install flatpak-builder"
-  command -v python3          &>/dev/null || error "python3 not found (required to generate cargo sources)"
   if ! flatpak remote-list --user --columns=name | grep -Fxq flathub; then
     error "Flathub user remote not found. Run: flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo"
   fi
 
   local manifest="build-aux/flatpak/io.github.tributary.Tributary.yml"
+  "$PACKAGE_METADATA_VALIDATOR"
   info "Generating cargo-sources.json..."
   bash build-aux/flatpak/generate-cargo-sources.sh
 
@@ -90,6 +133,7 @@ build_flatpak() {
     --repo=repo build-dir "$manifest"
   flatpak build-bundle repo tributary.flatpak io.github.tributary.Tributary \
     --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
+  "$FLATPAK_BUNDLE_VALIDATOR" tributary.flatpak
   info "Flatpak bundle: $(pwd)/tributary.flatpak"
 }
 
@@ -167,8 +211,10 @@ if $COVERAGE; then
 fi
 
 # ── Rust Build ───────────────────────────────────────────────────────────────
+"$PACKAGE_METADATA_VALIDATOR"
 info "Building Tributary (release)..."
 cargo build --release
+"$PACKAGE_VALIDATOR" --elf target/release/tributary
 info "Binary: $(pwd)/target/release/tributary"
 
 # ── Install Icons (if running with --install or as root) ─────────────────────
@@ -189,6 +235,7 @@ if $DEB; then
   cargo deb
   DEB_FILE=$(ls target/debian/*.deb 2>/dev/null | head -1)
   if [[ -n "$DEB_FILE" ]]; then
+    "$PACKAGE_VALIDATOR" --deb "$DEB_FILE"
     info "Debian package: $(pwd)/$DEB_FILE"
   else
     error "cargo-deb did not produce a .deb file"
@@ -206,6 +253,7 @@ if $RPM; then
   cargo generate-rpm
   RPM_FILE=$(ls target/generate-rpm/*.rpm 2>/dev/null | head -1)
   if [[ -n "$RPM_FILE" ]]; then
+    "$PACKAGE_VALIDATOR" --rpm "$RPM_FILE"
     info "RPM package: $(pwd)/$RPM_FILE"
   else
     error "cargo-generate-rpm did not produce an .rpm file"
@@ -229,6 +277,7 @@ if $ARCH_PKG; then
   if [[ -n "$PKG_FILE" ]]; then
     mkdir -p dist
     mv "$PKG_FILE" dist/
+    "$PACKAGE_VALIDATOR" --arch "dist/$PKG_FILE"
     info "Arch package: $(pwd)/dist/$PKG_FILE"
   else
     error "makepkg did not produce a .pkg.tar.zst file"

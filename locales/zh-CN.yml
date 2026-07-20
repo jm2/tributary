@@ -299,7 +299,7 @@ errors:
     decoder_failed: "音频解码器发生错误"
     audio_output_failed: "音频输出失败"
     playback_failed: "音频播放失败"
-    airplay_raopsink_missing: "AirPlay 需要 GStreamer 的 raopsink 元素。请安装 gst-plugins-bad 软件包，然后重新启动 Tributary"
+    airplay_raopsink_missing: "AirPlay 1 播放不可用：此版本不包含兼容的 GStreamer raopsink 发送器"
     mpd_exclusive_control_required: "请重新添加此 MPD 输出，确认对分区的独占控制，然后在播放前再次选择它"
 
 # ── About dialog ───────────────────────────────────────────────────

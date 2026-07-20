@@ -29,6 +29,12 @@ build() {
   cargo build --release
 }
 
+check() {
+  cd "$startdir"
+  build-aux/linux/test-package-compliance.sh
+  build-aux/linux/validate-package-compliance.sh --elf target/release/tributary
+}
+
 package() {
   cd "$startdir"
 
@@ -52,4 +58,8 @@ package() {
 
   # License
   install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  # Keep the completed package payload covered even when a third-party builder
+  # invokes makepkg with --nocheck and skips check().
+  build-aux/linux/validate-package-compliance.sh --tree "$pkgdir"
 }

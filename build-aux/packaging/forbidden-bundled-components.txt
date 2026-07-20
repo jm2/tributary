@@ -1,0 +1,19 @@
+# Case-insensitive filename substrings that release bundles must not contain.
+# Keep this focused on optical-disc copy-control and proprietary DRM support;
+# ordinary media codecs and general-purpose cryptography are not prohibited.
+dvdcss
+dvdread
+dvdnav
+aacs
+bdplus
+bluray
+mmbd
+makemkv
+decss
+dvdcpxm
+resindvd
+dvdspu
+widevinecdm
+playready
+fairplay
+keydb.cfg

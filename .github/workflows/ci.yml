@@ -20,6 +20,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+
+      - name: Test package compliance policies
+        run: |
+          build-aux/linux/test-package-compliance.sh
+          scripts/test-macos-package-policy.sh
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run cargo audit
@@ -103,7 +108,7 @@ jobs:
     steps:
       - name: Install system dependencies (Fedora)
         run: |
-          dnf install -y gcc gcc-c++ gtk4-devel libadwaita-devel \
+          dnf install -y elfutils gcc gcc-c++ gtk4-devel libadwaita-devel \
             dbus-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel \
             gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free gstreamer1-libav \
@@ -138,6 +143,9 @@ jobs:
 
       - name: Build (release)
         run: cargo build --release
+
+      - name: Validate Linux binary payload
+        run: build-aux/linux/validate-package-compliance.sh --elf target/release/tributary
 
       - name: Run tests
         run: cargo test --release
@@ -331,6 +339,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Parse bundler with Windows PowerShell 5.1
+        if: matrix.arch == 'x86_64'
+        shell: powershell
+        run: |
+          $parseTokens = $null
+          $parseErrors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'scripts/build-windows.ps1').Path,
+            [ref]$parseTokens,
+            [ref]$parseErrors
+          )
+          if (@($parseErrors).Count -gt 0) {
+            foreach ($parseError in @($parseErrors)) {
+              Write-Error $parseError.Message
+            }
+            exit 1
+          }
+
       - name: Set up MSYS2 (${{ matrix.msystem }})
         uses: msys2/setup-msys2@v2.32.0
         env:
@@ -451,6 +477,12 @@ jobs:
       - name: Test Flatpak permission policy
         run: build-aux/flatpak/test-permissions.sh
 
+      - name: Test Linux package compliance policy
+        run: |
+          command -v ostree
+          command -v readelf || command -v eu-readelf
+          build-aux/linux/test-package-compliance.sh
+
       - name: Install Python dependencies
         run: |
           python3 -m pip install --requirement build-aux/flatpak/generator-requirements.txt \
@@ -465,6 +497,9 @@ jobs:
           bundle: tributary.flatpak
           manifest-path: build-aux/flatpak/io.github.tributary.Tributary.yml
           cache-key: flatpak-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Validate completed Flatpak bundle payload
+        run: build-aux/flatpak/validate-bundle-compliance.sh tributary.flatpak
 
       - name: Upload Flatpak bundle
         uses: actions/upload-artifact@v7

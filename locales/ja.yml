@@ -299,7 +299,7 @@ errors:
     decoder_failed: "オーディオデコーダーでエラーが発生しました"
     audio_output_failed: "オーディオ出力に失敗しました"
     playback_failed: "オーディオ再生に失敗しました"
-    airplay_raopsink_missing: "AirPlay には GStreamer の raopsink エレメントが必要です。gst-plugins-bad パッケージをインストールしてから Tributary を再起動してください"
+    airplay_raopsink_missing: "AirPlay 1 再生は利用できません。このビルドには互換性のある GStreamer raopsink 送信機が含まれていません"
     mpd_exclusive_control_required: "この MPD 出力を再追加してパーティションの排他的制御を確認し、再生前にもう一度選択してください"
 
 # ── About dialog ───────────────────────────────────────────────────
