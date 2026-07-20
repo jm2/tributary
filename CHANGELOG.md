@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Subsonic server-native playlists now have a pull-only contract and exact-session read
+  foundation** ([#144](https://github.com/jm2/tributary/pull/144)) — The accepted
+  [`docs/subsonic-playlist-sync.md`](docs/subsonic-playlist-sync.md) contract separates a future
+  one-time detached, editable **Import Copy** from an opt-in read-only, server-authoritative
+  **Keep Synced** mirror. It defines all-or-none application, local-drift conflicts, offline and
+  cancellation retention, reconnect/manual refresh, server rename/deletion, explicit
+  Replace/Unlink/Remove recovery, and no-locator/no-credential persistence before schema or UI
+  work. Synchronization is pull-only: this capability never creates, updates, or deletes a server
+  playlist and does not add periodic polling.
+  A new exact, content-redacted `NativePlaylistId` uses the 4 KiB remote-identity ceiling.
+  `ServerPlaylistSummary` and `ServerPlaylistSnapshot` bound optional name/owner hints to 16 KiB,
+  treat advertised song counts as non-authoritative hints, and preserve exact ordered `TrackId`
+  occurrences including duplicates. Subsonic now reads authenticated `getPlaylists.view` and
+  `getPlaylist.view?id` through the existing reverse-proxy-aware client with 8 MiB/10,000-summary
+  and 64 MiB/100,000-entry limits. Explicit empty listings and zero-entry playlist details remain
+  valid; a missing/null list wrapper, missing detail object, malformed or oversized member,
+  duplicate native playlist ID, excessive response, or detail-ID mismatch rejects the complete
+  operation without truncation.
+  Server-playlist request diagnostics, architecture DTO debug output, and registry-returned errors
+  expose fixed categories and safe sizes/counts rather than URLs, credentials, server text,
+  response bodies, or native IDs.
+  Because Subsonic dialects conflate unsupported endpoints and missing entities, an HTTP or failed-
+  envelope rejection remains a closed backend failure in this stage and is never treated as an
+  empty successful list; dialect-aware missing/unsupported classification is reserved for the
+  persistence stage and complete-list evidence.
+  `ManagedSourceAdapter` defaults server-native playlists to `Unsupported`; only authenticated
+  Subsonic opts into `PullSnapshots`. Registry list/detail operations capture the exact adapter,
+  session epoch, and revocable lease, perform network I/O outside the lifecycle mutex, and recheck
+  the same authority afterward. Disconnect, replacement, retirement, shutdown, final release, or
+  reuse of an opaque list guard against a successor session rejects the result. Playlist endpoint
+  membership does not require accepted music-catalogue membership and deliberately grants no
+  display, stream, artwork, rating, or history authority. This foundation adds no database
+  migration, playlist/link write, synchronization scheduler, or UI; those remain the next two
+  staged records.
 - **Regular playlists now have a source-scoped storage foundation**
   ([#140](https://github.com/jm2/tributary/pull/140)) — Migration 13 makes the exact
   `(source_id, track_id)` pair canonical for each durable regular-playlist occurrence while keeping
@@ -35,8 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and root-reauthorization paths retain their prior behavior through the new schema. At this
   storage slice's delivery boundary the UI deliberately remained local-only; the live authority
   and mixed-source UI records below now consume the schema without widening what it may persist.
-  Mixed-source XSPF metadata export and Subsonic server-native playlist synchronization remain
-  separately designed capabilities.
+  Mixed-source XSPF metadata export remains separately designed. The server-native Subsonic pull
+  contract and read authority are documented above; link persistence and UI remain separate.
   The complete boundary and validation matrix are in
   [`docs/source-scoped-playlists.md`](docs/source-scoped-playlists.md).
 - **Regular playlists now have default-deny live-catalogue authority**
@@ -69,8 +103,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or same-session catalogue refresh invalidates old guards. Disconnect, shutdown, and final source
   release synchronously deny new authority before asynchronous teardown completes.
   This PR's delivery boundary was an internal authority foundation rather than a UI authorization;
-  the mixed-source record immediately below is its reviewed consumer. Mixed-source XSPF export and
-  Subsonic-native playlist synchronization remain separately tracked.
+  the mixed-source record immediately below is its reviewed consumer. Mixed-source XSPF export
+  remains separately tracked, as do server-native Subsonic link persistence and UI.
 - **Regular playlists now integrate exact mixed-source entries end to end**
   ([#142](https://github.com/jm2/tributary/pull/142)) — Add to Playlist now accepts exact local
   tracks plus rows from current authenticated Subsonic, Jellyfin, Plex, and DAAP catalogues. One

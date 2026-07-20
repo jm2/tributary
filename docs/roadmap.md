@@ -6,7 +6,7 @@ This document explains the product and engineering work that remains **after** t
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
 remediation record is preserved separately in
 [`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **220/223 (98.7%)**, with only three
-real-environment validation records left. The feature backlog is now **10/36 (27.8%)** complete.
+real-environment validation records left. The feature backlog is now **11/38 (28.9%)** complete.
 Neither percentage estimates equal engineering effort, and the historical percentage is not a
 claim that Tributary has implemented every requested product feature.
 
@@ -42,7 +42,10 @@ starts. Historical holistic-review documents are point-in-time findings, not act
   backend failure. Only local occurrences own local playback history, and remote ratings remain
   read-only or unsupported. Radio-Browser, removable, external, and unknown sources remain
   unsupported. Smart playlists and XSPF import/export remain local-only; mixed-source metadata
-  export and Subsonic server-native playlist synchronization remain separate. See the
+  export remains separate. Subsonic server-native integration now has a pull-only
+  [accepted contract](subsonic-playlist-sync.md), bounded `getPlaylists`/`getPlaylist` protocol
+  support, and a default-deny exact-session registry boundary. It deliberately has no persistence,
+  import/sync manager, reconnect scheduler, or UI yet. See the regular-playlist
   [storage contract](source-scoped-playlists.md).
 - XSPF v1 import/export is implemented with exact path and deterministic normalized-metadata
   matching. Apple/iTunes XML, Google Takeout CSV, M3U, service URLs, and fuzzy matching are not
@@ -165,8 +168,19 @@ before starting large protocol or transfer subsystems.
    remote rating capability do not widen. Radio-Browser, removable, external-file, and unknown
    sources remain unsupported; smart playlists and XSPF import/export remain local-only, and a
    remote or unresolved regular occurrence makes XSPF export refuse all-or-none rather than emit a
-   local-only subset. Native
-   Subsonic playlist semantics and mixed-source metadata export remain separate later policies.
+   local-only subset. Native Subsonic link persistence, pull application, and UI plus mixed-source
+   metadata export remain separate later policies.
+8. **Completed foundation: define and read server-native Subsonic playlists ([#143]).** The
+   [pull-sync contract](subsonic-playlist-sync.md) separates one-time detached Import Copy from an
+   opt-in read-only Keep Synced mirror, forbids server mutation and fuzzy matching, and pins
+   conflict, offline, cancellation, server-deletion, unlink, and privacy behavior before schema or
+   UI work. Bounded `getPlaylists` and `getPlaylist` reads preserve exact playlist/track IDs, order,
+   and duplicate occurrences while rejecting malformed or partial responses all-or-none.
+   `ManagedSourceAdapter` defaults this capability to Unsupported; only authenticated Subsonic
+   opts into PullSnapshots. List/detail work is accepted only when the exact adapter, session epoch,
+   and revocable lease remain current before and after network I/O. The endpoint snapshot neither
+   depends on music-catalogue membership nor grants playback authority. Link persistence and atomic
+   synchronization are the next record; localized UI/reconnect integration follows it.
 
 These contracts make Rhythmbox migration and Last.fm behavior much less ambiguous.
 
@@ -235,7 +249,7 @@ mistaken for work already underway.
 | [#57 — Rhythmbox playlists, play counts, and ratings](https://github.com/jm2/tributary/issues/57) | No direct importer. XSPF conversion plus completed playback-history and rating contracts are foundations; XSPF deliberately transfers neither history nor ratings. | Build a separate transactional, idempotent migration with explicit metadata consent and conflict reporting. |
 | [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | No Last.fm client or scrobble pipeline. | Authorization, secret storage, authoritative thresholds, retry/offline queue, and privacy UX. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
-| [#47 — Remote/Subsonic tracks in playlists](https://github.com/jm2/tributary/issues/47) | Source-scoped storage, default-deny live authority, and exact mixed-source Add/Remove/render/Play are complete for local plus authenticated Subsonic, Jellyfin, Plex, and DAAP entries. Unavailable rows remain visible/removable; unsupported sources fail all-or-none; no locator or credential is persisted. Smart playlists and XSPF remain local-only, and server-native Subsonic sync is absent. | Design Subsonic server-native direction, conflict, offline, deletion, and feature semantics separately; define a no-locator metadata policy before any mixed-source export. |
+| [#143 — Import and pull-sync server-native Subsonic playlists](https://github.com/jm2/tributary/issues/143) | Pull-only direction, conflict, offline, deletion, unlink, privacy, and non-mutation semantics are accepted. Bounded endpoint reads and exact-session default-deny authority are implemented, but no link state, import/sync transaction, reconnect scheduler, or UI exists yet. | Add dedicated non-secret link persistence and all-or-none pull application, then localized Import Copy/Keep Synced/Sync Now and recovery UI. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |
 | [#29 — UI refinement](https://github.com/jm2/tributary/issues/29) | Requested separators/alignment changes are not implemented. | Split into independently reviewable visual changes after current-theme design review. |
@@ -314,3 +328,4 @@ When an item becomes active:
 [#140]: https://github.com/jm2/tributary/pull/140
 [#141]: https://github.com/jm2/tributary/pull/141
 [#142]: https://github.com/jm2/tributary/pull/142
+[#143]: https://github.com/jm2/tributary/issues/143

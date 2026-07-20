@@ -33,9 +33,11 @@ At that delivery boundary the storage slice deliberately did **not** enable remo
 mixed-source rendering or playback, disconnected-row presentation, or playlist-UI lifecycle
 refresh. Record A added the internal live-registry authority described below, and Record B now
 integrates it into those user-facing behaviors without changing the durable schema. Remote XSPF
-metadata export still needs an explicit no-locator policy. Subsonic server-native playlist listing,
-import, synchronization, conflict handling, and deletion semantics remain a separate record and
-require their own design before implementation.
+metadata export still needs an explicit no-locator policy. Subsonic server-native playlist
+integration remains a separate capability with its own
+[`subsonic-playlist-sync.md`](subsonic-playlist-sync.md) contract. Its bounded read-only protocol and
+exact-session authority foundation are implemented, but its link persistence, atomic import/pull,
+conflict state, reconnect integration, and UI do not reuse or widen this regular-playlist record.
 
 Smart playlists are unaffected. They remain live queries over the local library rather than stored
 regular-playlist occurrences.
@@ -286,6 +288,24 @@ See the [rating contract](ratings.md), [playback-history contract](playback-hist
 [source-lifecycle architecture](architecture/source-lifecycle.md) for those independent authority
 boundaries.
 
+## Boundary with server-native Subsonic playlists
+
+A regular-playlist occurrence owns only media identity. It does not say that the containing
+playlist originated on a server, retain a native playlist ID, or carry synchronization state. The
+server-native foundation therefore introduces a separate content-redacted `NativePlaylistId`,
+bounded summary/detail snapshot values, and a separate default-deny `PullSnapshots` capability.
+Only the authenticated Subsonic adapter opts in. List/detail work is checked against the exact
+current source adapter, session epoch, and revocable lease before and after network I/O; it does not
+require current music-catalogue membership and does not grant display, stream, artwork, rating, or
+history authority for the returned track IDs.
+
+Future Import Copy and Keep Synced persistence will consume a current endpoint snapshot and write
+ordinary canonical `(SourceId, TrackId)` occurrences under this document's schema. The former then
+detaches; the latter retains a dedicated non-secret link outside `playlist_entries` and remains
+read-only. Neither mode may persist an endpoint, credential, locator, route, lease, or session
+epoch, and neither may metadata-match a missing server track. The complete direction, conflict,
+offline, server-deletion, and unlink policy is in the server-native contract.
+
 ## Validation matrix
 
 The storage record is complete only when automated coverage demonstrates:
@@ -305,9 +325,9 @@ The storage record is complete only when automated coverage demonstrates:
   deletion/retirement cannot cascade into playlist storage, and no remote locator or credential is
   accepted or serialized.
 
-The storage and authority foundation records do not retroactively claim their consumer. Native
-Subsonic playlist synchronization and mixed-source XSPF metadata export remain explicitly deferred
-and require their own validation. Until a no-locator mixed-source export policy exists, a regular
+The storage and authority foundation records do not retroactively claim their consumers. Native
+Subsonic link persistence/synchronization and mixed-source XSPF metadata export remain explicitly
+deferred and require their own validation. Until a no-locator mixed-source export policy exists, a regular
 playlist containing any remote or unresolved occurrence is refused all-or-none before XSPF touches
 its destination; the local-only compatibility projection is never exported as a truncated result.
 

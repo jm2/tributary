@@ -5,7 +5,7 @@
 //! cached for fast browsing. Credentials remain in the retained backend and
 //! are resolved into proxy-only requests at playback time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -16,7 +16,11 @@ use uuid::Uuid;
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
-use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest, TrackId};
+use crate::architecture::{
+    AdvertisedHttpRoute, NativePlaylistId, RemoteMediaResolver, ResolvedHttpRequest,
+    ServerPlaylistSnapshot, ServerPlaylistSummary, TrackId, MAX_SERVER_PLAYLISTS_PER_LIST,
+    MAX_SERVER_PLAYLIST_ENTRIES,
+};
 
 use super::api::{AlbumEntry, ArtistEntry, SongEntry};
 use super::client::SubsonicClient;
@@ -27,6 +31,15 @@ use super::client::SubsonicClient;
 /// still overlapping request latency for a large speed-up over the old
 /// fully-sequential walk.
 const FETCH_CONCURRENCY: usize = 8;
+
+/// Playlist listing responses contain metadata only and should remain far
+/// smaller than a full catalogue response.
+const MAX_PLAYLIST_LIST_BODY_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A detailed playlist may legitimately contain many ordered occurrences,
+/// but it is still finite and receives a tighter ceiling than a full-library
+/// response.
+const MAX_PLAYLIST_DETAIL_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// In-memory library cache populated from the Subsonic API.
 #[allow(dead_code)]
@@ -132,6 +145,128 @@ impl SubsonicBackend {
         backend.refresh_library().await?;
 
         Ok(backend)
+    }
+
+    /// List the current user's server-native playlists.
+    ///
+    /// This is a pull-only metadata operation. The returned identifiers are
+    /// opaque and bounded, and duplicate playlist identifiers make the whole
+    /// response invalid rather than introducing ambiguous synchronization
+    /// authority.
+    pub(crate) async fn list_server_playlists(&self) -> BackendResult<Vec<ServerPlaylistSummary>> {
+        let envelope = self
+            .client
+            .get_with_params_bounded(
+                "getPlaylists.view",
+                &[],
+                MAX_PLAYLIST_LIST_BODY_BYTES,
+                "server-playlist-list",
+            )
+            .await?;
+        let playlists = envelope
+            .response
+            .playlists
+            .ok_or_else(|| {
+                invalid_playlist_response(
+                    "server playlist listing was missing its playlists object",
+                )
+            })?
+            .playlist;
+        if playlists.len() > MAX_SERVER_PLAYLISTS_PER_LIST {
+            return Err(invalid_playlist_response(
+                "server playlist listing exceeded the supported item count",
+            ));
+        }
+
+        let mut seen = HashSet::with_capacity(playlists.len());
+        let mut summaries = Vec::with_capacity(playlists.len());
+        for playlist in playlists {
+            let native_id = NativePlaylistId::new(playlist.id).map_err(|_| {
+                invalid_playlist_response(
+                    "server playlist listing contained an invalid playlist identifier",
+                )
+            })?;
+            if !seen.insert(native_id.clone()) {
+                return Err(invalid_playlist_response(
+                    "server playlist listing contained a duplicate playlist identifier",
+                ));
+            }
+            summaries.push(
+                ServerPlaylistSummary::new(
+                    native_id,
+                    playlist.name,
+                    playlist.owner,
+                    playlist.song_count,
+                )
+                .map_err(|_| {
+                    invalid_playlist_response(
+                        "server playlist listing contained invalid presentation metadata",
+                    )
+                })?,
+            );
+        }
+        Ok(summaries)
+    }
+
+    /// Fetch one exact server-native playlist snapshot.
+    ///
+    /// The detail endpoint's ordered `entry` array is authoritative. Its
+    /// optional `songCount` is retained only as a hint, so a concurrently
+    /// changing server cannot make a complete valid snapshot fail solely due
+    /// to a stale advertised count.
+    pub(crate) async fn get_server_playlist(
+        &self,
+        native_id: &NativePlaylistId,
+    ) -> BackendResult<ServerPlaylistSnapshot> {
+        let envelope = self
+            .client
+            .get_with_params_bounded(
+                "getPlaylist.view",
+                &[("id", native_id.as_str())],
+                MAX_PLAYLIST_DETAIL_BODY_BYTES,
+                "server-playlist-detail",
+            )
+            .await?;
+        let playlist = envelope.response.playlist.ok_or_else(|| {
+            invalid_playlist_response("server playlist detail was missing its playlist object")
+        })?;
+        let returned_id = NativePlaylistId::new(playlist.id).map_err(|_| {
+            invalid_playlist_response(
+                "server playlist detail contained an invalid playlist identifier",
+            )
+        })?;
+        if &returned_id != native_id {
+            return Err(invalid_playlist_response(
+                "server playlist detail did not match the requested playlist",
+            ));
+        }
+        if playlist.entry.len() > MAX_SERVER_PLAYLIST_ENTRIES {
+            return Err(invalid_playlist_response(
+                "server playlist detail exceeded the supported entry count",
+            ));
+        }
+
+        let mut track_ids = Vec::with_capacity(playlist.entry.len());
+        for entry in playlist.entry {
+            track_ids.push(TrackId::remote(entry.id).map_err(|_| {
+                invalid_playlist_response(
+                    "server playlist detail contained an invalid track identifier",
+                )
+            })?);
+        }
+
+        ServerPlaylistSnapshot::new(
+            returned_id,
+            playlist.name,
+            playlist.owner,
+            playlist.song_count,
+            track_ids,
+        )
+        .map_err(|_| {
+            invalid_playlist_response(
+                "server playlist detail contained invalid presentation metadata",
+            )
+        })
     }
 
     /// Fetch the entire library from the server into the in-memory cache.
@@ -333,6 +468,13 @@ impl SubsonicBackend {
         };
 
         Ok(())
+    }
+}
+
+fn invalid_playlist_response(message: &'static str) -> BackendError {
+    BackendError::ParseError {
+        message: message.to_string(),
+        source: None,
     }
 }
 
@@ -622,6 +764,38 @@ mod tests {
             .query_pairs()
             .find_map(|(key, value)| (key == "id").then(|| value.into_owned()))
             .expect("resolved Subsonic request carries a public media ID")
+    }
+
+    fn empty_catalogue_routes(prefix: &str) -> Vec<MockRoute> {
+        vec![
+            MockRoute::get(format!("{prefix}/rest/ping.view")).reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get(format!("{prefix}/rest/getArtists.view")).reply(MockResponse::json(
+                serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artists": {"index": []}
+                    }
+                }),
+            )),
+        ]
+    }
+
+    async fn connect_empty_catalogue(
+        service: &MockHttpService,
+        prefix: &str,
+        username: &str,
+        password: &str,
+    ) -> SubsonicBackend {
+        SubsonicBackend::connect(
+            "fixture",
+            &format!("{}{prefix}", service.base_url()),
+            username,
+            password,
+        )
+        .await
+        .expect("connect to empty Subsonic fixture")
     }
 
     #[test]
@@ -948,6 +1122,448 @@ mod tests {
             "/gateway/rest/stream.view"
         );
         assert_eq!(service.requests().len(), 6);
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn native_playlist_http_preserves_prefix_auth_order_duplicates_and_count_hints() {
+        const PREFIX: &str = "/proxy";
+        let mut routes = empty_catalogue_routes(PREFIX);
+        routes.push(
+            MockRoute::get(format!("{PREFIX}/rest/getPlaylists.view")).replies([
+                MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "playlists": {}
+                    }
+                })),
+                MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "playlists": {"playlist": [
+                            {
+                                "id": "playlist-one",
+                                "name": "One",
+                                "owner": "fixture-owner",
+                                "songCount": 999
+                            },
+                            {"id": "playlist-two", "name": "Two", "songCount": 0}
+                        ]}
+                    }
+                })),
+            ]),
+        );
+        routes.push(
+            MockRoute::get(format!("{PREFIX}/rest/getPlaylist.view"))
+                .with_query("id", "playlist-one")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "playlist": {
+                            "id": "playlist-one",
+                            "name": "One",
+                            "owner": "fixture-owner",
+                            "songCount": 999,
+                            "entry": [
+                                {"id": "track-b"},
+                                {"id": "track-a"},
+                                {"id": "track-b"}
+                            ]
+                        }
+                    }
+                }))),
+        );
+        routes.push(
+            MockRoute::get(format!("{PREFIX}/rest/getPlaylist.view"))
+                .with_query("id", "playlist-two")
+                .replies([
+                    MockResponse::json(serde_json::json!({
+                        "subsonic-response": {
+                            "status": "ok",
+                            "playlist": {"id": "playlist-two"}
+                        }
+                    })),
+                    MockResponse::json(serde_json::json!({
+                        "subsonic-response": {
+                            "status": "ok",
+                            "playlist": {"id": "playlist-two", "entry": []}
+                        }
+                    })),
+                ]),
+        );
+        let service = MockHttpService::start(routes).await;
+        let username = Uuid::new_v4().to_string();
+        let password = Uuid::new_v4().to_string();
+        let backend = connect_empty_catalogue(&service, PREFIX, &username, &password).await;
+
+        assert!(backend
+            .list_server_playlists()
+            .await
+            .expect("empty listing")
+            .is_empty());
+        let summaries = backend
+            .list_server_playlists()
+            .await
+            .expect("playlist listing");
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].native_id().as_str(), "playlist-one");
+        assert_eq!(summaries[0].name(), Some("One"));
+        assert_eq!(summaries[0].owner(), Some("fixture-owner"));
+        assert_eq!(summaries[0].advertised_track_count(), Some(999));
+        assert_eq!(summaries[1].native_id().as_str(), "playlist-two");
+
+        let snapshot = backend
+            .get_server_playlist(summaries[0].native_id())
+            .await
+            .expect("playlist detail");
+        assert_eq!(snapshot.native_id(), summaries[0].native_id());
+        assert_eq!(snapshot.advertised_track_count(), Some(999));
+        assert_eq!(
+            snapshot
+                .track_ids()
+                .iter()
+                .map(TrackId::as_str)
+                .collect::<Vec<_>>(),
+            ["track-b", "track-a", "track-b"]
+        );
+        for _ in 0..2 {
+            assert!(backend
+                .get_server_playlist(summaries[1].native_id())
+                .await
+                .expect("empty playlist detail")
+                .track_ids()
+                .is_empty());
+        }
+
+        let requests = service.requests();
+        assert_eq!(requests.len(), 7);
+        for request in &requests {
+            assert!(request.uri.path().starts_with(PREFIX));
+            let query = request
+                .uri
+                .query()
+                .map(|query| {
+                    url::form_urlencoded::parse(query.as_bytes())
+                        .into_owned()
+                        .collect::<HashMap<_, _>>()
+                })
+                .expect("authenticated Subsonic query");
+            assert_eq!(query.get("u"), Some(&username));
+            assert!(query.contains_key("t"));
+            assert!(query.contains_key("s"));
+            assert_eq!(query.get("v").map(String::as_str), Some("1.16.1"));
+            assert_eq!(query.get("c").map(String::as_str), Some("Tributary"));
+            assert_eq!(query.get("f").map(String::as_str), Some("json"));
+            assert!(!query.contains_key("p"));
+        }
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn native_playlist_listing_requires_an_explicit_wrapper() {
+        const PREFIX: &str = "/wrapper";
+        let response_secret = Uuid::new_v4().to_string();
+        let mut routes = empty_catalogue_routes(PREFIX);
+        routes.push(
+            MockRoute::get(format!("{PREFIX}/rest/getPlaylists.view")).replies([
+                MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "unrelated": response_secret.clone()
+                    }
+                })),
+                MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "playlists": null,
+                        "unrelated": response_secret.clone()
+                    }
+                })),
+                MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "playlists": {}
+                    }
+                })),
+            ]),
+        );
+        let service = MockHttpService::start(routes).await;
+        let password = Uuid::new_v4().to_string();
+        let backend = connect_empty_catalogue(&service, PREFIX, "user", &password).await;
+
+        for _ in 0..2 {
+            let error = backend
+                .list_server_playlists()
+                .await
+                .expect_err("absent or null wrapper must fail");
+            assert!(matches!(
+                error,
+                BackendError::ParseError { source: None, .. }
+            ));
+            let rendered = error.to_string();
+            assert!(rendered.contains("missing its playlists object"));
+            assert!(!rendered.contains(&response_secret));
+            assert!(!rendered.contains(&password));
+        }
+        assert!(backend
+            .list_server_playlists()
+            .await
+            .expect("explicit empty wrapper")
+            .is_empty());
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn native_playlist_identifiers_fail_closed_without_echoing_server_content() {
+        const PREFIX: &str = "/native-id";
+        let oversized_playlist_id = format!("playlist-secret-{}", "x".repeat(4 * 1024));
+        let mismatched_playlist_id = "mismatched-secret-playlist";
+        let oversized_track_id = format!("track-secret-{}", "x".repeat(4 * 1024));
+        let mut routes = empty_catalogue_routes(PREFIX);
+        routes.push(
+            MockRoute::get(format!("{PREFIX}/rest/getPlaylists.view")).replies([
+                MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "playlists": {"playlist": [{"id": "", "name": "bad"}]}
+                    }
+                })),
+                MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "playlists": {"playlist": [{
+                            "id": oversized_playlist_id.clone(),
+                            "name": "bad"
+                        }]}
+                    }
+                })),
+                MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "playlists": {"playlist": [
+                            {"id": "duplicate-secret", "name": "first"},
+                            {"id": "duplicate-secret", "name": "second"}
+                        ]}
+                    }
+                })),
+            ]),
+        );
+        routes.push(
+            MockRoute::get(format!("{PREFIX}/rest/getPlaylist.view"))
+                .with_query("id", "expected-playlist")
+                .replies([
+                    MockResponse::json(serde_json::json!({
+                        "subsonic-response": {
+                            "status": "ok",
+                            "playlist": {"id": mismatched_playlist_id, "entry": []}
+                        }
+                    })),
+                    MockResponse::json(serde_json::json!({
+                        "subsonic-response": {
+                            "status": "ok",
+                            "playlist": {
+                                "id": "expected-playlist",
+                                "entry": [{"id": ""}]
+                            }
+                        }
+                    })),
+                    MockResponse::json(serde_json::json!({
+                        "subsonic-response": {
+                            "status": "ok",
+                            "playlist": {
+                                "id": "expected-playlist",
+                                "entry": [{"id": oversized_track_id.clone()}]
+                            }
+                        }
+                    })),
+                ]),
+        );
+        let service = MockHttpService::start(routes).await;
+        let username = Uuid::new_v4().to_string();
+        let password = Uuid::new_v4().to_string();
+        let backend = connect_empty_catalogue(&service, PREFIX, &username, &password).await;
+        let expected = NativePlaylistId::new("expected-playlist").unwrap();
+
+        let mut rendered_errors = Vec::new();
+        for _ in 0..3 {
+            rendered_errors.push(
+                backend
+                    .list_server_playlists()
+                    .await
+                    .expect_err("invalid listing must fail all-or-none")
+                    .to_string(),
+            );
+        }
+        for _ in 0..3 {
+            rendered_errors.push(
+                backend
+                    .get_server_playlist(&expected)
+                    .await
+                    .expect_err("invalid detail must fail all-or-none")
+                    .to_string(),
+            );
+        }
+        for rendered in rendered_errors {
+            for secret in [
+                oversized_playlist_id.as_str(),
+                mismatched_playlist_id,
+                "duplicate-secret",
+                oversized_track_id.as_str(),
+                username.as_str(),
+                password.as_str(),
+            ] {
+                assert!(!rendered.contains(secret), "error exposed server content");
+            }
+        }
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn native_playlist_body_and_item_count_limits_are_enforced() {
+        const PREFIX: &str = "/bounds";
+        let maximum_summaries = (0..MAX_SERVER_PLAYLISTS_PER_LIST)
+            .map(|index| serde_json::json!({"id": format!("playlist-{index}")}))
+            .collect::<Vec<_>>();
+        let too_many_summaries = (0..=MAX_SERVER_PLAYLISTS_PER_LIST)
+            .map(|index| serde_json::json!({"id": format!("playlist-{index}")}))
+            .collect::<Vec<_>>();
+        let maximum_entries = (0..MAX_SERVER_PLAYLIST_ENTRIES)
+            .map(|index| serde_json::json!({"id": format!("track-{index}")}))
+            .collect::<Vec<_>>();
+        let too_many_entries = (0..=MAX_SERVER_PLAYLIST_ENTRIES)
+            .map(|index| serde_json::json!({"id": format!("track-{index}")}))
+            .collect::<Vec<_>>();
+        let mut routes = empty_catalogue_routes(PREFIX);
+        routes.push(
+            MockRoute::get(format!("{PREFIX}/rest/getPlaylists.view")).replies([
+                MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "playlists": {"playlist": maximum_summaries}
+                    }
+                })),
+                MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "playlists": {"playlist": too_many_summaries}
+                    }
+                })),
+                MockResponse::text(
+                    "x".repeat(usize::try_from(MAX_PLAYLIST_LIST_BODY_BYTES).unwrap() + 1),
+                ),
+            ]),
+        );
+        routes.push(
+            MockRoute::get(format!("{PREFIX}/rest/getPlaylist.view"))
+                .with_query("id", "bounded-playlist")
+                .replies([
+                    MockResponse::json(serde_json::json!({
+                        "subsonic-response": {
+                            "status": "ok",
+                            "playlist": {
+                                "id": "bounded-playlist",
+                                "entry": maximum_entries
+                            }
+                        }
+                    })),
+                    MockResponse::json(serde_json::json!({
+                        "subsonic-response": {
+                            "status": "ok",
+                            "playlist": {
+                                "id": "bounded-playlist",
+                                "entry": too_many_entries
+                            }
+                        }
+                    })),
+                    MockResponse::text(
+                        "x".repeat(usize::try_from(MAX_PLAYLIST_DETAIL_BODY_BYTES).unwrap() + 1),
+                    ),
+                ]),
+        );
+        let service = MockHttpService::start(routes).await;
+        let password = Uuid::new_v4().to_string();
+        let backend = connect_empty_catalogue(&service, PREFIX, "user", &password).await;
+        let playlist_id = NativePlaylistId::new("bounded-playlist").unwrap();
+
+        let maximum_listing = backend
+            .list_server_playlists()
+            .await
+            .expect("listing at exact item cap");
+        assert_eq!(maximum_listing.len(), MAX_SERVER_PLAYLISTS_PER_LIST);
+        assert_eq!(maximum_listing[0].native_id().as_str(), "playlist-0");
+        assert_eq!(
+            maximum_listing[MAX_SERVER_PLAYLISTS_PER_LIST - 1]
+                .native_id()
+                .as_str(),
+            "playlist-9999"
+        );
+        let maximum_detail = backend
+            .get_server_playlist(&playlist_id)
+            .await
+            .expect("detail at exact item cap");
+        assert_eq!(
+            maximum_detail.track_ids().len(),
+            MAX_SERVER_PLAYLIST_ENTRIES
+        );
+        assert_eq!(maximum_detail.track_ids()[0].as_str(), "track-0");
+        assert_eq!(
+            maximum_detail.track_ids()[MAX_SERVER_PLAYLIST_ENTRIES - 1].as_str(),
+            "track-99999"
+        );
+        let listing_count = backend
+            .list_server_playlists()
+            .await
+            .expect_err("listing item bound");
+        assert!(listing_count.to_string().contains("supported item count"));
+        let detail_count = backend
+            .get_server_playlist(&playlist_id)
+            .await
+            .expect_err("detail item bound");
+        assert!(detail_count.to_string().contains("supported entry count"));
+        let listing_body = backend
+            .list_server_playlists()
+            .await
+            .expect_err("listing body bound");
+        assert!(listing_body.to_string().contains("response body too large"));
+        let detail_body = backend
+            .get_server_playlist(&playlist_id)
+            .await
+            .expect_err("detail body bound");
+        assert!(detail_body.to_string().contains("response body too large"));
+        for error in [listing_count, detail_count, listing_body, detail_body] {
+            assert!(!error.to_string().contains(&password));
+        }
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn native_playlist_api_failures_discard_server_messages() {
+        const PREFIX: &str = "/failure";
+        let server_message = Uuid::new_v4().to_string();
+        let mut routes = empty_catalogue_routes(PREFIX);
+        routes.push(
+            MockRoute::get(format!("{PREFIX}/rest/getPlaylists.view")).reply(MockResponse::json(
+                serde_json::json!({
+                    "subsonic-response": {
+                        "status": "failed",
+                        "error": {"code": 70, "message": server_message.clone()}
+                    }
+                }),
+            )),
+        );
+        let service = MockHttpService::start(routes).await;
+        let password = Uuid::new_v4().to_string();
+        let backend = connect_empty_catalogue(&service, PREFIX, "user", &password).await;
+
+        let error = backend
+            .list_server_playlists()
+            .await
+            .expect_err("failed API envelope");
+        assert!(matches!(error, BackendError::ConnectionFailed { .. }));
+        let rendered = error.to_string();
+        assert!(rendered.contains("Subsonic API error 70"));
+        assert!(!rendered.contains(&server_message));
+        assert!(!rendered.contains(&password));
         service.finish().await;
     }
 }
