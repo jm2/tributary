@@ -1641,6 +1641,7 @@ pub fn build_window(
         }
 
         if !shutdown_started_for_close.replace(true) {
+            super::rhythmbox_migration::cancel_pending();
             // End the two window-scoped receiver loops even though their
             // application-side senders can outlive this native window. This
             // releases the controllers and window captures deterministically.
@@ -2022,6 +2023,25 @@ pub fn build_window(
         shutdown_started.clone(),
     );
 
+    // Rhythmbox migration is library management and remains available even
+    // when audio output construction fails below.
+    {
+        let migration_window = window.clone();
+        let migration_runtime = rt_handle.clone();
+        let migration_admission = library_commands.clone();
+        let migration_closing = shutdown_started.clone();
+        let migrate_action = gtk::gio::SimpleAction::new("migrate-rhythmbox", None);
+        migrate_action.connect_activate(move |_, _| {
+            super::rhythmbox_migration::start(
+                &migration_window,
+                &migration_runtime,
+                &migration_admission,
+                migration_closing.clone(),
+            );
+        });
+        window.add_action(&migrate_action);
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // Phase 4: Audio Player + Desktop Integration
     // ═══════════════════════════════════════════════════════════════════
@@ -2046,6 +2066,7 @@ pub fn build_window(
         Err(e) => {
             tracing::error!(error = %e, "Failed to create audio player — playback disabled");
             setup_library_events(
+                &window,
                 engine_rx,
                 rt_handle.clone(),
                 source_registry.clone(),
@@ -3068,6 +3089,7 @@ pub fn build_window(
 
     // ── Receive LibraryEvents on GTK main thread ─────────────────────
     setup_library_events(
+        &window,
         engine_rx,
         rt_handle.clone(),
         source_registry,
@@ -3338,6 +3360,7 @@ fn invalidate_playlist_projections(
 /// Spawn the library event receiver loop on the GTK main thread.
 #[allow(clippy::too_many_arguments)]
 fn setup_library_events(
+    window: &adw::ApplicationWindow,
     engine_rx: async_channel::Receiver<LibraryEvent>,
     rt_handle: tokio::runtime::Handle,
     source_registry: crate::source_registry::SourceRegistry,
@@ -3362,6 +3385,7 @@ fn setup_library_events(
     server_playlist_browser: super::server_playlists::ServerPlaylistBrowserController,
     window_closing: Rc<Cell<bool>>,
 ) {
+    let window = window.clone();
     let browser_widget = browser_widget.clone();
     let column_view = column_view.clone();
 
@@ -3657,6 +3681,17 @@ fn setup_library_events(
                     warn!(?track_id, "Local track rating update failed");
                     status_label.set_text(rust_i18n::t!("ratings.update_failed").as_ref());
                 }
+
+                LibraryEvent::RhythmboxMigrationFinished {
+                    request_id,
+                    outcome,
+                    summary,
+                } => super::rhythmbox_migration::handle_finished(
+                    &window,
+                    request_id,
+                    outcome,
+                    &summary,
+                ),
 
                 LibraryEvent::PlaylistProjectionsInvalidated => {
                     invalidate_playlist_projections(

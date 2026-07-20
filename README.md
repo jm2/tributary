@@ -61,6 +61,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | USB file transfer (copy to device with progress) | ❌ Planned ([#8](https://github.com/jm2/tributary/issues/8)) |
 | Multiple music library directories | ✅ |
 | Playlist import/export (XSPF) | ✅ |
+| Rhythmbox profile migration | ✅ Preview-first, exact-path import of ratings, play counts, optional last-played timestamps, and representable playlists ([contract](docs/rhythmbox-migration.md)) |
 | Durable local playback history | ✅ Exact accepted local occurrences persist a saturating play count and monotonic last-played timestamp, with live Plays refresh ([contract](docs/playback-history.md)) |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ Recently Played and Top 25 use deterministic authoritative history, safe untouched-default migration, and live projection refresh ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
 | Track ratings | ✅ Exact 1–100 local editing, read-only/unsupported source states, deterministic sorting, live refresh, and smart-playlist rules ([contract](docs/ratings.md)) |
@@ -72,6 +73,25 @@ Tributary provides a unified interface for managing and streaming music from mul
 
 See the [implementation roadmap](docs/roadmap.md) for the audited open-issue backlog, proposed
 ordering, and explicit current limitations. The countable working list is [`docs/task.md`](docs/task.md).
+
+### Migrating from Rhythmbox
+
+Choose **Import from Rhythmbox…** from Tributary's application menu, select the Rhythmbox profile
+folder containing `rhythmdb.xml` and, when present, `playlists.xml`, and review the preview before
+applying it. Ratings and play counts are enabled by default; last-played timestamps and replacing a
+different Tributary rating require explicit choices. If the music library moved, the optional root
+remap replaces one exact old path prefix with one exact current prefix.
+
+Migration never guesses by title, artist, album, or a similar filename. A source row changes a track
+only when its mapped absolute file path exactly matches the current local library. The preview lists
+bounded details for unmatched paths, conflicts, invalid source data, skipped queues, and playlist
+rules Tributary cannot represent; applying that safe subset requires an explicit acknowledgement.
+Static playlists retain source order, duplicates, and valid unmatched occurrences as exact
+path-only intent that can reconcile later; automatic playlists are imported only when their
+supported play-count/rating rules can be reproduced exactly. One atomic database transaction
+applies the accepted preview, and an exact repeat of the same source snapshot and policy is a
+no-op. See the [Rhythmbox migration contract](docs/rhythmbox-migration.md) for limits, privacy
+boundaries, and the intentionally conservative smart-playlist subset.
 
 ### MPD output safety
 

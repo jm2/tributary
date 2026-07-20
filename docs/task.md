@@ -23,29 +23,27 @@ state.
 - Do not treat the order below as a release promise. It is a dependency-aware starting order and
   can change as issues receive product decisions and milestones.
 
-Current status: **13/38 (34.2%)** active implementation records complete. This percentage measures
+Current status: **14/38 (36.8%)** active implementation records complete. This percentage measures
 checklist completion, not equal engineering effort: several P3 records are deliberately large
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
 ## Current focus
 
-P1.1 through P1.5 are complete. Record E closes the source-scoped-playlist foundation with a
-localized virtualized server-playlist browser, opaque one-shot Import Copy/Keep Synced tokens, and
-visible Sync Now/conflict/missing/failure/offline recovery controls. Browser listing is independent
-of reconnect recovery, exact native identity remains Tokio-owned, manager writes still require
-post-staging coordinator and source-session authority, and committed changes converge through the
-durable full-sidebar publisher. Linked mirrors remain read-only; the accepted
-[`subsonic-playlist-sync.md`](subsonic-playlist-sync.md) contract remains pull-only and adds neither
-server mutation nor periodic polling.
+P1.1 through P1.5 and the Rhythmbox half of P2.1 are complete. The Rhythmbox migration is a bounded,
+preview-first local workflow with exact non-guessing path matching, explicit metadata policy,
+actionable safe-subset acknowledgement, conservative exactly representable smart-playlist import,
+transactional stale-state revalidation, and a content-free idempotency receipt. The accepted
+[`rhythmbox-migration.md`](rhythmbox-migration.md) contract records its privacy, limit,
+cancellation, retry, and intentional-omission boundaries.
 
-Continue with P2.1's Rhythmbox migration contract and importer, the highest-priority unchecked
-record whose dependencies are satisfied. Last.fm follows as a separate listening integration.
-Smart playlists and XSPF import/export remain local-only, while mixed-source metadata export still
-requires its own no-locator policy.
+Continue with P2.1's Last.fm integration, the highest-priority unchecked record whose dependencies
+are satisfied. Its authorization, secret storage, scrobble thresholds, durable offline retry, and
+privacy contract must be fixed before schema or UI work. Smart playlists and XSPF import/export
+remain local-only, while mixed-source metadata export still requires its own no-locator policy.
 
 The independent Linux watcher correctness fix tracked in
-[#103](https://github.com/jm2/tributary/pull/103) does not change the **13/38** feature total.
+[#103](https://github.com/jm2/tributary/pull/103) does not change the **14/38** feature total.
 The salvaged scope rejects explicitly classified access/access-time noise before the bounded watcher
 queue without filtering real bootstrap mutations or backend errors, while retaining overflow
 evidence for authoritative reconciliation. It intentionally omits the original persistent
@@ -518,9 +516,45 @@ the 38-record feature backlog.
 
 ### P2.1 — Migration and listening integrations
 
-- [ ] Import Rhythmbox `rhythmdb.xml`, playlists, play counts, and ratings transactionally and
+- [x] Import Rhythmbox `rhythmdb.xml`, playlists, play counts, and ratings transactionally and
   idempotently, with exact non-guessing matching and actionable conflict/unmatched reporting
   ([#57](https://github.com/jm2/tributary/issues/57)).
+
+  Completed scope:
+
+  - The chooser accepts a stable non-link local profile directory and captures only its exact direct
+    children through retained, revalidated regular-file handles. Strict UTF-8 XML 1.0 parsing and
+    independent byte, depth, scalar, song, playlist, entry, issue, query, and mapped-path budgets
+    fail closed on unsafe, expanding, or incoherent input.
+  - An optional component-exact root remap precedes exact current local-path matching. Ratings and
+    monotonic play counts are explicit policy; last-played timestamps and destructive rating
+    replacement remain opt-in. Titles, artists, albums, filenames, and fuzzy similarity never
+    establish identity.
+  - Nine independently capped report categories retain 100 deterministic details apiece and exact
+    omitted counts. Local paths/names appear only as escaped preview text, while diagnostics and
+    stored receipts stay content-free. Any skipped, conflicted, invalid, duplicate, or path-only
+    result gates Apply behind explicit acknowledgement.
+  - Playlist-name conflicts are the first and sole playlist-level planning reason reported for that
+    complete source playlist; they suppress additional queue, unsupported-rule, or static-occurrence
+    detail without suppressing independent parser issues. Otherwise, static playlists preserve
+    order and duplicates, while queues and inexact automatic rules are reported and skipped; only a
+    flat, exactly equivalent play-count/rating subset without explicit sort or active limit is
+    imported. The three validated Rhythmbox browser/search presentation attributes are recognized
+    as membership-inert rather than rejecting ordinary saved playlists, and are excluded from
+    semantic receipt identity so UI-only changes do not create a new attempt.
+  - One move-only plan revalidates path membership, track values, and every incoming playlist-name
+    presence inside the write transaction. Writes are all-or-none, the minimal three-field receipt
+    is inserted last, and an exact/concurrent retry is a no-op. A committed first apply attempts one
+    coherent library/sidebar refresh; any incomplete refresh on a live UI lane returns a typed,
+    localized committed-but-restart-required result without exposing internal error details.
+    Cancellation stops bounded capture and suppresses stale preview results; an admitted apply
+    drains before shutdown Flush.
+
+  Final validation: 75 focused Rhythmbox tests pass; exact code/catalog/placeholder parity covers
+  125 keys in all 13 locales without substantive English fallback. Locked debug and release suites
+  each pass 20 library, 1,345 application, and 10 repository-metadata tests (1,375 total). Strict
+  Clippy is green in both profiles, the declared Rust 1.92 toolchain passes the locked all-target
+  check, and formatting/diff checks are clean.
 - [ ] Implement Last.fm authorization and protected secret storage, now-playing/scrobble thresholds,
   durable retry/offline behavior, privacy UX, and source-aware metadata on authoritative playback
   events ([#50](https://github.com/jm2/tributary/issues/50)).
@@ -637,4 +671,5 @@ the 38-record feature backlog.
 | 2026-07-20 | P1.5 durable playlist-sidebar publication | [#147](https://github.com/jm2/tributary/pull/147) | Added migration 15's exact singleton revision and six transactional triggers, startup schema revalidation, a coherent redacted full-snapshot publisher with coalesced hints and polling fallback, and a strictly ordered GTK reducer with selection-safe replacement and structural fallback. Partial CRUD/import patches were removed; the headless coordinator and final browser/recovery consumer were explicit follow-on work later completed by [#148](https://github.com/jm2/tributary/pull/148) and [#149](https://github.com/jm2/tributary/pull/149). |
 | 2026-07-20 | P1.5 server-playlist coordinator and reconnect lifecycle | [#148](https://github.com/jm2/tributary/pull/148) | Added typed GTK-free source/remote/local lanes with global reconnect/manual ordering, monotonic generations, pre-admission supersession, same-key waiting through admitted task and guard settlement, and unrelated-key concurrency. Reconnect binds one sweep to each exact accepted epoch, prepares revisions before one indexed complete list, and bounds local detail/commit fan-out to eight; detail failure writes nothing and only proven complete-list absence marks missing. Pull/missing persistence retains coordinator plus source authority after SQL staging, local Unlink/Remove uses the same guarded lane, and shutdown closes admission before source revocation and drains admitted work. At that merge boundary the redacted headless Sync/Retry/Replace/Unlink/Remove completion surface was ready; [#149](https://github.com/jm2/tributary/pull/149) adds its final browser and visible-action consumer. |
 | 2026-07-20 | P1.5 server-playlist browser and visible recovery UI | [#149](https://github.com/jm2/tributary/pull/149) | Added the capability-filtered virtualized browser, independently cancellable listing, bounded revocable opaque tokens, exact Import Copy/Keep Synced admission, visible generation-gated recovery controls, destructive confirmations, focus-safe accessibility behavior, and complete 13-catalog localization. This completes Record E and P1.5 and closes [#143](https://github.com/jm2/tributary/issues/143). |
+| 2026-07-20 | P2.1 Rhythmbox profile migration | Pending focused PR | Added strict bounded profile capture/parsing, exact-path policy and conservative smart translation, nine-category acknowledged preview reporting, transactional stale-state revalidation, minimal semantic-digest receipts, one-shot publication, localized lifecycle UI, and end-to-end/idempotency/privacy regressions. This completes [#57](https://github.com/jm2/tributary/issues/57); Last.fm remains the next P2.1 record. |
 | 2026-07-18 | Linux watcher feedback-loop fix | [#103](https://github.com/jm2/tributary/pull/103) | Narrowed the external proposal to filter self-generated access events before queue admission without filtering genuine startup events or backend errors; bounded overflow still drives authoritative reconciliation. Persistent negative parse caching is deliberately excluded so failures remain retryable; this separate correctness fix does not advance the feature numerator. |
