@@ -37,6 +37,8 @@ pub enum PlaylistAction {
     EditSmart(String),
     /// Import a playlist from an XSPF file.
     ImportPlaylist,
+    /// Browse playlists exposed by connected servers.
+    BrowseServerPlaylists,
     /// Export a playlist to an XSPF file (id).
     ExportPlaylist(String),
 }
@@ -192,6 +194,10 @@ fn playlist_creation_menu() -> gio::Menu {
         Some(rust_i18n::t!("playlist_io.import_menu").as_ref()),
         Some("pl-add.import"),
     );
+    menu.append(
+        Some(rust_i18n::t!("server_playlists.browse_menu").as_ref()),
+        Some("pl-add.browse-server-playlists"),
+    );
     menu
 }
 
@@ -220,6 +226,13 @@ fn playlist_creation_action_group(
         let _ = tx_import.try_send(PlaylistAction::ImportPlaylist);
     });
     action_group.add_action(&import);
+
+    let tx_browse = tx.clone();
+    let browse = gio::SimpleAction::new("browse-server-playlists", None);
+    browse.connect_activate(move |_, _| {
+        let _ = tx_browse.try_send(PlaylistAction::BrowseServerPlaylists);
+    });
+    action_group.add_action(&browse);
 
     action_group
 }
@@ -798,6 +811,32 @@ mod tests {
         group.activate_action("import", None);
         assert_eq!(rx.try_recv().unwrap(), PlaylistAction::ImportPlaylist);
         assert_empty(&rx);
+
+        group.activate_action("browse-server-playlists", None);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            PlaylistAction::BrowseServerPlaylists
+        );
+        assert_empty(&rx);
+    }
+
+    #[test]
+    fn playlist_creation_menu_exposes_server_playlist_browser_action() {
+        let menu = playlist_creation_menu();
+        assert_eq!(menu.n_items(), 4);
+
+        let action = menu
+            .item_attribute_value(3, "action", Some(glib::VariantTy::STRING))
+            .expect("server playlist browser menu item action");
+        assert_eq!(action.str(), Some("pl-add.browse-server-playlists"));
+
+        let label = menu
+            .item_attribute_value(3, "label", Some(glib::VariantTy::STRING))
+            .expect("server playlist browser menu item label");
+        assert_eq!(
+            label.str(),
+            Some(rust_i18n::t!("server_playlists.browse_menu").as_ref())
+        );
     }
 
     #[test]

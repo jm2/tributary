@@ -1099,7 +1099,17 @@ mod tests {
         update_failed: String,
     }
 
-    const SERVER_PLAYLIST_KEYS: [&str; 20] = [
+    const SERVER_PLAYLIST_STATUS_KEYS: [&str; 7] = [
+        "status_linked_read_only",
+        "status_syncing",
+        "status_offline",
+        "status_failed",
+        "status_conflict",
+        "status_missing",
+        "status_conflict_missing",
+    ];
+
+    const SERVER_PLAYLIST_KEYS: [&str; 40] = [
         "controls_accessible_label",
         "status_linked_read_only",
         "status_syncing",
@@ -1120,6 +1130,26 @@ mod tests {
         "unlink_body",
         "remove_heading",
         "remove_body",
+        "browse_menu",
+        "browser_title",
+        "browser_source",
+        "browser_loading",
+        "browser_empty",
+        "browser_failed",
+        "browser_reload",
+        "browser_list_accessible_label",
+        "browser_unnamed",
+        "browser_owner",
+        "action_import_copy",
+        "action_keep_synced",
+        "browser_importing",
+        "browser_linking",
+        "browser_imported",
+        "browser_linked",
+        "browser_already_linked",
+        "browser_reload_required",
+        "browser_busy",
+        "browser_action_failed",
     ];
 
     fn server_playlist_catalog(locale: &str) -> BTreeMap<String, String> {
@@ -1264,10 +1294,11 @@ mod tests {
         // state intentionally exposes no count or time/freshness placeholders.
         for locale in rust_i18n::available_locales!() {
             let catalog = server_playlist_catalog(locale.as_ref());
-            for value in catalog.values() {
-                assert!(!value.contains("%{count}"), "locale {locale}");
-                assert!(!value.contains("%{time}"), "locale {locale}");
-                assert!(!value.contains("%{updated}"), "locale {locale}");
+            for key in SERVER_PLAYLIST_STATUS_KEYS {
+                let value = &catalog[key];
+                assert!(!value.contains("%{count}"), "locale {locale}, key {key}");
+                assert!(!value.contains("%{time}"), "locale {locale}, key {key}");
+                assert!(!value.contains("%{updated}"), "locale {locale}, key {key}");
             }
         }
     }
@@ -1325,6 +1356,11 @@ mod tests {
                     );
                 }
             }
+
+            assert!(
+                catalog["browser_owner"].contains("%{owner}"),
+                "{locale}.server_playlists.browser_owner must interpolate the owner"
+            );
         }
     }
 
