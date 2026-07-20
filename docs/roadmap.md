@@ -249,7 +249,9 @@ before starting large protocol or transfer subsystems.
    mutation, periodic polling, fuzzy matching, non-Subsonic authority, and native playlist IDs in
    GTK. Validation passes 92 focused server-playlist tests and locked 1,300-test debug and release
    suites.
-12. **Completed Rhythmbox profile migration ([#57]).** A preview-first local importer reads exact
+12. **Completed Rhythmbox profile migration
+   ([#57](https://github.com/jm2/tributary/issues/57),
+   [#150](https://github.com/jm2/tributary/pull/150)).** A preview-first local importer reads exact
    `rhythmdb.xml` and optional `playlists.xml` profile children under explicit byte, structure, and
    item limits. It rejects unsafe XML and locations, optionally replaces one exact path root, and
    matches only exact current local-library paths—never titles, artists, albums, or similar names.

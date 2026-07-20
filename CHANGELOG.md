@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Rhythmbox profiles can now be migrated through a bounded, preview-first, transactional
-  workflow** ([#57](https://github.com/jm2/tributary/issues/57)):
+  workflow** ([#57](https://github.com/jm2/tributary/issues/57),
+  [#150](https://github.com/jm2/tributary/pull/150)):
 
   - **Exact, coherent input:** choose the profile folder containing the exact direct child
     `rhythmdb.xml` and optional `playlists.xml`. Tributary rejects a linked/reparse profile folder,
