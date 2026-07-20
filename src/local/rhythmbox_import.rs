@@ -1561,6 +1561,12 @@ fn validate_decoded_path_text(path: &str) -> Result<(), RhythmboxLocationIssue> 
     let mut index = 0usize;
     while index < encoded.len() {
         if encoded[index] == b'%' {
+            if index + 2 >= encoded.len()
+                || !encoded[index + 1].is_ascii_hexdigit()
+                || !encoded[index + 2].is_ascii_hexdigit()
+            {
+                return Err(RhythmboxLocationIssue::Malformed);
+            }
             let high = hex_value(encoded[index + 1]);
             let low = hex_value(encoded[index + 2]);
             decoded.push((high << 4) | low);
@@ -2355,6 +2361,13 @@ mod tests {
 
     #[test]
     fn local_file_uri_validation_is_typed_and_redacted() {
+        for malformed in ["%", "%A", "%GG"] {
+            assert_eq!(
+                validate_decoded_path_text(malformed),
+                Err(RhythmboxLocationIssue::Malformed)
+            );
+        }
+
         let entries = [
             song("https://example.invalid/a", ""),
             song("file://server/share/a", ""),

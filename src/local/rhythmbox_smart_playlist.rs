@@ -584,9 +584,9 @@ mod tests {
             let rule =
                 translated_rule(source_operator, "play-count", &source_value.to_string()).unwrap();
             assert_eq!(rule.field, RuleField::PlayCount);
-            assert!(
-                std::mem::discriminant(&rule.operator)
-                    == std::mem::discriminant(&expected_operator)
+            assert_eq!(
+                std::mem::discriminant(&rule.operator),
+                std::mem::discriminant(&expected_operator)
             );
             assert_eq!(number(&rule), expected_value);
         }
