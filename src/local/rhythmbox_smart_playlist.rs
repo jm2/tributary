@@ -413,18 +413,16 @@ fn parse_rating(value: &str) -> Result<f64, RhythmboxSmartPlaylistUnsupported> {
     Ok(value)
 }
 
-#[allow(clippy::float_cmp)] // Exact IEEE-754 grid membership is the safety check here.
 fn exact_canonical_rating(value: f64) -> Result<i64, RhythmboxSmartPlaylistUnsupported> {
-    let scaled = value * 20.0;
-    let rounded = scaled.round();
-    // Canonical decimal twentieths round to an exact integer after this
-    // multiplication (for example, parsed 0.15 * 20.0 is exactly 3.0). Do
-    // not use an epsilon: a distinct neighboring source double can change a
-    // Rhythmbox equality/boundary while rounding to the same target rating.
-    if scaled != rounded || !(1.0..=100.0).contains(&rounded) {
-        return Err(RhythmboxSmartPlaylistUnsupported::RatingGrid);
-    }
-    Ok(rounded as i64)
+    // Compare the source's exact binary value with each canonical twentieth.
+    // A multiply-then-round check can retain excess intermediate precision on
+    // some Windows targets, which made a neighboring double such as
+    // 0.30000000000000004 look canonical in release builds. Materializing the
+    // candidate through `to_bits` makes grid membership target-independent and
+    // still rejects every neighboring value without an epsilon.
+    (1_i64..=100)
+        .find(|canonical| ((*canonical as f64) / 20.0).to_bits() == value.to_bits())
+        .ok_or(RhythmboxSmartPlaylistUnsupported::RatingGrid)
 }
 
 fn ratings_use_exact_grid(ratings: &[RhythmboxRating]) -> bool {
@@ -915,6 +913,11 @@ mod tests {
 
     #[test]
     fn source_rating_grid_is_checked_for_numeric_rating_queries() {
+        for canonical in 1_i64..=100 {
+            let native = canonical as f64 / 20.0;
+            assert_eq!(exact_canonical_rating(native), Ok(canonical));
+        }
+
         let source = automatic(vec![node("equals", "rating", "4")], Vec::new());
         assert!(
             translate_automatic_playlist(&source, &parsed_ratings(&["0", "3.95", "5"])).is_ok()
