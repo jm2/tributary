@@ -5,6 +5,7 @@
 //! platform context-menu key / Shift+F10.
 
 use adw::prelude::*;
+use gtk::gio::prelude::ActionExt;
 use std::rc::Rc;
 
 use super::objects::{SourceObject, TrackObject};
@@ -13,16 +14,9 @@ use crate::architecture::{MediaKey, SourceId, TrackId};
 use crate::local::playlist_manager::{PlaylistEntryAddOutcome, PlaylistEntryInput};
 use crate::source_registry::{RegularPlaylistTrackResolution, SourceRegistry};
 
-const CONTEXT_MENU_ACTION_GROUP: &str = "tracklist-ctx";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextMenuControllerPlan {
     EventControllerKeyBubble,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextMenuActionOwner {
-    Popover,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,16 +24,12 @@ struct ContextMenuInteractionPlan {
     keyboard_controller: ContextMenuControllerPlan,
     has_popup: bool,
     accessible_key_shortcuts: &'static str,
-    action_owner: ContextMenuActionOwner,
 }
 
 const CONTEXT_MENU_INTERACTION: ContextMenuInteractionPlan = ContextMenuInteractionPlan {
     keyboard_controller: ContextMenuControllerPlan::EventControllerKeyBubble,
     has_popup: true,
-    // GTK/GDK calls the physical key `Menu`; the GTK accessible shortcut
-    // grammar uses the standardized `ContextMenu` token.
     accessible_key_shortcuts: "Shift+F10 ContextMenu",
-    action_owner: ContextMenuActionOwner::Popover,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,14 +47,12 @@ impl SelectionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContextMenuPopupPlan {
     selection: SelectionSnapshot,
-    action_owner: ContextMenuActionOwner,
 }
 
 impl ContextMenuPopupPlan {
     fn from_positions(positions: impl IntoIterator<Item = u32>) -> Option<Self> {
         Some(Self {
             selection: SelectionSnapshot::from_positions(positions)?,
-            action_owner: CONTEXT_MENU_INTERACTION.action_owner,
         })
     }
 }
@@ -382,24 +370,36 @@ pub fn setup_context_menu(state: &WindowState) {
                 return false;
             }
 
-            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            // Bypass GtkPopoverMenu entirely — it does not activate actions
+            // via insert_action_group in this GTK4 runtime.
+            let popover = gtk::Popover::new();
             popover.set_parent(cv);
-            match popup_plan.action_owner {
-                ContextMenuActionOwner::Popover => {
-                    popover.insert_action_group(CONTEXT_MENU_ACTION_GROUP, Some(&action_group));
-                }
+            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+            // Properties button (closes popover on click)
+            let props_label = rust_i18n::t!("context.properties").into_owned();
+            let props_btn = gtk::Button::builder()
+                .label(&props_label)
+                .hexpand(true)
+                .css_classes(["flat"])
+                .build();
+            let popover_for_props = popover.clone();
+            if let Some(action) = action_group.lookup_action("properties") {
+                props_btn.connect_clicked(move |_| {
+                    action.activate(None::<&gtk::glib::Variant>);
+                    popover_for_props.popdown();
+                });
             }
+            vbox.append(&props_btn);
+
+            // Remove-from-playlist / add-to-playlist buttons (placeholder)
+            // TODO: refactor build_remove_from_playlist_action and
+            // build_add_to_playlist_actions to emit buttons here.
+
+            popover.set_child(Some(&vbox));
             if let Some(anchor) = anchor {
                 popover.set_pointing_to(Some(&anchor));
             }
-
-            // Disable the internal ScrolledWindow that GTK4 PopoverMenu
-            // creates — it adds unnecessary scrollbars for small menus.
-            disable_popover_scrollbars(&popover);
-
-            // Popovers created for a snapshot are one-shot. Explicitly detach the
-            // closed widget so repeated keyboard or pointer invocations do not
-            // retain obsolete action groups or captured selections.
             popover.connect_closed(|popover| popover.unparent());
             popover.popup();
             true
@@ -883,12 +883,20 @@ fn build_properties_action(
     }
 
     let props_action = gtk::gio::SimpleAction::new("properties", None);
-    let win_for_props = column_view
+    let win_for_props: Option<adw::ApplicationWindow> = column_view
         .root()
         .and_then(|root| root.downcast::<adw::ApplicationWindow>().ok());
+    tracing::debug!(
+        has_win = win_for_props.is_some(),
+        track_count = track_infos.len(),
+        "build_properties_action"
+    );
 
     props_action.connect_activate(move |_, _| {
-        let Some(ref win) = win_for_props else { return };
+        let Some(ref win) = win_for_props else {
+            tracing::warn!("properties action: win_for_props is None, cannot show dialog");
+            return;
+        };
         super::properties_dialog::show_properties_dialog(win, &track_infos, automatic_device);
     });
 
@@ -938,25 +946,6 @@ fn active_source_is_automatic_device(
                         .is_some_and(|source_id| source_id.to_string() == active_source_key)
             })
     })
-}
-
-/// Traverse a `PopoverMenu`'s widget tree and disable scrollbars on any
-/// internal `ScrolledWindow`.  GTK4's `PopoverMenu::from_model()` wraps
-/// its content in a `ScrolledWindow` that adds unnecessary scrollbars
-/// for small menus (e.g., "Add to Playlist" with only 2–3 entries).
-fn disable_popover_scrollbars(popover: &gtk::PopoverMenu) {
-    fn walk(widget: &gtk::Widget) {
-        if let Some(sw) = widget.downcast_ref::<gtk::ScrolledWindow>() {
-            sw.set_hscrollbar_policy(gtk::PolicyType::Never);
-            sw.set_vscrollbar_policy(gtk::PolicyType::Never);
-        }
-        let mut child = widget.first_child();
-        while let Some(c) = child {
-            walk(&c);
-            child = c.next_sibling();
-        }
-    }
-    walk(popover.upcast_ref::<gtk::Widget>());
 }
 
 #[cfg(test)]
@@ -1346,7 +1335,6 @@ mod tests {
                 keyboard_controller: ContextMenuControllerPlan::EventControllerKeyBubble,
                 has_popup: true,
                 accessible_key_shortcuts: "Shift+F10 ContextMenu",
-                action_owner: ContextMenuActionOwner::Popover,
             }
         );
 
@@ -1370,6 +1358,5 @@ mod tests {
         live_selection.clear();
         live_selection.push(4);
         assert_eq!(popup_plan.selection.positions, vec![1, 3]);
-        assert_eq!(popup_plan.action_owner, ContextMenuActionOwner::Popover);
     }
 }

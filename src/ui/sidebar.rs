@@ -13,15 +13,6 @@ use gtk::{gio, glib};
 use super::objects::{PlaylistSidebarKind, SourceObject};
 use tracing::debug;
 
-const PLAYLIST_POPUP_ACTION_GROUP: &str = "playlist";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlaylistPopupActionOwner {
-    Popover,
-}
-
-const PLAYLIST_POPUP_ACTION_OWNER: PlaylistPopupActionOwner = PlaylistPopupActionOwner::Popover;
-
 /// Playlist action emitted from the sidebar context menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaylistAction {
@@ -180,6 +171,7 @@ fn sidebar_row_action(
     action
 }
 
+#[allow(dead_code)]
 fn playlist_creation_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append(
@@ -242,6 +234,7 @@ fn playlist_creation_action_group(
 /// A `GtkListItem` and its row widget may be rebound while the menu remains
 /// open, so the actions must capture the target ID once and be owned by the
 /// one-shot popover rather than by the recycled row.
+#[allow(dead_code)]
 fn playlist_popup_action_group(
     tx: &async_channel::Sender<PlaylistAction>,
     playlist_id: Option<&str>,
@@ -374,26 +367,91 @@ pub fn build_sidebar(
             // its immutable action target and unbind revokes it, so a prior
             // source never remains reachable through this row-lifetime
             // handler.
-            let playlist_menu = playlist_creation_menu();
             let playlist_actions = playlist_creation_action_group(&tx_for_setup);
             action_btn.insert_action_group("pl-add", Some(&playlist_actions));
 
+            let tx_for_menu = tx_for_setup.clone();
             let button_for_menu = action_btn.downgrade();
-            let row_action =
-                sidebar_row_action(&disconnect_tx_for_setup, &delete_tx_for_setup, move || {
-                    let Some(button) = button_for_menu.upgrade() else {
-                        return;
-                    };
-                    let popover = gtk::PopoverMenu::from_model(Some(&playlist_menu));
-                    popover.set_parent(&button);
-                    popover.connect_closed(|popover| popover.unparent());
-                    popover.popup();
-                });
+            let row_action = sidebar_row_action(
+                &disconnect_tx_for_setup,
+                &delete_tx_for_setup,
+                {
+                    let tx_source = tx_for_menu.clone();
+                    move || {
+                        let Some(button) = button_for_menu.upgrade() else {
+                            return;
+                        };
+                        let popover = gtk::Popover::new();
+                        popover.set_parent(&button);
+                        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+                        let pop_pd = popover.clone();
+                        let tx = tx_source.clone();
+                        let label_new = rust_i18n::t!("sidebar.new_playlist_menu").into_owned();
+                        let btn = gtk::Button::builder()
+                            .label(&label_new)
+                            .hexpand(true)
+                            .css_classes(["flat"])
+                            .build();
+                        btn.connect_clicked(move |_| {
+                            let _ = tx.try_send(PlaylistAction::CreateRegular);
+                            pop_pd.popdown();
+                        });
+                        vbox.append(&btn);
+
+                        let label_smart = rust_i18n::t!("sidebar.new_smart_playlist_menu").into_owned();
+                        let pop_pd = popover.clone();
+                        let tx = tx_source.clone();
+                        let btn = gtk::Button::builder()
+                            .label(&label_smart)
+                            .hexpand(true)
+                            .css_classes(["flat"])
+                            .build();
+                        btn.connect_clicked(move |_| {
+                            let _ = tx.try_send(PlaylistAction::CreateSmart);
+                            pop_pd.popdown();
+                        });
+                        vbox.append(&btn);
+
+                        let label_import = rust_i18n::t!("playlist_io.import_menu").into_owned();
+                        let pop_pd = popover.clone();
+                        let tx = tx_source.clone();
+                        let btn = gtk::Button::builder()
+                            .label(&label_import)
+                            .hexpand(true)
+                            .css_classes(["flat"])
+                            .build();
+                        btn.connect_clicked(move |_| {
+                            let _ = tx.try_send(PlaylistAction::ImportPlaylist);
+                            pop_pd.popdown();
+                        });
+                        vbox.append(&btn);
+
+                        let label_browse = rust_i18n::t!("server_playlists.browse_menu").into_owned();
+                        let pop_pd = popover.clone();
+                        let tx = tx_source.clone();
+                        let btn = gtk::Button::builder()
+                            .label(&label_browse)
+                            .hexpand(true)
+                            .css_classes(["flat"])
+                            .build();
+                        btn.connect_clicked(move |_| {
+                            let _ = tx.try_send(PlaylistAction::BrowseServerPlaylists);
+                            pop_pd.popdown();
+                        });
+                        vbox.append(&btn);
+
+                        popover.set_child(Some(&vbox));
+                        popover.connect_closed(|popover| popover.unparent());
+                        popover.popup();
+                    }
+                },
+            );
             let row_actions = gio::SimpleActionGroup::new();
             row_actions.add_action(&row_action);
             row_box.insert_action_group("sidebar-row", Some(&row_actions));
-            action_btn.set_action_name(Some("sidebar-row.invoke"));
             action_btn.set_action_target_value(Some(&sidebar_button_action_target(None)));
+            action_btn.set_action_name(Some("sidebar-row.invoke"));
 
             // Per-row right-click gesture.
             //
@@ -425,63 +483,91 @@ pub fn build_sidebar(
                     return;
                 }
 
-                let menu = gtk::gio::Menu::new();
+                let tx_for_popup = tx_for_gesture.clone();
+                let pid = src.playlist_id();
+                let popover = gtk::Popover::new();
+                popover.set_parent(&row_box_for_gesture);
+                let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+                fn add_popup_btn<F: Fn() + 'static>(
+                    vbox: &gtk::Box,
+                    label: &str,
+                    f: F,
+                ) {
+                    let btn = gtk::Button::builder()
+                        .label(label)
+                        .hexpand(true)
+                        .css_classes(["flat"])
+                        .build();
+                    btn.connect_clicked(move |_| f());
+                    vbox.append(&btn);
+                }
+
+                let popover_for_close = popover.clone();
                 if is_playlist_header {
-                    menu.append(
-                        Some(rust_i18n::t!("sidebar.new_playlist_menu").as_ref()),
-                        Some("playlist.create-regular"),
-                    );
-                    menu.append(
-                        Some(rust_i18n::t!("sidebar.new_smart_playlist_menu").as_ref()),
-                        Some("playlist.create-smart"),
-                    );
-                    menu.append(
-                        Some(rust_i18n::t!("playlist_io.import_menu").as_ref()),
-                        Some("playlist.import"),
-                    );
+                    let tx = tx_for_popup.clone();
+                    add_popup_btn(&vbox, &rust_i18n::t!("sidebar.new_playlist_menu"), move || {
+                        let _ = tx.try_send(PlaylistAction::CreateRegular);
+                        popover_for_close.popdown();
+                    });
+
+                    let popover_for_close = popover.clone();
+                    let tx = tx_for_popup.clone();
+                    add_popup_btn(&vbox, &rust_i18n::t!("sidebar.new_smart_playlist_menu"), move || {
+                        let _ = tx.try_send(PlaylistAction::CreateSmart);
+                        popover_for_close.popdown();
+                    });
+
+                    let popover_for_close = popover.clone();
+                    let tx = tx_for_popup;
+                    add_popup_btn(&vbox, &rust_i18n::t!("playlist_io.import_menu"), move || {
+                        let _ = tx.try_send(PlaylistAction::ImportPlaylist);
+                        popover_for_close.popdown();
+                    });
                 } else if matches!(
                     playlist_kind,
                     Some(PlaylistSidebarKind::EditableRegular | PlaylistSidebarKind::EditableSmart)
                 ) {
-                    menu.append(
-                        Some(rust_i18n::t!("sidebar.rename").as_ref()),
-                        Some("playlist.rename"),
-                    );
-                    menu.append(
-                        Some(rust_i18n::t!("playlist_io.export_menu").as_ref()),
-                        Some("playlist.export"),
-                    );
-                    menu.append(
-                        Some(rust_i18n::t!("sidebar.delete").as_ref()),
-                        Some("playlist.delete"),
-                    );
+                    let pid_rename = pid.clone();
+                    let popover_for_close = popover.clone();
+                    let tx = tx_for_popup.clone();
+                    add_popup_btn(&vbox, &rust_i18n::t!("sidebar.rename"), move || {
+                        let _ = tx.try_send(PlaylistAction::Rename(pid_rename.clone()));
+                        popover_for_close.popdown();
+                    });
+
+                    let pid_export = pid.clone();
+                    let popover_for_close = popover.clone();
+                    let tx = tx_for_popup.clone();
+                    add_popup_btn(&vbox, &rust_i18n::t!("playlist_io.export_menu"), move || {
+                        let _ = tx.try_send(PlaylistAction::ExportPlaylist(pid_export.clone()));
+                        popover_for_close.popdown();
+                    });
+
+                    let pid_delete = pid.clone();
+                    let popover_for_close = popover.clone();
+                    let tx = tx_for_popup.clone();
+                    add_popup_btn(&vbox, &rust_i18n::t!("sidebar.delete"), move || {
+                        let _ = tx.try_send(PlaylistAction::Delete(pid_delete.clone()));
+                        popover_for_close.popdown();
+                    });
+
                     if playlist_kind == Some(PlaylistSidebarKind::EditableSmart) {
-                        menu.append(
-                            Some(rust_i18n::t!("sidebar.edit_smart_playlist").as_ref()),
-                            Some("playlist.edit-smart"),
-                        );
+                        let pid_edit = pid.clone();
+                        let popover_for_close = popover.clone();
+                        let tx = tx_for_popup;
+                        add_popup_btn(&vbox, &rust_i18n::t!("sidebar.edit_smart_playlist"), move || {
+                            let _ = tx.try_send(PlaylistAction::EditSmart(pid_edit.clone()));
+                            popover_for_close.popdown();
+                        });
                     }
                 } else {
-                    // Pull mirrors deliberately have no ordinary rename,
-                    // export, delete, or smart-rule action. Record E adds
-                    // their dedicated synchronization/recovery actions.
                     return;
                 }
 
-                let pid = src.playlist_id();
-                let action_group = playlist_popup_action_group(
-                    &tx_for_gesture,
-                    is_playlist.then_some(pid.as_str()),
-                );
-
-                let popover = gtk::PopoverMenu::from_model(Some(&menu));
-                popover.set_parent(&row_box_for_gesture);
-                match PLAYLIST_POPUP_ACTION_OWNER {
-                    PlaylistPopupActionOwner::Popover => popover
-                        .insert_action_group(PLAYLIST_POPUP_ACTION_GROUP, Some(&action_group)),
-                }
                 #[allow(clippy::cast_possible_truncation)]
                 popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                popover.set_child(Some(&vbox));
                 popover.connect_closed(|popover| popover.unparent());
                 popover.popup();
             });
@@ -841,11 +927,6 @@ mod tests {
 
     #[test]
     fn playlist_popup_actions_are_popover_owned_immutable_snapshots() {
-        assert_eq!(
-            PLAYLIST_POPUP_ACTION_OWNER,
-            PlaylistPopupActionOwner::Popover
-        );
-
         let (tx, rx) = async_channel::unbounded();
         let first_popup = playlist_popup_action_group(&tx, Some("first-playlist"));
         let rebound_popup = playlist_popup_action_group(&tx, Some("rebound-playlist"));
