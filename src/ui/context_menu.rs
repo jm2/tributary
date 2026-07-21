@@ -6,6 +6,7 @@
 
 use adw::prelude::*;
 use gtk::gio::prelude::ActionExt;
+use gtk::glib;
 use std::rc::Rc;
 
 use super::objects::{SourceObject, TrackObject};
@@ -370,37 +371,10 @@ pub fn setup_context_menu(state: &WindowState) {
                 return false;
             }
 
-            // Bypass GtkPopoverMenu entirely — it does not activate actions
-            // via insert_action_group in this GTK4 runtime.
-            let popover = gtk::Popover::new();
-            popover.set_parent(cv);
-            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-
-            // Properties button (closes popover on click)
-            let props_label = rust_i18n::t!("context.properties").into_owned();
-            let props_btn = gtk::Button::builder()
-                .label(&props_label)
-                .hexpand(true)
-                .css_classes(["flat"])
-                .build();
-            let popover_for_props = popover.clone();
-            if let Some(action) = action_group.lookup_action("properties") {
-                props_btn.connect_clicked(move |_| {
-                    action.activate(None::<&gtk::glib::Variant>);
-                    popover_for_props.popdown();
-                });
-            }
-            vbox.append(&props_btn);
-
-            // Remove-from-playlist / add-to-playlist buttons (placeholder)
-            // TODO: refactor build_remove_from_playlist_action and
-            // build_add_to_playlist_actions to emit buttons here.
-
-            popover.set_child(Some(&vbox));
+            let popover = popover_from_menu_model(cv, &menu, &action_group);
             if let Some(anchor) = anchor {
                 popover.set_pointing_to(Some(&anchor));
             }
-            popover.connect_closed(|popover| popover.unparent());
             popover.popup();
             true
         },
@@ -946,6 +920,72 @@ fn active_source_is_automatic_device(
                         .is_some_and(|source_id| source_id.to_string() == active_source_key)
             })
     })
+}
+
+/// Build a `gtk::Popover` from a `gio::Menu` model and action group.
+///
+/// Each menu item with an enabled action becomes a flat `gtk::Button`;
+/// disabled actions render as section-header labels. The popover is
+/// parented to `parent` and self-unparents on close.
+///
+/// Submenus are not supported — items with no action reference are
+/// silently skipped.
+pub fn popover_from_menu_model(
+    parent: &impl IsA<gtk::Widget>,
+    menu: &gtk::gio::Menu,
+    action_group: &gtk::gio::SimpleActionGroup,
+) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    popover.set_parent(parent);
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+    for i in 0..menu.n_items() as i32 {
+        let Some(action_ref) = menu
+            .item_attribute_value(i, "action", Some(glib::VariantTy::STRING))
+            .and_then(|v| v.str().map(|s| s.to_string()))
+        else {
+            continue;
+        };
+        let Some(label) = menu
+            .item_attribute_value(i, "label", Some(glib::VariantTy::STRING))
+            .and_then(|v| v.str().map(|s| s.to_string()))
+        else {
+            continue;
+        };
+
+        let bare_name = action_ref.rsplit('.').next().unwrap_or(&action_ref).to_string();
+
+        if let Some(action) = action_group.lookup_action(&bare_name) {
+            if action.is_enabled() {
+                let btn = gtk::Button::builder()
+                    .label(&label)
+                    .hexpand(true)
+                    .css_classes(["flat"])
+                    .build();
+                let act = action.clone();
+                let pop = popover.clone();
+                btn.connect_clicked(move |_| {
+                    act.activate(None::<&glib::Variant>);
+                    pop.popdown();
+                });
+                vbox.append(&btn);
+            } else {
+                let lbl = gtk::Label::builder()
+                    .label(&label)
+                    .halign(gtk::Align::Start)
+                    .css_classes(["heading", "dim-label"])
+                    .margin_start(8)
+                    .margin_top(4)
+                    .margin_bottom(2)
+                    .build();
+                vbox.append(&lbl);
+            }
+        }
+    }
+
+    popover.set_child(Some(&vbox));
+    popover.connect_closed(|popover| popover.unparent());
+    popover
 }
 
 #[cfg(test)]
