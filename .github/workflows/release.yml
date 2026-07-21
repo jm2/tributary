@@ -102,7 +102,7 @@ jobs:
       - name: Install Flatpak & Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y flatpak flatpak-builder elfutils python3-pip
+          sudo apt-get install -y binutils flatpak flatpak-builder ostree python3-pip
 
           # Fix Polkit permission errors for headless bare-metal Flatpak
           sudo mkdir -p /etc/polkit-1/rules.d
@@ -144,6 +144,11 @@ jobs:
           manifest-path: build-aux/flatpak/io.github.tributary.Tributary.yml
           cache-key: flatpak-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
           arch: ${{ matrix.arch }}
+
+      - name: Validate completed Flatpak bundle payload
+        run: >-
+          build-aux/flatpak/validate-bundle-compliance.sh
+          tributary-linux-${{ matrix.arch }}.flatpak
 
       - name: Upload Flatpak as workflow artifact
         uses: actions/upload-artifact@v7
@@ -355,7 +360,7 @@ jobs:
       - name: Install system dependencies
         run: |
           apt-get update
-          apt-get install -y build-essential curl git pkg-config \
+          apt-get install -y binutils build-essential curl git pkg-config \
             libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libdbus-1-dev
@@ -385,6 +390,11 @@ jobs:
       - name: Build .deb package
         run: cargo deb -o target/debian/tributary-${{ matrix.deb_arch }}.deb
 
+      - name: Validate completed .deb payload
+        run: >-
+          build-aux/linux/validate-package-compliance.sh --deb
+          target/debian/tributary-${{ matrix.deb_arch }}.deb
+
       - name: Upload .deb as workflow artifact
         uses: actions/upload-artifact@v7
         with:
@@ -411,7 +421,7 @@ jobs:
     steps:
       - name: Install system dependencies
         run: |
-          dnf install -y gcc gtk4-devel libadwaita-devel \
+          dnf install -y binutils cpio gcc rpm-build gtk4-devel libadwaita-devel \
             dbus-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel \
             pkgconf-pkg-config git curl
@@ -449,6 +459,11 @@ jobs:
           RPM_FILE=$(ls target/generate-rpm/*.rpm | head -1)
           mv "$RPM_FILE" "target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm"
 
+      - name: Validate completed .rpm payload
+        run: >-
+          build-aux/linux/validate-package-compliance.sh --rpm
+          target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
+
       - name: Upload .rpm as workflow artifact
         uses: actions/upload-artifact@v7
         with:
@@ -466,7 +481,7 @@ jobs:
     steps:
       - name: Install system dependencies
         run: |
-          pacman -Syu --noconfirm git gtk4 libadwaita gstreamer sqlite \
+          pacman -Syu --noconfirm binutils git libarchive gtk4 libadwaita gstreamer sqlite \
             gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav dbus rust
 
       - uses: actions/checkout@v7
@@ -506,6 +521,11 @@ jobs:
           PKG_FILE=$(ls /home/builder/tributary/*.pkg.tar.zst | head -1)
           mkdir -p dist
           cp "$PKG_FILE" dist/tributary-x86_64.pkg.tar.zst
+
+      - name: Validate completed Arch package payload
+        run: >-
+          build-aux/linux/validate-package-compliance.sh --arch
+          dist/tributary-x86_64.pkg.tar.zst
 
       - name: Upload Arch package as workflow artifact
         uses: actions/upload-artifact@v7

@@ -52,6 +52,21 @@ info()  { echo -e "${GREEN}[tributary]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[tributary]${NC} $*"; }
 error() { echo -e "${RED}[tributary]${NC} $*" >&2; exit 1; }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MACOS_PACKAGE_POLICY_HELPER="${SCRIPT_DIR}/macos-package-policy.sh"
+[[ -f "$MACOS_PACKAGE_POLICY_HELPER" ]] \
+  || error "macOS package-policy helper is missing: ${MACOS_PACKAGE_POLICY_HELPER}"
+# shellcheck source=macos-package-policy.sh
+source "$MACOS_PACKAGE_POLICY_HELPER"
+
+# Test-only policy hooks remain available to the sourced helper, but a release
+# build must use the repository policy and the platform inspection tools even
+# when its parent environment happens to define those hook names.
+readonly MACOS_BUNDLED_COMPONENT_POLICY="${SCRIPT_DIR}/../build-aux/packaging/forbidden-bundled-components.txt"
+readonly MACOS_FIND_COMMAND="/usr/bin/find"
+readonly MACOS_OTOOL_COMMAND="/usr/bin/otool"
+readonly MACOS_OD_COMMAND="/usr/bin/od"
+
 APP_NAME="Tributary"
 BUNDLE_ID="io.github.tributary.Tributary"
 BINARY="target/release/tributary"
@@ -120,6 +135,14 @@ if $COVERAGE; then
   cargo llvm-cov --all-targets --all-features --locked --summary-only
   exit 0
 fi
+
+for policy_tool in "$MACOS_FIND_COMMAND" "$MACOS_OTOOL_COMMAND" "$MACOS_OD_COMMAND"; do
+  [[ -x "$policy_tool" ]] || error "Required macOS package-policy tool is unavailable: ${policy_tool}"
+done
+if ! macos_package_policy_load "$MACOS_BUNDLED_COMPONENT_POLICY"; then
+  error "$MACOS_PACKAGE_POLICY_REASON"
+fi
+info "Loaded ${MACOS_FORBIDDEN_COMPONENT_TOKEN_COUNT} forbidden bundle filename tokens."
 
 # ── Rust Build ───────────────────────────────────────────────────────────────
 info "Building Tributary (release)..."
@@ -213,9 +236,21 @@ GST_PLUGIN_DEST="${RESOURCES_DIR}/lib/gstreamer-1.0"
 if [[ -d "$GST_PLUGIN_SRC" ]]; then
   info "Bundling GStreamer plugins..."
   mkdir -p "$GST_PLUGIN_DEST"
-  cp "${GST_PLUGIN_SRC}"/*.dylib "$GST_PLUGIN_DEST/" 2>/dev/null || true
-  GST_PLUGIN_COUNT=$(ls -1 "$GST_PLUGIN_DEST"/*.dylib 2>/dev/null | wc -l | tr -d ' ')
-  info "Bundled ${GST_PLUGIN_COUNT} GStreamer plugins."
+  GST_PLUGIN_COUNT=0
+  GST_PLUGIN_EXCLUDED=0
+  for plugin in "${GST_PLUGIN_SRC}"/*.dylib; do
+    [[ -f "$plugin" ]] || continue
+    if ! macos_stage_gstreamer_plugin "$plugin" "$GST_PLUGIN_DEST"; then
+      error "GStreamer plugin policy inspection failed: ${MACOS_PACKAGE_POLICY_REASON}"
+    fi
+    if [[ "$MACOS_PACKAGE_POLICY_RESULT" == excluded ]]; then
+      warn "Excluding GStreamer plugin: ${MACOS_PACKAGE_POLICY_REASON}"
+      GST_PLUGIN_EXCLUDED=$((GST_PLUGIN_EXCLUDED + 1))
+    else
+      GST_PLUGIN_COUNT=$((GST_PLUGIN_COUNT + 1))
+    fi
+  done
+  info "Bundled ${GST_PLUGIN_COUNT} GStreamer plugins; excluded ${GST_PLUGIN_EXCLUDED} by policy."
 else
   warn "GStreamer plugin directory not found at ${GST_PLUGIN_SRC}"
 fi
@@ -318,6 +353,11 @@ copy_dylib() {
   local basename
   basename="$(basename "$src")"
   local dest="${FRAMEWORKS_DIR}/${basename}"
+
+  if ! macos_validate_macho_copy_control "$src"; then
+    error "Refusing recursive dylib dependency: ${MACOS_PACKAGE_POLICY_REASON}"
+  fi
+
   [[ -f "$dest" ]] && return 1
   cp "$src" "$dest"
   chmod u+w "$dest"
@@ -438,6 +478,11 @@ if [[ -d "$ADWAITA_SCALABLE" ]]; then
   info "Adwaita scalable icons: ${ADWAITA_SVG_COUNT} SVGs found."
 fi
 
+if ! macos_validate_bundle_copy_control "$APP_BUNDLE"; then
+  error "macOS bundle component-policy validation failed before signing: ${MACOS_PACKAGE_POLICY_REASON}"
+fi
+info "macOS bundle component policy passed before signing."
+
 # ── Ad-hoc Code Signing ─────────────────────────────────────────────────────
 # macOS 13+ kills unsigned binaries launched from .app bundles (SIGKILL / exit 9).
 # After install_name_tool modifies binaries, any existing signature is invalidated.
@@ -520,6 +565,10 @@ info "Signed runtime probe and final signature verification passed."
 
 # ── DMG ──────────────────────────────────────────────────────────────────────
 if $MAKE_DMG; then
+  if ! macos_validate_bundle_copy_control "$APP_BUNDLE"; then
+    error "macOS bundle component-policy validation failed before DMG creation: ${MACOS_PACKAGE_POLICY_REASON}"
+  fi
+  info "macOS bundle component policy passed before DMG creation."
   info "Creating .dmg disk image..."
   mkdir -p dist
   rm -f "dist/${APP_NAME}.dmg"

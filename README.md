@@ -48,11 +48,11 @@ Tributary provides a unified interface for managing and streaming music from mul
 | XDG music directory support (non-English locales) | ✅ |
 | Network connection guard (prevents duplicate auth) | ✅ |
 | i18n/l10n framework (13 languages, auto locale detection) | ✅ |
-| Audio output selector (local + MPD, iTunes AirPlay-style) | ✅ |
+| Audio output selector (local + MPD + Chromecast; AirPlay discovery seam) | ✅ |
 | MPD output backend (sink-only, TCP with security hardening) | ✅ Requires explicit exclusive-control confirmation |
 | Output switching (click to swap local ↔ MPD) | ✅ |
-| AirPlay 1 (RAOP) output | ✅ Requires GStreamer's `raopsink` element (ships in `gst-plugins-bad`); a missing element fails with an actionable install message |
-| AirPlay 2 / HomeKit output | ❌ Not yet supported — see [AirPlay 2 roadmap](#airplay-2-roadmap) below |
+| AirPlay 1 (RAOP) output | ⚠️ Discovery and a fail-closed integration seam exist, but current supported GStreamer/Homebrew/MSYS2 packages do not ship the required `raopsink` sender |
+| AirPlay 2 / HomeKit output | ❌ Not yet supported — see [AirPlay roadmap](#airplay-roadmap) below |
 | Chromecast output (Cast V2 — local files + remote sources) | ✅ |
 | Album artist sort (preference toggle) | ✅ |
 | Smart playlist compound sort (multi-key ordering) | ✅ |
@@ -300,6 +300,22 @@ rustup target add x86_64-pc-windows-gnullvm
 
 This produces `dist/tributary-windows.zip` with the executable and all required DLLs/resources.
 
+### Release artifact component policy
+
+Tributary does not play DVDs, Blu-ray discs, or DRM-protected media. Its packaging helpers exclude and
+fail closed on dedicated optical-disc copy-control/decryption components, unused disc-access
+plugins that can introduce them transitively, and proprietary content-decryption modules. Windows
+and macOS validate their self-contained application trees; native Linux packages validate their
+own payload, package relationships, and installer metadata, while Flatpak validates its complete
+app-owned commit (`/app`, exports, and metadata) rather than the separately delivered shared
+runtime. Windows rejects filesystem reparse points before copying and reopens the completed ZIP, while the
+same final validation protects incremental and installer-only packaging from stale files.
+
+Ordinary audio codecs, TLS, and general-purpose cryptography are intentionally distinct from that
+deny policy and remain available for supported playback. See the
+[release component policy](docs/release-component-policy.md) for the exact enforcement and review
+boundary.
+
 ### Flatpak (Linux)
 
 The manifest builds offline (`CARGO_NET_OFFLINE=true`) from a generated
@@ -310,7 +326,7 @@ same location.
 
 ```bash
 # Install the tools and configure Flathub for this user:
-sudo apt install flatpak flatpak-builder python3-venv
+sudo apt install binutils flatpak flatpak-builder ostree python3-venv
 flatpak remote-add --if-not-exists --user flathub \
   https://dl.flathub.org/repo/flathub.flatpakrepo
 
@@ -481,7 +497,7 @@ src/
 │   ├── output.rs           # AudioOutput trait abstraction
 │   ├── local_output.rs     # Local GStreamer playback (AudioOutput impl)
 │   ├── mpd_output.rs       # MPD TCP output (AudioOutput impl)
-│   ├── airplay_output.rs   # AirPlay 1/RAOP GStreamer output
+│   ├── airplay_output.rs   # Runtime-gated AirPlay 1/RAOP sender seam
 │   ├── chromecast_output.rs# Chromecast/Cast V2 output (local + remote)
 │   └── cast_http_server.rs # Embedded LAN-only HTTP server for Chromecast
 ├── db/
@@ -969,8 +985,9 @@ playlist projections only after commit. Normal shutdown first closes the shared 
 disables playback/media/open-file producers, and appends a FIFO marker, so no later callback can
 queue behind the admitted history/root-trust commands it waits to finish. The disabled window can
 remain visible while an earlier serialized library scan finishes.
-AirPlay 1 contributes the same evidence through generation-scoped 500 ms position updates. Remote,
-radio, removable, and ephemeral files do not write local history. Recently Played now uses one
+The gated AirPlay 1 seam contributes the same evidence through generation-scoped 500 ms position
+updates only when an external compatible sender is present. Remote, radio, removable, and ephemeral
+files do not write local history. Recently Played now uses one
 evaluation clock and includes only valid, non-future last-played instants in the inclusive previous
 14 days, newest first with stable track-ID ties; null or corrupt history yields an intentional empty
 playlist. Top 25 admits positive counts—including legacy counts with no timestamp—then uses count
@@ -997,9 +1014,15 @@ Open **Preferences** from the hamburger menu (☰) to:
 
 ---
 
-## AirPlay 2 roadmap
+## AirPlay roadmap
 
-AirPlay 2 receivers (HomePod, recent Apple TVs, AirPlay-2-certified third-party speakers) advertise via `_airplay._tcp.local.` and are detected by the discovery layer today, but the output implementation only speaks the legacy RAOP protocol via GStreamer's `raopsink` element. AirPlay 2 uses a different protocol stack and cannot be driven by `raopsink`, so AirPlay-2-only devices are filtered out of the output selector to avoid silent playback failures. Re-enabling them requires real sender-side support to land first.
+Legacy RAOP receivers are discovered today, but Tributary's AirPlay 1 path is only a runtime-gated
+integration seam for a GStreamer element named `raopsink`. Current official GStreamer,
+Homebrew, and MSYS2 packages do not ship that element, so supported builds report AirPlay 1 as
+unavailable instead of recommending an unrelated package. AirPlay 2 receivers (HomePod, recent
+Apple TVs, and AirPlay-2-certified third-party speakers) advertise via `_airplay._tcp.local.` and
+are also detected by discovery, but remain filtered out because AirPlay 2 needs a different sender
+protocol stack. Both paths require a maintained sender implementation and real-device validation.
 
 Sender-side AirPlay 2 support requires, at minimum:
 
@@ -1013,7 +1036,8 @@ Each of these has specifics (key exchange algorithms, audio codec, RTSP/HTTP ver
 Likely paths forward (each to be evaluated when the work begins):
 
 - **Subprocess delegation** to a maintained external tool. Cheaper to integrate, but adds a runtime dependency outside the single-binary distribution model.
-- **A pure-Rust sender implementation**, either in-tree or as a contributed `gst-plugins-rs` element, so it can plug into the same pipeline pattern `raopsink` uses today. Higher engineering cost; cleanest distribution story.
+- **A pure-Rust sender implementation**, either in-tree or as a contributed `gst-plugins-rs`
+  element. Higher engineering cost; cleanest distribution and provenance story.
 - **Wait for an upstream component** to mature to the point that one of the above becomes obviously preferable.
 
 The hook for whichever path is chosen is `service_type: "airplay2"` in [`src/discovery.rs`](src/discovery.rs); today that branch is dropped by [`src/ui/discovery_handler.rs`](src/ui/discovery_handler.rs), and that's where AirPlay 2 sender support will plug in.

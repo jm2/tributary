@@ -9,6 +9,8 @@ Source0:        https://github.com/jm2/tributary/archive/refs/tags/v%{version}.t
 
 BuildRequires:  rust
 BuildRequires:  cargo
+BuildRequires:  bash
+BuildRequires:  binutils
 BuildRequires:  gcc
 BuildRequires:  pkgconf-pkg-config
 BuildRequires:  libadwaita-devel
@@ -55,7 +57,12 @@ for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
         %{buildroot}%{_datadir}/icons/hicolor/${size}/apps/io.github.tributary.Tributary.png
 done
 
+# Validate the installed tree even when a build service skips its test phase.
+build-aux/linux/validate-package-compliance.sh --tree "%{buildroot}"
+
 %check
+build-aux/linux/test-package-compliance.sh
+build-aux/linux/validate-package-compliance.sh --elf target/release/tributary
 desktop-file-validate %{buildroot}%{_datadir}/applications/*.desktop
 appstream-util validate-relax --nonet %{buildroot}%{_metainfodir}/*.metainfo.xml
 

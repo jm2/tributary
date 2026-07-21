@@ -299,7 +299,7 @@ errors:
     decoder_failed: "Falló el decodificador de audio"
     audio_output_failed: "Falló la salida de audio"
     playback_failed: "Falló la reproducción de audio"
-    airplay_raopsink_missing: "AirPlay requiere el elemento raopsink de GStreamer: instale el paquete gst-plugins-bad y reinicie Tributary"
+    airplay_raopsink_missing: "La reproducción mediante AirPlay 1 no está disponible: esta compilación no incluye un emisor raopsink de GStreamer compatible"
     mpd_exclusive_control_required: "Vuelva a agregar esta salida MPD, confirme el control exclusivo de la partición y vuelva a seleccionarla antes de reproducir"
 
 # ── About dialog ───────────────────────────────────────────────────

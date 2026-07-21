@@ -60,6 +60,9 @@ modules:
             "data/icons/hicolor/${size}x${size}/apps/io.github.tributary.Tributary.png"
             "/app/share/icons/hicolor/${size}x${size}/apps/io.github.tributary.Tributary.png";
         done
+      # Inspect only the app-owned /app payload. The referenced GNOME runtime
+      # remains outside the bundle and continues to provide ordinary codecs.
+      - bash build-aux/linux/validate-package-compliance.sh --tree /app
     sources:
       - type: dir
         path: ../..

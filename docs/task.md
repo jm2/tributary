@@ -58,6 +58,21 @@ evidence for authoritative reconciliation. It intentionally omits the original p
 unparseable-file cache so transient parser and I/O failures remain retryable. It is tracked outside
 the 38-record feature backlog.
 
+The cross-platform release-component containment work implemented in PR #152 on 2026-07-20 likewise does not
+change the feature total. It removes the observed path by which broad Windows/macOS GStreamer
+bundling could pull unused optical-disc access and decryption components into an artifact, adds a
+single reviewed deny policy, and makes Windows, macOS, native Linux, and Flatpak payload validation
+fail closed. Review and CI follow-up also pinned production macOS inspection inputs, covered
+nonstandard Mach-O and ELF reference paths, made Windows source-copy and final PE gates complete
+across DLL/DRV/EXE module forms, and distinguished FFmpeg's non-decrypting `libbluray` dependency
+from the denied `gstbluray`,
+AACS, and BD+ components. Its exact scope and limitations are recorded in
+[`release-component-policy.md`](release-component-policy.md). P2.1 Last.fm remains the feature
+focus after this urgent distribution safeguard. The same provenance review established that no
+current supported GStreamer/Homebrew/MSYS2 package provides the claimed `raopsink` element; its
+incorrect package-install guidance is now honest, and the existing P2.4 sender-design records cover
+selecting and validating a maintained AirPlay path.
+
 ## P1 — Correctness and shared feature foundations
 
 ### P1.1 — Harden and document existing shuffled playback history
@@ -145,9 +160,10 @@ the 38-record feature backlog.
   barrier deliberately does not claim to drain filesystem-watcher events, and the disabled window
   may remain visible until the serialized scan finishes. Only a committed update publishes the
   replacement row; the live local Plays value
-  refreshes by stable ID and active/cached playlist projections are invalidated. AirPlay 1 now
-  contributes the same evidence through generation-scoped 500 ms position samples. The complete
-  contract is in [`playback-history.md`](playback-history.md).
+  refreshes by stable ID and active/cached playlist projections are invalidated. The gated AirPlay
+  1 seam contributes the same evidence through generation-scoped 500 ms position samples only when
+  an external compatible sender is registered. The complete contract is in
+  [`playback-history.md`](playback-history.md).
 
   The seeded history consumers now use one immutable clock snapshot per evaluation. Recently
   Played accepts only representable, non-future `last_played` instants in the inclusive preceding
@@ -666,13 +682,15 @@ the 38-record feature backlog.
 - [ ] Implement the supported equalizer path and accessible settings UI, then test format changes,
   gapless navigation, disabled/bypass behavior, clipping policy, and each output's supported or
   explicitly unavailable state.
-- [ ] Open and complete an AirPlay 2 sender design investigation covering maintained dependencies,
-  pairing, encrypted control, audio/timing, licensing, packaging, and real-device test requirements.
-- [ ] Implement the selected AirPlay 2 pairing/control/audio path without exposing unsupported
-  discovered receivers in the output selector; keep simultaneous multi-room sync out of scope
-  unless separately approved.
-- [ ] Validate AirPlay 2 interoperability and packaging on supported platforms and representative
-  receivers, including reconnect, cancellation, authentication failure, and actionable diagnostics.
+- [ ] Open and complete an AirPlay sender design investigation that first resolves the current
+  non-shipped `raopsink` seam, then scopes maintained RAOP and/or AirPlay 2 dependencies, pairing,
+  encrypted control, audio/timing, licensing, key provenance, packaging, and real-device tests.
+- [ ] Implement the selected maintained AirPlay sender path without presenting unsupported
+  discovered receivers as playable; keep simultaneous multi-room sync out of scope unless
+  separately approved.
+- [ ] Validate the selected AirPlay interoperability and packaging paths on supported platforms and
+  representative receivers, including reconnect, cancellation, authentication failure, and
+  actionable diagnostics.
 - [ ] Add receiver-facing IPv6 Chromecast media tickets where a reachable scoped address can be
   published safely; retain fail-closed omission for unusable endpoints.
 - [ ] Design and implement an optional detectable MPD exclusive-control/ownership mode before
@@ -728,11 +746,16 @@ the 38-record feature backlog.
   “similarly named” matching are not scheduled. XSPF is the supported interchange path.
 - Automount/eject, markerless read-only root enrollment, stronger native removable IDs, and saved
   endpoint rebind are candidates rather than committed work until they receive scoped issues.
+- A capability-derived Windows/macOS GStreamer audio-plugin allowlist and narrower native Linux
+  plugin-package relationships are possible stronger least-privilege packaging boundaries, not a
+  scheduled feature record. They require a real cross-platform container/source/output playback
+  matrix before replacing the current shared fail-closed deny policy safely.
 
 ## Implementation log
 
 | Date | Task | PR | Result |
 |---|---|---|---|
+| 2026-07-20 | Cross-platform release-component containment | [#152](https://github.com/jm2/tributary/pull/152) | Replaced permissive disc-component bundling with one shared deny policy; filtered before native dependency traversal; rejected denied transitive dependencies and recognizable path references; rejected link-based, test-hook, and incomplete-inspection escapes; and added final Windows ZIP/PE, macOS, native Linux, Packit/COPR, and complete Flatpak app-commit gates, including stale-tree and installer-only paths. Review regressions cover nonstandard Mach-O placement, all bracket-valued ELF dynamic tags plus the program interpreter, source-copy reparse points, Windows DLL/DRV/EXE import forms, failure-cleaned temporary state, and the deliberate `libbluray`/decryptor distinction. The dependency audit also removed false `gst-plugins-bad`/`raopsink` install guidance and folded maintained AirPlay sender selection into P2.4. Ordinary codecs and transport cryptography remain intentionally available. This distribution safeguard does not advance the 14/38 feature numerator. |
 | 2026-07-18 | Backlog reset | — | Archived the holistic-review tracker and established the audited feature backlog; no implementation record completed. |
 | 2026-07-18 | P1.1 bounded shuffle history | [#132](https://github.com/jm2/tributary/pull/132) | Retained ten real prior occurrences, fixed forward traversal and complete Repeat All cycles, unified Previous dispatch, made toggle/reset semantics explicit, and added lifecycle/rollback regressions. |
 | 2026-07-18 | P1.2 honest unsupported playlist actions | [#133](https://github.com/jm2/tributary/pull/133) | Refused non-local Add to Playlist actions with an all-or-none localized dialog before database work, localized the existing context-menu labels, and regressed the fail-closed source policy plus every shipped catalog. |

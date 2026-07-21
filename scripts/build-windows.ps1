@@ -88,6 +88,209 @@ function Write-Info { Write-Host "[tributary] $args" -ForegroundColor Green }
 function Write-Warn { Write-Host "[tributary] $args" -ForegroundColor Yellow }
 function Write-Err { Write-Host "[tributary] $args" -ForegroundColor Red; exit 1 }
 
+# Tributary does not play encrypted optical discs or proprietary DRM media.
+# Load the shared filename-token policy once and apply it at every Windows copy
+# boundary. Ordinary codecs, TLS libraries, and generic cryptography remain
+# eligible for the bundle.
+function Import-ForbiddenBundledComponentPolicy {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Write-Err "Required bundled-component policy is missing: $Path"
+    }
+
+    $tokens = [System.Collections.Generic.List[string]]::new()
+    $known = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        $token = $line.Trim()
+        if (-not $token -or $token.StartsWith('#')) { continue }
+        if ($token -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]*$') {
+            Write-Err "Bundled-component policy contains an invalid filename token: '$token'"
+        }
+        if (-not $known.Add($token)) {
+            Write-Err "Bundled-component policy contains a duplicate filename token: '$token'"
+        }
+        $tokens.Add($token)
+    }
+    if ($tokens.Count -eq 0) {
+        Write-Err "Bundled-component policy contains no filename tokens: $Path"
+    }
+    return @($tokens)
+}
+
+$RepositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
+$ForbiddenBundledComponentPolicyPath = Join-Path $RepositoryRoot 'build-aux\packaging\forbidden-bundled-components.txt'
+$ForbiddenBundledComponentTokens = @(Import-ForbiddenBundledComponentPolicy $ForbiddenBundledComponentPolicyPath)
+
+function Test-ForbiddenBundledComponentName {
+    param([AllowNull()][string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    $fileName = [System.IO.Path]::GetFileName($Name)
+    foreach ($token in $ForbiddenBundledComponentTokens) {
+        if ($fileName.IndexOf($token, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-ForbiddenBundledRelativePath {
+    param([AllowNull()][string]$RelativePath)
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) { return $false }
+    foreach ($component in @($RelativePath -split '[\\/]')) {
+        if ($component -and (Test-ForbiddenBundledComponentName $component)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# Enumerate a filesystem tree ourselves so PowerShell 5.1 and 7 use the same
+# rule: include hidden files and directories, report reparse points as bundle
+# members, but never recurse through a junction/symlink into an external tree.
+function Get-WindowsTreeMembersWithoutReparseTraversal {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return @() }
+
+    $members = [System.Collections.Generic.List[System.IO.FileSystemInfo]]::new()
+    $pendingDirectories = [System.Collections.Queue]::new()
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    $rootIsReparsePoint = ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    if ($rootIsReparsePoint) {
+        $members.Add($rootItem)
+        return @($members)
+    }
+    $pendingDirectories.Enqueue($rootItem.FullName)
+    while ($pendingDirectories.Count -gt 0) {
+        $directory = [string]$pendingDirectories.Dequeue()
+        foreach ($member in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+            $members.Add($member)
+            $isDirectory = ($member.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+            $isReparsePoint = ($member.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+            if ($isDirectory -and -not $isReparsePoint) {
+                $pendingDirectories.Enqueue($member.FullName)
+            }
+        }
+    }
+    return @($members)
+}
+
+function Get-ForbiddenWindowsBundleMembers {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return @() }
+
+    $rootFull = (Get-Item -LiteralPath $Root -Force -ErrorAction Stop).FullName.TrimEnd(
+        [char[]]@('\', '/')
+    )
+    return @(Get-WindowsTreeMembersWithoutReparseTraversal $rootFull | Where-Object {
+        $relativePath = $_.FullName.Substring($rootFull.Length).TrimStart([char[]]@('\', '/'))
+        Test-ForbiddenBundledRelativePath $relativePath
+    })
+}
+
+function Get-WindowsBundleReparsePointMembers {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return @() }
+    return @(Get-WindowsTreeMembersWithoutReparseTraversal $Root | Where-Object {
+        ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    })
+}
+
+function Assert-WindowsBundleRootIsNotReparsePoint {
+    param([string]$Root)
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Write-Err "Windows bundle root must not be a filesystem reparse point: $($rootItem.FullName)"
+    }
+}
+
+# Delete selected entries deepest-first and non-recursively. DirectoryInfo's
+# zero-argument Delete removes a directory or reparse-point link itself; it
+# cannot walk into a junction target. Every real descendant was enumerated and
+# selected separately because its relative path inherits the forbidden parent.
+function Remove-ForbiddenWindowsBundleMembers {
+    param([string]$Root)
+    $forbiddenMembers = @(Get-ForbiddenWindowsBundleMembers $Root | Sort-Object `
+        @{ Expression = { $_.FullName.Length }; Descending = $true })
+    foreach ($member in $forbiddenMembers) {
+        try {
+            if (($member.Attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
+                $member.Attributes = $member.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
+            }
+            $member.Delete()
+        }
+        catch [System.IO.FileNotFoundException] { }
+        catch [System.IO.DirectoryNotFoundException] { }
+        catch {
+            throw "Could not safely remove forbidden bundle member '$($member.FullName)': $($_.Exception.Message)"
+        }
+    }
+    return $forbiddenMembers.Count
+}
+
+function Assert-WindowsBundleComponentPolicy {
+    param([string]$Root)
+    $forbiddenMembers = @(Get-ForbiddenWindowsBundleMembers $Root)
+    $reparsePointMembers = @(Get-WindowsBundleReparsePointMembers $Root)
+    if ($forbiddenMembers.Count -eq 0 -and $reparsePointMembers.Count -eq 0) { return }
+
+    $forbiddenSample = @($forbiddenMembers | Select-Object -First 8 | ForEach-Object {
+        $relativePath = $_.FullName.Substring($Root.Length).TrimStart('\', '/')
+        if ($relativePath) { $relativePath } else { '<bundle-root>' }
+    }) -join ', '
+    if ($forbiddenMembers.Count -gt 8) { $forbiddenSample += ', ...' }
+    $reparseSample = @($reparsePointMembers | Select-Object -First 8 | ForEach-Object {
+        $relativePath = $_.FullName.Substring($Root.Length).TrimStart('\', '/')
+        if ($relativePath) { $relativePath } else { '<bundle-root>' }
+    }) -join ', '
+    if ($reparsePointMembers.Count -gt 8) { $reparseSample += ', ...' }
+
+    $details = [System.Collections.Generic.List[string]]::new()
+    if ($forbiddenMembers.Count -gt 0) {
+        $details.Add("$($forbiddenMembers.Count) forbidden component(s): $forbiddenSample")
+    }
+    if ($reparsePointMembers.Count -gt 0) {
+        $details.Add("$($reparsePointMembers.Count) filesystem reparse point(s): $reparseSample")
+    }
+    Write-Err "Windows bundle violates the bundled-component policy ($($details -join '; '))"
+}
+
+function Assert-WindowsZipComponentPolicy {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Write-Err "Completed Windows ZIP was not found for policy validation: $Path"
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $archive = [System.IO.Compression.ZipFile]::OpenRead(
+        (Resolve-Path -LiteralPath $Path).ProviderPath
+    )
+    $forbiddenEntryCount = 0
+    $forbiddenEntrySample = [System.Collections.Generic.List[string]]::new()
+    try {
+        foreach ($entry in $archive.Entries) {
+            $entryPath = $entry.FullName.TrimEnd([char[]]@('\', '/'))
+            if ($entryPath -and (Test-ForbiddenBundledRelativePath $entryPath)) {
+                $forbiddenEntryCount++
+                if ($forbiddenEntrySample.Count -lt 8) {
+                    $forbiddenEntrySample.Add($entry.FullName)
+                }
+            }
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+
+    if ($forbiddenEntryCount -gt 0) {
+        $sample = $forbiddenEntrySample -join ', '
+        if ($forbiddenEntryCount -gt $forbiddenEntrySample.Count) { $sample += ', ...' }
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        Write-Err "Completed Windows ZIP contains $forbiddenEntryCount forbidden entry name(s): $sample"
+    }
+}
+
 function Get-BoundedProbeDiagnostic {
     param(
         [string]$Path,
@@ -204,6 +407,370 @@ function Stop-ProbeProcessTree {
     Stop-BoundedProcessTree $Process "packaged runtime probe"
 }
 
+# Extract one dependency basename from llvm-readobj's PE import-table form:
+#   Import {
+#     Name: libfoo.dll
+#   }
+# Windows also exposes a small number of legacy system modules with a .drv
+# suffix, notably WINSPOOL.DRV imported by current GTK packages. --coff-imports includes
+# ordinary and delay-load imports. Reject every other suffix, path separator,
+# and invalid filename character so inspector output can never redirect a copy
+# outside the selected MSYS2 architecture's bin folder.
+function Get-PeImportDependencyName {
+    param([string]$Line)
+    if ($Line -notmatch '^\s*Name:\s*([^\\/:*?"<>|\x00-\x1F]+\.(?:dll|drv))\s*$') { return $null }
+    return $matches[1]
+}
+
+# Render an untrusted target path in a bounded, single-line diagnostic. The
+# import inspector only receives paths assembled by this script, but keeping
+# this formatter bounded prevents a malformed filesystem entry from flooding
+# CI logs or injecting a second diagnostic line.
+function Format-PeImportTargetForDiagnostic {
+    param(
+        [AllowNull()][string]$Target,
+        [int]$Limit = 192
+    )
+    if ($null -eq $Target) { return "<null>" }
+
+    $safe = [System.Text.RegularExpressions.Regex]::Replace(
+        $Target,
+        '[\p{Cc}\p{Zl}\p{Zp}"]',
+        '?'
+    )
+    if ($safe.Length -gt $Limit) {
+        $safe = $safe.Substring(0, $Limit) + "...[truncated]"
+    }
+    return "'$safe'"
+}
+
+# Validate and quote one strongly typed target batch. The exact-host failure
+# persisted after named parameter binding, so the collection shape cannot stay
+# implicit at this boundary. A List[string] crosses it as one object, while
+# each normalized member is still passed to llvm-readobj as a separately
+# quoted argument.
+function ConvertTo-BoundedPeImportArgumentBatch {
+    param(
+        [AllowNull()][System.Collections.Generic.List[string]]$TargetBatch,
+        [int]$ArgumentCharacterLimit
+    )
+    if ($null -eq $TargetBatch) {
+        throw "PE import-inspection target batch was null"
+    }
+
+    $quotedTargets = [System.Collections.Generic.List[string]]::new()
+    $targetNames = [System.Collections.Generic.List[string]]::new()
+    for ($targetIndex = 0; $targetIndex -lt $TargetBatch.Count; $targetIndex++) {
+        $target = $TargetBatch[$targetIndex]
+        $targetNumber = $targetIndex + 1
+        $targetLabel = Format-PeImportTargetForDiagnostic $target
+
+        if ([string]::IsNullOrWhiteSpace($target)) {
+            throw "PE import-inspection target #$targetNumber was empty ($targetLabel)"
+        }
+        if ([System.Text.RegularExpressions.Regex]::IsMatch(
+                $target,
+                '[\p{Cc}\p{Zl}\p{Zp}"]'
+            )) {
+            throw "PE import-inspection target #$targetNumber contains an unsupported quote or control character ($targetLabel)"
+        }
+        if (-not [System.IO.Path]::IsPathRooted($target)) {
+            throw "PE import-inspection target #$targetNumber is not absolute ($targetLabel)"
+        }
+
+        try {
+            $normalizedTarget = [System.IO.Path]::GetFullPath($target)
+        }
+        catch {
+            throw "PE import-inspection target #$targetNumber is not a valid filesystem path ($targetLabel)"
+        }
+        $extension = [System.IO.Path]::GetExtension($normalizedTarget)
+        if ($extension -ine ".dll" -and $extension -ine ".drv" -and
+            $extension -ine ".exe") {
+            throw "PE import-inspection target #$targetNumber is not a DLL, DRV, or EXE ($targetLabel)"
+        }
+        if (-not [System.IO.File]::Exists($normalizedTarget)) {
+            throw "PE import-inspection target #$targetNumber is not an existing file ($targetLabel)"
+        }
+
+        $quotedTargets.Add('"' + $normalizedTarget + '"')
+        if ($targetNames.Count -lt 3) {
+            $targetNames.Add([System.IO.Path]::GetFileName($normalizedTarget))
+        }
+    }
+
+    $arguments = "--coff-imports " + ($quotedTargets -join " ")
+    if ($arguments.Length -gt $ArgumentCharacterLimit) {
+        throw "PE import-inspection batch exceeded its $ArgumentCharacterLimit-character command-line limit"
+    }
+
+    $batchLabel = $targetNames -join ", "
+    if ($TargetBatch.Count -gt $targetNames.Count) { $batchLabel += ", ..." }
+    return [PSCustomObject]@{
+        Arguments = $arguments
+        Label = $batchLabel
+    }
+}
+
+# Inspect a bounded batch without ever loading or executing a target DLL.
+# Start-Process redirects both streams straight to files, avoiding deadlocks
+# from synchronous whole-stream pipe reads. File sizes are polled while the
+# process runs and checked again after exit; only then is the capped stdout
+# read into memory for parsing.
+function Invoke-BoundedPeImportBatch {
+    param(
+        [string]$Inspector,
+        [AllowNull()][System.Collections.Generic.List[string]]$TargetBatch,
+        [System.Diagnostics.Stopwatch]$ClosureClock,
+        [int]$ClosureDeadlineMs,
+        [int]$ProcessDeadlineMs,
+        [int64]$OutputByteLimit,
+        [int]$ArgumentCharacterLimit
+    )
+    if ($null -eq $TargetBatch) {
+        throw "PE import-inspection target batch was null"
+    }
+    if ($TargetBatch.Count -eq 0) { return @() }
+
+    $argumentBatch = ConvertTo-BoundedPeImportArgumentBatch `
+        -TargetBatch $TargetBatch `
+        -ArgumentCharacterLimit $ArgumentCharacterLimit
+    $arguments = $argumentBatch.Arguments
+    $batchLabel = $argumentBatch.Label
+
+    $token = [Guid]::NewGuid().ToString("N")
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    $stdoutPath = Join-Path $tempRoot "tributary-readobj-$token.stdout"
+    $stderrPath = Join-Path $tempRoot "tributary-readobj-$token.stderr"
+    $process = $null
+    $processClock = [System.Diagnostics.Stopwatch]::StartNew()
+    $failure = $null
+    $diagnostic = ""
+    $stdoutLines = @()
+
+    try {
+        $process = Start-Process -FilePath $Inspector -ArgumentList $arguments `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
+            -NoNewWindow -PassThru
+
+        while (-not $process.WaitForExit(50)) {
+            $stdoutLength = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+                (Get-Item -LiteralPath $stdoutPath).Length
+            } else { 0 }
+            $stderrLength = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+                (Get-Item -LiteralPath $stderrPath).Length
+            } else { 0 }
+            if (($stdoutLength + $stderrLength) -gt $OutputByteLimit) {
+                throw "PE import inspector output crossed its $OutputByteLimit-byte batch limit ($batchLabel)"
+            }
+            if ($processClock.ElapsedMilliseconds -ge $ProcessDeadlineMs) {
+                throw "PE import inspector exceeded its $ProcessDeadlineMs-millisecond batch deadline ($batchLabel)"
+            }
+            if ($ClosureClock.ElapsedMilliseconds -ge $ClosureDeadlineMs) {
+                throw "PE import dependency closure exceeded its $ClosureDeadlineMs-millisecond deadline"
+            }
+        }
+
+        $stdoutLength = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+            (Get-Item -LiteralPath $stdoutPath).Length
+        } else { 0 }
+        $stderrLength = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+            (Get-Item -LiteralPath $stderrPath).Length
+        } else { 0 }
+        if (($stdoutLength + $stderrLength) -gt $OutputByteLimit) {
+            throw "PE import inspector output crossed its $OutputByteLimit-byte batch limit ($batchLabel)"
+        }
+        if ($processClock.ElapsedMilliseconds -ge $ProcessDeadlineMs) {
+            throw "PE import inspector exceeded its $ProcessDeadlineMs-millisecond batch deadline ($batchLabel)"
+        }
+        if ($ClosureClock.ElapsedMilliseconds -ge $ClosureDeadlineMs) {
+            throw "PE import dependency closure exceeded its $ClosureDeadlineMs-millisecond deadline"
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "PE import inspector exited with status $($process.ExitCode) ($batchLabel)"
+        }
+        $stdoutLines = @([System.IO.File]::ReadAllLines($stdoutPath))
+    }
+    catch {
+        $failure = $_.Exception.Message
+    }
+    finally {
+        try {
+            Stop-BoundedProcessTree $process "PE import inspector"
+        }
+        catch {
+            if ($failure) { $failure += "; $($_.Exception.Message)" }
+            else { $failure = $_.Exception.Message }
+        }
+        if ($failure) {
+            $diagnostic = Get-BoundedProbeDiagnostic $stderrPath "PE inspector stderr" 8192
+            if (-not $diagnostic) {
+                $diagnostic = Get-BoundedProbeDiagnostic $stdoutPath "PE inspector stdout" 8192
+            }
+        }
+        if ($null -ne $process) { $process.Dispose() }
+        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($failure) {
+        if ($diagnostic) { throw "$failure`n$diagnostic" }
+        throw $failure
+    }
+    return $stdoutLines
+}
+
+# Reinspect the completed application tree without copying or repairing
+# anything. This final gate runs after every normal-mode writer (including the
+# packaged runtime probe) and is also available to installer-only mode, whose
+# existing tree must be treated as untrusted stale input.
+function Assert-WindowsBundlePeImportPolicy {
+    param(
+        [string]$Root,
+        [string]$Inspector
+    )
+
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        throw "Windows bundle was not found for final PE import validation: $Root"
+    }
+    $rootFull = (Get-Item -LiteralPath $Root -Force -ErrorAction Stop).FullName.TrimEnd(
+        [char[]]@('\', '/')
+    )
+    Assert-WindowsBundleComponentPolicy $rootFull
+
+    if ([string]::IsNullOrWhiteSpace($Inspector) -or
+        -not [System.IO.Path]::IsPathRooted($Inspector)) {
+        throw "Final PE import inspector path must be absolute"
+    }
+    $inspectorFull = [System.IO.Path]::GetFullPath($Inspector)
+    if (-not (Test-Path -LiteralPath $inspectorFull -PathType Leaf)) {
+        throw "Required final PE import inspector was not found: $inspectorFull"
+    }
+    $inspectorItem = Get-Item -LiteralPath $inspectorFull -Force -ErrorAction Stop
+    if (($inspectorItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Final PE import inspector must not be a filesystem reparse point: $inspectorFull"
+    }
+
+    $targetItems = @(Get-WindowsTreeMembersWithoutReparseTraversal $rootFull | Where-Object {
+        $isDirectory = ($_.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+        $isReparsePoint = ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        $isPeCandidate = $_.Extension -ieq '.dll' -or $_.Extension -ieq '.drv' -or
+            $_.Extension -ieq '.exe'
+        -not $isDirectory -and -not $isReparsePoint -and $isPeCandidate
+    } | Sort-Object FullName)
+    if ($targetItems.Count -eq 0) {
+        throw "Windows bundle contains no DLL, DRV, or EXE targets for final PE import validation"
+    }
+
+    $maxTargets = 4096
+    if ($targetItems.Count -gt $maxTargets) {
+        throw "Final PE import validation exceeded its $maxTargets-binary safety limit"
+    }
+
+    $targets = [System.Collections.Generic.List[string]]::new()
+    $targetSnapshot = @{}
+    foreach ($targetItem in $targetItems) {
+        $stream = [System.IO.File]::Open(
+            $targetItem.FullName,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            if ($stream.Length -lt 2 -or $stream.ReadByte() -ne 0x4D -or
+                $stream.ReadByte() -ne 0x5A) {
+                throw "Final PE import target does not have an MZ header: $($targetItem.Name)"
+            }
+        }
+        finally {
+            $stream.Dispose()
+        }
+        $fullPath = [System.IO.Path]::GetFullPath($targetItem.FullName)
+        $targets.Add($fullPath)
+        $targetSnapshot[$fullPath] = "$($targetItem.Length):$($targetItem.LastWriteTimeUtc.Ticks)"
+    }
+
+    $maxOutputLines = 131072
+    $maxBatchTargets = 28
+    $maxArgumentCharacters = 24000
+    $maxBatchOutputBytes = 8388608
+    $batchDeadlineMs = 45000
+    $validationDeadlineMs = 300000
+    $outputLineCount = 0
+    $validationClock = [System.Diagnostics.Stopwatch]::StartNew()
+    $offset = 0
+    $batchNumber = 0
+
+    while ($offset -lt $targets.Count) {
+        if ($validationClock.ElapsedMilliseconds -ge $validationDeadlineMs) {
+            throw "Final PE import validation exceeded its $validationDeadlineMs-millisecond deadline"
+        }
+        $batchNumber++
+        $batchTargets = [System.Collections.Generic.List[string]]::new()
+        $batchArgumentCharacters = "--coff-imports ".Length
+        while ($offset -lt $targets.Count -and
+            $batchTargets.Count -lt $maxBatchTargets) {
+            $candidate = [string]$targets[$offset]
+            $candidateCharacters = $candidate.Length + 3
+            if (($batchArgumentCharacters + $candidateCharacters) -gt $maxArgumentCharacters) {
+                if ($batchTargets.Count -eq 0) {
+                    throw "Final PE import target exceeds the command-line safety limit: $([System.IO.Path]::GetFileName($candidate))"
+                }
+                break
+            }
+            $batchTargets.Add($candidate)
+            $batchArgumentCharacters += $candidateCharacters
+            $offset++
+        }
+
+        $lines = @(Invoke-BoundedPeImportBatch `
+            -Inspector $inspectorFull `
+            -TargetBatch $batchTargets `
+            -ClosureClock $validationClock `
+            -ClosureDeadlineMs $validationDeadlineMs `
+            -ProcessDeadlineMs $batchDeadlineMs `
+            -OutputByteLimit $maxBatchOutputBytes `
+            -ArgumentCharacterLimit $maxArgumentCharacters)
+        foreach ($line in $lines) {
+            $outputLineCount++
+            if ($outputLineCount -gt $maxOutputLines) {
+                throw "Final PE import validation exceeded its $maxOutputLines-line safety limit"
+            }
+            if ([string]$line -notmatch '^\s*Name\s*:') { continue }
+
+            $dllName = Get-PeImportDependencyName ([string]$line)
+            if (-not $dllName) {
+                throw "Final PE import inspector returned an unsupported dependency spelling in batch $batchNumber"
+            }
+            if (Test-ForbiddenBundledComponentName $dllName) {
+                $dependencyLabel = Format-PeImportTargetForDiagnostic $dllName
+                throw "Forbidden bundled dependency $dependencyLabel reported during final PE import validation"
+            }
+        }
+    }
+
+    # No writer is expected during this gate. Recheck the policy and the cheap
+    # path/size/write-time snapshot so a late member cannot miss inspection.
+    Assert-WindowsBundleComponentPolicy $rootFull
+    $finalTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $rootFull | Where-Object {
+        $isDirectory = ($_.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+        $isReparsePoint = ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        $isPeCandidate = $_.Extension -ieq '.dll' -or $_.Extension -ieq '.drv' -or
+            $_.Extension -ieq '.exe'
+        -not $isDirectory -and -not $isReparsePoint -and $isPeCandidate
+    })
+    if ($finalTargets.Count -ne $targetSnapshot.Count) {
+        throw "Windows bundle PE target set changed during final import validation"
+    }
+    foreach ($finalTarget in $finalTargets) {
+        $finalPath = [System.IO.Path]::GetFullPath($finalTarget.FullName)
+        $finalSignature = "$($finalTarget.Length):$($finalTarget.LastWriteTimeUtc.Ticks)"
+        if (-not $targetSnapshot.ContainsKey($finalPath) -or
+            $targetSnapshot[$finalPath] -ne $finalSignature) {
+            throw "Windows bundle PE target changed during final import validation: $($finalTarget.Name)"
+        }
+    }
+}
+
 # Auto-detect ARM64 when env vars are not explicitly set.
 $NativeArch = if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
     "arm64"
@@ -231,8 +798,9 @@ $DIST = "dist\tributary-windows"
 
 # ── Inno Setup only mode ─────────────────────────────────────────────────────
 # When -InnoSetup is passed with -SkipBundle, use an existing, already-probed
-# dist tree and skip straight to installer creation. This intentionally does
-# not claim to validate a tree that may have been changed since its bundle run.
+# dist tree and skip straight to installer creation. The runtime probe is not
+# repeated, but the existing tree still crosses the component-policy gate
+# immediately before the installer compiler runs.
 if ($InnoSetup -and $SkipBundle) {
     Write-Info "Building Inno Setup installer from the existing dist tree (bundle/runtime probe skipped)..."
 
@@ -262,6 +830,16 @@ if ($InnoSetup -and $SkipBundle) {
     $issFile = "build-aux\inno\tributary.iss"
     $sourceDir = (Resolve-Path $DIST).Path
     $outputDir = (Resolve-Path "dist").Path
+    Assert-WindowsBundleComponentPolicy $sourceDir
+    $installerPeImportInspector = [System.IO.Path]::GetFullPath(
+        (Join-Path $MsysPath "bin\llvm-readobj.exe")
+    )
+    try {
+        Assert-WindowsBundlePeImportPolicy $sourceDir $installerPeImportInspector
+    }
+    catch {
+        Write-Err "Installer source PE import validation failed: $($_.Exception.Message)"
+    }
 
     Write-Info "Running Inno Setup compiler..."
     & $iscc /DAppVersion="$CargoVersion" /DSourceDir="$sourceDir" /DOutputDir="$outputDir" /DTargetArch="$InnoArch" $issFile
@@ -506,19 +1084,63 @@ if ($SkipBundle) {
 # ── DLL Bundle ───────────────────────────────────────────────────────────────
 Write-Info "Bundling GTK4 DLLs and resources into $DIST ..."
 
+# Reject source aliases before Copy-Item can follow them and turn a forbidden
+# target into a safe-named regular destination. Keep the same guard on every
+# incremental and unconditional bundle copy.
+function Get-ValidatedWindowsBundleCopySourceItem {
+    param([string]$Src)
+    $sourceItem = Get-Item -LiteralPath $Src -Force -ErrorAction Stop
+    if (($sourceItem.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+        throw "Refusing to copy a directory as a Windows bundle file: $($sourceItem.FullName)"
+    }
+    if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to copy filesystem reparse point into the Windows bundle: $($sourceItem.FullName)"
+    }
+    if (Test-ForbiddenBundledComponentName $sourceItem.Name) {
+        throw "Refusing to copy forbidden bundled component: $($sourceItem.Name)"
+    }
+    return $sourceItem
+}
+
+function Get-ValidatedWindowsBundleCopyDestinationItem {
+    param([string]$Dst)
+    if (Test-ForbiddenBundledComponentName ([System.IO.Path]::GetFileName($Dst))) {
+        throw "Refusing to write forbidden Windows bundle destination: $Dst"
+    }
+
+    $destinationItem = Get-Item -LiteralPath $Dst -Force -ErrorAction SilentlyContinue
+    if ($null -eq $destinationItem) { return $null }
+    if (($destinationItem.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+        throw "Refusing to overwrite a directory as a Windows bundle file: $($destinationItem.FullName)"
+    }
+    if (($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to overwrite filesystem reparse point in the Windows bundle: $($destinationItem.FullName)"
+    }
+    return $destinationItem
+}
+
+function Copy-WindowsBundleFileForced {
+    param([string]$Src, [string]$Dst)
+    $sourceItem = Get-ValidatedWindowsBundleCopySourceItem $Src
+    $null = Get-ValidatedWindowsBundleCopyDestinationItem $Dst
+    Copy-Item -LiteralPath $sourceItem.FullName -Destination $Dst -Force
+}
+
 # Helper: copy a single file only if the destination doesn't exist or the
-# source is newer.  This avoids re-copying hundreds of unchanged DLLs on
-# every build, saving significant time on incremental rebuilds.
+# source is newer. This avoids re-copying hundreds of unchanged DLLs on every
+# build, saving significant time on incremental rebuilds.
 function Copy-IfNewer {
     param([string]$Src, [string]$Dst)
-    if (-not (Test-Path $Dst)) {
-        Copy-Item $Src $Dst
+    $sourceItem = Get-ValidatedWindowsBundleCopySourceItem $Src
+    $destinationItem = Get-ValidatedWindowsBundleCopyDestinationItem $Dst
+    if ($null -eq $destinationItem) {
+        Copy-Item -LiteralPath $sourceItem.FullName -Destination $Dst
         return $true
     }
-    $srcTime = (Get-Item $Src).LastWriteTimeUtc
-    $dstTime = (Get-Item $Dst).LastWriteTimeUtc
+    $srcTime = $sourceItem.LastWriteTimeUtc
+    $dstTime = $destinationItem.LastWriteTimeUtc
     if ($srcTime -gt $dstTime) {
-        Copy-Item $Src $Dst -Force
+        Copy-Item -LiteralPath $sourceItem.FullName -Destination $Dst -Force
         return $true
     }
     return $false
@@ -526,29 +1148,51 @@ function Copy-IfNewer {
 
 # Helper: recursively sync a directory tree, copying only newer files.
 function Sync-Directory {
-    param([string]$SrcDir, [string]$DstDir)
+    param(
+        [string]$SrcDir,
+        [string]$DstDir,
+        [switch]$SkipForbiddenComponents
+    )
     $copied = 0
-    Get-ChildItem -Path $SrcDir -Recurse -File | ForEach-Object {
-        $relPath = $_.FullName.Substring($SrcDir.Length)
+    $sourceRoot = (Get-Item -LiteralPath $SrcDir -Force -ErrorAction Stop).FullName.TrimEnd(
+        [char[]]@('\', '/')
+    )
+    if ($SkipForbiddenComponents -and
+        (Test-Path -LiteralPath $DstDir -PathType Container)) {
+        $null = Remove-ForbiddenWindowsBundleMembers $DstDir
+    }
+    if (Test-Path -LiteralPath $DstDir -PathType Container) {
+        $destinationReparsePoints = @(Get-WindowsBundleReparsePointMembers $DstDir)
+        if ($destinationReparsePoints.Count -gt 0) {
+            throw "Refusing to sync into a Windows destination tree containing a filesystem reparse point: $($destinationReparsePoints[0].FullName)"
+        }
+    }
+    foreach ($sourceMember in @(Get-WindowsTreeMembersWithoutReparseTraversal $sourceRoot)) {
+        $relPath = $sourceMember.FullName.Substring($sourceRoot.Length).TrimStart(
+            [char[]]@('\', '/')
+        )
+        $isDirectory = ($sourceMember.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+        $isReparsePoint = ($sourceMember.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        if ($isReparsePoint) {
+            throw "Refusing to sync filesystem reparse point into the Windows bundle: $relPath"
+        }
+        if ($isDirectory) { continue }
+
+        $sourceFile = $sourceMember
         $destFile = Join-Path $DstDir $relPath
+        if (Test-ForbiddenBundledRelativePath $relPath) {
+            if (-not $SkipForbiddenComponents) {
+                throw "Refusing to sync forbidden bundled relative path: $relPath"
+            }
+            # Incremental bundles may retain a component copied by an older
+            # version of this script; the destination tree was purged above.
+            continue
+        }
         $destDir = Split-Path $destFile
         if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Force $destDir | Out-Null }
-        if (Copy-IfNewer $_.FullName $destFile) { $copied++ }
+        if (Copy-IfNewer $sourceFile.FullName $destFile) { $copied++ }
     }
     return $copied
-}
-
-# Extract one dependency basename from llvm-readobj's PE import-table form:
-#   Import {
-#     Name: libfoo.dll
-#   }
-# --coff-imports includes ordinary and delay-load imports. Reject path
-# separators and other invalid filename characters so inspector output can
-# never redirect a copy outside the selected MSYS2 architecture's bin folder.
-function Get-PeImportDependencyName {
-    param([string]$Line)
-    if ($Line -notmatch '^\s*Name:\s*([^\\/:*?"<>|\x00-\x1F]+\.dll)\s*$') { return $null }
-    return $matches[1]
 }
 
 function Add-DllScanTarget {
@@ -565,202 +1209,6 @@ function Add-DllScanTarget {
     }
     $Known[$fullPath] = $true
     $Queue.Enqueue($fullPath)
-}
-
-# Render an untrusted target path in a bounded, single-line diagnostic. The
-# import inspector only receives paths assembled by this script, but keeping
-# this formatter bounded prevents a malformed filesystem entry from flooding
-# CI logs or injecting a second diagnostic line.
-function Format-PeImportTargetForDiagnostic {
-    param(
-        [AllowNull()][string]$Target,
-        [int]$Limit = 192
-    )
-    if ($null -eq $Target) { return "<null>" }
-
-    $safe = [System.Text.RegularExpressions.Regex]::Replace(
-        $Target,
-        '[\p{Cc}\p{Zl}\p{Zp}"]',
-        '?'
-    )
-    if ($safe.Length -gt $Limit) {
-        $safe = $safe.Substring(0, $Limit) + "...[truncated]"
-    }
-    return "'$safe'"
-}
-
-# Validate and quote one strongly typed target batch. The exact-host failure
-# persisted after named parameter binding, so the collection shape cannot stay
-# implicit at this boundary. A List[string] crosses it as one object, while
-# each normalized member is still passed to llvm-readobj as a separately
-# quoted argument.
-function ConvertTo-BoundedPeImportArgumentBatch {
-    param(
-        [AllowNull()][System.Collections.Generic.List[string]]$TargetBatch,
-        [int]$ArgumentCharacterLimit
-    )
-    if ($null -eq $TargetBatch) {
-        throw "PE import-inspection target batch was null"
-    }
-
-    $quotedTargets = [System.Collections.Generic.List[string]]::new()
-    $targetNames = [System.Collections.Generic.List[string]]::new()
-    for ($targetIndex = 0; $targetIndex -lt $TargetBatch.Count; $targetIndex++) {
-        $target = $TargetBatch[$targetIndex]
-        $targetNumber = $targetIndex + 1
-        $targetLabel = Format-PeImportTargetForDiagnostic $target
-
-        if ([string]::IsNullOrWhiteSpace($target)) {
-            throw "PE import-inspection target #$targetNumber was empty ($targetLabel)"
-        }
-        if ([System.Text.RegularExpressions.Regex]::IsMatch(
-                $target,
-                '[\p{Cc}\p{Zl}\p{Zp}"]'
-            )) {
-            throw "PE import-inspection target #$targetNumber contains an unsupported quote or control character ($targetLabel)"
-        }
-        if (-not [System.IO.Path]::IsPathRooted($target)) {
-            throw "PE import-inspection target #$targetNumber is not absolute ($targetLabel)"
-        }
-
-        try {
-            $normalizedTarget = [System.IO.Path]::GetFullPath($target)
-        }
-        catch {
-            throw "PE import-inspection target #$targetNumber is not a valid filesystem path ($targetLabel)"
-        }
-        $extension = [System.IO.Path]::GetExtension($normalizedTarget)
-        if ($extension -ine ".dll" -and $extension -ine ".exe") {
-            throw "PE import-inspection target #$targetNumber is not a DLL or EXE ($targetLabel)"
-        }
-        if (-not [System.IO.File]::Exists($normalizedTarget)) {
-            throw "PE import-inspection target #$targetNumber is not an existing file ($targetLabel)"
-        }
-
-        $quotedTargets.Add('"' + $normalizedTarget + '"')
-        if ($targetNames.Count -lt 3) {
-            $targetNames.Add([System.IO.Path]::GetFileName($normalizedTarget))
-        }
-    }
-
-    $arguments = "--coff-imports " + ($quotedTargets -join " ")
-    if ($arguments.Length -gt $ArgumentCharacterLimit) {
-        throw "PE import-inspection batch exceeded its $ArgumentCharacterLimit-character command-line limit"
-    }
-
-    $batchLabel = $targetNames -join ", "
-    if ($TargetBatch.Count -gt $targetNames.Count) { $batchLabel += ", ..." }
-    return [PSCustomObject]@{
-        Arguments = $arguments
-        Label = $batchLabel
-    }
-}
-
-# Inspect a bounded batch without ever loading or executing a target DLL.
-# Start-Process redirects both streams straight to files, avoiding deadlocks
-# from synchronous whole-stream pipe reads. File sizes
-# are polled while the process runs and checked again after exit; only then is
-# the capped stdout read into memory for parsing.
-function Invoke-BoundedPeImportBatch {
-    param(
-        [string]$Inspector,
-        [AllowNull()][System.Collections.Generic.List[string]]$TargetBatch,
-        [System.Diagnostics.Stopwatch]$ClosureClock,
-        [int]$ClosureDeadlineMs,
-        [int]$ProcessDeadlineMs,
-        [int64]$OutputByteLimit,
-        [int]$ArgumentCharacterLimit
-    )
-    if ($null -eq $TargetBatch) {
-        throw "PE import-inspection target batch was null"
-    }
-    if ($TargetBatch.Count -eq 0) { return @() }
-
-    $argumentBatch = ConvertTo-BoundedPeImportArgumentBatch `
-        -TargetBatch $TargetBatch `
-        -ArgumentCharacterLimit $ArgumentCharacterLimit
-    $arguments = $argumentBatch.Arguments
-    $batchLabel = $argumentBatch.Label
-
-    $token = [Guid]::NewGuid().ToString("N")
-    $tempRoot = [System.IO.Path]::GetTempPath()
-    $stdoutPath = Join-Path $tempRoot "tributary-readobj-$token.stdout"
-    $stderrPath = Join-Path $tempRoot "tributary-readobj-$token.stderr"
-    $process = $null
-    $processClock = [System.Diagnostics.Stopwatch]::StartNew()
-    $failure = $null
-    $diagnostic = ""
-    $stdoutLines = @()
-
-    try {
-        $process = Start-Process -FilePath $Inspector -ArgumentList $arguments `
-            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
-            -NoNewWindow -PassThru
-
-        while (-not $process.WaitForExit(50)) {
-            $stdoutLength = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
-                (Get-Item -LiteralPath $stdoutPath).Length
-            } else { 0 }
-            $stderrLength = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
-                (Get-Item -LiteralPath $stderrPath).Length
-            } else { 0 }
-            if (($stdoutLength + $stderrLength) -gt $OutputByteLimit) {
-                throw "PE import inspector output crossed its $OutputByteLimit-byte batch limit ($batchLabel)"
-            }
-            if ($processClock.ElapsedMilliseconds -ge $ProcessDeadlineMs) {
-                throw "PE import inspector exceeded its $ProcessDeadlineMs-millisecond batch deadline ($batchLabel)"
-            }
-            if ($ClosureClock.ElapsedMilliseconds -ge $ClosureDeadlineMs) {
-                throw "PE import dependency closure exceeded its $ClosureDeadlineMs-millisecond deadline"
-            }
-        }
-
-        $stdoutLength = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
-            (Get-Item -LiteralPath $stdoutPath).Length
-        } else { 0 }
-        $stderrLength = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
-            (Get-Item -LiteralPath $stderrPath).Length
-        } else { 0 }
-        if (($stdoutLength + $stderrLength) -gt $OutputByteLimit) {
-            throw "PE import inspector output crossed its $OutputByteLimit-byte batch limit ($batchLabel)"
-        }
-        if ($processClock.ElapsedMilliseconds -ge $ProcessDeadlineMs) {
-            throw "PE import inspector exceeded its $ProcessDeadlineMs-millisecond batch deadline ($batchLabel)"
-        }
-        if ($ClosureClock.ElapsedMilliseconds -ge $ClosureDeadlineMs) {
-            throw "PE import dependency closure exceeded its $ClosureDeadlineMs-millisecond deadline"
-        }
-        if ($process.ExitCode -ne 0) {
-            throw "PE import inspector exited with status $($process.ExitCode) ($batchLabel)"
-        }
-        $stdoutLines = @([System.IO.File]::ReadAllLines($stdoutPath))
-    }
-    catch {
-        $failure = $_.Exception.Message
-    }
-    finally {
-        try {
-            Stop-BoundedProcessTree $process "PE import inspector"
-        }
-        catch {
-            if ($failure) { $failure += "; $($_.Exception.Message)" }
-            else { $failure = $_.Exception.Message }
-        }
-        if ($failure) {
-            $diagnostic = Get-BoundedProbeDiagnostic $stderrPath "PE inspector stderr" 8192
-            if (-not $diagnostic) {
-                $diagnostic = Get-BoundedProbeDiagnostic $stdoutPath "PE inspector stdout" 8192
-            }
-        }
-        if ($null -ne $process) { $process.Dispose() }
-        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
-    }
-
-    if ($failure) {
-        if ($diagnostic) { throw "$failure`n$diagnostic" }
-        throw $failure
-    }
-    return $stdoutLines
 }
 
 function Add-PeImportDependencies {
@@ -787,8 +1235,19 @@ function Add-PeImportDependencies {
             throw "PE import dependency closure exceeded its $OutputLineLimit-line safety limit"
         }
 
+        if ([string]$line -notmatch '^\s*Name\s*:') { continue }
         $dllName = Get-PeImportDependencyName ([string]$line)
-        if (-not $dllName) { continue }
+        if (-not $dllName) {
+            throw "PE import inspector returned an unsupported dependency spelling for $SourceLabel"
+        }
+
+        # Never satisfy an import with a prohibited copy-control/DRM runtime.
+        # Failing here, rather than silently omitting the DLL, preserves the
+        # bundle's strict dependency-closure contract and identifies the
+        # remaining importer that must be excluded.
+        if (Test-ForbiddenBundledComponentName $dllName) {
+            throw "Forbidden bundled dependency $dllName reported for $SourceLabel"
+        }
 
         # Copy only exact imports that exist in the selected architecture's
         # bin directory. Imports provided by Windows itself are intentionally
@@ -823,10 +1282,23 @@ New-Item -ItemType Directory -Force $DIST | Out-Null
 # ProviderPath returns the physical path even when $PWD uses a custom
 # FileSystem PSDrive; repository paths containing spaces remain intact.
 $DIST = (Resolve-Path -LiteralPath $DIST).ProviderPath
+Assert-WindowsBundleRootIsNotReparsePoint $DIST
 New-Item -ItemType Directory -Force "$DIST\lib" | Out-Null
 
+# Remove policy members left by an older incremental bundle before copying or
+# inspecting anything. The same policy is asserted again after all copy paths,
+# so this cleanup cannot hide a newly introduced forbidden dependency.
+$staleForbiddenMemberCount = Remove-ForbiddenWindowsBundleMembers $DIST
+if ($staleForbiddenMemberCount -gt 0) {
+    Write-Info "Removed $staleForbiddenMemberCount forbidden component(s) from the incremental Windows bundle."
+}
+# Reject allowed-named reparse points before any incremental copy can write
+# through a junction into an external destination.
+Assert-WindowsBundleComponentPolicy $DIST
+
 # Always copy the executable (just built).
-Copy-Item $exePath $DIST -Force
+$exeBundleDest = Join-Path $DIST (Split-Path $exePath -Leaf)
+Copy-WindowsBundleFileForced $exePath $exeBundleDest
 
 # Copy dynamic plugin folders (incremental — only newer files).
 Write-Info "Syncing GTK plugins and GStreamer codecs (incremental)..."
@@ -834,13 +1306,15 @@ $totalCopied = 0
 
 $loadersSrc = Join-Path $MsysPath "lib\gdk-pixbuf-2.0"
 if (Test-Path $loadersSrc) {
-    $n = Sync-Directory $loadersSrc (Join-Path $DIST "lib\gdk-pixbuf-2.0")
+    $n = Sync-Directory $loadersSrc (Join-Path $DIST "lib\gdk-pixbuf-2.0") `
+        -SkipForbiddenComponents
     $totalCopied += $n
 }
 
 $gstPluginSrc = Join-Path $MsysPath "lib\gstreamer-1.0"
 if (Test-Path $gstPluginSrc) {
-    $n = Sync-Directory $gstPluginSrc (Join-Path $DIST "lib\gstreamer-1.0")
+    $n = Sync-Directory $gstPluginSrc (Join-Path $DIST "lib\gstreamer-1.0") `
+        -SkipForbiddenComponents
     $totalCopied += $n
 }
 
@@ -857,7 +1331,7 @@ if (-not (Test-Path -LiteralPath $gstScannerSrc -PathType Leaf)) {
     Write-Err "Required GStreamer plugin scanner not found at $gstScannerSrc"
 }
 Remove-Item -LiteralPath $legacyGstScannerDest -Force -ErrorAction SilentlyContinue
-Copy-Item -LiteralPath $gstScannerSrc -Destination $gstScannerDest -Force
+Copy-WindowsBundleFileForced $gstScannerSrc $gstScannerDest
 Write-Info "Bundled gst-plugin-scanner.exe (unconditional overwrite)."
 
 # Resolve all transitive dependencies for the EXE and plugins without loading
@@ -873,9 +1347,12 @@ if (-not [System.IO.Path]::IsPathRooted($peImportInspector) -or
 
 Write-Info "Resolving required DLLs for executable and plugins..."
 
-# Seed the dependency closure with Tributary, every copied plugin, and the
-# exact scanner. Every MSYS2 runtime DLL discovered below is copied to the
-# bundle root and enqueued in turn, so transitive dependencies reach closure.
+# Seed the dependency closure with every PE DLL, DRV, and executable already present
+# anywhere in the bundle, including hidden and stale incremental members. The
+# same hidden-inclusive enumerator used by the final policy scan avoids a
+# visible-lib-only gap. Every MSYS2 runtime DLL discovered below is copied to
+# the bundle root and enqueued in turn, so transitive dependencies reach
+# closure.
 $requiredSoupPluginDest = Join-Path $DIST "lib\gstreamer-1.0\$requiredSoupPluginName"
 if (-not (Test-Path -LiteralPath $requiredSoupPluginDest -PathType Leaf)) {
     Write-Err "Required souphttpsrc plugin was not copied into the Windows bundle."
@@ -891,9 +1368,13 @@ $peInspectorClosureDeadlineMs = 300000
 $dllScanQueue = [System.Collections.Queue]::new()
 $knownDllScanTargets = @{}
 $scannedDllTargets = @{}
-$initialDllScanTargets = @(Join-Path $DIST (Split-Path $exePath -Leaf))
-$initialDllScanTargets += Get-ChildItem -Path "$DIST\lib" -Recurse -Filter *.dll | Select-Object -ExpandProperty FullName
-$initialDllScanTargets += $gstScannerDest
+$initialDllScanTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $DIST | Where-Object {
+    $isDirectory = ($_.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+    $isReparsePoint = ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    $isPeCandidate = $_.Extension -ieq '.dll' -or $_.Extension -ieq '.drv' -or
+        $_.Extension -ieq '.exe'
+    -not $isDirectory -and -not $isReparsePoint -and $isPeCandidate
+} | Select-Object -ExpandProperty FullName)
 foreach ($bin in $initialDllScanTargets) {
     Add-DllScanTarget $dllScanQueue $knownDllScanTargets $bin $maxDllScanTargets
 }
@@ -1033,7 +1514,7 @@ foreach ($theme in @("hicolor", "Adwaita")) {
     $src = Join-Path $MsysPath "share\icons\$theme"
     $dest = Join-Path $DIST   "share\icons\$theme"
     if (Test-Path $src) {
-        $n = Sync-Directory $src $dest
+        $n = Sync-Directory $src $dest -SkipForbiddenComponents
         $totalCopied += $n
     }
 }
@@ -1042,7 +1523,8 @@ foreach ($theme in @("hicolor", "Adwaita")) {
 $appIconsSrc = "data\icons\hicolor"
 if (Test-Path $appIconsSrc) {
     $appIconsDest = Join-Path $DIST "share\icons\hicolor"
-    $n = Sync-Directory (Resolve-Path $appIconsSrc).Path $appIconsDest
+    $n = Sync-Directory (Resolve-Path $appIconsSrc).Path $appIconsDest `
+        -SkipForbiddenComponents
     $totalCopied += $n
     Write-Info "Bundled app icons: $n file(s) synced."
 
@@ -1074,6 +1556,10 @@ if (Test-Path $schemasSrc) {
 }
 
 Write-Info "Total incremental sync: $totalCopied file(s) updated."
+
+# Do not execute a bundle that violated the shared packaging policy. This also
+# catches stale or indirectly copied files outside the GStreamer plugin tree.
+Assert-WindowsBundleComponentPolicy $DIST
 
 # ── Packaged Runtime Probe ──────────────────────────────────────────────────
 # Run the bundled executable itself before archiving it. The child receives no
@@ -1249,10 +1735,20 @@ if ($probeFailure) { Write-Err "Packaged Windows runtime probe failed: $probeFai
 Write-Info "Packaged Windows runtime probe passed."
 
 # ── Zip Archive ──────────────────────────────────────────────────────────────
+# Recheck immediately before archiving so the emitted artifact, rather than
+# merely the earlier dependency-closure snapshot, is covered by the policy.
+Assert-WindowsBundleComponentPolicy $DIST
+try {
+    Assert-WindowsBundlePeImportPolicy $DIST $peImportInspector
+}
+catch {
+    Write-Err "Final Windows PE import validation failed: $($_.Exception.Message)"
+}
 Write-Info "Creating zip archive..."
 $zipPath = "dist\tributary-windows.zip"
 Remove-Item $zipPath -ErrorAction SilentlyContinue
 Compress-Archive -Path $DIST -DestinationPath $zipPath
+Assert-WindowsZipComponentPolicy $zipPath
 Write-Info "Archive created: $((Get-Item $zipPath).FullName)"
 
 # ── Inno Setup Installer (optional) ─────────────────────────────────────────
@@ -1285,6 +1781,7 @@ if ($InnoSetup) {
     $issFile = "build-aux\inno\tributary.iss"
     $sourceDir = (Resolve-Path $DIST).Path
     $outputDir = (Resolve-Path "dist").Path
+    Assert-WindowsBundleComponentPolicy $sourceDir
 
     Write-Info "Running Inno Setup compiler..."
     & $iscc /DAppVersion="$CargoVersion" /DSourceDir="$sourceDir" /DOutputDir="$outputDir" /DTargetArch="$InnoArch" $issFile

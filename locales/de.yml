@@ -299,7 +299,7 @@ errors:
     decoder_failed: "Audiodecoder ist fehlgeschlagen"
     audio_output_failed: "Audioausgabe ist fehlgeschlagen"
     playback_failed: "Audiowiedergabe ist fehlgeschlagen"
-    airplay_raopsink_missing: "AirPlay benötigt das GStreamer-Element raopsink – bitte das Paket gst-plugins-bad installieren und Tributary neu starten"
+    airplay_raopsink_missing: "AirPlay-1-Wiedergabe ist nicht verfügbar: Dieser Build enthält keinen kompatiblen GStreamer-raopsink-Sender"
     mpd_exclusive_control_required: "Fügen Sie diese MPD-Ausgabe erneut hinzu, bestätigen Sie die exklusive Partitionskontrolle und wählen Sie sie dann vor der Wiedergabe erneut aus"
 
 # ── About dialog ───────────────────────────────────────────────────

@@ -1513,11 +1513,15 @@ mod tests {
             "$gstScannerDest = Join-Path $DIST \"libexec\\gstreamer-1.0\\gst-plugin-scanner.exe\""
         ));
         let scanner_copy = script
-            .find("Copy-Item -LiteralPath $gstScannerSrc -Destination $gstScannerDest -Force")
+            .find("Copy-WindowsBundleFileForced $gstScannerSrc $gstScannerDest")
             .expect("unconditional scanner copy");
         let scanner_scan = script
-            .find("$initialDllScanTargets += $gstScannerDest")
-            .expect("scanner dependency scan");
+            .find("$initialDllScanTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $DIST")
+            .expect("whole-bundle dependency scan");
+        let executable_filter = script[scanner_scan..]
+            .find("$_.Extension -ieq '.dll' -or $_.Extension -ieq '.drv'")
+            .map(|offset| scanner_scan + offset)
+            .expect("scanner executable inclusion in the normal dependency closure");
         let runtime_probe = script
             .find("Write-Info \"Running packaged Windows runtime probe...\"")
             .expect("packaged runtime probe");
@@ -1525,7 +1529,8 @@ mod tests {
             .find("Write-Info \"Creating zip archive...\"")
             .expect("zip creation");
         assert!(scanner_copy < scanner_scan);
-        assert!(scanner_scan < runtime_probe);
+        assert!(scanner_scan < executable_filter);
+        assert!(executable_filter < runtime_probe);
         assert!(runtime_probe < archive);
         assert!(!script.contains("Copy-IfNewer $gstScannerSrc"));
         assert!(script.contains(
@@ -1543,8 +1548,9 @@ mod tests {
             "$PkgPrefix-libsoup3 packages",
             "function Get-PeImportDependencyName",
             "Name: libfoo.dll",
-            "--coff-imports includes ordinary and delay-load imports",
-            "if ($Line -notmatch '^\\s*Name:\\s*([^\\\\/:*?\"<>|\\x00-\\x1F]+\\.dll)\\s*$')",
+            "WINSPOOL.DRV imported by current GTK packages",
+            "ordinary and delay-load imports. Reject every other suffix",
+            "if ($Line -notmatch '^\\s*Name:\\s*([^\\\\/:*?\"<>|\\x00-\\x1F]+\\.(?:dll|drv))\\s*$')",
             "$peImportInspector = [System.IO.Path]::GetFullPath((Join-Path $MsysPath \"bin\\llvm-readobj.exe\"))",
             "[System.IO.Path]::IsPathRooted($peImportInspector)",
             "Required PE import inspector not found",
@@ -1555,7 +1561,7 @@ mod tests {
             "[System.Collections.Generic.List[string]]$TargetBatch",
             "function Invoke-BoundedPeImportBatch",
             "PE import-inspection target #$targetNumber is not absolute",
-            "PE import-inspection target #$targetNumber is not a DLL or EXE",
+            "PE import-inspection target #$targetNumber is not a DLL, DRV, or EXE",
             "PE import-inspection target #$targetNumber is not an existing file",
             "[System.IO.File]::Exists($normalizedTarget)",
             "Start-Process -FilePath $Inspector -ArgumentList $arguments",
@@ -1715,11 +1721,11 @@ mod tests {
         let invocations = production_invocations(script);
         assert_eq!(
             invocations.len(),
-            2,
+            3,
             "every production PE-import batch call must be covered"
         );
 
-        let expected_shared_bindings = [
+        let expected_closure_bindings = [
             ("-Inspector", "$peImportInspector"),
             ("-ClosureClock", "$peInspectorClosureClock"),
             ("-ClosureDeadlineMs", "$peInspectorClosureDeadlineMs"),
@@ -1730,7 +1736,16 @@ mod tests {
                 "$maxPeInspectorArgumentCharacters",
             ),
         ];
-        let mut target_bindings = std::collections::BTreeSet::new();
+        let expected_final_bindings = [
+            ("-Inspector", "$inspectorFull"),
+            ("-ClosureClock", "$validationClock"),
+            ("-ClosureDeadlineMs", "$validationDeadlineMs"),
+            ("-ProcessDeadlineMs", "$batchDeadlineMs"),
+            ("-OutputByteLimit", "$maxBatchOutputBytes"),
+            ("-ArgumentCharacterLimit", "$maxArgumentCharacters"),
+        ];
+        let mut closure_target_bindings = std::collections::BTreeSet::new();
+        let mut final_invocations = 0usize;
         for (invocation_index, invocation) in invocations.iter().enumerate() {
             let tokens: Vec<_> = invocation.split_whitespace().collect();
             assert_eq!(tokens.first(), Some(&"Invoke-BoundedPeImportBatch"));
@@ -1752,6 +1767,13 @@ mod tests {
                     pair[0]
                 );
             }
+            let expected_shared_bindings = match bindings.get("-Inspector").copied() {
+                Some("$peImportInspector") => &expected_closure_bindings,
+                Some("$inspectorFull") => &expected_final_bindings,
+                inspector => panic!(
+                    "invocation {invocation_index} uses an unknown inspector binding: {inspector:?}"
+                ),
+            };
             assert_eq!(
                 bindings.len(),
                 expected_shared_bindings.len() + 1,
@@ -1760,20 +1782,28 @@ mod tests {
             for (parameter, value) in expected_shared_bindings {
                 assert_eq!(
                     bindings.get(parameter),
-                    Some(&value),
+                    Some(value),
                     "invocation {invocation_index} must bind {parameter} explicitly"
                 );
             }
-            target_bindings.insert(
-                *bindings.get("-TargetBatch").unwrap_or_else(|| {
-                    panic!("invocation {invocation_index} must bind -TargetBatch")
-                }),
-            );
+            let target_binding = *bindings
+                .get("-TargetBatch")
+                .unwrap_or_else(|| panic!("invocation {invocation_index} must bind -TargetBatch"));
+            if bindings.get("-Inspector") == Some(&"$inspectorFull") {
+                assert_eq!(target_binding, "$batchTargets");
+                final_invocations += 1;
+            } else {
+                closure_target_bindings.insert(target_binding);
+            }
         }
         assert_eq!(
-            target_bindings,
+            closure_target_bindings,
             std::collections::BTreeSet::from(["$batchTargets", "$soupInspectorTargets"]),
             "the singleton Soup proof and closure batches must each bind their own exact typed list"
+        );
+        assert_eq!(
+            final_invocations, 1,
+            "the completed-tree verifier must contribute one bounded batch call site"
         );
         assert!(!script.contains("[string[]]$Paths"));
         assert!(!script.contains("-Paths @($requiredSoupPluginFull)"));
@@ -1783,20 +1813,22 @@ mod tests {
     fn powershell_pe_import_target_batch_preserves_lists_and_bounds_diagnostics() {
         let script = include_str!("../scripts/build-windows.ps1");
         let helpers_start = script
-            .find("function Format-PeImportTargetForDiagnostic")
-            .expect("bounded PE target formatter");
+            .find("function Get-PeImportDependencyName")
+            .expect("bounded PE import-name parser");
         let helpers_end = script[helpers_start..]
-            .find("function Add-PeImportDependencies")
+            .find("function Assert-WindowsBundlePeImportPolicy")
             .expect("PE target helper boundary")
             + helpers_start;
         let helpers = &script[helpers_start..helpers_end];
 
         let temp = tempfile::tempdir().unwrap();
         let valid_dll = temp.path().join("valid target with spaces.dll");
+        let valid_drv = temp.path().join("valid-system-style.DRV");
         let valid_exe = temp.path().join("valid-target.exe");
         let wrong_extension = temp.path().join("wrong-extension.txt");
         let missing_dll = temp.path().join("missing-target.dll");
         fs::write(&valid_dll, b"not executed").unwrap();
+        fs::write(&valid_drv, b"not executed").unwrap();
         fs::write(&valid_exe, b"not executed").unwrap();
         fs::write(&wrong_extension, b"not executed").unwrap();
 
@@ -1861,12 +1893,29 @@ function Assert-InvokeTargetFailure {
     }
 }
 
+if ((Get-PeImportDependencyName "  Name: libfoo.dll") -cne "libfoo.dll") {
+    throw "ordinary DLL import spelling was not preserved"
+}
+if ((Get-PeImportDependencyName "  Name: WINSPOOL.DRV") -cne "WINSPOOL.DRV") {
+    throw "legacy Windows DRV import spelling was not preserved"
+}
+foreach ($invalidImport in @(
+    "  Name: ../libdvdcss.dll",
+    "  Name: plugin.ocx",
+    "  Name: extensionless"
+)) {
+    if ($null -ne (Get-PeImportDependencyName $invalidImport)) {
+        throw "unsafe or unsupported import spelling was accepted: $invalidImport"
+    }
+}
+
 $validTargets = [System.Collections.Generic.List[string]]::new()
 $validTargets.Add($env:TRIBUTARY_VALID_DLL)
+$validTargets.Add($env:TRIBUTARY_VALID_DRV)
 $validTargets.Add($env:TRIBUTARY_VALID_EXE)
 $batch = ConvertTo-BoundedPeImportArgumentBatch `
     -TargetBatch $validTargets -ArgumentCharacterLimit 4096
-if ($batch.Label -ne "valid target with spaces.dll, valid-target.exe") {
+if ($batch.Label -ne "valid target with spaces.dll, valid-system-style.DRV, valid-target.exe") {
     throw "typed target list changed shape: $($batch.Label)"
 }
 foreach ($target in $validTargets) {
@@ -1886,7 +1935,7 @@ Assert-InvokeTargetFailure $relativeTarget "target #1 is not absolute"
 
 $wrongExtension = [System.Collections.Generic.List[string]]::new()
 $wrongExtension.Add($env:TRIBUTARY_WRONG_EXTENSION)
-Assert-TargetFailure $wrongExtension "target #1 is not a DLL or EXE"
+Assert-TargetFailure $wrongExtension "target #1 is not a DLL, DRV, or EXE"
 
 $missingTarget = [System.Collections.Generic.List[string]]::new()
 $missingTarget.Add($env:TRIBUTARY_MISSING_DLL)
@@ -1903,6 +1952,7 @@ Assert-TargetFailure $newlineTarget "target #1 contains an unsupported quote or 
             std::process::Command::new(program)
                 .args(["-NoProfile", "-NonInteractive", "-Command", &command])
                 .env("TRIBUTARY_VALID_DLL", &valid_dll)
+                .env("TRIBUTARY_VALID_DRV", &valid_drv)
                 .env("TRIBUTARY_VALID_EXE", &valid_exe)
                 .env("TRIBUTARY_WRONG_EXTENSION", &wrong_extension)
                 .env("TRIBUTARY_MISSING_DLL", &missing_dll)
@@ -1956,20 +2006,18 @@ Assert-TargetFailure $newlineTarget "target #1 contains an unsupported quote or 
         assert!(create < resolve);
         assert!(resolve < soup_inspection);
         assert!(!script[resolve..soup_inspection].contains("$DIST = \"dist\\tributary-windows\""));
+        let resolved_closure = &script[resolve..soup_inspection];
         for fragment in [
             "$gstScannerDest = Join-Path $DIST \"gst-plugin-scanner.exe\"",
             "$requiredSoupPluginDest = Join-Path $DIST",
-            "$initialDllScanTargets = @(Join-Path $DIST",
-            "$initialDllScanTargets += Get-ChildItem -Path \"$DIST\\lib\"",
+            "$initialDllScanTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $DIST",
+            "$_.Extension -ieq '.dll' -or $_.Extension -ieq '.drv'",
             "$requiredSoupRuntimeDest = Join-Path $DIST",
         ] {
-            let target = script
+            let target = resolved_closure
                 .find(fragment)
-                .unwrap_or_else(|| panic!("missing distribution-rooted PE target: {fragment}"));
-            assert!(
-                resolve < target,
-                "PE target was constructed before distribution resolution: {fragment}"
-            );
+                .unwrap_or_else(|| panic!("missing post-resolution PE target: {fragment}"));
+            assert!(target < resolved_closure.len());
         }
     }
 

@@ -299,7 +299,7 @@ errors:
     decoder_failed: "De audiodecoder is mislukt"
     audio_output_failed: "De audio-uitvoer is mislukt"
     playback_failed: "Het afspelen van audio is mislukt"
-    airplay_raopsink_missing: "AirPlay vereist het GStreamer-element raopsink – installeer het pakket gst-plugins-bad en start Tributary opnieuw"
+    airplay_raopsink_missing: "AirPlay 1-weergave is niet beschikbaar: deze build bevat geen compatibele GStreamer-raopsink-zender"
     mpd_exclusive_control_required: "Voeg deze MPD-uitvoer opnieuw toe, bevestig exclusieve partitiecontrole en selecteer deze opnieuw vóór het afspelen"
 
 # ── About dialog ───────────────────────────────────────────────────

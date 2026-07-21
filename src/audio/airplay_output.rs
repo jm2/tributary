@@ -16,8 +16,8 @@
 //! spawned `shairport-sync`, which is an AirPlay *receiver* — it
 //! ignored the device the user selected and could never reach it
 //! (review finding M3, tracker item P2.9).  A missing `raopsink` now
-//! fails the load with a localized error naming the package to
-//! install instead of silently spawning a subprocess that cannot work.
+//! fails the load with a localized, honest unsupported message instead
+//! of silently spawning a subprocess that cannot work.
 //!
 //! A bus watch on the dedicated pipeline forwards EOS / errors / state
 //! changes into the same `PlayerEvent` channel the rest of the app
@@ -34,11 +34,10 @@
 //!   this output does not implement.  Such devices are filtered out
 //!   of the output selector by [`crate::ui::discovery_handler`] until
 //!   a sender-side AirPlay 2 implementation lands.
-//! - **Requires a working `raopsink` element.**  It ships in the
-//!   GStreamer "bad" plugins set (`gst-plugins-bad`); the exact
-//!   package name varies by distro.  The code probes the GStreamer
-//!   registry at runtime and surfaces an actionable error when the
-//!   element is absent.
+//! - **Requires a working external `raopsink` element.**  Current official
+//!   GStreamer, Homebrew, and MSYS2 packages do not ship that element. The
+//!   code retains the registry-gated integration seam but reports AirPlay 1
+//!   unavailable unless a compatible third-party element is already present.
 //! - **Seeking is not supported** for live RAOP streams.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -164,7 +163,7 @@ impl AirPlayOutput {
         // Refuse a missing transmitter before any per-track proxy work:
         // otherwise a protected load would start a loopback route and mint
         // a ticket only to revoke it, and a preparation failure would mask
-        // the actionable install guidance with its generic message.
+        // the explicit unavailable-sender guidance with its generic message.
         Self::ensure_raopsink(Self::raopsink_available())?;
 
         // Prepare exactly once so the pipeline receives the credential-safe
@@ -275,8 +274,8 @@ impl AirPlayOutput {
     /// There is deliberately no fallback here: the one this module used to
     /// have piped PCM into `shairport-sync`, an AirPlay *receiver*, which
     /// ignored the device the user selected and could never reach it. A
-    /// missing `raopsink` is a hard error that tells the user what to
-    /// install instead.
+    /// missing `raopsink` is a hard error that accurately reports the
+    /// unsupported sender rather than recommending an unrelated package.
     fn ensure_raopsink(available: bool) -> Result<(), String> {
         if available {
             Ok(())
@@ -285,9 +284,8 @@ impl AirPlayOutput {
         }
     }
 
-    /// Localized "install gst-plugins-bad" guidance. `raopsink` and
-    /// `gst-plugins-bad` are technical identifiers and stay untranslated
-    /// inside every catalog entry.
+    /// Localized unsupported-sender guidance. `raopsink` is a technical
+    /// identifier and stays untranslated inside every catalog entry.
     fn raopsink_missing_message(locale: &str) -> String {
         rust_i18n::t!("errors.playback.airplay_raopsink_missing", locale = locale).into_owned()
     }
@@ -716,20 +714,20 @@ mod tests {
         ));
     }
 
-    /// P2.9's core guarantee: a missing `raopsink` is refused with guidance
-    /// naming both the element and the package that provides it — never
-    /// routed to a fallback that cannot transmit.
+    /// P2.9's core guarantee: a missing `raopsink` is refused explicitly and
+    /// never routed to a fallback that cannot transmit. No currently
+    /// supported package is misrepresented as providing the element.
     #[test]
-    fn a_missing_raopsink_is_refused_with_install_guidance() {
+    fn a_missing_raopsink_is_refused_with_honest_guidance() {
         assert!(AirPlayOutput::ensure_raopsink(true).is_ok());
 
         let error = AirPlayOutput::ensure_raopsink(false).unwrap_err();
         assert!(error.contains("raopsink"), "{error}");
-        assert!(error.contains("gst-plugins-bad"), "{error}");
+        assert!(!error.contains("gst-plugins-bad"), "{error}");
     }
 
     /// The guidance must be real in every catalog — present, mentioning the
-    /// exact technical identifiers, and not silently falling back to English.
+    /// exact technical identifier, and not silently falling back to English.
     #[test]
     fn raopsink_guidance_is_localized_for_every_catalog() {
         let english = AirPlayOutput::raopsink_missing_message("en");
@@ -739,7 +737,7 @@ mod tests {
             let localized = AirPlayOutput::raopsink_missing_message(&locale);
             assert!(localized.contains("raopsink"), "{locale}: {localized}");
             assert!(
-                localized.contains("gst-plugins-bad"),
+                !localized.contains("gst-plugins-bad"),
                 "{locale}: {localized}"
             );
             if locale != "en" {
@@ -749,7 +747,7 @@ mod tests {
     }
 
     /// A load without a transmitter must fail *loudly* — an `Error` event
-    /// carrying the actionable message followed by `Stopped` — never a
+    /// carrying the honest unavailable message followed by `Stopped` — never a
     /// silent no-op stream.
     #[test]
     fn a_missing_raopsink_load_fails_loudly_not_silently() {
@@ -767,9 +765,9 @@ mod tests {
             }) => {
                 assert_eq!(event_generation, generation);
                 assert!(message.contains("raopsink"), "{message}");
-                assert!(message.contains("gst-plugins-bad"), "{message}");
+                assert!(!message.contains("gst-plugins-bad"), "{message}");
             }
-            event => panic!("expected actionable error, got {event:?}"),
+            event => panic!("expected explicit sender error, got {event:?}"),
         }
         assert!(matches!(
             rx.try_recv(),
@@ -793,7 +791,7 @@ mod tests {
         output.set_event_generation(generation);
 
         // The transmitter gate runs before any per-track proxy work, so on
-        // a machine without `raopsink` the actionable install guidance wins.
+        // a machine without `raopsink` the honest unavailable guidance wins.
         // With `raopsink` registered, preparation is reached next and must
         // fail — a protected URI requires the app runtime to mint its
         // loopback ticket, and none is configured. Either way the failure

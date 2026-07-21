@@ -32,7 +32,9 @@ settings remain the next slices.
 - Local, Subsonic, Jellyfin, Plex, and DAAP publish complete catalogues through the shared
   `MediaBackend` seam. Connected remotes, Radio-Browser, removable media, and operating-system-opened
   files use the common `SourceRegistry` lifecycle and playback-time authority model.
-- AirPlay 1/RAOP, Chromecast, MPD, and local playback are implemented. AirPlay 2/HomeKit is not.
+- Chromecast, MPD, and local playback are implemented. AirPlay discovery and a fail-closed
+  `raopsink` integration seam exist, but current supported GStreamer/Homebrew/MSYS2 packages do not
+  supply that sender; AirPlay 1 and AirPlay 2 therefore still need a maintained implementation.
 - Regular-playlist storage now has a source-scoped foundation: migration 13 gives every valid
   existing entry the built-in local `SourceId`, makes `(source_id, track_id)` canonical, and
   retains a separate nullable local-track foreign-key cache for deletion and reconciliation.
@@ -87,7 +89,8 @@ settings remain the next slices.
   defines occurrence, threshold, duration, seek/retry/restart, clock, and legacy semantics.
   `PlaybackSession` rejects stale/rejected generations and re-anchors discontinuities; the library
   engine atomically updates one stable local track ID, and committed changes refresh the Plays row
-  and invalidate playlist projections. AirPlay 1 supplies generation-scoped 500 ms progress.
+  and invalidate playlist projections. The gated AirPlay 1 seam supplies generation-scoped 500 ms
+  progress only when an external compatible sender element is present.
   Recently Played evaluates one inclusive 14-day clock window over representable, non-future
   timestamps, newest first with stable ID ties. Top 25 selects and presents positive counts by
   count descending, last-played descending with unknown timestamps last, then stable ID, capped at
@@ -152,8 +155,9 @@ before starting large protocol or transfer subsystems.
    history, root-trust, media-key, seek, and open-file callbacks inert before the drain. The engine
    atomically updates one stable local ID with a saturating count and monotonic timestamp, then
    refreshes the Plays row and invalidates active/cached playlist
-   projections only after commit. AirPlay 1 now publishes generation-scoped position evidence on a
-   500 ms timer. Recently Played uses one clock snapshot, an inclusive preceding 14-day window over
+   projections only after commit. The gated AirPlay 1 seam publishes generation-scoped position
+   evidence on a 500 ms timer only when an external compatible sender is present. Recently Played
+   uses one clock snapshot, an inclusive preceding 14-day window over
    valid non-future timestamps, newest-first presentation, and a stable-ID tie-breaker. Top 25
    admits only positive counts—including legacy counts without timestamps—and selects/presents at
    most 25 by count descending, last-played descending with unknown timestamps last, then stable
@@ -372,11 +376,14 @@ not mistaken for work already underway.
 | [#11 — Offline cache/download](https://github.com/jm2/tributary/issues/11) | No remote download or offline catalogue subsystem. | Large persistent cache/download epic with quota, retry, reconciliation, and secure auth handling. |
 | [#8 — Android synchronization](https://github.com/jm2/tributary/issues/8) | Mounted-device browse/play exists; transfer, sync, automount, and MTP do not. | Large transfer/sync epic with MTP, write authority, planning, progress, conflicts, and rollback. |
 
-## AirPlay 2
+## AirPlay senders
 
 AirPlay 2 receivers advertise via `_airplay._tcp.local.` and discovery labels them as `airplay2`,
-but the UI deliberately filters them out because Tributary currently has only an AirPlay 1/RAOP
-sender through GStreamer's `raopsink`.
+but the UI deliberately filters them out because Tributary has no maintained AirPlay 2 sender.
+Legacy RAOP receivers are visible, but their output path is a runtime-gated seam for an element
+named `raopsink`; current official GStreamer, Homebrew, and MSYS2 packages do not ship it. The
+previous package-install guidance was therefore incorrect and has been replaced by an honest
+unavailable message.
 
 No sender dependency or protocol implementation has been selected. The implementation must first
 confirm current reverse-engineering and interoperability details for:
@@ -392,6 +399,14 @@ distribution model, platform packaging, license, maintenance health, and real-de
 must be part of that decision. This work should start with a design issue; it is not currently an
 active implementation.
 
+Any selected media or sender dependency must also preserve Tributary's
+[release component policy](release-component-policy.md): application artifacts omit dedicated
+copy-control circumvention components, unused optical-disc playback plugins, and proprietary
+content-decryption modules. Ordinary authenticated protocol encryption, media decoding, and the
+non-decrypting `libbluray` access/navigation library required transitively by supported FFmpeg
+builds are not treated as circumvention by filename, but each new dependency still needs its own
+license, distribution, key-material provenance, and interoperability review.
+
 ## Other explicit follow-ups and accepted limits
 
 ### Engineering follow-ups
@@ -403,6 +418,12 @@ active implementation.
   supported runtime floor and has been validated on affected multi-channel hardware.
 - A direct end-to-end watcher-backlog/root-confirmation ordering harness would strengthen existing
   component and engine-loop coverage, although the remediation acceptance record is already closed.
+- Evaluate replacing the broad Windows/macOS GStreamer plugin copy with a capability-derived audio
+  allowlist and narrowing native Linux's broad plugin-package relationships after a cross-platform
+  playback/output matrix can prove all supported containers, remote sources, local sinks, and
+  any selected AirPlay sender. The current shared deny policy already blocks the known
+  dedicated decrypt/CDM families and unused disc-playback plugins in Tributary-owned payloads and
+  fails closed at artifact boundaries.
 
 ### Deliberate current limitations, not scheduled commitments
 
