@@ -85,6 +85,7 @@ mod jellyfin;
 pub(crate) mod lastfm;
 #[allow(dead_code)]
 mod local;
+mod panic_reporting;
 mod platform_runtime;
 #[allow(dead_code)]
 mod plex;
@@ -149,6 +150,11 @@ fn initialize_i18n_backend() -> Result<(), String> {
 }
 
 fn main() {
+    // Rust invokes the global panic hook even for failures caught by a task
+    // supervisor. Install a content-free hook before any application work so
+    // panic payloads can never escape through the default formatter.
+    panic_reporting::install_privacy_preserving_panic_hook();
+
     // ── Windows: attach to parent console ────────────────────────────
     // The `windows_subsystem = "windows"` attribute prevents a console
     // window from popping up when double-clicking the exe.  However,

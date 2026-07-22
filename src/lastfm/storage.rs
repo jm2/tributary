@@ -29,11 +29,114 @@ pub const MAX_LASTFM_QUEUE_ROWS: u64 = 10_000;
 /// Last.fm's protocol batch ceiling.
 pub const MAX_LASTFM_BATCH_ROWS: usize = 50;
 
-/// Canonical payload admitted before network delivery.
+/// Account-independent, fully validated playback evidence awaiting runtime
+/// admission.
+///
+/// Playback producers can construct this value without receiving the
+/// vault-derived account binding. Only the Last.fm runtime may bind it to the
+/// exact current account before durable queue admission.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UnboundLastFmScrobble {
+    payload: ValidatedLastFmScrobble,
+}
+
+impl UnboundLastFmScrobble {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        occurrence_id: Uuid,
+        artist: String,
+        track_title: String,
+        album: Option<String>,
+        album_artist: Option<String>,
+        track_number: Option<i32>,
+        duration_secs: i32,
+        started_at_unix_secs: i64,
+    ) -> Result<Self, LastFmQueueError> {
+        ValidatedLastFmScrobble::try_new(
+            occurrence_id,
+            artist,
+            track_title,
+            album,
+            album_artist,
+            track_number,
+            duration_secs,
+            started_at_unix_secs,
+        )
+        .map(|payload| Self { payload })
+    }
+
+    #[must_use]
+    pub const fn occurrence_id(&self) -> Uuid {
+        self.payload.occurrence_id
+    }
+
+    #[must_use]
+    pub fn artist(&self) -> &str {
+        &self.payload.artist
+    }
+
+    #[must_use]
+    pub fn track_title(&self) -> &str {
+        &self.payload.track_title
+    }
+
+    #[must_use]
+    pub fn album(&self) -> Option<&str> {
+        self.payload.album.as_deref()
+    }
+
+    #[must_use]
+    pub fn album_artist(&self) -> Option<&str> {
+        self.payload.album_artist.as_deref()
+    }
+
+    #[must_use]
+    pub const fn track_number(&self) -> Option<i32> {
+        self.payload.track_number
+    }
+
+    #[must_use]
+    pub const fn duration_secs(&self) -> i32 {
+        self.payload.duration_secs
+    }
+
+    #[must_use]
+    pub const fn started_at_unix_secs(&self) -> i64 {
+        self.payload.started_at_unix_secs
+    }
+
+    /// Attach the exact current vault-derived account authority.
+    ///
+    /// Keeping this inside `crate::lastfm` prevents playback producers from
+    /// selecting or retaining account identity themselves.
+    pub(in crate::lastfm) fn bind(
+        self,
+        account_binding: LastFmAccountBinding,
+    ) -> PendingLastFmScrobble {
+        PendingLastFmScrobble {
+            account_binding,
+            payload: self.payload,
+        }
+    }
+}
+
+impl fmt::Debug for UnboundLastFmScrobble {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.payload
+            .fmt_redacted("UnboundLastFmScrobble", formatter)
+    }
+}
+
+/// Canonical account-bound payload admitted before network delivery.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PendingLastFmScrobble {
-    occurrence_id: Uuid,
     account_binding: LastFmAccountBinding,
+    payload: ValidatedLastFmScrobble,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ValidatedLastFmScrobble {
+    occurrence_id: Uuid,
     artist: String,
     track_title: String,
     album: Option<String>,
@@ -43,11 +146,10 @@ pub struct PendingLastFmScrobble {
     started_at_unix_secs: i64,
 }
 
-impl PendingLastFmScrobble {
+impl ValidatedLastFmScrobble {
     #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
+    fn try_new(
         occurrence_id: Uuid,
-        account_binding: LastFmAccountBinding,
         artist: String,
         track_title: String,
         album: Option<String>,
@@ -72,7 +174,6 @@ impl PendingLastFmScrobble {
 
         Ok(Self {
             occurrence_id,
-            account_binding,
             artist,
             track_title,
             album,
@@ -83,9 +184,48 @@ impl PendingLastFmScrobble {
         })
     }
 
+    fn fmt_redacted(&self, type_name: &str, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct(type_name)
+            .field("artist_byte_len", &self.artist.len())
+            .field("track_title_byte_len", &self.track_title.len())
+            .field("has_album", &self.album.is_some())
+            .field("has_album_artist", &self.album_artist.is_some())
+            .field("has_track_number", &self.track_number.is_some())
+            .field("duration_secs", &self.duration_secs)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingLastFmScrobble {
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::lastfm) fn try_new(
+        occurrence_id: Uuid,
+        account_binding: LastFmAccountBinding,
+        artist: String,
+        track_title: String,
+        album: Option<String>,
+        album_artist: Option<String>,
+        track_number: Option<i32>,
+        duration_secs: i32,
+        started_at_unix_secs: i64,
+    ) -> Result<Self, LastFmQueueError> {
+        UnboundLastFmScrobble::try_new(
+            occurrence_id,
+            artist,
+            track_title,
+            album,
+            album_artist,
+            track_number,
+            duration_secs,
+            started_at_unix_secs,
+        )
+        .map(|input| input.bind(account_binding))
+    }
+
     #[must_use]
     pub const fn occurrence_id(&self) -> Uuid {
-        self.occurrence_id
+        self.payload.occurrence_id
     }
 
     #[must_use]
@@ -95,51 +235,44 @@ impl PendingLastFmScrobble {
 
     #[must_use]
     pub fn artist(&self) -> &str {
-        &self.artist
+        &self.payload.artist
     }
 
     #[must_use]
     pub fn track_title(&self) -> &str {
-        &self.track_title
+        &self.payload.track_title
     }
 
     #[must_use]
     pub fn album(&self) -> Option<&str> {
-        self.album.as_deref()
+        self.payload.album.as_deref()
     }
 
     #[must_use]
     pub fn album_artist(&self) -> Option<&str> {
-        self.album_artist.as_deref()
+        self.payload.album_artist.as_deref()
     }
 
     #[must_use]
     pub const fn track_number(&self) -> Option<i32> {
-        self.track_number
+        self.payload.track_number
     }
 
     #[must_use]
     pub const fn duration_secs(&self) -> i32 {
-        self.duration_secs
+        self.payload.duration_secs
     }
 
     #[must_use]
     pub const fn started_at_unix_secs(&self) -> i64 {
-        self.started_at_unix_secs
+        self.payload.started_at_unix_secs
     }
 }
 
 impl fmt::Debug for PendingLastFmScrobble {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PendingLastFmScrobble")
-            .field("artist_byte_len", &self.artist.len())
-            .field("track_title_byte_len", &self.track_title.len())
-            .field("has_album", &self.album.is_some())
-            .field("has_album_artist", &self.album_artist.is_some())
-            .field("has_track_number", &self.track_number.is_some())
-            .field("duration_secs", &self.duration_secs)
-            .finish_non_exhaustive()
+        self.payload
+            .fmt_redacted("PendingLastFmScrobble", formatter)
     }
 }
 
@@ -189,6 +322,18 @@ impl LastFmBatchReceipt {
     pub fn len(&self) -> usize {
         self.rows.len()
     }
+
+    /// Largest durable retry count in this exact FIFO prefix.
+    ///
+    /// A batch may contain newly admitted rows behind rows that have already
+    /// failed, so the delivery worker must advance from the most conservative
+    /// retained attempt when it computes one shared not-before value.
+    #[must_use]
+    pub fn maximum_attempt_count(&self) -> i32 {
+        self.rows
+            .iter()
+            .fold(0, |maximum, row| maximum.max(row.attempt_count))
+    }
 }
 
 impl fmt::Debug for LastFmBatchReceipt {
@@ -198,6 +343,18 @@ impl fmt::Debug for LastFmBatchReceipt {
             .field("row_count", &self.rows.len())
             .finish_non_exhaustive()
     }
+}
+
+/// Availability of the oldest account-bound FIFO prefix.
+///
+/// A delayed oldest row is distinct from an empty queue so the delivery
+/// worker can wait for the exact durable not-before time without polling.
+/// Newer rows never bypass that delayed head.
+#[derive(Debug)]
+pub enum LastFmBatchAvailability {
+    Empty,
+    DelayedUntil { next_attempt_at_ms: i64 },
+    Ready(LastFmBatchReceipt),
 }
 
 /// Content-free queue failure category.
@@ -307,15 +464,15 @@ where
              AND (SELECT COUNT(*) FROM lastfm_scrobble_queue) < ?
              ON CONFLICT(occurrence_id) DO NOTHING",
             [
-                input.occurrence_id.as_bytes().to_vec().into(),
+                input.payload.occurrence_id.as_bytes().to_vec().into(),
                 input.account_binding.as_bytes().to_vec().into(),
-                input.artist.clone().into(),
-                input.track_title.clone().into(),
-                input.album.clone().into(),
-                input.album_artist.clone().into(),
-                input.track_number.into(),
-                input.duration_secs.into(),
-                input.started_at_unix_secs.into(),
+                input.payload.artist.clone().into(),
+                input.payload.track_title.clone().into(),
+                input.payload.album.clone().into(),
+                input.payload.album_artist.clone().into(),
+                input.payload.track_number.into(),
+                input.payload.duration_secs.into(),
+                input.payload.started_at_unix_secs.into(),
                 input.account_binding.as_bytes().to_vec().into(),
                 i64::try_from(cap)
                     .map_err(|_| LastFmQueueError::InvalidInput)?
@@ -342,7 +499,13 @@ where
     }
 
     if let Some(existing) = lastfm_scrobble::Entity::find()
-        .filter(lastfm_scrobble::Column::OccurrenceId.eq(input.occurrence_id.as_bytes().to_vec()))
+        .filter(
+            lastfm_scrobble::Column::OccurrenceId.eq(input
+                .payload
+                .occurrence_id
+                .as_bytes()
+                .to_vec()),
+        )
         .one(db)
         .await
         .map_err(|_| LastFmQueueError::Storage)?
@@ -370,13 +533,17 @@ where
     }
 }
 
-/// Read at most one Last.fm batch from the oldest due FIFO prefix.
-pub async fn due_batch(
+/// Inspect at most one Last.fm batch from the oldest FIFO prefix.
+///
+/// The result distinguishes an empty queue from a delayed head. When the head
+/// is due, only its contiguous due prefix is returned; a future row blocks
+/// every row behind it even when those later rows carry an earlier timestamp.
+pub async fn batch_availability(
     db: &DatabaseConnection,
     account_binding: LastFmAccountBinding,
     now_ms: i64,
     limit: usize,
-) -> Result<Option<LastFmBatchReceipt>, LastFmQueueError> {
+) -> Result<LastFmBatchAvailability, LastFmQueueError> {
     if !(0..=MAX_LASTFM_RETRY_AT_MS).contains(&now_ms)
         || !(1..=MAX_LASTFM_BATCH_ROWS).contains(&limit)
     {
@@ -387,14 +554,32 @@ pub async fn due_batch(
         return Err(LastFmQueueError::AccountMismatch);
     }
     let rows = load_prefix(db, account_binding, limit).await?;
+    let Some(head) = rows.first() else {
+        return Ok(LastFmBatchAvailability::Empty);
+    };
+    if head.next_attempt_at_ms > now_ms {
+        return Ok(LastFmBatchAvailability::DelayedUntil {
+            next_attempt_at_ms: head.next_attempt_at_ms,
+        });
+    }
+
     let due = rows
         .into_iter()
         .take_while(|row| row.next_attempt_at_ms <= now_ms)
         .collect::<Vec<_>>();
-    if due.is_empty() {
-        Ok(None)
-    } else {
-        LastFmBatchReceipt::try_new(account_binding, due).map(Some)
+    LastFmBatchReceipt::try_new(account_binding, due).map(LastFmBatchAvailability::Ready)
+}
+
+/// Compatibility wrapper for callers that do not need the delayed deadline.
+pub async fn due_batch(
+    db: &DatabaseConnection,
+    account_binding: LastFmAccountBinding,
+    now_ms: i64,
+    limit: usize,
+) -> Result<Option<LastFmBatchReceipt>, LastFmQueueError> {
+    match batch_availability(db, account_binding, now_ms, limit).await? {
+        LastFmBatchAvailability::Ready(receipt) => Ok(Some(receipt)),
+        LastFmBatchAvailability::Empty | LastFmBatchAvailability::DelayedUntil { .. } => Ok(None),
     }
 }
 
@@ -583,6 +768,63 @@ pub async fn queue_len(db: &DatabaseConnection) -> Result<u64, LastFmQueueError>
         .map_err(|_| LastFmQueueError::Storage)
 }
 
+/// Validate the complete retained queue for one expected account.
+///
+/// Startup uses this stronger boundary before opening admission. Unlike a
+/// delivery read, validation cannot stop at the 50-row protocol batch limit:
+/// every retained row must be canonical, belong to the expected account, and
+/// fit within the global queue bound before the exact count is returned.
+pub async fn validate_account_queue(
+    db: &DatabaseConnection,
+    account_binding: LastFmAccountBinding,
+) -> Result<u64, LastFmQueueError> {
+    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let result = async {
+        if queue_has_other_binding(&transaction, account_binding).await? {
+            return Err(LastFmQueueError::AccountMismatch);
+        }
+
+        let count = lastfm_scrobble::Entity::find()
+            .count(&transaction)
+            .await
+            .map_err(|_| LastFmQueueError::Storage)?;
+        if count > MAX_LASTFM_QUEUE_ROWS {
+            return Err(LastFmQueueError::CorruptStorage);
+        }
+
+        let rows = lastfm_scrobble::Entity::find()
+            .order_by_asc(lastfm_scrobble::Column::Id)
+            .all(&transaction)
+            .await
+            .map_err(|_| LastFmQueueError::Storage)?;
+        let loaded_count =
+            u64::try_from(rows.len()).map_err(|_| LastFmQueueError::CorruptStorage)?;
+        if loaded_count != count
+            || rows
+                .into_iter()
+                .any(|row| StoredLastFmScrobble::try_from(row).is_err())
+        {
+            return Err(LastFmQueueError::CorruptStorage);
+        }
+        Ok(count)
+    }
+    .await;
+
+    match result {
+        Ok(count) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| LastFmQueueError::Storage)?;
+            Ok(count)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
+}
+
 async fn validate_receipt<C>(db: &C, receipt: &LastFmBatchReceipt) -> Result<(), LastFmQueueError>
 where
     C: ConnectionTrait,
@@ -620,14 +862,14 @@ where
 
 fn same_payload(model: &lastfm_scrobble::Model, input: &PendingLastFmScrobble) -> bool {
     model.account_binding.as_slice() == input.account_binding.as_bytes()
-        && model.artist.as_str() == input.artist
-        && model.track_title.as_str() == input.track_title
-        && model.album.as_ref().map(StoredMetadataText::as_str) == input.album.as_deref()
+        && model.artist.as_str() == input.payload.artist
+        && model.track_title.as_str() == input.payload.track_title
+        && model.album.as_ref().map(StoredMetadataText::as_str) == input.payload.album.as_deref()
         && model.album_artist.as_ref().map(StoredMetadataText::as_str)
-            == input.album_artist.as_deref()
-        && model.track_number == input.track_number
-        && model.duration_secs == input.duration_secs
-        && model.started_at_unix_secs.get() == input.started_at_unix_secs
+            == input.payload.album_artist.as_deref()
+        && model.track_number == input.payload.track_number
+        && model.duration_secs == input.payload.duration_secs
+        && model.started_at_unix_secs.get() == input.payload.started_at_unix_secs
 }
 
 async fn queue_has_other_binding<C>(
@@ -740,6 +982,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_account_queue_validation_returns_exact_count() {
+        let db = database().await;
+        let account = binding("listener");
+        assert_eq!(validate_account_queue(&db, account).await.unwrap(), 0);
+
+        for title in ["First", "Second", "Third"] {
+            enqueue(&db, &input(account, title)).await.unwrap();
+        }
+        assert_eq!(validate_account_queue(&db, account).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn complete_account_queue_validation_rejects_another_binding() {
+        let db = database().await;
+        let retained_account = binding("retained-listener");
+        let expected_account = binding("expected-listener");
+        enqueue(&db, &input(retained_account, "Private row"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            validate_account_queue(&db, expected_account)
+                .await
+                .unwrap_err(),
+            LastFmQueueError::AccountMismatch
+        );
+        assert_eq!(queue_len(&db).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn complete_account_queue_validation_finds_corruption_beyond_one_batch() {
+        let db = database().await;
+        let account = binding("listener");
+        for index in 0..=MAX_LASTFM_BATCH_ROWS {
+            enqueue(&db, &input(account, &format!("Track {index}")))
+                .await
+                .unwrap();
+        }
+        let retained = models(&db).await;
+        let corrupt_id = retained[MAX_LASTFM_BATCH_ROWS].id;
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE lastfm_scrobble_queue SET occurrence_id = ? WHERE id = ?",
+            [Uuid::nil().as_bytes().to_vec().into(), corrupt_id.into()],
+        ))
+        .await
+        .unwrap();
+
+        let first_batch = batch_availability(&db, account, 0, MAX_LASTFM_BATCH_ROWS)
+            .await
+            .unwrap();
+        assert!(matches!(
+            first_batch,
+            LastFmBatchAvailability::Ready(receipt)
+                if receipt.len() == MAX_LASTFM_BATCH_ROWS
+        ));
+        let error = validate_account_queue(&db, account).await.unwrap_err();
+        assert_eq!(error, LastFmQueueError::CorruptStorage);
+        assert_eq!(format!("{error:?}"), "CorruptStorage");
+        assert_eq!(queue_len(&db).await.unwrap(), 51);
+    }
+
+    #[tokio::test]
     async fn enqueue_is_atomic_bounded_idempotent_and_collision_safe() {
         let db = database().await;
         let account = binding("listener");
@@ -754,7 +1059,7 @@ mod tests {
         );
 
         let mut collision = input(account, "Changed");
-        collision.occurrence_id = first.occurrence_id;
+        collision.payload.occurrence_id = first.payload.occurrence_id;
         assert_eq!(
             enqueue_with_cap(&db, &collision, 2).await.unwrap_err(),
             LastFmQueueError::OccurrenceConflict
@@ -792,7 +1097,7 @@ mod tests {
                            1700000000, 0, 0)",
                 [
                     malformed_id.into(),
-                    pending.occurrence_id.as_bytes().to_vec().into(),
+                    pending.occurrence_id().as_bytes().to_vec().into(),
                     account.as_bytes().to_vec().into(),
                 ],
             ))
@@ -808,21 +1113,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_availability_reports_empty_and_rejects_invalid_bounds() {
+        let db = database().await;
+        let account = binding("listener");
+        assert!(matches!(
+            batch_availability(&db, account, 0, 1).await.unwrap(),
+            LastFmBatchAvailability::Empty
+        ));
+
+        for (now_ms, limit) in [
+            (-1, 1),
+            (MAX_LASTFM_RETRY_AT_MS + 1, 1),
+            (0, 0),
+            (0, MAX_LASTFM_BATCH_ROWS + 1),
+        ] {
+            assert_eq!(
+                batch_availability(&db, account, now_ms, limit)
+                    .await
+                    .unwrap_err(),
+                LastFmQueueError::InvalidBatch
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn delayed_oldest_row_blocks_newer_due_rows_and_retry_is_durable() {
         let db = database().await;
         let account = binding("listener");
-        for title in ["First", "Second", "Third"] {
+        enqueue(&db, &input(account, "First")).await.unwrap();
+        let initial = batch(&db, account, 0, 50).await;
+        assert_eq!(initial.len(), 1);
+        reschedule_batch(&db, &initial, 500).await.unwrap();
+        for title in ["Second", "Third"] {
             enqueue(&db, &input(account, title)).await.unwrap();
         }
-        let initial = batch(&db, account, 0, 50).await;
-        assert_eq!(initial.len(), 3);
-        reschedule_batch(&db, &initial, 500).await.unwrap();
-        assert!(due_batch(&db, account, 499, 50).await.unwrap().is_none());
+        assert!(matches!(
+            batch_availability(&db, account, 499, 50).await.unwrap(),
+            LastFmBatchAvailability::DelayedUntil {
+                next_attempt_at_ms: 500
+            }
+        ));
 
-        let due = batch(&db, account, 500, 50).await;
+        let due = match batch_availability(&db, account, 500, 50).await.unwrap() {
+            LastFmBatchAvailability::Ready(receipt) => receipt,
+            availability => panic!("exact not-before boundary must be ready: {availability:?}"),
+        };
         assert_eq!(due.len(), 3);
-        assert!(due.rows().iter().all(|row| row.attempt_count == 1));
-        assert!(due.rows().iter().all(|row| row.next_attempt_at_ms == 500));
+        assert_eq!(due.maximum_attempt_count(), 1);
+        assert_eq!(due.rows()[0].attempt_count, 1);
+        assert_eq!(due.rows()[0].next_attempt_at_ms, 500);
+        assert!(due.rows()[1..]
+            .iter()
+            .all(|row| row.attempt_count == 0 && row.next_attempt_at_ms == 0));
         assert_eq!(due.rows().iter().map(|row| row.id).collect::<Vec<_>>(), {
             let mut ids = due.rows().iter().map(|row| row.id).collect::<Vec<_>>();
             ids.sort_unstable();
@@ -831,11 +1173,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_batch_stops_before_a_delayed_row_that_blocks_a_due_tail() {
+        let db = database().await;
+        let account = binding("listener");
+        for title in ["First", "Second", "Third"] {
+            enqueue(&db, &input(account, title)).await.unwrap();
+        }
+        let stored = models(&db).await;
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE lastfm_scrobble_queue SET next_attempt_at_ms = 500 WHERE id = ?",
+            [stored[1].id.into()],
+        ))
+        .await
+        .unwrap();
+
+        let ready = match batch_availability(&db, account, 0, 50).await.unwrap() {
+            LastFmBatchAvailability::Ready(receipt) => receipt,
+            availability => panic!("oldest due row must be ready: {availability:?}"),
+        };
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready.rows()[0].id, stored[0].id);
+        settle_terminal(&db, &ready).await.unwrap();
+
+        assert!(matches!(
+            batch_availability(&db, account, 0, 50).await.unwrap(),
+            LastFmBatchAvailability::DelayedUntil {
+                next_attempt_at_ms: 500
+            }
+        ));
+        let remaining = models(&db).await;
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[1].next_attempt_at_ms, 0);
+    }
+
+    #[tokio::test]
     async fn binding_mismatch_quarantines_and_disconnect_purges_every_row() {
         let db = database().await;
         let first_account = binding("first-listener");
         let second_account = binding("second-listener");
         enqueue(&db, &input(first_account, "First")).await.unwrap();
+        assert_eq!(
+            batch_availability(&db, second_account, 0, 50)
+                .await
+                .unwrap_err(),
+            LastFmQueueError::AccountMismatch
+        );
         assert_eq!(
             enqueue(&db, &input(second_account, "Second"))
                 .await
@@ -965,9 +1348,199 @@ mod tests {
         ))
         .await
         .unwrap();
-        let error = due_batch(&db, account, 0, 50).await.unwrap_err();
+        let error = batch_availability(&db, account, 0, 50).await.unwrap_err();
         assert_eq!(error, LastFmQueueError::CorruptStorage);
         assert_eq!(format!("{error:?}"), "CorruptStorage");
+    }
+
+    #[test]
+    fn unbound_and_bound_construction_share_exact_validation() {
+        let account = binding("listener");
+        let invalid_inputs = [
+            (
+                Uuid::nil(),
+                "Artist".to_owned(),
+                "Track".to_owned(),
+                None,
+                None,
+                Some(1),
+                60,
+                1,
+            ),
+            (
+                Uuid::new_v4(),
+                "Artist\0".to_owned(),
+                "Track".to_owned(),
+                None,
+                None,
+                Some(1),
+                60,
+                1,
+            ),
+            (
+                Uuid::new_v4(),
+                "Artist".to_owned(),
+                " \t".to_owned(),
+                None,
+                None,
+                Some(1),
+                60,
+                1,
+            ),
+            (
+                Uuid::new_v4(),
+                "Artist".to_owned(),
+                "Track".to_owned(),
+                Some("Album\n".to_owned()),
+                None,
+                Some(1),
+                60,
+                1,
+            ),
+            (
+                Uuid::new_v4(),
+                "Artist".to_owned(),
+                "Track".to_owned(),
+                None,
+                None,
+                Some(0),
+                60,
+                1,
+            ),
+            (
+                Uuid::new_v4(),
+                "Artist".to_owned(),
+                "Track".to_owned(),
+                None,
+                None,
+                Some(1),
+                30,
+                1,
+            ),
+            (
+                Uuid::new_v4(),
+                "Artist".to_owned(),
+                "Track".to_owned(),
+                None,
+                None,
+                Some(1),
+                60,
+                0,
+            ),
+        ];
+
+        for (
+            occurrence_id,
+            artist,
+            track_title,
+            album,
+            album_artist,
+            track_number,
+            duration_secs,
+            started_at_unix_secs,
+        ) in invalid_inputs
+        {
+            let unbound_error = UnboundLastFmScrobble::try_new(
+                occurrence_id,
+                artist.clone(),
+                track_title.clone(),
+                album.clone(),
+                album_artist.clone(),
+                track_number,
+                duration_secs,
+                started_at_unix_secs,
+            )
+            .unwrap_err();
+            let bound_error = PendingLastFmScrobble::try_new(
+                occurrence_id,
+                account,
+                artist,
+                track_title,
+                album,
+                album_artist,
+                track_number,
+                duration_secs,
+                started_at_unix_secs,
+            )
+            .unwrap_err();
+            assert_eq!(unbound_error, LastFmQueueError::InvalidInput);
+            assert_eq!(bound_error, unbound_error);
+        }
+    }
+
+    #[test]
+    fn binding_adds_only_account_authority_to_the_validated_payload() {
+        let account = binding("listener");
+        let occurrence_id = Uuid::new_v4();
+        let unbound = UnboundLastFmScrobble::try_new(
+            occurrence_id,
+            " Artist ".to_owned(),
+            " Track ".to_owned(),
+            Some(" Album ".to_owned()),
+            Some(" \t".to_owned()),
+            Some(7),
+            301,
+            1_700_000_123,
+        )
+        .unwrap();
+        assert_eq!(unbound.occurrence_id(), occurrence_id);
+        assert_eq!(unbound.artist(), " Artist ");
+        assert_eq!(unbound.track_title(), " Track ");
+        assert_eq!(unbound.album(), Some(" Album "));
+        assert_eq!(unbound.album_artist(), None);
+        assert_eq!(unbound.track_number(), Some(7));
+        assert_eq!(unbound.duration_secs(), 301);
+        assert_eq!(unbound.started_at_unix_secs(), 1_700_000_123);
+
+        let bound = unbound.clone().bind(account);
+        let legacy_constructor = PendingLastFmScrobble::try_new(
+            occurrence_id,
+            account,
+            " Artist ".to_owned(),
+            " Track ".to_owned(),
+            Some(" Album ".to_owned()),
+            Some(" \t".to_owned()),
+            Some(7),
+            301,
+            1_700_000_123,
+        )
+        .unwrap();
+        assert_eq!(bound, legacy_constructor);
+        assert_eq!(bound.account_binding(), account);
+        assert_eq!(bound.occurrence_id(), unbound.occurrence_id());
+        assert_eq!(bound.artist(), unbound.artist());
+        assert_eq!(bound.track_title(), unbound.track_title());
+        assert_eq!(bound.album(), unbound.album());
+        assert_eq!(bound.album_artist(), unbound.album_artist());
+        assert_eq!(bound.track_number(), unbound.track_number());
+        assert_eq!(bound.duration_secs(), unbound.duration_secs());
+        assert_eq!(bound.started_at_unix_secs(), unbound.started_at_unix_secs());
+    }
+
+    #[test]
+    fn unbound_and_bound_diagnostics_remain_content_free() {
+        let account = binding("private-listener");
+        let occurrence_id = Uuid::new_v4();
+        let unbound = UnboundLastFmScrobble::try_new(
+            occurrence_id,
+            "Private Artist".to_owned(),
+            "Private Track".to_owned(),
+            Some("Private Album".to_owned()),
+            Some("Private Album Artist".to_owned()),
+            Some(9),
+            321,
+            1_700_987_654,
+        )
+        .unwrap();
+        let bound = unbound.clone().bind(account);
+
+        for diagnostics in [format!("{unbound:?}"), format!("{bound:?}")] {
+            assert!(!diagnostics.contains("Private"));
+            assert!(!diagnostics.contains(&occurrence_id.to_string()));
+            assert!(!diagnostics.contains("1700987654"));
+            assert!(!diagnostics.contains("LastFmAccountBinding"));
+            assert!(diagnostics.contains("duration_secs: 321"));
+        }
     }
 
     #[test]
