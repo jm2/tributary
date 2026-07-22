@@ -65,7 +65,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Durable local playback history | ✅ Exact accepted local occurrences persist a saturating play count and monotonic last-played timestamp, with live Plays refresh ([contract](docs/playback-history.md)) |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ Recently Played and Top 25 use deterministic authoritative history, safe untouched-default migration, and live projection refresh ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
 | Track ratings | ✅ Exact 1–100 local editing, read-only/unsupported source states, deterministic sorting, live refresh, and smart-playlist rules ([contract](docs/ratings.md)) |
-| Last.fm scrobbling | 🚧 Foundation only — bounded HTTPS/auth client, native-vault credentials, and private durable FIFO are implemented; playback/runtime and settings UI are not yet available ([contract](docs/lastfm-scrobbling.md)) |
+| Last.fm scrobbling | 🚧 Internal foundation only — bounded protocol/vault storage, a private durable FIFO, and its single-flight delivery/lifecycle runtime are implemented but deliberately not wired into the application. Playback evidence and now-playing, authorization, consent/source policy, activation and lifecycle wiring, source-owner conversion, account/recovery/status UX, localization/accessibility, production credentials/verification, and final acceptance testing remain ([complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary)) |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
 | Linux and macOS file associations | ✅ |
@@ -480,6 +480,7 @@ CI automatically runs on every push/PR:
 ```
 src/
 ├── main.rs                 # Application entry point (GTK + tokio bootstrap)
+├── panic_reporting.rs      # Process-wide content-free panic diagnostics
 ├── discovery.rs            # mDNS + UDP zero-config server discovery
 ├── architecture/
 │   ├── mod.rs              # Module root & re-exports
@@ -541,6 +542,15 @@ src/
 │   ├── dmap.rs             # DMAP binary TLV parser (nom-based, 24 tag types)
 │   ├── client.rs           # HTTP client (5-step session handshake)
 │   └── backend.rs          # MediaBackend impl (in-memory cache)
+├── lastfm/
+│   ├── mod.rs              # Private Last.fm integration boundary
+│   ├── client.rs           # Bounded signed Last.fm 2.0 protocol client
+│   ├── credentials.rs      # Native-vault session and account binding
+│   ├── storage.rs          # Private durable FIFO and opaque receipts
+│   ├── delivery.rs         # Exhaustive outcome and retry policy
+│   ├── worker.rs           # Single-flight FIFO delivery worker
+│   ├── lifecycle.rs        # Shared vault lease and explicit recovery
+│   └── runtime.rs          # Bounded serialized queue/lifecycle owner
 ├── device/
 │   ├── mod.rs              # DeviceInfo model for mounted browsable media
 │   └── usb.rs              # GIO mount filtering + logical removable-source identity

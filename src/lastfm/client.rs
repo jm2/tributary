@@ -647,11 +647,14 @@ fn provider_error(
         .ok_or(LastFmClientError::InvalidResponse)?;
     Ok(Some(match code {
         9 => LastFmClientError::ReauthenticationRequired,
-        11 | 16 => LastFmClientError::ServiceUnavailable,
+        // Last.fm's published registry explicitly asks clients to retry the
+        // generic backend failure (8) and temporary outages (11/16).
+        8 | 11 | 16 => LastFmClientError::ServiceUnavailable,
+        29 => LastFmClientError::RateLimited,
         // Exhaustive recognized set from Last.fm's published error-code
         // registry. Unknown future values are compatibility failures rather
         // than guessed terminal results.
-        1..=8 | 10 | 12..=15 | 17..=27 | 29 => LastFmClientError::ServiceRejected { code },
+        1..=7 | 10 | 12..=15 | 17..=27 => LastFmClientError::ServiceRejected { code },
         _ => return Err(LastFmClientError::InvalidResponse),
     }))
 }
@@ -820,9 +823,10 @@ mod tests {
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
 
     use super::{
-        append_track_parameters, encode_form, sign_parameters, AppCredentials, IgnoredReason,
-        LastFmClient, LastFmClientError, LastFmTrack, RequestPolicy, Scrobble, ScrobblesEnvelope,
-        SubmissionResult, MAX_FORM_BODY_BYTES, MAX_RESPONSE_BODY_BYTES, MAX_SCROBBLES_PER_BATCH,
+        append_track_parameters, encode_form, provider_error, sign_parameters, AppCredentials,
+        IgnoredReason, LastFmClient, LastFmClientError, LastFmTrack, RequestPolicy, Scrobble,
+        ScrobblesEnvelope, SubmissionResult, MAX_FORM_BODY_BYTES, MAX_RESPONSE_BODY_BYTES,
+        MAX_SCROBBLES_PER_BATCH,
     };
 
     const API_KEY: &str = "0123456789abcdef0123456789abcdef";
@@ -1191,6 +1195,7 @@ mod tests {
         let service =
             MockHttpService::start(vec![MockRoute::new(Method::POST, "/2.0/").replies([
                 MockResponse::json(json!({"error": 9, "message": "session-secret-from-provider"})),
+                MockResponse::json(json!({"error": "8", "message": "backend private text"})),
                 MockResponse::json(json!({"error": "29", "message": "private metadata"})),
                 MockResponse::json(json!({"error": 13, "message": "signature secret"})),
                 MockResponse::json(json!({"error": 28, "message": "future provider code"})),
@@ -1205,7 +1210,11 @@ mod tests {
             client
                 .request_auth_token()
                 .await
-                .expect_err("code 29 fails"),
+                .expect_err("code 8 fails transiently"),
+            client
+                .request_auth_token()
+                .await
+                .expect_err("code 29 fails transiently"),
             client
                 .request_auth_token()
                 .await
@@ -1221,16 +1230,35 @@ mod tests {
         ];
         assert_eq!(errors[0], LastFmClientError::ReauthenticationRequired);
         assert!(errors[0].requires_reauthentication());
-        assert_eq!(errors[1], LastFmClientError::ServiceRejected { code: 29 });
-        assert!(!errors[1].is_retryable());
-        assert_eq!(errors[2], LastFmClientError::ServiceRejected { code: 13 });
-        assert_eq!(errors[3], LastFmClientError::InvalidResponse);
+        assert_eq!(errors[1], LastFmClientError::ServiceUnavailable);
+        assert!(errors[1].is_retryable());
+        assert_eq!(errors[2], LastFmClientError::RateLimited);
+        assert!(errors[2].is_retryable());
+        assert_eq!(errors[3], LastFmClientError::ServiceRejected { code: 13 });
         assert_eq!(errors[4], LastFmClientError::InvalidResponse);
+        assert_eq!(errors[5], LastFmClientError::InvalidResponse);
         let rendered = format!("{errors:?}");
         assert!(!rendered.contains("provider"));
         assert!(!rendered.contains("private metadata"));
         assert!(!rendered.contains("signature secret"));
         service.finish().await;
+    }
+
+    #[test]
+    fn published_transient_provider_codes_are_exhaustively_retryable() {
+        for (code, expected) in [
+            (8, LastFmClientError::ServiceUnavailable),
+            (11, LastFmClientError::ServiceUnavailable),
+            (16, LastFmClientError::ServiceUnavailable),
+            (29, LastFmClientError::RateLimited),
+        ] {
+            assert_eq!(
+                provider_error(&json!({"error": code})).unwrap(),
+                Some(expected),
+                "published provider code {code} changed retry class"
+            );
+            assert!(expected.is_retryable());
+        }
     }
 
     #[tokio::test]
