@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime foundation**
   ([#50](https://github.com/jm2/tributary/issues/50),
   [#151](https://github.com/jm2/tributary/pull/151),
-  [runtime/lifecycle slice](https://github.com/jm2/tributary/tree/agent/p2.1-lastfm-runtime)). This
+  [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153)). This
   is an internal foundation, not yet a user-visible scrobbling feature, and the runtime is
   deliberately not connected to application startup. Playback evidence and now-playing, the
   desktop authorization flow, explicit consent and per-source policy, settings/status UI,
